@@ -1007,6 +1007,214 @@ class TestCursorReachesEndOfSequence:
             assert sp._cursor_pos == n - 1
 
 
+class TestSeqHomeEndAndCtrlArrow:
+    """The seq panel's keyboard surface gained three extras (2026-04-30+):
+
+      * Home / End jump the seq cursor to the start / end of the
+        current display row — same semantics as a text editor. Home
+        also still resets the map origin when the map has focus,
+        because the App-level priority Home binding fires first there.
+      * Ctrl+Arrow slides the active selection by 1 bp (left/right)
+        or by `line_width` (up/down). Complement to Shift+Arrow,
+        which extends the selection. No-op when no selection exists.
+    """
+
+    async def test_home_jumps_cursor_to_row_start(
+        self, tiny_record, isolated_library,
+    ):
+        """Home should park the cursor on a row-start boundary —
+        i.e. `cursor_pos % line_width == 0`. We don't check a
+        specific bp because `_line_width()` depends on the live
+        render width, which is not necessarily what we'd compute
+        at test-setup time."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._cursor_pos = max(1, len(sp._seq) // 2)
+            app.set_focus(None)
+            await pilot.pause(0.05)
+            before = sp._cursor_pos
+            await pilot.press("home")
+            await pilot.pause(0.05)
+            lw = sp._line_width()
+            assert sp._cursor_pos % lw == 0, (
+                f"Home should jump to a row-start boundary; "
+                f"cursor_pos={sp._cursor_pos}, lw={lw}"
+            )
+            assert sp._cursor_pos <= before, (
+                f"Home should not move the cursor forward; "
+                f"before={before}, after={sp._cursor_pos}"
+            )
+
+    async def test_end_jumps_cursor_to_row_end(
+        self, tiny_record, isolated_library,
+    ):
+        """End should park the cursor at a row-end (= one before
+        the next row-start, or n-1 on the last row)."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            n  = len(sp._seq)
+            sp._cursor_pos = max(1, n // 2)
+            app.set_focus(None)
+            await pilot.pause(0.05)
+            before = sp._cursor_pos
+            await pilot.press("end")
+            await pilot.pause(0.05)
+            lw = sp._line_width()
+            after = sp._cursor_pos
+            # End-of-row = one less than next row-start, OR n-1
+            # on the final row.
+            is_row_end = ((after + 1) % lw == 0) or (after == n - 1)
+            assert is_row_end, (
+                f"End should jump to a row-end boundary; "
+                f"cursor_pos={after}, lw={lw}, n={n}"
+            )
+            assert after >= before
+
+    async def test_home_resets_map_origin_when_map_focused(
+        self, tiny_record, isolated_library,
+    ):
+        """When the map has focus, Home should still reset the origin
+        — the App-level priority binding takes that path before our
+        seq-cursor on_key handler runs."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm.origin_bp = 50
+            app.set_focus(pm)
+            await pilot.pause(0.05)
+            await pilot.press("home")
+            await pilot.pause(0.05)
+            assert pm.origin_bp == 0, (
+                f"Home with map focused should reset origin to 0; "
+                f"got {pm.origin_bp}"
+            )
+
+    async def test_ctrl_right_slides_selection(
+        self, tiny_record, isolated_library,
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel = (10, 20)
+            app.set_focus(None)
+            await pilot.pause(0.05)
+            await pilot.press("ctrl+right")
+            await pilot.pause(0.05)
+            assert sp._user_sel == (11, 21), (
+                f"Ctrl+Right should slide (10,20) → (11,21); "
+                f"got {sp._user_sel}"
+            )
+
+    async def test_ctrl_left_slides_selection(
+        self, tiny_record, isolated_library,
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel = (10, 20)
+            app.set_focus(None)
+            await pilot.pause(0.05)
+            await pilot.press("ctrl+left")
+            await pilot.pause(0.05)
+            assert sp._user_sel == (9, 19)
+
+    async def test_ctrl_left_clamps_at_zero(
+        self, tiny_record, isolated_library,
+    ):
+        """Ctrl+Left at the start of the sequence should clamp to
+        (0, span) instead of going negative."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel = (0, 10)   # already at start
+            app.set_focus(None)
+            await pilot.pause(0.05)
+            await pilot.press("ctrl+left")
+            await pilot.pause(0.05)
+            assert sp._user_sel == (0, 10), (
+                f"Ctrl+Left at start should be a no-op; "
+                f"got {sp._user_sel}"
+            )
+
+    async def test_ctrl_right_clamps_at_n(
+        self, tiny_record, isolated_library,
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            n = len(sp._seq)
+            sp._user_sel = (n - 10, n)   # already flush right
+            app.set_focus(None)
+            await pilot.pause(0.05)
+            await pilot.press("ctrl+right")
+            await pilot.pause(0.05)
+            assert sp._user_sel == (n - 10, n)
+
+    async def test_ctrl_arrow_no_op_without_selection(
+        self, tiny_record, isolated_library,
+    ):
+        """Ctrl+Arrow without an active selection should not move the
+        cursor — it's a deliberate no-op so the keys feel inert in
+        contexts where there's nothing to slide."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel  = None
+            sp._sel_range = None
+            sp._cursor_pos = 30
+            app.set_focus(None)
+            await pilot.pause(0.05)
+            await pilot.press("ctrl+right")
+            await pilot.pause(0.05)
+            assert sp._cursor_pos == 30
+            assert sp._user_sel is None
+
+    async def test_ctrl_down_slides_selection_by_line_width(
+        self, tiny_record, isolated_library,
+    ):
+        """Ctrl+Down should preserve selection span and shift it by
+        line_width. We check span preservation + a positive shift
+        rather than a specific delta because `_line_width()` is
+        layout-dependent and may differ from a pre-press capture."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel = (10, 20)
+            app.set_focus(None)
+            await pilot.pause(0.05)
+            await pilot.press("ctrl+down")
+            await pilot.pause(0.05)
+            new_s, new_e = sp._user_sel
+            delta = new_s - 10
+            assert delta > 1, (
+                f"Ctrl+Down should slide by more than 1 bp; "
+                f"got delta={delta}"
+            )
+            assert new_e - new_s == 10, (
+                f"Span should be preserved; new={(new_s, new_e)}"
+            )
+
+
 class TestRotationDoesNotMoveSeqCursor:
     """Regression guard for 2026-04-29: arrow keys with PlasmidMap focused
     rotate the plasmid origin, and MUST NOT move the seq cursor as a

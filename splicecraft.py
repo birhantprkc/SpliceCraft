@@ -2501,7 +2501,13 @@ class PlasmidMap(Widget):
         height: 1fr;
         background: $background;
     }
-    PlasmidMap:focus { border: solid $accent; }
+    /* Subtle background brighten when the map has focus — gives the
+       user a "you are here" cue without the layout-disrupting
+       accent border that ate a row/column off the braille canvas
+       (which then forced a viewport recompute + visible resize).
+       `#0c0c0c` is ~5 % brighter than pure black: barely there in
+       full light, clearly visible on a dim terminal. */
+    PlasmidMap:focus-within { background: #0c0c0c; }
     """
 
     can_focus = True
@@ -3271,6 +3277,9 @@ class FeatureSidebar(Widget):
         width: 32;
         border-left: solid $primary;
     }
+    /* Subtle "you are here" brighten when the inner DataTable
+       holds focus. See PlasmidMap for the colour rationale. */
+    FeatureSidebar:focus-within { background: #0c0c0c; }
     #feat-table  { height: 1fr; }
     #sidebar-hdr { background: $primary; padding: 0 1; }
     """
@@ -3438,6 +3447,10 @@ class LibraryPanel(Widget):
         width: 26;
         border-right: solid $primary;
     }
+    /* Subtle "you are here" brighten when focus is anywhere inside
+       the panel (collections table, plasmids table, search input).
+       See PlasmidMap for the colour rationale. */
+    LibraryPanel:focus-within { background: #0c0c0c; }
     #lib-hdr        { background: $primary; padding: 0 1; }
     /* Search input lives directly under the header; height 3 is the
        Textual Input default (1 content row + 2 border rows). */
@@ -3996,6 +4009,10 @@ class SequencePanel(Widget):
         height: 14;
         border-top: solid $primary;
     }
+    /* Subtle "you are here" brighten when focus is anywhere inside
+       the panel (the inner ScrollableContainer takes focus on
+       click). See PlasmidMap for the colour rationale. */
+    SequencePanel:focus-within { background: #0c0c0c; }
     #seq-scroll { height: 1fr; }
     """
 
@@ -15502,14 +15519,16 @@ EditSeqDialog { align: center middle; }
 #edit-btns Button { margin-right: 1; }
 
 /* ── Unsaved-quit dialog ─────────────────────────────────── */
-/* The cool dim-indigo `#1a1f3a` lifts the confirmation modals off
-   the pure-black panels so they read as a raised surface. All six
+/* The dark gray `#1c1c1c` lifts the confirmation modals off the
+   pure-black panels so they read as a raised surface. All six
    confirm modals share it; tweak in one place if you want a
-   different shade. */
+   different shade. The same gray is set on `$surface` in the
+   `splicecraft-black` theme, so most other modals (Fetch, Open,
+   Export, ...) pick it up automatically via `background: $surface`. */
 UnsavedQuitModal { align: center middle; }
 #quit-dlg {
     width: 60; height: auto;
-    background: #1a1f3a; border: solid $error; padding: 1 2;
+    background: #1c1c1c; border: solid $error; padding: 1 2;
 }
 #quit-title { background: $error-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #quit-msg   { color: $text-muted; margin-bottom: 1; }
@@ -15520,7 +15539,7 @@ UnsavedQuitModal { align: center middle; }
 UnsavedNavigateModal { align: center middle; }
 #navunsv-dlg {
     width: 60; height: auto;
-    background: #1a1f3a; border: solid $warning; padding: 1 2;
+    background: #1c1c1c; border: solid $warning; padding: 1 2;
 }
 #navunsv-title { background: $warning-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #navunsv-msg   { color: $text-muted; margin-bottom: 1; }
@@ -15531,7 +15550,7 @@ UnsavedNavigateModal { align: center middle; }
 QuitConfirmModal { align: center middle; }
 #quitcon-dlg {
     width: 50; height: auto;
-    background: #1a1f3a; border: solid $primary; padding: 1 2;
+    background: #1c1c1c; border: solid $primary; padding: 1 2;
 }
 #quitcon-title { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #quitcon-msg   { color: $text-muted; margin-bottom: 1; }
@@ -15550,7 +15569,7 @@ SplashScreen { background: black; }
 LibraryDeleteConfirmModal { align: center middle; }
 #libdel-dlg {
     width: 64; height: auto;
-    background: #1a1f3a; border: solid $error; padding: 1 2;
+    background: #1c1c1c; border: solid $error; padding: 1 2;
 }
 #libdel-title { background: $error-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #libdel-msg   { color: $text-muted; margin-bottom: 1; }
@@ -15600,7 +15619,7 @@ CollectionNameModal { align: center middle; }
 CollectionDeleteConfirmModal { align: center middle; }
 #colldel-dlg {
     width: 60; height: 16;
-    background: #1a1f3a; border: solid $primary; padding: 1 2;
+    background: #1c1c1c; border: solid $primary; padding: 1 2;
 }
 #colldel-title { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
 #colldel-msg   { height: 1fr; }
@@ -15611,7 +15630,7 @@ CollectionDeleteConfirmModal { align: center middle; }
 ScaryDeleteConfirmModal { align: center middle; }
 #scarydel-dlg {
     width: 70; height: 20;
-    background: #1a1f3a;
+    background: #1c1c1c;
     border: thick $error;
     padding: 1 2;
 }
@@ -16066,6 +16085,7 @@ SpeciesPickerModal { align: center middle; }
         # keys were App-level with priority=True, which fired even on
         # modal screens — moving them to the map removes that surprise.
         Binding("home",        "reset_origin",     "Reset origin",  show=True,  priority=True),
+        Binding("end",         "end_of_row",       "End of row",    show=False, priority=True),
         Binding("v",           "toggle_map_view",  "⊙/─ View",      show=True,  priority=True),
         Binding("l",           "toggle_connectors","Connectors",    show=True,  priority=True),
         Binding("r",           "toggle_restr",     "RE sites",      show=True,  priority=True),
@@ -16149,8 +16169,53 @@ SpeciesPickerModal { align: center middle; }
     # `v` remain at the App level because they should still work when
     # the user is editing the seq panel or browsing the sidebar.
 
+    def _seq_jump_row_edge(self, *, end: bool) -> bool:
+        """Jump the seq cursor to the start (end=False) or end (end=True)
+        of its current display row. Returns True on success, False
+        if focus is on a widget that should keep its own Home/End
+        semantics (DataTable, Input, the PlasmidMap)."""
+        focused = self.focused
+        if focused is not None:
+            from textual.widgets import DataTable, Input
+            if isinstance(focused, (DataTable, PlasmidMap, Input)):
+                return False
+        try:
+            sp = self.query_one("#seq-panel", SequencePanel)
+        except NoMatches:
+            return False
+        if not sp._seq:
+            return False
+        n  = len(sp._seq)
+        lw = sp._line_width()
+        cur = sp._cursor_pos if sp._cursor_pos >= 0 else 0
+        row_start = (cur // lw) * lw
+        row_end_pos = min(row_start + lw - 1, n - 1)
+        sp._cursor_pos = row_end_pos if end else row_start
+        sp._user_sel   = None
+        sp._sel_range  = None
+        sp._sel_anchor = -1
+        sp._ensure_cursor_visible()
+        sp._refresh_view()
+        return True
+
     def action_reset_origin(self):
+        """Home is context-aware: when no focus-stealing widget owns
+        the keystroke (typical seq-cursor case), jump the seq cursor
+        to the start of its current display row — same semantic as
+        a text editor. With focus on the map / a DataTable / an
+        Input, fall through to the original "reset the map's origin"
+        behaviour. The App-level priority binding ensures Home keeps
+        working even when a focused DataTable would normally consume
+        the key."""
+        if self._seq_jump_row_edge(end=False):
+            return
         self.query_one("#plasmid-map", PlasmidMap).action_reset_origin()
+
+    def action_end_of_row(self):
+        """End: jump the seq cursor to the end of its current display
+        row. No-op when focus is on the map / a DataTable / an Input
+        (those widgets keep their native End semantics)."""
+        self._seq_jump_row_edge(end=True)
 
     def action_toggle_map_view(self):
         self.query_one("#plasmid-map", PlasmidMap).action_toggle_map_view()
@@ -16418,10 +16483,17 @@ SpeciesPickerModal { align: center middle; }
 
     def on_mount(self) -> None:
         # Pin every panel/screen background to true black to match the
-        # logo. textual-dark's defaults are near-black greys; we register
-        # a fork that pins background/surface/panel to #000000 and keep
-        # the rest of textual-dark's palette. Done before push_screen so
-        # the splash inherits the black backdrop.
+        # logo. textual-dark's defaults are near-black greys; we
+        # register a fork that pins `background` / `panel` to
+        # #000000 and keep the rest of textual-dark's palette. Done
+        # before push_screen so the splash inherits the black
+        # backdrop.
+        # `surface` is intentionally NOT black — it's the colour
+        # Textual uses for raised UI like modals and scrollables, so
+        # a slightly lighter dark gray (#1c1c1c) lets the modal panel
+        # read as a distinct surface against the surrounding pure-
+        # black backdrop. Keeping it monochrome (no indigo / blue
+        # tint) preserves the theme's overall look.
         self.register_theme(Theme(
             name="splicecraft-black",
             primary="#0178D4",
@@ -16432,7 +16504,7 @@ SpeciesPickerModal { align: center middle; }
             accent="#ffa62b",
             foreground="#e0e0e0",
             background="#000000",
-            surface="#000000",
+            surface="#1c1c1c",
             panel="#000000",
             dark=True,
         ))
@@ -16806,6 +16878,38 @@ SpeciesPickerModal { align: center middle; }
         # ── Ctrl+Shift+Z / Ctrl+Y: redo ───────────────────────────────────────
         if event.key in ("ctrl+shift+z", "ctrl+Z", "ctrl+y"):
             self._action_redo()
+            event.stop()
+            return
+
+        # ── Ctrl+Arrow: slide the active selection (complement to Shift+Arrow,
+        # which extends instead of slides). No-op when no selection is active
+        # so it doesn't accidentally move the cursor in a context where the
+        # user expects the keys to do nothing. Wrap selections (`e < s`) are
+        # left untouched — sliding them needs different rules and is rare. */
+        if (event.key in ("ctrl+left", "ctrl+right",
+                           "ctrl+up", "ctrl+down")
+                and sp._seq):
+            sel = sp._user_sel or sp._sel_range
+            n = len(sp._seq)
+            if sel is not None and n > 0:
+                s, e = sel
+                if e > s:
+                    lw = sp._line_width()
+                    delta = {
+                        "ctrl+left":  -1,
+                        "ctrl+right":  1,
+                        "ctrl+up":    -lw,
+                        "ctrl+down":   lw,
+                    }[event.key]
+                    span = e - s
+                    new_s = max(0, min(n - span, s + delta))
+                    new_e = new_s + span
+                    sp._user_sel  = (new_s, new_e)
+                    sp._sel_range = None
+                    sp._cursor_pos = new_s
+                    sp._sel_anchor = new_s
+                    sp._ensure_cursor_visible()
+                    sp._refresh_view()
             event.stop()
             return
 
