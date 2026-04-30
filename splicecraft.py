@@ -18564,10 +18564,28 @@ SpeciesPickerModal { align: center middle; }
         pm.refresh()
         sidebar.populate(pm._feats)
         sp.update_seq(seq_str, pm._feats + displayed)
-        # Keep the user's selection alive on screen so they can see
-        # the annotation overlay the bases they highlighted; the
-        # cursor / sel_anchor already match.
+        # Auto-highlight the freshly-annotated bp range. `update_seq`
+        # cleared `_user_sel`; setting it now to the new feature's
+        # span paints the white-on-black overlay on those bases the
+        # moment the modal closes — the user sees confirmation of
+        # what was added AND can locate the bar (which sits at the
+        # top of the lane stack with insertion-order packing) by
+        # following the highlighted bp range. Without this cue users
+        # have to hunt for an unfamiliar bar position and repeated
+        # off-target clicks read as "the app stopped responding".
+        sp._user_sel  = (start, end)
+        sp._sel_range = None
+        sp._sel_anchor = start
+        sp._cursor_pos = start
         sp._refresh_view()
+        # Map / sidebar should also reflect the new selection.
+        try:
+            new_idx = len(pm._feats) - 1
+            if 0 <= new_idx < len(pm._feats):
+                pm.select_feature(new_idx)
+                sidebar.highlight_row(new_idx)
+        except (IndexError, AttributeError):
+            _log.exception("Post-annotate selection sync failed")
         self._mark_dirty()
 
         coord_str = (f"{start + 1}..{end}" if end > start
