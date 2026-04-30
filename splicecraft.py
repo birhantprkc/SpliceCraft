@@ -4374,6 +4374,14 @@ class SequencePanel(Widget):
         self._last_aa_codon_click = None
         bp = self._click_to_bp(event.screen_x, event.screen_y)
         if bp < 0:
+            # Log even on miss so a "the app isn't responding to my
+            # clicks" complaint shows whether the event reached us at
+            # all. `bp=-1` here means the click hit blank space within
+            # the seq-panel viewport (gap row, off-grid coordinate).
+            _log_event(
+                "seq.mouse_down_miss",
+                screen_x=event.screen_x, screen_y=event.screen_y,
+            )
             return
         # AA-letter click → land the cursor at the CENTER bp of the
         # codon (= where the AA letter was rendered), not the feature
