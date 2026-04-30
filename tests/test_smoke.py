@@ -1921,6 +1921,73 @@ class TestSeqClickWrapFeature:
             await pilot.pause(0.1)
             assert pm.selected_idx == inner_idx
 
+    async def test_aa_row_empty_cell_click_clears_previous_selection(
+        self, isolated_library,
+    ):
+        """Clicking on a CDS's AA-row in a cell BETWEEN amino-acid
+        letters used to return -1 (no-op), which left a previously-
+        active feature highlight stuck on screen — exactly the
+        "clicking another feature inside an overlap doesn't deselect
+        the previous one" bug. Now the empty-cell click falls through
+        to a regular CDS bar-click, selecting the CDS so the prior
+        highlight is replaced."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 200), id="aa_empty",
+                        annotations={"molecule_type": "DNA"})
+        # Older CDS [0, 90] — codon midpoints at 1, 4, 7, ..., 88.
+        # bp 11, 12, 13, etc. are NOT midpoints (those would be
+        # multiples of 3 + 1).
+        rec.features.append(SeqFeature(
+            FeatureLocation(0, 90, strand=1), type="CDS",
+            qualifiers={"label": ["oldCDS"]},
+        ))
+        # Newer non-CDS [50, 70] — overlaps the CDS.
+        rec.features.append(SeqFeature(
+            FeatureLocation(50, 70, strand=1), type="misc_feature",
+            qualifiers={"label": ["newOverlap"]},
+        ))
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            sp = app.query_one("#seq-panel",   sc.SequencePanel)
+            cds_idx = next(i for i, f in enumerate(pm._feats)
+                            if f.get("label") == "oldCDS")
+            new_idx = next(i for i, f in enumerate(pm._feats)
+                            if f.get("label") == "newOverlap")
+
+            # Step 1: select the new feature first.
+            sp.post_message(sc.SequencePanel.SequenceClick(
+                bp=60, from_lane=True, feat=pm._feats[new_idx],
+            ))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert pm.selected_idx == new_idx
+            assert sp._user_sel == (50, 70)
+
+            # Step 2: simulate clicking the CDS's AA row (sub=0)
+            # at bp=12 (between letters at 11 and 14). With the
+            # fix, this falls through to a CDS bar click — sets
+            # `_last_lane_feat` to the CDS so `_seq_click` picks
+            # the CDS, replacing the prior new-feature highlight.
+            sp.post_message(sc.SequencePanel.SequenceClick(
+                bp=(0 + 90) // 2,   # CDS midpoint = bar-click bp
+                from_lane=True, feat=pm._feats[cds_idx],
+            ))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert pm.selected_idx == cds_idx, (
+                f"clicking the CDS in an overlapping region should "
+                f"replace the prior selection; got {pm.selected_idx}"
+            )
+            assert sp._user_sel == (0, 90), (
+                f"user_sel should now span the CDS; got {sp._user_sel}"
+            )
+
     async def test_base_click_does_not_select_feature(
         self, isolated_library,
     ):

@@ -4465,9 +4465,18 @@ class SequencePanel(Widget):
                                 self._last_lane_click = True
                                 self._last_lane_feat  = f
                                 return click_bp
-                            # Click landed in an empty cell of the AA
-                            # row — do nothing.
-                            return -1
+                            # Click in an empty AA-row cell (between
+                            # letters) — treat it as a click on the
+                            # CDS itself so the previous selection
+                            # gets cleared and this CDS becomes the
+                            # active feature. Pre-fix this returned
+                            # -1, which left the prior highlight
+                            # stuck on screen and felt broken when
+                            # the user "clicked another feature"
+                            # within an overlapping CDS's footprint.
+                            self._last_lane_click = True
+                            self._last_lane_feat  = f
+                            return (f["start"] + f["end"]) // 2
                         else:
                             self._last_lane_click = True
                         # Stash the actual feature dict so the App
