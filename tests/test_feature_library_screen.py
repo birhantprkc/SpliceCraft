@@ -720,7 +720,8 @@ class TestFeatureSnippetPanelFormat:
 
     # ── DNA block: ``_build_seq_text`` pipeline (dithered ▒ bar + arrow) ──────
     # The DNA Rich Text contains the feature-bar row drawn by
-    # ``_render_feature_row_pair``. Its glyph set depends on strand:
+    # ``_paint_feature_bar`` (post-2026-04-30 2D-packed renderer).
+    # Its glyph set depends on strand:
     #   strand=1  → ▒…▒▶
     #   strand=-1 → ◀▒…▒
     #   strand=0  → ▒…▒       (no arrows)

@@ -49,6 +49,7 @@ def _protect_user_data(tmp_path, monkeypatch):
         ("_GRAMMARS_FILE",        "_grammars_cache"),
         ("_SETTINGS_FILE",        "_settings_cache"),
         ("_COLLECTIONS_FILE",     "_collections_cache"),
+        ("_AGENT_TOKEN_FILE",     None),   # written when --agent-api is on
     ]
 
     for file_attr, cache_attr in _DATA_FILES:

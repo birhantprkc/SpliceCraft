@@ -53,14 +53,19 @@ Issues     = "https://github.com/Binomica-Labs/SpliceCraft/issues"
 Changelog  = "https://github.com/Binomica-Labs/SpliceCraft/blob/master/CHANGELOG.md"
 
 [project.scripts]
-splicecraft = "splicecraft:main"
+splicecraft     = "splicecraft:main"
+# Stdlib-only sidecar (~50 ms startup) for external AI agents driving
+# the running GUI via the localhost agent-API. See `splicecraft --help`
+# for `--agent-api` and the README's "Agent API" section.
+splicecraft-cli = "splicecraft_cli:main"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["splicecraft.py"]
+only-include = ["splicecraft.py", "splicecraft_cli.py"]
 
 [tool.hatch.build.targets.sdist]
 include = [
     "splicecraft.py",
+    "splicecraft_cli.py",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",

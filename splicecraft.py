@@ -1125,56 +1125,6 @@ def _scan_restriction_sites(
     return feats
 
 
-def _assign_chunk_features(
-    chunk_feats: list[dict], chunk_start: int, chunk_end: int
-) -> tuple[list[list[dict]], list[list[dict]]]:
-    """
-    Forward-strand features always go above DNA; reverse-strand always below.
-    Within each group, overlapping features are stacked into greedy lanes
-    (each lane is a list of non-overlapping features). Lane[0] is the lane
-    closest to the DNA; new features try lane[0] first and only spill into
-    lane[1+] when there's a collision in this chunk.
-
-    No cap on lane count — features pile up as deep as the data demands.
-    A future "feature priority" knob will reorder placement; until then
-    sort by (start ascending, length descending) so longer features win
-    the lower lanes when starts tie.
-    """
-    def _greedy_lanes(feats: list[dict]) -> list[list[dict]]:
-        # Plain greedy packing — sort by start (with longer features
-        # first as a tie-breaker so a long CDS doesn't get bumped by
-        # a tiny one starting at the same bp). Type-based priority
-        # is now handled by `_chunk_lane_groups` segregating CDS
-        # and non-CDS into separate per-side lane stacks.
-        sorted_f = sorted(
-            feats,
-            key=lambda f: (max(f["start"], chunk_start),
-                           -(f["end"] - f["start"])),
-        )
-        lanes: list[list[dict]] = []
-        lane_ends: list[int]    = []
-        for f in sorted_f:
-            bar_s = max(f["start"], chunk_start)
-            bar_e = min(f["end"],   chunk_end)
-            if bar_e - bar_s <= 0:
-                continue
-            placed = False
-            for i, end in enumerate(lane_ends):
-                if bar_s >= end:
-                    lanes[i].append(f)
-                    lane_ends[i] = bar_e
-                    placed = True
-                    break
-            if not placed:
-                lanes.append([f])
-                lane_ends.append(bar_e)
-        return lanes
-
-    fwd = [f for f in chunk_feats if f["strand"] >= 0]
-    rev = [f for f in chunk_feats if f["strand"] <  0]
-    return _greedy_lanes(fwd), _greedy_lanes(rev)
-
-
 def _emit_packed_row(result: "Text", row_arr: list[tuple[str, str]],
                       prefix_w: int) -> None:
     """Append a packed row (per-column (char, style) tuples) to `result`
@@ -1237,8 +1187,7 @@ def _paint_feature_label(arr: list[tuple[str, str]], f: dict,
                 if 0 <= pos < content_w:
                     arr[pos] = (ch, name_sty)
         # Type-IIS dashed bridge in the parens row, between the
-        # recognition and the cut column. Mirrors the original
-        # `_render_feature_row_pair` resite block.
+        # recognition and the cut column.
         ext_cut_bp = f.get("ext_cut_bp")
         if ext_cut_bp is not None and chunk_start <= ext_cut_bp < chunk_end:
             cut_abs = ext_cut_bp - chunk_start
@@ -1428,236 +1377,6 @@ def _render_packed_strand(result: "Text",
         _emit_packed_row(result, arr, prefix_w)
 
 
-def _render_feature_row_pair(
-    result: "Text",
-    feats: list[dict],
-    chunk_start: int,
-    chunk_end: int,
-    prefix_w: int,
-    is_below_dna: bool,
-    show_connectors: bool,
-    flip_label_bar: bool = False,
-    single_row: bool = False,
-    re_highlight_se: "tuple[int, int] | None" = None,
-    seq_upper: str = "",
-    aa_highlight: "dict | None" = None,
-) -> None:
-    """
-    Append one label row + optional connector row + one feature-bar row to result.
-    For above-DNA: label / [connector] / bar.
-    For below-DNA: bar / [connector] / label.
-
-    Feature bars use ▒ (medium-shade / dither) as the fill glyph so the bar
-    reads as a single flat coloured tone rather than a pattern of distinct dots.
-    This is DELIBERATELY different from PlasmidMap, which still uses braille
-    sub-character rendering (U+2800–U+28FF) for the circular-map feature arcs —
-    only the sequence panel switched off braille.
-
-    When single_row=True (RE lanes), collapse to one content row: the cut arrow is
-    placed just outside the bracket (left of '(' above DNA, right of ')' below) only
-    if that cell is a space, so it never overwrites another character.
-    Multiple non-overlapping features share the same pair of rows horizontally.
-    """
-    content_w = chunk_end - chunk_start
-    label_arr: list[tuple[str, str]] = [(" ", "")] * content_w
-    bar_arr:   list[tuple[str, str]] = [(" ", "")] * content_w
-    conn_arr:  list[tuple[str, str]] = [(" ", "")] * content_w
-
-    for f in feats:
-        bar_s = max(f["start"], chunk_start) - chunk_start
-        bar_e = min(f["end"],   chunk_end)   - chunk_start
-        bar_len = bar_e - bar_s
-        if bar_len <= 0:
-            continue
-        starts_here = f["start"] >= chunk_start
-        ends_here   = f["end"]   <= chunk_end
-        strand      = f["strand"]
-        color       = f["color"]
-        label       = f.get("label", f.get("type", ""))
-
-        feat_type = f.get("type", "")
-
-        if feat_type == "resite":
-            # ── Parenthesis-style RE site: ( EnzymeName ) ─────────────────
-            # Layout convention (post-2026-04-30):
-            #   * label_arr (the "far from DNA" row) carries `( EnzymeName )`
-            #     and the Type-IIS dashed bridge.
-            #   * bar_arr (the "close to DNA" row) carries the cut arrow.
-            # Putting the cut close to DNA keeps it pointing at the actual
-            # bp on the strand. Critically, this matches the convention
-            # used by regular features (label far, bar close) so a
-            # resite can share a unified lane with a CDS / promoter etc.
-            # without a per-feature flip.
-            cut_col = f.get("cut_col")   # 0-based offset from f["start"], or None
-
-            # Opening / closing parens — go in label_arr (the "name" row).
-            if starts_here and bar_len >= 1:
-                label_arr[bar_s] = ("(", color)
-            if ends_here and bar_len >= 1:
-                label_arr[bar_s + bar_len - 1] = (")", color)
-
-            # Enzyme name: bold white normally, bold green when this is
-            # the resite the user just clicked (matched on start/end so
-            # repeated sites of the same enzyme stay independent). The
-            # green flips back to white as soon as the highlight clears
-            # — see PlasmidApp.on_click and on_key for the revert paths.
-            is_active_re = (re_highlight_se is not None
-                            and f["start"] == re_highlight_se[0]
-                            and f["end"]   == re_highlight_se[1])
-            name_sty = "bold green" if is_active_re else "bold white"
-            interior_start = (1 if starts_here else 0)
-            interior_end   = (bar_len - 1 if ends_here else bar_len)
-            interior_len   = interior_end - interior_start
-            if interior_len > 0:
-                name_str  = label[:interior_len]
-                name_pad  = interior_len - len(name_str)
-                name_lpad = name_pad // 2
-                for j, ch in enumerate(name_str):
-                    pos = bar_s + interior_start + name_lpad + j
-                    if 0 <= pos < content_w:
-                        label_arr[pos] = (ch, name_sty)
-
-            # Cut arrow in bar_arr (close-to-DNA row).
-            cut_ch = "↑" if is_below_dna else "↓"
-            if cut_col is not None:
-                visible_offset = cut_col - max(0, chunk_start - f["start"])
-                cut_pos = bar_s + visible_offset
-                if 0 <= cut_pos < content_w:
-                    bar_arr[cut_pos] = (cut_ch, "bold " + color)
-
-            # Type IIS: dashed bridge in label_arr (with the parens) +
-            # cut arrow in bar_arr at the external cut position.
-            ext_cut_bp = f.get("ext_cut_bp")
-            if ext_cut_bp is not None and chunk_start <= ext_cut_bp < chunk_end:
-                cut_abs = ext_cut_bp - chunk_start
-                if 0 <= cut_abs < content_w:
-                    bar_arr[cut_abs] = (cut_ch, "bold " + color)
-                # Bridge in label_arr — the dashed line lives on the
-                # parens row, visually connecting `(name)` to the cut
-                # column above (which in turn aligns with the arrow on
-                # the bar row below).
-                if cut_abs >= bar_s + bar_len:       # downstream cut
-                    for j in range(bar_s + bar_len, cut_abs):
-                        if 0 <= j < content_w and label_arr[j][0] == " ":
-                            label_arr[j] = ("╌", color)
-                elif cut_abs < bar_s:                # upstream cut
-                    for j in range(cut_abs + 1, bar_s):
-                        if 0 <= j < content_w and label_arr[j][0] == " ":
-                            label_arr[j] = ("╌", color)
-
-            # Connector tick at midpoint
-            mid = bar_s + bar_len // 2
-            if 0 <= mid < content_w:
-                conn_arr[mid] = ("┊", color)
-            continue   # skip the regular label/bar/conn logic below
-
-        elif feat_type == "recut":
-            continue   # cut position is rendered inside the resite bar; skip here
-
-        # ── Standard feature (non-RE) ──────────────────────────────────────
-
-        # Label (centered in feature span)
-        lbl = label[:bar_len]
-        pad = bar_len - len(lbl)
-        pl  = pad // 2
-        lbl_str = " " * pl + lbl + " " * (pad - pl)
-        for i, ch in enumerate(lbl_str):
-            if 0 <= bar_s + i < content_w:
-                label_arr[bar_s + i] = (ch, color)
-
-        # Dithered feature bar — medium-shade fill + directional arrowhead at
-        # the feature end (strand direction preserved). 1 bp features get a
-        # triangle pointing toward the DNA row. strand==0 renders as an
-        # arrowless bar; strand==2 renders as a double-headed bar.
-        if bar_len == 1:
-            bar_str = "▲" if is_below_dna else "▼"
-        elif strand == 0:
-            bar_str = "▒" * bar_len
-        elif strand == 2:
-            head = "◀" if starts_here else "▒"
-            tail = "▶" if ends_here   else "▒"
-            middle = "▒" * max(0, bar_len - 2)
-            bar_str = head + middle + tail
-        elif strand >= 1:
-            bar_str = "▒" * (bar_len - (1 if ends_here   else 0)) + ("▶" if ends_here   else "")
-        else:
-            bar_str = ("◀" if starts_here else "") + "▒" * (bar_len - (1 if starts_here else 0))
-        for i, ch in enumerate(bar_str):
-            if 0 <= bar_s + i < content_w:
-                bar_arr[bar_s + i] = (ch, color)
-
-        # Connector tick at midpoint of feature span
-        mid = bar_s + bar_len // 2
-        if 0 <= mid < content_w:
-            conn_arr[mid] = ("┊", color)
-
-    def _write_arr(arr: list[tuple[str, str]]) -> None:
-        result.append(" " * prefix_w)
-        run: list[str] = []
-        sty = ""
-        for ch, s in arr:
-            if s == sty:
-                run.append(ch)
-            else:
-                if run:
-                    result.append("".join(run), style=sty)
-                run = [ch]
-                sty = s
-        if run:
-            result.append("".join(run), style=sty)
-        result.append("\n")
-
-    if single_row:
-        # Place cut arrow adjacent to the bracket — never overlapping a name char.
-        for f in feats:
-            if f.get("type") != "resite":
-                continue
-            bar_s  = max(f["start"], chunk_start) - chunk_start
-            bar_e  = min(f["end"],   chunk_end)   - chunk_start
-            cut_ch = "↑" if is_below_dna else "↓"
-            color  = f["color"]
-            if not is_below_dna:
-                # Above DNA: try left of opening paren, then right of closing paren
-                if bar_s > 0 and bar_arr[bar_s - 1][0] == " ":
-                    bar_arr[bar_s - 1] = (cut_ch, "bold " + color)
-                elif bar_e < content_w and bar_arr[bar_e][0] == " ":
-                    bar_arr[bar_e] = (cut_ch, "bold " + color)
-            else:
-                # Below DNA: try right of closing paren, then left of opening paren
-                if bar_e < content_w and bar_arr[bar_e][0] == " ":
-                    bar_arr[bar_e] = (cut_ch, "bold " + color)
-                elif bar_s > 0 and bar_arr[bar_s - 1][0] == " ":
-                    bar_arr[bar_s - 1] = (cut_ch, "bold " + color)
-            # Type IIS: ext_cut_bp arrow goes into bar_arr at the actual cut position
-            ext_cut_bp = f.get("ext_cut_bp")
-            if ext_cut_bp is not None and chunk_start <= ext_cut_bp < chunk_end:
-                cut_abs = ext_cut_bp - chunk_start
-                if 0 <= cut_abs < content_w and bar_arr[cut_abs][0] == " ":
-                    bar_arr[cut_abs] = (cut_ch, "bold " + color)
-        if not is_below_dna:
-            _write_arr(bar_arr)
-            if show_connectors:
-                _write_arr(conn_arr)
-        else:
-            if show_connectors:
-                _write_arr(conn_arr)
-            _write_arr(bar_arr)
-        return
-
-    first_arr  = bar_arr   if flip_label_bar else label_arr
-    second_arr = label_arr if flip_label_bar else bar_arr
-    if not is_below_dna:
-        _write_arr(first_arr)
-        if show_connectors:
-            _write_arr(conn_arr)
-        _write_arr(second_arr)
-    else:
-        _write_arr(second_arr)
-        if show_connectors:
-            _write_arr(conn_arr)
-        _write_arr(first_arr)
-
-
 def _feat_stack_height(f: dict) -> int:
     """Vertical row count for a single feature's lane art:
     non-CDS = 2 (bar + label); CDS = 3 (AA + bar + label)."""
@@ -1681,14 +1400,22 @@ def _pack_features_2d(feats: list[dict], chunk_start: int,
     rows are free. If nothing overlaps the feature, max_top is -1
     and the feature lands at row 0 (bar adjacent to DNA).
     """
-    sorted_f = sorted(
-        feats,
-        key=lambda f: (
+    # Sort key uses the in-chunk visible span (bar_e - bar_s) rather
+    # than the raw `end - start`. `_feats_in_chunk` always splits
+    # wrap features before they reach this function, but if a future
+    # refactor ever lets a wrap feature through (`end < start`), the
+    # raw subtraction goes negative and a tie-breaker that's supposed
+    # to favour longer features starts favouring shorter ones. The
+    # in-chunk span is always non-negative.
+    def _sort_key(f):
+        bar_s = max(f["start"], chunk_start)
+        bar_e = min(f["end"],   chunk_end)
+        return (
             0 if f.get("type") == "CDS" else 1,
-            max(f["start"], chunk_start),
-            -(f["end"] - f["start"]),
-        ),
-    )
+            bar_s,
+            -(bar_e - bar_s),
+        )
+    sorted_f = sorted(feats, key=_sort_key)
     placements: list[tuple[dict, int]] = []
     col_top: dict[int, int] = {}
     for f in sorted_f:
@@ -1764,7 +1491,7 @@ _CHUNK_LAYOUT_CACHE: dict = {}
 # Rich Text per chunk, ASSUMING NO OVERLAYS (no cursor / selection / RE
 # highlight). Cursor moves only re-render the chunk under the cursor; the
 # other ~1500 chunks of a 200 kb BAC are reused from this cache. Profile-
-# driven: `_render_feature_row_pair` was 78% of cursor-move time on a 150 kb
+# driven: lane-art rendering was 78% of cursor-move time on a 150 kb
 # plasmid; lane art is fully deterministic per chunk so caching it
 # eliminates that hot path. Stored as `dict[key, list[Text|None]]`.
 _CHUNK_STATIC_CACHE: dict = {}
@@ -1947,9 +1674,9 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     # Per-chunk static-render cache. The first render fills it; subsequent
     # cursor moves only re-render the chunk under the cursor and reuse the
     # other ~N pre-rendered Text objects. Without this, the BAC-scale
-    # `_render_feature_row_pair` cost (~78 % of render time) recurs every
-    # keystroke. Cache stays valid for cursor/selection changes; it
-    # invalidates only on (seq, feats, line_width, show_connectors) change.
+    # lane-art cost (~78 % of render time) recurs every keystroke. Cache
+    # stays valid for cursor/selection changes; it invalidates only on
+    # (seq, feats, line_width, show_connectors) change.
     static_key   = (id(seq), id(feats), line_width, show_connectors)
     static_cache = _CHUNK_STATIC_CACHE.get(static_key)
     if static_cache is None or len(static_cache) != len(chunks_layout):
@@ -2337,7 +2064,15 @@ def _feat_label(feat) -> str:
     for q in ("label", "gene", "product", "standard_name", "note", "bound_moiety"):
         if q in feat.qualifiers:
             v = feat.qualifiers[q]
-            s = v[0] if isinstance(v, list) else v
+            # Biopython normally wraps qualifier values in a 1+ element
+            # list, but malformed GenBank files can produce empty lists
+            # or bare strings. Guard both.
+            if isinstance(v, list):
+                if not v:
+                    continue
+                s = v[0]
+            else:
+                s = v
             if not isinstance(s, str):
                 continue
             # Collapse whitespace characters (newline, tab, vertical tab)
@@ -5004,7 +4739,12 @@ class SequencePanel(Widget):
         # scroll up followed by a snap back. Callers that change content
         # should set scroll before calling `_refresh_view`; the sync set
         # survives the refresh tick on its own.
-        view.update(self._view_cache_txt)
+        # Cache is populated by the `if key != …` block above on first
+        # call (and any time the key changes); guard for the edge case
+        # where `_build_seq_text` somehow returned None so we don't
+        # pass None into `Static.update`.
+        if self._view_cache_txt is not None:
+            view.update(self._view_cache_txt)
 
     def on_resize(self, _) -> None:
         self._refresh_view()
@@ -5420,7 +5160,7 @@ class DropdownScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         yield Static(
-            self._render_content(),
+            self._build_dropdown_text(),
             id="dropdown-box",
         )
 
@@ -5434,7 +5174,7 @@ class DropdownScreen(ModalScreen):
         box.styles.border = ("solid", "#555555")
         box.styles.background = "#1e1e1e"
 
-    def _render_content(self) -> Text:
+    def _build_dropdown_text(self) -> Text:
         inner_w = max((len(lbl) for lbl, _ in self._items), default=10) + 4
         sep_line = "\u2500" * (inner_w - 2)
         result = Text()
@@ -5458,7 +5198,7 @@ class DropdownScreen(ModalScreen):
 
     def _refresh_box(self) -> None:
         box = self.query_one("#dropdown-box", Static)
-        box.update(self._render_content())
+        box.update(self._build_dropdown_text())
 
     def on_key(self, event) -> None:
         items = self._items
@@ -15103,6 +14843,462 @@ class LibraryDeleteConfirmModal(ModalScreen):
         self.dismiss(False)
 
 
+# ── Agent API: HTTP server for external CLI/IDE control (0.4.6+) ───────────────
+# Optional sidecar that exposes the app's actions as JSON endpoints on
+# localhost. Off by default — opt in with `--agent-api` (or
+# SPLICECRAFT_AGENT_API=1`). The intent is "BYO-AI": the user already
+# has a CLI agent (Claude Code, Cursor, aider, …) outside SpliceCraft;
+# this lets that agent drive the running session via the
+# `splicecraft-cli` wrapper without paying any per-action API costs.
+#
+# Threading model: stdlib HTTPServer runs in a daemon thread. Each
+# request handler dispatches state mutations to the Textual UI thread
+# via `app.call_from_thread(...)` so the reactive system redraws
+# automatically — same path as a menu click.
+#
+# Security: localhost-only bind (127.0.0.1) keeps the API off the
+# network. Any local process on the same machine can hit the port,
+# so write endpoints additionally require a per-session bearer token
+# (UUID written to `_AGENT_TOKEN_FILE` at startup, mode 0600). Read
+# endpoints are unauthenticated for now — they can't damage state.
+#
+# Stale-write guard: if `app._unsaved` is True, write endpoints
+# return HTTP 409 unless the caller passes `{"force": true}`. The
+# user's in-flight edits never get clobbered without explicit
+# acknowledgement.
+
+import http.server
+import threading
+import uuid
+from socketserver import ThreadingMixIn
+
+_AGENT_API_HOST = "127.0.0.1"
+_AGENT_API_PORT_DEFAULT = 6701
+_AGENT_TOKEN_FILE = _DATA_DIR / "agent_token"
+
+# (handler_fn, write_bool) — write endpoints require token + dirty check.
+_AGENT_HANDLERS: "dict[str, tuple]" = {}
+
+
+def _agent_endpoint(name: str, *, write: bool = False):
+    """Decorator: register a handler at `/<name>`.
+    Handlers take `(app, payload)` and return either a `dict` (200) or
+    `(dict, status_code)`. `write=True` flags state-mutating endpoints —
+    these require the bearer token AND refuse if `app._unsaved` is True
+    (unless the payload has `{"force": true}`)."""
+    def deco(fn):
+        _AGENT_HANDLERS[name] = (fn, write)
+        return fn
+    return deco
+
+
+def _agent_dirty_guard(app, payload):
+    """Return None if writes may proceed, else (error_dict, 409). The
+    `force` field in the payload (or `?force=1` in the query, applied
+    by the request handler) overrides the dirty check."""
+    if getattr(app, "_unsaved", False) and not bool(payload.get("force")):
+        return ({"error":
+                  "unsaved changes — pass {\"force\": true} to override",
+                  "dirty": True}, 409)
+    return None
+
+
+@_agent_endpoint("status")
+def _h_status(app, payload):
+    """Current session state: loaded record, dirty flag, source path."""
+    rec = getattr(app, "_current_record", None)
+    pm = None
+    if rec is not None:
+        try:
+            pm = app.query_one("#plasmid-map", PlasmidMap)
+        except (NoMatches, AttributeError):
+            pm = None
+    return {
+        "loaded":      rec is not None,
+        "name":        rec.name if rec else None,
+        "id":          rec.id   if rec else None,
+        "length":      len(rec.seq) if rec else 0,
+        "topology":    (rec.annotations.get("topology") if rec else None),
+        "n_features":  len(pm._feats) if pm else 0,
+        "dirty":       bool(getattr(app, "_unsaved", False)),
+        "source_path": getattr(app, "_source_path", None),
+        "version":     __version__,
+    }
+
+
+@_agent_endpoint("tools")
+def _h_tools(app, payload):
+    """Self-describe: list of available endpoints + their write/read mode."""
+    return {"endpoints": [
+        {
+            "name":   name,
+            "method": "POST" if write else "GET",
+            "write":  write,
+            "doc":    (fn.__doc__ or "").strip().split("\n")[0],
+        }
+        for name, (fn, write) in sorted(_AGENT_HANDLERS.items())
+    ]}
+
+
+@_agent_endpoint("features")
+def _h_features(app, payload):
+    """List features on the loaded record (idx, label, type, start, end, strand)."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return {"features": []}
+    try:
+        pm = app.query_one("#plasmid-map", PlasmidMap)
+    except (NoMatches, AttributeError):
+        return {"features": []}
+    return {"features": [
+        {
+            "idx":    i,
+            "label":  f.get("label") or "",
+            "type":   f.get("type", "misc_feature"),
+            "start":  f["start"],
+            "end":    f["end"],
+            "strand": f.get("strand", 1),
+            "color":  f.get("color"),
+        }
+        for i, f in enumerate(pm._feats)
+        if f.get("type") not in ("site", "recut")
+    ]}
+
+
+@_agent_endpoint("fetch", write=True)
+def _h_fetch(app, payload):
+    """Fetch a GenBank record from NCBI by accession and load it into the GUI."""
+    accession = (payload.get("accession") or "").strip()
+    if not accession:
+        return ({"error": "missing 'accession'"}, 400)
+    # NCBI roundtrip is slow (1-3s). Run it on the HTTP-handler thread
+    # — only the apply step needs the UI thread. The dirty-state guard
+    # also runs on the UI thread so it sees the live `_unsaved` value.
+    try:
+        record = fetch_genbank(accession)
+    except Exception as exc:
+        _log.exception("agent-api fetch failed: %s", accession)
+        return ({"error": f"NCBI fetch failed: {exc}"}, 502)
+
+    def _apply():
+        guard = _agent_dirty_guard(app, payload)
+        if guard is not None:
+            return guard
+        app._apply_record(record)
+        return None
+
+    err = app.call_from_thread(_apply)
+    if err is not None:
+        return err
+    return {
+        "ok":         True,
+        "name":       record.name,
+        "length":     len(record.seq),
+        "n_features": sum(1 for f in record.features if f.type != "source"),
+    }
+
+
+@_agent_endpoint("load-entry", write=True)
+def _h_load_entry(app, payload):
+    """Load a plasmid library entry by name or id."""
+    key = (payload.get("name") or payload.get("id") or "").strip()
+    if not key:
+        return ({"error": "missing 'name' or 'id'"}, 400)
+    entries = _load_library()
+    match = next((e for e in entries
+                  if e.get("name") == key or e.get("id") == key),
+                 None)
+    if match is None:
+        return ({"error": f"no library entry matching {key!r}",
+                 "available": [e.get("name") or e.get("id")
+                                for e in entries[:50]]}, 404)
+    gb_text = match.get("gb_text") or ""
+    if not gb_text:
+        return ({"error": "library entry has no stored sequence"}, 422)
+    try:
+        record = _gb_text_to_record(gb_text)
+    except Exception as exc:
+        _log.exception("agent-api load-entry parse failed")
+        return ({"error": f"parse failed: {exc}"}, 500)
+
+    def _apply():
+        guard = _agent_dirty_guard(app, payload)
+        if guard is not None:
+            return guard
+        app._apply_record(record)
+        return None
+
+    err = app.call_from_thread(_apply)
+    if err is not None:
+        return err
+    return {"ok": True, "name": record.name, "length": len(record.seq)}
+
+
+@_agent_endpoint("add-feature", write=True)
+def _h_add_feature(app, payload):
+    """Add a feature. Body: `{start, end, label?, type?, strand?}`.
+    Coordinates are 0-based half-open `[start, end)`. Wrap features
+    (`end < start`) are supported via CompoundLocation."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    try:
+        start = int(payload["start"])
+        end   = int(payload["end"])
+    except (KeyError, ValueError, TypeError):
+        return ({"error": "missing or invalid 'start'/'end' (must be int)"},
+                400)
+    n = len(rec.seq)
+    if not (0 <= start < n):
+        return ({"error": f"start {start} out of range [0, {n})"}, 400)
+    if not (0 <= end <= n):
+        return ({"error": f"end {end} out of range [0, {n}]"}, 400)
+    if end == start:
+        return ({"error": "zero-length feature (end == start)"}, 400)
+    label = (payload.get("label") or "").strip()
+    feat_type = (payload.get("type") or "misc_feature").strip()
+    try:
+        strand = int(payload.get("strand", 1))
+    except (ValueError, TypeError):
+        return ({"error": "invalid 'strand' (must be -1, 0, or 1)"}, 400)
+    if strand not in (-1, 0, 1):
+        return ({"error": "'strand' must be -1, 0, or 1"}, 400)
+
+    from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+    from copy import deepcopy
+    qualifiers = {"label": [label]} if label else {}
+    biop_strand = strand if strand in (-1, 1) else None
+    if end > start:
+        loc = FeatureLocation(start, end, strand=biop_strand)
+    else:
+        # Wrap feature: split into compound [start, n) + [0, end).
+        loc = CompoundLocation([
+            FeatureLocation(start, n, strand=biop_strand),
+            FeatureLocation(0, end, strand=biop_strand),
+        ])
+    new_feat = SeqFeature(loc, type=feat_type, qualifiers=qualifiers)
+
+    def _apply():
+        guard = _agent_dirty_guard(app, payload)
+        if guard is not None:
+            return guard
+        # Snapshot pre-edit so the user can Ctrl+Z the agent's change.
+        app._push_undo()
+        new_rec = deepcopy(app._current_record)
+        new_rec.features.append(new_feat)
+        app._current_record = new_rec
+        # Mirrors the panel-refresh block in `_handle_pasted_part` —
+        # don't go through `_apply_record` because that path marks
+        # the record CLEAN and shows a "Loaded …" toast, which would
+        # be wrong semantics for an in-place agent edit.
+        pm      = app.query_one("#plasmid-map", PlasmidMap)
+        sidebar = app.query_one("#sidebar",     FeatureSidebar)
+        sp      = app.query_one("#seq-panel",   SequencePanel)
+        pm.load_record(new_rec)
+        seq_str = str(new_rec.seq)
+        app._restr_cache = _scan_restriction_sites(
+            seq_str,
+            min_recognition_len=app._restr_min_len,
+            unique_only=app._restr_unique_only,
+        )
+        displayed = app._restr_cache if app._show_restr else []
+        pm._restr_feats = displayed
+        pm.refresh()
+        sidebar.populate(pm._feats)
+        sp.update_seq(seq_str, pm._feats + displayed)
+        app._mark_dirty()
+        # Show the agent's edit in the toast stream so the user sees
+        # what just happened on screen — same channel as menu actions.
+        coord_str = (f"{start + 1}..{end}" if end > start
+                     else f"{start + 1}..{n},1..{end}")
+        app._notify_success(
+            f"Agent added {feat_type} '{label or '(unlabeled)'}' "
+            f"at {coord_str}"
+        )
+        return new_rec.id
+
+    result = app.call_from_thread(_apply)
+    if isinstance(result, tuple):
+        return result   # error tuple from the dirty guard
+    return {"ok": True, "label": label or "(unlabeled)",
+            "start": start, "end": end, "strand": strand,
+            "type": feat_type, "record_id": result}
+
+
+@_agent_endpoint("save", write=True)
+def _h_save(app, payload):
+    """Save current record to its source file (if any) and library."""
+    if getattr(app, "_current_record", None) is None:
+        return ({"error": "nothing to save"}, 422)
+    ok = app.call_from_thread(app._do_save)
+    return {"ok": bool(ok),
+            "source_path": getattr(app, "_source_path", None)}
+
+
+# ── HTTP plumbing ──────────────────────────────────────────────────────────────
+
+class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
+    """Routes `/<name>` to the registered handler. JSON in, JSON out.
+    Bearer-token auth on write endpoints; no CORS handling since we
+    only bind 127.0.0.1."""
+
+    server_version = f"SpliceCraft/{__version__}"
+
+    def log_message(self, format, *args):
+        # Stdlib HTTPServer logs to stderr by default — that would
+        # corrupt the Textual TUI. Route to our own logger instead.
+        _log.debug("agent-api: " + format, *args)
+
+    # Generous cap for any single agent payload — protects against a
+    # malformed (or malicious) `Content-Length: 9999999999` header
+    # parking the handler thread on `rfile.read` indefinitely. 1 MiB
+    # is well above any realistic agent command (the largest field
+    # we accept is a short label / accession), but small enough to
+    # bail early instead of OOM'ing.
+    _MAX_BODY_BYTES = 1 << 20
+
+    def _read_body(self) -> dict:
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            return {}
+        if length <= 0:
+            return {}
+        if length > self._MAX_BODY_BYTES:
+            _log.warning("agent-api: oversized request body (%d bytes) "
+                         "rejected", length)
+            return {}
+        try:
+            raw = self.rfile.read(length).decode("utf-8")
+            data = json.loads(raw) if raw else {}
+            return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+
+    def _send(self, payload: dict, status: int = 200) -> None:
+        body = json.dumps(payload, default=str).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _check_token(self) -> bool:
+        expected = getattr(self.server, "_token", None)
+        if expected is None:
+            return True   # token-free mode (used by some tests)
+        provided = self.headers.get("Authorization", "")
+        if provided.startswith("Bearer "):
+            return provided[len("Bearer "):] == expected
+        return False
+
+    def do_GET(self):  return self._handle("GET")
+    def do_POST(self): return self._handle("POST")
+
+    def _handle(self, method: str) -> None:
+        # Strip leading slash + query string.
+        path_part = self.path.lstrip("/").split("?", 1)[0]
+        if path_part in ("", "tools"):
+            return self._send(
+                _h_tools(getattr(self.server, "_app", None), {})
+            )
+        handler = _AGENT_HANDLERS.get(path_part)
+        if handler is None:
+            return self._send(
+                {"error": f"unknown endpoint {path_part!r}",
+                 "endpoints": sorted(_AGENT_HANDLERS)},
+                404,
+            )
+        fn, write = handler
+        if write and not self._check_token():
+            return self._send(
+                {"error": "missing or invalid bearer token"}, 401,
+            )
+        body = self._read_body() if method == "POST" else {}
+        try:
+            result = fn(getattr(self.server, "_app"), body)
+        except Exception as exc:
+            _log.exception("agent-api %s failed", path_part)
+            return self._send(
+                {"error": str(exc), "type": type(exc).__name__}, 500,
+            )
+        if isinstance(result, tuple):
+            payload, status = result
+        else:
+            payload, status = result, 200
+        self._send(payload, status)
+
+
+class _AgentAPIServer(ThreadingMixIn, http.server.HTTPServer):
+    """HTTPServer with `_app` and `_token` attached so handlers can
+    reach them. ThreadingMixIn so a slow handler (e.g. NCBI fetch)
+    doesn't block other requests."""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, addr, app, token):
+        super().__init__(addr, _AgentRequestHandler)
+        self._app = app
+        self._token = token
+
+
+def _start_agent_api(app, port: int = _AGENT_API_PORT_DEFAULT):
+    """Start the agent-API server in a daemon thread.
+    Writes `(port, token)` to `_AGENT_TOKEN_FILE` (mode 0600 on POSIX)
+    so the `splicecraft-cli` wrapper can find this session.
+    Returns the server instance, or None if the bind failed."""
+    token = uuid.uuid4().hex
+    try:
+        srv = _AgentAPIServer((_AGENT_API_HOST, port), app, token)
+    except OSError as exc:
+        _log.exception("agent-api: failed to bind %s:%d (%s)",
+                       _AGENT_API_HOST, port, exc)
+        return None
+    try:
+        _AGENT_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _AGENT_TOKEN_FILE.write_text(
+            f"{port}\n{token}\n", encoding="utf-8",
+        )
+        try:
+            os.chmod(_AGENT_TOKEN_FILE, 0o600)
+        except OSError:
+            # Windows / FAT filesystem — chmod no-op. The file's
+            # contents are still localhost-only since we bind to
+            # 127.0.0.1.
+            pass
+    except OSError:
+        _log.exception("agent-api: failed to write token file %s",
+                       _AGENT_TOKEN_FILE)
+        srv.server_close()
+        return None
+
+    threading.Thread(
+        target=srv.serve_forever, daemon=True,
+        name="splicecraft-agent-api",
+    ).start()
+    _log.info("agent-api: serving on http://%s:%d (token in %s)",
+              _AGENT_API_HOST, port, _AGENT_TOKEN_FILE)
+    return srv
+
+
+def _stop_agent_api(srv) -> None:
+    """Shutdown helper. Removes the token file so a stale CLI
+    invocation can't accidentally hit a different process that bound
+    the same port later."""
+    if srv is None:
+        return
+    try:
+        srv.shutdown()
+        srv.server_close()
+    except Exception:
+        _log.exception("agent-api: shutdown failed")
+    try:
+        _AGENT_TOKEN_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 # ── Main app ───────────────────────────────────────────────────────────────────
 
 class PlasmidApp(App):
@@ -16190,6 +16386,26 @@ SpeciesPickerModal { align: center middle; }
             dark=True,
         ))
         self.theme = "splicecraft-black"
+        # Agent API: opt-in localhost server for external CLI/IDE
+        # control. `_agent_api_port` is set by `main()` when the user
+        # passed `--agent-api` (or SPLICECRAFT_AGENT_API=1). Don't
+        # crash the app if the bind fails — log and carry on so the
+        # GUI is still usable.
+        self._agent_api_server = None
+        port = getattr(self, "_agent_api_port", None)
+        if port:
+            self._agent_api_server = _start_agent_api(self, port)
+            if self._agent_api_server is not None:
+                self.notify(
+                    f"Agent API on http://{_AGENT_API_HOST}:{port} — "
+                    f"token at {_AGENT_TOKEN_FILE}",
+                    timeout=10,
+                )
+            else:
+                self.notify(
+                    f"Agent API: failed to bind port {port} (already in use?)",
+                    severity="warning", timeout=10,
+                )
         # Show the splash on top first; the rest of init runs underneath
         # while the user reads it. Skipped under `--no-splash` (and during
         # tests by default — splash blocks input which interferes with
@@ -17704,7 +17920,11 @@ SpeciesPickerModal { align: center middle; }
 
     def action_add_feature(self) -> None:
         """Open the AddFeatureModal. If the sequence panel has an active
-        cursor, the Insert button is enabled; otherwise only Save is."""
+        cursor, the Insert button is enabled; otherwise only Save is.
+        If the user has a multi-bp selection (drag, Shift+click, or
+        feature-pick), pre-fill the modal's Sequence body with the
+        highlighted bases verbatim — saves the typical "select →
+        Ctrl+C → paste into modal" round-trip."""
         sp = None
         cursor_pos = -1
         try:
@@ -17713,8 +17933,27 @@ SpeciesPickerModal { align: center middle; }
         except NoMatches:
             cursor_pos = -1
         have_cursor = (self._current_record is not None and cursor_pos >= 0)
+        prefill: "dict | None" = None
+        if sp is not None and sp._seq:
+            sel = sp._user_sel or sp._sel_range
+            if sel is not None:
+                s, e = sel
+                n = len(sp._seq)
+                # Wrap-aware span; only pre-fill when more than 1 bp is
+                # highlighted (single-base "selections" come from a
+                # plain click and aren't really a selection the user
+                # would expect to copy).
+                span = _feat_len(s, e, n) if n else 0
+                if span > 1:
+                    if e >= s:
+                        highlighted = sp._seq[s:e]
+                    else:
+                        # Wrap: tail [s, n) + head [0, e), both
+                        # already in the underlying seq order.
+                        highlighted = sp._seq[s:] + sp._seq[:e]
+                    prefill = {"sequence": highlighted.upper()}
         self.push_screen(
-            AddFeatureModal(prefill=None, have_cursor=have_cursor),
+            AddFeatureModal(prefill=prefill, have_cursor=have_cursor),
             callback=self._add_feature_result,
         )
 
@@ -17915,6 +18154,29 @@ def main():
         if flag in args:
             args.remove(flag)
             skip_splash = True
+    # Agent-API opt-in: `--agent-api` (default port) or
+    # `--agent-api-port=PORT`. Both also accept the env-var
+    # alternative SPLICECRAFT_AGENT_API=1 / =PORT for shell pipelines.
+    enable_agent_api = False
+    agent_port = _AGENT_API_PORT_DEFAULT
+    if "--agent-api" in args:
+        args.remove("--agent-api")
+        enable_agent_api = True
+    for a in list(args):
+        if a.startswith("--agent-api-port="):
+            try:
+                agent_port = int(a.split("=", 1)[1])
+            except ValueError:
+                print(f"Invalid --agent-api-port value: {a}",
+                      file=sys.stderr)
+                sys.exit(2)
+            args.remove(a)
+            enable_agent_api = True
+    env_api = os.environ.get("SPLICECRAFT_AGENT_API", "").strip()
+    if env_api and env_api.lower() not in ("0", "false", "no", ""):
+        enable_agent_api = True
+        if env_api.isdigit() and int(env_api) > 1:
+            agent_port = int(env_api)
     arg = args[0] if args else None
     # Handle --version / -V without loading the TUI
     if arg in ("--version", "-V"):
@@ -17923,11 +18185,16 @@ def main():
     if arg in ("--help", "-h"):
         print(
             f"splicecraft {__version__}\n"
-            "Usage: splicecraft [ACCESSION | FILE.gb] [--no-splash]\n\n"
-            "  splicecraft             # empty canvas\n"
-            "  splicecraft L09137      # fetch pUC19 from NCBI\n"
-            "  splicecraft my.gb       # open a local GenBank file\n"
-            "  splicecraft --no-splash # skip the launcher splash\n\n"
+            "Usage: splicecraft [ACCESSION | FILE.gb] [--no-splash] "
+            "[--agent-api[-port=PORT]]\n\n"
+            "  splicecraft               # empty canvas\n"
+            "  splicecraft L09137        # fetch pUC19 from NCBI\n"
+            "  splicecraft my.gb         # open a local GenBank file\n"
+            "  splicecraft --no-splash   # skip the launcher splash\n"
+            "  splicecraft --agent-api   # expose JSON API on "
+            f"127.0.0.1:{_AGENT_API_PORT_DEFAULT}\n"
+            "                            # (use `splicecraft-cli`"
+            " from another shell)\n\n"
             "Data files (library, parts, primers) live in:\n"
             f"  {_DATA_DIR}\n"
             "Override with $SPLICECRAFT_DATA_DIR."
@@ -17943,6 +18210,8 @@ def main():
     _log_startup_banner()
     app = PlasmidApp()
     app._skip_splash = skip_splash
+    if enable_agent_api:
+        app._agent_api_port = agent_port
 
     if arg:
         looks_like_file = arg.lower().endswith((".gb", ".gbk", ".genbank", ".dna"))
@@ -17976,6 +18245,7 @@ def main():
         _log.exception("App terminated with unhandled exception")
         raise
     finally:
+        _stop_agent_api(getattr(app, "_agent_api_server", None))
         _log.info("SpliceCraft session %s ending", _SESSION_ID)
 
 

@@ -289,7 +289,7 @@ class TestLargePlasmidCursorScrolling:
 
     Holding the Right arrow key fires `_build_seq_text` once per move on a
     new cursor position. Without the static-render cache, every keystroke
-    re-runs `_render_feature_row_pair` for ~1500 chunks on a 200 kb plasmid
+    re-runs the lane-art painters for ~1500 chunks on a 200 kb plasmid
     (~120 ms = 8 fps, visibly jerky). With the cache, only the chunk
     containing the cursor re-renders.
     """

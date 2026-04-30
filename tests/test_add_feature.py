@@ -314,6 +314,162 @@ class TestAddFeatureModal:
 # Save-to-library flow via _add_feature_result
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class TestAddFeatureSelectionPrefill:
+    """Ctrl+F (`action_add_feature`) checks the seq panel for an
+    active multi-bp selection and pre-fills the modal's Sequence body
+    with those bases verbatim. Saves the typical "select region →
+    Ctrl+C → paste into modal" round-trip when adding a feature for
+    a region the user just highlighted.
+
+    Selection sources covered: drag/Shift-click (`_user_sel`) and
+    feature picks (`_sel_range`). Single-bp selections are NOT
+    pre-filled — a click that lands on one base shouldn't be treated
+    as a selection. Wrap-around selections (end < start) splice
+    tail+head correctly. Pre-existing 2026-04-30 add-feature path."""
+
+    async def test_user_sel_prefills_sequence(self, tiny_record,
+                                                isolated_library):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            # tiny_record sequence starts with "ATGAAAGATCTGGAATTC..."
+            sp._user_sel = (0, 9)   # "ATGAAAGAT"
+            app.action_add_feature()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            assert isinstance(modal, sc.AddFeatureModal)
+            seq_box = modal.query_one("#addfeat-seq")
+            assert seq_box.text == "ATGAAAGAT"
+
+    async def test_sel_range_prefills_sequence(self, tiny_record,
+                                                 isolated_library):
+        """`_sel_range` is set when a feature is highlighted via map /
+        sidebar / lane click. The Ctrl+F flow should still pick it up."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._sel_range = (3, 12)   # "AAAGATCTG"
+            app.action_add_feature()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            assert isinstance(modal, sc.AddFeatureModal)
+            seq_box = modal.query_one("#addfeat-seq")
+            assert seq_box.text == "AAAGATCTG"
+
+    async def test_user_sel_takes_precedence_over_sel_range(
+        self, tiny_record, isolated_library,
+    ):
+        """If both selections happen to be set (e.g., feature picked
+        then user dragged a different region), the user's drag wins —
+        same precedence Ctrl+C uses."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel  = (0, 6)    # "ATGAAA"
+            sp._sel_range = (10, 20)  # different region
+            app.action_add_feature()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            seq_box = modal.query_one("#addfeat-seq")
+            assert seq_box.text == "ATGAAA"
+
+    async def test_single_bp_selection_does_not_prefill(
+        self, tiny_record, isolated_library,
+    ):
+        """A 1-bp 'selection' is what a plain click produces; treat it
+        as no selection so the modal opens with an empty Sequence box."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel = (5, 6)   # 1 bp
+            app.action_add_feature()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            seq_box = modal.query_one("#addfeat-seq")
+            assert seq_box.text == ""
+
+    async def test_no_selection_opens_empty_modal(
+        self, tiny_record, isolated_library,
+    ):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel  = None
+            sp._sel_range = None
+            app.action_add_feature()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            seq_box = modal.query_one("#addfeat-seq")
+            assert seq_box.text == ""
+
+    async def test_wrap_selection_splices_tail_plus_head(
+        self, isolated_library,
+    ):
+        """Wrap-around selections (end < start) should splice the tail
+        [start, n) + head [0, end) — same convention as `_user_sel` set
+        by `select_feature_range` for an origin-spanning feature."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        seq = "AAAACCCCGGGGTTTT"   # n = 16
+        rec = SeqRecord(Seq(seq), id="wrap_sel", name="wrap_sel",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel = (12, 4)   # tail "TTTT" + head "AAAA"
+            app.action_add_feature()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            seq_box = modal.query_one("#addfeat-seq")
+            assert seq_box.text == "TTTTAAAA"
+
+    async def test_prefill_uppercases_lowercase_input(
+        self, isolated_library,
+    ):
+        """The seq panel can hold lowercase bases (some users edit
+        input as lowercase to mark introns / annotation overlays).
+        Ctrl+F should normalise to uppercase like Ctrl+C does, since
+        the modal's downstream validator expects ACGT/IUPAC uppercase."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("aaaaccccGGGG"), id="case_test",
+                        name="case_test",
+                        annotations={"molecule_type": "DNA"})
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel = (0, 8)
+            app.action_add_feature()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            seq_box = modal.query_one("#addfeat-seq")
+            assert seq_box.text == "AAAACCCC"
+
+
 class TestSaveToLibraryFlow:
     """The modal dismisses with {"action": "save", "entry": ...}; the app's
     `_add_feature_result` must persist via _save_features."""
