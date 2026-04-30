@@ -799,7 +799,7 @@ class TestAddFeatureModalOrientation:
         async with app.run_test(size=_BASELINE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            app.push_screen(sc.AddFeatureModal(have_cursor=False))
+            app.push_screen(sc.AddFeatureModal())
             await pilot.pause()
             await pilot.pause(0.1)
             labels = [str(lbl.render()) for lbl
@@ -822,7 +822,7 @@ class TestAddFeatureModalOrientation:
         async with app.run_test(size=_BASELINE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            app.push_screen(sc.AddFeatureModal(have_cursor=False))
+            app.push_screen(sc.AddFeatureModal())
             await pilot.pause()
             await pilot.pause(0.1)
             for rid in ("#addfeat-strand-fwd", "#addfeat-strand-rev",
@@ -846,7 +846,7 @@ class TestAddFeatureModalOrientation:
             await pilot.pause()
             await pilot.pause(0.05)
             app.push_screen(
-                sc.AddFeatureModal(have_cursor=False),
+                sc.AddFeatureModal(),
                 callback=captured.append,
             )
             await pilot.pause()
@@ -882,7 +882,6 @@ class TestAddFeatureModalOrientation:
             app.push_screen(sc.AddFeatureModal(
                 prefill={"name": "x", "feature_type": "CDS",
                          "sequence": "ATG", "strand": prefill_strand},
-                have_cursor=False,
             ))
             await pilot.pause()
             await pilot.pause(0.1)
@@ -1193,7 +1192,7 @@ class TestAddFeatureModalColorField:
                 "name": "widget", "feature_type": "CDS",
                 "sequence": "ATG", "strand": 1,
                 "color": "#AABBCC",
-            }, have_cursor=False)
+            })
             app.push_screen(modal)
             await pilot.pause()
             await pilot.pause(0.1)
@@ -1213,7 +1212,7 @@ class TestAddFeatureModalColorField:
             modal = sc.AddFeatureModal(prefill={
                 "name": "widget", "feature_type": "CDS",
                 "sequence": "ATG", "strand": 1,
-            }, have_cursor=False)
+            })
             app.push_screen(modal)
             await pilot.pause()
             await pilot.pause(0.1)
@@ -1234,7 +1233,7 @@ class TestAddFeatureModalColorField:
                 "name": "widget", "feature_type": "CDS",
                 "sequence": "ATG", "strand": 1,
                 "color": "#112233",
-            }, have_cursor=False)
+            })
             app.push_screen(modal)
             await pilot.pause()
             await pilot.pause(0.1)

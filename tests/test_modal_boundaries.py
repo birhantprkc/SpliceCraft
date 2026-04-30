@@ -148,7 +148,7 @@ _MODAL_CASES = [
                                                [{"name": "lacZ", "feature_type": "CDS",
                                                  "sequence": "ATG", "strand": 1}],
                                                plasmid_name="demo")),
-    ("AddFeatureModal",            lambda: sc.AddFeatureModal(have_cursor=True)),
+    ("AddFeatureModal",            lambda: sc.AddFeatureModal(selection_range=(0, 10))),
     ("AminoAcidPickerModal",       lambda: sc.AminoAcidPickerModal(42, "W")),
     ("NcbiTaxonPickerModal",       lambda: sc.NcbiTaxonPickerModal("")),
     ("SpeciesPickerModal",         lambda: sc.SpeciesPickerModal()),
@@ -226,7 +226,7 @@ class TestAddFeatureModalRegressionGuards:
         async with app.run_test(size=size) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            app.push_screen(sc.AddFeatureModal(have_cursor=True))
+            app.push_screen(sc.AddFeatureModal(selection_range=(0, 10)))
             await pilot.pause()
             await pilot.pause(0.05)
             modal = app.screen
@@ -256,7 +256,7 @@ class TestAddFeatureModalRegressionGuards:
         async with app.run_test(size=size) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            app.push_screen(sc.AddFeatureModal(have_cursor=True))
+            app.push_screen(sc.AddFeatureModal(selection_range=(0, 10)))
             await pilot.pause()
             await pilot.pause(0.05)
             modal = app.screen

@@ -109,121 +109,220 @@ class TestExtractFeatureEntries:
 # App-side insert pipeline
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class TestInsertFeatureAtCursor:
-    """`_insert_feature_at_cursor` must splice in the DNA, shift existing
-    feature coords via `_rebuild_record_with_edit`, and append a new
-    SeqFeature at the right place."""
+class TestAnnotateWithFeature:
+    """`_annotate_with_feature` adds a SeqFeature to the loaded record
+    spanning the given range without modifying the underlying DNA. This
+    is the shared backend for both the AddFeatureModal "Insert feature"
+    button and the agent-API `add-feature` endpoint — single source of
+    truth for "annotate existing bases".
 
-    async def test_insert_forward_feature_appends_to_record(self, tiny_record,
-                                                             isolated_library):
+    Pre-2026-04-30 the modal button instead spliced new DNA at the
+    cursor (`_insert_feature_at_cursor`); that path was removed in
+    favour of "select region → Ctrl+F → annotate range" which lets the
+    user mark up an existing region without changing its length. New
+    DNA insertion lives in Ctrl+E (EditSeqDialog) for users who need it.
+    """
+
+    async def test_forward_feature_appends_with_correct_coords(
+        self, tiny_record, isolated_library,
+    ):
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            sp = app.query_one("#seq-panel", sc.SequencePanel)
-            sp._cursor_pos = 10
+            orig_len = len(tiny_record.seq)
             entry = {
-                "name": "my-insert",
+                "name": "my-feat",
                 "feature_type": "promoter",
-                "sequence": "AAATTTGGG",
                 "strand": 1,
                 "qualifiers": {"note": ["user-added"]},
-                "description": "",
             }
-            orig_len = len(tiny_record.seq)
-            app._insert_feature_at_cursor(entry)
-            # Length grew by inserted size
-            assert len(app._current_record.seq) == orig_len + 9
-            # New feature is the last one
+            app._annotate_with_feature(10, 25, entry)
+            # Sequence is unchanged — the whole point of "annotate".
+            assert len(app._current_record.seq) == orig_len
+            # New feature is the last one.
             last = app._current_record.features[-1]
             assert last.type == "promoter"
             assert int(last.location.start) == 10
-            assert int(last.location.end) == 19
+            assert int(last.location.end) == 25
             assert last.location.strand == 1
-            # Qualifiers include our note + auto-label
+            # Qualifiers include the user's note + the auto-label.
             assert last.qualifiers.get("note") == ["user-added"]
-            assert last.qualifiers.get("label") == ["my-insert"]
+            assert last.qualifiers.get("label") == ["my-feat"]
 
-    async def test_insert_reverse_splices_rc_into_sequence(self, tiny_record,
-                                                            isolated_library):
-        """Reverse-strand entries store the 5'→3' of the feature; the bases
-        spliced into the genomic strand are the RC."""
+    async def test_reverse_strand_records_strand_minus_one(
+        self, tiny_record, isolated_library,
+    ):
+        """Reverse-strand annotations don't touch the DNA — they only
+        flag the SeqFeature's strand. (The displayed bases are still
+        the underlying top-strand bases.)"""
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            sp = app.query_one("#seq-panel", sc.SequencePanel)
-            sp._cursor_pos = 30
+            orig_seq = str(tiny_record.seq)
             entry = {
-                "name": "rev-feat",
-                "feature_type": "CDS",
-                "sequence": "ATGAAATAG",   # feature 5'→3'
-                "strand": -1,
-                "qualifiers": {},
-                "description": "",
+                "name": "rev-feat", "feature_type": "CDS",
+                "strand": -1, "qualifiers": {},
             }
-            app._insert_feature_at_cursor(entry)
-            inserted = str(app._current_record.seq[30:39])
-            # Inserted genomic bases == RC of feature sequence
-            assert inserted == sc._rc("ATGAAATAG")
-            # New feature has strand=-1
+            app._annotate_with_feature(30, 39, entry)
+            # Sequence unchanged.
+            assert str(app._current_record.seq) == orig_seq
             last = app._current_record.features[-1]
             assert last.location.strand == -1
+            assert int(last.location.start) == 30
+            assert int(last.location.end) == 39
 
-    async def test_insert_shifts_downstream_features(self, tiny_record,
-                                                      isolated_library):
-        """Existing features after the insertion point must shift by len(insert)."""
+    async def test_other_features_keep_their_coords(
+        self, tiny_record, isolated_library,
+    ):
+        """Annotating doesn't shift any existing features — opposite
+        of the old splice behaviour."""
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            # Capture pre-insert coords of the misc_feature at [50, 80)
             mf_pre = next(f for f in app._current_record.features
                           if f.type == "misc_feature")
             pre_start = int(mf_pre.location.start)
             pre_end   = int(mf_pre.location.end)
-            sp = app.query_one("#seq-panel", sc.SequencePanel)
-            sp._cursor_pos = 5  # well before the misc_feature
             entry = {
                 "name": "x", "feature_type": "misc_feature",
-                "sequence": "GGGGGGGGGG",  # 10 bp
-                "strand": 1, "qualifiers": {}, "description": "",
+                "strand": 1, "qualifiers": {},
             }
-            app._insert_feature_at_cursor(entry)
+            # Annotate well before the existing misc_feature.
+            app._annotate_with_feature(0, 5, entry)
             mf_post = next(f for f in app._current_record.features
-                           if f.type == "misc_feature")
-            assert int(mf_post.location.start) == pre_start + 10
-            assert int(mf_post.location.end)   == pre_end   + 10
+                           if f.type == "misc_feature"
+                           and f.qualifiers.get("label") != ["x"])
+            assert int(mf_post.location.start) == pre_start
+            assert int(mf_post.location.end)   == pre_end
 
-    async def test_insert_without_cursor_raises(self, tiny_record,
-                                                 isolated_library):
+    async def test_no_record_raises(self, tiny_record, isolated_library):
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            sp = app.query_one("#seq-panel", sc.SequencePanel)
-            sp._cursor_pos = -1
+            app._current_record = None
             with pytest.raises(RuntimeError):
-                app._insert_feature_at_cursor({
+                app._annotate_with_feature(0, 5, {
                     "name": "x", "feature_type": "CDS",
-                    "sequence": "ATG", "strand": 1,
-                    "qualifiers": {}, "description": "",
+                    "strand": 1, "qualifiers": {},
                 })
 
-    async def test_insert_marks_dirty(self, tiny_record, isolated_library):
+    async def test_zero_length_range_raises(self, tiny_record,
+                                              isolated_library):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            with pytest.raises(ValueError):
+                app._annotate_with_feature(5, 5, {
+                    "name": "x", "feature_type": "CDS",
+                    "strand": 1, "qualifiers": {},
+                })
+
+    async def test_out_of_range_raises(self, tiny_record, isolated_library):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            n = len(app._current_record.seq)
+            with pytest.raises(ValueError):
+                app._annotate_with_feature(n + 5, n + 10, {
+                    "name": "x", "feature_type": "CDS",
+                    "strand": 1, "qualifiers": {},
+                })
+
+    async def test_annotate_marks_dirty(self, tiny_record, isolated_library):
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
             app._unsaved = False
-            sp = app.query_one("#seq-panel", sc.SequencePanel)
-            sp._cursor_pos = 0
-            app._insert_feature_at_cursor({
+            app._annotate_with_feature(0, 6, {
                 "name": "x", "feature_type": "CDS",
-                "sequence": "ATGTAA", "strand": 1,
-                "qualifiers": {}, "description": "",
+                "strand": 1, "qualifiers": {},
             })
             assert app._unsaved is True
+
+    async def test_wrap_range_builds_compound_location(
+        self, isolated_library,
+    ):
+        """end < start should produce a CompoundLocation with two
+        FeatureLocation parts (tail [start, n) + head [0, end)) — the
+        same wrap-aware shape every other code path expects (sacred
+        invariant #9)."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import CompoundLocation
+        rec = SeqRecord(Seq("A" * 100), id="wrap_anno", name="wrap_anno",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._annotate_with_feature(95, 5, {
+                "name": "wrap-feat", "feature_type": "misc_feature",
+                "strand": 1, "qualifiers": {},
+            })
+            last = app._current_record.features[-1]
+            assert isinstance(last.location, CompoundLocation)
+            parts = list(last.location.parts)
+            assert int(parts[0].start) == 95
+            assert int(parts[0].end)   == 100
+            assert int(parts[1].start) == 0
+            assert int(parts[1].end)   == 5
+
+    async def test_strand_zero_accepted(self, tiny_record, isolated_library):
+        """Arrowless / unknown-strand annotations (strand=0) should
+        round-trip through `_annotate_with_feature` without crashing —
+        BioPython needs `strand=None` for that case."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._annotate_with_feature(0, 10, {
+                "name": "ds", "feature_type": "misc_feature",
+                "strand": 0, "qualifiers": {},
+            })
+            last = app._current_record.features[-1]
+            # FeatureLocation(strand=None) → location.strand == None
+            assert last.location.strand is None
+            assert int(last.location.start) == 0
+            assert int(last.location.end)   == 10
+
+    async def test_modal_dispatches_annotate_action(
+        self, tiny_record, isolated_library,
+    ):
+        """End-to-end: setting a selection_range, opening the modal,
+        and clicking "Insert feature" should fire `_add_feature_result`
+        with `action="annotate"` and our captured range, which lands
+        a feature at exactly that range."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            n_before = len(app._current_record.features)
+            # Drive the result callback directly — the button is
+            # wired to dismiss with this exact dict shape.
+            app._add_feature_result({
+                "action": "annotate",
+                "range":  (12, 24),
+                "entry":  {
+                    "name": "marked",
+                    "feature_type": "misc_feature",
+                    "strand": 1,
+                    "qualifiers": {},
+                },
+            })
+            assert len(app._current_record.features) == n_before + 1
+            new = app._current_record.features[-1]
+            assert int(new.location.start) == 12
+            assert int(new.location.end)   == 24
+            assert new.qualifiers.get("label") == ["marked"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -237,7 +336,7 @@ class TestAddFeatureModal:
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            app.push_screen(sc.AddFeatureModal(have_cursor=False))
+            app.push_screen(sc.AddFeatureModal())
             await pilot.pause()
             await pilot.pause(0.05)
             modal = app.screen

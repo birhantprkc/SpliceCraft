@@ -87,6 +87,50 @@ class MockApp:
     def _notify_success(self, msg, **kwargs):
         pass
 
+    def _annotate_with_feature(self, start, end, entry):
+        """Stub mirror of `PlasmidApp._annotate_with_feature`. Validates
+        the same way (range check, zero-length reject, strand coercion)
+        and appends a real BioPython SeqFeature to the record so tests
+        that assert on `record.features[-1]` see the same shape they
+        would in the running GUI. No panel refresh — there's no Textual
+        loop here to refresh against."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        from copy import deepcopy
+        if self._current_record is None:
+            raise RuntimeError("Load a plasmid first.")
+        n = len(self._current_record.seq)
+        if not (0 <= start < n):
+            raise ValueError(f"start {start} out of range [0, {n})")
+        if not (0 <= end <= n):
+            raise ValueError(f"end {end} out of range [0, {n}]")
+        if end == start:
+            raise ValueError("zero-length feature (end == start)")
+        try:
+            strand = int(entry.get("strand", 1))
+        except (TypeError, ValueError):
+            strand = 1
+        biop_strand = strand if strand in (-1, 1) else None
+        if end > start:
+            loc = FeatureLocation(start, end, strand=biop_strand)
+        else:
+            loc = CompoundLocation([
+                FeatureLocation(start, n, strand=biop_strand),
+                FeatureLocation(0, end, strand=biop_strand),
+            ])
+        feat_type = entry.get("feature_type") or "misc_feature"
+        qualifiers: dict = {
+            k: list(v) if isinstance(v, (list, tuple)) else [v]
+            for k, v in (entry.get("qualifiers") or {}).items()
+        }
+        label = (entry.get("name") or "").strip()
+        if label and "label" not in qualifiers:
+            qualifiers["label"] = [label]
+        new_feat = SeqFeature(loc, type=feat_type, qualifiers=qualifiers)
+        new_rec = deepcopy(self._current_record)
+        new_rec.features.append(new_feat)
+        self._current_record = new_rec
+        self._unsaved = True
+
     def query_one(self, selector, *args):
         # Handlers that touch `query_one("#plasmid-map", PlasmidMap)`
         # for read-only feature listing — we expose a shim with a
