@@ -133,6 +133,107 @@ def tiny_gb_path(tmp_path, tiny_record):
 
 
 @pytest.fixture
+def realistic_plasmid():
+    """Synthetic ~2700 bp circular plasmid with realistic feature density —
+    one resistance-marker-style CDS (~840 bp), one origin-of-replication
+    misc_feature, one promoter, two ribosome binding sites, and several
+    common restriction-enzyme sites scattered around. Sized to mirror a
+    typical lab plasmid (pUC19 = 2686 bp) so render / search / packing
+    code is tested under realistic load.
+
+    Use for integration tests where the 120 bp `tiny_record` doesn't
+    catch issues that only appear at full-plasmid scale (e.g. seq panel
+    chunk caching, BLAST DB build time, feature-packer 2D layout under
+    crowding).
+    """
+    from Bio.SeqRecord import SeqRecord
+    from Bio.Seq import Seq
+    from Bio.SeqFeature import SeqFeature, FeatureLocation
+
+    # Backbone + features sized to look pUC19-ish. Hand-crafted to
+    # contain real restriction sites at known positions:
+    #   EcoRI  (GAATTC) at  396, 1980
+    #   BamHI  (GGATCC) at  608
+    #   HindIII (AAGCTT) at 1102
+    #   XhoI   (CTCGAG) at 1845
+    #   SalI   (GTCGAC) at  220
+    # Filler regions are non-repetitive 50-mers seeded with a fixed
+    # PRNG so tests stay deterministic.
+    import random
+    rng = random.Random(0xCAFEBABE)
+    bases = "ACGT"
+    def filler(n: int) -> str:
+        return "".join(rng.choice(bases) for _ in range(n))
+
+    parts = []
+    parts.append(filler(220))                # 0..220
+    parts.append("GTCGAC")                   # 220 SalI
+    parts.append(filler(170))                # 226..396
+    parts.append("GAATTC")                   # 396 EcoRI
+    parts.append(filler(206))                # 402..608
+    parts.append("GGATCC")                   # 608 BamHI
+    parts.append(filler(488))                # 614..1102
+    parts.append("AAGCTT")                   # 1102 HindIII
+    parts.append(filler(737))                # 1108..1845
+    parts.append("CTCGAG")                   # 1845 XhoI
+    parts.append(filler(129))                # 1851..1980
+    parts.append("GAATTC")                   # 1980 EcoRI
+    parts.append(filler(700))                # 1986..2686
+    seq_str = "".join(parts)
+    assert len(seq_str) == 2686
+
+    rec = SeqRecord(
+        Seq(seq_str),
+        id="SYNREAL", name="SYNREAL",
+        description="Synthetic realistic 2.7 kb test plasmid",
+    )
+    rec.annotations["molecule_type"] = "DNA"
+    rec.annotations["topology"]      = "circular"
+
+    # Resistance-marker-like CDS, 840 bp on the (+) strand.
+    rec.features.append(SeqFeature(
+        FeatureLocation(400, 1240, strand=1),
+        type="CDS",
+        qualifiers={"label": ["AmpR"], "gene": ["bla"],
+                     "product": ["beta-lactamase (synthetic)"]},
+    ))
+    # Promoter upstream of the CDS.
+    rec.features.append(SeqFeature(
+        FeatureLocation(330, 400, strand=1),
+        type="promoter",
+        qualifiers={"label": ["AmpR_promoter"]},
+    ))
+    # RBS just before the CDS.
+    rec.features.append(SeqFeature(
+        FeatureLocation(390, 400, strand=1),
+        type="RBS",
+        qualifiers={"label": ["RBS"]},
+    ))
+    # Ori on the (-) strand, opposite the CDS.
+    rec.features.append(SeqFeature(
+        FeatureLocation(1700, 2400, strand=-1),
+        type="rep_origin",
+        qualifiers={"label": ["pMB1_ori"]},
+    ))
+    # MCS / polylinker spanning the cluster of restriction sites.
+    rec.features.append(SeqFeature(
+        FeatureLocation(216, 614, strand=0),
+        type="misc_feature",
+        qualifiers={"label": ["MCS"]},
+    ))
+    return rec
+
+
+@pytest.fixture
+def realistic_gb_path(tmp_path, realistic_plasmid):
+    """Write `realistic_plasmid` to a .gb file and return the path."""
+    from Bio import SeqIO
+    p = tmp_path / "realistic.gb"
+    SeqIO.write(realistic_plasmid, str(p), "genbank")
+    return str(p)
+
+
+@pytest.fixture
 def isolated_library(tmp_path, monkeypatch):
     """Redirect `_LIBRARY_FILE` to a tmp path. Kept for backward compat with
     tests that explicitly request it — _protect_user_data already handles

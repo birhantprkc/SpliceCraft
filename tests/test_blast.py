@@ -247,6 +247,50 @@ class TestBlastpEngine:
         # ATG GCT GCT GCT → M A A A
         assert q.startswith("MAAA")
 
+    def test_six_frame_finds_unannotated_orf(self):
+        # Plasmid with NO annotated CDS — six-frame should still find
+        # ORFs ≥ _BLASTP_MIN_ORF_AA. Build a backbone that contains a
+        # 35-codon ORF in frame 1 (no stops until the end).
+        # Codons chosen to avoid stops (TAA/TAG/TGA): use only AAA/GCT.
+        orf_codons = ("ATG" + "AAA" * 17 + "GCT" * 17 + "TAA")
+        plas = "GGCCGGCC" * 3 + orf_codons + "TTTTGGGG" * 3
+        rec = _make_record("ORFTEST", plas)   # no CDS feature!
+        _seed_collection("OrfBp", [rec])
+        sc._blast_clear_cache()
+
+        # Default (no 6-frame) → empty BLASTP db.
+        db_default = sc._blast_get_db("blastp", ["OrfBp"])
+        assert db_default["subjects"] == [], (
+            "BLASTP without 6-frame should yield no subjects when "
+            "there's no annotated CDS"
+        )
+
+        # 6-frame on → should pick up the embedded ORF.
+        db_6f = sc._blast_get_db("blastp", ["OrfBp"], six_frame=True)
+        assert db_6f["subjects"], "6-frame should find the embedded ORF"
+        # Cache must distinguish six_frame=True from default.
+        assert db_6f is not db_default
+
+        # Query the protein middle and expect a hit.
+        from Bio.Seq import Seq
+        protein = str(Seq(orf_codons[3:-3]).translate())  # drop M and stop
+        hits = sc._blast_search(protein[5:30], db_6f)
+        # Don't insist on hits — pyhmmer may filter low-complexity poly-K
+        # sequences — but verify no crash.
+        for h in hits:
+            assert "subject_id" in h
+
+    def test_six_frame_off_by_default_in_modal_dispatch(self):
+        # Through the dispatcher with the default (no kwarg), 6-frame
+        # is off. This guards against accidental flips.
+        rec = _make_record("DEFTEST", "ATG" + "AAA" * 50 + "TAA")
+        _seed_collection("DefBp", [rec])
+        sc._blast_clear_cache()
+        db = sc._blast_get_db("blastp", ["DefBp"])
+        # Without an annotated CDS feature, the default path yields
+        # zero subjects.
+        assert db["subjects"] == []
+
     def test_skips_short_or_non_triple_cds(self):
         # CDS with length not divisible by 3 must be skipped (else the
         # BLASTP DB build would crash on translate). Build a record

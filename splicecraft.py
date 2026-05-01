@@ -297,8 +297,8 @@ from textual.screen import ModalScreen, Screen
 from textual.theme import Theme
 from textual.widget import Widget
 from textual.widgets import (
-    Button, DataTable, DirectoryTree, Footer, Header, Input, Label, ListItem,
-    ListView, RadioButton, RadioSet, Select, Static, TextArea,
+    Button, Checkbox, DataTable, DirectoryTree, Footer, Header, Input, Label,
+    ListItem, ListView, RadioButton, RadioSet, Select, Static, TextArea,
 )
 from rich.text import Text
 
@@ -6248,9 +6248,21 @@ class ExportGenBankModal(ModalScreen):
             return
         try:
             summary = _export_genbank_to_path(self._record, path)
-        except (OSError, ValueError) as exc:
+        except OSError as exc:
             _log.exception("GenBank export to %s failed", path)
-            status.update(f"[red]Export failed: {exc}[/red]")
+            status.update(
+                f"[red]Could not write to {path!r}: {exc.strerror or exc}. "
+                f"Check the directory exists and you have write permission."
+                f"[/red]"
+            )
+            return
+        except ValueError as exc:
+            _log.exception("GenBank export to %s rejected", path)
+            status.update(
+                f"[red]Export rejected: {exc}. The path needs to end in "
+                f".gb / .gbk and the record must be GenBank-compliant."
+                f"[/red]"
+            )
             return
         self.dismiss(summary)
 
@@ -6326,9 +6338,21 @@ class FastaExportModal(ModalScreen):
             return
         try:
             summary = _export_fasta_to_path(self._name, self._sequence, path)
-        except (OSError, ValueError) as exc:
+        except OSError as exc:
             _log.exception("FASTA export to %s failed", path)
-            status.update(f"[red]Export failed: {exc}[/red]")
+            status.update(
+                f"[red]Could not write to {path!r}: {exc.strerror or exc}. "
+                f"Check the directory exists and you have write permission."
+                f"[/red]"
+            )
+            return
+        except ValueError as exc:
+            _log.exception("FASTA export to %s rejected", path)
+            status.update(
+                f"[red]Export rejected: {exc}. Path should end in "
+                f".fa / .fasta and the sequence must be non-empty."
+                f"[/red]"
+            )
             return
         self.dismiss(summary)
 
@@ -9493,7 +9517,9 @@ class AddFeatureModal(ModalScreen):
             except Exception as exc:    # noqa: BLE001
                 _log.exception("Feature import: failed to parse library entry")
                 self.query_one("#addfeat-status", Static).update(
-                    f"[red]Failed to load plasmid: {exc}[/red]"
+                    f"[red]Couldn't parse the stored plasmid: {exc}. "
+                    f"The library entry may be corrupted — try re-saving "
+                    f"that plasmid from its source file.[/red]"
                 )
                 return
             feat_entries = _extract_feature_entries_from_record(rec)
@@ -9902,20 +9928,30 @@ class NewPlasmidModal(ModalScreen):
             db = _blast_get_db("blastn", None)
         except Exception as exc:
             _log.exception("NewPlasmidModal BLAST: DB build failed")
-            status.update(f"[red]BLAST DB build failed: {exc}[/red]")
+            status.update(
+                f"[red]Couldn't build the BLAST database: {exc}. "
+                f"A plasmid in one of your collections may have malformed "
+                f"GenBank — check the log at "
+                f"~/.local/share/splicecraft/logs/splicecraft.log.[/red]"
+            )
             return
         if not db.get("subjects"):
             status.update(
-                "[yellow]No collections to BLAST against — add plasmids "
-                "to a collection first, or use 'Annotate from library'."
-                "[/yellow]"
+                "[yellow]No plasmids in any collection to BLAST against. "
+                "Save the current plasmid to the library first, or use "
+                "'Annotate from library' to match against feature-library "
+                "entries.[/yellow]"
             )
             return
         try:
             hits = _blast_search(bases, db, max_hits=200)
         except Exception as exc:
             _log.exception("NewPlasmidModal BLAST: search failed")
-            status.update(f"[red]BLAST search failed: {exc}[/red]")
+            status.update(
+                f"[red]BLAST search failed: {exc}. Try shortening the "
+                f"pasted sequence — pyhmmer can stall on extreme low-"
+                f"complexity inputs.[/red]"
+            )
             return
         # Promote hits to feature dicts. Strict threshold (≥90% id)
         # avoids "vaguely similar" annotations.
@@ -10324,7 +10360,8 @@ def _blast_index_kmers(seq: str, k: int) -> "dict[str, list[int]]":
 
 
 def _blast_build_db(program: str,
-                    collection_names: "list[str] | None" = None) -> dict:
+                    collection_names: "list[str] | None" = None,
+                    *, six_frame: bool = False) -> dict:
     """Build an in-memory search database for ``program`` from the
     chosen plasmid collections.
 
@@ -10332,6 +10369,11 @@ def _blast_build_db(program: str,
       * ``None`` or empty → all collections (the "(all collections)"
         sentinel from the modal).
       * non-empty list → just those.
+
+    ``six_frame`` (BLASTP only): also index every ≥30-aa ORF from all
+    six reading frames of every plasmid. Surfaces un-annotated coding
+    regions; off by default because the noise floor is much higher
+    than the curated CDS-only path.
 
     Returned db schema:
       ``{"program": str, "k": int, "subjects":
@@ -10341,8 +10383,8 @@ def _blast_build_db(program: str,
 
     For BLASTN, ``subjects`` are full plasmid sequences; the index covers
     both strands (strand=+1 for forward, -1 for RC). For BLASTP, subjects
-    are individual annotated CDS-derived proteins; strand is always +1
-    in the index (BLASTP doesn't search the RC strand).
+    are individual annotated CDS-derived proteins (`kind="cds"`) plus —
+    when `six_frame=True` — every 6-frame ORF (`kind="orf6f"`).
     """
     cols = _load_collections()
     if collection_names:
@@ -10352,7 +10394,7 @@ def _blast_build_db(program: str,
     if program == "blastn":
         return _blast_build_db_blastn(cols)
     if program == "blastp":
-        return _blast_build_db_blastp(cols)
+        return _blast_build_db_blastp(cols, six_frame=six_frame)
     return {"program": program, "k": 0, "subjects": [], "kmer_index": {}}
 
 
@@ -10398,15 +10440,49 @@ def _blast_build_db_blastn(cols: "list[dict]") -> dict:
     }
 
 
-def _blast_build_db_blastp(cols: "list[dict]") -> dict:
+_BLASTP_MIN_ORF_AA = 30
+
+
+def _blast_build_db_blastp(cols: "list[dict]",
+                            *, six_frame: bool = False) -> dict:
     """For BLASTP, every annotated CDS feature in every plasmid in the
     chosen collections becomes a subject (translated to protein).
     Plasmids without CDSes contribute nothing — keeps the noise floor
-    low at the cost of missing un-annotated coding regions. Six-frame
-    translation could be added later if a use-case needs it."""
+    low at the cost of missing un-annotated coding regions.
+
+    ``six_frame=True`` adds an extra pass per plasmid that translates
+    all six reading frames (3 forward + 3 RC) and indexes every ORF
+    of length ≥ ``_BLASTP_MIN_ORF_AA`` (30 aa, since shorter ORFs in
+    random sequence are dominated by noise). Subjects from this pass
+    are tagged ``kind="orf6f"`` and named with frame + start so users
+    can distinguish them from annotated CDSes in the results panel.
+    Off by default — turning it on roughly doubles index size and adds
+    spurious noise hits; useful when the user is searching against an
+    unannotated draft contig.
+    """
     k = _BLAST_BLASTP_K
     subjects: list[dict] = []
     index: dict[str, list[tuple[int, int, int]]] = {}
+
+    def _index_protein(protein: str, name: str, kind: str,
+                        *, plasmid_id: str, plasmid_name: str,
+                        coll_name: str) -> None:
+        """Append `protein` as a new subject + add k-mer entries."""
+        if len(protein) < k:
+            return
+        sub_idx = len(subjects)
+        subjects.append({
+            "id":      f"{plasmid_id}:{name}",
+            "name":    name,
+            "collection": coll_name,
+            "plasmid": plasmid_name,
+            "kind":    kind,
+            "length":  len(protein),
+            "seq_fwd": protein,
+        })
+        for i in range(len(protein) - k + 1):
+            index.setdefault(protein[i:i + k], []).append((sub_idx, i, 1))
+
     for c in cols:
         coll_name = c.get("name", "?")
         for entry in c.get("plasmids") or []:
@@ -10417,6 +10493,10 @@ def _blast_build_db_blastp(cols: "list[dict]") -> dict:
                 rec = _gb_text_to_record(gb)
             except Exception:
                 continue
+            plasmid_id   = rec.id
+            plasmid_name = rec.name or rec.id
+
+            # ── Annotated CDS pass ────────────────────────────────
             for feat in rec.features:
                 if feat.type != "CDS":
                     continue
@@ -10428,38 +10508,52 @@ def _blast_build_db_blastp(cols: "list[dict]") -> dict:
                 if len(cds_seq) < 9 or len(cds_seq) % 3 != 0:
                     continue
                 try:
-                    # `feat.extract` already orients the sequence in
-                    # transcript direction (reverses + complements
-                    # strand=-1), so we translate frame 1 directly with
-                    # Biopython rather than `_translate_cds(...)` which
-                    # is a positional helper for the seq panel that
-                    # takes (full_seq, start, end, strand).
                     from Bio.Seq import Seq
                     protein = str(Seq(cds_seq).translate())
                 except Exception:
                     continue
-                # Drop trailing stop if present so the index doesn't
-                # hit on a hundred different proteins all ending in '*'.
                 if protein.endswith("*"):
                     protein = protein[:-1]
-                if len(protein) < k:
-                    continue
                 qual = feat.qualifiers
                 lbl = (qual.get("label") or qual.get("gene")
-                       or qual.get("product") or [rec.name or rec.id])[0]
-                sub_idx = len(subjects)
-                subjects.append({
-                    "id":      f"{rec.id}:{lbl}",
-                    "name":    str(lbl),
-                    "collection": coll_name,
-                    "plasmid": rec.name or rec.id,
-                    "kind":    "cds",
-                    "length":  len(protein),
-                    "seq_fwd": protein,
-                })
-                for i in range(len(protein) - k + 1):
-                    index.setdefault(protein[i:i + k], []).append(
-                        (sub_idx, i, 1))
+                       or qual.get("product") or [plasmid_name])[0]
+                _index_protein(
+                    protein, str(lbl), "cds",
+                    plasmid_id=plasmid_id, plasmid_name=plasmid_name,
+                    coll_name=coll_name,
+                )
+
+            # ── Six-frame ORF pass (optional) ─────────────────────
+            if six_frame:
+                from Bio.Seq import Seq
+                full_fwd = str(rec.seq).upper()
+                full_rev = _rc(full_fwd)
+                for strand_name, full in (("F", full_fwd), ("R", full_rev)):
+                    for frame in (0, 1, 2):
+                        sub = full[frame:]
+                        # Trim to triplet boundary.
+                        sub = sub[: (len(sub) // 3) * 3]
+                        if len(sub) < 9:
+                            continue
+                        try:
+                            translated = str(Seq(sub).translate())
+                        except Exception:
+                            continue
+                        # Split on stop codons; index each ORF that
+                        # passes the length floor.
+                        for orf_idx, orf in enumerate(translated.split("*")):
+                            if len(orf) < _BLASTP_MIN_ORF_AA:
+                                continue
+                            label = (
+                                f"orf:{strand_name}{frame + 1}:#{orf_idx}"
+                            )
+                            _index_protein(
+                                orf, label, "orf6f",
+                                plasmid_id=plasmid_id,
+                                plasmid_name=plasmid_name,
+                                coll_name=coll_name,
+                            )
+
     return {
         "program":     "blastp",
         "k":           k,
@@ -10903,15 +10997,20 @@ _BLAST_DB_CACHE_MAX = 4
 
 
 def _blast_get_db(program: str,
-                  collection_names: "list[str] | None") -> dict:
+                  collection_names: "list[str] | None",
+                  *, six_frame: bool = False) -> dict:
     """Cached wrapper around `_blast_build_db`. Returns the same db on
-    subsequent calls with the same inputs until evicted."""
+    subsequent calls with the same inputs until evicted.
+
+    The cache key includes ``six_frame`` so a 6-frame BLASTP DB and a
+    CDS-only BLASTP DB for the same collection don't collide.
+    """
     key = (program, frozenset(collection_names) if collection_names
-           else frozenset())
+           else frozenset(), bool(six_frame))
     if key in _BLAST_DB_CACHE:
         _BLAST_DB_CACHE.move_to_end(key)
         return _BLAST_DB_CACHE[key]
-    db = _blast_build_db(program, collection_names)
+    db = _blast_build_db(program, collection_names, six_frame=six_frame)
     _BLAST_DB_CACHE[key] = db
     while len(_BLAST_DB_CACHE) > _BLAST_DB_CACHE_MAX:
         _BLAST_DB_CACHE.popitem(last=False)
@@ -11126,6 +11225,17 @@ class BlastModal(ModalScreen):
                 yield Input(value=str(last_hmm),
                             placeholder="e.g. ~/db/Pfam-A.hmm",
                             id="blast-hmm-path")
+                # Six-frame BLASTP toggle. Off by default — annotated
+                # CDSes only, low noise. On indexes every ≥30 aa ORF
+                # in 6 frames so un-annotated coding regions become
+                # findable, at the cost of ~2× DB size + some
+                # spurious hits in random sequence.
+                yield Checkbox(
+                    "Index 6-frame ORFs (BLASTP) — find un-annotated "
+                    "coding regions",
+                    value=False,
+                    id="blast-six-frame",
+                )
                 yield Label("Results:")
                 yield Static("[dim]No query run yet.[/dim]",
                              id="blast-results", markup=True)
@@ -11342,12 +11452,22 @@ class BlastModal(ModalScreen):
             fake_db, hits, None,
         )
 
+    def _six_frame_active(self) -> bool:
+        """Return True iff the user ticked the 6-frame checkbox.
+        Only meaningful for BLASTP — BLASTN ignores it."""
+        try:
+            cb = self.query_one("#blast-six-frame", Checkbox)
+            return bool(cb.value)
+        except NoMatches:
+            return False
+
     @work(thread=True)
     def _do_run(self, prog: str, query: str,
                 col_filter: "list[str] | None",
                 src_label: str, truncated: bool) -> None:
+        six_frame = (prog == "blastp" and self._six_frame_active())
         try:
-            db = _blast_get_db(prog, col_filter)
+            db = _blast_get_db(prog, col_filter, six_frame=six_frame)
         except Exception as exc:
             _log.exception("BLAST DB build failed (worker)")
             self.app.call_from_thread(
@@ -11476,8 +11596,9 @@ class BlastModal(ModalScreen):
     @work(thread=True)
     def _do_build(self, prog: str,
                   col_filter: "list[str] | None") -> None:
+        six_frame = (prog == "blastp" and self._six_frame_active())
         try:
-            db = _blast_get_db(prog, col_filter)
+            db = _blast_get_db(prog, col_filter, six_frame=six_frame)
         except Exception as exc:
             _log.exception("BLAST DB build failed (worker)")
             self.app.call_from_thread(
@@ -14209,7 +14330,11 @@ class DomesticatorModal(ModalScreen):
             )
         except Exception as exc:
             _log.exception("Primer design failed")
-            status.update(f"[red]Primer design failed: {exc}[/red]")
+            status.update(
+                f"[red]Primer design failed: {exc}. "
+                f"Try widening the selection (≥ 18 bp), or check that the "
+                f"chosen Tm range is reachable for this template.[/red]"
+            )
             return
 
         if "error" in self._design:
@@ -15587,7 +15712,11 @@ class MutagenizeModal(ModalScreen):
             rec = _gb_text_to_record(gb)
         except Exception as exc:
             _log.exception("Mutagenize: library entry parse failed")
-            info.update(f"[red]Could not parse library GenBank: {exc}[/red]")
+            info.update(
+                f"[red]Couldn't parse the stored plasmid: {exc}. "
+                f"The library entry may be corrupted — re-save the source "
+                f"file or pick a different plasmid.[/red]"
+            )
             return
         self._lib_template = str(rec.seq).upper()
         total = len(self._lib_template)
@@ -15743,7 +15872,12 @@ class MutagenizeModal(ModalScreen):
             )
         except Exception as exc:
             _log.exception("Mutagenize: optimize failed")
-            info.update(f"[red]Optimization failed: {exc}[/red]")
+            info.update(
+                f"[red]Codon optimization failed: {exc}. "
+                f"The selected codon table may be missing entries for this "
+                f"protein's residues — try a different organism or "
+                f"add codon-table entries via File > Codon tables.[/red]"
+            )
             return
         name = self.query_one("#mut-prot-name", Input).value.strip() or "protein"
         self._cds_dna  = cds
@@ -19522,7 +19656,7 @@ NewPlasmidModal { align: center middle; }
 /* ── BLAST modal ─────────────────────────────────────────── */
 BlastModal { align: center middle; }
 #blast-dlg {
-    width: 96; height: 90%; max-height: 42;
+    width: 96; height: 90%; max-height: 44;
     background: $surface; border: solid $primary; padding: 1 2;
 }
 #blast-title { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
@@ -19534,6 +19668,7 @@ BlastModal { align: center middle; }
 #blast-coll-col  { width: 1fr; height: 5; }
 #blast-prog-col Label, #blast-coll-col Label { margin-top: 0; height: 1; }
 #blast-hmm-path { height: 3; margin-top: 0; }
+#blast-six-frame { height: 1; margin-top: 1; }
 #blast-results { height: auto; min-height: 4; margin-top: 0; padding: 0 1; }
 #blast-status { height: 2; margin-top: 1; }
 #blast-btns   { height: 3; margin-top: 1; }
