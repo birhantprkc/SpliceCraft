@@ -1638,12 +1638,19 @@ def _feats_in_chunk(
         # midpoints would be computed off the half's local start
         # and the AA letters would land on the wrong bp with the
         # wrong translation. Non-CDS features ignore these keys.
+        # `_orig_dict` keeps a reference to the unsplit feature so
+        # the click / hover resolver can identity-match a half-dict
+        # back to a feature in `pm._feats` (without it the App's
+        # `event.feat is f` check fails for wrap features and falls
+        # back to bp-search).
         if s < chunk_end and total > chunk_start:
             out.append({**f, "end": total,
-                        "_orig_start": s, "_orig_end": e})
+                        "_orig_start": s, "_orig_end": e,
+                        "_orig_dict": f})
         if 0 < chunk_end and e > chunk_start:
             out.append({**f, "start": 0, "label": "",
-                        "_orig_start": s, "_orig_end": e})
+                        "_orig_start": s, "_orig_end": e,
+                        "_orig_dict": f})
     return out
 
 
@@ -1812,7 +1819,12 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     if static_cache is None or len(static_cache) != len(chunks_layout):
         static_cache = [None] * len(chunks_layout)
         _CHUNK_STATIC_CACHE[static_key] = static_cache
-        if len(_CHUNK_STATIC_CACHE) > 4:
+        # Cap is generous because each entry is just a list of `Text`
+        # references per chunk, and the static cache only invalidates
+        # on (seq, feats, line_width, show_connectors) change — not
+        # on selection or cursor moves. 16 entries is enough headroom
+        # for resize + plasmid switches without thrashing.
+        if len(_CHUNK_STATIC_CACHE) > 16:
             _CHUNK_STATIC_CACHE.pop(next(iter(_CHUNK_STATIC_CACHE)))
 
     aa_id = id(aa_highlight) if aa_highlight is not None else 0
@@ -1822,7 +1834,13 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     if overlay_cache is None or len(overlay_cache) != len(chunks_layout):
         overlay_cache = [None] * len(chunks_layout)
         _CHUNK_OVERLAY_CACHE[overlay_key] = overlay_cache
-        if len(_CHUNK_OVERLAY_CACHE) > 4:
+        # Selection state changes per click → overlay key changes →
+        # new entry. With only 4 entries, clicking through 5 features
+        # in a row evicted the first cache and forced re-render of
+        # the selection-overlap chunks. 16 entries gives users a
+        # comfortable working set for clicking back-and-forth between
+        # several features without redoing per-base style work.
+        if len(_CHUNK_OVERLAY_CACHE) > 16:
             _CHUNK_OVERLAY_CACHE.pop(next(iter(_CHUNK_OVERLAY_CACHE)))
 
     for i, (chunk_start, chunk_end, groups, _ab_pairs, _be_pairs,
@@ -4227,9 +4245,23 @@ class SequencePanel(Widget):
     Click  on the sequence → place cursor + select feature at that position.
     Shift+click           → extend selection for editing.
     Ctrl+E                → open insert/replace dialog at cursor / selection.
-    H                     → copy hover-status text to clipboard.
+    Alt+D                 → toggle hover-status debug mode.
+    H (debug only)        → copy hover-status text to clipboard.
+    D (debug only)        → dump rendered chunk text to clipboard + log.
     """
 
+    BINDINGS = [
+        # Panel-level (no priority) so Textual's focus chain
+        # dispatches them only when the seq panel or one of its
+        # descendants (seq-scroll, seq-hover-status) has focus.
+        # That keeps modal Input fields free to receive literal
+        # `h` / `d` characters (e.g. IUPAC ambiguity code H = A/C/T
+        # while editing a sequence). H / D are gated on `_debug_mode`
+        # internally; Alt+D is the always-available toggle.
+        Binding("h",     "copy_hover_status", "Copy hover", show=False),
+        Binding("d",     "dump_hover_chunk",  "Dump chunk", show=False),
+        Binding("alt+d", "toggle_debug",      "Debug mode", show=False),
+    ]
 
     DEFAULT_CSS = """
     SequencePanel {
@@ -4253,12 +4285,48 @@ class SequencePanel(Widget):
     #seq-scroll { height: 1fr; }
     """
 
+    def action_toggle_debug(self) -> None:
+        """Alt+D — show / hide the seq-panel hover-status diagnostic
+        row. When on, MouseMove updates the row in real time and
+        H / D copy / dump as before. When off, the row is hidden
+        from layout (seq-scroll gets the space back) and H / D
+        notify the user to enable debug mode first. Logged so users
+        can grep their own usage."""
+        self._debug_mode = not self._debug_mode
+        try:
+            status = self.query_one("#seq-hover-status", Static)
+        except NoMatches:
+            return
+        status.display = self._debug_mode
+        if self._debug_mode:
+            mx, my = self._last_mouse_xy
+            if mx >= 0:
+                self._update_hover_status(mx, my)
+            else:
+                status.update(
+                    "[dim]Debug mode ON — hover the seq panel to see "
+                    "kind/packed_row/col/feature info. H copies, D dumps "
+                    "the chunk. Alt+D toggles off.[/]"
+                )
+        _log_event("seq.debug_toggle", on=self._debug_mode)
+        self.app.notify(
+            f"Seq panel debug mode {'ON' if self._debug_mode else 'OFF'}",
+            severity="information",
+        )
+
     def action_dump_hover_chunk(self) -> None:
         """Dump the rendered plain text of the chunk under the mouse
         to clipboard + log. Each line is prefixed with its packed-row
         / DNA / below classification so we can compare against the
         hover diagnostic. Crucial for chasing renderer-vs-owner-fill
-        divergences ("I see a bar at this row but you say no feature")."""
+        divergences ("I see a bar at this row but you say no feature").
+        Gated on debug mode (Alt+D)."""
+        if not self._debug_mode:
+            self.app.notify(
+                "Enable debug mode first (Alt+D)",
+                severity="information",
+            )
+            return
         mx, my = self._last_mouse_xy
         if mx < 0 or not self._seq:
             self.app.notify("Move mouse over the panel before pressing D",
@@ -4382,7 +4450,13 @@ class SequencePanel(Widget):
         Re-runs `_hover_at` with the last seen mouse position and
         copies the resulting plain-text status string. Logs the
         underlying dict so the user has a verbatim record in the log
-        as well."""
+        as well. Gated on debug mode (Alt+D)."""
+        if not self._debug_mode:
+            self.app.notify(
+                "Enable debug mode first (Alt+D)",
+                severity="information",
+            )
+            return
         mx, my = self._last_mouse_xy
         if mx < 0:
             self.app.notify(
@@ -4514,6 +4588,11 @@ class SequencePanel(Widget):
         # the system clipboard. Initial (-1, -1) sentinel means
         # "mouse hasn't entered the panel yet".
         self._last_mouse_xy: "tuple[int, int]" = (-1, -1)
+        # Debug mode toggle (Alt+D). When False, the hover-status
+        # diagnostic row is hidden and H / D bindings notify the user
+        # to enable debug mode first. Off by default — the diagnostic
+        # is for developer/bug-report use, not a normal-flow feature.
+        self._debug_mode: bool = False
         self._sel_range:    "tuple[int,int] | None" = None  # feature highlight
         self._user_sel:     "tuple[int,int] | None" = None  # drag/shift selection
         self._cursor_pos:   int                     = -1    # -1 = no cursor
@@ -4585,7 +4664,12 @@ class SequencePanel(Widget):
         self._chunks_owners: "dict[tuple, dict]" = {}
 
     def compose(self) -> ComposeResult:
-        yield Static("", id="seq-hover-status")
+        # Hover-status diagnostic row, hidden by default. Toggled on
+        # via Alt+D. When hidden, the seq-scroll gets the row back
+        # for DNA visibility — `display=False` removes it from layout.
+        status = Static("", id="seq-hover-status")
+        status.display = False
+        yield status
         with ScrollableContainer(id="seq-scroll"):
             yield Static("", id="seq-view")
 
@@ -4753,14 +4837,11 @@ class SequencePanel(Widget):
         self._refresh_view()
 
     def on_mouse_move(self, event: MouseMove) -> None:
-        # Hover diagnostic — runs on every move so the user can see
-        # exactly which cell the system thinks the mouse is over
-        # (and which feature, if any) BEFORE clicking. Read-only;
-        # doesn't mutate the click-state flags. The last position
-        # is captured so `H` can copy the verbatim status to the
-        # clipboard without depending on a transient widget update.
+        # Always capture the last position so Alt+D → H / D can use
+        # it. The hover status only updates when debug mode is on.
         self._last_mouse_xy = (event.screen_x, event.screen_y)
-        self._update_hover_status(event.screen_x, event.screen_y)
+        if self._debug_mode:
+            self._update_hover_status(event.screen_x, event.screen_y)
         if not self._mouse_button_held or self._drag_start_bp < 0:
             return
         bp = self._click_to_bp(event.screen_x, event.screen_y)
@@ -4799,112 +4880,116 @@ class SequencePanel(Widget):
         except Exception:
             return {"kind": "scroll_query_fail"}
 
+        import bisect
         n           = len(self._seq)
         num_w       = len(str(n)) if n else 1
         line_width  = max(20, self._seq_render_width() - (num_w + 2))
-        # Insertion order — must match the renderer (`_build_seq_inputs`)
-        # so hover dispatch sees the SAME packed rows as what's drawn.
-        annot_feats = [f for f in self._feats
-                       if f.get("type") not in ("site", "recut")]
-        seq_col = vp_x - (num_w + 2)
-        row     = 0
-        for chunk_start in range(0, n, line_width):
-            chunk_end   = min(chunk_start + line_width, n)
-            chunk_idx   = chunk_start // line_width
-            chunk_feats = _feats_in_chunk(annot_feats, chunk_start, chunk_end, n)
-            above_p, below_p, above_rows, below_rows = (
-                _chunk_lane_groups(chunk_feats, chunk_start, chunk_end)
-            )
+        seq_col     = vp_x - (num_w + 2)
 
-            # Above stack (top of stack first)
-            for k in range(above_rows):
-                if row == content_row:
-                    packed_row = above_rows - 1 - k
-                    f = None
-                    if 0 <= seq_col < (chunk_end - chunk_start):
-                        owners_data = self._chunk_glyph_owners(
-                            chunk_start, chunk_end, chunk_feats,
-                            above_p, below_p, above_rows, below_rows,
-                        )
-                        owners = owners_data["owners_above"]
-                        if 0 <= packed_row < len(owners):
-                            f = owners[packed_row][seq_col]
-                    # Also list any features at this column on the
-                    # above strand (across all packed rows) — helps
-                    # the user see WHERE a feature actually renders
-                    # when their hover row reports `(no feature)`.
-                    others = self._features_at_col(
-                        above_p, chunk_start, chunk_end, seq_col,
-                    ) if f is None else []
-                    return {
-                        "kind": "above",
-                        "chunk": chunk_idx,
-                        "packed_row": packed_row,
-                        "screen_row": k,    # 0 = top of above stack on screen
-                        "above_rows": above_rows,
-                        "seq_col": seq_col,
-                        "vp_y": vp_y,
-                        "vp_x": vp_x,
-                        "feat": f,
-                        "others_at_col": others,
-                    }
-                row += 1
+        # O(1) chunk lookup via the cached layout's prefix sums —
+        # avoids walking every chunk on a 200 kb cosmid where each
+        # MouseMove would otherwise iterate ~1500 chunks linearly.
+        # `_chunk_layout` returns `prefix_dna2[i]` = total rows
+        # (assuming rpg=2) up to but not including chunk `i`. The
+        # chunk containing `content_row` is the largest `i` with
+        # `prefix_dna2[i] <= content_row`. show_connectors path is
+        # unused (rpg==2 always); kept simple.
+        chunks_layout, prefix_dna2, _pf_lanes = _chunk_layout(
+            self._seq, self._feats, line_width,
+        )
+        if not chunks_layout:
+            return {"kind": "no_chunks"}
+        idx = bisect.bisect_right(prefix_dna2, content_row) - 1
+        if idx < 0 or idx >= len(chunks_layout):
+            return {"kind": "past_content",
+                    "content_row": content_row,
+                    "total_rows": prefix_dna2[-1] if prefix_dna2 else 0}
+        chunk_start, chunk_end, groups, *_extra = chunks_layout[idx]
+        above_p, below_p, above_rows, below_rows = groups
+        chunk_idx = idx
+        # Re-derive chunk_feats only when needed (for the
+        # `_features_at_col` fallback). _chunk_lane_groups already
+        # cached its own work via _CHUNK_LAYOUT_CACHE, so the cached
+        # placements are reused — no duplicate _feats_in_chunk call.
+        row_in_chunk = content_row - prefix_dna2[idx]
 
-            # DNA rows (fwd + rev)
-            for strand_i in range(2):
-                if row == content_row:
-                    if 0 <= seq_col < (chunk_end - chunk_start):
-                        return {
-                            "kind": "dna",
-                            "strand": "fwd" if strand_i == 0 else "rev",
-                            "chunk": chunk_idx,
-                            "seq_col": seq_col,
-                            "bp": chunk_start + seq_col,
-                        }
-                    return {"kind": "dna_off",
-                            "chunk": chunk_idx,
-                            "seq_col": seq_col}
-                row += 1
+        # Dispatch within the chunk. Order (from screen top to bottom):
+        #   above_rows × above stack
+        #   2 × DNA strands
+        #   below_rows × below stack
+        #   1 × trailing gap
+        if row_in_chunk < above_rows:
+            k = row_in_chunk
+            packed_row = above_rows - 1 - k
+            f = None
+            if 0 <= seq_col < (chunk_end - chunk_start):
+                owners_data = self._chunk_glyph_owners(
+                    chunk_start, chunk_end, [],  # chunk_feats unused
+                    above_p, below_p, above_rows, below_rows,
+                )
+                owners = owners_data["owners_above"]
+                if 0 <= packed_row < len(owners):
+                    f = owners[packed_row][seq_col]
+            others = self._features_at_col(
+                above_p, chunk_start, chunk_end, seq_col,
+            ) if f is None else []
+            return {
+                "kind": "above",
+                "chunk": chunk_idx,
+                "packed_row": packed_row,
+                "screen_row": k,
+                "above_rows": above_rows,
+                "seq_col": seq_col,
+                "vp_y": vp_y,
+                "vp_x": vp_x,
+                "feat": f,
+                "others_at_col": others,
+            }
 
-            # Below stack (closest to DNA first)
-            for k in range(below_rows):
-                if row == content_row:
-                    packed_row = k
-                    f = None
-                    if 0 <= seq_col < (chunk_end - chunk_start):
-                        owners_data = self._chunk_glyph_owners(
-                            chunk_start, chunk_end, chunk_feats,
-                            above_p, below_p, above_rows, below_rows,
-                        )
-                        owners = owners_data["owners_below"]
-                        if 0 <= packed_row < len(owners):
-                            f = owners[packed_row][seq_col]
-                    others = self._features_at_col(
-                        below_p, chunk_start, chunk_end, seq_col,
-                    ) if f is None else []
-                    return {
-                        "kind": "below",
-                        "chunk": chunk_idx,
-                        "packed_row": packed_row,
-                        "screen_row": k,
-                        "below_rows": below_rows,
-                        "seq_col": seq_col,
-                        "vp_y": vp_y,
-                        "vp_x": vp_x,
-                        "feat": f,
-                        "others_at_col": others,
-                    }
-                row += 1
+        row_after_above = row_in_chunk - above_rows
+        if row_after_above < 2:
+            if 0 <= seq_col < (chunk_end - chunk_start):
+                return {
+                    "kind": "dna",
+                    "strand": "fwd" if row_after_above == 0 else "rev",
+                    "chunk": chunk_idx,
+                    "seq_col": seq_col,
+                    "bp": chunk_start + seq_col,
+                }
+            return {"kind": "dna_off",
+                    "chunk": chunk_idx,
+                    "seq_col": seq_col}
 
-            # Trailing inter-chunk gap row
-            if row == content_row:
-                return {"kind": "gap", "chunk": chunk_idx,
-                        "seq_col": seq_col}
-            row += 1
+        row_after_dna = row_after_above - 2
+        if row_after_dna < below_rows:
+            packed_row = row_after_dna
+            f = None
+            if 0 <= seq_col < (chunk_end - chunk_start):
+                owners_data = self._chunk_glyph_owners(
+                    chunk_start, chunk_end, [],  # chunk_feats unused
+                    above_p, below_p, above_rows, below_rows,
+                )
+                owners = owners_data["owners_below"]
+                if 0 <= packed_row < len(owners):
+                    f = owners[packed_row][seq_col]
+            others = self._features_at_col(
+                below_p, chunk_start, chunk_end, seq_col,
+            ) if f is None else []
+            return {
+                "kind": "below",
+                "chunk": chunk_idx,
+                "packed_row": packed_row,
+                "screen_row": row_after_dna,
+                "below_rows": below_rows,
+                "seq_col": seq_col,
+                "vp_y": vp_y,
+                "vp_x": vp_x,
+                "feat": f,
+                "others_at_col": others,
+            }
 
-            if row > content_row:
-                break
-        return {"kind": "past_content"}
+        # Trailing inter-chunk gap (the +1 row at the end of each chunk).
+        return {"kind": "gap", "chunk": chunk_idx, "seq_col": seq_col}
 
     def _update_hover_status(self, screen_x: int, screen_y: int) -> None:
         try:
@@ -5115,6 +5200,16 @@ class SequencePanel(Widget):
             "above_rows":   above_rows,
             "below_rows":   below_rows,
         }
+        # Soft cap: a 200 kb cosmid has ~1230 chunks; without a cap
+        # `_chunks_owners` would grow to ~10-20 MB after the user
+        # navigates the whole record. 256 entries × ~15 KB ≈ 4 MB —
+        # plenty for a working window without unbounded retention.
+        # FIFO eviction (oldest insertion popped first) is fine here:
+        # the cache invalidates on every `update_seq` anyway, so
+        # entries are scoped to the current record, and re-clicking
+        # an evicted chunk only costs the ~1 ms re-fill.
+        if len(self._chunks_owners) >= 256:
+            self._chunks_owners.pop(next(iter(self._chunks_owners)))
         self._chunks_owners[cache_key] = result
         return result
 
@@ -15345,6 +15440,14 @@ class SplashScreen(ModalScreen):
                 self.dismiss(None)
             except Exception:
                 _log.exception("splash dismiss failed")
+        else:
+            # Silent no-op left a paper trail nowhere — log so a user
+            # complaining "the splash sometimes ignores my Enter"
+            # has something we can grep for. Spurious double-dismiss
+            # is harmless; a recurring miss would indicate something
+            # else is popping the splash too eagerly.
+            _log_event("splash.dismiss_skipped",
+                       reason="not_on_stack")
 
 
 class UnsavedNavigateModal(ModalScreen):
@@ -17015,19 +17118,13 @@ SpeciesPickerModal { align: center middle; }
         Binding("ctrl+c",       "copy_selection",        "",         show=False, priority=True),
         Binding("alt+c",        "copy_selection_bottom", "",         show=False, priority=True),
         Binding("ctrl+shift+c", "copy_selection_bottom", "",         show=False, priority=True),
-        # H (any case) copies the seq-panel hover-status text to
-        # clipboard. App-level + priority so it fires regardless of
-        # which widget currently has focus — the panel-level binding
-        # was missing reliably because the seq-scroll inside the
-        # panel takes focus on click and Textual's binding lookup
-        # didn't always reach the parent.
-        Binding("h",            "copy_hover_status",     "Copy hover", show=False, priority=True),
-        # D dumps the rendered text of the chunk under the mouse to
-        # clipboard + log — diagnoses cases where the user reports
-        # seeing a bar that the owner-fill says doesn't exist there.
-        # Lets us compare the actual render output against the
-        # owner-fill data to pinpoint a renderer/owner divergence.
-        Binding("d",            "dump_hover_chunk",      "Dump chunk", show=False, priority=True),
+        # H / D / Alt+D used to live here as App-level priority
+        # bindings, but they intercepted literal `h` / `d` keystrokes
+        # in modal Input fields (e.g. typing the IUPAC `H` ambiguity
+        # code while editing a sequence). Moved to `SequencePanel.
+        # BINDINGS` so Textual's focus chain dispatches them only
+        # when the seq panel (or its descendants) has focus — modals
+        # take focus and absorb their own keys.
     ]
 
     # Actions that remain available even when a screen is pushed on top.
@@ -17663,32 +17760,6 @@ SpeciesPickerModal { align: center middle; }
         reverse-complement) of the selection."""
         self._copy_strand(bottom=True)
 
-    def action_copy_hover_status(self) -> None:
-        """H — copy the seq-panel hover-status text to clipboard.
-        Delegates to the panel since it owns the last-mouse-position
-        state. App-level + priority so the binding fires regardless
-        of which widget has focus (the panel-level binding wasn't
-        reliable because the inner seq-scroll captures focus on
-        click and Textual's binding lookup didn't always reach the
-        parent panel)."""
-        try:
-            sp = self.query_one("#seq-panel", SequencePanel)
-        except NoMatches:
-            return
-        sp.action_copy_hover_status()
-
-    def action_dump_hover_chunk(self) -> None:
-        """D — dump the rendered plain-text of the chunk under the
-        mouse cursor to clipboard + log. Lets the user paste a row-
-        by-row view of what the renderer is actually emitting so we
-        can compare against the hover diagnostic's owner-fill data
-        — pinpoints the exact row the bar visually lives on if the
-        two ever disagree."""
-        try:
-            sp = self.query_one("#seq-panel", SequencePanel)
-        except NoMatches:
-            return
-        sp.action_dump_hover_chunk()
 
     def _copy_strand(self, *, bottom: bool) -> None:
         sp  = self.query_one("#seq-panel", SequencePanel)
@@ -18575,8 +18646,12 @@ SpeciesPickerModal { align: center middle; }
         # senders, programmatic posts).
         best_idx = -1
         if event.feat is not None:
+            # For wrap features, `_feats_in_chunk` builds a half-dict
+            # per chunk and stamps the original on `_orig_dict`. Walk
+            # to the original first so identity match succeeds.
+            target = event.feat.get("_orig_dict", event.feat)
             for i, f in enumerate(pm._feats):
-                if f is event.feat:
+                if f is target:
                     best_idx = i
                     break
         used_fallback = False
