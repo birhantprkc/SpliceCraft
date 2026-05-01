@@ -288,7 +288,9 @@ def _log_timing(path: str, threshold_ms: float = _SLOW_THRESHOLD_MS):
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, ScrollableContainer
+from textual.containers import (
+    Horizontal, Vertical, ScrollableContainer, VerticalScroll,
+)
 from textual.css.query import NoMatches
 from textual.events import Click, MouseDown, MouseMove, MouseUp, MouseScrollDown, MouseScrollUp
 from textual.message import Message
@@ -298,7 +300,8 @@ from textual.theme import Theme
 from textual.widget import Widget
 from textual.widgets import (
     Button, Checkbox, DataTable, DirectoryTree, Footer, Header, Input, Label,
-    ListItem, ListView, RadioButton, RadioSet, Select, Static, TextArea,
+    ListItem, ListView, Markdown, RadioButton, RadioSet, Select, Static,
+    TextArea,
 )
 from rich.text import Text
 
@@ -5931,9 +5934,12 @@ class EditSeqDialog(ModalScreen):
 
 class HelpModal(ModalScreen):
     """Keyboard-shortcut + feature-overview reference. Opened by `?`
-    from anywhere in the app; dismissed by any key. Replaces the
-    secondary `#status-bar` row that used to live below the seq panel
-    (removed 2026-05-01 to free real estate for future widgets)."""
+    from anywhere in the app; dismissed by any key.
+
+    Renders via Textual's `Markdown` widget so users can drag-select
+    a key combination to clipboard (one of the few `Markdown`-only
+    affordances). The body is a single `_HELP_BODY_MD` constant so
+    binding changes only need to update one place."""
 
     BINDINGS = [
         Binding("escape", "dismiss_help", "Close"),
@@ -5944,7 +5950,7 @@ class HelpModal(ModalScreen):
     DEFAULT_CSS = """
     HelpModal { align: center middle; }
     #help-box {
-        width: 88; height: auto; max-height: 90%;
+        width: 92; height: 90%; max-height: 40;
         background: $surface;
         border: solid $accent;
         padding: 1 2;
@@ -5954,7 +5960,12 @@ class HelpModal(ModalScreen):
         color: $accent;
         margin-bottom: 1;
     }
-    #help-body { padding: 0 1; }
+    /* The Markdown widget sits inside #help-body-scroll
+       (VerticalScroll). The scroll wrapper takes the bulk of the
+       dialog's free vertical space; #help-body itself is auto-sized
+       to its rendered tables so the wrapper can scroll them. */
+    #help-body-scroll { height: 1fr; min-height: 10; padding: 0 1; }
+    #help-body { height: auto; }
     #help-hint {
         margin-top: 1;
         color: $text-muted;
@@ -5965,9 +5976,14 @@ class HelpModal(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="help-box"):
             yield Static("SpliceCraft — keyboard shortcuts", id="help-title")
-            yield Static(_HELP_BODY_TEXT, id="help-body", markup=True)
+            # Markdown widget itself is layout-only (not scrolling) —
+            # wrap in VerticalScroll so the rendered tables stay inside
+            # the modal box on small terminals.
+            with VerticalScroll(id="help-body-scroll"):
+                yield Markdown(_HELP_BODY_MD, id="help-body")
             yield Static(
-                "Press Esc, ?, or q to close.",
+                "Press Esc, ?, or q to close.  Drag-select any cell "
+                "to copy.",
                 id="help-hint",
             )
 
@@ -5975,53 +5991,83 @@ class HelpModal(ModalScreen):
         self.dismiss(None)
 
     def on_key(self, event) -> None:
-        # Catch-all: any key not bound to a modal action also dismisses.
-        # Lets the user close with Enter / Space / etc. without having
-        # to remember the specific Esc binding.
+        # Catch-all: any key not bound to a modal action also dismisses,
+        # except the keys Markdown uses for in-content navigation
+        # (arrows + page up/down + home/end). Without this exception,
+        # arrow keys couldn't scroll the help body.
+        nav_keys = {"up", "down", "left", "right",
+                     "pageup", "pagedown", "home", "end"}
+        if event.key in nav_keys:
+            return
         if event.key not in ("escape", "question_mark", "q"):
             self.dismiss(None)
             event.stop()
 
 
-# Single source of truth for the help body so refactors that add a
-# binding don't need to update two places. Keep entries grouped by
-# panel / context — flat alphabetical lists are harder to scan.
-_HELP_BODY_TEXT = (
-    "[bold]File / Record[/bold]\n"
-    "  [b]f[/b]            Fetch GenBank from NCBI\n"
-    "  [b]^O[/b]           Open file (.gb / .gbk / .dna)\n"
-    "  [b]^S[/b]           Save\n"
-    "  [b]^⇧A[/b]          Add current record to library\n"
-    "  [b]q[/b]            Quit\n"
-    "\n"
-    "[bold]Editing[/bold]\n"
-    "  [b]^E[/b]           Edit sequence (insert / replace)\n"
-    "  [b]^F[/b]           Add feature\n"
-    "  [b]^⇧F[/b]          Capture selection → feature library\n"
-    "  [b]Delete[/b]       Delete selected feature\n"
-    "  [b]^Z / ^⇧Z[/b]     Undo / redo\n"
-    "\n"
-    "[bold]Map / view[/bold]\n"
-    "  [b]← →[/b]         Rotate (focus on map) · move cursor (focus on seq panel)\n"
-    "  [b]Shift+←/→[/b]    Coarse rotate / extend selection\n"
-    "  [b]Home[/b]         Reset map origin / jump to row start (seq)\n"
-    "  [b]End[/b]          Jump to row end (seq panel)\n"
-    "  [b]v[/b]            Toggle linear / circular map\n"
-    "  [b]l[/b]            Toggle feature connectors\n"
-    "  [b]r[/b]            Toggle restriction sites\n"
-    "\n"
-    "[bold]Selection / clipboard[/bold]\n"
-    "  [b]Click bar[/b]    Highlight feature DNA span\n"
-    "  [b]Click base[/b]   Place cursor (no feature pick)\n"
-    "  [b]Shift+click[/b]  Extend selection\n"
-    "  [b]^C[/b]           Copy selection (top strand)\n"
-    "  [b]Alt+C[/b]        Copy selection (bottom strand, reverse-complement)\n"
-    "\n"
-    "[bold]Seq-panel debug[/bold]\n"
-    "  [b]Alt+D[/b]        Toggle hover-status diagnostic row\n"
-    "  [b]H[/b]            Copy hover info to clipboard (debug only)\n"
-    "  [b]D[/b]            Dump rendered chunk to clipboard (debug only)\n"
-)
+# Single source of truth for the help body. Keep entries grouped by
+# panel / context — flat alphabetical lists are harder to scan. The
+# Markdown table format is selectable: users can drag a row to copy
+# the key combo.
+_HELP_BODY_MD = """\
+### File / Record
+
+| Key | Action |
+|---|---|
+| `f` | Fetch GenBank from NCBI |
+| `Ctrl+O` | Open file (`.gb` / `.gbk` / `.dna`) |
+| `Ctrl+S` | Save |
+| `Ctrl+N` | New plasmid (paste DNA + annotate) |
+| `Ctrl+Shift+A` | Add current record to library |
+| `Ctrl+Q` | Quit |
+
+### Editing
+
+| Key | Action |
+|---|---|
+| `Ctrl+A` | Select entire sequence |
+| `Ctrl+E` | Edit sequence (insert / replace) |
+| `Ctrl+F` | Add feature (uses current selection) |
+| `Ctrl+Shift+F` | Capture selection → feature library |
+| `Delete` | Delete selected feature |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
+
+### Cloning + analysis
+
+| Key | Action |
+|---|---|
+| `Ctrl+P` | Primer design |
+| `Ctrl+B` | BLAST (BLASTN / BLASTP / HMMscan) |
+
+### Map / view
+
+| Key | Action |
+|---|---|
+| `←` `→` | Rotate (map focus) · move cursor (seq focus) |
+| `Shift+←/→` | Coarse rotate / extend selection |
+| `Home` | Reset map origin / jump to row start (seq) |
+| `End` | Jump to row end (seq panel) |
+| `v` | Toggle linear / circular map |
+| `l` | Toggle feature connectors |
+| `r` | Toggle restriction sites |
+
+### Selection / clipboard
+
+| Key / action | Effect |
+|---|---|
+| Click bar | Highlight feature DNA span |
+| Click base | Place cursor (no feature pick) |
+| Shift+click | Extend selection |
+| `Ctrl+C` | Copy selection (top strand) |
+| `Alt+C` | Copy selection (bottom strand, reverse-complement) |
+
+### Seq-panel debug
+
+| Key | Action |
+|---|---|
+| `Alt+D` | Toggle hover-status diagnostic row |
+| `H` | Copy hover info to clipboard (debug only) |
+| `D` | Dump rendered chunk to clipboard (debug only) |
+"""
 
 
 # ── Fetch modal ────────────────────────────────────────────────────────────────
