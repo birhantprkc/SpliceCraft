@@ -30,23 +30,24 @@ classifiers = [
     "Topic :: Terminals",
 ]
 dependencies = [
-    "textual>=8.2.3",
+    "textual>=8.2.5",
     "biopython>=1.87",
     "primer3-py>=2.3.0",
-    "platformdirs>=4.2",
-    # pyhmmer powers the BLAST modal's HMMscan tier — pure-Python
-    # bindings to HMMER 3 with no external C-library install required
-    # (the wheels ship the HMMER source compiled in). Optional only in
-    # the sense that BLASTN/BLASTP work without it; HMMscan can't.
-    "pyhmmer>=0.10",
+    "platformdirs>=4.9",
+    # pyhmmer powers the BLAST modal's BLASTN (nhmmer), BLASTP (phmmer),
+    # and HMMscan tiers — pure-Python bindings to HMMER 3 with no
+    # external C-library install required (the wheels ship the HMMER
+    # source compiled in). The pure-Python BLAST fallback also runs
+    # without pyhmmer for very short queries.
+    "pyhmmer>=0.12",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=9.0",
     "pytest-asyncio>=1.3",
-    "pytest-xdist>=3.6",
-    "hypothesis>=6.100",
+    "pytest-xdist>=3.8",
+    "hypothesis>=6.152",
     "build",
     "twine",
 ]

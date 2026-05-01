@@ -12,7 +12,7 @@ A **terminal-based circular plasmid map viewer, sequence editor, and cloning/mut
 
 - **Single-file architecture:** entire app is `splicecraft.py` (~17,900 lines). Intentional — keeps the codebase greppable. Sibling project ScriptoScope (~8,600 lines) follows the same convention.
 - **Test suite:** ~1,200 tests across 19 files in `tests/`. `pytest -n auto` ~2-3 min on 8 cores; sequential ~13 min. Biology subset (`test_dna_sanity.py`) < 2 s. `test_invariants_hypothesis.py` adds property-based fuzzing. New in 0.5.1: `test_blast.py` (BLASTN/BLASTP/HMMscan engines + sanitisation) and `test_new_plasmid.py` (NewPlasmidModal + `_annotate_seq_from_feature_library`).
-- **Dependencies:** `textual>=8.2.3`, `biopython>=1.87`, `primer3-py>=2.3.0`, `platformdirs>=4.2`, `pyhmmer>=0.10` (HMMscan). Tests: `pytest`, `pytest-asyncio`, `pytest-xdist`, `hypothesis`. No optional runtime deps — pLannotate integration was removed in 0.4.0.
+- **Dependencies:** `textual>=8.2.5`, `biopython>=1.87`, `primer3-py>=2.3.0`, `platformdirs>=4.9`, `pyhmmer>=0.12`. Tests: `pytest>=9.0`, `pytest-asyncio>=1.3`, `pytest-xdist>=3.8`, `hypothesis>=6.152`. No optional runtime deps — pLannotate integration was removed in 0.4.0.
 - Releases via `./release.py X.Y.Z` (bumps version, runs tests, builds, tags, pushes; `publish.yml` uploads to PyPI via OIDC). Pure-Python — no bash/sed/grep dependencies.
 
 ## How to run
