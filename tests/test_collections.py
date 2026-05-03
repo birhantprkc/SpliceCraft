@@ -454,9 +454,9 @@ class TestPanelCollectionCRUD:
             lib.query_one("#btn-coll-add").action_press()
             await pilot.pause(0.2)
             modal = app.screen
-            assert isinstance(modal, sc.CollectionNameModal)
-            modal.query_one("#collname-input").value = "MyNew"
-            modal.query_one("#btn-collname-ok").action_press()
+            assert isinstance(modal, sc.NewCollectionModal)
+            modal.query_one("#newcoll-name").value = "MyNew"
+            modal.query_one("#btn-newcoll-ok").action_press()
             await pilot.pause(0.2)
             names = [c["name"] for c in sc._load_collections()]
             assert "MyNew" in names
@@ -474,8 +474,8 @@ class TestPanelCollectionCRUD:
             lib.query_one("#btn-coll-add").action_press()
             await pilot.pause(0.2)
             modal = app.screen
-            modal.query_one("#collname-input").value = "Same"
-            modal.query_one("#btn-collname-ok").action_press()
+            modal.query_one("#newcoll-name").value = "Same"
+            modal.query_one("#btn-newcoll-ok").action_press()
             await pilot.pause(0.2)
             # Still only one — duplicate rejected.
             same = [c for c in sc._load_collections() if c.get("name") == "Same"]
@@ -604,6 +604,304 @@ class TestPanelCollectionCRUD:
             await pilot.pause(0.2)
             assert sc._load_collections() == []
             assert sc._get_active_collection_name() is None
+            app.exit()
+
+
+class TestBulkImportFolder:
+    """`_bulk_import_folder` walks a folder, loads every supported file,
+    and returns (entries, failures) without touching disk state.
+    Uses the CommercialSaaS fixtures shipped in tests/ (see test_genbank_io)."""
+
+    @staticmethod
+    def _fixtures_dir():
+        from pathlib import Path
+        return Path(__file__).parent
+
+    def test_imports_all_dna_fixtures(self):
+        from pathlib import Path
+        folder = self._fixtures_dir()
+        # Skip if the FFE fixtures are missing (fresh-clone case).
+        if not list(folder.glob("FFE*.dna")):
+            pytest.skip("No FFE .dna fixtures present")
+        entries, failures = sc._bulk_import_folder(folder)
+        assert failures == [], f"unexpected failures: {failures}"
+        # All fixtures should round-trip — sequences are non-empty, sizes
+        # are sane plasmid sizes (1-10 kb).
+        assert len(entries) >= 5
+        for e in entries:
+            assert 100 < e["size"] < 100_000
+            assert e["n_feats"] > 0
+            assert e["gb_text"]
+
+    def test_display_name_preserves_filename_spaces(self):
+        folder = self._fixtures_dir()
+        if not list(folder.glob("FFE 1*.dna")):
+            pytest.skip("No FFE .dna fixtures present")
+        entries, _ = sc._bulk_import_folder(folder)
+        names = [e["name"] for e in entries]
+        # Filename was "FFE 1 ENTRY UPD.dna" — spaces must survive into
+        # the display name even though record.id is sanitized.
+        assert any(" " in n and "FFE" in n for n in names), \
+            f"expected a space-containing display name in {names}"
+        # Meanwhile id stays LOCUS-safe (no spaces).
+        for e in entries:
+            assert " " not in e["id"]
+
+    def test_dedup_by_id_with_suffix(self, tmp_path):
+        # Two files with the same stem (and so same backfilled record.id
+        # for CommercialSaaS) must end up with distinct ids (`_2` suffix).
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ATGAAA"), id="dup", name="dup",
+                        annotations={"molecule_type": "DNA"})
+        # Two GenBank files in subfolders sharing stems
+        a = tmp_path / "shared.gb"
+        b = tmp_path / "shared.gbk"
+        SeqIO.write(rec, a, "genbank")
+        SeqIO.write(rec, b, "genbank")
+        entries, failures = sc._bulk_import_folder(tmp_path)
+        assert failures == []
+        ids = sorted(e["id"] for e in entries)
+        assert ids[0] != ids[1]
+        assert ids[1].endswith("_2")
+
+    def test_one_corrupt_file_does_not_abort_batch(self, tmp_path):
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        good = tmp_path / "good.gb"
+        rec = SeqRecord(Seq("ATGAAA"), id="g", name="g",
+                        annotations={"molecule_type": "DNA"})
+        SeqIO.write(rec, good, "genbank")
+        bad = tmp_path / "broken.dna"
+        bad.write_bytes(b"not a commercialsaas file")
+        entries, failures = sc._bulk_import_folder(tmp_path)
+        assert len(entries) == 1
+        assert len(failures) == 1
+        assert failures[0][0].name == "broken.dna"
+
+
+class TestBulkImportHardening:
+    """Robustness against hostile / weird inputs.
+    Each test mounts a synthetic attack and asserts the importer
+    surfaces a friendly failure rather than crashing or accepting
+    garbage."""
+
+    def test_nonexistent_folder_returns_failure_not_crash(self, tmp_path):
+        bogus = tmp_path / "does_not_exist"
+        entries, failures = sc._bulk_import_folder(bogus)
+        assert entries == []
+        assert len(failures) == 1
+        assert failures[0][0] == bogus
+        assert "could not read folder" in failures[0][1].lower()
+
+    def test_unreadable_folder_returns_failure_not_crash(self, tmp_path):
+        import os
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        os.chmod(locked, 0)
+        try:
+            entries, failures = sc._bulk_import_folder(locked)
+            assert entries == []
+            assert len(failures) == 1
+            assert "could not read folder" in failures[0][1].lower()
+        finally:
+            os.chmod(locked, 0o755)  # so pytest cleanup can remove it
+
+    def test_oversized_file_skipped_with_reason(self, tmp_path,
+                                                  monkeypatch):
+        # Lower the cap so the test doesn't have to write 50 MB to disk
+        monkeypatch.setattr(sc, "_BULK_IMPORT_MAX_BYTES", 100)
+        big = tmp_path / "big.gb"
+        big.write_bytes(b"x" * 500)
+        entries, failures = sc._bulk_import_folder(tmp_path)
+        assert entries == []
+        assert len(failures) == 1
+        assert "too large" in failures[0][1]
+
+    def test_empty_sequence_skipped_with_reason(self, tmp_path):
+        # Hand-craft a 0-bp GenBank record (Biopython would refuse to
+        # WRITE one with a length-0 LOCUS, so build the text directly).
+        zero = tmp_path / "zerolen.gb"
+        zero.write_text(
+            "LOCUS       zerolen                    0 bp    DNA     "
+            "circular SYN 01-JAN-2026\n"
+            "DEFINITION  zero.\n"
+            "ACCESSION   zero\n"
+            "FEATURES             Location/Qualifiers\n"
+            "ORIGIN\n"
+            "//\n"
+        )
+        entries, failures = sc._bulk_import_folder(tmp_path)
+        assert entries == []
+        assert len(failures) == 1
+        assert "empty sequence" in failures[0][1]
+
+    def test_filename_markup_chars_sanitized_in_display_name(self, tmp_path):
+        # Filename with literal Rich markup tags (no path separator).
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        evil = tmp_path / "[red]EVIL[reset].gb"
+        rec = SeqRecord(Seq("ATGAAA"), id="r", name="r",
+                        annotations={"molecule_type": "DNA"})
+        SeqIO.write(rec, evil, "genbank")
+        entries, failures = sc._bulk_import_folder(tmp_path)
+        assert failures == []
+        assert len(entries) == 1
+        # The display name keeps the literal characters — no auto-strip.
+        # Markup-injection prevention happens at render time (Text() in
+        # the panel, markup=False on notify), not here.
+        assert "[red]" in entries[0]["name"]
+        # Control chars: a filename with literal newlines must be
+        # neutered so the panel can't be split by an injected line.
+        ctrl = tmp_path / ("ctrl_" + "x" + ".gb")
+        ctrl.write_text(evil.read_text())
+        # Now write a record with a name containing newline-like bytes
+        # — the import path strips control chars from display_name.
+        # We approximate by passing a record through directly:
+        from pathlib import Path
+        synth = SeqRecord(Seq("ATGAAA"), id="x",
+                          annotations={"molecule_type": "DNA"})
+        # synthesise a path stem with a literal NUL (filesystems forbid
+        # this but the helper might still see it from elsewhere)
+        fake = Path("ev\nil")
+        entry = sc._record_to_library_entry(synth, fake)
+        assert "\n" not in entry["name"]
+        assert "_" in entry["name"]  # newline replaced
+
+    def test_long_filename_truncated_to_cap(self):
+        # Filesystems cap filenames at 255 bytes, so we can't actually
+        # write a 4 KB-stem file. Test the helper directly with a
+        # synthetic Path — the cap protects against any path-like input
+        # including ones constructed in code from external sources.
+        from pathlib import Path
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ATGAAA"), id="r", name="r",
+                        annotations={"molecule_type": "DNA"})
+        long_path = Path("a" * 4000 + ".gb")
+        entry = sc._record_to_library_entry(rec, long_path)
+        assert len(entry["name"]) <= sc._BULK_IMPORT_MAX_NAME_LEN
+
+    def test_struct_error_on_truncated_dna_rewrapped_as_value_error(
+        self, tmp_path
+    ):
+        # Truncated CommercialSaaS file — Biopython raises struct.error when
+        # the binary header doesn't add up. load_genbank must rewrap as
+        # ValueError so callers get the friendly message.
+        truncated = tmp_path / "truncated.dna"
+        truncated.write_bytes(b"\x09\x00not enough bytes")
+        with pytest.raises(ValueError, match="CommercialSaaS"):
+            sc.load_genbank(str(truncated))
+
+    def test_repopulate_uses_text_so_markup_in_name_renders_literal(self):
+        """Plasmid display name with Rich markup must render literally,
+        not inject style. Cell stored as Text(...) — the rich `Text`
+        wrapper is opaque to markup parsing, so the brackets stay."""
+        from rich.text import Text
+        sc._save_collections([{"name": "[red]EVIL[reset]", "plasmids": []}])
+        # The actual rendering check is hard to do headlessly without
+        # the App harness; verify the storage shape: the collection name
+        # round-trips with brackets intact, and adding a Text-wrapped
+        # cell to a DataTable doesn't expand markup.
+        cell = Text("[red]EVIL[reset]")
+        # A bare string would render as styled text via Console; the
+        # Text wrapper preserves the literal characters.
+        from rich.console import Console
+        from io import StringIO
+        cap = Console(file=StringIO(), width=40, force_terminal=False,
+                      no_color=True)
+        cap.print(cell)
+        out = cap.file.getvalue()
+        # The literal "[red]" stays in the rendered output; if Rich
+        # interpreted it, the substring would be stripped.
+        assert "[red]" in out
+
+
+class TestNewCollectionModalFlow:
+    """End-to-end: clicking + on collections view → NewCollectionModal →
+    submit name+folder → collection populated with imports."""
+
+    async def test_create_empty_collection_no_folder(self):
+        sc._save_collections([])
+        sc._set_active_collection_name(None)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib._view_mode = "collections"
+            lib._apply_view_mode()
+            lib._repopulate_collections()
+            lib.query_one("#btn-coll-add").action_press()
+            await pilot.pause(0.2)
+            modal = app.screen
+            assert isinstance(modal, sc.NewCollectionModal)
+            modal.query_one("#newcoll-name").value = "Empty"
+            modal.query_one("#btn-newcoll-ok").action_press()
+            await pilot.pause(0.2)
+            colls = sc._load_collections()
+            empty = [c for c in colls if c["name"] == "Empty"]
+            assert len(empty) == 1
+            assert empty[0]["plasmids"] == []
+            app.exit()
+
+    async def test_create_collection_with_bulk_import(self):
+        from pathlib import Path
+        fixtures_dir = Path(__file__).parent
+        if not list(fixtures_dir.glob("FFE*.dna")):
+            pytest.skip("No FFE .dna fixtures present")
+        sc._save_collections([])
+        sc._set_active_collection_name(None)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib._view_mode = "collections"
+            lib._apply_view_mode()
+            lib._repopulate_collections()
+            lib.query_one("#btn-coll-add").action_press()
+            await pilot.pause(0.2)
+            modal = app.screen
+            assert isinstance(modal, sc.NewCollectionModal)
+            modal.query_one("#newcoll-name").value = "FFE Trial"
+            # Bypass the DirectoryTree click → set the selection directly.
+            modal._selected_folder = fixtures_dir
+            modal.query_one("#btn-newcoll-ok").action_press()
+            await pilot.pause(0.5)
+            colls = sc._load_collections()
+            ffe = [c for c in colls if c["name"] == "FFE Trial"]
+            assert len(ffe) == 1
+            # All fixtures imported with non-empty sequences
+            assert len(ffe[0]["plasmids"]) >= 5
+            for e in ffe[0]["plasmids"]:
+                assert e["size"] > 0 and e["gb_text"]
+            app.exit()
+
+    async def test_clear_folder_button_deselects(self):
+        from pathlib import Path
+        fixtures_dir = Path(__file__).parent
+        sc._save_collections([])
+        sc._set_active_collection_name(None)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib._view_mode = "collections"
+            lib._apply_view_mode()
+            lib._repopulate_collections()
+            lib.query_one("#btn-coll-add").action_press()
+            await pilot.pause(0.2)
+            modal = app.screen
+            modal._selected_folder = fixtures_dir
+            assert modal._selected_folder is not None
+            modal.query_one("#btn-newcoll-clear").action_press()
+            await pilot.pause(0.05)
+            assert modal._selected_folder is None
             app.exit()
 
 

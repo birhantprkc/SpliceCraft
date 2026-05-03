@@ -7,120 +7,213 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Status: Beta](https://img.shields.io/badge/status-beta-orange.svg)](https://github.com/Binomica-Labs/SpliceCraft)
 
-A terminal-based circular plasmid map viewer, sequence editor, **primer design
-workbench**, and **Golden Braid parts domesticator** — rendered entirely in your
-shell. Fetch any GenBank record by accession, load local files, organize plasmids
-into named **collections**, design diagnostic / cloning / Golden Braid primers
-with Primer3, run **SOE-PCR site-directed mutagenesis** on any CDS, and edit
-sequences — without ever leaving the terminal.
+**A plasmid workbench you live in.** SpliceCraft is a terminal-native
+viewer, sequence editor, primer + mutagenesis designer, Golden Braid /
+MoClo cloning workbench, and in-process BLAST / HMMscan engine — all
+rendered as crisp Unicode braille graphics in any modern terminal.
+Fetch from NCBI, load `.gb` / `.gbk` / CommercialSaaS `.dna` files (single or
+in bulk), organize plasmids into named collections, design diagnostic /
+cloning / Golden Braid primers via Primer3, run SOE-PCR site-directed
+mutagenesis on any CDS, and search your own plasmid library by sequence
+similarity — without ever leaving the shell.
+
+**Built for daily lab work.** SpliceCraft is actively maintained by a
+practicing bioengineer who uses it as their primary day-to-day tool for
+plasmid design, cloning planning, and sequence triage. Bug reports come
+from the bench; releases ship from the bench. Every feature has a
+real-world job.
 
 ![SpliceCraft screenshot](https://raw.githubusercontent.com/Binomica-Labs/SpliceCraft/master/splicecraftScreenshot.png)
 
-## Quick start
+---
 
-> ⚠️ **Beta software.** SpliceCraft is under active development and the API,
-> UI, and on-disk file formats may change between releases. Your data files
-> (`plasmid_library.json`, `parts_bin.json`, `primers.json`) are auto-backed
-> up to `*.bak` on every save, but please keep your own off-disk copies of
-> anything critical. **Do not use SpliceCraft as your sole system of record
-> for cloning work until it exits beta.**
+## Robustness is a feature, not an afterthought
 
-```bash
-pipx install splicecraft
-splicecraft              # empty canvas
-splicecraft L09137       # fetch pUC19 from NCBI
-splicecraft myplasmid.gb # open a local GenBank (.gb/.gbk) or CommercialSaaS (.dna) file
-```
+A workbench you trust your day to has to behave like one. SpliceCraft
+takes data safety and predictable behaviour as first-class design
+constraints:
 
-**That's it.** `pipx` creates an isolated virtual environment for SpliceCraft
-and its dependencies, so it won't clash with system Python packages. If you
-don't have pipx yet: `sudo apt install pipx` on Debian/Ubuntu/WSL2,
-`brew install pipx` on macOS, or `python -m pip install --user pipx` elsewhere.
-User data lives in the platform-appropriate data directory (see the
-Installation section below).
+- **Atomic writes with on-disk backups.** Every `*.json` library file
+  goes through `tempfile.mkstemp` + `os.fsync` + `os.replace`, with the
+  prior version copied to `*.json.bak` *before* the new write lands.
+  Mid-process crash, full-disk error, or hand-edit gone wrong — the
+  panel re-loads from `.bak` on next launch with a corruption-recovery
+  toast.
+- **Crash-recovery autosave.** Dirty edits debounce a 3-second write
+  to a per-record `.gb` snapshot. Power-cut your laptop mid-edit; the
+  next launch surfaces the survivors.
+- **1,200+ tests** (`pytest -n auto -q`, ~3 min on 8 cores) anchored on
+  ten **sacred invariants** for biology correctness: palindromic-enzyme
+  scanning, reverse-strand coordinate handling, IUPAC reverse-complement
+  including ambiguity codes, wrap-around feature math, atomic-save
+  contract, undo deepcopy, etc. Property-based fuzzing
+  (`hypothesis`) doubles up on the riskiest ones. Touching the biology
+  primitives trips a test in under two seconds.
+- **No external BLAST install.** `pyhmmer` ships HMMER 3 source compiled
+  in-wheel; BLASTN, BLASTP, and HMMscan all run in-process via
+  `nhmmer` / `phmmer` / `hmmscan`, with a pure-Python ungapped fallback
+  for queries too short for HMMER's profile builder. Zero external
+  binaries; no PATH gymnastics.
+- **Hardened input boundaries.** Centralised sanitisers strip control
+  characters and Rich-markup metacharacters at every user-input boundary
+  (modals, agent-API endpoints, NCBI fetch, bulk-import filenames). A
+  hostile filename like `[red]EVIL[/red].dna` imports cleanly and
+  renders as the literal characters in the panel and notifications.
+  Modal-active gating keeps seq-cursor moves and selection slides from
+  firing underneath active modals; CDS-divisibility gating prevents
+  nonsensical AA strips on non-triple features; resite cuts carry baked
+  per-strand offsets (no legacy schema crashes).
+- **Refusal to start in a tiny terminal.** Below 100×30, SpliceCraft
+  prints a friendly resize-and-retry message and exits with code 2
+  rather than rendering a clipped, broken UI.
+- **Bulk-import with per-file failure isolation.** The bulk CommercialSaaS /
+  GenBank importer caps per-file size at 50 MB, skips zero-length
+  records, catches `OSError` / `PermissionError` / `struct.error`
+  per-file, and dedups colliding ids by suffix. One bad file in a
+  500-plasmid archive does not abort the batch.
+- **Drift defenses.** Future-version JSON schemas load with a warning
+  and a `.bak` rotation rather than crashing. Legacy schemas auto-
+  rewrite on the next save. Migration code runs idempotently in
+  `App.compose()` before any child mounts so the panel always sees a
+  consistent state.
+
+> ⚠️ **Beta software.** SpliceCraft is under active development; the
+> UI, on-disk file formats, and agent-API surface may evolve between
+> releases. Your data files are auto-backed up to `*.bak` on every
+> save, but please keep your own off-disk copies of anything critical.
+> The maintainer treats it as their primary workbench — but it should
+> not yet be a project's sole system of record.
 
 ---
 
-## Features
+## Quick start
 
-### Core visualization & editing
-- **Braille dot-matrix circular map** — plasmids rendered as crisp Unicode braille
-  rings with per-strand feature arcs, directional arrowheads, and proximity-placed
-  labels
-- **Linear map view** — toggle with `v` for a horizontal strip layout
-- **Dithered sequence panel** — per-base DNA viewer with feature bars, restriction
-  site overlays, and double-stranded display
-- **Inline amino-acid translation** — every CDS shows its protein right above
-  (forward) or below (reverse) its DNA bar, one letter per codon midpoint, in
-  the feature's colour. Wrap-around CDSes translate correctly across the origin.
-  Click an AA letter to highlight that codon's three bases on the strand —
-  `Ctrl+C` copies the codon
-- **Per-strand restriction-cut visualization** — clicking a sticky cutter
-  (EcoRI, HindIII, …) tints the upstream bases blue and downstream bases red,
-  with the staggered overhang shown as different colours on the two strands
-- **Live NCBI fetch** — pull any GenBank record by accession number on demand
-- **Local file support** — open `.gb` / `.gbk` (GenBank) or `.dna` (CommercialSaaS native) files directly from disk
-- **Free rotation** — spin the origin with `[` / `]` or arrow keys (when the map has focus)
-- **Restriction enzyme overlay** — 200+ NEB enzymes including Type IIS
-  (BsaI, BsmBI, BbsI, SapI) with visible recognition arcs + cut markers
+```bash
+pipx install splicecraft
+splicecraft                      # empty canvas
+splicecraft L09137               # fetch pUC19 from NCBI on launch
+splicecraft myplasmid.gb         # local GenBank (.gb/.gbk) or CommercialSaaS (.dna) file
+```
 
-### Libraries (all persist to JSON)
-- **Plasmid collections** — organize plasmids into named buckets (e.g. "yeast
-  project", "E. coli toolkit"). Library panel toggles between a collection list
-  and the active collection's plasmids; a default "Main Collection" is created
-  on first run, with full add / remove / rename CRUD from the panel
-- **Plasmid library** — auto-saves on import, mirrors live into the active
-  collection, survives restarts, rename + handslip-protected delete; unsaved
-  edits prompt Save / Discard / Cancel before navigating away
-- **Library fuzzy search** — type into the search box at the top of the
-  library panel to filter the visible table by subsequence match (case-insensitive,
-  not necessarily contiguous). Empty submit restores the full list.
-- **Parts Bin** — Golden Braid L0 parts catalog with user-domesticated parts
-  including sequences and primer pairs
-- **Primer library** — all designed primers with Tm, length, date, status
-  (Designed / Ordered / Validated), multi-select for batch operations
-- **Feature library** — reusable feature snippets with per-entry color and strand,
-  centralized workbench for browse / edit / rename / recolor / delete
+`pipx` creates an isolated virtual environment for SpliceCraft and its
+dependencies, so it won't clash with system Python packages. If you
+don't have pipx yet: `sudo apt install pipx` on Debian/Ubuntu/WSL2,
+`brew install pipx` on macOS, or `python -m pip install --user pipx`
+elsewhere. User data lives in the platform-appropriate data directory
+(see Installation).
 
-### Primer design (Primer3)
-- **Detection primers** — diagnostic PCR; Primer3 picks the ideal pair within
-  a selected region, 450-550 bp product by default (configurable)
-- **Cloning primers** — RE-site tails + GCGC padding; 30+ common enzymes or
-  type a custom recognition sequence
-- **Golden Braid primers** — Esp3I / BsmBI domestication for all L0
-  positions (Promoter, 5' UTR, CDS, CDS-NS, C-tag, Terminator). Splitting
-  L0 (Esp3I) from L1 (BsaI) lets domesticated parts survive the L1
-  Golden Gate reaction without re-cutting.
-- **Generic primers** — simple binding primers, no tails
-- Primers can be added to the plasmid map as `primer_bind` features
-- Scrollable `TextArea` for custom sequence input; highlighted text = target
+Press `?` once running for the full keyboard-shortcut reference.
+
+---
+
+## What you can do without leaving the terminal
+
+### View
+- **Braille dot-matrix circular maps** — plasmids rendered as crisp
+  Unicode braille rings with per-strand feature arcs, directional
+  arrowheads, and proximity-placed labels. `v` toggles linear view.
+- **Per-base sequence panel** with two-strand display, wrap-aware
+  feature lanes, restriction-site overlays, and inline AA translation
+  (one letter per codon midpoint, in the CDS's colour, with wrap-CDS
+  support across the origin). Click an AA letter to highlight the
+  codon's three bases on the strand.
+- **Per-strand restriction-cut visualisation** — clicking a sticky
+  cutter (EcoRI, HindIII, BsaI, BsmBI, BbsI, …) tints upstream bases
+  blue and downstream red, with the staggered overhang showing as
+  different colours on the two strands.
+- **200+ NEB enzymes** including Type IIS scanners; toggle restriction
+  overlays with `r`, filter to unique cutters / 6+ bp / connectors.
+
+### Edit
+- **In-place sequence edits** with full undo / redo (50-deep snapshot
+  stack, deepcopied SeqRecord). Per-plasmid undo stashes — switch
+  records, edit, switch back, undo history is restored.
+- **Feature CRUD**: add / merge / split / delete / rename / recolor
+  features; clipboard copies (top strand or reverse-complement bottom
+  strand). Mouse-drag selects ranges; `Enter` highlights the smallest
+  feature enclosing the cursor.
+- **Crash-recovery autosave** writes a 3-second-debounced `.gb`
+  snapshot to the data dir; survivors surface on next launch.
+
+### Cloning
+- **Cloning grammars** — GB L0 (Esp3I) and MoClo Plant (BsaI) ship as
+  built-ins; user-defined grammars persist to `cloning_grammars.json`
+  and are editable in `GrammarEditorModal`. The active grammar
+  parameterises the Domesticator, Parts Bin, and Constructor — change
+  enzyme / overhang / forbidden-site set without code edits.
+- **Domesticator** — 4-source part picker (current map, library,
+  Parts Bin, FASTA file). Auto-scrubs forbidden Type IIS sites in the
+  CDS body via codon swap with cascade-prevention; primer tails follow
+  the active grammar's pad / site / spacer / overhang.
+- **Parts Bin** — domesticated parts catalog with per-grammar filtering;
+  legacy parts default to GB L0; "Copy primed sequence" preserves the
+  part's stored grammar.
+- **Constructor** — assembly UI for chaining L0 parts into a TU.
+- **Primer design** — detection / cloning / Golden Braid / generic via
+  Primer3; primers can be added to the map as `primer_bind` features
+  or saved to the persistent primer library (Designed → Ordered →
+  Validated lifecycle).
 
 ### Mutagenesis
-- **SOE-PCR site-directed mutagenesis** — design 4-primer SOE sets for any
-  W140F-style mutation. CDS source can be the loaded plasmid, a library entry,
-  a domesticated part from the Parts Bin, or a free-form protein sequence
-  (auto-optimized to the active codon table). Edge cases (mutation within
-  60 nt of a CDS end) auto-fall back to a 2-primer modified-outer PCR.
+- **SOE-PCR site-directed mutagenesis** — design 4-primer SOE sets for
+  any W140F-style point mutation. CDS source can be the loaded plasmid,
+  a library entry, a Parts Bin part, or a free-form protein sequence
+  (auto-optimised via the active codon table). Edge cases (mutation
+  within 60 nt of a CDS end) auto-fall back to a 2-primer modified-outer
+  PCR.
 
-### Feature operations
-- **Feature sidebar** — click a row to highlight on map; click the map to
-  select the feature under the cursor
-- **Undo/redo** — 50-deep snapshot stack for all sequence edits
-- **Delete protection** — focus-aware Delete key; confirmation modal (default
-  focus = No) for library entries
-- **Clipboard** — OSC-52 copy works in Windows Terminal, iTerm2, modern WSL
+### Search
+- **In-process BLAST** (`Ctrl+B`):
+  - **BLASTN** (DNA → DNA) and **BLASTP** (protein → protein) via
+    `pyhmmer.hmmer.nhmmer` / `phmmer` (HMMER 3 in-process at C speed);
+    pure-Python ungapped fallback for queries below the HMMER profile-
+    builder minimum (20 bp / 6 aa).
+  - **HMMscan** reads any HMMER 3 `.hmm` / `.h3m` / `.h3p` file
+    directly — point it at Pfam-A or any custom profile DB. Lazy file
+    read so Pfam-scale (~1 GB) DBs don't pre-fetch into RAM.
+  - DB build + search run in a `@work(thread=True)` worker; UI stays
+    responsive on a 50-plasmid index. 4-entry LRU DB cache, auto-
+    invalidated on `_save_collections`.
+- **Six-frame ORF indexing** (opt-in checkbox) for BLASTP against
+  unannotated regions of plasmid backbones.
+- **New Plasmid modal** (`Ctrl+N`) — paste a sequence, optionally name
+  + set topology, then either Create / Annotate-from-library
+  (substring match) / Annotate-via-BLAST (≥90% identity → `misc_feature`).
 
-### Data safety
-- **Atomic saves** — all JSON files written via tempfile + `os.replace`
-- **Automatic backups** — every save writes `*.json.bak` before overwriting
-- **Corrupt-file recovery** — missing files don't crash; corrupt files auto-
-  restore from `.bak` with a warning notification on startup
+### Library
+- **Plasmid collections** — named buckets (e.g. "yeast project",
+  "E. coli toolkit"); the panel toggles between a collection list and
+  the active collection's plasmids. Atomic writes, `.bak` per change.
+  Save the loaded record with `Ctrl+Shift+A`.
+- **Bulk import a folder** — from the collections-list view, click `+`,
+  type a name, and pick a folder via the embedded directory tree.
+  Every `.dna` / `.gb` / `.gbk` / `.genbank` file inside is loaded
+  independently into a new collection; failures are isolated per file
+  and surfaced in a notify summary. Designed for migrating a CommercialSaaS
+  archive in one shot.
+- **Library fuzzy search** — subsequence match (case-insensitive,
+  non-contiguous) against the visible table.
+- **Feature library** — reusable feature snippets (per-entry colour
+  and strand) with a centralised browse / edit / rename / recolor /
+  delete workbench.
+
+### Drive it from outside the GUI
+- **Agent API** (`splicecraft --agent-api`) exposes a localhost JSON
+  API with bearer-token auth, covering every GUI action external AI
+  agents need: get / set sequence, list features, add / update / delete
+  features, export GenBank / FASTA, list library / collections, scan
+  restriction sites, look up codon tables, optimize protein sequences,
+  load files (chromosome-scale safe via the path-based loader).
+- **`splicecraft-cli`** — stdlib-only sidecar (~50 ms cold start) that
+  reads connection details from `~/.local/share/splicecraft/agent_token`
+  and drives the running GUI. Intended for Claude Code, Cursor, aider,
+  hand-rolled scripts, or any external automation.
 
 ---
 
 ## Installation
 
-Requires **Python 3.10+**.
+Requires **Python 3.10+** and a terminal of at least **100×30**.
 
 ### With pipx (recommended)
 
@@ -128,24 +221,23 @@ Requires **Python 3.10+**.
 pipx install splicecraft
 ```
 
-`pipx` installs SpliceCraft (and its Textual / Biopython / primer3-py /
-platformdirs deps) into an isolated virtual environment and places the
-`splicecraft` command on your `PATH`. This is the right approach on
-modern Debian, Ubuntu, Fedora, and WSL2, where `pip install` into the
-system Python is blocked by [PEP 668](https://peps.python.org/pep-0668/).
+`pipx` installs SpliceCraft and its deps (Textual, Biopython,
+primer3-py, platformdirs, pyhmmer) into an isolated virtual
+environment and places the `splicecraft` command on your `PATH`. This
+is the right approach on modern Debian, Ubuntu, Fedora, and WSL2,
+where `pip install` into the system Python is blocked by
+[PEP 668](https://peps.python.org/pep-0668/).
 
 If you don't already have pipx:
 
 ```bash
-sudo apt install pipx           # Debian / Ubuntu / WSL2
-brew install pipx               # macOS
-python -m pip install --user pipx  # everywhere else
-pipx ensurepath                 # one-time; adds ~/.local/bin to PATH
+sudo apt install pipx                # Debian / Ubuntu / WSL2
+brew install pipx                    # macOS
+python -m pip install --user pipx    # everywhere else
+pipx ensurepath                      # one-time; adds ~/.local/bin to PATH
 ```
 
 ### With pip inside a venv
-
-If you prefer a plain pip workflow, use a virtual environment:
 
 ```bash
 python3 -m venv ~/.venvs/splicecraft
@@ -154,201 +246,165 @@ python3 -m venv ~/.venvs/splicecraft
 ```
 
 (Plain `pip install splicecraft` into system Python works on older
-distros and inside conda envs, but will be rejected by PEP 668 on any
+distros and inside conda envs, but is rejected by PEP 668 on any
 recent Debian-family system — use `pipx` or a venv instead.)
-
-### User data location
-
-User data (library, parts bin, primers) lives in the platform-appropriate
-data directory:
-
-  | Platform | Path |
-  |---|---|
-  | Linux   | `~/.local/share/splicecraft/` |
-  | macOS   | `~/Library/Application Support/splicecraft/` |
-  | Windows | `%APPDATA%\splicecraft\` |
-
-Override with `SPLICECRAFT_DATA_DIR=/path/to/dir splicecraft`.
 
 ### From source
 
 ```bash
 git clone https://github.com/Binomica-Labs/SpliceCraft.git
 cd SpliceCraft
-pip install -e .        # inside a venv, or pass --break-system-packages
+pip install -e .                     # inside a venv
 ```
+
+### User data location
+
+User data (collections, library, parts, primers, features, codon
+tables, settings) lives in the platform-appropriate data directory:
+
+| Platform | Path                                          |
+|----------|-----------------------------------------------|
+| Linux    | `~/.local/share/splicecraft/`                 |
+| macOS    | `~/Library/Application Support/splicecraft/`  |
+| Windows  | `%APPDATA%\splicecraft\`                      |
+
+Override with `SPLICECRAFT_DATA_DIR=/path/to/dir splicecraft`.
 
 ---
 
-## Usage
+## Key bindings
 
-```bash
-splicecraft              # empty canvas
-splicecraft L09137       # fetch pUC19 from NCBI on launch
-splicecraft myplasmid.gb # open a local GenBank (.gb/.gbk) or CommercialSaaS (.dna) file
-splicecraft --version    # print version
-splicecraft --help       # quick usage hint
-```
-
-If running from a git clone (`pip install -e .`), the same commands work;
-you can also still run `python3 splicecraft.py` directly.
-
----
-
-## Key Bindings
+Press `?` in-app for the full reference (rendered via Markdown so you
+can drag-select a key combo to copy it).
 
 ### Main screen
 
-| Key            | Description                            |
-|----------------|----------------------------------------|
+| Key            | Description                                  |
+|----------------|----------------------------------------------|
 | `[` / `]`      | Rotate map origin left / right (when map focused) |
-| `← / →`        | Same as `[` / `]` (when map focused)   |
-| `↑`            | Reset origin to 0 (when map focused)   |
-| `Shift+[/]`    | Rotate coarse (10× step)               |
-| `Home`         | Reset origin to 0                      |
-| `,` / `.`      | Circular map aspect wider / taller     |
-| `v`            | Toggle circular ↔ linear map           |
-| `l`            | Toggle feature label connector lines   |
-| `r`            | Toggle restriction-site overlay        |
-| `f`            | Fetch a record from NCBI by accession  |
-| `Ctrl+O`       | Open a `.gb` file from disk            |
-| `Ctrl+Shift+A` | Add current plasmid to the library     |
-| `Ctrl+E`       | Enter sequence editor mode             |
-| `Ctrl+S`       | Save edits to file                     |
-| `Ctrl+F`       | Add a new feature (from cursor or blank) |
+| `← / →`        | Same as `[` / `]` (when map focused)         |
+| `↑`            | Reset origin to 0 (when map focused)         |
+| `Shift+[/]`    | Rotate coarse (10× step)                     |
+| `,` / `.`      | Circular map aspect wider / taller           |
+| `v`            | Toggle circular ↔ linear map                 |
+| `l`            | Toggle feature label connector lines         |
+| `r`            | Toggle restriction-site overlay              |
+| `f`            | Fetch a record from NCBI by accession        |
+| `Ctrl+O`       | Open a `.gb` / `.gbk` / `.dna` file from disk |
+| `Ctrl+N`       | New Plasmid (paste sequence + optional annotate) |
+| `Ctrl+B`       | BLAST modal (BLASTN / BLASTP / HMMscan)      |
+| `Ctrl+Shift+A` | Add current plasmid to the library           |
+| `Ctrl+A`       | Select-all sequence                          |
+| `Ctrl+E`       | Enter sequence editor mode                   |
+| `Ctrl+S`       | Save edits to file                           |
+| `Ctrl+F`       | Add a new feature (from cursor or blank)     |
 | `Ctrl+Shift+F` | Capture selection / feature → Feature library |
+| `Ctrl+P`       | Primer Design workbench                      |
 | `Enter`        | Highlight the feature enclosing the seq cursor |
 | `Delete`       | Context-aware delete (feature or library entry) |
-| `Ctrl+Z`       | Undo                                   |
-| `Ctrl+Shift+Z` | Redo                                   |
+| `Ctrl+Z`       | Undo                                         |
+| `Ctrl+Shift+Z` / `Ctrl+Y` | Redo                              |
 | `Ctrl+C`       | Copy selection (top strand 5'→3', or AA when CDS highlighted) |
 | `Alt+C`        | Copy selection (bottom strand, reverse-complement) |
-| `q`            | Quit                                   |
-
-### Primer Design screen
-
-| Key   | Description                                    |
-|-------|------------------------------------------------|
-| `esc` | Close primer screen                            |
-| `m`   | Mark / unmark primer under cursor (`★`)        |
-| `M`   | Mark / unmark all primers                      |
-| `S`   | Cycle status: Designed → Ordered → Validated   |
-| `Tab` | Cycle focus between fields                     |
+| `Alt+D`        | Toggle hover-status diagnostic row           |
+| `?`            | Help modal                                   |
+| `Ctrl+Q`       | Quit                                         |
 
 ### Mouse
 
-| Action         | Description                                 |
-|----------------|---------------------------------------------|
-| Click DNA row  | Place cursor at that base                   |
-| Click feature bar | Highlight the feature, set cursor at its 5' end |
-| Click AA letter | Highlight that codon's three bases on the strand |
+| Action               | Description                                        |
+|----------------------|----------------------------------------------------|
+| Click DNA row        | Place cursor at that base                          |
+| Click feature bar    | Highlight the feature, set cursor at its 5' end    |
+| Click AA letter      | Highlight that codon's three bases on the strand   |
 | Click restriction site | Highlight recognition span; tint upstream blue / downstream red per strand |
-| Double-click   | Select full feature span                    |
-| Drag           | Select a sequence range                     |
-| Scroll wheel   | Rotate map (when over map panel)            |
-| Click backbone | Clear all panel highlights                  |
+| Double-click         | Select full feature span                           |
+| Drag                 | Select a sequence range                            |
+| Scroll wheel         | Rotate map (when over map panel)                   |
+| Click backbone       | Clear all panel highlights                         |
 
 ---
 
 ## Menus
 
-| Menu       | Items                                                                                  |
-|------------|----------------------------------------------------------------------------------------|
-| File       | Open .gb file · Fetch from NCBI · Add to Library · Save · Export GenBank · Collections · Quit |
-| Edit       | Edit Sequence · Undo · Redo · Add Feature · Capture → feat-lib · Delete Feature        |
-| Enzymes    | Show RE sites · Unique cutters · 6+/4+ bp sites · Connectors                           |
-| Features   | Opens the Feature Library workbench                                                    |
-| Primers    | Opens the full-screen Primer Design workbench                                          |
-| Mutagenize | Opens the SOE-PCR site-directed mutagenesis designer (4-source CDS picker)             |
-| Parts      | Opens the Parts Bin (Golden Braid L0 parts catalog)                                    |
-| Constructor| Opens the Assembly Constructor for TU building                                         |
-
----
-
-## Requirements
-
-| Package           | Version           | Purpose                                      |
-|-------------------|-------------------|----------------------------------------------|
-| Python            | ≥ 3.10            | Runtime                                      |
-| Textual           | ≥ 8.2.3           | TUI framework and rendering engine           |
-| Rich              | ≥ 14.0            | Terminal rendering (Textual dependency)      |
-| Biopython         | ≥ 1.87            | GenBank parsing and NCBI Entrez fetch        |
-| primer3-py        | ≥ 2.3.0           | Primer design (Tm, thermodynamic screening)  |
-| platformdirs      | ≥ 4.2             | Cross-platform user-data directory           |
-| pytest            | ≥ 9.0             | Test suite (dev only)                        |
-| pytest-asyncio    | ≥ 1.3             | Async test support (dev only)                |
+| Menu        | Items                                                                            |
+|-------------|----------------------------------------------------------------------------------|
+| File        | Open · Fetch from NCBI · New Plasmid · Add to Library · Save · Export GenBank · Collections · Quit |
+| Edit        | Edit Sequence · Undo · Redo · Add Feature · Capture → feat-lib · Delete Feature  |
+| Enzymes     | Show RE sites · Unique cutters · 6+/4+ bp sites · Connectors                     |
+| Features    | Feature Library workbench                                                        |
+| Primers     | Full-screen Primer Design workbench                                              |
+| Mutagenize  | SOE-PCR site-directed mutagenesis designer (4-source CDS picker)                 |
+| Parts       | Parts Bin (per-grammar)                                                          |
+| Constructor | Assembly Constructor for TU building                                             |
+| BLAST       | BLAST / HMMscan modal                                                            |
 
 ---
 
 ## Data files
 
-All user data persists as human-readable JSON in the platform-appropriate user
-data directory:
+All user data persists as human-readable JSON in the user data
+directory; every save is atomic and writes a `.bak` first.
 
 | File                       | Purpose                                                  |
 |----------------------------|----------------------------------------------------------|
-| `collections.json`         | Named collections of plasmids; source of truth           |
+| `collections.json`         | Named collections of plasmids — source of truth          |
 | `plasmid_library.json`     | Live mirror of the active collection's plasmids          |
-| `parts_bin.json`           | User-domesticated Golden Braid parts                     |
+| `parts_bin.json`           | User-domesticated cloning parts                          |
 | `primers.json`             | Designed primer library                                  |
 | `features.json`            | Reusable feature snippets                                |
 | `feature_colors.json`      | Per-type feature color overrides                         |
 | `codon_tables.json`        | Cached codon-usage tables fetched from Kazusa            |
-| `cloning_grammars.json`    | User-defined cloning grammars (Golden Braid / MoClo)     |
-| `settings.json`            | App preferences (active collection, active grammar, ...) |
+| `cloning_grammars.json`    | User-defined cloning grammars (Golden Braid / MoClo / custom) |
+| `settings.json`            | App preferences (active collection, active grammar, …)   |
+| `crash_recovery/*.gb`      | Per-record crash-recovery autosaves                      |
 | `*.json.bak`               | Automatic backup — written before each save              |
 
-A manual backup rotation happens on every save so accidental data loss is
-always recoverable via the `.bak` file.
+The schema envelope (`{"_schema_version": 1, "entries": [...]}`)
+silently accepts the legacy bare-list format (pre-0.3.1) and rewrites
+it on the next save. Newer-version files load with a warning rather
+than crashing.
 
 ---
 
 ## Tests
 
 ```bash
-python3 -m pytest -n auto -q                  # full suite (1,009 tests, ~2 min on 8 cores)
-python3 -m pytest tests/test_dna_sanity.py    # biology correctness only (< 2s)
+python3 -m pytest -n auto -q                  # full suite (~3 min on 8 cores)
+python3 -m pytest tests/test_dna_sanity.py    # biology correctness only (< 2 s)
+python3 -m pytest tests/test_invariants_hypothesis.py  # property-based fuzzing
 ```
+
+All tests run offline against synthetic `SeqRecord`s and monkeypatched
+data paths; an autouse fixture in `tests/conftest.py` guarantees no
+test can write to real user files.
 
 ---
 
 ## Codebase tour
 
-SpliceCraft is a single-file Python app (`splicecraft.py`, ~17,900 lines) built on
-Textual + Biopython. The single-file layout is intentional — no import puzzles,
-and everything is greppable from one place.
+SpliceCraft is a single-file Python app (`splicecraft.py`,
+~23,000 lines) on Textual + Biopython. The single-file layout is
+intentional — no import puzzles, everything is greppable from one
+place.
 
-### Layout at a glance
+`grep -n "^class \|^def " splicecraft.py` gives an authoritative live
+map. Test files are 1:1 named after the subsystem they cover.
 
-| Region | Contents |
-|--------|----------|
-| Top of file | imports, user data dir (`platformdirs`), rotating session-tagged logger, `_safe_save_json` / `_safe_load_json` (atomic writes + `.bak` recovery) |
-| Persistence | Library + parts-bin + primers + features + feature-colors + codon-tables + cloning-grammars + settings + **collections** (collection-driven model with active-pointer in settings.json + library mirror sync) |
-| Biology core | NEB enzyme catalog, IUPAC-aware `_rc`, `_scan_restriction_sites` (palindrome- and wrap-aware), sequence panel renderer, `_translate_cds` |
-| I/O | `fetch_genbank` (NCBI Entrez), `load_genbank` (`.gb` / `.gbk` / `.dna`), GenBank/FASTA export |
-| Rendering | `_Canvas` + `_BrailleCanvas` (sub-cell dot matrix), `PlasmidMap`, `SequencePanel`, `FeatureSidebar`, `LibraryPanel` (two-mode: collections list ↔ active-collection plasmids), `MenuBar` |
-| Workbenches | `PrimerDesignScreen` (detection / cloning / Golden Braid / generic), `MutagenizeModal` (SOE-PCR; 4-source CDS picker), `DomesticatorModal` + `ConstructorModal` (Golden Braid L0), `FeatureLibraryScreen` |
-| Registries | codon-usage tables, parts bin, primer library, feature library, cloning grammars, plasmid collections — all persisted as JSON with automatic `.bak` backups |
-| Controller | `PlasmidApp` — keybindings, undo/redo (50-deep snapshot stack), `@work` threads for NCBI / Kazusa, collection-driven startup migration in `compose()` |
+`CLAUDE.md` at the repo root is the **agent + contributor handover
+document**: ten sacred invariants, error-handling convention, known
+pitfalls. Read it before touching the rendering layer, record pipeline,
+or primer design.
 
-### Contributor docs
+---
 
-`CLAUDE.md` at the repo root is the **agent + contributor handover document**.
-It covers the 10 sacred invariants (biology correctness rules with test coverage),
-the error-handling convention, performance notes, and modular recipes for adding
-modals, workers, menus, or persisted libraries without tripping the invariants.
-Read it before touching the rendering layer, record pipeline, or primer design.
+## Maintenance
 
-### Running the suite
-
-```bash
-python3 -m pytest -n auto -q                  # full suite (~2 min)
-python3 -m pytest tests/test_dna_sanity.py    # biology only (< 2 s)
-```
-
-All tests run offline against synthetic `SeqRecord`s and monkeypatched data paths;
-an autouse fixture in `tests/conftest.py` guarantees no test can write to real
-user files.
+SpliceCraft is actively maintained. The maintainer is a practicing
+bioengineer running real cloning workflows in it daily; releases
+typically go out the same week a problem surfaces at the bench. Issues
+and PRs welcome at
+[github.com/Binomica-Labs/SpliceCraft/issues](https://github.com/Binomica-Labs/SpliceCraft/issues).
 
 ---
 

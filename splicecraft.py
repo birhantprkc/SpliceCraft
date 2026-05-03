@@ -27,6 +27,7 @@ import math
 import os
 import platform
 import re
+import shutil
 import sys
 import uuid as _uuid
 from datetime import date as _date
@@ -2392,14 +2393,18 @@ def load_genbank(path: str):
     Raises ValueError with a user-friendly message if the file has no
     records or multiple records.
     """
+    import struct
     from Bio import SeqIO
     from pathlib import Path as _P
     fmt = _detect_plasmid_format(path)
     try:
         records = list(SeqIO.parse(path, fmt))
-    except ValueError as exc:
-        # CommercialSaaS parser raises ValueError on malformed files; rewrap
-        # with a more useful message.
+    except (ValueError, struct.error) as exc:
+        # CommercialSaaS parser raises ValueError on most malformed files, but
+        # Biopython's binary unpacking can also leak struct.error when a
+        # .dna file has a truncated header / nonsense packet length.
+        # Rewrap both as user-friendly ValueError so callers don't have
+        # to special-case struct.error.
         if fmt == "commercialsaas":
             raise ValueError(
                 f"Could not parse CommercialSaaS file {path}: {exc}. "
@@ -2421,6 +2426,120 @@ def load_genbank(path: str):
     if not rec.name or rec.name.startswith("<unknown"):
         rec.name = safe_stem
     return rec
+
+
+_BULK_IMPORT_EXTS = {".dna", ".gb", ".gbk", ".genbank"}
+
+# Per-file size cap. Plasmids are typically <100 KB; anything larger is
+# probably a chromosome dump or an unrelated file. Refuse rather than
+# OOM the parser. 50 MB leaves headroom for huge cosmids / BACs.
+_BULK_IMPORT_MAX_BYTES = 50 * 1024 * 1024
+
+# Hard cap on display-name length stored in entry["name"]. The panel
+# truncates to 14 chars, but the full name lives in the JSON; keep it
+# from blowing up if someone hands us a 4 KB filename.
+_BULK_IMPORT_MAX_NAME_LEN = 256
+
+
+def _record_to_library_entry(record, source_path: Path) -> dict:
+    """Build a plasmid_library.json entry dict from a SeqRecord.
+
+    Display name uses the original filename stem (spaces preserved); the
+    LOCUS-safe `record.id` is kept as the entry id. This way a CommercialSaaS
+    file named "FFE 1 ENTRY UPD.dna" shows up in the panel as
+    "FFE 1 ENTRY UPD" (truncated to 14 chars by the panel) rather than
+    the underscored LOCUS form.
+
+    Display name is capped at `_BULK_IMPORT_MAX_NAME_LEN` and stripped of
+    control characters so a hostile filename can't blow up the panel
+    table or hide content via newline injection.
+    """
+    raw_name = source_path.stem or record.name or record.id or "plasmid"
+    # Strip control chars (newline, tab, carriage return, NUL). Replace
+    # with underscore so the name stays readable.
+    cleaned = "".join(c if c.isprintable() else "_" for c in raw_name)
+    display_name = cleaned[:_BULK_IMPORT_MAX_NAME_LEN] or "plasmid"
+    return {
+        "name":    display_name,
+        "id":      record.id,
+        "size":    len(record.seq),
+        "n_feats": len([f for f in record.features if f.type != "source"]),
+        "source":  f"file:{source_path.name}",
+        "added":   _date.today().isoformat(),
+        "gb_text": _record_to_gb_text(record),
+    }
+
+
+def _bulk_import_folder(folder: Path) -> "tuple[list[dict], list[tuple[Path, str]]]":
+    """Walk `folder` for .dna / .gb / .gbk / .genbank files and load each.
+
+    Returns (entries, failures). Each file is loaded independently —
+    a single corrupt file doesn't abort the batch. Entries are deduped
+    by id within the batch; collisions get a `_2`, `_3`, ... suffix.
+    Failures carry (path, reason) so the caller can surface them.
+
+    Defensive against:
+      - Folders that can't be read (PermissionError / FileNotFoundError /
+        OSError on the directory itself) → returned as a single failure
+        keyed on the folder path.
+      - Files larger than `_BULK_IMPORT_MAX_BYTES` → skipped with reason.
+      - Records with zero-length sequences → skipped with reason.
+      - `path.stat()` / `path.is_file()` raising OSError on a per-file
+        basis → that file is recorded as a failure, others continue.
+      - Any exception inside `load_genbank` → recorded as a failure with
+        the friendly reason; full traceback goes to `_log.exception`.
+    """
+    entries: list[dict] = []
+    failures: list[tuple[Path, str]] = []
+    seen_ids: set[str] = set()
+
+    # Read the directory once. Permission / not-found / disappeared-during-
+    # selection: surface as one folder-level failure rather than crash.
+    try:
+        children = sorted(folder.iterdir())
+    except (OSError, PermissionError) as exc:
+        _log.warning("bulk_import: cannot read folder %s: %s", folder, exc)
+        return [], [(folder, f"could not read folder: {exc}")]
+
+    for path in children:
+        try:
+            if not path.is_file():
+                continue
+        except OSError as exc:
+            failures.append((path, f"stat failed: {exc}"))
+            continue
+        if path.suffix.lower() not in _BULK_IMPORT_EXTS:
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            failures.append((path, f"stat failed: {exc}"))
+            continue
+        if size > _BULK_IMPORT_MAX_BYTES:
+            failures.append((
+                path,
+                f"file too large ({size:,} bytes; cap "
+                f"{_BULK_IMPORT_MAX_BYTES:,}). Skipping to avoid OOM.",
+            ))
+            continue
+        try:
+            rec = load_genbank(str(path))
+            if len(rec.seq) == 0:
+                failures.append((path, "empty sequence (no bases)"))
+                continue
+            entry = _record_to_library_entry(rec, path)
+            base_id = entry["id"]
+            n = 1
+            while entry["id"] in seen_ids:
+                n += 1
+                entry["id"] = f"{base_id}_{n}"
+            seen_ids.add(entry["id"])
+            entries.append(entry)
+        except Exception as exc:
+            _log.exception("bulk_import: failed to load %s", path)
+            failures.append((path, str(exc)))
+    return entries, failures
+
 
 def _record_to_gb_text(record) -> str:
     """Serialize a SeqRecord to GenBank format text.
@@ -2591,12 +2710,6 @@ def _export_fasta_to_path(name: str, sequence: str, path) -> dict:
 
     _log.info("Exported FASTA to %s (%s, %d bp)", p, header, len(seq))
     return {"path": str(p), "bp": len(seq), "name": header}
-
-
-# pLannotate integration removed — the panel's annotate button became a
-# back-to-collections button, and the Shift+A keybinding + Edit menu entry
-# are gone. Users who want auto-annotation can still run pLannotate
-# externally and import the resulting GenBank file via File > Open.
 
 
 # ── Core drawing ───────────────────────────────────────────────────────────────
@@ -3913,7 +4026,10 @@ class LibraryPanel(Widget):
             if not _fuzzy_match(flt, name):
                 continue
             n_plas = len(c.get("plasmids", []) or [])
-            t.add_row(name[:14], str(n_plas), key=name)
+            # Wrap in Text() so any markup chars (e.g. a collection
+            # named "[red]x[/red]") render literally — Text(str) is
+            # opaque to Rich's markup parser, unlike a bare string.
+            t.add_row(Text(name[:14]), str(n_plas), key=name)
 
     def _repopulate_plasmids(self) -> None:
         t = self.query_one("#lib-table", DataTable)
@@ -3925,8 +4041,10 @@ class LibraryPanel(Widget):
                 continue
             is_dirty = (entry["id"] == self._active_id and self._active_dirty)
             name_disp = ("*" + name)[:14] if is_dirty else name[:14]
+            # See _repopulate_collections: Text() prevents markup
+            # injection from filename-derived display names.
             t.add_row(
-                name_disp,
+                Text(name_disp),
                 f"{entry['size']:,}",
                 key=entry["id"],
             )
@@ -4187,26 +4305,67 @@ class LibraryPanel(Widget):
 
     @on(Button.Pressed, "#btn-coll-add")
     def _btn_coll_add(self):
-        def _picked(name: "str | None") -> None:
-            if not name:
+        def _picked(result) -> None:
+            if not result:
                 return
+            name, folder = result
             if _collection_name_taken(name):
                 self.app.notify(
                     f"Collection '{name}' already exists.",
                     severity="warning",
                 )
                 return
+            plasmids: list[dict] = []
+            description = ""
+            if folder is not None:
+                entries, failures = _bulk_import_folder(folder)
+                plasmids = entries
+                description = f"Bulk imported from {folder}"
+                n_ok, n_fail = len(entries), len(failures)
+                # markup=False so a hostile filename / folder path with
+                # Rich tags ([red]…[/]) renders literally instead of
+                # injecting style. _record_to_library_entry already
+                # sanitises display names, but the notify summary below
+                # still echoes raw filename paths from the failures list.
+                if n_ok and not n_fail:
+                    self.app.notify(
+                        f"Imported {n_ok} plasmid(s) into '{name}'.",
+                        severity="information", markup=False,
+                    )
+                elif n_ok and n_fail:
+                    tail = ", ".join(p.name for p, _ in failures[:3])
+                    if n_fail > 3:
+                        tail += f", … (+{n_fail - 3} more)"
+                    self.app.notify(
+                        f"Imported {n_ok}, failed {n_fail}: {tail}",
+                        severity="warning", timeout=8, markup=False,
+                    )
+                elif n_fail:
+                    # Folder-level failure (single tuple keyed on the
+                    # folder itself) shows up here. Surface the reason
+                    # so the user knows whether to fix permissions.
+                    reason = failures[0][1] if len(failures) == 1 else \
+                             f"{n_fail} file(s) failed to import"
+                    self.app.notify(
+                        f"Import failed: {reason}",
+                        severity="error", timeout=8, markup=False,
+                    )
+                else:
+                    self.app.notify(
+                        f"No .dna / .gb / .gbk files found in {folder}.",
+                        severity="warning", markup=False,
+                    )
             existing = _load_collections()
             existing.append({
                 "name":        name,
-                "description": "",
-                "plasmids":    [],
+                "description": description,
+                "plasmids":    plasmids,
                 "saved":       _date.today().isoformat(),
             })
             _save_collections(existing)
             self._repopulate_collections()
         self.app.push_screen(
-            CollectionNameModal("New collection", "", "Collection name"),
+            NewCollectionModal(),
             callback=_picked,
         )
 
@@ -18087,8 +18246,12 @@ class CollectionNameModal(ModalScreen):
         self._submit()
 
     def _submit(self) -> None:
-        name = self.query_one("#collname-input", Input).value.strip()
-        if not name:
+        raw = self.query_one("#collname-input", Input).value
+        # Same normaliser the agent-API uses: strip control chars,
+        # trim, cap length. Stops a hand-typed `name\x00\n` from
+        # breaking the panel header / collection-list rendering.
+        name = _normalize_collection_name(raw)
+        if name is None:
             self.query_one("#collname-status", Static).update(
                 "[red]Name cannot be empty.[/red]"
             )
@@ -18096,6 +18259,109 @@ class CollectionNameModal(ModalScreen):
         self.dismiss(name)
 
     @on(Button.Pressed, "#btn-collname-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class NewCollectionModal(ModalScreen):
+    """Create-collection modal with an embedded folder picker for
+    optional bulk-import-from-folder.
+
+    The user types a collection name, navigates the directory tree, and
+    clicks a folder to mark it as the import source. "Clear folder"
+    deselects so the collection is created empty. Typing a path was
+    deliberately removed — typing a long /path/to/commercialsaas/exports while
+    inside a fullscreen TUI is awkward.
+
+    Dismisses with (name, folder_or_None) on submit, or None on cancel.
+    The caller is responsible for collection-name collision checking
+    and for running `_bulk_import_folder` when a folder is supplied.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",          "Cancel"),
+        Binding("tab",    "app.focus_next",  "Next", show=False),
+    ]
+
+    def __init__(self, start_path: "str | None" = None) -> None:
+        super().__init__()
+        start = Path(start_path).expanduser() if start_path else Path.home()
+        try:
+            if not start.is_dir():
+                start = Path.home()
+        except OSError:
+            start = Path.home()
+        self._start = str(start)
+        self._selected_folder: "Path | None" = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="newcoll-dlg"):
+            yield Static(" New collection ", id="newcoll-title")
+            yield Label("Name:")
+            yield Input(placeholder="Collection name", id="newcoll-name")
+            yield Label("Bulk import from folder (optional):")
+            yield Static(
+                "[dim]Click a folder in the tree below; "
+                "leave unselected to create an empty collection.[/dim]",
+                id="newcoll-folder-hint", markup=True,
+            )
+            yield Static(
+                "[dim]No folder selected.[/dim]",
+                id="newcoll-folder-disp", markup=True,
+            )
+            yield DirectoryTree(self._start, id="newcoll-tree")
+            yield Static("", id="newcoll-status", markup=True)
+            with Horizontal(id="newcoll-btns"):
+                yield Button("Create",        id="btn-newcoll-ok",
+                             variant="primary")
+                yield Button("Clear folder",  id="btn-newcoll-clear")
+                yield Button("Cancel",        id="btn-newcoll-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#newcoll-name", Input).focus()
+
+    @on(DirectoryTree.DirectorySelected)
+    def _on_dir_selected(self, event) -> None:
+        from rich.markup import escape as _esc
+        self._selected_folder = Path(event.path)
+        # Escape the path so a folder named "[red]hack[/red]" renders
+        # as the literal string instead of injecting style.
+        self.query_one("#newcoll-folder-disp", Static).update(
+            f"[dim]Selected:[/dim] {_esc(str(self._selected_folder))}"
+        )
+
+    @on(Button.Pressed, "#btn-newcoll-clear")
+    def _clear(self, _) -> None:
+        self._selected_folder = None
+        self.query_one("#newcoll-folder-disp", Static).update(
+            "[dim]No folder selected.[/dim]"
+        )
+
+    @on(Button.Pressed, "#btn-newcoll-ok")
+    def _ok(self, _) -> None:
+        self._submit()
+
+    @on(Input.Submitted, "#newcoll-name")
+    def _submitted(self, _) -> None:
+        self._submit()
+
+    def _submit(self) -> None:
+        # Run the typed name through the same normaliser the agent-API
+        # uses (strip control chars, trim, cap length). Stops a typed
+        # `name\x00\n` from corrupting the panel header.
+        raw = self.query_one("#newcoll-name", Input).value
+        name = _normalize_collection_name(raw)
+        if name is None:
+            self.query_one("#newcoll-status", Static).update(
+                "[red]Name cannot be empty.[/red]"
+            )
+            return
+        self.dismiss((name, self._selected_folder))
+
+    @on(Button.Pressed, "#btn-newcoll-cancel")
     def _cancel_btn(self, _) -> None:
         self.dismiss(None)
 
@@ -18388,36 +18654,41 @@ _CONTROL_CHARS_RE = _re_mod.compile(r"[\x00-\x1f\x7f]+")
 
 def _sanitize_label(s: "str | None", *, max_len: int = 200) -> str:
     """Clean a feature label / qualifier value: strip control chars,
-    collapse to single line, trim, cap length. Empty input → empty
-    string (callers decide the default). Replaces control chars with
-    nothing rather than spaces so a typo'd `name\\x00bug` becomes
-    `namebug` instead of `name bug`."""
-    if not s:
+    collapse to single line, trim, cap length. Empty / None / non-
+    string input → empty string (callers decide the default).
+
+    Type-strict: a dict / list / int payload value is treated as
+    "missing" rather than coerced via ``str()`` — coercion would
+    silently accept a JSON ``{"name": {"x": 1}}`` and store
+    ``"{'x': 1}"`` as the label. Wrong by design.
+    """
+    if not isinstance(s, str) or not s:
         return ""
-    s = _CONTROL_CHARS_RE.sub("", str(s)).strip()
+    s = _CONTROL_CHARS_RE.sub("", s).strip()
     return s[:max_len]
 
 
 def _sanitize_feat_type(s: "str | None", *,
                          max_len: int = 50,
                          default: str = "misc_feature") -> str:
-    """Clean a GenBank feature-type string. Empty input → ``default``.
-    INSDC types are short alpha words with underscore — non-strict
-    here (we accept anything printable) since users may legitimately
-    add custom types not in the curated list."""
-    if not s:
+    """Clean a GenBank feature-type string. Empty / None / non-string
+    input → ``default``. INSDC types are short alpha words with
+    underscore — non-strict here (we accept anything printable) since
+    users may legitimately add custom types not in the curated list."""
+    if not isinstance(s, str) or not s:
         return default
-    s = _CONTROL_CHARS_RE.sub("", str(s)).strip()
+    s = _CONTROL_CHARS_RE.sub("", s).strip()
     return (s or default)[:max_len]
 
 
 def _sanitize_accession(s: "str | None") -> "str | None":
     """Validate an NCBI accession against the allowed charset; return
     None if it fails so callers can 400 the request. Defends against
-    accessions like ``L09137; rm -rf /`` smuggled into the URL."""
-    if not s:
+    accessions like ``L09137; rm -rf /`` smuggled into the URL.
+    Type-strict: non-string input → None."""
+    if not isinstance(s, str) or not s:
         return None
-    s = str(s).strip()
+    s = s.strip()
     if _NCBI_ACCESSION_RE.fullmatch(s):
         return s
     return None
@@ -18425,13 +18696,43 @@ def _sanitize_accession(s: "str | None") -> "str | None":
 
 def _sanitize_path(p: "str | None") -> "Path | None":
     """Resolve a user-supplied path with `~` expansion. Returns None
-    on empty input. Doesn't reject any specific paths — the user owns
-    their filesystem and the agent runs with their permissions, so
-    OS-level file mode controls trust. We just normalize so a relative
-    path lands at CWD rather than a surprise location."""
-    if not p:
+    on empty / None / non-string input. Doesn't reject any specific
+    paths — the user owns their filesystem and the agent runs with
+    their permissions, so OS-level file mode controls trust. We just
+    normalize so a relative path lands at CWD rather than a surprise
+    location, and reject non-string types so a JSON ``{"path": {}}``
+    can't smuggle a dict's str() into a Path constructor."""
+    if not isinstance(p, str) or not p:
         return None
-    return Path(str(p)).expanduser()
+    return Path(p).expanduser()
+
+
+def _coerce_int(value, *, name: str = "value") -> "tuple[int | None, str | None]":
+    """Type-safe int coercion for agent-API JSON payloads.
+
+    Returns ``(value, None)`` on success or ``(None, error_msg)`` on
+    failure. Accepts ``bool`` / ``int`` / finite ``float`` / digit
+    ``str``. Rejects ``None`` / dict / list / NaN / +-Inf — all of
+    which would either AttributeError on a downstream `.get` or
+    raise ``OverflowError`` on a naked ``int(value)`` (the case that
+    bit us when an agent sent ``{"max_hits": Infinity}`` and a
+    downstream ``int(...)`` blew up before our range check).
+    """
+    import math as _m
+    if isinstance(value, bool):
+        return int(value), None
+    if isinstance(value, int):
+        return value, None
+    if isinstance(value, float):
+        if not _m.isfinite(value):
+            return None, f"{name!r} must be a finite number"
+        return int(value), None
+    if isinstance(value, str):
+        try:
+            return int(value), None
+        except ValueError:
+            return None, f"{name!r} must be an integer"
+    return None, f"{name!r} must be an integer"
 
 
 def _sanitize_bases(s: "str | None", *,
@@ -18669,7 +18970,7 @@ def _h_add_feature(app, payload):
     try:
         start = int(payload["start"])
         end   = int(payload["end"])
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, ValueError, TypeError, OverflowError):
         return ({"error": "missing or invalid 'start'/'end' (must be int)"},
                 400)
     label = _sanitize_label(payload.get("label"))
@@ -18736,7 +19037,7 @@ def _h_get_sequence(app, payload):
     try:
         start = int(payload["start"])
         end   = int(payload["end"])
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, ValueError, TypeError, OverflowError):
         return ({"error": "missing or invalid 'start'/'end'"}, 400)
     if not (0 <= start <= n) or not (0 <= end <= n):
         return ({"error": f"start/end out of range [0, {n}]"}, 400)
@@ -18769,7 +19070,7 @@ def _h_replace_sequence(app, payload):
     try:
         start = int(payload["start"])
         end   = int(payload["end"])
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, ValueError, TypeError, OverflowError):
         return ({"error": "missing or invalid 'start'/'end'"}, 400)
     bases, err = _sanitize_bases(payload.get("bases"))
     if err is not None:
@@ -18830,7 +19131,7 @@ def _h_delete_feature(app, payload):
         return ({"error": "no plasmid loaded"}, 422)
     try:
         idx = int(payload["idx"])
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, ValueError, TypeError, OverflowError):
         return ({"error": "missing or invalid 'idx'"}, 400)
 
     def _apply():
@@ -18894,7 +19195,7 @@ def _h_update_feature(app, payload):
         return ({"error": "no plasmid loaded"}, 422)
     try:
         idx = int(payload["idx"])
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, ValueError, TypeError, OverflowError):
         return ({"error": "missing or invalid 'idx'"}, 400)
     new_label  = (_sanitize_label(payload["label"])
                   if "label" in payload else None)
@@ -18980,7 +19281,7 @@ def _h_get_feature(app, payload):
         return ({"error": "no plasmid loaded"}, 422)
     try:
         idx = int(payload["idx"])
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, ValueError, TypeError, OverflowError):
         return ({"error": "missing or invalid 'idx'"}, 400)
     try:
         pm = app.query_one("#plasmid-map", PlasmidMap)
@@ -19208,6 +19509,302 @@ def _h_optimize_protein(app, payload):
     }
 
 
+# ── Library + collections (parity with GUI Library panel) ─────────────────────
+
+# Hard caps on collection / plasmid name length so a hostile or
+# malformed request can't park megabytes in JSON and rot the panel.
+_MAX_COLLECTION_NAME_LEN = 200
+
+
+def _normalize_collection_name(s: "str | None") -> "str | None":
+    """Trim, strip control chars, cap length, reject blank. Returns
+    None on empty input so the caller can 400 the request."""
+    name = _sanitize_label(s, max_len=_MAX_COLLECTION_NAME_LEN)
+    return name or None
+
+
+@_agent_endpoint("add-current-to-library", write=True)
+def _h_add_current_to_library(app, payload):
+    """Persist the currently-loaded record into the active collection
+    (panel equivalent of `Ctrl+Shift+A`). No-op if the record id is
+    already in the library — the existing entry is replaced."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+
+    def _apply():
+        try:
+            lib = app.query_one("#library", LibraryPanel)
+        except (NoMatches, AttributeError):
+            return ({"error": "library panel not mounted"}, 500)
+        lib.add_entry(rec)
+        return None
+
+    err = app.call_from_thread(_apply)
+    if err is not None:
+        return err
+    return {"ok": True, "id": rec.id, "name": rec.name,
+            "size": len(rec.seq)}
+
+
+@_agent_endpoint("create-collection", write=True)
+def _h_create_collection(app, payload):
+    """Create a new (empty) collection. Body: ``{name, folder?}``.
+    If ``folder`` is supplied, every importable file in that directory
+    is bulk-imported into the new collection (same path as the GUI
+    NewCollectionModal). Returns counts; the full plasmid list is
+    available via ``list-library`` after switching active collection."""
+    name = _normalize_collection_name(payload.get("name"))
+    if name is None:
+        return ({"error": "missing or invalid 'name'"}, 400)
+    if _collection_name_taken(name):
+        return ({"error": f"collection {name!r} already exists"}, 409)
+
+    folder_raw = payload.get("folder")
+    folder = _sanitize_path(folder_raw) if folder_raw else None
+    plasmids: list[dict] = []
+    failures_summary: list[dict] = []
+    n_failures_total = 0
+    description = ""
+    if folder is not None:
+        if not folder.is_dir():
+            return ({"error": f"not a directory: {folder}"}, 400)
+        entries, failures = _bulk_import_folder(folder)
+        plasmids = entries
+        n_failures_total = len(failures)
+        description = f"Bulk imported from {folder}"
+        # Truncate the per-file detail list so a folder with thousands
+        # of failures doesn't return a huge JSON body. The total count
+        # stays accurate via n_failures_total.
+        failures_summary = [{"path": p.name, "reason": r}
+                              for p, r in failures[:25]]
+
+    colls = _load_collections()
+    colls.append({
+        "name":        name,
+        "description": description,
+        "plasmids":    plasmids,
+        "saved":       _date.today().isoformat(),
+    })
+    _save_collections(colls)
+    return {
+        "ok":          True,
+        "name":        name,
+        "n_plasmids":  len(plasmids),
+        "n_failures":  n_failures_total,
+        "failures":    failures_summary,
+    }
+
+
+@_agent_endpoint("delete-collection", write=True)
+def _h_delete_collection(app, payload):
+    """Delete a collection by exact name. Body: ``{name}``. If the
+    deleted collection is the active one, the active pointer is
+    cleared and the panel returns to the collections-list view on
+    next render."""
+    name = _normalize_collection_name(payload.get("name"))
+    if name is None:
+        return ({"error": "missing or invalid 'name'"}, 400)
+    colls = _load_collections()
+    remaining = [c for c in colls if c.get("name") != name]
+    if len(remaining) == len(colls):
+        return ({"error": f"no collection named {name!r}"}, 404)
+    _save_collections(remaining)
+    if _get_active_collection_name() == name:
+        _set_active_collection_name(None)
+    return {"ok": True, "deleted": name, "n_remaining": len(remaining)}
+
+
+@_agent_endpoint("rename-collection", write=True)
+def _h_rename_collection(app, payload):
+    """Rename a collection. Body: ``{old, new}``."""
+    old = _normalize_collection_name(payload.get("old"))
+    new = _normalize_collection_name(payload.get("new"))
+    if old is None or new is None:
+        return ({"error": "missing or invalid 'old' / 'new'"}, 400)
+    if old == new:
+        return ({"error": "old and new names are identical"}, 400)
+    if _collection_name_taken(new):
+        return ({"error": f"collection {new!r} already exists"}, 409)
+    colls = _load_collections()
+    found = False
+    for c in colls:
+        if c.get("name") == old:
+            c["name"] = new
+            found = True
+            break
+    if not found:
+        return ({"error": f"no collection named {old!r}"}, 404)
+    _save_collections(colls)
+    if _get_active_collection_name() == old:
+        _set_active_collection_name(new)
+    return {"ok": True, "old": old, "new": new}
+
+
+@_agent_endpoint("set-active-collection", write=True)
+def _h_set_active_collection(app, payload):
+    """Switch the active collection. Body: ``{name}``. Mirrors the
+    panel's Click-to-enter flow (writes the active pointer to
+    settings.json + refreshes the in-memory library)."""
+    name = _normalize_collection_name(payload.get("name"))
+    if name is None:
+        return ({"error": "missing or invalid 'name'"}, 400)
+    coll = _find_collection(name)
+    if coll is None:
+        return ({"error": f"no collection named {name!r}"}, 404)
+    _set_active_collection_name(name)
+    plasmids = [dict(p) for p in (coll.get("plasmids") or [])
+                 if isinstance(p, dict)]
+    _save_library(plasmids)
+    return {"ok": True, "active": name, "n_plasmids": len(plasmids)}
+
+
+@_agent_endpoint("bulk-import-folder", write=True)
+def _h_bulk_import_folder(app, payload):
+    """Import every `.dna` / `.gb` / `.gbk` / `.genbank` file in a
+    folder into a target collection. Body: ``{folder, collection}``.
+    The collection is created if missing, refused if it exists (use
+    a second call to ``create-collection`` with the same name first to
+    pre-create, or pick a unique target). Per-file failures are
+    isolated; the response carries a per-file summary."""
+    folder_raw = payload.get("folder")
+    folder = _sanitize_path(folder_raw) if folder_raw else None
+    if folder is None:
+        return ({"error": "missing 'folder'"}, 400)
+    if not folder.is_dir():
+        return ({"error": f"not a directory: {folder}"}, 400)
+    name = _normalize_collection_name(payload.get("collection"))
+    if name is None:
+        return ({"error": "missing or invalid 'collection'"}, 400)
+    if _collection_name_taken(name):
+        return ({"error": f"collection {name!r} already exists; "
+                          f"delete it first or pick a unique name"}, 409)
+    entries, failures = _bulk_import_folder(folder)
+    colls = _load_collections()
+    colls.append({
+        "name":        name,
+        "description": f"Bulk imported from {folder}",
+        "plasmids":    entries,
+        "saved":       _date.today().isoformat(),
+    })
+    _save_collections(colls)
+    return {
+        "ok":         True,
+        "collection": name,
+        "n_imported": len(entries),
+        "n_failed":   len(failures),
+        "failures":   [{"path": p.name, "reason": r}
+                        for p, r in failures[:25]],
+    }
+
+
+# ── Search (Tier 2) ───────────────────────────────────────────────────────────
+
+
+@_agent_endpoint("blast")
+def _h_blast(app, payload):
+    """In-process BLASTN / BLASTP against the user's plasmid
+    collections. Body: ``{query, program?, collections?, max_hits?,
+    six_frame?, backend?}``. ``program`` is auto-detected from the
+    query alphabet when omitted; ``collections`` defaults to all
+    collections; ``max_hits`` defaults to 25 (capped at 500);
+    ``six_frame`` enables BLASTP six-frame ORF indexing (off by
+    default); ``backend`` is ``auto`` / ``pyhmmer`` / ``pure``.
+
+    Read-only — never touches the loaded record or any saved file.
+    Hits are returned as a list of dicts (subject name + collection,
+    coords, score, identity %, alignment fragments)."""
+    raw_query = payload.get("query")
+    if not raw_query or not isinstance(raw_query, str):
+        return ({"error": "missing or non-string 'query'"}, 400)
+    program_hint = str(payload.get("program") or "").lower()
+    if program_hint and program_hint not in ("blastn", "blastp"):
+        return ({"error": "'program' must be 'blastn' or 'blastp'"}, 400)
+    program, cleaned = _detect_query_program(raw_query, program_hint)
+    if not cleaned:
+        return ({"error": "query is empty after sanitisation"}, 400)
+
+    # Validate collections list — must be a JSON array of strings,
+    # capped at a sane size so a malicious payload can't make us scan
+    # 10,000 names.
+    coll_raw = payload.get("collections")
+    coll_names: "list[str] | None" = None
+    if coll_raw is not None:
+        if not isinstance(coll_raw, list):
+            return ({"error": "'collections' must be a list of names"}, 400)
+        if len(coll_raw) > 100:
+            return ({"error": "'collections' too long (max 100)"}, 400)
+        coll_names = []
+        for n in coll_raw:
+            norm = _normalize_collection_name(n)
+            if norm is None:
+                return ({"error":
+                          f"invalid collection name in list: {n!r}"}, 400)
+            coll_names.append(norm)
+
+    max_hits, mh_err = _coerce_int(payload.get("max_hits", 25),
+                                     name="max_hits")
+    if mh_err is not None:
+        return ({"error": mh_err}, 400)
+    max_hits = max(1, min(max_hits, 500))
+
+    six_frame = bool(payload.get("six_frame", False))
+    backend = str(payload.get("backend") or "auto").lower()
+    if backend not in ("auto", "pyhmmer", "pure"):
+        return ({"error": "'backend' must be 'auto' / 'pyhmmer' / 'pure'"},
+                400)
+
+    try:
+        db = _blast_get_db(program, coll_names, six_frame=six_frame)
+        hits = _blast_search(cleaned, db, max_hits=max_hits, backend=backend)
+    except Exception as exc:
+        _log.exception("agent-api blast failed")
+        return ({"error": f"blast failed: {exc}",
+                 "type": type(exc).__name__}, 500)
+
+    return {
+        "ok":           True,
+        "program":      program,
+        "backend":      backend,
+        "query_length": len(cleaned),
+        "n_hits":       len(hits),
+        "hits":         hits,
+    }
+
+
+@_agent_endpoint("hmmscan")
+def _h_hmmscan(app, payload):
+    """Scan a query AA sequence against a HMMER 3 profile DB. Body:
+    ``{query, hmm_path, max_hits?}``. ``hmm_path`` must point at a
+    readable .hmm / .h3m / .h3p file on the server filesystem; the
+    file is read lazily so Pfam-scale DBs don't pre-fetch into RAM.
+    Returns hits in the same shape as ``blast``."""
+    raw_query = payload.get("query")
+    if not raw_query or not isinstance(raw_query, str):
+        return ({"error": "missing or non-string 'query'"}, 400)
+    hmm_path = _sanitize_path(payload.get("hmm_path"))
+    if hmm_path is None:
+        return ({"error": "missing 'hmm_path'"}, 400)
+    if not hmm_path.exists():
+        return ({"error": f"hmm file not found: {hmm_path}"}, 404)
+    max_hits, mh_err = _coerce_int(payload.get("max_hits", 25),
+                                     name="max_hits")
+    if mh_err is not None:
+        return ({"error": mh_err}, 400)
+    max_hits = max(1, min(max_hits, 500))
+    try:
+        hits = _hmmscan_run(raw_query, str(hmm_path), max_hits=max_hits)
+    except FileNotFoundError as exc:
+        return ({"error": str(exc)}, 404)
+    except ValueError as exc:
+        return ({"error": str(exc)}, 400)
+    except Exception as exc:
+        _log.exception("agent-api hmmscan failed")
+        return ({"error": f"hmmscan failed: {exc}",
+                 "type": type(exc).__name__}, 500)
+    return {"ok": True, "n_hits": len(hits), "hits": hits}
+
+
 # ── HTTP plumbing ──────────────────────────────────────────────────────────────
 
 class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -19257,13 +19854,19 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _check_token(self) -> bool:
+        import secrets
         expected = getattr(self.server, "_token", None)
         if expected is None:
             return True   # token-free mode (used by some tests)
         provided = self.headers.get("Authorization", "")
-        if provided.startswith("Bearer "):
-            return provided[len("Bearer "):] == expected
-        return False
+        if not provided.startswith("Bearer "):
+            return False
+        # `secrets.compare_digest` is constant-time on equal-length
+        # inputs — eliminates the per-byte timing oracle that a naïve
+        # `==` would expose to a local attacker probing the token
+        # one byte at a time. Both sides are str (UUID hex), so no
+        # encoding step needed.
+        return secrets.compare_digest(provided[len("Bearer "):], expected)
 
     def do_GET(self):  return self._handle("GET")
     def do_POST(self): return self._handle("POST")
@@ -19288,6 +19891,12 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
                 {"error": "missing or invalid bearer token"}, 401,
             )
         body = self._read_body() if method == "POST" else {}
+        # `_read_body` already returns {} on missing / malformed JSON,
+        # but defend against any future code path that might thread a
+        # None through. Handlers expect a dict with .get(); a None
+        # would AttributeError on the very first field access.
+        if not isinstance(body, dict):
+            body = {}
         try:
             result = fn(getattr(self.server, "_app"), body)
         except Exception as exc:
@@ -19330,16 +19939,43 @@ def _start_agent_api(app, port: int = _AGENT_API_PORT_DEFAULT):
         return None
     try:
         _AGENT_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _AGENT_TOKEN_FILE.write_text(
-            f"{port}\n{token}\n", encoding="utf-8",
+        # Write atomically to a temp file with mode 0600 from creation,
+        # then rename into place. Stops a parallel local process from
+        # racing in to read the token in the window between creat() and
+        # chmod() (the bug if we used Path.write_text + chmod). On POSIX
+        # the os.open mode arg is honoured immediately; on Windows
+        # (umask doesn't apply, NTFS ACLs differ) the file is still
+        # only useful to a local-process attacker because we bind
+        # 127.0.0.1.
+        body = f"{port}\n{token}\n".encode("utf-8")
+        tmp_path = _AGENT_TOKEN_FILE.with_suffix(
+            _AGENT_TOKEN_FILE.suffix + ".tmp"
+        )
+        # Remove any leftover .tmp from a prior crashed start.
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        fd = os.open(
+            str(tmp_path),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
         )
         try:
-            os.chmod(_AGENT_TOKEN_FILE, 0o600)
-        except OSError:
-            # Windows / FAT filesystem — chmod no-op. The file's
-            # contents are still localhost-only since we bind to
-            # 127.0.0.1.
-            pass
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(body)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        os.replace(str(tmp_path), str(_AGENT_TOKEN_FILE))
     except OSError:
         _log.exception("agent-api: failed to write token file %s",
                        _AGENT_TOKEN_FILE)
@@ -19618,6 +20254,22 @@ CollectionNameModal { align: center middle; }
 #collname-status { height: 1; margin-top: 1; }
 #collname-btns   { height: 3; margin-top: 1; }
 #collname-btns Button { margin-right: 1; min-width: 10; }
+
+NewCollectionModal { align: center middle; }
+#newcoll-dlg {
+    width: 90; max-width: 95%; min-width: 60;
+    height: 36; max-height: 92%;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#newcoll-title       { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#newcoll-dlg Label   { color: $text-muted; margin-top: 1; }
+#newcoll-name        { margin-top: 1; }
+#newcoll-folder-hint { height: 1; color: $text-muted; }
+#newcoll-folder-disp { height: 1; margin-top: 1; }
+#newcoll-tree        { height: 1fr; border: solid $primary-darken-2; margin-top: 1; }
+#newcoll-status      { height: 1; margin-top: 1; }
+#newcoll-btns        { height: 3; margin-top: 1; }
+#newcoll-btns Button { margin-right: 1; min-width: 10; }
 
 CollectionDeleteConfirmModal { align: center middle; }
 #colldel-dlg {
@@ -22655,6 +23307,25 @@ def main():
             file=sys.stderr,
         )
         sys.exit(2)
+
+    # Force full-screen alt-screen mode: bail out early if the terminal is
+    # too small for the panels + modals to render legibly. The bulk-import
+    # picker, BlastModal, and DomesticatorModal all assume ≥ 100 cols by
+    # ~30 rows; smaller and the user sees overflow / clipped buttons.
+    _MIN_COLS, _MIN_ROWS = 100, 30
+    try:
+        _term_cols, _term_rows = shutil.get_terminal_size((_MIN_COLS, _MIN_ROWS))
+    except OSError:
+        _term_cols, _term_rows = (_MIN_COLS, _MIN_ROWS)
+    if _term_cols < _MIN_COLS or _term_rows < _MIN_ROWS:
+        print(
+            f"SpliceCraft requires a terminal of at least "
+            f"{_MIN_COLS}x{_MIN_ROWS} (yours is {_term_cols}x{_term_rows}). "
+            "Resize your terminal window and retry.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     _log_startup_banner()
     app = PlasmidApp()
     app._skip_splash = skip_splash

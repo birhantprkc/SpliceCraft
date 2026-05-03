@@ -75,7 +75,8 @@ include = [
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
-    "screenshot.jpg",
+    "splicecraftLogo.png",
+    "splicecraftScreenshot.png",
     "tests/**",
     "pyproject.toml",
 ]

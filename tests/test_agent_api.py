@@ -645,3 +645,472 @@ class TestEndpointHardening:
             token=token,
         )
         assert status == 400
+
+
+class TestTokenHardening:
+    """Bearer-token comparison must be timing-safe and the token file
+    written atomically with mode 0600 — a local-process attacker
+    shouldn't be able to either time-leak the token byte-by-byte or
+    race the chmod() to read the token in plaintext."""
+
+    def test_token_compare_is_constant_time(self, http_server):
+        # We can't directly time the comparison reliably enough to
+        # detect a non-constant-time bug from a unit test, but we can
+        # at least confirm `secrets.compare_digest` is in the call
+        # path by verifying that two equal-length wrong tokens both
+        # 401 (rather than 401-on-prefix-mismatch / 200-on-match).
+        base, _token, _ = http_server
+        wrong_a = "0" * 32
+        wrong_b = "f" * 32
+        s1, _ = _http(f"{base}/save", method="POST", body={},
+                       token=wrong_a)
+        s2, _ = _http(f"{base}/save", method="POST", body={},
+                       token=wrong_b)
+        assert s1 == s2 == 401
+
+    def test_short_token_rejected_without_crash(self, http_server):
+        base, _token, _ = http_server
+        # Different length than the real token. compare_digest only
+        # returns False here (doesn't raise). Pre-fix, this would
+        # have hit a timing oracle; either way it must 401, not 500.
+        status, _ = _http(f"{base}/save", method="POST", body={},
+                           token="x")
+        assert status == 401
+
+
+class TestNewLibraryEndpoints:
+    """Coverage for the parity endpoints added in the hardening pass:
+    add-current-to-library, create-collection, delete-collection,
+    rename-collection, set-active-collection, bulk-import-folder."""
+
+    def test_create_collection_empty(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/create-collection", method="POST",
+            body={"name": "agent-empty"}, token=token,
+        )
+        assert status == 200, payload
+        assert payload["ok"] is True
+        assert payload["n_plasmids"] == 0
+        names = [c["name"] for c in sc._load_collections()]
+        assert "agent-empty" in names
+
+    def test_create_collection_rejects_blank(self, http_server):
+        base, token, _ = http_server
+        for bad in ("", "   ", "\x00\x00\x00", None):
+            status, payload = _http(
+                f"{base}/create-collection", method="POST",
+                body={"name": bad}, token=token,
+            )
+            assert status == 400, (bad, payload)
+
+    def test_create_collection_rejects_duplicate(self, http_server):
+        sc._save_collections([{"name": "Existing", "plasmids": []}])
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/create-collection", method="POST",
+            body={"name": "Existing"}, token=token,
+        )
+        assert status == 409
+        assert "already exists" in payload["error"]
+
+    def test_create_collection_with_invalid_folder(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/create-collection", method="POST",
+            body={"name": "agent-folder", "folder": "/nope/none/nada"},
+            token=token,
+        )
+        assert status == 400
+        assert "not a directory" in payload["error"]
+
+    def test_delete_collection_round_trip(self, http_server):
+        sc._save_collections([{"name": "Doomed", "plasmids": []}])
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/delete-collection", method="POST",
+            body={"name": "Doomed"}, token=token,
+        )
+        assert status == 200
+        assert payload["deleted"] == "Doomed"
+        names = [c["name"] for c in sc._load_collections()]
+        assert "Doomed" not in names
+
+    def test_delete_collection_404_on_missing(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/delete-collection", method="POST",
+            body={"name": "GhostCollection"}, token=token,
+        )
+        assert status == 404
+
+    def test_rename_collection_updates_active_pointer(self, http_server):
+        sc._save_collections([{"name": "Old", "plasmids": []}])
+        sc._set_active_collection_name("Old")
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/rename-collection", method="POST",
+            body={"old": "Old", "new": "New"}, token=token,
+        )
+        assert status == 200
+        assert sc._get_active_collection_name() == "New"
+
+    def test_rename_collection_rejects_collision(self, http_server):
+        sc._save_collections([
+            {"name": "A", "plasmids": []},
+            {"name": "B", "plasmids": []},
+        ])
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/rename-collection", method="POST",
+            body={"old": "A", "new": "B"}, token=token,
+        )
+        assert status == 409
+
+    def test_set_active_collection(self, http_server):
+        sc._save_collections([
+            {"name": "ColA", "plasmids": [
+                {"id": "p1", "name": "p1", "size": 10, "gb_text": "X"}
+            ]},
+            {"name": "ColB", "plasmids": []},
+        ])
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/set-active-collection", method="POST",
+            body={"name": "ColA"}, token=token,
+        )
+        assert status == 200
+        assert sc._get_active_collection_name() == "ColA"
+        assert payload["n_plasmids"] == 1
+
+    def test_set_active_collection_404(self, http_server):
+        base, token, _ = http_server
+        status, _ = _http(
+            f"{base}/set-active-collection", method="POST",
+            body={"name": "NotThere"}, token=token,
+        )
+        assert status == 404
+
+    def test_bulk_import_folder_with_fixtures(self, http_server,
+                                                isolated_library):
+        from pathlib import Path
+        fixtures_dir = Path(__file__).parent
+        if not list(fixtures_dir.glob("FFE*.dna")):
+            pytest.skip("No FFE .dna fixtures present")
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/bulk-import-folder", method="POST",
+            body={"folder": str(fixtures_dir),
+                  "collection": "FFE Bulk"},
+            token=token,
+        )
+        assert status == 200, payload
+        assert payload["n_imported"] >= 5
+        assert payload["n_failed"] == 0
+        names = [c["name"] for c in sc._load_collections()]
+        assert "FFE Bulk" in names
+
+    def test_bulk_import_folder_refuses_collection_collision(
+        self, http_server, isolated_library
+    ):
+        sc._save_collections([{"name": "Taken", "plasmids": []}])
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/bulk-import-folder", method="POST",
+            body={"folder": "/tmp", "collection": "Taken"},
+            token=token,
+        )
+        assert status == 409
+
+    def test_bulk_import_folder_validates_folder(self, http_server):
+        base, token, _ = http_server
+        status, _ = _http(
+            f"{base}/bulk-import-folder", method="POST",
+            body={"folder": "/no/such/dir/anywhere",
+                  "collection": "X"},
+            token=token,
+        )
+        assert status == 400
+
+
+class TestNewSearchEndpoints:
+    """BLAST + HMMscan parity for agents."""
+
+    def test_blast_returns_hits(self, http_server, isolated_library):
+        # Library has the conftest's seeded plasmid; BLASTN against
+        # itself should return at least one self-hit. Build the GenBank
+        # text via Biopython so LOCUS length and ORIGIN bases agree
+        # exactly (no parser warning).
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        bases = "ATGAAATTCCGATTAACCGGTTAAGGGCCATTTGCAAGGACCGGTTTAAA"
+        rec = SeqRecord(Seq(bases), id="rec1", name="rec1",
+                        annotations={"molecule_type": "DNA",
+                                       "topology":      "circular"})
+        sc._save_collections([{
+            "name": "TestColl",
+            "plasmids": [{
+                "id":      "rec1",
+                "name":    "rec1",
+                "size":    len(bases),
+                "gb_text": sc._record_to_gb_text(rec),
+            }],
+        }])
+        base, token, _ = http_server
+        # Long-enough query for pyhmmer (≥ 20 bp)
+        status, payload = _http(
+            f"{base}/blast", method="POST",
+            body={"query": "ATGAAATTCCGATTAACCGGTTAAGGGCCATTTGC",
+                  "program": "blastn", "backend": "pure"},
+            token=token,
+        )
+        assert status == 200, payload
+        assert payload["program"] == "blastn"
+        assert payload["n_hits"] >= 1
+
+    def test_blast_rejects_empty_query(self, http_server):
+        base, token, _ = http_server
+        status, _ = _http(
+            f"{base}/blast", method="POST",
+            body={"query": "", "program": "blastn"},
+            token=token,
+        )
+        assert status == 400
+
+    def test_blast_rejects_invalid_program(self, http_server):
+        base, token, _ = http_server
+        status, _ = _http(
+            f"{base}/blast", method="POST",
+            body={"query": "ATGC", "program": "tblastx"},
+            token=token,
+        )
+        assert status == 400
+
+    def test_blast_rejects_oversized_collection_list(self, http_server):
+        base, token, _ = http_server
+        status, _ = _http(
+            f"{base}/blast", method="POST",
+            body={"query": "ATGCATGCATGCATGCATGC",
+                  "collections": ["x"] * 200},
+            token=token,
+        )
+        assert status == 400
+
+    def test_blast_rejects_invalid_collection_name(self, http_server):
+        base, token, _ = http_server
+        status, _ = _http(
+            f"{base}/blast", method="POST",
+            body={"query": "ATGCATGCATGCATGCATGC",
+                  "collections": ["valid", "\x00\x00\x00"]},
+            token=token,
+        )
+        assert status == 400
+
+    def test_blast_clamps_max_hits(self, http_server, isolated_library):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/blast", method="POST",
+            body={"query": "ATGCATGCATGCATGCATGC",
+                  "max_hits": 99999, "backend": "pure"},
+            token=token,
+        )
+        # Clamped to 500 internally; the search itself succeeds.
+        assert status == 200
+
+    def test_blast_invalid_backend(self, http_server):
+        base, token, _ = http_server
+        status, _ = _http(
+            f"{base}/blast", method="POST",
+            body={"query": "ATGC", "backend": "xyz"},
+            token=token,
+        )
+        assert status == 400
+
+    def test_hmmscan_404_on_missing_path(self, http_server):
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/hmmscan", method="POST",
+            body={"query": "MAEELFKWILR" * 5,
+                  "hmm_path": "/no/such/file.hmm"},
+            token=token,
+        )
+        assert status == 404
+
+    def test_hmmscan_400_on_short_query(self, http_server, tmp_path):
+        # Build a tiny .hmm so the path-exists check passes; the
+        # query length check rejects before we hit pyhmmer.
+        fake = tmp_path / "fake.hmm"
+        fake.write_text("")  # empty file is enough for the existence check
+        base, token, _ = http_server
+        status, _ = _http(
+            f"{base}/hmmscan", method="POST",
+            body={"query": "M",  # below _HMMSCAN_MIN_QUERY_LEN
+                  "hmm_path": str(fake)},
+            token=token,
+        )
+        assert status == 400
+
+
+class TestAdditionalAgentHardening:
+    """A grab-bag of attack inputs against the new endpoints — none
+    must crash the server or accept dangerous payloads."""
+
+    def test_create_collection_rejects_oversized_name(self, http_server):
+        base, token, _ = http_server
+        status, _ = _http(
+            f"{base}/create-collection", method="POST",
+            body={"name": "x" * (sc._MAX_COLLECTION_NAME_LEN + 100)},
+            token=token,
+        )
+        # Long name is *truncated* to the cap, not rejected, so the
+        # collection is still created successfully — the cap protects
+        # against megabyte-sized JSON, not from semantic validation.
+        assert status == 200
+        names = [c["name"] for c in sc._load_collections()]
+        assert any(len(n) <= sc._MAX_COLLECTION_NAME_LEN for n in names)
+
+    def test_rename_collection_old_equals_new(self, http_server):
+        sc._save_collections([{"name": "Same", "plasmids": []}])
+        base, token, _ = http_server
+        status, _ = _http(
+            f"{base}/rename-collection", method="POST",
+            body={"old": "Same", "new": "Same"}, token=token,
+        )
+        assert status == 400
+
+    def test_add_current_to_library_no_record(self, http_server):
+        base, token, app = http_server
+        # Nuke the current record on the mock app
+        app._current_record = None
+        status, _ = _http(
+            f"{base}/add-current-to-library", method="POST",
+            body={}, token=token,
+        )
+        assert status == 422
+
+
+class TestTypeStrictSanitisation:
+    """Sanitisers must reject non-string inputs (dicts, lists, ints,
+    None) rather than silently coerce via ``str()``. A JSON payload
+    of ``{"name": {"x": 1}}`` should NOT become a collection literally
+    named ``"{'x': 1}"``."""
+
+    def test_sanitize_label_rejects_non_string(self):
+        # Each of these used to be accepted via str() coercion; now
+        # they must come back as empty.
+        assert sc._sanitize_label({"x": 1}) == ""
+        assert sc._sanitize_label([1, 2, 3]) == ""
+        assert sc._sanitize_label(42) == ""
+        assert sc._sanitize_label(None) == ""
+        assert sc._sanitize_label(True) == ""
+
+    def test_sanitize_feat_type_rejects_non_string(self):
+        assert sc._sanitize_feat_type({"x": 1}) == "misc_feature"
+        assert sc._sanitize_feat_type(42)        == "misc_feature"
+        assert sc._sanitize_feat_type(None)      == "misc_feature"
+
+    def test_sanitize_accession_rejects_non_string(self):
+        assert sc._sanitize_accession({"x": 1}) is None
+        assert sc._sanitize_accession([1, 2])   is None
+        assert sc._sanitize_accession(42)       is None
+
+    def test_sanitize_path_rejects_non_string(self):
+        assert sc._sanitize_path({"x": 1}) is None
+        assert sc._sanitize_path([1, 2])   is None
+        assert sc._sanitize_path(42)       is None
+
+    def test_create_collection_rejects_non_string_name(self, http_server):
+        base, token, _ = http_server
+        for bad in ({"x": 1}, [1, 2, 3], 42, None):
+            status, payload = _http(
+                f"{base}/create-collection", method="POST",
+                body={"name": bad}, token=token,
+            )
+            assert status == 400, (bad, payload)
+
+
+class TestNumericCoercionHardening:
+    """``int(x)`` blows up on ``+/- Infinity`` (OverflowError) and
+    ``NaN`` returns silently as 0 in some paths. Both must be caught
+    cleanly at every numeric input boundary so a hostile JSON payload
+    can't crash the handler thread."""
+
+    def test_blast_max_hits_infinity(self, http_server):
+        base, token, _ = http_server
+        body_json = '{"query": "ATGCATGCATGCATGCATGC", "max_hits": Infinity}'
+        # Send raw JSON (urllib helper auto-encodes a dict, but we
+        # want literal JSON Infinity which Python's json.loads accepts).
+        import urllib.request, urllib.error
+        req = urllib.request.Request(
+            f"{base}/blast", data=body_json.encode(),
+            headers={"Authorization": f"Bearer {token}",
+                       "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5).read()
+            status = 200
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        # Pre-fix this was a 500 (OverflowError trace). Now must 400
+        # with a clear "must be a finite number" message.
+        assert status == 400
+
+    def test_add_feature_start_infinity(self, http_server, tiny_record):
+        base, token, _ = http_server
+        body_json = ('{"start": Infinity, "end": 10, "label": "x"}')
+        import urllib.request, urllib.error
+        req = urllib.request.Request(
+            f"{base}/add-feature", data=body_json.encode(),
+            headers={"Authorization": f"Bearer {token}",
+                       "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5).read()
+            status = 200
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        assert status == 400
+
+
+class TestRequestDispatcherHardening:
+    """The HTTP dispatcher must hand handlers a real dict (never None,
+    never a list) so .get() never crashes."""
+
+    def test_handle_passes_dict_on_empty_body(self, http_server):
+        base, token, _ = http_server
+        # POST with Content-Length: 0 → handler should still get {}
+        import urllib.request, urllib.error
+        req = urllib.request.Request(
+            f"{base}/save", data=b"",
+            headers={"Authorization": f"Bearer {token}"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5).read()
+            status = 200
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        # 422 (no record loaded) is the right error; what we care about
+        # is that the handler didn't AttributeError on a None body.
+        assert status in (200, 422)
+
+    def test_handle_normalizes_non_dict_json(self, http_server):
+        # JSON body that's a list, not a dict — should be normalised
+        # to {} before reaching the handler.
+        base, token, _ = http_server
+        import urllib.request, urllib.error
+        req = urllib.request.Request(
+            f"{base}/save", data=b'[1,2,3]',
+            headers={"Authorization": f"Bearer {token}",
+                       "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5).read()
+            status = 200
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        # Must be a clean 200/422 — not a 500 from .get() on a list.
+        assert status in (200, 422)

@@ -19,10 +19,12 @@ git checkout -b add-splicecraft
 
 # 3. Copy the recipe into place
 mkdir -p recipes/splicecraft
-cp /home/seb/SpliceCraft/conda-recipe/meta.yaml recipes/splicecraft/
+cp /path/to/SpliceCraft/conda-recipe/meta.yaml recipes/splicecraft/
 
 # 4. Regenerate source.sha256 for the current PyPI tarball
-VERSION=0.2.2  # or whatever the current version is
+#    (use whatever version meta.yaml is bumped to)
+VERSION=$(grep '^version' /path/to/SpliceCraft/pyproject.toml | head -1 \
+          | sed -E 's/.*"([^"]+)".*/\1/')
 curl -sL "https://pypi.io/packages/source/s/splicecraft/splicecraft-${VERSION}.tar.gz" \
   | sha256sum
 # paste the 64-char hash into the sha256 field of meta.yaml
@@ -51,7 +53,7 @@ needed when dependencies or test commands change.
 
 ## Why bioconda?
 
-Bench scientists running BLAST, Biopython, pLannotate, or any of the
+Bench scientists running BLAST, Biopython, HMMER, or any of the
 thousands of bioconda-packaged tools can then do:
 
 ```bash
@@ -60,5 +62,4 @@ conda install -c bioconda splicecraft
 
 …which sidesteps PEP 668 on Debian/Ubuntu/WSL2, keeps versions pinned,
 and composes cleanly with the rest of a conda-based bioinformatics
-workflow. pLannotate itself is on bioconda — a user can install both in
-the same env.
+workflow.
