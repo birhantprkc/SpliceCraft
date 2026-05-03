@@ -35,7 +35,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "0.5.1.2"
+__version__ = "0.5.2.0"
 
 # ── User data directory ────────────────────────────────────────────────────────
 # All user-writable state (library, parts bin, primers, .bak files) lives in
