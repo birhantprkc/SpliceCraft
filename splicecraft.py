@@ -2304,6 +2304,48 @@ def _feat_label(feat) -> str:
                 return s[:28]
     return feat.type
 
+def _format_feat_tooltip(feat: dict, total: int) -> str:
+    """Build the hover-tooltip text for a feature dict (the in-memory
+    shape produced by `PlasmidMap._parse` and friends).
+
+    Format:
+        ``<type>  <label>``
+        ``<start+1>..<end> bp (+/- strand)  ·  <length> bp``
+        ``<note>``  ← optional, when the feature came from the feature
+                       library and carries a stored note qualifier.
+
+    The tooltip is meant for at-a-glance reading on hover; long notes
+    are truncated to fit one panel-width-ish row. Wrap features
+    (`end < start`) display as ``start+1..total, 1..end`` so the user
+    sees the origin span clearly.
+    """
+    s = int(feat.get("start", 0))
+    e = int(feat.get("end",   0))
+    strand = int(feat.get("strand", 1) or 0)
+    sym = "+" if strand >= 0 else "−" if strand < 0 else "·"
+    length = _feat_len(s, e, total) if total else max(0, e - s)
+    if total and e < s:
+        # Wrap span: tail + head
+        coord = f"{s + 1}..{total}, 1..{e}"
+    else:
+        coord = f"{s + 1}..{e}"
+    label = (feat.get("label") or feat.get("type") or "?").strip() or "(unnamed)"
+    ftype = feat.get("type") or "?"
+    head  = f"{ftype}  {label}"
+    body  = f"{coord} bp ({sym})  ·  {length:,} bp"
+    note  = ""
+    quals = feat.get("qualifiers") or {}
+    if isinstance(quals, dict):
+        for q in ("note", "product", "function"):
+            v = quals.get(q)
+            if isinstance(v, list):
+                v = next((x for x in v if isinstance(x, str)), None)
+            if isinstance(v, str) and v.strip():
+                note = " ".join(v.split())[:200]
+                break
+    return f"{head}\n{body}" + (f"\n{note}" if note else "")
+
+
 def _nice_tick(total: int) -> int:
     """A tick interval that gives ~6-10 ticks for this plasmid size."""
     for t in [50, 100, 200, 250, 500, 1000, 2000, 2500, 5000, 10000, 25000, 50000]:
@@ -2565,6 +2607,252 @@ def _gb_text_to_record(text: str):
     """Parse GenBank format text back to a SeqRecord."""
     from Bio import SeqIO
     return SeqIO.read(StringIO(text), "genbank")
+
+
+# ── Sequencing-data ingestion (Plasmidsaurus etc.) ────────────────────────────
+#
+# Plasmidsaurus delivers each run as a .zip with per-sample directories
+# containing a consensus assembly (`*.gbk` / `*.gb`), raw reads, and
+# QC plots. SpliceCraft's first-pass workflow:
+#
+#   1. User picks the .zip via `PlasmidsaurusZipModal` (file browser).
+#   2. We list every `.gbk` / `.gb` member inside (size-capped to keep
+#      the picker responsive against absurd zips).
+#   3. User picks a member; we `_extract_gbk_member` it into memory and
+#      parse via `_gb_text_to_record`.
+#   4. User picks a target plasmid from the library — we run a
+#      `_pairwise_align` between the two sequences and surface the
+#      result on `AlignmentScreen`.
+#
+# Future: a Plasmidsaurus API key + per-account download lands here as
+# a network sibling of the zip path. Same downstream alignment +
+# visualisation pipeline.
+
+# Per-zip + per-member size caps. Plasmidsaurus zips for a single run
+# are typically <50 MB and the consensus assembly is <100 KB. Anything
+# larger is suspicious; refuse rather than OOM the picker.
+_PLASMIDSAURUS_ZIP_MAX_BYTES    = 500 * 1024 * 1024   # 500 MB whole zip
+_PLASMIDSAURUS_MEMBER_MAX_BYTES = 50  * 1024 * 1024   # 50 MB per .gbk
+_PLASMIDSAURUS_MAX_MEMBERS      = 2000                # listing cap
+_GBK_EXTS = (".gbk", ".gb", ".genbank")
+
+
+def _list_gbk_members_in_zip(zip_path: Path) -> "list[dict]":
+    """Walk a .zip and return a list of dicts describing every .gbk /
+    .gb / .genbank member. Each dict carries:
+
+        ``{"name": <member name>, "size": <uncompressed bytes>}``
+
+    Raises ValueError on unreadable / oversized / non-zip files.
+    Cap-protected: refuses zips above `_PLASMIDSAURUS_ZIP_MAX_BYTES`,
+    individual members above `_PLASMIDSAURUS_MEMBER_MAX_BYTES`, and
+    listings beyond `_PLASMIDSAURUS_MAX_MEMBERS` to keep the picker
+    snappy and resistant to malformed archives.
+    """
+    import zipfile
+    p = Path(zip_path)
+    if not p.exists():
+        raise ValueError(f"zip not found: {p}")
+    if not p.is_file():
+        raise ValueError(f"not a regular file: {p}")
+    try:
+        size = p.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"could not stat zip: {exc}") from exc
+    if size > _PLASMIDSAURUS_ZIP_MAX_BYTES:
+        raise ValueError(
+            f"zip too large ({size:,} bytes; cap "
+            f"{_PLASMIDSAURUS_ZIP_MAX_BYTES:,})"
+        )
+    try:
+        zf = zipfile.ZipFile(str(p), "r")
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise ValueError(f"could not open zip: {exc}") from exc
+    members: list[dict] = []
+    try:
+        for info in zf.infolist():
+            if len(members) >= _PLASMIDSAURUS_MAX_MEMBERS:
+                _log.warning(
+                    "plasmidsaurus: zip listing truncated at %d members",
+                    _PLASMIDSAURUS_MAX_MEMBERS,
+                )
+                break
+            if info.is_dir():
+                continue
+            name = info.filename
+            base = name.rsplit("/", 1)[-1]
+            if not base or base.startswith("."):
+                continue
+            ext = ""
+            for e in _GBK_EXTS:
+                if name.lower().endswith(e):
+                    ext = e
+                    break
+            if not ext:
+                continue
+            if info.file_size > _PLASMIDSAURUS_MEMBER_MAX_BYTES:
+                _log.warning(
+                    "plasmidsaurus: skipping oversized member %s (%d bytes)",
+                    name, info.file_size,
+                )
+                continue
+            members.append({
+                "name": name,
+                "size": int(info.file_size),
+            })
+    finally:
+        zf.close()
+    members.sort(key=lambda m: m["name"].lower())
+    return members
+
+
+def _extract_gbk_member(zip_path: Path, member_name: str) -> str:
+    """Read a single .gbk member out of a zip and return its decoded
+    text. Caller passes the result through `_gb_text_to_record` to get
+    a SeqRecord. Raises ValueError on missing / oversized / unreadable
+    member, or on UTF-8 / latin-1 decode failure."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(str(zip_path), "r") as zf:
+            try:
+                info = zf.getinfo(member_name)
+            except KeyError as exc:
+                raise ValueError(
+                    f"member not in zip: {member_name!r}"
+                ) from exc
+            if info.file_size > _PLASMIDSAURUS_MEMBER_MAX_BYTES:
+                raise ValueError(
+                    f"member too large ({info.file_size:,} bytes; cap "
+                    f"{_PLASMIDSAURUS_MEMBER_MAX_BYTES:,})"
+                )
+            with zf.open(info, "r") as fh:
+                raw = fh.read()
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise ValueError(f"could not read zip: {exc}") from exc
+    # GenBank is ASCII per the spec; fall back to latin-1 only if a
+    # stray high-bit byte slipped in (some sequencer pipelines do).
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1", errors="replace")
+
+
+# ── Pairwise alignment (sequencing data ↔ plasmid map) ────────────────────────
+#
+# Wraps Bio.Align.PairwiseAligner so callers get a small dict result
+# rather than a pyobjC-style alignment iterator. Used by
+# AlignmentScreen for visualisation and (later) by the agent API for
+# scripted alignment runs.
+#
+# Default mode is `global` end-to-end — Plasmidsaurus consensus is
+# usually full-length, so the user wants to see the whole map vs the
+# whole consensus. Local mode is offered for partial reads.
+
+# Hard cap on per-side sequence length to keep DP memory bounded.
+# 200 kb on each side = ~80 GB if naive O(NM); Biopython's aligner is
+# smarter than that but we still don't want the user pasting a
+# chromosome.
+_PAIRWISE_MAX_LEN = 200_000
+
+
+def _pairwise_align(query_seq: str, target_seq: str,
+                     *, mode: str = "global",
+                     match: float = 2.0,
+                     mismatch: float = -1.0,
+                     open_gap: float = -2.0,
+                     extend_gap: float = -0.5,
+                     ) -> dict:
+    """Run a pairwise alignment via Biopython's PairwiseAligner.
+
+    Returns a dict:
+
+        {
+          "mode":          "global" | "local",
+          "score":         float,
+          "identity_pct":  float,         # over the aligned columns
+          "aligned_q":     str,           # gapped query string
+          "aligned_t":     str,           # gapped target string
+          "n_matches":     int,
+          "n_mismatches":  int,
+          "n_gaps":        int,           # combined gap chars
+          "q_len":         int,
+          "t_len":         int,
+        }
+
+    Raises ValueError on empty / oversized / non-IUPAC input or when
+    Biopython can't produce an alignment (rare; falls through cleanly).
+    """
+    from Bio.Align import PairwiseAligner
+    if not isinstance(query_seq, str) or not isinstance(target_seq, str):
+        raise ValueError("query_seq and target_seq must be str")
+    q = query_seq.strip().upper()
+    t = target_seq.strip().upper()
+    if not q or not t:
+        raise ValueError("query / target sequence is empty")
+    if len(q) > _PAIRWISE_MAX_LEN or len(t) > _PAIRWISE_MAX_LEN:
+        raise ValueError(
+            f"sequence too long for pairwise align "
+            f"(cap {_PAIRWISE_MAX_LEN:,} bp per side)"
+        )
+    if mode not in ("global", "local"):
+        raise ValueError(f"mode must be 'global' or 'local' (got {mode!r})")
+    aligner = PairwiseAligner()
+    aligner.mode               = mode
+    aligner.match_score        = match
+    aligner.mismatch_score     = mismatch
+    aligner.open_gap_score     = open_gap
+    aligner.extend_gap_score   = extend_gap
+    try:
+        alignments = aligner.align(q, t)
+    except Exception as exc:
+        raise ValueError(f"pairwise align failed: {exc}") from exc
+    try:
+        first = alignments[0]
+    except (IndexError, StopIteration) as exc:
+        raise ValueError("no alignment produced") from exc
+    # Biopython 1.81+ Alignment supports row-indexing: `aln[0]` is the
+    # gapped first sequence (target), `aln[1]` is the gapped second
+    # (query). The text `format()` representation wraps at 60 cols
+    # with coordinate prefixes which is awkward to parse — direct
+    # row indexing is the documented API.
+    # `aligner.align(q, t)` was called q-first, t-second above. So
+    # `first[0]` is the gapped query and `first[1]` is the gapped
+    # target — preserve that ordering in the result dict.
+    try:
+        aligned_q = str(first[0])
+        aligned_t = str(first[1])
+    except (IndexError, TypeError) as exc:
+        raise ValueError(f"could not extract aligned rows: {exc}") from exc
+    if not aligned_q or not aligned_t:
+        raise ValueError("aligner produced empty rows")
+    if len(aligned_q) != len(aligned_t):
+        raise ValueError(
+            f"aligned strings differ in length: q={len(aligned_q)} "
+            f"vs t={len(aligned_t)}"
+        )
+    n_matches    = 0
+    n_mismatches = 0
+    n_gaps       = 0
+    for ch_q, ch_t in zip(aligned_q, aligned_t):
+        if ch_q == "-" or ch_t == "-":
+            n_gaps += 1
+        elif ch_q == ch_t:
+            n_matches += 1
+        else:
+            n_mismatches += 1
+    aligned_cols = max(1, n_matches + n_mismatches + n_gaps)
+    return {
+        "mode":         mode,
+        "score":        float(first.score),
+        "identity_pct": 100.0 * n_matches / aligned_cols,
+        "aligned_q":    aligned_q,
+        "aligned_t":    aligned_t,
+        "n_matches":    n_matches,
+        "n_mismatches": n_mismatches,
+        "n_gaps":       n_gaps,
+        "q_len":        len(q),
+        "t_len":        len(t),
+    }
 
 
 # ── GenBank export (NCBI-compliant normalization + atomic write) ──────────────
@@ -2882,10 +3170,17 @@ class PlasmidMap(Widget):
     # ── Messages ───────────────────────────────────────────────────────────────
 
     class FeatureSelected(Message):
-        def __init__(self, idx: int, feat_dict: dict | None, bp: int = -1):
+        def __init__(self, idx: int, feat_dict: dict | None, bp: int = -1,
+                      *, shift: bool = False):
             self.idx       = idx
             self.feat_dict = feat_dict
             self.bp        = bp   # bp at click point, or -1 if unknown
+            # Shift+click on the map → extend the seq-panel selection
+            # from the currently-selected feature to this one. Honoured
+            # by `PlasmidApp._map_feat_selected_impl`. Click-order
+            # convention: anchor stays the originally-selected feature;
+            # subsequent shift+clicks redefine the END of the span only.
+            self.shift     = bool(shift)
             super().__init__()
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -2918,6 +3213,42 @@ class PlasmidMap(Widget):
         # the label points at.
         self._label_bboxes: list = []
         self.refresh()
+
+    def on_mouse_move(self, event: MouseMove) -> None:
+        """Update the widget's hover tooltip with the feature under the
+        cursor. Gated by the user's Settings → 'Show feature hover
+        tooltips' toggle so users who find the popup distracting can
+        switch it off without code changes.
+
+        Tooltip text is built from the in-memory feat dict (type +
+        label + bp range + strand) — cheap, no SeqRecord lookup. When
+        the cursor isn't over a feature, the tooltip is cleared so
+        Textual hides the popup.
+        """
+        try:
+            app = self.app
+        except Exception:
+            return
+        if not getattr(app, "_show_feature_tooltips", True):
+            if self.tooltip is not None:
+                self.tooltip = None
+            return
+        if not self.record or not self._feats:
+            if self.tooltip is not None:
+                self.tooltip = None
+            return
+        if self._map_mode == "linear":
+            idx, _bp = self._feat_at_linear(event.x, event.y)
+        else:
+            idx, _bp = self._feat_at(event.x, event.y)
+        if idx < 0 or idx >= len(self._feats):
+            if self.tooltip is not None:
+                self.tooltip = None
+            return
+        new = _format_feat_tooltip(self._feats[idx], self._total)
+        # Avoid spamming reactive churn with identical writes.
+        if self.tooltip != new:
+            self.tooltip = new
 
     def _parse(self, record) -> list[dict]:
         feats = []
@@ -3086,7 +3417,17 @@ class PlasmidMap(Widget):
         return -1
 
     def _feat_at(self, x: int, y: int) -> tuple[int, int]:
-        """Return (feature_idx, click_bp) at terminal cell (x, y), or (-1, -1)."""
+        """Return (feature_idx, click_bp) at terminal cell (x, y), or (-1, -1).
+
+        Nested-feature handling: when several features cover the click
+        bp (e.g. a misc_feature inside a CDS), pick the **smallest
+        enclosing** one. First-match-wins would otherwise route every
+        nested click to whichever feature appears earliest in
+        ``self._feats``, surprising users who clicked the inner
+        annotation. Mirrors `PlasmidApp._seq_click_impl`'s smallest-
+        span fallback so map and seq-panel feature picks resolve the
+        same feature for the same bp.
+        """
         if not self.record or not self._total:
             return -1, -1
         # Label-first: a click that hits a feature's text label
@@ -3110,10 +3451,16 @@ class PlasmidMap(Widget):
         angle = math.atan2(dr_n, dc_n)
         angle_norm = (angle + math.pi / 2) % (2 * math.pi)
         bp = int(self.origin_bp + self._total * angle_norm / (2 * math.pi)) % self._total
+        best_idx = -1
+        best_span = float("inf")
         for i, f in enumerate(self._feats):
-            if self._bp_in(bp, f):
-                return i, bp
-        return -1, -1
+            if not self._bp_in(bp, f):
+                continue
+            span = _feat_len(f["start"], f["end"], self._total) or 0
+            if span < best_span:
+                best_span = span
+                best_idx  = i
+        return (best_idx, bp) if best_idx >= 0 else (-1, -1)
 
     def on_click(self, event: Click):
         if not self.record:
@@ -3122,16 +3469,35 @@ class PlasmidMap(Widget):
             idx, bp = self._feat_at_linear(event.x, event.y)
         else:
             idx, bp = self._feat_at(event.x, event.y)
-        self.selected_idx = idx
+        # Treat shift OR ctrl as the "extend selection" modifier. Most
+        # terminals (xterm, macOS Terminal.app, stock GNOME Terminal)
+        # intercept shift+click for native text-selection so the click
+        # never reaches the app; ctrl+click is the most reliable
+        # cross-terminal alternative. Both are honoured upstream by
+        # `PlasmidApp._extend_selection_to`.
+        ext = bool(getattr(event, "shift", False)
+                    or getattr(event, "ctrl",  False))
+        if not ext:
+            self.selected_idx = idx
         f = self._feats[idx] if idx >= 0 else None
+        # Surface raw modifier state so the App's click-debug toggle
+        # (Alt+M) can echo it for users diagnosing terminal-eats-shift
+        # issues.
+        try:
+            self.app._echo_click_modifiers("plasmid map", event)
+        except Exception:
+            pass
         _log_event(
             "map.click", mode=self._map_mode,
             x=event.x, y=event.y,
             idx=idx, bp=bp,
+            shift=bool(getattr(event, "shift", False)),
+            ctrl=bool(getattr(event, "ctrl", False)),
+            extend=ext,
             feat=(f or {}).get("label") if f else None,
             label_hit=(idx >= 0 and self._label_at(event.x, event.y) == idx),
         )
-        self.post_message(self.FeatureSelected(idx, f, bp))
+        self.post_message(self.FeatureSelected(idx, f, bp, shift=ext))
 
     def _bp_in(self, bp: int, f: dict) -> bool:
         s, e = f["start"], f["end"]
@@ -3456,14 +3822,34 @@ class PlasmidMap(Widget):
 
     # ── Linear map ─────────────────────────────────────────────────────────────
 
+    # Lane geometry constants for the linear plasmid map (cell-based).
+    # Per lane: 2-row arrow body + 1-row label + 1-row gap = 4 rows.
+    # `_LINEAR_BAR_ROWS` = the body height (top + bottom row of the
+    # 2-row arrow). `_LINEAR_LANE_H` = total per-lane row stride.
+    _LINEAR_BAR_ROWS  = 2
+    _LINEAR_LANE_H    = 4   # bar (2) + label (1) + gap (1)
+    _LINEAR_BACKBONE_GAP = 2   # rows between backbone + first lane
+
     def _feat_at_linear(self, x: int, y: int) -> tuple[int, int]:
-        """Return (feature_idx, click_bp) at terminal cell (x, y) in linear view,
-        or (-1, -1) if outside the map region / no feature matched."""
+        """Return (feature_idx, click_bp) at terminal cell (x, y) in
+        the cell-based linear view.
+
+        Click resolution:
+          1. Label bbox match (populated by `_draw_linear`).
+          2. Lane match: the click row maps to a forward / reverse
+             lane, and the click column resolves to a bp within the
+             feature's cell range.
+
+        Smallest-enclosing wins on nested features so a click on an
+        inner annotation routes to the inner feature (mirrors the
+        circular path). Strand-gated: clicks above the backbone only
+        match forward features, below only reverse.
+        """
         if not self._total:
             return -1, -1
         # Label-first: same logic as the circular path. A click on a
-        # feature's text label routes to that feature with bp set
-        # to its 5' end so the seq panel scrolls to the start.
+        # feature's text label routes to that feature with bp set to
+        # its 5' end so the seq panel scrolls to the start.
         idx = self._label_at(x, y)
         if idx >= 0:
             f = self._feats[idx]
@@ -3478,17 +3864,26 @@ class PlasmidMap(Widget):
         bp = int((x - margin_l) / usable_w * self._total)
         above = y < backbone_row
         below = y > backbone_row
+        # Smallest-enclosing wins on nested features (mirrors `_feat_at`
+        # in the circular path). Strand gate stays so a forward-strand
+        # click row never picks a reverse-strand inner feature.
+        best_idx  = -1
+        best_span = float("inf")
         for i, f in enumerate(self._feats):
             # Use half-open [start, end) to match _bp_in elsewhere. This
             # also makes zero-width features (s == e) unclickable instead
             # of matching every column on the backbone.
             if not self._bp_in(bp, f):
                 continue
-            if above and f["strand"] >= 0:
-                return i, bp
-            if below and f["strand"] < 0:
-                return i, bp
-        return -1, -1
+            if above and f["strand"] < 0:
+                continue
+            if below and f["strand"] >= 0:
+                continue
+            span = _feat_len(f["start"], f["end"], self._total) or 0
+            if span < best_span:
+                best_span = span
+                best_idx  = i
+        return (best_idx, bp) if best_idx >= 0 else (-1, -1)
 
     def _draw_linear(self, w: int, h: int) -> Text:
         """Render a horizontal linear plasmid map."""
@@ -3550,9 +3945,17 @@ class PlasmidMap(Widget):
         end_tx = min(margin_l + usable_w, w - 1)
         canvas.put(end_tx, backbone_row, "┤", "color(250)")
 
-        # ── Restriction site marks ──
-        # resite: thin braille arc above (fwd) or below (rev) backbone
-        # recut:  radial tick at cut position
+        # ── Restriction site marks (cell-based) ──
+        # Pre-fix this layer drew via the braille canvas at backbone
+        # ±2 braille rows, which collides with lane-0 feature rows in
+        # the redesigned cell-based view. Cell glyphs in the gap row
+        # adjacent to the backbone (row ±1) keep restriction sites
+        # outside any feature lane while staying close enough that
+        # the strand association is obvious. Recut markers come
+        # AFTER the resite bar in the loop so the ↓/↑ glyph
+        # overwrites the bar at its column — preserves the visual
+        # cue for "this is where the cut is" inside the recognition
+        # span.
         for rf in self._restr_feats:
             color = rf["color"]
             if rf["type"] == "resite":
@@ -3560,15 +3963,12 @@ class PlasmidMap(Widget):
                 x1 = margin_l + rf["end"]   * usable_w // total
                 x0 = max(margin_l, min(x0, w - margin_r - 1))
                 x1 = max(margin_l, min(x1, w - margin_r - 1))
-                dy = -2 if rf["strand"] >= 0 else 2
-                bar_py = backbone_py + dy * 4
-                for bx in range(x0 * 2, x1 * 2 + 1):
-                    pcol, prow = bx >> 1, bar_py >> 2
-                    if 0 <= pcol < bc_cols and 0 <= prow < bc_rows:
-                        bc_bits[prow][pcol]   |= 1 << _BIT[(bar_py & 3) << 1 | (bx & 1)]
-                        if 1 >= bc_prio[prow][pcol]:
-                            bc_colors[prow][pcol] = color
-                            bc_prio[prow][pcol]   = 1
+                bar_row = (backbone_row - 1
+                            if rf["strand"] >= 0
+                            else backbone_row + 1)
+                if 0 <= bar_row < h:
+                    for cx in range(x0, x1 + 1):
+                        canvas.put(cx, bar_row, "─", color)
             elif rf["type"] == "recut":
                 cut_x = margin_l + rf["start"] * usable_w // total
                 if margin_l <= cut_x < w - margin_r:
@@ -3581,17 +3981,32 @@ class PlasmidMap(Widget):
                         canvas.put(cut_x, row_below, "↑" if rf["strand"] < 0 else " ", color)
 
         # ── Lane assignment (greedy interval scheduling) ──
-        fwd_ends: list[int] = []   # rightmost braille-x used per fwd lane
+        # Cell-based now: lane "ends" are tracked in terminal columns,
+        # not braille pixels. A feature occupies its bar columns plus
+        # the arrowhead column plus the label width (whichever is
+        # wider) — we use the bar-end column for collision detection
+        # and let the label live above (for forward) / below (for
+        # reverse) the bar where it can extend slightly past without
+        # bumping the next lane.
+        def bp_to_col(bp: int) -> int:
+            return margin_l + bp * usable_w // total
+
+        fwd_ends: list[int] = []   # rightmost terminal col used per fwd lane
         rev_ends: list[int] = []
         feat_meta: list[tuple[bool, int]] = []   # (is_fwd, lane_idx)
 
         for feat in self._feats:
             is_fwd = feat["strand"] >= 0
-            x0, x1 = bp_to_px(feat["start"]), bp_to_px(feat["end"])
-            ends   = fwd_ends if is_fwd else rev_ends
-            lane   = len(ends)
+            x0     = bp_to_col(feat["start"])
+            x1     = bp_to_col(feat["end"])
+            # Pad lane width by 1 col so adjacent features don't share
+            # a column, and reserve an extra arrowhead col when the
+            # bar is otherwise zero-width.
+            x1 = max(x1, x0 + 1)
+            ends = fwd_ends if is_fwd else rev_ends
+            lane = len(ends)
             for li, ex in enumerate(ends):
-                if x0 > ex + 2:
+                if x0 > ex + 1:
                     lane = li
                     ends[li] = x1
                     break
@@ -3599,10 +4014,16 @@ class PlasmidMap(Widget):
                 ends.append(x1)
             feat_meta.append((is_fwd, lane))
 
-        # ── Draw features ──
-        lane_gap    = 3    # braille rows between backbone and first lane
-        bar_half    = 2    # half-height of feature bar in braille rows
-        lane_stride = 7    # braille rows between lane centres
+        # ── Draw features (cell-based, double-row arrows) ──
+        # Layout per lane (top → bottom for forward; mirrored for
+        # reverse): label row, bar-top row, bar-bottom row, gap row.
+        # That's 4 rows per lane (`_LINEAR_LANE_H`). Reverse stack
+        # mirrors below the backbone with the label on the BOTTOM so
+        # text is always on the side of the strand pointing AWAY from
+        # the backbone.
+        bar_rows = self._LINEAR_BAR_ROWS
+        lane_h   = self._LINEAR_LANE_H
+        gap      = self._LINEAR_BACKBONE_GAP
 
         for i, (feat, (is_fwd, lane)) in enumerate(zip(self._feats, feat_meta)):
             start_bp = feat["start"]
@@ -3610,59 +4031,76 @@ class PlasmidMap(Widget):
             strand   = feat["strand"]
             color    = feat["color"]
             label    = feat.get("label", feat.get("type", ""))
+            is_sel   = (i == self.selected_idx)
+            style    = ("reverse " + color) if is_sel else color
 
-            # Handle wrap-around features
+            # Handle wrap-around features by emitting two segments.
             if end_bp > start_bp:
-                segments = [(bp_to_px(start_bp), bp_to_px(end_bp))]
+                segments = [(start_bp, end_bp)]
             else:
-                segments = [(bp_to_px(start_bp), px_start + px_w),
-                            (px_start, bp_to_px(end_bp))]
+                segments = [(start_bp, total), (0, end_bp)]
 
-            center_py = (backbone_py - lane_gap - bar_half - lane * lane_stride
-                         if is_fwd else
-                         backbone_py + lane_gap + bar_half + lane * lane_stride)
-            bar_top    = center_py - bar_half
-            bar_bottom = center_py + bar_half
+            # Vertical placement. Forward stack grows upward from the
+            # backbone; reverse stack grows downward.
+            if is_fwd:
+                bar_bottom_row = backbone_row - gap - lane * lane_h
+                bar_top_row    = bar_bottom_row - (bar_rows - 1)
+                label_row      = bar_top_row - 1
+            else:
+                bar_top_row    = backbone_row + gap + lane * lane_h
+                bar_bottom_row = bar_top_row + (bar_rows - 1)
+                label_row      = bar_bottom_row + 1
 
-            if bar_top < 0 or bar_bottom >= h * 4:
+            if bar_top_row < 0 or bar_bottom_row >= h:
                 continue
 
-            is_sel = (i == self.selected_idx)
-            prio   = 3 if is_sel else 2
-            style  = ("reverse " + color) if is_sel else color
-            feat_ty = center_py >> 2
+            for seg_start, seg_end in segments:
+                cx0 = bp_to_col(seg_start)
+                cx1 = bp_to_col(seg_end)
+                cx0 = max(margin_l, min(cx0, w - margin_r - 1))
+                cx1 = max(margin_l, min(cx1, w - margin_r))
+                if cx1 <= cx0:
+                    cx1 = cx0 + 1   # at least show the arrowhead
+                bar_w = cx1 - cx0
 
-            # Label row: above bar for forward, below for reverse
-            label_ty = feat_ty - 1 if is_fwd else feat_ty + 1
-
-            for sx0, sx1 in segments:
-                sx0 = max(px_start, min(sx0, px_start + px_w))
-                sx1 = max(px_start, min(sx1, px_start + px_w))
-                if sx1 <= sx0:
-                    continue
-
-                # Fill bar in braille
-                for py in range(bar_top, bar_bottom + 1):
-                    for px in range(sx0, sx1):
-                        _set(px, py, style, prio)
-
-                # Arrowhead character
+                # Fill the body. Forward: arrowhead occupies the LAST
+                # column; reverse: arrowhead occupies the FIRST column
+                # (leftmost). Single-col features become pure
+                # arrowhead — no body fill — so they remain visible.
                 if strand >= 0:
-                    canvas.put(min(sx1 >> 1, w - margin_r - 1), feat_ty, "▶", style)
+                    head_col  = cx1 - 1
+                    body_cols = range(cx0, cx1 - 1)
+                    # Half-triangle corner glyphs:
+                    #   ◥  upper-right triangle (top half of right-arrow)
+                    #   ◢  lower-right triangle (bottom half)
+                    head_top, head_bot = "◥", "◢"
                 else:
-                    canvas.put(max(sx0 >> 1, margin_l), feat_ty, "◀", style)
+                    head_col  = cx0
+                    body_cols = range(cx0 + 1, cx1)
+                    #   ◤  upper-left  (top half of left-arrow)
+                    #   ◣  lower-left  (bottom half)
+                    head_top, head_bot = "◤", "◣"
 
-                # Label above (fwd) or below (rev) the bar
-                x0c, x1c = sx0 >> 1, sx1 >> 1
-                max_lbl_w = x1c - x0c
-                if max_lbl_w >= 1 and 0 <= label_ty < h:
-                    lbl = label[:max_lbl_w]
-                    lx  = x0c + (max_lbl_w - len(lbl)) // 2
-                    canvas.put_text(lx, label_ty, lbl, style)
-                    # Click-target: linear-map labels route a click
-                    # to the same feature the label belongs to.
+                for col in body_cols:
+                    canvas.put(col, bar_top_row,    "█", style)
+                    canvas.put(col, bar_bottom_row, "█", style)
+                # Arrowhead column. Always paint, even for very narrow
+                # features — the user needs a directional cue more
+                # than they need a body fill.
+                if 0 <= head_col < w:
+                    canvas.put(head_col, bar_top_row,    head_top, style)
+                    canvas.put(head_col, bar_bottom_row, head_bot, style)
+
+                # Label centred over the bar's column range. Truncate
+                # to fit; if the bar is narrower than the label, the
+                # label still renders truncated rather than spilling
+                # into adjacent columns of other features.
+                if 0 <= label_row < h and bar_w >= 1:
+                    lbl = label[:max(1, bar_w)]
+                    lx  = cx0 + (bar_w - len(lbl)) // 2
+                    canvas.put_text(lx, label_row, lbl, style)
                     self._label_bboxes.append(
-                        (lx, lx + len(lbl) - 1, label_ty, i)
+                        (lx, lx + len(lbl) - 1, label_row, i)
                     )
 
         # ── Header ──
@@ -3690,8 +4128,13 @@ class FeatureSidebar(Widget):
     """
 
     class RowActivated(Message):
-        def __init__(self, idx: int):
-            self.idx = idx
+        def __init__(self, idx: int, *, shift: bool = False):
+            self.idx   = idx
+            # Shift+click on a sidebar row → extend the seq-panel
+            # selection from the anchor feature to this one. The App
+            # reads it and falls back to bare-click behaviour when no
+            # feature is currently selected.
+            self.shift = bool(shift)
             super().__init__()
 
     def compose(self) -> ComposeResult:
@@ -3749,6 +4192,12 @@ class FeatureSidebar(Widget):
 
     _prog_row: int = -1   # cursor moves driven by highlight_row, not the user
     _populating: bool = False   # suppress RowActivated cascade during populate()
+    # DataTable's RowSelected / RowHighlighted events don't carry the
+    # mouse-modifier state. We capture shift on the parent Click event
+    # (which fires *before* RowSelected) and stash it here for the
+    # row-event handlers to read. Per-sidebar instance, reset after
+    # consumption so the next bare click reads `False`.
+    _pending_shift: bool = False
 
     def highlight_row(self, idx: int) -> None:
         """Move cursor to row; suppresses the resulting RowActivated echo."""
@@ -3761,6 +4210,25 @@ class FeatureSidebar(Widget):
         except Exception:
             self._prog_row = -1
 
+    @on(Click)
+    def _on_table_click(self, event: Click) -> None:
+        # Capture shift OR ctrl state *before* DataTable's own row
+        # events fire. Don't stop propagation — the table still needs
+        # the click to move its cursor. Ctrl is a synonym for shift
+        # because many terminals eat shift+click for native text-
+        # selection.
+        self._pending_shift = bool(getattr(event, "shift", False)
+                                     or getattr(event, "ctrl",  False))
+        try:
+            self.app._echo_click_modifiers("sidebar", event)
+        except Exception:
+            pass
+
+    def _consume_shift(self) -> bool:
+        s = self._pending_shift
+        self._pending_shift = False
+        return s
+
     @on(DataTable.RowHighlighted, "#feat-table")
     def _row_highlighted(self, event: DataTable.RowHighlighted):
         # Ignore every auto-highlight that fires while populate() is running.
@@ -3769,7 +4237,8 @@ class FeatureSidebar(Widget):
         if event.cursor_row == self._prog_row:
             self._prog_row = -1
             return
-        self.post_message(self.RowActivated(event.cursor_row))
+        self.post_message(self.RowActivated(event.cursor_row,
+                                              shift=self._consume_shift()))
 
     @on(DataTable.RowSelected, "#feat-table")
     def _row_selected(self, event: DataTable.RowSelected):
@@ -3794,7 +4263,8 @@ class FeatureSidebar(Widget):
             return
         # No `_prog_row` check here — programmatic moves don't trigger
         # RowSelected, only real clicks/Enter do, so we always want to react.
-        self.post_message(self.RowActivated(event.cursor_row))
+        self.post_message(self.RowActivated(event.cursor_row,
+                                              shift=self._consume_shift()))
 
 
 # ── Library panel ──────────────────────────────────────────────────────────────
@@ -4450,10 +4920,15 @@ class SequencePanel(Widget):
     """
     Bottom DNA sequence viewer.
 
-    Click  on the sequence → place cursor + select feature at that position.
-    Shift+click           → extend selection for editing.
+    Click on the sequence → place cursor + select feature at that position.
+    Ctrl+click  → extend selection (works everywhere).
+    Shift+click → same effect, but terminals that intercept Shift+click
+                  for native text-selection (xterm, macOS Terminal,
+                  GNOME Terminal) will eat the click before the app
+                  sees it. Use Ctrl+click if Shift seems ignored.
     Ctrl+E                → open insert/replace dialog at cursor / selection.
     Alt+D                 → toggle hover-status debug mode.
+    Alt+M                 → toggle click-modifier echo debug.
     H (debug only)        → copy hover-status text to clipboard.
     D (debug only)        → dump rendered chunk text to clipboard + log.
     """
@@ -4778,11 +5253,18 @@ class SequencePanel(Widget):
         """
         def __init__(self, bp: int, double: bool = False,
                      from_lane: bool = False,
-                     feat: "dict | None" = None):
+                     feat: "dict | None" = None,
+                     *, shift: bool = False):
             self.bp        = bp
             self.double    = double
             self.from_lane = from_lane
             self.feat      = feat
+            # Shift state of the originating click. The lane-click
+            # branch in `PlasmidApp._seq_click_impl` honours this for
+            # feature-to-feature span selection; DNA-row clicks ignore
+            # it (the bp-level shift+drag path handles those via
+            # `on_mouse_down` directly on the seq panel).
+            self.shift     = bool(shift)
             super().__init__()
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -5003,7 +5485,10 @@ class SequencePanel(Widget):
         self._mouse_button_held = True
         self._drag_start_bp     = bp
         self._has_dragged       = False
-        self._drag_was_shift    = event.shift
+        # Ctrl is treated as a shift synonym (some terminals eat
+        # shift+click for native text-selection). The on_mouse_down
+        # extend-selection branch below uses the same combined flag.
+        self._drag_was_shift    = bool(event.shift) or bool(event.ctrl)
         # Snapshot the lane feat clicked at mouse_down so on_mouse_up
         # can demote a tiny in-feature jiggle back to a click.
         self._mouse_down_lane_feat = self._last_lane_feat
@@ -5018,8 +5503,11 @@ class SequencePanel(Widget):
             **{k: v for k, v in dbg.items()
                if k in ("packed_row", "seq_col", "is_below", "owner_set")},
         )
-        if event.shift and self._cursor_pos >= 0:
-            # Shift+click: extend selection from anchor (or cursor) to here
+        if (event.shift or event.ctrl) and self._cursor_pos >= 0:
+            # Shift / Ctrl + click: extend bp-level selection from
+            # anchor (or cursor) to here. Either modifier triggers
+            # the same flow because terminals can swallow shift+click
+            # for native text-selection.
             anchor = self._sel_anchor if self._sel_anchor >= 0 else self._cursor_pos
             self._sel_anchor = anchor
             s = min(anchor, bp)
@@ -5050,6 +5538,12 @@ class SequencePanel(Widget):
         self._last_mouse_xy = (event.screen_x, event.screen_y)
         if self._debug_mode:
             self._update_hover_status(event.screen_x, event.screen_y)
+        # Hover tooltip on lane art (gated by Settings → Show feature
+        # hover tooltips). Cheap when off — early-returns before any
+        # hover-resolve work. Skipped during a drag so a selection
+        # gesture doesn't flicker the popup.
+        if not self._mouse_button_held:
+            self._update_feature_tooltip(event.screen_x, event.screen_y)
         if not self._mouse_button_held or self._drag_start_bp < 0:
             return
         bp = self._click_to_bp(event.screen_x, event.screen_y)
@@ -5062,6 +5556,42 @@ class SequencePanel(Widget):
         self._cursor_pos = bp
         self._sel_range  = None
         self._refresh_view()
+
+    def _update_feature_tooltip(self, screen_x: int, screen_y: int) -> None:
+        """Set / clear `self.tooltip` based on whether the cursor is on
+        feature lane art. Only triggers on lane rows, not DNA bases —
+        DNA hover would be too noisy. Cleared when the user toggles
+        the setting off via `PlasmidApp.action_toggle_feature_tooltips`.
+        """
+        try:
+            app = self.app
+        except Exception:
+            return
+        if not getattr(app, "_show_feature_tooltips", True):
+            if self.tooltip is not None:
+                self.tooltip = None
+            return
+        info = self._hover_at(screen_x, screen_y) if self._seq else None
+        # Lane-art kinds emitted by `_hover_at`. DNA-row hovers are
+        # excluded so passing the cursor across bases doesn't
+        # tooltip-storm — the user only gets a popup when actually
+        # over a feature bar / label.
+        kind = (info or {}).get("kind", "")
+        if kind not in ("above", "below"):
+            if self.tooltip is not None:
+                self.tooltip = None
+            return
+        feat = info.get("feat") if info else None
+        if not isinstance(feat, dict):
+            if self.tooltip is not None:
+                self.tooltip = None
+            return
+        # `_orig_dict` carries the original (un-split) wrap feature
+        # so the tooltip shows the full bp range, not the half-piece.
+        feat = feat.get("_orig_dict", feat)
+        new = _format_feat_tooltip(feat, len(self._seq))
+        if self.tooltip != new:
+            self.tooltip = new
 
     def _hover_at(self, screen_x: int, screen_y: int) -> dict:
         """Read-only mirror of `_click_to_bp`'s row-dispatch logic.
@@ -5339,9 +5869,18 @@ class SequencePanel(Widget):
                   if self._last_lane_feat else None,
             double=double,
         )
+        # Extend modifier = shift OR ctrl (terminals frequently eat
+        # shift+click; ctrl+click stays as a cross-terminal alias).
+        ext = bool(getattr(event, "shift", False)
+                    or getattr(event, "ctrl",  False))
+        try:
+            self.app._echo_click_modifiers("seq panel", event)
+        except Exception:
+            pass
         self.post_message(self.SequenceClick(
             bp, double=double, from_lane=self._last_lane_click,
             feat=self._last_lane_feat,
+            shift=ext,
         ))
 
     def _seq_render_width(self) -> int:
@@ -6215,9 +6754,12 @@ _HELP_BODY_MD = """\
 |---|---|
 | Click bar | Highlight feature DNA span |
 | Click base | Place cursor (no feature pick) |
-| Shift+click | Extend selection |
+| **Ctrl+click base** | Extend bp-level selection from cursor |
+| **Ctrl+click feature** | Extend selection from anchor feature to this one (works on map, sequence-panel lanes, sidebar rows) |
+| Shift+click | Same as Ctrl+click — but many terminals (xterm, macOS Terminal, GNOME Terminal) intercept Shift+click for their own text-selection so the click never reaches the app. Ctrl+click is the reliable default. |
 | `Ctrl+C` | Copy selection (top strand) |
 | `Alt+C` | Copy selection (bottom strand, reverse-complement) |
+| `Alt+M` | Toggle click-debug — each click echoes modifier state in a toast. Diagnoses terminals that swallow Shift+click: no toast on Shift+click means the terminal ate it; use Ctrl+click instead. |
 
 ### Seq-panel debug
 
@@ -6710,8 +7252,8 @@ class MenuBar(Widget):
     }
     """
 
-    MENUS = ["File", "Edit", "Enzymes", "Features", "Primers", "Mutagenize",
-             "Parts", "Constructor"]
+    MENUS = ["File", "Settings", "Edit", "Enzymes", "Features", "Primers",
+             "Mutagenize", "Parts", "Constructor"]
 
     def compose(self) -> ComposeResult:
         for name in self.MENUS:
@@ -13951,6 +14493,523 @@ class FastaFilePickerModal(ModalScreen):
         self.dismiss(None)
 
 
+_SEQ_ZIP_EXTS: frozenset[str] = frozenset({".zip"})
+
+_SEQ_ZIP_HIGHLIGHT_STYLE = "bold #BFFF00"
+_SEQ_ZIP_OTHER_STYLE     = "#FFFFFF"
+
+
+def _is_seq_zip_path(path) -> bool:
+    """True if `path` looks like a sequencing-data archive by extension.
+    Currently a `.zip` check; if vendors start shipping `.tar.gz` /
+    `.7z` we add them here."""
+    try:
+        suffix = getattr(path, "suffix", None)
+        if suffix is None:
+            suffix = Path(str(path)).suffix
+    except Exception:
+        return False
+    return suffix.lower() in _SEQ_ZIP_EXTS
+
+
+class _ZipAwareDirectoryTree(DirectoryTree):
+    """DirectoryTree variant that colours .zip archives lime green so
+    the user can scan a downloads folder for the Plasmidsaurus run.
+    Mirrors `_FastaAwareDirectoryTree`'s contract."""
+
+    def render_label(self, node, base_style, style):
+        label = super().render_label(node, base_style, style)
+        data = node.data
+        if data is None:
+            return label
+        p = getattr(data, "path", None)
+        if p is None:
+            return label
+        try:
+            if not p.is_file():
+                return label
+        except OSError:
+            return label
+        styled = label.copy()
+        if _is_seq_zip_path(p):
+            styled.stylize(_SEQ_ZIP_HIGHLIGHT_STYLE)
+        else:
+            styled.stylize(_SEQ_ZIP_OTHER_STYLE)
+        return styled
+
+
+# ── Plasmidsaurus alignment ingestion ─────────────────────────────────────────
+#
+# `PlasmidsaurusAlignModal` is the entry point for "I have a Plasmidsaurus
+# results .zip and want to align the consensus to one of my library
+# plasmids". Three-step flow rolled into one modal so users don't bounce
+# between dialogs:
+#
+#   1. Type a .zip path (with `~` expansion).
+#   2. Listing of .gbk members surfaces — pick one.
+#   3. Target plasmid (from the active collection) is auto-selected to
+#      the currently-loaded record; user can change to any library entry.
+#   4. Run → pushes `AlignmentScreen` with the pairwise result.
+#
+# Future: the same modal will gain a "Download from Plasmidsaurus
+# account" tab once the API integration lands; the alignment pipeline
+# downstream is unchanged.
+
+class PlasmidsaurusAlignModal(ModalScreen):
+    """Modal: pick a Plasmidsaurus .zip, pick a .gbk member, pick a
+    library target plasmid, run pairwise alignment.
+
+    Dismisses with ``None`` on cancel. On submit, pushes
+    `AlignmentScreen` directly and dismisses with the alignment dict
+    so the caller can chain (currently only the menu action drives
+    this; the dismiss payload is unused but kept for symmetry).
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    PlasmidsaurusAlignModal { align: center middle; }
+    #align-box {
+        width: 110; max-width: 96%; min-width: 80;
+        height: 44;  max-height: 96%;
+        background: $surface; border: solid $accent; padding: 1 2;
+    }
+    #align-title  { background: $accent-darken-2; color: $text;
+                    padding: 0 1; margin-bottom: 1; }
+    #align-box Label { color: $text-muted; margin-top: 1; }
+    #align-zip-tree { height: 12; border: solid $primary-darken-2; }
+    #align-selected-zip { height: 1; color: $text-muted; }
+    #align-members  { height: 1fr; border: solid $primary-darken-2; }
+    #align-target   { margin-top: 1; }
+    #align-status   { height: 1; margin-top: 1; }
+    #align-btns     { height: 3; margin-top: 1; }
+    #align-btns Button { margin-right: 1; min-width: 12; }
+    """
+
+    def __init__(self, start_path: "str | None" = None) -> None:
+        super().__init__()
+        # Tree starts at the user's home dir by default. A custom
+        # start_path lets future entry points (e.g. an agent-API
+        # wrapper) jump straight to a known downloads folder.
+        start = Path(start_path).expanduser() if start_path else Path.home()
+        try:
+            if not start.is_dir():
+                start = Path.home()
+        except OSError:
+            start = Path.home()
+        self._tree_start: str = str(start)
+        self._zip_path: "Path | None" = None
+        self._members: list[dict] = []
+        self._selected_member: "str | None" = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="align-box"):
+            yield Static(
+                " Align sequencing run (Plasmidsaurus .zip) ",
+                id="align-title",
+            )
+            yield Label("Browse for the run .zip "
+                        "(highlighted lime-green):")
+            yield _ZipAwareDirectoryTree(
+                self._tree_start, id="align-zip-tree",
+            )
+            yield Static(
+                "[dim]No zip selected.[/dim]",
+                id="align-selected-zip", markup=True,
+            )
+            yield Label(".gbk members inside the zip (click to pick):")
+            yield DataTable(id="align-members", cursor_type="row",
+                              zebra_stripes=True)
+            yield Label("Target plasmid (from active collection):")
+            yield Select(
+                self._target_options(),
+                id="align-target",
+                allow_blank=False,
+            )
+            yield Static("", id="align-status", markup=True)
+            with Horizontal(id="align-btns"):
+                yield Button("Align", id="btn-align-go",
+                              variant="primary", disabled=True)
+                yield Button("Cancel", id="btn-align-cancel")
+
+    def _target_options(self) -> list[tuple[str, str]]:
+        """Build the (label, value) list for the target dropdown.
+        Pulls from the library so the user can align against any
+        plasmid in the active collection. Each value is the entry's
+        `id` (LOCUS-safe), label is the display name + size."""
+        opts: list[tuple[str, str]] = []
+        try:
+            for e in _load_library():
+                eid = e.get("id") or ""
+                if not eid:
+                    continue
+                name = e.get("name") or eid
+                size = e.get("size", 0)
+                opts.append((f"{name}  ({size:,} bp)", eid))
+        except Exception:
+            _log.exception("PlasmidsaurusAlignModal: library load failed")
+        if not opts:
+            opts.append(("(no plasmids in library — save one first)", "—"))
+        return opts
+
+    def on_mount(self) -> None:
+        t = self.query_one("#align-members", DataTable)
+        t.add_columns("Member", "Size")
+        # Pre-select the currently-loaded record if it has a saved
+        # library entry. Otherwise the dropdown's first row stands.
+        try:
+            cur = getattr(self.app, "_current_record", None)
+            if cur is not None:
+                sel = self.query_one("#align-target", Select)
+                for _label, val in self._target_options():
+                    if val == cur.id:
+                        sel.value = val
+                        break
+        except (NoMatches, AttributeError):
+            pass
+
+    @on(DirectoryTree.FileSelected, "#align-zip-tree")
+    def _on_zip_picked(self, event) -> None:
+        """User clicked a file in the directory tree. If it's a .zip,
+        list its .gbk members; if anything else, surface a helpful
+        warning so the user knows what kind of file this modal needs."""
+        path = Path(str(event.path))
+        sel  = self.query_one("#align-selected-zip", Static)
+        t    = self.query_one("#align-members", DataTable)
+        status = self.query_one("#align-status", Static)
+        # Reset the downstream state every time the user picks a new
+        # file — even one we end up rejecting. Otherwise the previous
+        # zip's members list lingers and the Align button might still
+        # be enabled when the user has clicked through to garbage.
+        t.clear()
+        self._members = []
+        self._selected_member = None
+        self._zip_path = None
+        self.query_one("#btn-align-go", Button).disabled = True
+        if not _is_seq_zip_path(path):
+            sel.update(
+                f"[yellow]Not a .zip: {_esc_md(path.name)}[/yellow]"
+            )
+            status.update("")
+            return
+        try:
+            members = _list_gbk_members_in_zip(path)
+        except ValueError as exc:
+            sel.update(
+                f"[dim]Picked:[/dim] {_esc_md(str(path))}"
+            )
+            status.update(f"[red]{_esc_md(str(exc))}[/red]")
+            return
+        self._zip_path = path
+        self._members  = members
+        sel.update(f"[dim]Picked:[/dim] {_esc_md(str(path))}")
+        if not members:
+            status.update(
+                "[yellow]No .gbk / .gb / .genbank members found "
+                "inside.[/yellow]"
+            )
+            return
+        for m in members:
+            t.add_row(m["name"], f"{m['size']:,}", key=m["name"])
+        status.update(
+            f"[dim]Found {len(members)} member(s). Click one to "
+            f"select.[/dim]"
+        )
+
+    @on(DataTable.RowSelected, "#align-members")
+    def _on_member_selected(self, event: DataTable.RowSelected) -> None:
+        try:
+            t = self.query_one("#align-members", DataTable)
+            row = t.get_row_at(event.cursor_row)
+            if not row:
+                return
+            self._selected_member = str(row[0])
+            self.query_one("#btn-align-go", Button).disabled = False
+            self.query_one("#align-status", Static).update(
+                f"[dim]Selected: {_esc_md(self._selected_member)}[/dim]"
+            )
+        except (NoMatches, IndexError):
+            pass
+
+    @on(Button.Pressed, "#btn-align-go")
+    def _go(self, _) -> None:
+        if self._zip_path is None or not self._selected_member:
+            return
+        sel = self.query_one("#align-target", Select)
+        target_id = sel.value
+        if not target_id or target_id == "—":
+            self.query_one("#align-status", Static).update(
+                "[red]Pick a target plasmid first.[/red]"
+            )
+            return
+        # Read the .gbk text out of the zip and parse to a record.
+        try:
+            gbk_text = _extract_gbk_member(self._zip_path,
+                                              self._selected_member)
+            query_rec = _gb_text_to_record(gbk_text)
+        except (ValueError, Exception) as exc:
+            _log.exception("PlasmidsaurusAlignModal: extract / parse failed")
+            self.query_one("#align-status", Static).update(
+                f"[red]{_esc_md(str(exc))}[/red]"
+            )
+            return
+        # Resolve the target plasmid from the library.
+        target_entry = next(
+            (e for e in _load_library() if e.get("id") == target_id),
+            None,
+        )
+        if target_entry is None:
+            self.query_one("#align-status", Static).update(
+                "[red]Target plasmid not found in library.[/red]"
+            )
+            return
+        try:
+            target_rec = _gb_text_to_record(target_entry.get("gb_text", ""))
+        except Exception as exc:
+            _log.exception("PlasmidsaurusAlignModal: target parse failed")
+            self.query_one("#align-status", Static).update(
+                f"[red]Target parse failed: {_esc_md(str(exc))}[/red]"
+            )
+            return
+        # Run the alignment.
+        try:
+            result = _pairwise_align(
+                str(query_rec.seq),
+                str(target_rec.seq),
+                mode="global",
+            )
+        except ValueError as exc:
+            self.query_one("#align-status", Static).update(
+                f"[red]Alignment failed: {_esc_md(str(exc))}[/red]"
+            )
+            return
+        # Push the visualisation screen, then dismiss this modal.
+        self.app.push_screen(
+            AlignmentScreen(
+                query_label=self._selected_member,
+                target_label=target_entry.get("name") or target_id,
+                target_record=target_rec,
+                result=result,
+            )
+        )
+        self.dismiss(result)
+
+    @on(Button.Pressed, "#btn-align-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+def _esc_md(s: str) -> str:
+    """Local helper — escape Rich markup metachars so a hostile / odd
+    file path or error string can't inject styling into Static updates
+    in this modal. Equivalent to `rich.markup.escape`."""
+    from rich.markup import escape
+    return escape(s)
+
+
+# ── Alignment visualisation screen ────────────────────────────────────────────
+#
+# Renders a pairwise alignment as parallel rows of bases with mismatches
+# highlighted. CommercialSaaS-style two-row diff, but with an annotation lane
+# above showing which target features each column falls into — a
+# question biologists actually ask ("does my mismatch land in my
+# CDS?"). Header summary: identity %, score, mismatch / gap counts.
+
+class AlignmentScreen(Screen):
+    """Full-screen pairwise alignment viewer.
+
+    Uses Textual's Markdown widget for the header summary and a Static
+    inside a VerticalScroll for the alignment body. The body is plain
+    Rich text — each column is a query/target pair, mismatches tinted
+    red, gaps shown as `─`. Coordinates printed every 60 cols for
+    navigation. Press `q` or `Esc` to close.
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("q",      "close", "Close"),
+    ]
+
+    DEFAULT_CSS = """
+    AlignmentScreen {
+        align: center middle;
+        background: $background;
+    }
+    #aln-box {
+        width:  98%;
+        height: 96%;
+        background: $surface;
+        border: solid $accent;
+        padding: 1 2;
+    }
+    #aln-title { background: $accent-darken-2; color: $text;
+                  padding: 0 1; margin-bottom: 1; }
+    #aln-summary { height: auto; margin-bottom: 1; }
+    #aln-body   { height: 1fr; border: solid $primary-darken-2; }
+    #aln-hint   { height: 1; margin-top: 1; color: $text-muted; }
+    """
+
+    # Width of one alignment row segment before wrapping.
+    _CHUNK_W = 60
+
+    def __init__(self, query_label: str, target_label: str,
+                 target_record, result: dict) -> None:
+        super().__init__()
+        self._query_label  = query_label
+        self._target_label = target_label
+        self._target_rec   = target_record
+        self._result       = result
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="aln-box"):
+            yield Static(" Pairwise alignment ", id="aln-title")
+            yield Markdown(self._summary_md(), id="aln-summary")
+            with VerticalScroll(id="aln-body"):
+                yield Static(self._body_text(), id="aln-body-content")
+            yield Static(
+                "[dim]Press q or Esc to close. Mismatches tinted "
+                "[red]red[/]; gaps shown as ─. Annotation lane shows "
+                "which target features each column falls into.[/dim]",
+                id="aln-hint", markup=True,
+            )
+
+    def _summary_md(self) -> str:
+        r = self._result
+        return (
+            f"**Query**: `{_esc_md(self._query_label)}`  "
+            f"({r['q_len']:,} bp)  \n"
+            f"**Target**: `{_esc_md(self._target_label)}`  "
+            f"({r['t_len']:,} bp)  \n"
+            f"**Identity**: {r['identity_pct']:.2f}%  ·  "
+            f"**Score**: {r['score']:.0f}  ·  "
+            f"**Matches**: {r['n_matches']:,}  ·  "
+            f"**Mismatches**: {r['n_mismatches']:,}  ·  "
+            f"**Gaps**: {r['n_gaps']:,}"
+        )
+
+    def _body_text(self) -> Text:
+        """Render the alignment body as Rich Text. Three rows per
+        chunk: target features lane, target bases, match track,
+        query bases. Mismatches red, gaps dim."""
+        from rich.markup import escape as _esc
+        r       = self._result
+        aq      = r["aligned_q"]
+        at      = r["aligned_t"]
+        n       = len(aq)
+        # Map each alignment column → target bp position (so we can
+        # look up which feature covers it). Walk through the target
+        # row, advancing a counter on every non-gap.
+        col_to_t_bp: list[int] = [-1] * n
+        bp = 0
+        for i, ch in enumerate(at):
+            if ch != "-":
+                col_to_t_bp[i] = bp
+                bp += 1
+        # Pre-compute which feature label covers each target bp. We
+        # only annotate non-source features; on overlap, the
+        # smallest-enclosing feature wins (same convention as
+        # PlasmidMap._feat_at).
+        feat_at_bp: list[str] = [""] * (len(self._target_rec.seq) or 1)
+        feats = []
+        for f in self._target_rec.features:
+            if f.type == "source":
+                continue
+            try:
+                s = int(f.location.start)
+                e = int(f.location.end)
+            except Exception:
+                continue
+            label = ""
+            for q in ("label", "gene", "product"):
+                v = f.qualifiers.get(q)
+                if isinstance(v, list) and v:
+                    label = str(v[0])
+                    break
+            if not label:
+                label = f.type
+            feats.append((s, e, label, e - s))
+        feats.sort(key=lambda t: (t[3], t[0]))
+        for s, e, label, _ in feats:
+            for i in range(s, min(e, len(feat_at_bp))):
+                if not feat_at_bp[i]:   # smallest wins → first writer
+                    feat_at_bp[i] = label
+        # Render in chunks.
+        out = Text(no_wrap=True, overflow="crop")
+        for chunk_s in range(0, n, self._CHUNK_W):
+            chunk_e = min(chunk_s + self._CHUNK_W, n)
+            # Coordinate header: target bp at chunk start.
+            tbp_s = next(
+                (col_to_t_bp[i] for i in range(chunk_s, chunk_e)
+                  if col_to_t_bp[i] >= 0),
+                -1,
+            )
+            tbp_e = next(
+                (col_to_t_bp[i] for i in range(chunk_e - 1, chunk_s - 1, -1)
+                  if col_to_t_bp[i] >= 0),
+                -1,
+            )
+            out.append(
+                f"target bp {tbp_s + 1 if tbp_s >= 0 else '?'}"
+                f"..{tbp_e + 1 if tbp_e >= 0 else '?'}\n",
+                style="dim cyan",
+            )
+            # Annotation lane: feature label per column when it
+            # changes. Use single-char glyphs so the row stays one
+            # screen line; print the label only at the start of a
+            # contiguous run.
+            ann_row = []
+            prev = None
+            for i in range(chunk_s, chunk_e):
+                tbp = col_to_t_bp[i]
+                lbl = feat_at_bp[tbp] if 0 <= tbp < len(feat_at_bp) else ""
+                if lbl and lbl != prev:
+                    # Start of a new feature run — print the label
+                    # truncated to fit.
+                    glyph = lbl[:1] or "·"
+                else:
+                    glyph = "·" if lbl else " "
+                ann_row.append(glyph)
+                prev = lbl
+            out.append("".join(ann_row) + "\n", style="dim yellow")
+            # Target row (with feature-position cyan bg on column 0
+            # of each non-gap to anchor the eye).
+            t_row = at[chunk_s:chunk_e]
+            out.append(t_row + "\n", style="white")
+            # Match-track + query row, mismatches red.
+            match_track = []
+            for i in range(chunk_s, chunk_e):
+                cq, ct = aq[i], at[i]
+                if cq == "-" or ct == "-":
+                    match_track.append("─")
+                elif cq == ct:
+                    match_track.append("│")
+                else:
+                    match_track.append("✗")
+            out.append("".join(match_track) + "\n", style="dim")
+            # Query row, with mismatches highlighted red.
+            for i in range(chunk_s, chunk_e):
+                cq, ct = aq[i], at[i]
+                if cq == "-":
+                    out.append("─", style="dim")
+                elif ct == "-":
+                    out.append(cq, style="bold yellow on grey15")
+                elif cq != ct:
+                    out.append(cq, style="bold red")
+                else:
+                    out.append(cq, style="white")
+            out.append("\n\n")
+        return out
+
+    def action_close(self) -> None:
+        self.app.pop_screen()
+
+
 # ── Constructor modal ──────────────────────────────────────────────────────────
 
 def _feats_for_domesticator(record) -> list[dict]:
@@ -20032,6 +21091,14 @@ class PlasmidApp(App):
     _restr_min_len: int = 6
     _show_restr: bool = False
     _restr_cache: "list" = []
+    # User preferences (loaded from settings.json on mount, saved on
+    # change). The Settings menu in the menu bar is the user-facing
+    # toggle surface; entries here are the in-memory mirror so hot
+    # paths (mouse-move handlers, etc.) don't have to read JSON each
+    # time. Keep the schema flat so adding future toggles stays
+    # mechanical: add the bool here, add the menu line in `open_menu`,
+    # add the `action_toggle_*` method, and load it in `on_mount`.
+    _show_feature_tooltips: bool = True
     # Splash screen on launch — skip via CLI `--no-splash` or by setting
     # `app._skip_splash = True` before run() (the test conftest sets this
     # because the splash modal blocks pilot.click before the suite drives
@@ -20816,6 +21883,12 @@ SpeciesPickerModal { align: center middle; }
         # `priority=True` so it works even when a modal has focus
         # (the modal can still receive `?` for itself if it overrides).
         Binding("?",            "show_help",             "Help",      show=True,  priority=True),
+        # Click-modifier diagnostic — toggles a per-click notify that
+        # echoes shift / ctrl / meta state so users on terminals that
+        # eat shift+click (xterm-style "extend selection") can see
+        # which modifiers actually reach the app and pick a working
+        # binding. Off by default; Alt+M to flip.
+        Binding("alt+m",        "toggle_click_debug",    "Click debug", show=False),
         # H / D / Alt+D used to live here as App-level priority
         # bindings, but they intercepted literal `h` / `d` keystrokes
         # in modal Input fields (e.g. typing the IUPAC `H` ambiguity
@@ -20861,6 +21934,37 @@ SpeciesPickerModal { align: center middle; }
         # Both helpers are idempotent.
         _ensure_default_collection()
         _restore_library_from_active_collection()
+        # Hydrate user-preference toggles from settings.json. Defaults
+        # match the class-level annotations above; missing keys (fresh
+        # data dir) take the default. Done in compose() so the value
+        # is visible to children's on_mount handlers without a
+        # second-pass refresh.
+        #
+        # Adding a new persistent toggle: bump this block, add the
+        # `_set_setting(...)` call to the matching `action_toggle_*`
+        # method, and surface it in the Settings (or relevant) menu.
+        self._show_feature_tooltips = bool(
+            _get_setting("show_feature_tooltips", True)
+        )
+        self._click_debug          = bool(_get_setting("click_debug", False))
+        self._show_restr           = bool(_get_setting("show_restr",  False))
+        self._restr_unique_only    = bool(
+            _get_setting("restr_unique_only", True)
+        )
+        # Restriction-recognition minimum length is an int (4 or 6).
+        # Non-int / out-of-range values fall back to the default 6 so a
+        # hand-edited settings.json can't poison the scanner.
+        rml = _get_setting("restr_min_len", 6)
+        self._restr_min_len = rml if rml in (4, 6) else 6
+        # `show_connectors` lives on both seq panel and map; can't
+        # hydrate from compose() because the children haven't
+        # composed yet — defer to on_mount via a saved class attr.
+        self._pending_show_connectors = bool(
+            _get_setting("show_connectors", False)
+        )
+        # `map_mode` similarly applies to PlasmidMap once mounted.
+        mm = _get_setting("map_mode", "circular")
+        self._pending_map_mode = mm if mm in ("circular", "linear") else "circular"
         yield Header()
         yield MenuBar()
         # Three side-by-side panels share the top row; the sequence
@@ -20941,13 +22045,16 @@ SpeciesPickerModal { align: center middle; }
         self._seq_jump_row_edge(end=True)
 
     def action_toggle_map_view(self):
-        self.query_one("#plasmid-map", PlasmidMap).action_toggle_map_view()
+        pm = self.query_one("#plasmid-map", PlasmidMap)
+        pm.action_toggle_map_view()
+        _set_setting("map_mode", pm._map_mode)
 
     def action_toggle_connectors(self):
         sp = self.query_one("#seq-panel", SequencePanel)
         pm = self.query_one("#plasmid-map", PlasmidMap)
         sp._show_connectors  = not sp._show_connectors
         pm._show_connectors  = sp._show_connectors
+        _set_setting("show_connectors", sp._show_connectors)
         sp._view_cache_key   = None   # invalidate seq panel cache
         pm._draw_cache       = None   # invalidate map draw cache
         sp._refresh_view()
@@ -21232,6 +22339,21 @@ SpeciesPickerModal { align: center middle; }
             dark=True,
         ))
         self.theme = "splicecraft-black"
+        # Apply hydrated preference toggles to children that hadn't
+        # been composed when `compose()` ran. `_pending_show_connectors`
+        # / `_pending_map_mode` are the staging values from the
+        # settings.json hydration block; pop them here once the panels
+        # exist.
+        try:
+            sp = self.query_one("#seq-panel", SequencePanel)
+            pm = self.query_one("#plasmid-map", PlasmidMap)
+            if getattr(self, "_pending_show_connectors", False):
+                sp._show_connectors = True
+                pm._show_connectors = True
+            if getattr(self, "_pending_map_mode", "circular") == "linear":
+                pm._map_mode = "linear"
+        except (NoMatches, AttributeError):
+            pass
         # Agent API: opt-in localhost server for external CLI/IDE
         # control. `_agent_api_port` is set by `main()` when the user
         # passed `--agent-api` (or SPLICECRAFT_AGENT_API=1). Don't
@@ -21795,6 +22917,39 @@ SpeciesPickerModal { align: center middle; }
             return
         event.stop()
         if k.startswith("shift+"):
+            # If a whole-feature highlight is active and the cursor
+            # isn't at the "free" end of the selection (the end
+            # OPPOSITE _sel_anchor), snap it there first. Without
+            # this, a feature click leaves the cursor mid-feature
+            # (where the user clicked) and the very first Shift+Arrow
+            # would collapse the selection to "anchor … cursor±1"
+            # — typically about half the feature, which the user
+            # reads as "the highlight jumped to the centre". Snapping
+            # to the active end makes Shift+Arrow grow / shrink the
+            # boundary by 1 bp like every other text editor's
+            # selection-extend convention.
+            if sp._user_sel is not None and sp._sel_anchor >= 0:
+                sel_s, sel_e = sp._user_sel
+                # `free_end` = the bp the cursor *should* be on for
+                # boundary-stepping. When anchor == sel_s (the most
+                # common case — feature click anchors at start),
+                # free_end is the right edge (sel_e - 1). When the
+                # user drag-selected leftward (anchor at the right
+                # edge of the span), free_end is sel_s.
+                if sp._sel_anchor <= sel_s:
+                    free_end = sel_e - 1
+                else:
+                    free_end = sel_s
+                if sp._cursor_pos != free_end:
+                    sp._cursor_pos = free_end
+                    if k == "shift+left":
+                        new_pos = max(0, free_end - 1)
+                    elif k == "shift+right":
+                        new_pos = min(n, free_end + 1)
+                    elif k == "shift+up":
+                        new_pos = max(0, free_end - lw)
+                    else:  # shift+down
+                        new_pos = min(max(0, n - 1), free_end + lw)
             # Extend or shrink selection; anchor is set on first Shift+arrow press
             if sp._sel_anchor < 0:
                 sp._sel_anchor = sp._cursor_pos
@@ -22343,6 +23498,201 @@ SpeciesPickerModal { align: center middle; }
             return False
         return (e - 1) // line_width != s // line_width
 
+    # Click-modifier diagnostic. Off by default. Toggle with Alt+M.
+    # When on, every Click event in the three feature-pick widgets
+    # posts a notify echoing the modifier state so users on
+    # shift-eating terminals (xterm "extend selection", macOS
+    # Terminal.app, stock GNOME Terminal) can see which combinations
+    # actually arrive at the app vs are intercepted upstream.
+    _click_debug: bool = False
+
+    def action_toggle_click_debug(self) -> None:
+        self._click_debug = not self._click_debug
+        _set_setting("click_debug", self._click_debug)
+        # Reset the heuristic counters when toggling on so the "no
+        # extend modifier seen" hint can fire even after a previous
+        # session.
+        if self._click_debug:
+            self._click_debug_total = 0
+            self._click_debug_extends = 0
+            self._click_debug_hinted = False
+        _log_event("app.click_debug_toggle", on=self._click_debug)
+        self.notify(
+            f"Click debug {'ON' if self._click_debug else 'OFF'} — "
+            f"each click echoes the modifier state in a toast so you "
+            f"can confirm shift/ctrl reach the app. Some terminals "
+            f"intercept shift+click for native text selection.",
+            severity="information",
+            timeout=8 if self._click_debug else 3,
+        )
+
+    # Track recent click stats so we can detect "user keeps clicking
+    # but no modifier ever arrives" patterns and surface a helpful
+    # hint about ctrl+click. Reset on any successful extend.
+    _click_debug_total: int  = 0
+    _click_debug_extends: int = 0
+    _click_debug_hinted: bool = False
+
+    def _echo_click_modifiers(self, label: str, event) -> None:
+        """If click-debug is on, post a brief notify summarising the
+        click's modifier flags. Cheap no-op when debug is off.
+
+        Side effect: counts clicks with no extend modifier and after
+        a few in a row, posts a one-time hint that some terminals
+        eat shift+click — try ctrl+click. The hint only fires while
+        click-debug is on so it doesn't bother users not actively
+        diagnosing."""
+        if not self._click_debug:
+            return
+        shift = bool(getattr(event, "shift", False))
+        ctrl  = bool(getattr(event, "ctrl",  False))
+        meta  = bool(getattr(event, "meta",  False))
+        x     = getattr(event, "x", "?")
+        y     = getattr(event, "y", "?")
+        self._click_debug_total += 1
+        if shift or ctrl:
+            self._click_debug_extends += 1
+        self.notify(
+            f"{label} click @({x},{y})  shift={shift}  ctrl={ctrl}  meta={meta}  "
+            f"(#{self._click_debug_total})",
+            severity="information",
+            timeout=3,
+            markup=False,
+        )
+        # Heuristic hint: ≥4 clicks observed, 0 with an extend
+        # modifier — likely the terminal is eating shift+click.
+        if (not self._click_debug_hinted
+                and self._click_debug_total >= 4
+                and self._click_debug_extends == 0):
+            self._click_debug_hinted = True
+            self.notify(
+                "Heads up: I haven't seen any shift / ctrl modifier on "
+                "your clicks yet. Some terminals (xterm, macOS Terminal, "
+                "GNOME Terminal) intercept Shift+click for native text "
+                "selection so the app never sees it. Try Ctrl+click "
+                "instead — it's a fully equivalent extend modifier.",
+                severity="warning",
+                timeout=12,
+                markup=False,
+            )
+
+    def _is_extend_modifier(self, event) -> bool:
+        """Return True if the click event carries an "extend selection"
+        modifier. Accepts shift OR ctrl: shift is the convention but
+        many terminals intercept it for native text-selection, so
+        ctrl+click is offered as an equivalent on the same handlers.
+        Either modifier alone (without the other) triggers extend."""
+        return bool(getattr(event, "shift", False)
+                     or getattr(event, "ctrl",  False))
+
+    def _extend_selection_to(self, target_feat: dict, target_bp: int,
+                              *, scroll: bool = True) -> bool:
+        """Shift+click extend: span from the currently-selected feature
+        (the anchor) to ``target_feat``. Linear span only — both
+        features' bp ranges combined via ``min(start) … max(end)``.
+
+        Returns True on success, False if there's no anchor (no feature
+        currently selected) so the caller can fall back to bare-click
+        behaviour.
+
+        Anchor is taken from ``PlasmidMap.selected_idx``; subsequent
+        shift+clicks redefine the END of the span only (the anchor
+        stays put until a non-shift click resets it). Matches the
+        IDE / file-manager convention: click A, shift+click B,
+        shift+click C → spans A through C.
+
+        Wrap-aware caveat: this is a linear span. If a feature wraps
+        the origin (``end < start``), we use its raw start/end which
+        likely produces a span that doesn't include the wrap loop.
+        Users wanting cross-origin spans should rotate the origin
+        with ``[`` / ``]`` first so the desired range is contiguous.
+        """
+        pm      = self.query_one("#plasmid-map", PlasmidMap)
+        seq_pnl = self.query_one("#seq-panel",   SequencePanel)
+        sidebar = self.query_one("#sidebar",     FeatureSidebar)
+        anchor_idx = pm.selected_idx
+        if anchor_idx < 0 or anchor_idx >= len(pm._feats):
+            _log_event("app.extend_selection.no_anchor",
+                        target=target_feat.get("label"),
+                        target_bp=target_bp,
+                        selected_idx=anchor_idx,
+                        n_feats=len(pm._feats))
+            return False
+        anchor = pm._feats[anchor_idx]
+        a_s, a_e = int(anchor["start"]), int(anchor["end"])
+        t_s, t_e = int(target_feat["start"]), int(target_feat["end"])
+        # Same-feature shift+click: anchor and target identical. No
+        # span change is meaningful; swallow the click rather than
+        # silently leaving the user thinking nothing happened.
+        if anchor is target_feat:
+            _log_event("app.extend_selection.same_feature",
+                        idx=anchor_idx,
+                        label=anchor.get("label"))
+            return True
+        # Treat wrap features by their visible linear span — `start` /
+        # `end` only — so the math stays simple. Wrap-arc spans are a
+        # separate enhancement.
+        span_s = min(a_s, t_s)
+        span_e = max(a_e, t_e)
+        total  = len(seq_pnl._seq) or pm._total or 1
+        # Clamp to the sequence length defensively.
+        span_s = max(0, span_s)
+        span_e = min(total, span_e)
+        if span_e <= span_s:
+            _log_event("app.extend_selection.empty_span",
+                        anchor=anchor.get("label"),
+                        target=target_feat.get("label"),
+                        span_s=span_s, span_e=span_e)
+            return False
+        seq_pnl._user_sel  = (span_s, span_e)
+        seq_pnl._sel_range = None
+        # Park the cursor at the target's 5' end (or click bp) so the
+        # user can see where their latest action landed without
+        # jumping to the far end of the span.
+        cursor_bp = (target_bp if 0 <= target_bp < total
+                      else max(0, t_s))
+        seq_pnl._cursor_pos = cursor_bp
+        # Anchor at the OPPOSITE end of the span from the cursor's
+        # natural target end so a follow-up Shift+Arrow grows / shrinks
+        # the active end by 1 bp instead of collapsing the span.
+        # If the cursor lands inside the span (most cases), pick the
+        # span end farther from the cursor as the anchor; otherwise
+        # default to span_s.
+        if abs(cursor_bp - span_e) <= abs(cursor_bp - span_s):
+            seq_pnl._sel_anchor = span_s
+        else:
+            seq_pnl._sel_anchor = span_e - 1
+        # Sidebar mirrors the target (most recent click) so the user
+        # sees its details, not the anchor's. Anchor stays selected
+        # in the map for the next shift+click extension.
+        sidebar.show_detail(target_feat)
+        seq_pnl._refresh_view()
+        if scroll:
+            seq_pnl._ensure_cursor_visible()
+        _log_event(
+            "app.extend_selection.ok",
+            anchor_idx=anchor_idx,
+            anchor=anchor.get("label"),
+            anchor_range=f"{a_s}..{a_e}",
+            target=target_feat.get("label"),
+            target_range=f"{t_s}..{t_e}",
+            span=f"{span_s}..{span_e}",
+            cursor=cursor_bp,
+        )
+        # Click-debug-aware confirmation toast — shows the user what
+        # span actually got highlighted so they can verify nesting /
+        # ordering issues at a glance.
+        if self._click_debug:
+            self.notify(
+                f"extend: anchor={anchor.get('label','?')} "
+                f"({a_s}..{a_e}) → target={target_feat.get('label','?')} "
+                f"({t_s}..{t_e})  span={span_s}..{span_e}",
+                severity="information",
+                timeout=4,
+                markup=False,
+            )
+        return True
+
     def _focus_feature(self, f: "dict | None", bp: int,
                        *, scroll: bool = True) -> None:
         """Single-source UX for "user picked a feature": highlight the
@@ -22440,9 +23790,40 @@ SpeciesPickerModal { align: center middle; }
             f = pm._feats[best_idx]
             _log_event(
                 "app.seq_click_pick", bp=bp, idx=best_idx,
-                feat=f.get("label"),
+                feat=f.get("label"), shift=getattr(event, "shift", False),
                 via=("event_feat" if not used_fallback else "bp_search_fallback"),
             )
+            # Shift+click: extend selection from the anchor (currently
+            # selected feature on the map) to this feature. If no
+            # anchor, fall through to the bare-click flow.
+            if getattr(event, "shift", False):
+                _log_event(
+                    "app.seq_lane_extend",
+                    anchor_idx=pm.selected_idx,
+                    target_idx=best_idx,
+                    target=f.get("label"),
+                    target_range=f"{f.get('start','?')}..{f.get('end','?')}",
+                    bp=bp,
+                )
+                if pm.selected_idx >= 0:
+                    if self._extend_selection_to(f, bp, scroll=False):
+                        sidebar.highlight_row(best_idx)
+                        if seq_pnl._aa_highlight is not None:
+                            seq_pnl._aa_highlight = None
+                            seq_pnl._refresh_view()
+                        return
+                else:
+                    # Click-debug-aware nudge: the user pressed an
+                    # extend modifier but there was no anchor. Help
+                    # them understand the convention.
+                    if self._click_debug:
+                        self.notify(
+                            "extend modifier received but no anchor "
+                            "feature is selected — bare-click a "
+                            "feature first, THEN shift/ctrl-click "
+                            "another to extend the selection.",
+                            severity="warning", timeout=6, markup=False,
+                        )
             pm.select_feature(best_idx)
             sidebar.show_detail(f)
             sidebar.highlight_row(best_idx)
@@ -22467,10 +23848,20 @@ SpeciesPickerModal { align: center middle; }
     def _map_feat_selected_impl(self, event: PlasmidMap.FeatureSelected):
         _log_event(
             "app.map_feat_selected",
-            idx=event.idx, bp=event.bp,
+            idx=event.idx, bp=event.bp, shift=event.shift,
             feat=(event.feat_dict or {}).get("label")
                   if event.feat_dict else None,
         )
+        # Click-debug (Alt+M): post a notify echoing modifier flags
+        # so users on shift-eating terminals can see what arrived.
+        # `event.shift` here already folds in ctrl-as-synonym from
+        # the originating Click event (set by PlasmidMap.on_click).
+        if self._click_debug:
+            self.notify(
+                f"map feature click @bp={event.bp}  "
+                f"extend_modifier={event.shift}  idx={event.idx}",
+                severity="information", timeout=3, markup=False,
+            )
         sidebar = self.query_one("#sidebar", FeatureSidebar)
         # Backbone click (idx == -1, feat_dict is None): treat as a
         # neutral click and wipe every panel's highlight, including
@@ -22484,6 +23875,20 @@ SpeciesPickerModal { align: center middle; }
             if event.bp >= 0:
                 self.query_one("#seq-panel", SequencePanel).center_on_bp(event.bp)
             return
+        # Shift+click on a feature: extend the selection from the
+        # currently-selected feature (anchor) to this one. Anchor
+        # stays put for chained shift+click extensions. If there's
+        # no anchor, fall through to the bare-click path.
+        if event.shift:
+            if self._extend_selection_to(event.feat_dict, event.bp):
+                sidebar.highlight_row(event.idx)
+                return
+        # Bare click: make the App handler the source of truth for
+        # the anchor (PlasmidMap.on_click usually sets this, but a
+        # message posted from elsewhere — sidebar synthesised, agent
+        # path, tests — wouldn't).
+        pm = self.query_one("#plasmid-map", PlasmidMap)
+        pm.select_feature(event.idx)
         sidebar.show_detail(event.feat_dict)
         sidebar.highlight_row(event.idx)
         # Scroll to the feature's START rather than where the user
@@ -22498,16 +23903,32 @@ SpeciesPickerModal { align: center middle; }
     def _sidebar_row_activated(self, event: FeatureSidebar.RowActivated):
         pm      = self.query_one("#plasmid-map", PlasmidMap)
         sidebar = self.query_one("#sidebar",     FeatureSidebar)
-        pm.select_feature(event.idx)
         f = pm._feats[event.idx] if 0 <= event.idx < len(pm._feats) else None
+        if f is None:
+            return
+        # Shift+click on a sidebar row: extend selection from the
+        # current map anchor to this feature. Anchor stays the same
+        # for chained shift+click extensions. Bare-click: normal
+        # focus-this-feature flow (and update the anchor).
+        if event.shift:
+            _log_event(
+                "app.sidebar_extend",
+                anchor_idx=pm.selected_idx,
+                target_idx=event.idx,
+                target=f.get("label"),
+                target_range=f"{f.get('start','?')}..{f.get('end','?')}",
+            )
+            if self._extend_selection_to(f, f["start"]):
+                sidebar.highlight_row(event.idx)
+                return
+        pm.select_feature(event.idx)
         sidebar.show_detail(f)
         # Anchor at the feature's START (5' end) rather than its
         # midpoint so the seq panel scrolls to where the feature
         # begins. Pre-2026-04-30 we used `_wrap_aware_midpoint` which
         # parked the viewport on the middle of long features; users
         # found it disorienting on multi-kb CDS rows.
-        bp = f["start"] if f is not None else -1
-        self._focus_feature(f, bp)
+        self._focus_feature(f, f["start"])
 
     # ── Library events ─────────────────────────────────────────────────────────
 
@@ -22721,6 +24142,15 @@ SpeciesPickerModal { align: center middle; }
         m4 = ck if self._restr_min_len == 4  else nc
         rs = ck if self._show_restr        else nc
 
+        # Settings dropdown is built from a flat list of toggles. Adding
+        # a new boolean preference: append `(label, action_name)` to
+        # this section's list, define `action_<name>` on PlasmidApp,
+        # and (if the in-memory mirror matters) load the value from
+        # `_get_setting` in `on_mount`. Non-toggle settings (numeric,
+        # enum, file path) will need their own modal — keep this list
+        # for simple booleans only.
+        ft = "✓" if self._show_feature_tooltips else " "
+        cd = "✓" if self._click_debug          else " "
         menus = {
             "File": [
                 ("Open file (.gb / .dna)  [^O]", "open_file"),
@@ -22731,8 +24161,14 @@ SpeciesPickerModal { align: center middle; }
                 ("Export as GenBank (.gb)...",   "export_genbank"),
                 ("---",                          None),
                 ("Collections...",               "open_collections"),
+                ("Align sequencing run (Plasmidsaurus .zip)...",
+                                                 "open_align_zip"),
                 ("---",                          None),
                 ("Quit  [q]",                    "quit"),
+            ],
+            "Settings": [
+                (f"[{ft}] Show feature hover tooltips",  "toggle_feature_tooltips"),
+                (f"[{cd}] Click debug echo  [Alt+M]",    "toggle_click_debug"),
             ],
             "Edit": [
                 ("Edit Sequence  [^E]",            "edit_seq"),
@@ -22773,23 +24209,55 @@ SpeciesPickerModal { align: center middle; }
 
     def action_toggle_restr(self) -> None:
         self._show_restr = not self._show_restr
+        _set_setting("show_restr", self._show_restr)
         self._apply_restr_visibility()
         state = "shown" if self._show_restr else "hidden"
         self.notify(f"Restriction enzymes {state}")
 
+    def action_open_align_zip(self) -> None:
+        """File → Align sequencing run (Plasmidsaurus .zip)…
+        Opens the alignment ingestion modal. The modal handles the zip
+        listing, member selection, target plasmid pick, and pushes the
+        AlignmentScreen on submit."""
+        self.push_screen(PlasmidsaurusAlignModal())
+
+    def action_toggle_feature_tooltips(self) -> None:
+        """Settings → 'Show feature hover tooltips'. Persists the
+        preference to settings.json so it survives across sessions.
+        Clears any active tooltip immediately when toggled off so the
+        user sees the change right away."""
+        self._show_feature_tooltips = not self._show_feature_tooltips
+        _set_setting("show_feature_tooltips", self._show_feature_tooltips)
+        if not self._show_feature_tooltips:
+            # Wipe any tooltip already showing on the panels.
+            for selector, cls in (("#plasmid-map", PlasmidMap),
+                                    ("#seq-panel",   SequencePanel)):
+                try:
+                    self.query_one(selector, cls).tooltip = None
+                except (NoMatches, AttributeError):
+                    pass
+        self.notify(
+            f"Feature hover tooltips "
+            f"{'ON' if self._show_feature_tooltips else 'OFF'}",
+            severity="information",
+        )
+
     def action_toggle_restr_unique(self) -> None:
         self._restr_unique_only = not self._restr_unique_only
+        _set_setting("restr_unique_only", self._restr_unique_only)
         self._rescan_restrictions()
         state = "on" if self._restr_unique_only else "off"
         self.notify(f"Unique cutters {state}")
 
     def action_toggle_restr_min6(self) -> None:
         self._restr_min_len = 6
+        _set_setting("restr_min_len", 6)
         self._rescan_restrictions()
         self.notify("Showing 6+ bp recognition sites")
 
     def action_toggle_restr_min4(self) -> None:
         self._restr_min_len = 4
+        _set_setting("restr_min_len", 4)
         self._rescan_restrictions()
         self.notify("Showing 4+ bp recognition sites")
 

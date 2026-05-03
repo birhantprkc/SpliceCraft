@@ -60,6 +60,29 @@ Each has at least one test in `tests/`. Touching `_scan_restriction_sites`, `_rc
 16. **`_blast_get_db` LRU is invalidated by `_save_collections`** via `globals().get("_blast_clear_cache")()`. Any new collection-mutation path that doesn't go through `_save_collections` must call `_blast_clear_cache()` manually.
 17. **Cache contracts.** `_load_collections`, `_load_features`, `_load_custom_grammars` deepcopy on read so caller-side mutations of returned dicts don't poison the cache. New persisted libraries with mutable callers should follow the same convention.
 
+## Persistent user preferences
+
+User-preference toggles persist across sessions via `settings.json`.
+Adding one is mechanical:
+
+1. Class-level annotation on `PlasmidApp` with the default value (e.g. `_my_setting: bool = True`).
+2. Hydrate in `PlasmidApp.compose()` next to the existing block — `self._my_setting = bool(_get_setting("my_setting", True))`. **`compose()` not `on_mount`** because Textual fires mount events leaves→root, so by the time `on_mount` runs the children have already read stale defaults.
+3. In `action_toggle_my_setting`, call `_set_setting("my_setting", self._my_setting)` after flipping.
+4. Surface in the Settings menu (`MenuBar.MENUS` between File and Edit; populated by the `Settings` entry in `PlasmidApp.open_menu`'s `menus` dict).
+
+Currently persisted: `show_feature_tooltips`, `click_debug`, `show_restr`, `restr_unique_only`, `restr_min_len`, `show_connectors`, `map_mode`, `active_collection`, `active_grammar`. The `show_connectors` and `map_mode` toggles need a deferred apply via `_pending_show_connectors` / `_pending_map_mode` because their target widgets aren't composed yet when `compose()` runs; `on_mount` reads the pending values once the children exist.
+
+## Pairwise alignment + Plasmidsaurus ingestion (0.5.3+)
+
+Two-stage pipeline:
+
+1. **Zip ingestion** — `_list_gbk_members_in_zip(path)` lists `.gbk` / `.gb` / `.genbank` members; `_extract_gbk_member(path, name)` reads one out as text. Both are size-capped (`_PLASMIDSAURUS_ZIP_MAX_BYTES = 500 MB`, `_PLASMIDSAURUS_MEMBER_MAX_BYTES = 50 MB`, `_PLASMIDSAURUS_MAX_MEMBERS = 2000`) so a malformed archive can't OOM the picker. Dotfile members and directories are filtered.
+2. **Alignment** — `_pairwise_align(query, target, mode='global'|'local')` wraps `Bio.Align.PairwiseAligner`. Returns `{mode, score, identity_pct, aligned_q, aligned_t, n_matches, n_mismatches, n_gaps, q_len, t_len}`. Length-capped at `_PAIRWISE_MAX_LEN = 200_000`. **Aligned strings come from `Alignment[0]` / `Alignment[1]`**, NOT `format()`-parsing — the text format wraps at 60 cols with coordinate prefixes which is fragile to parse.
+
+Entry point: `File → Align sequencing run (Plasmidsaurus .zip)…` → `PlasmidsaurusAlignModal` → on submit pushes `AlignmentScreen` (full-screen viewer with target features lane + parallel target / query rows + match track + mismatch-red highlighting). Both modal and screen are in `splicecraft.py` near the FASTA file picker.
+
+Future expansion (already designed for): a Plasmidsaurus API key tab in the same modal that downloads run zips directly. Same downstream alignment + visualisation pipeline; only the ingestion source changes.
+
 ## Architecture pointers
 
 `splicecraft.py` is laid out top-to-bottom roughly: imports + persistence helpers → enzyme catalog + IUPAC + scanner + 2D feature packer + seq-panel renderer → GenBank I/O → `_Canvas` / `_BrailleCanvas` / `PlasmidMap` / `FeatureSidebar` → `LibraryPanel` → `SequencePanel` → core modals → grammars + settings → codon registry + Kazusa + mutagenesis → feature-library workbench → parts bin → domesticator + constructor → mutagenize modal → primer design → small modals → `PlasmidApp` (controller, keybindings, undo stashes, autosave, `@work` threads) → `main()`.

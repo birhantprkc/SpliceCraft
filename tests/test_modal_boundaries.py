@@ -177,6 +177,7 @@ _MODAL_CASES = [
     ("HelpModal",                    lambda: sc.HelpModal()),
     ("NewPlasmidModal",              lambda: sc.NewPlasmidModal()),
     ("BlastModal",                   lambda: sc.BlastModal()),
+    ("PlasmidsaurusAlignModal",      lambda: sc.PlasmidsaurusAlignModal()),
 ]
 
 
