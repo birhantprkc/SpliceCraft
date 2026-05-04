@@ -302,9 +302,13 @@ from textual.theme import Theme
 from textual.widget import Widget
 from textual.widgets import (
     Button, Checkbox, DataTable, DirectoryTree, Footer, Header, Input, Label,
-    ListItem, ListView, Markdown, ProgressBar, RadioButton, RadioSet, Select,
+    ListItem, ListView, ProgressBar, RadioButton, RadioSet, Select,
     Static, TextArea,
 )
+# `Markdown` is deliberately NOT in this list — it pulls markdown_it
+# (~50 ms) + pygments (~50 ms) + rich.markdown (~30 ms) at import
+# time, all only needed by the `?` Help modal. Imported lazily inside
+# `HelpModal.compose` instead so the cold-launch path stays lean.
 from rich.text import Text
 
 # ── Feature appearance ─────────────────────────────────────────────────────────
@@ -4829,6 +4833,32 @@ def _fuzzy_match(query: str, name: str) -> bool:
     return True
 
 
+_NATURAL_SORT_RE = re.compile(r"(\d+)")
+
+
+def _natural_sort_key(s: str) -> tuple:
+    """Return a tuple suitable for natural / human-friendly sorting.
+
+    Splits `s` into alternating text and integer runs so that
+    `pBin2` sorts before `pBin10`, instead of the lexicographic
+    `pBin1 < pBin10 < pBin2 < pBin20`. Tuples carry `(0, str)` for
+    text runs and `(1, int)` for digit runs so Python's tuple
+    comparison never tries to order an `int` against a `str` (which
+    raises in Py3) — that mixed comparison is the gotcha that bites
+    the naïve `(int_or_str, ...)` formulation when a name starts
+    with a digit (like `"5kb_backbone"` vs `"pBin1"`).
+    """
+    out: list[tuple[int, "int | str"]] = []
+    for part in _NATURAL_SORT_RE.split(s.lower()):
+        if not part:
+            continue
+        if part.isdigit():
+            out.append((1, int(part)))
+        else:
+            out.append((0, part))
+    return tuple(out)
+
+
 class _SearchInput(Input):
     """Input that clears its display when focus is gained, so the user
     sees a fresh cursor regardless of whether the field had the
@@ -5035,7 +5065,11 @@ class LibraryPanel(Widget):
         t = self.query_one("#lib-coll-table", DataTable)
         t.clear()
         flt = self._filter_text
-        for c in _load_collections():
+        # Natural sort by display name so `Backbones 2`, `Backbones 10`
+        # land in human-readable order instead of lexicographic
+        # `Backbones 10`, `Backbones 2`.
+        for c in sorted(_load_collections(),
+                         key=lambda x: _natural_sort_key(x.get("name") or "")):
             name = c.get("name") or "?"
             if not _fuzzy_match(flt, name):
                 continue
@@ -5049,7 +5083,13 @@ class LibraryPanel(Widget):
         t = self.query_one("#lib-table", DataTable)
         t.clear()
         flt = self._filter_text
-        for entry in _load_library():
+        # Natural sort by name (`pBin2` before `pBin10`) — see
+        # `_natural_sort_key`. Splits each name into text + integer
+        # runs so the sort respects numeric magnitude rather than the
+        # lexicographic `pBin10 < pBin2 < pBin20` ordering.
+        for entry in sorted(_load_library(),
+                             key=lambda e: _natural_sort_key(
+                                 e.get("name") or e.get("id") or "")):
             name = entry.get("name") or entry.get("id") or "?"
             if not _fuzzy_match(flt, name):
                 continue
@@ -7296,13 +7336,18 @@ class HelpModal(ModalScreen):
     """
 
     def compose(self) -> ComposeResult:
+        # Lazy-import Markdown — only triggered when the user opens the
+        # `?` help modal. Saves ~125 ms of cold-launch time for users
+        # who never open help (markdown_it + pygments + rich.markdown
+        # otherwise import eagerly via `from textual.widgets import Markdown`).
+        from textual.widgets import Markdown as _Markdown
         with Vertical(id="help-box"):
             yield Static("SpliceCraft — keyboard shortcuts", id="help-title")
             # Markdown widget itself is layout-only (not scrolling) —
             # wrap in VerticalScroll so the rendered tables stay inside
             # the modal box on small terminals.
             with VerticalScroll(id="help-body-scroll"):
-                yield Markdown(_HELP_BODY_MD, id="help-body")
+                yield _Markdown(_HELP_BODY_MD, id="help-body")
             yield Static(
                 "Press Esc, ?, or q to close.  Drag-select any cell "
                 "to copy.",
@@ -15504,9 +15549,11 @@ class AlignmentScreen(Screen):
         self._result       = result
 
     def compose(self) -> ComposeResult:
+        # Lazy-import Markdown — see HelpModal.compose for rationale.
+        from textual.widgets import Markdown as _Markdown
         with Vertical(id="aln-box"):
             yield Static(" Pairwise alignment ", id="aln-title")
-            yield Markdown(self._summary_md(), id="aln-summary")
+            yield _Markdown(self._summary_md(), id="aln-summary")
             with VerticalScroll(id="aln-body"):
                 yield Static(self._body_text(), id="aln-body-content")
             yield Static(

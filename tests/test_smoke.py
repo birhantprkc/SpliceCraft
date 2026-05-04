@@ -1655,6 +1655,83 @@ class TestLibrarySearch:
         # 'zlc' fails because no 'c' after the 'z' in "LacZ alpha".
         assert not sc._fuzzy_match("zlc", "LacZ alpha")
 
+    def test_natural_sort_key_orders_numbers_by_value(self):
+        """`pBin2` must sort before `pBin10` — lexicographic sort would
+        put `pBin10` first because '1' < '2' as a character. Natural
+        sort splits text and integer runs and compares integers
+        numerically. Regression guard for the 2026-05-04 plasmid
+        library sort fix."""
+        names = ["pBin10", "pBin2", "pBin1", "pBin20", "pBin11", "pBin3"]
+        srt = sorted(names, key=sc._natural_sort_key)
+        assert srt == ["pBin1", "pBin2", "pBin3", "pBin10", "pBin11", "pBin20"]
+
+    def test_natural_sort_key_handles_mixed_prefixes(self):
+        """Different alpha prefixes still sort alphabetically; numeric
+        runs only kick in when the surrounding text matches."""
+        names = ["pBin2", "pAlpha10", "pAlpha2", "pBin10"]
+        srt = sorted(names, key=sc._natural_sort_key)
+        assert srt == ["palpha2", "palpha10", "pbin2", "pbin10"] or \
+               srt == ["pAlpha2", "pAlpha10", "pBin2", "pBin10"]
+
+    def test_natural_sort_key_no_digits_fallback(self):
+        """Names without digits fall back to lex order."""
+        srt = sorted(["zeta", "alpha", "mu"], key=sc._natural_sort_key)
+        assert srt == ["alpha", "mu", "zeta"]
+
+    def test_natural_sort_key_starting_with_digit(self):
+        """Mixed types in the tuple don't crash — the helper wraps
+        each chunk with a `(0, str)` / `(1, int)` discriminator so
+        Python never compares an int to a str directly. `5kb_X` and
+        `pBin1` would otherwise crash on tuple comparison in Py3.
+        Text chunks rank before integer chunks (`(0,...) < (1,...)`),
+        so alpha-prefix names land before pure-digit-prefix ones —
+        the order Linux `sort -V` produces, and the most useful for
+        a plasmid library that's mostly named with letter prefixes."""
+        srt = sorted(["pBin1", "5kb_backbone", "10kb_backbone"],
+                      key=sc._natural_sort_key)
+        # Alpha-prefixed names (`pBin1`) come BEFORE digit-prefixed
+        # ones, then the digit-prefixed names sort numerically among
+        # themselves (`5kb` before `10kb`).
+        assert srt == ["pBin1", "5kb_backbone", "10kb_backbone"]
+
+    async def test_library_panel_displays_plasmids_in_natural_order(
+            self, isolated_library, tiny_record):
+        """End-to-end check: adding pBin1, pBin10, pBin2, pBin20 in
+        random order and the library DataTable lists them as
+        pBin1, pBin2, pBin10, pBin20."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            for nm in ("pBin10", "pBin2", "pBin20", "pBin1"):
+                rec = SeqRecord(Seq("A" * 50), id=nm, name=nm,
+                                annotations={"molecule_type": "DNA",
+                                             "topology": "circular"})
+                lib.add_entry(rec)
+            await pilot.pause()
+            from textual.widgets import DataTable
+            t = app.query_one("#lib-table", DataTable)
+            # First column of each row is the (Text-wrapped) name —
+            # walk the rows in display order and pull out the plain
+            # string. We only care about the rows we added; ignore
+            # the seed `tiny_record` if it's listed.
+            ours = {"pBin1", "pBin2", "pBin10", "pBin20"}
+            order = []
+            for row_key in t.rows:
+                row = t.get_row(row_key)
+                cell0 = row[0]
+                name = cell0.plain if hasattr(cell0, "plain") else str(cell0)
+                # Strip the dirty-marker asterisk.
+                name = name.lstrip("*")
+                if name in ours:
+                    order.append(name)
+            assert order == ["pBin1", "pBin2", "pBin10", "pBin20"], (
+                f"expected natural sort order; got {order}"
+            )
+
     async def test_search_filter_applies_and_clears(
         self, tiny_record, isolated_library,
     ):

@@ -2,6 +2,30 @@
 
 ---
 
+## [0.5.5.3] — 2026-05-04
+
+### Added
+
+- **Natural-order sort in the plasmid library and collections list.** Plasmids named `pBin1`, `pBin2`, …, `pBin10`, `pBin20` now display in human-readable numeric order instead of the lexicographic `pBin1, pBin10, pBin2, pBin20`. New `_natural_sort_key` helper splits each name into alternating text + integer runs and uses `(0, str)` / `(1, int)` discriminator tuples so mixed-prefix names (`5kb_backbone` vs `pBin1`) compare without raising on cross-type tuple comparison. Applied to both `_repopulate_plasmids` and `_repopulate_collections`.
+
+### Performance
+
+- **Cold-launch import time cut by ~33 %** (≈ 180 ms saved on a T480s baseline). `Markdown` is no longer imported eagerly at the top of `splicecraft.py` — it's lazy-imported inside `HelpModal.compose` and `AlignmentScreen.compose`, the only two places that use it. The eager import was pulling `markdown_it`, `pygments`, and `rich.markdown` (~125 ms cumulative dependency cost), penalising every `splicecraft` invocation even though the help modal opens only on `?` and the alignment viewer is rare. Profiled top-level cumulative import time dropped from ~558 ms to ~327 ms; first user-visible splash frame correspondingly comes up sooner.
+
+### Audit findings (no-action)
+
+- `Bio.SeqIO` (~241 ms): already lazy-imported inside fetch / open / save helpers — paid only when the user actually opens a file. No further win available.
+- `pyhmmer` (~53 ms), `primer3` (~9 ms): already lazy.
+- `http.server` + `socketserver` (~24 ms cumulative): used only when the agent-API is opted in via `--agent-api`. Marginal win, would require restructuring the `_AgentRequestHandler` / `_AgentAPIServer` classes — deferred until the saving justifies the surgery.
+- Splash screen `_compose_splash` is ~10 ms per frame; animation runs at 25 FPS. Not on the critical path to first-paint.
+
+### Tests
+
+- +5 tests in `test_smoke.py` covering `_natural_sort_key` directly (numeric ordering, mixed prefix, no-digits fallback, digit-prefix mixed types) and an end-to-end check that the LibraryPanel DataTable lists plasmids in natural order after they're added in random order.
+- Updated `test_delete_collection_via_panel` to look up the row by collection name instead of relying on insertion order — collections now sort alphabetically.
+
+---
+
 ## [0.5.5.2] — 2026-05-04
 
 ### Fixed

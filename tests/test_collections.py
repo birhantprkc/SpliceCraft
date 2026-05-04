@@ -523,7 +523,13 @@ class TestPanelCollectionCRUD:
             lib._apply_view_mode()
             lib._repopulate_collections()
             t = lib.query_one("#lib-coll-table")
-            t.move_cursor(row=1)  # "Drop"
+            # Collections list natural-sorts since 0.5.5.3 — "Drop"
+            # sorts before "Keep" alphabetically, so cursor row=0 is
+            # "Drop". Look it up by name in case the sort changes.
+            for r, row_key in enumerate(t.rows):
+                if row_key.value == "Drop":
+                    t.move_cursor(row=r)
+                    break
             lib.query_one("#btn-coll-del").action_press()
             await pilot.pause(0.2)
             # Stage 1: friendly confirm
