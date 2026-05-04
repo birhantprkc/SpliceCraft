@@ -2,6 +2,20 @@
 
 ---
 
+## [0.5.5.0] — 2026-05-04
+
+### Added
+
+- **Linear viewport "flag" layout (Settings → Linear layout).** Alternative to the default centered layout: features stack into greedy first-fit lanes ABOVE (forward) and BELOW (reverse) a thin rail, each with a single-column stem (`│`) connecting feature-midpoint to rail. Forward heads use `▶`, reverse `◀`. Designed for densely-annotated regions where the centered layout's shared 2-row strip causes overlap. Toggleable via Settings menu and persisted to `settings.json` as `linear_layout` (`"centered"` default | `"flag"`). The two layouts are interchangeable — same zoom + pan + click-target conventions; click hit-testing audited on both layouts.
+- **Panel focus mode (Ctrl+1 … Ctrl+5).** Collapse the 4-panel layout down to a single panel for focused work: `Ctrl+1` library only, `Ctrl+2` plasmid map only, `Ctrl+3` feature list only, `Ctrl+4` sequence panel only, `Ctrl+5` restores the multi-panel layout. The remaining panel fills the freed space — Library / Sidebar widths and the SequencePanel height are overridden to `1fr` (and snapshotted in `_panel_dims` so Ctrl+5 puts them back). `self.refresh(layout=True)` after each transition so live terminals see the swap immediately. All five bindings are `priority=True` so they fire even when an inner Input or DataTable holds focus; `check_action` blocks them on modal screens. Documented in the `?` Help modal under "Layout".
+
+### Tests
+
+- +4 tests for the flag-layout in `test_smoke.py`: glyphs, default-is-centered, `action_toggle_linear_layout` round-trip + settings persistence, and overlapping-feature multi-lane packing.
+- +7 tests for panel focus mode covering each `action_focus_panel_*` action, the seq-panel "hide top-row" path with explicit height-fills-screen check, the restore-everything path including the seq-panel height roundtrip, and a chained `Ctrl+1 → Ctrl+2 → Ctrl+3 → Ctrl+5` to verify the snapshot logic. Cumulative: 1,291 tests.
+
+---
+
 ## [0.5.4.0] — 2026-05-03
 
 ### Added

@@ -3220,6 +3220,318 @@ class TestShiftClickFeatureExtend:
                 "expected reverse arrowhead corner triangle in linear view"
             )
 
+    async def test_linear_flag_layout_renders_with_arrow_glyphs(
+            self, isolated_library):
+        """Flag layout renders forward features with `▶` and reverse
+        with `◀` (rather than the centered layout's corner triangles).
+        Smoke test that the new renderer produces output without error
+        and emits the expected glyphs."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 1000), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(100, 400, strand=1), type="CDS",
+                        qualifiers={"label": ["fwd"]}),
+            SeqFeature(FeatureLocation(500, 800, strand=-1),
+                        type="misc_feature",
+                        qualifiers={"label": ["rev"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm._map_mode = "linear"
+            pm._linear_layout = "flag"
+            pm.refresh()
+            await pilot.pause(0.1)
+            text = pm.render()
+            plain = text.plain if hasattr(text, "plain") else str(text)
+            assert "▶" in plain, "expected ▶ for forward feature in flag layout"
+            assert "◀" in plain, "expected ◀ for reverse feature in flag layout"
+            # Stems hang off the rail.
+            assert "│" in plain, "expected stem connector in flag layout"
+            # Header should advertise the flag mode.
+            assert "flag" in plain
+
+    async def test_linear_flag_layout_default_is_centered(
+            self, isolated_library):
+        """A fresh PlasmidMap defaults to the centered layout. Tests
+        that the reactive starts at 'centered' and the centered-only
+        glyphs are produced when no explicit layout has been set."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 1000), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(100, 400, strand=1), type="CDS",
+                        qualifiers={"label": ["fwd"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            assert pm._linear_layout == "centered"
+            pm._map_mode = "linear"
+            pm.refresh()
+            await pilot.pause(0.1)
+            text = pm.render()
+            plain = text.plain if hasattr(text, "plain") else str(text)
+            # Centered layout uses corner triangles, not ▶
+            assert "◥" in plain or "◢" in plain
+            assert "▶" not in plain  # flag-only glyph
+
+    async def test_linear_flag_layout_action_toggles_and_persists(
+            self, isolated_library):
+        """The PlasmidApp action flips between the two layouts and
+        writes the new value to settings.json so the choice survives
+        a session restart."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 500), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            assert pm._linear_layout == "centered"
+            app.action_toggle_linear_layout()
+            await pilot.pause()
+            assert pm._linear_layout == "flag"
+            assert sc._get_setting("linear_layout") == "flag"
+            app.action_toggle_linear_layout()
+            await pilot.pause()
+            assert pm._linear_layout == "centered"
+            assert sc._get_setting("linear_layout") == "centered"
+
+    async def test_linear_flag_layout_handles_overlapping_features(
+            self, isolated_library):
+        """Overlapping forward features get pushed into separate lanes
+        by greedy first-fit packing — the renderer must not crash and
+        must emit at least two distinct row positions for the bars."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 2000), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(100, 800,  strand=1), type="CDS",
+                        qualifiers={"label": ["A"]}),
+            SeqFeature(FeatureLocation(200, 700,  strand=1), type="CDS",
+                        qualifiers={"label": ["B"]}),
+            SeqFeature(FeatureLocation(300, 600,  strand=1), type="CDS",
+                        qualifiers={"label": ["C"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm._map_mode = "linear"
+            pm._linear_layout = "flag"
+            pm.refresh()
+            await pilot.pause(0.1)
+            text = pm.render()
+            plain = text.plain if hasattr(text, "plain") else str(text)
+            # All three feature labels (or their first character) should
+            # render somewhere — overlapping features in centered layout
+            # would all stack on the same 2-row pair and clobber each
+            # other; flag layout pushes them onto distinct rows.
+            assert "▶" in plain
+            # Multiple distinct rows touched (each lane = different row)
+            row_count_with_block = sum(1 for ln in plain.splitlines() if "█" in ln)
+            assert row_count_with_block >= 2, (
+                "expected ≥2 distinct rows with feature blocks "
+                f"(overlapping features should land on different lanes); "
+                f"got {row_count_with_block}"
+            )
+
+    async def test_focus_panel_library_only_hides_others(
+            self, isolated_library):
+        """Ctrl+1 collapses to library-only: PlasmidMap, FeatureSidebar,
+        and SequencePanel become non-displayed; LibraryPanel remains
+        visible with width overridden so it fills the row."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 200), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.action_focus_panel_library()
+            await pilot.pause()
+            assert app.query_one("#library").display is True
+            assert app.query_one("#plasmid-map").display is False
+            assert app.query_one("#sidebar").display is False
+            assert app.query_one("#seq-panel").display is False
+
+    async def test_focus_panel_map_only(self, isolated_library):
+        """Ctrl+2 collapses to plasmid-map-only."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 200), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.action_focus_panel_map()
+            await pilot.pause()
+            assert app.query_one("#plasmid-map").display is True
+            assert app.query_one("#library").display is False
+            assert app.query_one("#sidebar").display is False
+            assert app.query_one("#seq-panel").display is False
+
+    async def test_focus_panel_sidebar_only(self, isolated_library):
+        """Ctrl+3 collapses to feature-sidebar-only."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 200), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.action_focus_panel_sidebar()
+            await pilot.pause()
+            assert app.query_one("#sidebar").display is True
+            assert app.query_one("#library").display is False
+            assert app.query_one("#plasmid-map").display is False
+            assert app.query_one("#seq-panel").display is False
+
+    async def test_focus_panel_seq_only_hides_top_row(
+            self, isolated_library):
+        """Ctrl+4 collapses to seq-panel-only, hiding the entire
+        top-row container (not just its individual children) so the
+        sequence strip can use the full window height. Verifies the
+        seq-panel actually expands beyond its fixed CSS height of 14
+        rows — without the explicit override, hiding top-row would
+        leave seq-panel marooned at the top of the screen."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 200), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.action_focus_panel_seq()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert app.query_one("#top-row").display is False
+            sp = app.query_one("#seq-panel")
+            assert sp.display is True
+            # Regression guard for 2026-05-04 fix: seq-panel must take
+            # well more than its default 14 rows when alone. The test
+            # terminal is 48 rows tall (TERMINAL_SIZE); minus header +
+            # menubar + footer (~3 rows) leaves >40 available.
+            assert sp.size.height > 30, (
+                f"seq-panel should fill the screen when alone; "
+                f"got height={sp.size.height}"
+            )
+
+    async def test_focus_panel_all_restores_layout(
+            self, isolated_library):
+        """Ctrl+5 restores the multi-panel layout after any focus
+        mode. All four panels become displayed again, and the
+        Library / Sidebar widths are restored to their canonical
+        fixed widths (26 / 32) — overrides applied during focus mode
+        get rolled back."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 200), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.action_focus_panel_library()
+            await pilot.pause()
+            app.action_focus_panel_all()
+            await pilot.pause()
+            assert app.query_one("#library").display is True
+            assert app.query_one("#plasmid-map").display is True
+            assert app.query_one("#sidebar").display is True
+            assert app.query_one("#seq-panel").display is True
+            assert app.query_one("#top-row").display is True
+            # Width restoration: library back to 26 cells, sidebar to 32.
+            lib = app.query_one("#library")
+            sb  = app.query_one("#sidebar")
+            sp  = app.query_one("#seq-panel")
+            assert int(lib.styles.width.value) == 26
+            assert int(sb.styles.width.value) == 32
+            # Seq-panel height also restored to the canonical 14 rows
+            # (the override-to-1fr that Ctrl+4 applies must not stick).
+            assert int(sp.styles.height.value) == 14
+
+    async def test_focus_panel_seq_then_restore_resets_height(
+            self, isolated_library):
+        """Regression guard for 2026-05-04 fix: Ctrl+4 → Ctrl+5 sequence
+        must put the seq-panel height back to the canonical 14 rows.
+        Without explicit restoration the override-to-1fr would persist
+        and the multi-panel layout would render with a malformed
+        seq-panel that ate the whole bottom of the screen."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 200), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.action_focus_panel_seq()
+            await pilot.pause()
+            app.action_focus_panel_all()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel")
+            assert int(sp.styles.height.value) == 14
+            # And the top-row panels are visible again at full height.
+            assert sp.size.height < 20  # squeezed back to its strip
+
+    async def test_focus_panel_chain_then_restore(self, isolated_library):
+        """Ctrl+1 → Ctrl+2 → Ctrl+3 → Ctrl+5 leaves the layout in
+        the canonical multi-panel state, exercising the snapshot
+        logic that remembers original widths only on the first
+        focus action."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 200), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            for action in ("focus_panel_library",
+                           "focus_panel_map",
+                           "focus_panel_sidebar"):
+                getattr(app, f"action_{action}")()
+                await pilot.pause()
+            app.action_focus_panel_all()
+            await pilot.pause()
+            for sel in ("#library", "#plasmid-map", "#sidebar",
+                        "#seq-panel", "#top-row"):
+                assert app.query_one(sel).display is True, sel
+            assert int(app.query_one("#library").styles.width.value) == 26
+            assert int(app.query_one("#sidebar").styles.width.value) == 32
+
     def test_pairwise_align_basic(self):
         """1-bp substitution in a 300 bp sequence aligns with no gaps,
         99.67% identity, 1 mismatch, 0 gaps."""

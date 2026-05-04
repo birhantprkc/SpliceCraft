@@ -1051,7 +1051,7 @@ _rebuild_scan_catalog()
 # not historical ones. Auto-invalidated by sequence edits because
 # `_rebuild_record_with_edit` returns a fresh SeqRecord, hence a new
 # `id(seq)`.
-_RESTR_SCAN_CACHE: "OrderedDict[tuple, list]" = _OD()
+_RESTR_SCAN_CACHE: "_OD[tuple, list]" = _OD()
 _RESTR_SCAN_CACHE_MAX = 4
 
 
@@ -3293,6 +3293,13 @@ class PlasmidMap(Widget):
     # so pan can't scroll past either end.
     _linear_zoom:      reactive[float] = reactive(1.0)
     _linear_offset_bp: reactive[int]   = reactive(0)
+    # Linear feature layout style. "centered" = backbone runs through
+    # the middle of the 2-row arrow (canonical look). "flag" = backbone
+    # is an uninterrupted thin rail; features sit above (forward) or
+    # below (reverse) with a vertical stem connecting block → label.
+    # Hydrated from `settings.json` in `PlasmidApp.compose()`; toggled
+    # via the Settings menu.
+    _linear_layout:    reactive[str]   = reactive("centered")
 
     # ── Messages ───────────────────────────────────────────────────────────────
 
@@ -3809,7 +3816,8 @@ class PlasmidMap(Widget):
             return Text(f"  Window too small ({w}×{h})", style="dim red")
         key = (w, h, self.origin_bp, self.selected_idx, self._aspect,
                id(self._feats), id(self._restr_feats), self._map_mode,
-               self._show_connectors, self.record.name)
+               self._show_connectors, self.record.name,
+               self._linear_zoom, self._linear_offset_bp, self._linear_layout)
         if self._draw_cache and self._draw_cache[0] == key:
             return self._draw_cache[1]
         result = self._draw_linear(w, h) if self._map_mode == "linear" else self._draw(w, h)
@@ -4151,6 +4159,16 @@ class PlasmidMap(Widget):
         return (best_idx, bp) if best_idx >= 0 else (-1, -1)
 
     def _draw_linear(self, w: int, h: int) -> Text:
+        # Layout dispatcher: backbone-centered (default) vs flag-style
+        # (features hang from a thin rail with a stem connecting them
+        # to a label). Both honour the same zoom + pan + click-target
+        # bbox conventions; only the per-row vertical placement
+        # differs. Toggleable via Settings → "Linear features layout".
+        if getattr(self, "_linear_layout", "centered") == "flag":
+            return self._draw_linear_flag(w, h)
+        return self._draw_linear_centered(w, h)
+
+    def _draw_linear_centered(self, w: int, h: int) -> Text:
         """Render a horizontal linear plasmid map.
 
         Layout (single-lane, backbone-centered):
@@ -4400,6 +4418,239 @@ class PlasmidMap(Widget):
         name = (self.record.name or self.record.id or "?")[:w // 3]
         canvas.put_text(margin_l, 0, f"{name}  {total:,} bp", "bold white")
         hint = "[ linear  ·  v = circular ]"
+        canvas.put_text(w - len(hint) - 1, 0, hint, "dim")
+
+        return bc.combine(canvas)
+
+    def _draw_linear_flag(self, w: int, h: int) -> Text:
+        """Render a horizontal linear plasmid map — flag-style.
+
+        Layout (multi-lane, rail-bisected):
+
+            forward features stack ABOVE the rail in lanes assigned by
+            greedy first-fit packing (lane 0 = closest to rail). Each
+            feature is a single-row coloured bar with the label inside
+            and a `▶` arrowhead at the right end. A single-column stem
+            (`│`) drops from the feature midpoint to the rail.
+
+            reverse features mirror the same scheme BELOW the rail with
+            a `◀` arrowhead at the left end.
+
+        Versus the centered layout, this trades the through-the-middle
+        backbone for explicit vertical lane separation, so highly-
+        annotated regions stop overlapping. Honours the same zoom +
+        pan + click-target conventions; the two are interchangeable
+        via Settings → "Linear features layout".
+        """
+        canvas = _Canvas(w, h)
+        bc     = _BrailleCanvas(w, h)
+        total  = self._total
+
+        self._label_bboxes = []
+
+        if not total:
+            canvas.put_text(w // 2 - 9, h // 2, "No record loaded", "dim")
+            return bc.combine(canvas)
+
+        margin_l = 5
+        margin_r = 2
+        usable_w = w - margin_l - margin_r
+        rail_row = max(4, h // 2)
+        tick_label_row = rail_row + 1   # tucked just below the rail
+
+        view_s, view_e = self._linear_view_range()
+        if view_e <= view_s:
+            view_e = view_s + 1
+        visible_bp = max(1, view_e - view_s)
+
+        def bp_to_col(bp: int) -> int:
+            return margin_l + int(
+                (bp - view_s) / visible_bp * usable_w
+            )
+
+        # ── Rail ──
+        for cx in range(margin_l, margin_l + usable_w + 1):
+            canvas.put(cx, rail_row, "─", "color(238)")
+
+        # ── Ticks + bp labels ──
+        tick_int  = max(1, _nice_tick(visible_bp))
+        first_tick = (view_s // tick_int) * tick_int
+        if first_tick < view_s:
+            first_tick += tick_int
+        bp = first_tick
+        # Reserve one row of feature lanes between the rail and the tick
+        # labels so a reverse-strand lane and a tick label never collide
+        # on the same column.
+        while bp <= view_e:
+            tx = bp_to_col(bp)
+            if margin_l <= tx <= margin_l + usable_w:
+                canvas.put(tx, rail_row, "┼", "color(250)")
+                lbl = _format_bp(bp)
+                lx  = tx - len(lbl) // 2
+                if 0 <= tick_label_row < h:
+                    canvas.put_text(lx, tick_label_row, lbl, "color(245)")
+            bp += tick_int
+        canvas.put(margin_l, rail_row,
+                    "├" if view_s == 0 else "─",
+                    "color(250)")
+        end_tx = min(margin_l + usable_w, w - 1)
+        canvas.put(end_tx, rail_row,
+                    "┤" if view_e >= total else "─",
+                    "color(250)")
+
+        # ── Restriction marks at the rail ──
+        # Recuts only — resite spans would clash with the lane-stems.
+        # The centered layout still shows full resite spans for users
+        # who need them.
+        for rf in self._restr_feats:
+            if rf.get("type") != "recut":
+                continue
+            color = rf["color"]
+            r_start = rf.get("start", 0)
+            if r_start < view_s or r_start >= view_e:
+                continue
+            cut_x = bp_to_col(r_start)
+            if margin_l <= cut_x < w - margin_r:
+                canvas.put(cut_x, rail_row, "┼", color)
+
+        # ── Collect features in view ──
+        # Same sorted-index + wrap second-pass pattern as
+        # `_draw_linear_centered`. We render each visible segment
+        # independently so a wrap feature contributes one bar per half.
+        feats_in_view: list[tuple[int, dict, int, int]] = []
+        sorted_idx = getattr(self, "_feats_by_start", None) \
+                     or list(range(len(self._feats)))
+        import bisect as _bs
+        starts = [self._feats[i]["start"] for i in sorted_idx]
+        upper  = _bs.bisect_right(starts, view_e)
+        for k in range(upper):
+            i  = sorted_idx[k]
+            feat = self._feats[i]
+            sb = feat["start"]
+            eb = feat["end"]
+            if eb < sb or eb <= view_s:
+                continue
+            feats_in_view.append(
+                (i, feat, max(view_s, sb), min(view_e, eb))
+            )
+        for i, feat in enumerate(self._feats):
+            sb = feat["start"]
+            eb = feat["end"]
+            if eb >= sb:
+                continue
+            if view_s < eb:
+                feats_in_view.append(
+                    (i, feat, view_s, min(view_e, eb))
+                )
+            if sb < view_e:
+                feats_in_view.append(
+                    (i, feat, max(view_s, sb), min(view_e, total))
+                )
+
+        # ── Greedy lane packing ──
+        # Process largest spans first so big features land in low lanes
+        # (closest to the rail) and small annotations stack outward.
+        feats_in_view.sort(
+            key=lambda t: -(t[3] - t[2])
+        )
+
+        fwd_lanes: list[list[tuple[int, int]]] = []
+        rev_lanes: list[list[tuple[int, int]]] = []
+        # Each placed entry: (i, feat, cx0, cx1, is_fwd, lane_idx)
+        placed: list[tuple[int, dict, int, int, bool, int]] = []
+
+        for i, feat, seg_s, seg_e in feats_in_view:
+            is_fwd = feat["strand"] >= 0
+            cx0 = bp_to_col(seg_s)
+            cx1 = bp_to_col(seg_e)
+            cx0 = max(margin_l, min(cx0, w - margin_r - 1))
+            cx1 = max(margin_l, min(cx1, w - margin_r))
+            if cx1 <= cx0:
+                cx1 = cx0 + 1
+            lanes = fwd_lanes if is_fwd else rev_lanes
+            chosen = -1
+            for li, lane in enumerate(lanes):
+                if all(cx1 <= a or cx0 >= b for a, b in lane):
+                    chosen = li
+                    break
+            if chosen < 0:
+                lanes.append([])
+                chosen = len(lanes) - 1
+            lanes[chosen].append((cx0, cx1))
+            placed.append((i, feat, cx0, cx1, is_fwd, chosen))
+
+        # ── Render features ──
+        # Lane k for forward sits at row `rail_row - 2 - k`, leaving
+        # row `rail_row - 1` clear for stems. Lane k for reverse sits
+        # at row `rail_row + 2 + k`, with row `rail_row + 1` for the
+        # bp tick labels and stems threading through it.
+        for i, feat, cx0, cx1, is_fwd, lane_idx in placed:
+            color  = feat["color"]
+            label  = feat.get("label", feat.get("type", ""))
+            is_sel = (i == self.selected_idx)
+            style  = ("reverse " + color) if is_sel else color
+
+            if is_fwd:
+                feat_row = rail_row - 2 - lane_idx
+                if feat_row < 1:
+                    continue
+            else:
+                # Push reverse lanes further down to avoid the tick row.
+                feat_row = rail_row + 2 + lane_idx
+                if feat_row >= h:
+                    continue
+
+            bar_w = cx1 - cx0
+            if is_fwd:
+                head_col  = cx1 - 1
+                body_cols = range(cx0, head_col)
+                head_glyph = "▶"
+            else:
+                head_col  = cx0
+                body_cols = range(cx0 + 1, cx1)
+                head_glyph = "◀"
+
+            for col in body_cols:
+                canvas.put(col, feat_row, "█", style)
+            if 0 <= head_col < w:
+                canvas.put(head_col, feat_row, head_glyph, style)
+
+            # Label INSIDE the bar — bold black on the feature's colour
+            # so it reads like a proper "flag". The arrowhead column is
+            # excluded so the head glyph stays visible.
+            if bar_w >= 2 and label:
+                inner_cx0 = cx0 + (1 if not is_fwd else 0)
+                inner_cx1 = cx1 - (1 if is_fwd else 0)
+                inner_w   = max(1, inner_cx1 - inner_cx0)
+                lbl = label[:inner_w]
+                lx  = inner_cx0 + (inner_w - len(lbl)) // 2
+                lbl_style = "bold black on " + color
+                canvas.put_text(lx, feat_row, lbl, lbl_style)
+
+            # Click-target bbox spans the WHOLE bar (label + head).
+            self._label_bboxes.append(
+                (cx0, cx1 - 1, feat_row, i)
+            )
+
+            # Stem from feature midpoint down/up to the rail. Walk one
+            # cell at a time and only paint into blank cells so we
+            # don't tear through another feature's bar that happens to
+            # share the column.
+            stem_col = (cx0 + cx1 - 1) // 2
+            if is_fwd:
+                stem_rows = range(feat_row + 1, rail_row)
+            else:
+                stem_rows = range(rail_row + 1, feat_row)
+            for sr in stem_rows:
+                if 0 <= sr < h:
+                    existing = canvas._chars[sr][stem_col]
+                    if existing == " ":
+                        canvas.put(stem_col, sr, "│", color)
+
+        # ── Header ──
+        name = (self.record.name or self.record.id or "?")[:w // 3]
+        canvas.put_text(margin_l, 0, f"{name}  {total:,} bp", "bold white")
+        hint = "[ flag  ·  v = circular ]"
         canvas.put_text(w - len(hint) - 1, 0, hint, "dim")
 
         return bc.combine(canvas)
@@ -7123,6 +7374,16 @@ _HELP_BODY_MD = """\
 | `0` | Reset zoom + pan to whole-record view (linear map only) |
 | `l` | Toggle feature connectors |
 | `r` | Toggle restriction sites |
+
+### Layout (focus one panel full-screen)
+
+| Key | Action |
+|---|---|
+| `Ctrl+1` | Library only |
+| `Ctrl+2` | Plasmid map only |
+| `Ctrl+3` | Feature list only |
+| `Ctrl+4` | Sequence panel only |
+| `Ctrl+5` | Restore all panels |
 
 ### Selection / clipboard
 
@@ -22455,6 +22716,14 @@ SpeciesPickerModal { align: center middle; }
         Binding("ctrl+shift+a","add_to_library",   "Add to lib",    show=False),
         Binding("ctrl+e",      "edit_seq",         "Edit seq",      show=False),
         Binding("ctrl+shift+f","capture_to_features", "→ Feat lib", show=False, priority=True),
+        # Panel focus shortcuts: each Ctrl+N collapses the multi-panel
+        # layout to just one panel; Ctrl+5 restores. priority=True so
+        # they fire even when an inner DataTable / Input has focus.
+        Binding("ctrl+1",      "focus_panel_library",  "Library only", show=False, priority=True),
+        Binding("ctrl+2",      "focus_panel_map",      "Map only",     show=False, priority=True),
+        Binding("ctrl+3",      "focus_panel_sidebar",  "Features only",show=False, priority=True),
+        Binding("ctrl+4",      "focus_panel_seq",      "Sequence only",show=False, priority=True),
+        Binding("ctrl+5",      "focus_panel_all",      "All panels",   show=False, priority=True),
         # Rotation keys (arrows + [/]) live on PlasmidMap.BINDINGS so they
         # only rotate when the map has focus. Pre-2026-04-29 the `[`/`]`
         # keys were App-level with priority=True, which fired even on
@@ -22571,6 +22840,13 @@ SpeciesPickerModal { align: center middle; }
         # circular is the canonical default for every plasmid load,
         # and `PlasmidMap.load_record` resets the mode on every
         # record. Persisting would override that intent.
+        # `linear_layout` IS persisted — it's a pure cosmetic preference
+        # ("centered" vs "flag") and doesn't depend on the record. The
+        # PlasmidMap reactive defaults to "centered"; we forward the
+        # hydrated value here. Read into a pending attr because the
+        # PlasmidMap child hasn't composed yet — `on_mount` applies it.
+        _layout = str(_get_setting("linear_layout", "centered"))
+        self._pending_linear_layout = _layout if _layout in ("centered", "flag") else "centered"
         yield Header()
         yield MenuBar()
         # Three side-by-side panels share the top row; the sequence
@@ -22963,6 +23239,11 @@ SpeciesPickerModal { align: center middle; }
             # map_mode intentionally NOT hydrated — circular is the
             # canonical default and `PlasmidMap.load_record` resets
             # it on every plasmid load.
+            # linear_layout IS hydrated: it's a pure cosmetic
+            # preference and doesn't depend on the loaded record.
+            _pending_layout = getattr(self, "_pending_linear_layout", "centered")
+            if _pending_layout in ("centered", "flag"):
+                pm._linear_layout = _pending_layout
         except (NoMatches, AttributeError):
             pass
         # Agent API: opt-in localhost server for external CLI/IDE
@@ -24762,6 +25043,14 @@ SpeciesPickerModal { align: center middle; }
         # for simple booleans only.
         ft = "✓" if self._show_feature_tooltips else " "
         cd = "✓" if self._click_debug          else " "
+        # Linear layout is a tri-label since it's NOT a binary toggle —
+        # show the *current* layout name so the menu reads as the
+        # action that will fire ("Switch to flag" vs "Switch to centered").
+        try:
+            pm_layout = self.query_one("#plasmid-map", PlasmidMap)._linear_layout
+        except (NoMatches, AttributeError):
+            pm_layout = getattr(self, "_pending_linear_layout", "centered")
+        ll_next = "flag" if pm_layout == "centered" else "centered"
         menus = {
             "File": [
                 ("Open file (.gb / .dna)  [^O]", "open_file"),
@@ -24780,6 +25069,8 @@ SpeciesPickerModal { align: center middle; }
             "Settings": [
                 (f"[{ft}] Show feature hover tooltips",  "toggle_feature_tooltips"),
                 (f"[{cd}] Click debug echo  [Alt+M]",    "toggle_click_debug"),
+                (f"Linear layout: {pm_layout} → switch to {ll_next}",
+                                                          "toggle_linear_layout"),
             ],
             "Edit": [
                 ("Edit Sequence  [^E]",            "edit_seq"),
@@ -24832,6 +25123,131 @@ SpeciesPickerModal { align: center middle; }
         AlignmentScreen on submit."""
         self.push_screen(PlasmidsaurusAlignModal())
 
+    # ── Panel focus mode (Ctrl+1 .. Ctrl+5) ────────────────────────────
+    # Each Ctrl+N collapses the 4-panel layout down to a single panel
+    # so the user can focus on one task without the others competing
+    # for screen real-estate. Ctrl+5 restores the multi-panel layout.
+    # The original Library / Sidebar widths and the SequencePanel
+    # height are remembered in `_panel_dims` and restored on Ctrl+5.
+    _panel_dims: "dict[str, str | int] | None" = None
+
+    def _focus_panel(self, panel_id: "str | None") -> None:
+        """Show ONLY the panel whose id is `panel_id` (or restore all
+        when `panel_id is None`).
+
+        Implementation: hide the other panels via `widget.display`
+        (Textual removes the widget from layout entirely so the
+        remaining one fills the freed space). Three of the four panels
+        carry fixed CSS dimensions — Library 26 cols, Sidebar 32 cols,
+        SequencePanel 14 rows — so when shown solo we override to
+        `1fr` and snapshot the originals so Ctrl+5 can put them back.
+        Layout is force-refreshed so live terminals see the swap on
+        the next tick instead of waiting for an unrelated reactive
+        change to repaint.
+        """
+        try:
+            lib = self.query_one("#library", LibraryPanel)
+            pm  = self.query_one("#plasmid-map", PlasmidMap)
+            sb  = self.query_one("#sidebar", FeatureSidebar)
+            sp  = self.query_one("#seq-panel", SequencePanel)
+            top = self.query_one("#top-row", Horizontal)
+        except NoMatches:
+            return
+
+        # Snapshot canonical dimensions on first focus — the values
+        # match the DEFAULT_CSS rules on each widget. Ctrl+5 restores
+        # from this snapshot regardless of intermediate transitions.
+        if self._panel_dims is None:
+            self._panel_dims = {
+                "library_w": 26,
+                "sidebar_w": 32,
+                "seq_h":     14,
+            }
+
+        if panel_id is None:
+            # Restore everything.
+            for w in (lib, pm, sb, sp, top):
+                w.display = True
+            lib.styles.width  = self._panel_dims["library_w"]
+            sb.styles.width   = self._panel_dims["sidebar_w"]
+            sp.styles.height  = self._panel_dims["seq_h"]
+            self.refresh(layout=True)
+            # Park focus on the map by default — canonical interactive
+            # surface for keyboard navigation.
+            try:
+                pm.focus()
+            except Exception:
+                pass
+            self.notify("Layout: all panels", timeout=1)
+            return
+
+        if panel_id == "seq-panel":
+            top.display = False
+            sp.display  = True
+            # Override the fixed `height: 14` so the seq panel fills
+            # the entire app body when it's the only visible panel.
+            sp.styles.height = "1fr"
+            self.refresh(layout=True)
+            try:
+                sp.query_one(ScrollableContainer).focus()
+            except (NoMatches, Exception):
+                pass
+            self.notify("Layout: sequence panel only  [^5 = restore]",
+                         timeout=2)
+            return
+
+        # One of library / plasmid-map / sidebar — show top-row,
+        # hide seq-panel, and within top-row hide the two siblings.
+        top.display = True
+        sp.display  = False
+        lib.display = (panel_id == "library")
+        pm.display  = (panel_id == "plasmid-map")
+        sb.display  = (panel_id == "sidebar")
+
+        # Force the visible top-row panel to fill the freed width.
+        # plasmid-map already has `width: 1fr` so it expands naturally;
+        # library / sidebar carry fixed widths and need the override.
+        if panel_id == "library":
+            lib.styles.width = "1fr"
+            label = "library"
+        elif panel_id == "plasmid-map":
+            label = "plasmid map"
+        else:  # sidebar
+            sb.styles.width = "1fr"
+            label = "feature list"
+
+        self.refresh(layout=True)
+
+        # Focus the visible panel's primary interactive child after the
+        # layout settles. `query_one` on a hidden widget would raise,
+        # so we gate by panel_id.
+        try:
+            if panel_id == "library":
+                lib.query_one("#lib-table").focus()
+            elif panel_id == "plasmid-map":
+                pm.focus()
+            elif panel_id == "sidebar":
+                sb.query_one("#feat-table").focus()
+        except (NoMatches, Exception):
+            pass
+
+        self.notify(f"Layout: {label} only  [^5 = restore]", timeout=2)
+
+    def action_focus_panel_library(self) -> None:
+        self._focus_panel("library")
+
+    def action_focus_panel_map(self) -> None:
+        self._focus_panel("plasmid-map")
+
+    def action_focus_panel_sidebar(self) -> None:
+        self._focus_panel("sidebar")
+
+    def action_focus_panel_seq(self) -> None:
+        self._focus_panel("seq-panel")
+
+    def action_focus_panel_all(self) -> None:
+        self._focus_panel(None)
+
     def action_toggle_feature_tooltips(self) -> None:
         """Settings → 'Show feature hover tooltips'. Persists the
         preference to settings.json so it survives across sessions.
@@ -24850,6 +25266,29 @@ SpeciesPickerModal { align: center middle; }
         self.notify(
             f"Feature hover tooltips "
             f"{'ON' if self._show_feature_tooltips else 'OFF'}",
+            severity="information",
+        )
+
+    def action_toggle_linear_layout(self) -> None:
+        """Settings → 'Linear layout'. Cycles between 'centered' (single
+        backbone-bisecting lane, default) and 'flag' (multi-lane greedy
+        packing with stems to a thin rail). Persists across sessions.
+        Refreshes the map only when in linear mode — circular mode
+        ignores the setting until the user toggles back to linear."""
+        try:
+            pm = self.query_one("#plasmid-map", PlasmidMap)
+        except NoMatches:
+            return
+        new_layout = "flag" if pm._linear_layout == "centered" else "centered"
+        pm._linear_layout = new_layout
+        _set_setting("linear_layout", new_layout)
+        # Force a redraw if we're currently in linear mode. Reactive
+        # auto-invalidates on assignment, but the map widget caches its
+        # canvas via `render()` so call `refresh()` to be sure.
+        if pm._map_mode == "linear":
+            pm.refresh()
+        self.notify(
+            f"Linear layout: {new_layout}",
             severity="information",
         )
 
