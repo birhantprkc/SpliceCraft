@@ -2,6 +2,19 @@
 
 ---
 
+## [0.5.9.1] — 2026-05-04
+
+### Fixed
+
+- **Wrap-primer bound bases overflowed past the half's column range.** A primer whose bound region crossed the origin (e.g. `start=95, end=5` on a 100-bp plasmid) got split by `_feats_in_chunk` into a tail half + head half, but `_paint_primer_bound_bar` wrote ALL of the bound's bases starting at each half's left edge — so a 10-bp wrap primer painted `AAAAA▶AAAA` (10 chars) into the head half's 5-cell window. Now the painter inspects `_orig_start` / `_orig_end` (stamped by `_feats_in_chunk` on each half) and slices `_primer_seq[flap_len:]` so the tail half holds the FIRST bases and the head half holds the LAST. Arrow suppression is symmetric: only the half owning the primer's 3' end paints the arrow (head for fwd, tail for rev).
+- **Full-binding primers (primer_seq present, no flap) now show their bases inline** with the strand instead of falling back to the legacy `▒▒▒▒` block fill. `_primer_seq` and `_bound_len` are stamped on every `primer_bind` feature whose qualifier is set, regardless of flap presence; the renderer dispatches to the bases-inline painter on the bound row when `_primer_seq` is available, and uses the floating-flap row only when `_flap_bases` is also set. Full-binding primers keep their name label on the row above the bar.
+
+### Tests
+
+- +2 regression tests in `test_smoke.py`: `test_wrap_primer_bound_bases_dont_overflow` exercises the head-half slicing directly with a synthesised wrap primer; `test_full_binding_primer_renders_bases_inline` verifies the bases-in-bar painter fires for a primer with `_primer_seq` but no flap.
+
+---
+
 ## [0.5.9.0] — 2026-05-04
 
 ### Added

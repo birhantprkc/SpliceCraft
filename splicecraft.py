@@ -1425,7 +1425,7 @@ def _paint_feature_label(arr: list[tuple[str, str]], f: dict,
 
 def _paint_primer_bound_bar(arr: list[tuple[str, str]], f: dict,
                               chunk_start: int, chunk_end: int) -> None:
-    """Bound-region row for a primer with a 5' flap.
+    """Bound-region row for a primer with a `/primer_seq` qualifier.
 
     Unlike `_paint_feature_bar` which fills the bar with `▒` block
     characters, this painter writes the **primer's bases** into the
@@ -1435,9 +1435,16 @@ def _paint_primer_bound_bar(arr: list[tuple[str, str]], f: dict,
     The arrow glyph (`►` / `◄`) sits at the primer's 3' end so the
     direction reads as in any other feature.
 
-    Strand 0 (no direction) gets no arrow — the bar is just the
-    primer's bound bases over the strand. The flap (if any) is
-    drawn by `_paint_primer_flap_bar` on the row above.
+    Wrap-aware: `_feats_in_chunk` splits a wrap primer into a tail
+    half (cols `[orig_start, total)`) + head half (cols `[0, orig_end)`).
+    Each half carries `_orig_start` / `_orig_end` so we can compute
+    the offset within the full bound region: tail holds the FIRST
+    bases of the bound, head holds the LAST. Without this slicing,
+    the painter would write all 10 bases of a 10-bp wrap primer at
+    each half's start and overflow past the half's nominal width.
+    Only one half carries the arrow (whichever owns the primer's
+    3' end: tail for fwd, head for rev — opposite of the displayed
+    arrow position).
     """
     s, e = f["start"], f["end"]
     bar_s = max(s, chunk_start) - chunk_start
@@ -1449,51 +1456,83 @@ def _paint_primer_bound_bar(arr: list[tuple[str, str]], f: dict,
     color  = f.get("color", "white")
     primer_seq = str(f.get("_primer_seq") or "")
     flap_len   = int(f.get("_flap_len")   or 0)
-    bound_len  = int(f.get("_bound_len")  or (e - s if e >= s else 0))
+    bound_len  = int(f.get("_bound_len")  or 0)
+    if bound_len <= 0:
+        bound_len = e - s if e >= s else 0
     starts_here = s >= chunk_start
     ends_here   = e <= chunk_end
     content_w   = chunk_end - chunk_start
 
-    # Top-strand-oriented bound bases: forward primer's bound region
-    # is `primer_seq[flap_len:]`; reverse primer's bound region in
-    # top-strand orientation = RC of the same slice.
     if not primer_seq or bound_len <= 0:
-        # Defensive: malformed; fall back to plain bar painter so
-        # the user still sees the feature.
         _paint_feature_bar(arr, f, chunk_start, chunk_end)
         return
+    # Full bound bases in top-strand orientation. Forward primer's
+    # bound region = `primer_seq[flap_len:]`; reverse primer's
+    # bound region in top-strand orientation = RC of the same slice.
     if strand >= 0:
-        bound_bases = primer_seq[flap_len:flap_len + bound_len]
+        full_bound_bases = primer_seq[flap_len:flap_len + bound_len]
     else:
-        bound_bases = _rc(primer_seq[flap_len:flap_len + bound_len])
+        full_bound_bases = _rc(primer_seq[flap_len:flap_len + bound_len])
 
-    # Slice off the bases that fall before / after the visible chunk.
+    # ── Slice the half's portion of the full bound ─────────────────
+    orig_start = f.get("_orig_start")
+    orig_end   = f.get("_orig_end")
+    is_wrap_split = (
+        isinstance(orig_start, int) and isinstance(orig_end, int)
+        and orig_end < orig_start
+    )
+    half_len = e - s
+    if is_wrap_split:
+        # Head half (s == 0): last `head_len` bases of the bound.
+        # Tail half (s != 0): first `tail_len` bases.
+        if s == 0:
+            half_offset = bound_len - half_len
+        else:
+            half_offset = 0
+    else:
+        half_offset = 0
+    bound_slice = full_bound_bases[half_offset: half_offset + half_len]
+
+    # Slice off the bases that fall before / after the visible chunk
+    # within this half.
     skip_left   = max(0, chunk_start - s)
     skip_right  = max(0, e - chunk_end)
-    visible_bases = bound_bases[
+    visible_bases = bound_slice[
         skip_left:
-        (len(bound_bases) - skip_right) if skip_right else len(bound_bases)
+        (len(bound_slice) - skip_right) if skip_right else len(bound_slice)
     ]
     bg_style = f"black on {color}"
-    # Bases occupy the bar's nominal column range `[s, e)` — every
-    # bound base stays visible (unlike `_paint_feature_bar` which
-    # eats the last base for the arrow). The arrow takes one EXTRA
-    # cell beyond the bar (col `e` for fwd, col `s-1` for rev) so
-    # the user keeps the full primer sequence.
+    # Bases occupy the bar's nominal column range `[s, e)`. The
+    # arrow gets one EXTRA cell beyond the bar (col `e` for fwd,
+    # col `s-1` for rev) so the full primer sequence stays visible.
     for i, ch in enumerate(visible_bases):
         col = bar_s + i
         if 0 <= col < content_w:
             arr[col] = (ch, bg_style)
-    # Arrow glyph in the extra cell. Only draw when the relevant
-    # primer edge is inside the visible chunk; clipped otherwise.
+
+    # Arrow glyph: at the 3' end of the primer. For non-wrap
+    # primers, that's the "natural" edge (right for fwd, left for
+    # rev). For wrap primers, only ONE half owns the 3' end:
+    #   forward: head half (its `e` is at the wrap end, the 3' end)
+    #   reverse: tail half (its `s` is at the wrap start, the 3' end)
     if strand >= 0 and ends_here:
-        arrow_col = e - chunk_start
-        if 0 <= arrow_col < content_w:
-            arr[arrow_col] = ("▶", bg_style)
+        # Suppress arrow on the tail half of a forward wrap primer
+        # (the head half draws it instead).
+        if is_wrap_split and s != 0:
+            pass
+        else:
+            arrow_col = e - chunk_start
+            if 0 <= arrow_col < content_w:
+                arr[arrow_col] = ("▶", bg_style)
     elif strand < 0 and starts_here:
-        arrow_col = s - chunk_start - 1
-        if 0 <= arrow_col < content_w:
-            arr[arrow_col] = ("◀", bg_style)
+        # Suppress arrow on the head half of a reverse wrap primer
+        # (the tail half draws it instead).
+        if is_wrap_split and s == 0:
+            pass
+        else:
+            arrow_col = s - chunk_start - 1
+            if 0 <= arrow_col < content_w:
+                arr[arrow_col] = ("◀", bg_style)
 
 
 def _paint_primer_flap_bar(arr: list[tuple[str, str]], f: dict,
@@ -1687,18 +1726,22 @@ def _render_packed_strand(result: "Text",
                     _paint_feature_label(arr, f, chunk_start, chunk_end,
                                          re_highlight_se=re_highlight_se)
             else:
-                # Primer with a flap (set by `PlasmidMap._parse` when
-                # the source `primer_bind` carries a `/primer_seq`
-                # qualifier): bound bases on the bar row, flap bases
-                # on the row farther from the strand. Replaces the
-                # default bar+label rendering for these features —
-                # the primer name lives elsewhere (sidebar tooltip).
-                has_flap = (
+                # Primer with a `/primer_seq` qualifier (set by
+                # `PlasmidMap._parse`): bound bar shows the primer's
+                # bases inline with the strand. If the primer is
+                # ALSO longer than its bound region (has a 5' flap),
+                # the row farther from the strand shows the flap
+                # bases as a floating segment; the primer's name
+                # label is dropped (its bases convey "this is a
+                # primer"). Full-binding primers (primer_seq present
+                # but no flap) keep the name label.
+                has_primer_seq = (
                     f.get("type") == "primer_bind"
-                    and f.get("_flap_bases")
+                    and f.get("_primer_seq")
                 )
+                has_flap = has_primer_seq and f.get("_flap_bases")
                 if sub == 0:
-                    if has_flap:
+                    if has_primer_seq:
                         _paint_primer_bound_bar(arr, f, chunk_start, chunk_end)
                     else:
                         _paint_feature_bar(arr, f, chunk_start, chunk_end,
@@ -3719,11 +3762,16 @@ class PlasmidMap(Widget):
                     primer_seq = str(primer_seq_q[0]).strip().upper()
                 if primer_seq:
                     bound_len = _feat_len(start, end, total) or 0
-                    flap_len = max(0, len(primer_seq) - bound_len)
+                    flap_len  = max(0, len(primer_seq) - bound_len)
+                    # `_primer_seq` + `_bound_len` are always stamped
+                    # so the seq panel can paint primer bases inline
+                    # with the strand even for full-binding primers
+                    # (no flap → no flap row, but bound bar still
+                    # shows the primer sequence in its cells).
+                    new_feat["_primer_seq"] = primer_seq
+                    new_feat["_bound_len"]  = bound_len
                     if flap_len > 0:
-                        new_feat["_primer_seq"] = primer_seq
-                        new_feat["_bound_len"]  = bound_len
-                        new_feat["_flap_len"]   = flap_len
+                        new_feat["_flap_len"] = flap_len
                         # Top-strand-oriented flap bases (so they
                         # read inline with the strand below):
                         # forward primer flap = primer_seq[:flap_len];

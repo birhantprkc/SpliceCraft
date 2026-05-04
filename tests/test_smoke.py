@@ -4239,8 +4239,78 @@ class TestShiftClickFeatureExtend:
             await pilot.pause(0.05)
             pm = app.query_one("#plasmid-map", sc.PlasmidMap)
             f = next(f for f in pm._feats if f.get("label") == "full-bind")
-            assert "_flap_bases" not in f
+            assert "_flap_bases" not in f   # no flap row drawn
             assert "_flap_len" not in f
+            # `_primer_seq` + `_bound_len` ARE always set when the
+            # qualifier is present, so the seq panel can paint primer
+            # bases inline with the strand even for full-binding
+            # primers (no flap, but still bases-in-bar instead of
+            # the legacy ▒ block fill).
+            assert f["_primer_seq"] == "AAAAAAAAAA"
+            assert f["_bound_len"]  == 10
+
+    async def test_wrap_primer_bound_bases_dont_overflow(self):
+        """Regression guard for 2026-05-04 fix: when a primer's bound
+        region wraps the origin (start=95, end=5 on a 100-bp plasmid),
+        `_feats_in_chunk` splits it into a tail half + head half. The
+        bound-bar painter must slice `_primer_seq[flap_len:]` so each
+        half writes only ITS portion of the bound bases — without the
+        slicing, both halves wrote the full 10-bp bound region at
+        their respective starts, overflowing past the half's nominal
+        column range and showing the same bases twice.
+
+        This test exercises the painter directly with a synthesised
+        head half. The head half (s=0, e=5, _orig_start=95,
+        _orig_end=5, _bound_len=10) should render the LAST 5 bound
+        bases at cols 0..4."""
+        # Forward primer 5'-AAAAAA-CCGGAACCGG-3': flap=AAAAAA (6 bp),
+        # bound=CCGGAACCGG (10 bp). Head half holds the last 5 bound
+        # bases ("ACCGG") at cols 0..4; arrow ▶ at col 5.
+        head_half = {
+            "type": "primer_bind", "start": 0, "end": 5, "strand": 1,
+            "color": "cyan", "label": "",
+            "_primer_seq": "AAAAAACCGGAACCGG",
+            "_bound_len": 10,
+            "_flap_len":  6,
+            "_flap_bases": "AAAAAA",
+            "_flap_start": 89, "_flap_end": 95,
+            "_orig_start": 95, "_orig_end": 5,
+        }
+        arr: list[tuple[str, str]] = [(" ", "")] * 30
+        sc._paint_primer_bound_bar(arr, head_half, 0, 30)
+        # Cols 0..4 should hold "ACCGG" (last 5 of bound bases),
+        # col 5 should hold the arrow ▶.
+        rendered = "".join(c for c, _ in arr[:6])
+        assert rendered == "ACCGG▶", (
+            f"head half should hold last 5 bound bases + arrow, "
+            f"got {rendered!r}"
+        )
+        # Cols 6..29 must remain empty — no overflow past half's bar.
+        assert all(c == " " for c, _ in arr[6:]), (
+            "wrap primer head half overflowed into untouched cells"
+        )
+
+    async def test_full_binding_primer_renders_bases_inline(self):
+        """Regression guard for 2026-05-04 fix: a primer whose
+        primer_seq length equals its bound length (no flap) used to
+        fall back to the plain `▒▒▒▒` bar painter, hiding the
+        primer's bases. Now the bar paints the bases inline with
+        the strand whenever `_primer_seq` is set, regardless of
+        flap presence."""
+        feat = {
+            "type": "primer_bind", "start": 5, "end": 13, "strand": 1,
+            "color": "magenta", "label": "P-full",
+            "_primer_seq": "ATGAAACG",
+            "_bound_len":  8,
+            # No _flap_*: full-binding primer.
+        }
+        arr: list[tuple[str, str]] = [(" ", "")] * 20
+        sc._paint_primer_bound_bar(arr, feat, 0, 20)
+        rendered = "".join(c for c, _ in arr[:14])
+        # Bases at cols 5..12, arrow at col 13.
+        assert rendered == "     ATGAAACG▶", (
+            f"full-binding primer should show bases + arrow, got {rendered!r}"
+        )
 
     async def test_seq_panel_renders_primer_flap_bases(
             self, isolated_library):
