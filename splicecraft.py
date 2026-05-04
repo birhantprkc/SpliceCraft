@@ -8498,6 +8498,77 @@ def _get_active_grammar() -> dict:
     return grammars["gb_l0"]
 
 
+# ── Per-grammar entry-vector storage ────────────────────────────────
+# Each cloning grammar (Golden Braid L0, MoClo, custom) has a
+# canonical destination plasmid — pUPD2 for GB L0, pAGM4673 for
+# MoClo L1, etc. The user picks one once per grammar via
+# `GrammarEditorModal`; the choice is stored here keyed by grammar
+# id and surfaced (with a Change button) at the top of the
+# ConstructorModal so it's confirmed before every assembly run.
+#
+# Storage embeds the FULL gb_text rather than a library reference
+# so the choice is resilient: renaming or deleting the source
+# plasmid in the library doesn't orphan the grammar's vector.
+# Schema per entry:
+#   {
+#     "grammar_id":  str,       # "gb_l0" / custom grammar id
+#     "name":        str,       # display name (e.g. "pUPD2")
+#     "size":        int,       # bp; 0 if unknown
+#     "source":      str,       # "library:<lib_id>" | "file:<path>"
+#     "gb_text":     str,       # GenBank text body
+#   }
+_ENTRY_VECTORS_FILE = _DATA_DIR / "entry_vectors.json"
+_entry_vectors_cache: "list | None" = None
+
+
+def _load_entry_vectors() -> list[dict]:
+    global _entry_vectors_cache
+    from copy import deepcopy
+    if _entry_vectors_cache is not None:
+        return deepcopy(_entry_vectors_cache)
+    entries, warning = _safe_load_json(_ENTRY_VECTORS_FILE,
+                                         "Entry vectors")
+    if warning:
+        _log.warning(warning)
+    entries = [e for e in entries
+                 if isinstance(e, dict)
+                 and isinstance(e.get("grammar_id"), str)]
+    _entry_vectors_cache = entries
+    return deepcopy(_entry_vectors_cache)
+
+
+def _save_entry_vectors(entries: list[dict]) -> None:
+    global _entry_vectors_cache
+    from copy import deepcopy
+    _safe_save_json(_ENTRY_VECTORS_FILE, entries, "Entry vectors")
+    _entry_vectors_cache = deepcopy(entries)
+
+
+def _get_entry_vector(grammar_id: str) -> "dict | None":
+    """Return the entry-vector dict for the named grammar, or None
+    if none has been assigned yet."""
+    if not isinstance(grammar_id, str) or not grammar_id:
+        return None
+    for e in _load_entry_vectors():
+        if e.get("grammar_id") == grammar_id:
+            return e
+    return None
+
+
+def _set_entry_vector(grammar_id: str, vector: "dict | None") -> None:
+    """Replace (or remove, with `vector=None`) the entry vector for
+    `grammar_id`. Persists via `_safe_save_json`."""
+    if not isinstance(grammar_id, str) or not grammar_id:
+        return
+    entries = [e for e in _load_entry_vectors()
+                 if e.get("grammar_id") != grammar_id]
+    if vector is not None:
+        v = dict(vector)
+        v["grammar_id"] = grammar_id
+        entries.append(v)
+    _save_entry_vectors(entries)
+
+
 def _grammar_position_by_type(grammar: dict, ptype: str) -> "dict | None":
     """Helper: find the position spec for a given part type within a
     grammar. ``None`` if the grammar doesn't define that type — which
@@ -11206,15 +11277,21 @@ class FeatureEditModal(ModalScreen):
 
     DEFAULT_CSS = """
     FeatureEditModal { align: center middle; }
+    /* `height: auto` lets the dialog shrink to content — the previous
+       `height: 90%` always inflated the modal to ~43 rows even when
+       the form was 25 rows tall, leaving a big blank gap below the
+       notes box. The remaining vertical space is now reclaimed by
+       the TextArea / Markdown widgets, which carry their own
+       internal scrollbars when content overflows. `max-height: 90%`
+       still caps the dialog on small terminals so the buttons stay
+       reachable. */
     #featedit-dlg {
-        width: 90; max-width: 95%; height: 90%; max-height: 90%;
+        width: 90; max-width: 95%; height: auto; max-height: 38;
         background: $surface;
         border: solid $accent;
         padding: 1 2;
     }
-    /* Title docks top — always visible at the top of the dialog. */
     #featedit-title {
-        dock: top;
         height: 1;
         text-style: bold;
         background: $accent;
@@ -11222,43 +11299,42 @@ class FeatureEditModal(ModalScreen):
         padding: 0 1;
         margin-bottom: 1;
     }
-    /* Buttons row docks bottom — always visible regardless of body
-       height. The status row sits just above it (also docked), so
-       error / confirmation messages don't fight the form fields
-       for space when the body scrolls. */
-    #featedit-btns {
-        dock: bottom;
-        height: 3;
-        margin-top: 1;
-    }
-    #featedit-btns Button { margin-right: 1; }
-    #featedit-status {
-        dock: bottom;
-        height: 1;
-        padding: 0 1;
-    }
-    /* Body fills the remaining vertical space and scrolls if the
-       form is taller than the dialog. */
+    /* Body fills the remaining space inside the (capped) dialog.
+       When the dialog hits its max-height, body scrolls; on a
+       roomy terminal the dialog hugs content height (set above
+       via `height: auto`) so the body never actually scrolls.
+       That's the trade we want — no big vertical gap on average
+       terminals, but the buttons remain reachable on tiny ones. */
     #featedit-body { height: 1fr; padding: 0 1; }
-    #featedit-body Label { color: $text-muted; margin-top: 1; }
-    #featedit-pos { color: $text-muted; padding: 0 1; }
+    #featedit-body Label { color: $text-muted; margin: 0; height: 1; }
+    /* Inline position row — label + value on one line so we don't
+       waste a row on the label. */
+    #featedit-pos-row { height: 1; margin-top: 1; }
+    #featedit-pos-row Label { width: auto; margin-right: 1; }
+    #featedit-pos { width: 1fr; color: $text-muted; }
     #featedit-row1 { height: auto; }
     #featedit-type-col   { width: 1fr; }
     #featedit-strand-col { width: 1fr; }
     #featedit-color-row  { height: auto; margin-top: 1; }
     #featedit-color-row Label { width: auto; margin-right: 1; }
     #featedit-color-swatch { width: auto; padding: 0 1; }
-    /* Sequence display — modest height (8 rows) to leave room for
-       the notes box below. The TextArea scrolls horizontally for
-       long features. */
-    #featedit-seq { height: 8; border: solid $primary-darken-1; }
+    /* Sequence + notes carry their OWN scrollbars — modal doesn't
+       scroll, the textboxes do. 4 rows each keeps the dialog under
+       the 48-row baseline terminal cap (the modal-boundary check);
+       long content scrolls inside the widget. */
+    #featedit-seq { height: 4; border: solid $primary-darken-1; }
     /* Notes: Markdown widget for view-mode (clickable URLs) and
        TextArea for edit-mode. Mounted side-by-side; visibility
        toggled by `_set_editing`. Both share a height so the layout
        doesn't shift when the user clicks Edit. */
-    #featedit-notes-md { height: 8; border: solid $primary-darken-1;
-                          padding: 0 1; }
-    #featedit-notes-edit { height: 8; border: solid $primary-darken-1; }
+    #featedit-notes-md {
+        height: 4; border: solid $primary-darken-1;
+        padding: 0 1; overflow-y: auto;
+    }
+    #featedit-notes-edit { height: 4; border: solid $primary-darken-1; }
+    #featedit-status { height: 1; padding: 0 1; }
+    #featedit-btns { height: 3; margin-top: 1; }
+    #featedit-btns Button { margin-right: 1; }
     """
 
     def __init__(self, idx: int, feat: dict, total: int,
@@ -11308,17 +11384,11 @@ class FeatureEditModal(ModalScreen):
         with Vertical(id="featedit-dlg"):
             yield Static(f" Feature: {label or '(unnamed)'} ",
                          id="featedit-title")
-            # Status + buttons dock bottom (declared inside the
-            # Vertical AFTER the body so they read top-to-bottom in
-            # source order, but `dock: bottom` in CSS pulls them).
-            yield Static("", id="featedit-status", markup=True)
-            with Horizontal(id="featedit-btns"):
-                yield Button("Edit", id="btn-featedit-edit",
-                             variant="primary")
-                yield Button("Save", id="btn-featedit-save",
-                             variant="success", disabled=True)
-                yield Button("Cancel", id="btn-featedit-cancel")
-
+            # Body wraps in ScrollableContainer only as a fallback
+            # for tiny terminals; on a comfortable terminal it sizes
+            # itself to content (no scrollbar) thanks to `height: auto`.
+            # Long-form content stays inside the sequence + notes
+            # widgets, which scroll internally regardless.
             with ScrollableContainer(id="featedit-body"):
                 yield Label("Label:")
                 yield Input(value=label, id="featedit-name", disabled=True)
@@ -11350,30 +11420,49 @@ class FeatureEditModal(ModalScreen):
                     yield Button("Auto",
                                  id="btn-featedit-color-clear", disabled=True)
 
-                yield Label("Position (read-only):")
-                yield Static(pos_str, id="featedit-pos")
+                # Inline position row — saves a vertical line versus
+                # a separate label + value pair.
+                with Horizontal(id="featedit-pos-row"):
+                    yield Label("Position:")
+                    yield Static(pos_str, id="featedit-pos")
 
-                # ── Sequence (read-only) ────────────────────────────
-                # Always disabled — position-changing edits are out of
-                # scope for this modal. The TextArea is scrollable so
-                # multi-kb features stay manageable.
-                yield Label(f"Sequence  (5'→3', {len(self._sequence):,} bp):")
-                yield TextArea(self._sequence, id="featedit-seq",
-                                read_only=True, soft_wrap=True)
+                # Sequence (read-only). Title sits on the border so
+                # we save a row vs an external Label. TextArea has
+                # its own scrollbar — the modal itself stays static.
+                seq_ta = TextArea(self._sequence, id="featedit-seq",
+                                   read_only=True, soft_wrap=True)
+                seq_ta.border_title = (
+                    f"Sequence  (5'→3', {len(self._sequence):,} bp)"
+                )
+                yield seq_ta
 
-                # ── Notes / references ──────────────────────────────
-                # In view mode the Markdown widget renders clickable
-                # URLs and `[text](url)` link syntax. In edit mode we
-                # toggle to the TextArea so the user can type raw
-                # Markdown. Stored under `qualifiers["note"]` so it
-                # round-trips through `.gb` files via SeqIO.
-                yield Label("Notes / references  (Markdown — links + [text](url) supported):")
-                yield _Markdown(self._notes_md or "_(none)_",
-                                 id="featedit-notes-md")
+                # Notes / references. View mode → Markdown widget
+                # (clickable URLs); edit mode → TextArea. Both have
+                # internal scrollbars so the modal layout doesn't
+                # shift when the user clicks Edit. Markdown widgets
+                # accept `border_title` too — same row-saving trick.
+                md = _Markdown(self._notes_md or "_(none)_",
+                                id="featedit-notes-md")
+                md.border_title = (
+                    "Notes / references  "
+                    "(Markdown — links + [text](url) supported)"
+                )
+                yield md
                 ta = TextArea(self._notes_md, id="featedit-notes-edit",
                                soft_wrap=True)
+                ta.border_title = (
+                    "Notes / references  (raw Markdown — Edit mode)"
+                )
                 ta.display = False  # hidden until Edit is pressed
                 yield ta
+
+            yield Static("", id="featedit-status", markup=True)
+            with Horizontal(id="featedit-btns"):
+                yield Button("Edit", id="btn-featedit-edit",
+                             variant="primary")
+                yield Button("Save", id="btn-featedit-save",
+                             variant="success", disabled=True)
+                yield Button("Cancel", id="btn-featedit-cancel")
 
     def on_mount(self) -> None:
         self._refresh_color_swatch()
@@ -14698,6 +14787,11 @@ class GrammarEditorModal(ModalScreen):
         self._grammar = deepcopy(
             grammars.get(grammar_id, _BUILTIN_GRAMMARS["gb_l0"])
         )
+        # Entry vector is editable for ALL grammars (built-in or
+        # custom). Stored separately from the grammar dict in
+        # `entry_vectors.json` so the canonical built-in grammar
+        # definitions stay immutable.
+        self._entry_vector = _get_entry_vector(grammar_id)
 
     def compose(self) -> ComposeResult:
         g = self._grammar
@@ -14716,6 +14810,27 @@ class GrammarEditorModal(ModalScreen):
                 )
 
             with ScrollableContainer(id="ged-body"):
+                # ── Entry vector ─────────────────────────────────────
+                # Always editable (even on built-in grammars) — the
+                # entry vector is grammar-scoped meta, not part of
+                # the canonical grammar definition. Stored in
+                # `entry_vectors.json` and persisted *immediately*
+                # on pick (no need to hit Save), so users can
+                # configure even read-only built-ins.
+                yield Label("Entry vector  (the destination plasmid for assemblies):")
+                with Horizontal(id="ged-entry-row"):
+                    yield Static(self._entry_vector_summary(),
+                                 id="ged-entry-info", markup=True)
+                with Horizontal(id="ged-entry-btns"):
+                    yield Button("Pick from library…",
+                                 id="btn-ged-entry-lib")
+                    yield Button("Open file…",
+                                 id="btn-ged-entry-file")
+                    yield Button("Clear",
+                                 id="btn-ged-entry-clear",
+                                 variant="error",
+                                 disabled=self._entry_vector is None)
+
                 yield Label("Name:")
                 yield Input(value=g.get("name", ""),
                             id="ged-name", disabled=not editable)
@@ -14784,6 +14899,99 @@ class GrammarEditorModal(ModalScreen):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+    # ── Entry-vector handlers ────────────────────────────────────────────────
+
+    def _entry_vector_summary(self) -> str:
+        """Markup string summarising the current entry vector. Used to
+        populate `#ged-entry-info` both at compose time and after a
+        pick. Empty / unset → `(none assigned)` in dim style.
+        User-controlled strings (file paths, plasmid names) are run
+        through `rich.markup.escape` so a name like `pUC[18]` can't
+        accidentally trip Rich's markup parser."""
+        from rich.markup import escape as _esc
+        v = self._entry_vector
+        if not isinstance(v, dict) or not v.get("name"):
+            return "[dim](none assigned)[/dim]"
+        size = int(v.get("size") or 0)
+        src  = str(v.get("source") or "")
+        src_tag = ""
+        if src.startswith("library:"):
+            src_tag = "from library"
+        elif src.startswith("file:"):
+            tail = src.split(":", 1)[1]
+            src_tag = f"from file: [italic]{_esc(tail)}[/italic]"
+        nm = _esc(str(v.get("name") or "?"))
+        return (f"[green]{nm}[/green]  ({size:,} bp)"
+                + (f"  · {src_tag}" if src_tag else ""))
+
+    def _refresh_entry_row(self) -> None:
+        try:
+            info = self.query_one("#ged-entry-info", Static)
+            clr  = self.query_one("#btn-ged-entry-clear", Button)
+        except NoMatches:
+            return
+        info.update(self._entry_vector_summary())
+        clr.disabled = self._entry_vector is None
+
+    def _commit_entry_vector(self, vector: "dict | None") -> None:
+        """Persist + refresh the entry-vector row. Persisting via
+        `_set_entry_vector` immediately means the choice survives a
+        Cancel on the rest of the grammar editor — entry vectors are
+        a separate concern from the (mutable) grammar definition."""
+        self._entry_vector = vector
+        _set_entry_vector(self._grammar_id, vector)
+        self._refresh_entry_row()
+
+    @on(Button.Pressed, "#btn-ged-entry-lib")
+    def _ged_entry_lib(self, _: Button.Pressed) -> None:
+        """Pick the entry vector from the plasmid library — pushes
+        `PlasmidPickerModal` and on dismiss assembles the vector
+        dict from the matching library entry."""
+        def _picked(plasmid_id: "str | None") -> None:
+            if not plasmid_id:
+                return
+            for entry in _load_library():
+                if entry.get("id") == plasmid_id:
+                    self._commit_entry_vector({
+                        "name":    str(entry.get("name") or plasmid_id),
+                        "size":    int(entry.get("size") or 0),
+                        "source":  f"library:{plasmid_id}",
+                        "gb_text": str(entry.get("gb_text") or ""),
+                    })
+                    return
+        self.app.push_screen(PlasmidPickerModal(), _picked)
+
+    @on(Button.Pressed, "#btn-ged-entry-file")
+    def _ged_entry_file(self, _: Button.Pressed) -> None:
+        """Pick the entry vector from a `.gb` / `.gbk` / `.dna` file
+        on disk — pushes `OpenFileModal` and on dismiss converts the
+        loaded record to a stored vector."""
+        def _picked(record) -> None:
+            if record is None:
+                return
+            try:
+                gb_text = _record_to_gb_text(record)
+            except Exception:
+                _log.exception("Entry vector: GenBank serialisation failed")
+                self.app.notify(
+                    "Could not serialise the file as GenBank text.",
+                    severity="error",
+                )
+                return
+            self._commit_entry_vector({
+                "name":    str(getattr(record, "name", "") or
+                                 getattr(record, "id", "") or "vector"),
+                "size":    int(len(record.seq) if getattr(record, "seq", None)
+                                else 0),
+                "source":  f"file:{getattr(record, '_tui_source', '?')}",
+                "gb_text": gb_text,
+            })
+        self.app.push_screen(OpenFileModal(), _picked)
+
+    @on(Button.Pressed, "#btn-ged-entry-clear")
+    def _ged_entry_clear(self, _: Button.Pressed) -> None:
+        self._commit_entry_vector(None)
 
     @on(Button.Pressed, "#btn-ged-save")
     def _save(self, _) -> None:
@@ -17126,6 +17334,18 @@ class ConstructorModal(ModalScreen):
             yield Static(
                 " Constructor  —  Golden Braid TU Assembly ", id="ctor-title"
             )
+            # Entry-vector banner — pulls the user-configured
+            # destination plasmid for the active grammar (set in
+            # GrammarEditorModal). Provides at-a-glance confirmation
+            # of which vector the assembly will land in. The Change
+            # button jumps directly into the grammar editor's
+            # entry-vector row so users can swap without leaving the
+            # Constructor (Close → Edit grammar → Pick → reopen).
+            with Horizontal(id="ctor-vector-row"):
+                yield Static(self._entry_vector_summary_for_active_grammar(),
+                             id="ctor-vector-info", markup=True)
+                yield Button("Change…", id="btn-ctor-vector-change",
+                             variant="default")
             with Horizontal(id="ctor-main"):
                 # Left: parts palette
                 with Vertical(id="ctor-palette-col"):
@@ -17399,6 +17619,47 @@ class ConstructorModal(ModalScreen):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+    # ── Entry-vector helpers ───────────────────────────────────────────────
+
+    def _entry_vector_summary_for_active_grammar(self) -> str:
+        """Markup string for the entry-vector banner. Resolves the
+        active grammar id at call time so the banner stays in sync
+        if the user changes grammar from the Domesticator.
+
+        Reuses the same `(name) (size bp) · from <source>` shape as
+        `GrammarEditorModal._entry_vector_summary` for visual
+        consistency. Untrusted name / path strings are run through
+        `rich.markup.escape` so a vector named `pUC[18]` renders
+        literally rather than tripping Rich's markup lexer."""
+        from rich.markup import escape as _esc
+        gid = _get_setting("active_grammar", "gb_l0")
+        v   = _get_entry_vector(gid)
+        prefix = "[bold]Entry vector:[/bold]  "
+        if not isinstance(v, dict) or not v.get("name"):
+            return prefix + "[dim](none — set in Grammar editor)[/dim]"
+        size = int(v.get("size") or 0)
+        nm   = _esc(str(v.get("name") or "?"))
+        return f"{prefix}[green]{nm}[/green]  ({size:,} bp)"
+
+    def _refresh_entry_vector_banner(self) -> None:
+        try:
+            info = self.query_one("#ctor-vector-info", Static)
+        except NoMatches:
+            return
+        info.update(self._entry_vector_summary_for_active_grammar())
+
+    @on(Button.Pressed, "#btn-ctor-vector-change")
+    def _on_change_vector(self, _: Button.Pressed) -> None:
+        """Open the Grammar editor for the active grammar so the user
+        can pick / clear the entry vector. On dismiss, refresh the
+        banner so a fresh choice shows up immediately."""
+        gid = _get_setting("active_grammar", "gb_l0")
+
+        def _on_dismissed(_result):
+            self._refresh_entry_vector_banner()
+
+        self.app.push_screen(GrammarEditorModal(gid), _on_dismissed)
 
 
 # ── NCBI taxon picker (sub-modal for species-name → taxid lookup) ─────────────
@@ -23011,6 +23272,9 @@ ConstructorModal { align: center middle; }
     background: $surface; border: solid $accent; padding: 1 2;
 }
 #ctor-title       { background: $accent-darken-2; padding: 0 1; margin-bottom: 1; }
+#ctor-vector-row  { height: 3; margin-bottom: 1; align: left middle; }
+#ctor-vector-info { width: 1fr; padding: 0 1; }
+#ctor-vector-row Button { min-width: 12; margin-left: 1; }
 #ctor-main        { height: 20; }
 #ctor-palette-col { width: 1fr; border-right: solid $primary-darken-2; padding-right: 1; }
 #ctor-palette-hdr { background: $primary-darken-2; padding: 0 1; }
@@ -23050,6 +23314,10 @@ GrammarEditorModal { align: center middle; }
 #ged-forbidden { height: 5; border: solid $primary-darken-2; }
 #ged-positions { height: 9; border: solid $primary-darken-2; }
 #ged-status { height: auto; min-height: 1; padding: 0 1; }
+#ged-entry-row  { height: 1; margin-top: 0; padding: 0 1; }
+#ged-entry-info { width: 1fr; }
+#ged-entry-btns { height: 3; margin-top: 0; margin-bottom: 1; }
+#ged-entry-btns Button { margin-right: 1; }
 #ged-btns { height: 3; margin-top: 1; }
 #ged-btns Button { margin-right: 1; }
 
@@ -23997,11 +24265,12 @@ SpeciesPickerModal { align: center middle; }
         # detected NOW (with .bak recovery + a user notify) rather than at
         # the first lazy-load when something breaks downstream.
         for path, label, cache_attr in [
-            (_LIBRARY_FILE,     "Plasmid library",     "_library_cache"),
-            (_PARTS_BIN_FILE,   "Parts bin",           "_parts_bin_cache"),
-            (_PRIMERS_FILE,     "Primer library",      "_primers_cache"),
-            (_COLLECTIONS_FILE, "Plasmid collections", "_collections_cache"),
-            (_SETTINGS_FILE,    "Settings",            "_settings_cache"),
+            (_LIBRARY_FILE,        "Plasmid library",     "_library_cache"),
+            (_PARTS_BIN_FILE,      "Parts bin",           "_parts_bin_cache"),
+            (_PRIMERS_FILE,        "Primer library",      "_primers_cache"),
+            (_COLLECTIONS_FILE,    "Plasmid collections", "_collections_cache"),
+            (_ENTRY_VECTORS_FILE,  "Entry vectors",       "_entry_vectors_cache"),
+            (_SETTINGS_FILE,       "Settings",            "_settings_cache"),
         ]:
             globals()[cache_attr] = None
             _, warning = _safe_load_json(path, label)

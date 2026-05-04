@@ -2,6 +2,24 @@
 
 ---
 
+## [0.5.8.0] — 2026-05-04
+
+### Added
+
+- **Per-grammar entry-vector assignment.** Each cloning grammar (Golden Braid L0, MoClo, custom) can now have a canonical destination plasmid (e.g. pUPD2 for GB L0, pAGM4673 for MoClo L1). Set via the **Grammar editor** (a new "Entry vector" row near the top with `Pick from library…` / `Open file…` / `Clear` buttons) and surfaced as a banner at the top of the **Constructor modal** (`Entry vector: <name> (<size> bp)  [Change…]`). The Change button on the constructor jumps directly into the grammar editor for the active grammar.
+- **Storage**: new `entry_vectors.json` file (envelope schema v1, atomic save via `_safe_save_json` like every other persisted library). Each entry embeds the full GenBank text rather than a library-id reference so the vector survives library renames / deletes. Schema: `{grammar_id, name, size, source ("library:<id>" | "file:<path>"), gb_text}`. Editable for built-in grammars too — entry vector is grammar-scoped meta, not part of the canonical (immutable) grammar definition.
+- New helpers: `_load_entry_vectors`, `_save_entry_vectors`, `_get_entry_vector(grammar_id)`, `_set_entry_vector(grammar_id, vector | None)`. Type-strict (non-string grammar_id silently rejected, mirroring the `_sanitize_*` family). Hooked into `_check_data_files` for startup corruption detection + .bak recovery.
+
+### Changed
+
+- **`FeatureEditModal` layout fix.** Replaced the `height: 90%` rule that always inflated the dialog to ~43 rows (leaving a big vertical gap below the form) with `height: auto; max-height: 38`. The dialog now hugs its content, while the sequence + notes textboxes carry their own scrollbars (sized at 4 rows each — the modal-boundary check enforces fit on a 48-row terminal). Inline position row (`Position: 100..400 (300 bp)`), `border_title` on the sequence + notes widgets to drop the redundant external labels, body wrapped in a `ScrollableContainer` only as a fallback so tiny terminals stay reachable.
+
+### Tests
+
+- +4 entry-vector tests in `test_smoke.py`: `_set_entry_vector` round-trip with multi-grammar separation, type-strict rejection of bad `grammar_id`, the Grammar editor's entry-vector row renders + is enabled even on built-ins, and `_commit_entry_vector` persists through `_get_entry_vector`.
+
+---
+
 ## [0.5.7.0] — 2026-05-04
 
 ### Performance

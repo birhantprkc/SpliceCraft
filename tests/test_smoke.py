@@ -4056,6 +4056,118 @@ class TestShiftClickFeatureExtend:
             await pilot.pause(0.05)
             assert isinstance(app.screen, sc.FeatureEditModal)
 
+    def test_entry_vector_round_trip(self, isolated_library):
+        """Entry-vector helpers persist through `_safe_save_json` and
+        round-trip cleanly via `_get_entry_vector` / `_set_entry_vector`.
+        Each grammar gets at most one vector — re-setting replaces."""
+        # Empty initially.
+        assert sc._get_entry_vector("gb_l0") is None
+        # Set + read back.
+        sc._set_entry_vector("gb_l0", {
+            "name": "pUPD2", "size": 2520,
+            "source": "library:abc", "gb_text": "LOCUS pUPD2\n//\n",
+        })
+        v = sc._get_entry_vector("gb_l0")
+        assert v is not None
+        assert v["name"] == "pUPD2"
+        assert v["size"] == 2520
+        assert v["source"] == "library:abc"
+        # Re-set replaces (one vector per grammar).
+        sc._set_entry_vector("gb_l0", {
+            "name": "pUPD2_v2", "size": 2540,
+            "source": "file:/tmp/x.gb", "gb_text": "LOCUS pUPD2_v2\n//\n",
+        })
+        v = sc._get_entry_vector("gb_l0")
+        assert v is not None and v["name"] == "pUPD2_v2"
+        # Different grammar gets its own slot.
+        sc._set_entry_vector("moclo_plant", {
+            "name": "pAGM4673", "size": 6000,
+            "source": "library:def", "gb_text": "LOCUS pAGM4673\n//\n",
+        })
+        assert sc._get_entry_vector("gb_l0")["name"] == "pUPD2_v2"
+        assert sc._get_entry_vector("moclo_plant")["name"] == "pAGM4673"
+        # Clear via None.
+        sc._set_entry_vector("gb_l0", None)
+        assert sc._get_entry_vector("gb_l0") is None
+        assert sc._get_entry_vector("moclo_plant") is not None
+
+    def test_entry_vector_set_rejects_invalid_grammar_id(
+            self, isolated_library):
+        """Type-strict: non-string / empty grammar_id is silently
+        ignored rather than coerced. Mirrors the `_sanitize_*` family
+        — the helpers don't accept anything that smells suspect."""
+        sc._set_entry_vector("", {"name": "x", "size": 0,
+                                   "source": "library:y", "gb_text": ""})
+        sc._set_entry_vector(None, {"name": "x", "size": 0,    # type: ignore[arg-type]
+                                     "source": "library:y", "gb_text": ""})
+        sc._set_entry_vector(123,  {"name": "x", "size": 0,    # type: ignore[arg-type]
+                                     "source": "library:y", "gb_text": ""})
+        # Nothing was actually persisted.
+        assert sc._load_entry_vectors() == []
+
+    async def test_grammar_editor_shows_entry_vector_row(
+            self, isolated_library):
+        """The Grammar editor surfaces an "Entry vector" row for
+        every grammar (built-in or custom). Even though built-ins
+        are otherwise read-only, the entry-vector buttons stay
+        editable so users can configure their own vector for the
+        canonical grammars."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 100), id="x", name="x",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.GrammarEditorModal("gb_l0"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert isinstance(modal, sc.GrammarEditorModal)
+            from textual.widgets import Button, Static
+            # Buttons exist + are enabled (even though the rest of
+            # the built-in form is disabled).
+            for bid in ("btn-ged-entry-lib", "btn-ged-entry-file"):
+                btn = modal.query_one(f"#{bid}", Button)
+                assert btn.disabled is False
+            # Clear button is disabled until a vector is assigned.
+            assert modal.query_one("#btn-ged-entry-clear", Button).disabled
+            # Initially no vector assigned — modal state reflects that.
+            assert modal._entry_vector is None
+
+    async def test_grammar_editor_persists_entry_vector_pick(
+            self, isolated_library):
+        """Picking an entry vector via the helper persists it and
+        the modal's `_entry_vector` state reflects the choice."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 100), id="x", name="x",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.GrammarEditorModal("gb_l0"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            modal._commit_entry_vector({
+                "name": "pUPD2", "size": 2520,
+                "source": "library:abc",
+                "gb_text": "LOCUS pUPD2 100 bp DNA circular\n//\n",
+            })
+            await pilot.pause()
+            assert modal._entry_vector is not None
+            # Persistence via _set_entry_vector inside _commit_entry_vector.
+            v = sc._get_entry_vector("gb_l0")
+            assert v is not None and v["name"] == "pUPD2"
+            # Clear button should now be enabled.
+            from textual.widgets import Button
+            assert not modal.query_one("#btn-ged-entry-clear", Button).disabled
+
     def test_pairwise_align_basic(self):
         """1-bp substitution in a 300 bp sequence aligns with no gaps,
         99.67% identity, 1 mismatch, 0 gaps."""

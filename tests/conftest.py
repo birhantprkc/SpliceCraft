@@ -47,6 +47,7 @@ def _protect_user_data(tmp_path, monkeypatch):
         ("_FEATURES_FILE",        "_features_cache"),
         ("_FEATURE_COLORS_FILE",  "_feature_colors_cache"),
         ("_GRAMMARS_FILE",        "_grammars_cache"),
+        ("_ENTRY_VECTORS_FILE",   "_entry_vectors_cache"),
         ("_SETTINGS_FILE",        "_settings_cache"),
         ("_COLLECTIONS_FILE",     "_collections_cache"),
         ("_AGENT_TOKEN_FILE",     None),   # written when --agent-api is on
