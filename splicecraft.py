@@ -16646,6 +16646,21 @@ class DomesticatorModal(ModalScreen):
                         id="dom-grammar-select",
                         allow_blank=False,
                     )
+                # ── Row 0.5: Entry-vector banner ──
+                # Mirrors the same banner the Constructor shows, but
+                # surfaced HERE because L0 part design depends on
+                # which destination plasmid the part will land in
+                # (overhangs, forbidden sites, etc. are grammar-
+                # scoped but the user wants visual confirmation that
+                # the right vector is set BEFORE designing primers).
+                # Change… jumps into the Grammar editor for the
+                # active grammar; on dismiss the banner refreshes.
+                with Horizontal(id="dom-vector-row"):
+                    yield Static(self._entry_vector_summary(active_gid),
+                                 id="dom-vector-info", markup=True)
+                    yield Button("Change…",
+                                 id="btn-dom-vector-change",
+                                 variant="default")
                 # ── Row 1: Part name + type ──
                 with Horizontal(id="dom-row1"):
                     with Vertical(id="dom-name-col"):
@@ -16951,7 +16966,50 @@ class DomesticatorModal(ModalScreen):
             )
         except NoMatches:
             pass
+        # Refresh the entry-vector banner since the active grammar
+        # changed → different vector might be assigned to the new
+        # grammar.
+        self._refresh_vector_banner(new_gid)
         self._update_oh_display()
+
+    # ── Entry-vector banner ────────────────────────────────────────────────
+
+    def _entry_vector_summary(self, grammar_id: str) -> str:
+        """Markup for the Domesticator's entry-vector banner. Mirrors
+        the Constructor's banner format so the two surfaces read
+        identically. User-controlled name strings go through
+        `rich.markup.escape` so a custom vector named `pUPD[FFE-1]`
+        renders literally rather than tripping Rich's parser."""
+        from rich.markup import escape as _esc
+        v = _get_entry_vector(grammar_id)
+        prefix = "[bold]Entry vector:[/bold]  "
+        if not isinstance(v, dict) or not v.get("name"):
+            return prefix + "[dim](none — set in Grammar editor)[/dim]"
+        size = int(v.get("size") or 0)
+        nm   = _esc(str(v.get("name") or "?"))
+        return f"{prefix}[green]{nm}[/green]  ({size:,} bp)"
+
+    def _refresh_vector_banner(self, grammar_id: "str | None" = None) -> None:
+        """Repaint `#dom-vector-info` from the persisted entry-vector
+        for the active grammar (or `grammar_id` if supplied)."""
+        gid = grammar_id or _get_setting("active_grammar", "gb_l0")
+        try:
+            info = self.query_one("#dom-vector-info", Static)
+        except NoMatches:
+            return
+        info.update(self._entry_vector_summary(gid))
+
+    @on(Button.Pressed, "#btn-dom-vector-change")
+    def _on_dom_vector_change(self, _: Button.Pressed) -> None:
+        """Open the Grammar editor for the active grammar so the
+        user can pick / clear the entry vector. On dismiss, refresh
+        the banner. Same pattern the Constructor uses."""
+        gid = _get_setting("active_grammar", "gb_l0")
+
+        def _on_dismissed(_result):
+            self._refresh_vector_banner(gid)
+
+        self.app.push_screen(GrammarEditorModal(gid), _on_dismissed)
 
     @on(Select.Changed, "#dom-type")
     def _type_changed(self, _event) -> None:
@@ -23349,6 +23407,9 @@ DomesticatorModal { align: center middle; }
 #dom-grammar-row { height: 3; margin-bottom: 1; }
 #dom-grammar-row Label { padding: 1 1 0 0; width: 18; }
 #dom-grammar-row Select { width: 1fr; }
+#dom-vector-row  { height: 3; margin-bottom: 1; align: left middle; }
+#dom-vector-info { width: 1fr; padding: 0 1; }
+#dom-vector-row Button { min-width: 12; margin-left: 1; }
 #dom-row1   { height: 5; }
 #dom-name-col { width: 1fr; padding-right: 1; }
 #dom-type-col { width: 1fr; }

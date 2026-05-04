@@ -2,6 +2,14 @@
 
 ---
 
+## [0.5.8.1] — 2026-05-04
+
+### Added
+
+- **Entry-vector banner on `DomesticatorModal`.** The vector chosen for the active grammar (set in Grammar editor → Entry vector) is now also surfaced at the top of the Domesticator with a `Change…` button — mirrors the Constructor banner so users designing L0 parts can confirm at-a-glance which destination plasmid the part will land in. Auto-refreshes when the cloning grammar changes via the existing dropdown so a switch from `gb_l0` (FFE 1) to `moclo_plant` (pAGM4673) updates the banner without leaving the modal.
+
+---
+
 ## [0.5.8.0] — 2026-05-04
 
 ### Added
