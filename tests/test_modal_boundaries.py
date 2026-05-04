@@ -181,6 +181,17 @@ _MODAL_CASES = [
     ("LargeFileConfirmModal",        lambda: sc.LargeFileConfirmModal(
                                                 "/some/big.gb", "12.3 MB",
                                                 threshold_text="cap = 5 MB")),
+    ("FeatureEditModal",             lambda: sc.FeatureEditModal(
+                                                idx=0,
+                                                feat={"label": "lacZ",
+                                                      "type":  "CDS",
+                                                      "start": 100,
+                                                      "end":   400,
+                                                      "strand": 1,
+                                                      "color": "#80FF80"},
+                                                total=2686,
+                                                sequence="ATG" * 100,
+                                                notes="See [Bolivar 1977](https://doi.org/10.1016/0378-1119(77)90000-2)")),
 ]
 
 

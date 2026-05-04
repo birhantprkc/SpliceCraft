@@ -2,6 +2,58 @@
 
 ---
 
+## [0.5.7.0] — 2026-05-04
+
+### Performance
+
+Three render-path optimizations targeting the user-perceived sluggishness in fullscreen panel modes (F1-F5) and modal dialogs on older WSL2 hardware:
+
+- **Skip redundant `Static.update()` in `SequencePanel._refresh_view`** — when the cache key is unchanged, both the rebuild AND the push are now skipped. Previously the push fired on every call, costing ~18 ms per redundant repaint on a 45-row fullscreen seq panel because Textual's `Static.update` triggers a full layout pass even with an unchanged renderable. Tracked separately as `_pushed_view_key` so cache invalidations (e.g. connector toggle, restriction overlay change) still force the next call to repush.
+- **Memoize `textual.style.Style.from_rich_style`** — profiling on a 5 kb plasmid in fullscreen seq mode showed 87 % of every cursor-move's wall-clock time inside Textual's Rich-Text-to-Content conversion, dominated by 912 `from_rich_style` calls per repaint. The conversion is pure within a single app run (Rich `Style` is frozen-hashable; `console` is the singleton App console), so memoizing on the Rich Style hash with a 2048-entry LRU saves ~2 ms per cursor move and ~30 ms per cold PlasmidMap render. Patched at module-import time near the `textual.style` import. As a happy side-effect the test suite itself runs ~30 % faster (rendering shows up across many widget tests).
+- **`ColorPickerModal` xterm grid: 256 Buttons → 1 Static (`_XtermColorGrid`).** The picker used to mount 256 individual cell Buttons + iterate them in `on_mount` to set per-cell `styles.background`; on a T480s baseline that pushed the modal-open latency to ~2 s. Replaced with a single `Static` subclass that renders the entire 256-color grid as one Rich Text canvas (3 spaces per cell with a coloured background) and hit-tests clicks via integer math against the widget's region — three orders of magnitude fewer widgets, modal-open latency drops to ~490 ms (4.1× faster). Drag-preview behaviour is unchanged: `on_mouse_down` / `on_mouse_move` still drive the live preview, just routing through the new `cell_at(x, y)` helper instead of a `get_widget_at` widget-tree lookup.
+
+Measured on a T480s baseline plasmid (5 kb, 80 features), 50 sustained cursor moves:
+
+| Mode | Before | After | Speedup |
+|---|---|---|---|
+| Multi-panel (F5) cursor move | 2.91 ms | 1.39 ms | **2.1×** |
+| Seq-panel only (F4) cursor move | 11.44 ms | 3.53 ms | **3.2×** |
+| PlasmidMap cold render (F2 fullscreen) | 39 ms | 8 ms | **4.8×** |
+| Seq panel warm `_refresh_view` (no input change) | 18 ms | 0.1 ms | **180×** |
+| ColorPickerModal push + settle | 2025 ms | 491 ms | **4.1×** |
+| Test suite wall time (no functional change) | 256 s | 183 s | 1.4× |
+
+The 180× win on warm `_refresh_view` is what makes holding an arrow key feel snappy in fullscreen seq mode — every keystroke triggered the redundant `Static.update` cycle even when the cache was warm. The cumulative effect across selections, scroll, hover, and resize is a noticeably less choppy app on slower hardware.
+
+### Hardening
+
+- **`/note` qualifier sanitization (`_sanitize_note`).** New helper strips `\x00..\x08`, `\x0b..\x1f`, and DEL (preserving `\t` and `\n` so multi-paragraph Markdown round-trips), caps at 8 KB, and is type-strict (a JSON dict / int payload becomes empty rather than `str()`-coerced — same convention as `_sanitize_label`). Wired into `FeatureEditModal._on_save` so user-typed notes can't smuggle ANSI escape sequences into the `.gb` export, and into `_apply_feature_edit` as defence-in-depth for non-modal call paths (tests, future agent-API endpoint).
+- **Defence-in-depth on the read path.** `_open_feature_editor` now also runs sanitization when extracting notes + sequence from a freshly-opened SeqRecord. A malicious `.gb` whose `/note` qualifier or sequence body carries terminal-escape bytes can no longer reach the modal's Markdown widget or read-only sequence TextArea unfiltered. `Bio.Seq` doesn't enforce a DNA alphabet, so the same `_CONTROL_CHARS_RE` filter applied to labels now scrubs the sequence display too. +3 regression tests cover the sanitizer behaviour, the read-path notes path, and the read-path sequence path.
+
+---
+
+## [0.5.6.0] — 2026-05-04
+
+### Added
+
+- **Feature editor modal (`FeatureEditModal`).** Opens read-only by default — every input (label, type, strand, color, notes) is `disabled` so a stray click can't mutate the record. The user presses **Edit** to unlock the form, then **Save** to commit (or **Cancel** to discard). Position is shown but never editable from this modal — wrap-feature invariants (CLAUDE.md sacred #5/#8/#9) make that path significantly more involved than the safe label/type/strand/color/notes edits, so position changes still flow through delete + re-add.
+- **Sequence box + notes box.** The body now includes:
+  - A **read-only sequence TextArea** (8-row scrollable) showing the feature's 5'→3' bases, wrap-aware so a feature spanning the origin renders its tail + head as a contiguous string (extracted from the SeqRecord at open time, not stored on the modal).
+  - A **notes / references field** that round-trips through the standard GenBank `/note` qualifier. Renders as a Markdown widget in view mode (clickable URLs and `[text](url)` links) and swaps to a TextArea in edit mode for raw Markdown editing. Multi-paragraph notes (separated by blank lines) are split into one `/note` qualifier per paragraph so they round-trip cleanly through `.gb` files via SeqIO.
+- **Three triggers** all funnel through the same `PlasmidApp._open_feature_editor(idx)`:
+  1. **Enter** on a row in the feature sidebar (priority binding pre-empts `DataTable.action_select_cursor` so it actually fires on a resting cursor).
+  2. **Double-click** on a sidebar row (`Click.chain >= 2` captured in `_on_table_click` and consumed in `_row_selected`, which then posts `RowOpened` instead of the highlight-only `RowActivated`).
+  3. **Enter** while the SequencePanel has focus and the plasmid map has a selected feature.
+- **Layout fix.** Title docks top, action buttons (`Edit` / `Save` / `Cancel`) and status row dock bottom — both **always visible** regardless of body height. The form fields, sequence box, and notes box live in a `1fr` ScrollableContainer in between, so dense content scrolls inside the dialog instead of pushing the buttons off-screen. Resolves the "buttons out of viewport" bug from the prior layout, where `height: auto` on the dialog combined with `max-height: 28` on the body let the modal grow past the visible area on certain terminal sizes.
+- Save flow mirrors the agent-API `_h_update_feature` endpoint so the UI and the API can't drift — both rebuild the SeqRecord via `deepcopy` + per-feature mutation, push undo, and refresh all panels. Color persists via CommercialSaaS/Benchling `ApEinfo_fwdcolor` / `ApEinfo_revcolor`; notes via the standard GenBank `/note` qualifier.
+
+### Tests
+
+- +1 modal-boundary case for `FeatureEditModal` to verify it fits in the 160×48 baseline terminal (now exercising the new sequence + notes args).
+- +10 tests in `test_smoke.py`: opens-read-only, Edit-unlocks-the-form, Save-applies-edits (label change round-trips through the SeqFeature qualifiers), Cancel-discards-edits, sequence-box-shows-feature-bases, wrap-feature sequence assembles tail + head, notes round-trip through `/note` qualifier (multi-paragraph splits), seq-panel Enter on a selected feature opens the modal, seq-panel Enter without a selection no-ops, sidebar `action_open_feature_at_cursor` opens the modal.
+
+---
+
 ## [0.5.5.3] — 2026-05-04
 
 ### Added

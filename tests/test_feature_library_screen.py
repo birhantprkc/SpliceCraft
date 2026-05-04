@@ -1348,8 +1348,19 @@ class TestColorPickerExpanded:
             app.push_screen(modal)
             await pilot.pause()
             await pilot.pause(0.1)
-            # Simulate pressing xterm cell 196 (a bright red) directly.
-            modal.query_one("#colorpick-x-196", Button).press()
+            # Simulate clicking xterm cell 196 (a bright red) directly.
+            # The grid is now a single Static (since 0.5.7.x); we drive
+            # `_set_pending` through the same path the click handler
+            # would: compute the screen coords for cell 196, fire the
+            # mouse-down handler.
+            grid = modal.query_one("#colorpick-xterm-grid", sc._XtermColorGrid)
+            row = 1 + (196 - 16) // 36
+            col = (196 - 16) % 36
+            sx = grid.region.x + col * grid._CELL_W + 1
+            sy = grid.region.y + row
+            from types import SimpleNamespace
+            modal.on_mouse_down(SimpleNamespace(
+                screen_x=sx, screen_y=sy, button=1))
             await pilot.pause()
             await pilot.pause(0.05)
             assert modal._pending == "#FF0000"
@@ -1443,13 +1454,37 @@ class TestColorPickerDragPreview:
     down and sweeping across cells updates the preview live, committing on
     release. These tests drive the handlers directly with stub events —
     Textual's pilot doesn't expose a clean mouse-drag primitive, so we go
-    one level below the event loop."""
+    one level below the event loop.
+
+    The grid is a single `_XtermColorGrid` Static (since 0.5.7.x) — it
+    used to be 256 individual Buttons but the per-cell mount cost made
+    the modal sluggish on slow hardware. Tests compute screen coords
+    for a cell from the grid's region + the same `_CELL_W` cell width
+    the widget uses, then exercise `on_mouse_down` / `on_mouse_move`
+    directly against those coords.
+    """
 
     def _make_event(self, sx: int, sy: int, button: int = 1):
         """Stub mouse event — the handlers only read ``screen_x``,
         ``screen_y``, and ``button``, so a SimpleNamespace is enough."""
         from types import SimpleNamespace
         return SimpleNamespace(screen_x=sx, screen_y=sy, button=button)
+
+    def _cell_screen_coords(self, modal, idx: int) -> "tuple[int, int]":
+        """Return `(screen_x, screen_y)` at the centre of the xterm cell
+        with index `idx`. Inverse of `_XtermColorGrid.cell_at`."""
+        grid = modal.query_one("#colorpick-xterm-grid", sc._XtermColorGrid)
+        cw = grid._CELL_W
+        if 0 <= idx < 16:
+            row, col = 0, idx
+        elif 16 <= idx < 232:
+            row = 1 + (idx - 16) // 36
+            col = (idx - 16) % 36
+        elif 232 <= idx < 256:
+            row, col = 7, idx - 232
+        else:
+            raise ValueError(f"idx out of range: {idx}")
+        return (grid.region.x + col * cw + 1, grid.region.y + row)
 
     async def test_mouse_down_on_cell_arms_drag_and_sets_pending(
             self, tiny_record):
@@ -1465,10 +1500,8 @@ class TestColorPickerDragPreview:
             await pilot.pause()
             await pilot.pause(0.1)
 
-            cell = modal.query_one("#colorpick-x-196", Button)
-            r = cell.region
-            modal.on_mouse_down(self._make_event(
-                r.x + r.width // 2, r.y + r.height // 2))
+            x, y = self._cell_screen_coords(modal, 196)
+            modal.on_mouse_down(self._make_event(x, y))
             assert modal._drag_active is True
             assert modal._pending == sc._xterm_index_to_hex(196)
 
@@ -1485,20 +1518,16 @@ class TestColorPickerDragPreview:
             await pilot.pause()
             await pilot.pause(0.1)
 
-            start = modal.query_one("#colorpick-x-21",  Button)  # blue cube
-            over  = modal.query_one("#colorpick-x-82",  Button)  # green
-            end   = modal.query_one("#colorpick-x-196", Button)  # red
-
             modal.on_mouse_down(self._make_event(
-                start.region.x + 1, start.region.y))
+                *self._cell_screen_coords(modal, 21)))
             assert modal._pending == sc._xterm_index_to_hex(21)
 
             modal.on_mouse_move(self._make_event(
-                over.region.x + 1, over.region.y))
+                *self._cell_screen_coords(modal, 82)))
             assert modal._pending == sc._xterm_index_to_hex(82)
 
             modal.on_mouse_move(self._make_event(
-                end.region.x + 1, end.region.y))
+                *self._cell_screen_coords(modal, 196)))
             assert modal._pending == sc._xterm_index_to_hex(196)
 
     async def test_mouse_move_without_drag_is_noop(self, tiny_record):
@@ -1515,10 +1544,9 @@ class TestColorPickerDragPreview:
             await pilot.pause()
             await pilot.pause(0.1)
 
-            cell = modal.query_one("#colorpick-x-21", Button)
             assert modal._drag_active is False
             modal.on_mouse_move(self._make_event(
-                cell.region.x + 1, cell.region.y))
+                *self._cell_screen_coords(modal, 21)))
             assert modal._pending == "#FF6347"
 
     async def test_mouse_up_clears_drag_flag(self, tiny_record):
@@ -1534,18 +1562,14 @@ class TestColorPickerDragPreview:
             await pilot.pause()
             await pilot.pause(0.1)
 
-            start = modal.query_one("#colorpick-x-82",  Button)
-            after = modal.query_one("#colorpick-x-196", Button)
-
-            modal.on_mouse_down(self._make_event(
-                start.region.x + 1, start.region.y))
-            modal.on_mouse_up(self._make_event(
-                start.region.x + 1, start.region.y))
+            sx, sy = self._cell_screen_coords(modal, 82)
+            modal.on_mouse_down(self._make_event(sx, sy))
+            modal.on_mouse_up(self._make_event(sx, sy))
             assert modal._drag_active is False
             before = modal._pending
 
             modal.on_mouse_move(self._make_event(
-                after.region.x + 1, after.region.y))
+                *self._cell_screen_coords(modal, 196)))
             assert modal._pending == before
 
     async def test_mouse_down_outside_grid_does_not_arm_drag(
@@ -1582,9 +1606,8 @@ class TestColorPickerDragPreview:
             await pilot.pause()
             await pilot.pause(0.1)
 
-            cell = modal.query_one("#colorpick-x-196", Button)
-            modal.on_mouse_down(self._make_event(
-                cell.region.x + 1, cell.region.y, button=3))  # right click
+            x, y = self._cell_screen_coords(modal, 196)
+            modal.on_mouse_down(self._make_event(x, y, button=3))  # right click
             assert modal._drag_active is False
             assert modal._pending is None
 

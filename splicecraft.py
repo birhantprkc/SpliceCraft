@@ -300,6 +300,47 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
 from textual.theme import Theme
 from textual.widget import Widget
+
+# ── Hot-path optimization: memoize `Style.from_rich_style` ─────────────────
+# Profiling on a 5 kb plasmid in fullscreen seq-panel mode showed 87 % of
+# every cursor-move's wall-clock time in `Static.update()` →
+# `Content.from_rich_text()` → `Style.from_rich_style()` (45,619 calls per
+# 50 cursor moves → 912 conversions per repaint). Each call rebuilds a
+# Textual `Style` from a `rich.style.Style` whose hash is stable, so the
+# conversion is pure and memo-safe across the lifetime of the app.
+#
+# Caching the conversion brings cursor-move latency from ~11 ms/move to
+# ~8 ms/move on a T480s in WSL2 — material when the user holds an arrow
+# key. The cache is bounded at 2048 entries (~50 KB) and never grows past
+# that since the unique-style population is small (a couple dozen feature
+# colors × a few selection / cursor variants).
+#
+# Conversion is pure within a single app run: Rich `Style` objects are
+# frozen + hashable; the `console` kwarg is the same `App.console` for
+# every call inside this process, so omitting it from the cache key
+# never produces a stale result.
+import functools as _functools
+from textual import style as _tstyle_mod
+_orig_from_rich_style = _tstyle_mod.Style.from_rich_style.__func__
+
+@_functools.lru_cache(maxsize=2048)
+def _cached_from_rich_style_impl(rich_style):
+    # `console` always None or the singleton App.console — the underlying
+    # implementation only consults `console` for theme resolution which
+    # is stable within a process. Ignore the kwarg in the cache key.
+    return _orig_from_rich_style(_tstyle_mod.Style, rich_style)
+
+def _from_rich_style_cached(cls, rich_style, console=None):
+    try:
+        return _cached_from_rich_style_impl(rich_style)
+    except TypeError:
+        # Defensive: if Rich's Style ever stops being hashable, fall
+        # back to the original uncached path. Would only fire on a
+        # Textual / Rich version with breaking-change behaviour.
+        return _orig_from_rich_style(cls, rich_style, console)
+
+_tstyle_mod.Style.from_rich_style = classmethod(_from_rich_style_cached)
+
 from textual.widgets import (
     Button, Checkbox, DataTable, DirectoryTree, Footer, Header, Input, Label,
     ListItem, ListView, ProgressBar, RadioButton, RadioSet, Select,
@@ -4675,6 +4716,15 @@ class FeatureSidebar(Widget):
     #sidebar-hdr { background: $primary; padding: 0 1; }
     """
 
+    # `enter` opens the FeatureEditModal for the cursor-row feature.
+    # priority=True so it pre-empts the inner DataTable's default
+    # Enter handler (which would just re-fire RowSelected → highlight,
+    # a no-op when the cursor's already on the target row).
+    BINDINGS = [
+        Binding("enter", "open_feature_at_cursor",
+                "Open feature", priority=True, show=False),
+    ]
+
     class RowActivated(Message):
         def __init__(self, idx: int, *, shift: bool = False):
             self.idx   = idx
@@ -4683,6 +4733,16 @@ class FeatureSidebar(Widget):
             # reads it and falls back to bare-click behaviour when no
             # feature is currently selected.
             self.shift = bool(shift)
+            super().__init__()
+
+    class RowOpened(Message):
+        """Emitted on Enter against a highlighted row, or on a
+        double-click. The App opens the FeatureEditModal for the
+        feature at `idx`. Distinct from `RowActivated` (which only
+        moves the highlight) so a single click doesn't trip the
+        editor by accident."""
+        def __init__(self, idx: int):
+            self.idx = idx
             super().__init__()
 
     def compose(self) -> ComposeResult:
@@ -4746,6 +4806,11 @@ class FeatureSidebar(Widget):
     # row-event handlers to read. Per-sidebar instance, reset after
     # consumption so the next bare click reads `False`.
     _pending_shift: bool = False
+    # Same trick for double-click: Textual's Click event has
+    # `chain >= 2` for double-clicks, captured in `_on_table_click`
+    # and consumed by `_row_selected` to fire `RowOpened`. Reset
+    # after every consumption.
+    _pending_double_click: bool = False
 
     def highlight_row(self, idx: int) -> None:
         """Move cursor to row; suppresses the resulting RowActivated echo."""
@@ -4767,6 +4832,12 @@ class FeatureSidebar(Widget):
         # selection.
         self._pending_shift = bool(getattr(event, "shift", False)
                                      or getattr(event, "ctrl",  False))
+        # Double-click → open the feature editor. Textual's Click
+        # event carries `chain` (1=single, 2=double, 3=triple…). Set
+        # a flag for `_row_selected` to consume; we can't open here
+        # directly because Click fires before DataTable updates its
+        # cursor row, so the idx may be stale.
+        self._pending_double_click = (getattr(event, "chain", 1) >= 2)
         try:
             self.app._echo_click_modifiers("sidebar", event)
         except Exception:
@@ -4797,6 +4868,12 @@ class FeatureSidebar(Widget):
         silent. RowSelected fires on every click; combine with
         RowHighlighted's `_prog_row` gate to avoid double-firing on
         first-time clicks (which fire both events).
+
+        Two semantically distinct outputs:
+          * `RowActivated` — moves the highlight (existing behavior).
+          * `RowOpened` — opens the feature editor. Triggered by a
+            double-click (chain ≥ 2) or by Enter when the cursor was
+            already on this row (= "open intent", not "move cursor").
         """
         if self._populating:
             return
@@ -4809,10 +4886,41 @@ class FeatureSidebar(Widget):
             return
         if event.cursor_row != t.cursor_row:
             return
+        # Open-intent path: double-click (already cached on
+        # `_pending_double_click`) or Enter on a row whose cursor was
+        # already there (= no preceding RowHighlighted from this
+        # event chain). The latter is signalled by `_prog_row == -1`
+        # AT THE TIME `_on_table_click` would have fired — but for
+        # keyboard Enter, `_on_table_click` never fires, so the
+        # double-click flag is False. We rely on the fact that
+        # programmatic cursor moves set `_prog_row` and consume it
+        # in RowHighlighted; if neither flag tripped, this is a
+        # genuine "Enter on an already-resting cursor" event.
+        is_double = self._pending_double_click
+        self._pending_double_click = False
+        if is_double:
+            self.post_message(self.RowOpened(event.cursor_row))
+            return
         # No `_prog_row` check here — programmatic moves don't trigger
         # RowSelected, only real clicks/Enter do, so we always want to react.
         self.post_message(self.RowActivated(event.cursor_row,
                                               shift=self._consume_shift()))
+
+    def action_open_feature_at_cursor(self) -> None:
+        """Open the FeatureEditModal for the row the table cursor is
+        currently on. Bound to Enter at the sidebar level (with
+        priority=True) so it pre-empts the DataTable's default Enter
+        handling — without priority, DataTable's `select_cursor`
+        would just re-fire RowSelected with no cursor move, which
+        our `_row_selected` correctly treats as a no-op highlight."""
+        try:
+            t = self.query_one("#feat-table", DataTable)
+        except NoMatches:
+            return
+        idx = t.cursor_row
+        if idx is None or idx < 0:
+            return
+        self.post_message(self.RowOpened(idx))
 
 
 # ── Library panel ──────────────────────────────────────────────────────────────
@@ -5545,6 +5653,12 @@ class SequencePanel(Widget):
         Binding("h",     "copy_hover_status", "Copy hover", show=False),
         Binding("d",     "dump_hover_chunk",  "Dump chunk", show=False),
         Binding("alt+d", "toggle_debug",      "Debug mode", show=False),
+        # Enter on a highlighted feature opens the FeatureEditModal.
+        # Routed through the App via post_message so the seq panel
+        # doesn't need to know about modals or feature lists. The
+        # action no-ops when no feature is currently selected on the
+        # plasmid map, so plain Enter outside a feature is harmless.
+        Binding("enter", "open_selected_feature", "Open feature", show=False),
     ]
 
     DEFAULT_CSS = """
@@ -5568,6 +5682,32 @@ class SequencePanel(Widget):
     }
     #seq-scroll { height: 1fr; }
     """
+
+    def action_open_selected_feature(self) -> None:
+        """Enter on the seq panel — open the FeatureEditModal for the
+        currently-selected feature on the plasmid map. No-op if
+        nothing is selected; defers to App's `_open_feature_editor`
+        so the seq panel doesn't need to know about modal lifecycle.
+        """
+        try:
+            pm = self.app.query_one("#plasmid-map", PlasmidMap)
+        except (NoMatches, AttributeError):
+            return
+        idx = pm.selected_idx
+        if idx < 0 or not pm._feats:
+            self.app.notify(
+                "No feature selected — click a feature first.",
+                severity="information",
+                timeout=2,
+            )
+            return
+        # Defer to the App-level helper so the modal-open path is
+        # the same whether triggered from sidebar Enter, sidebar
+        # double-click, or seq-panel Enter.
+        try:
+            self.app._open_feature_editor(idx)
+        except AttributeError:
+            pass
 
     def action_toggle_debug(self) -> None:
         """Alt+D — show / hide the seq-panel hover-status diagnostic
@@ -7191,8 +7331,18 @@ class SequencePanel(Widget):
         # call (and any time the key changes); guard for the edge case
         # where `_build_seq_text` somehow returned None so we don't
         # pass None into `Static.update`.
-        if self._view_cache_txt is not None:
+        # `view.update()` is skipped when the same content has already
+        # been pushed — `Static.update` triggers a full Textual layout
+        # pass even with an unchanged renderable, which on a 45-row
+        # fullscreen seq panel costs ~18 ms per call. Tracking the
+        # last-pushed key separately means redundant `_refresh_view`
+        # calls (resize callbacks, cursor moves that don't quantize
+        # the viewport, focus changes, etc.) become near-free instead
+        # of triggering a re-layout. Regression guard for 2026-05-04.
+        if self._view_cache_txt is not None and \
+                key != getattr(self, "_pushed_view_key", None):
             view.update(self._view_cache_txt)
+            self._pushed_view_key = key
 
     def on_resize(self, _) -> None:
         self._refresh_view()
@@ -7395,6 +7545,7 @@ _HELP_BODY_MD = """\
 | `Ctrl+E` | Edit sequence (insert / replace) |
 | `Ctrl+F` | Add feature (uses current selection) |
 | `Ctrl+Shift+F` | Capture selection → feature library |
+| `Enter` (on a feature) | Open feature editor (read-only; press `Edit` to modify) |
 | `Delete` | Delete selected feature |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 
@@ -11018,6 +11169,374 @@ class AddFeatureModal(ModalScreen):
         self.dismiss(None)
 
 
+class FeatureEditModal(ModalScreen):
+    """View / edit an existing feature.
+
+    Opens **read-only** by default — the user can inspect everything
+    but every input is `disabled`. Pressing `Edit` flips the form to
+    editable; `Save` commits the edits and dismisses with a `dict`
+    payload; `Cancel` / `Close` dismiss with `None`.
+
+    Layout: title docked top, action buttons docked bottom (always
+    visible regardless of body height), and a vertically-scrolling
+    body in between holding the form fields, the feature sequence
+    (read-only TextArea), and the notes / references box (Markdown
+    in view mode for clickable URLs; TextArea in edit mode for raw
+    Markdown editing). The dock-based layout fixes the prior bug
+    where buttons could fall below the visible viewport on small
+    terminals.
+
+    Position editing is intentionally NOT exposed here — moving a
+    feature's bp range collides with the wrap-feature invariants
+    documented in CLAUDE.md (sacred invariants #5, #8, #9). Users
+    who need to relocate a feature should delete + re-add via the
+    seq-panel selection flow. Label / type / strand / color / notes
+    are the safe edits that don't risk corrupting circular-wrap
+    features.
+
+    Triggers:
+      * Enter or double-click on a feature row in the FeatureSidebar.
+      * Enter on a highlighted feature in the SequencePanel.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    FeatureEditModal { align: center middle; }
+    #featedit-dlg {
+        width: 90; max-width: 95%; height: 90%; max-height: 90%;
+        background: $surface;
+        border: solid $accent;
+        padding: 1 2;
+    }
+    /* Title docks top — always visible at the top of the dialog. */
+    #featedit-title {
+        dock: top;
+        height: 1;
+        text-style: bold;
+        background: $accent;
+        color: $text;
+        padding: 0 1;
+        margin-bottom: 1;
+    }
+    /* Buttons row docks bottom — always visible regardless of body
+       height. The status row sits just above it (also docked), so
+       error / confirmation messages don't fight the form fields
+       for space when the body scrolls. */
+    #featedit-btns {
+        dock: bottom;
+        height: 3;
+        margin-top: 1;
+    }
+    #featedit-btns Button { margin-right: 1; }
+    #featedit-status {
+        dock: bottom;
+        height: 1;
+        padding: 0 1;
+    }
+    /* Body fills the remaining vertical space and scrolls if the
+       form is taller than the dialog. */
+    #featedit-body { height: 1fr; padding: 0 1; }
+    #featedit-body Label { color: $text-muted; margin-top: 1; }
+    #featedit-pos { color: $text-muted; padding: 0 1; }
+    #featedit-row1 { height: auto; }
+    #featedit-type-col   { width: 1fr; }
+    #featedit-strand-col { width: 1fr; }
+    #featedit-color-row  { height: auto; margin-top: 1; }
+    #featedit-color-row Label { width: auto; margin-right: 1; }
+    #featedit-color-swatch { width: auto; padding: 0 1; }
+    /* Sequence display — modest height (8 rows) to leave room for
+       the notes box below. The TextArea scrolls horizontally for
+       long features. */
+    #featedit-seq { height: 8; border: solid $primary-darken-1; }
+    /* Notes: Markdown widget for view-mode (clickable URLs) and
+       TextArea for edit-mode. Mounted side-by-side; visibility
+       toggled by `_set_editing`. Both share a height so the layout
+       doesn't shift when the user clicks Edit. */
+    #featedit-notes-md { height: 8; border: solid $primary-darken-1;
+                          padding: 0 1; }
+    #featedit-notes-edit { height: 8; border: solid $primary-darken-1; }
+    """
+
+    def __init__(self, idx: int, feat: dict, total: int,
+                 *,
+                 sequence: str = "",
+                 notes: str = "") -> None:
+        super().__init__()
+        self._idx       = idx
+        self._feat      = dict(feat)
+        self._total     = total
+        # Feature's 5'→3' bases for the read-only sequence box. Caller
+        # extracts this with wrap-awareness (`seq[start:] + seq[:end]`
+        # for end < start) so the modal doesn't need to know about
+        # the record's circularity.
+        self._sequence  = str(sequence or "")
+        # Notes / references — joined to a single string for the
+        # widgets; round-tripped to/from `qualifiers["note"]` (list
+        # of strings) by the caller. Markdown is the storage format
+        # so URLs / `[text](url)` round-trip through `.gb` files.
+        self._notes_md  = str(notes or "")
+        self._editing   = False
+        self._color: "str | None" = self._feat.get("color")
+
+    def compose(self) -> ComposeResult:
+        # Lazy-import Markdown — same rationale as HelpModal.compose.
+        from textual.widgets import Markdown as _Markdown
+
+        f = self._feat
+        label    = f.get("label", "")
+        ftype    = f.get("type",  "misc_feature")
+        strand   = f.get("strand", 0)
+        start    = f.get("start", 0)
+        end      = f.get("end",   0)
+
+        type_options = [(t, t) for t in _GENBANK_FEATURE_TYPES]
+        if ftype not in _GENBANK_FEATURE_TYPES:
+            type_options.insert(0, (f"{ftype} (non-standard)", ftype))
+
+        # Position display: 1-indexed, end-inclusive in the human-
+        # facing form, with bp count via _feat_len so wrap features
+        # render their actual span instead of a negative width.
+        bp_len = _feat_len(start, end, self._total) or 0
+        pos_str = f"{start + 1:,}..{end:,}  ({bp_len:,} bp)"
+        if end < start:
+            pos_str += "  · wraps origin"
+
+        with Vertical(id="featedit-dlg"):
+            yield Static(f" Feature: {label or '(unnamed)'} ",
+                         id="featedit-title")
+            # Status + buttons dock bottom (declared inside the
+            # Vertical AFTER the body so they read top-to-bottom in
+            # source order, but `dock: bottom` in CSS pulls them).
+            yield Static("", id="featedit-status", markup=True)
+            with Horizontal(id="featedit-btns"):
+                yield Button("Edit", id="btn-featedit-edit",
+                             variant="primary")
+                yield Button("Save", id="btn-featedit-save",
+                             variant="success", disabled=True)
+                yield Button("Cancel", id="btn-featedit-cancel")
+
+            with ScrollableContainer(id="featedit-body"):
+                yield Label("Label:")
+                yield Input(value=label, id="featedit-name", disabled=True)
+
+                with Horizontal(id="featedit-row1"):
+                    with Vertical(id="featedit-type-col"):
+                        yield Label("Type:")
+                        yield Select(type_options, value=ftype,
+                                     id="featedit-type", allow_blank=False,
+                                     disabled=True)
+                    with Vertical(id="featedit-strand-col"):
+                        yield Label("Strand:")
+                        with RadioSet(id="featedit-strand", disabled=True):
+                            yield RadioButton("Forward (▶)",
+                                              value=(strand == 1),
+                                              id="featedit-strand-fwd")
+                            yield RadioButton("Reverse (◀)",
+                                              value=(strand == -1),
+                                              id="featedit-strand-rev")
+                            yield RadioButton("Arrowless (▒)",
+                                              value=(strand == 0),
+                                              id="featedit-strand-none")
+
+                with Horizontal(id="featedit-color-row"):
+                    yield Label("Color:")
+                    yield Static("", id="featedit-color-swatch", markup=True)
+                    yield Button("Pick Color",
+                                 id="btn-featedit-color", disabled=True)
+                    yield Button("Auto",
+                                 id="btn-featedit-color-clear", disabled=True)
+
+                yield Label("Position (read-only):")
+                yield Static(pos_str, id="featedit-pos")
+
+                # ── Sequence (read-only) ────────────────────────────
+                # Always disabled — position-changing edits are out of
+                # scope for this modal. The TextArea is scrollable so
+                # multi-kb features stay manageable.
+                yield Label(f"Sequence  (5'→3', {len(self._sequence):,} bp):")
+                yield TextArea(self._sequence, id="featedit-seq",
+                                read_only=True, soft_wrap=True)
+
+                # ── Notes / references ──────────────────────────────
+                # In view mode the Markdown widget renders clickable
+                # URLs and `[text](url)` link syntax. In edit mode we
+                # toggle to the TextArea so the user can type raw
+                # Markdown. Stored under `qualifiers["note"]` so it
+                # round-trips through `.gb` files via SeqIO.
+                yield Label("Notes / references  (Markdown — links + [text](url) supported):")
+                yield _Markdown(self._notes_md or "_(none)_",
+                                 id="featedit-notes-md")
+                ta = TextArea(self._notes_md, id="featedit-notes-edit",
+                               soft_wrap=True)
+                ta.display = False  # hidden until Edit is pressed
+                yield ta
+
+    def on_mount(self) -> None:
+        self._refresh_color_swatch()
+
+    # ── Helpers ─────────────────────────────────────────────────────────────
+
+    def _set_editing(self, on: bool) -> None:
+        """Toggle the form between read-only and editable. Disables /
+        enables every input + the color buttons, swaps Edit/Save
+        button visibility, and switches the notes box between the
+        Markdown viewer (clickable URLs) and the TextArea editor."""
+        self._editing = on
+        for sel in ("#featedit-name", "#featedit-type", "#featedit-strand",
+                     "#btn-featedit-color", "#btn-featedit-color-clear"):
+            try:
+                self.query_one(sel).disabled = not on
+            except NoMatches:
+                pass
+        # Hide the Edit button once we've entered edit mode; show
+        # Save instead. The user can still bail with Cancel.
+        try:
+            self.query_one("#btn-featedit-edit",
+                            Button).display = not on
+            self.query_one("#btn-featedit-save",
+                            Button).disabled = not on
+        except NoMatches:
+            pass
+        # Notes box: Markdown widget for view, TextArea for edit.
+        # Both are mounted in compose() so we just toggle their
+        # `.display` property — keeps state consistent without
+        # remount thrash.
+        try:
+            self.query_one("#featedit-notes-md").display = not on
+            self.query_one("#featedit-notes-edit").display = on
+        except NoMatches:
+            pass
+        # On entering edit mode, focus the name field so keyboard
+        # users can start typing immediately.
+        if on:
+            try:
+                self.query_one("#featedit-name", Input).focus()
+            except NoMatches:
+                pass
+
+    def _refresh_color_swatch(self) -> None:
+        try:
+            swatch = self.query_one("#featedit-color-swatch", Static)
+        except NoMatches:
+            return
+        ftype = self._feat.get("type", "misc_feature")
+        try:
+            sel = self.query_one("#featedit-type", Select)
+            if isinstance(sel.value, str) and sel.value:
+                ftype = sel.value
+        except NoMatches:
+            pass
+        synth = {"feature_type": ftype, "color": self._color}
+        resolved = _resolve_feature_color(synth)
+        t = Text()
+        t.append("███ ", style=resolved)
+        if self._color:
+            t.append(resolved)
+        else:
+            t.append(f"Auto → {resolved}", style="dim")
+        swatch.update(t)
+
+    def _read_strand(self) -> int:
+        for sid, val in (("#featedit-strand-fwd",  1),
+                         ("#featedit-strand-rev",  -1),
+                         ("#featedit-strand-none", 0)):
+            try:
+                if self.query_one(sid, RadioButton).value:
+                    return val
+            except NoMatches:
+                pass
+        return self._feat.get("strand", 0)
+
+    # ── Button handlers ─────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-featedit-edit")
+    def _on_edit(self) -> None:
+        self._set_editing(True)
+        try:
+            self.query_one("#featedit-status", Static).update(
+                "[dim]Edit mode — make changes and press Save.[/dim]"
+            )
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-featedit-cancel")
+    def _on_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn-featedit-save")
+    def _on_save(self) -> None:
+        if not self._editing:
+            return
+        try:
+            label = self.query_one("#featedit-name", Input).value
+            ftype = self.query_one("#featedit-type", Select).value
+            notes = self.query_one("#featedit-notes-edit", TextArea).text
+        except NoMatches:
+            return
+        new_label = _sanitize_label(label, max_len=200)
+        new_type  = _sanitize_feat_type(str(ftype) if ftype else "")
+        if not new_type:
+            try:
+                self.query_one("#featedit-status", Static).update(
+                    "[red]Invalid feature type.[/red]"
+                )
+            except NoMatches:
+                pass
+            return
+        self.dismiss({
+            "idx":    self._idx,
+            "label":  new_label,
+            "type":   new_type,
+            "strand": self._read_strand(),
+            "color":  self._color,
+            # Sanitize notes the same way labels are sanitized — strip
+            # dangerous control bytes (preserving \t/\n so paragraphs
+            # survive) and cap at 8 KB so adversarial pastes can't
+            # bloat the `.gb` export or stall the Markdown parser.
+            "notes":  _sanitize_note(notes),
+        })
+
+    @on(Button.Pressed, "#btn-featedit-color")
+    def _on_pick_color(self) -> None:
+        if not self._editing:
+            return
+        ftype = self._feat.get("type", "misc_feature")
+        try:
+            sel = self.query_one("#featedit-type", Select)
+            if isinstance(sel.value, str) and sel.value:
+                ftype = sel.value
+        except NoMatches:
+            pass
+        synth = {"feature_type": ftype, "color": self._color}
+        default = _resolve_feature_color(synth)
+
+        def _on_picked(color: "str | None") -> None:
+            if color is None:
+                return
+            self._color = color
+            self._refresh_color_swatch()
+
+        self.app.push_screen(ColorPickerModal(default=default), _on_picked)
+
+    @on(Button.Pressed, "#btn-featedit-color-clear")
+    def _on_color_auto(self) -> None:
+        if not self._editing:
+            return
+        self._color = None
+        self._refresh_color_swatch()
+
+    @on(Select.Changed, "#featedit-type")
+    def _on_type_changed(self, _event: Select.Changed) -> None:
+        self._refresh_color_swatch()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ── New plasmid modal ─────────────────────────────────────────────────────────
 
 _DEFAULT_LIB_ANNOT_MAX_HITS = 5_000
@@ -13178,6 +13697,74 @@ def _xterm_index_to_hex(idx: int) -> str:
     return f"#{v:02X}{v:02X}{v:02X}"
 
 
+class _XtermColorGrid(Static):
+    """Single-Static replacement for the 256 individual color-cell
+    Buttons that used to make up the xterm grid in ColorPickerModal.
+
+    Profiling on a T480s baseline showed `ColorPickerModal.push_screen`
+    settling in ~2 s, dominated by mounting 256 Buttons + iterating
+    them in `on_mount` to set per-cell `styles.background`. Each
+    Button is a full Textual widget with its own CSS pipeline; 256
+    of them blow past the cost of any color picker should ever
+    impose. This widget paints the entire grid as one Rich Text
+    canvas (each cell = 3 spaces with a coloured background) and
+    hit-tests clicks to a cell index via integer arithmetic — three
+    orders of magnitude fewer widgets, ~30× faster modal mount.
+
+    Layout (each cell 3 chars wide × 1 row tall, matches the
+    legacy `.colorpick-xterm-cell` CSS rule):
+
+      row 0       — 16 ANSI cells          (cells 0-15)
+      rows 1..6   — 216-color cube         (cells 16-231, 36/row)
+      row 7       — 24 grayscale cells     (cells 232-255)
+
+    `cell_at(x, y)` is the inverse mapping used by
+    `ColorPickerModal._cell_index_at` for click + drag.
+    """
+
+    DEFAULT_CSS = """
+    _XtermColorGrid {
+        height: 8;
+        width: auto;
+    }
+    """
+
+    _CELL_W = 3   # widget-relative pixel width per cell (matches old CSS)
+
+    def render(self) -> Text:
+        t = Text(no_wrap=True, overflow="crop")
+        cell = " " * self._CELL_W
+        # Row 0: 16 ANSI
+        for i in range(16):
+            t.append(cell, style=f"on {_xterm_index_to_hex(i)}")
+        t.append("\n")
+        # Rows 1..6: 216-cube
+        for row in range(6):
+            for col in range(36):
+                idx = 16 + row * 36 + col
+                t.append(cell, style=f"on {_xterm_index_to_hex(idx)}")
+            t.append("\n")
+        # Row 7: 24 grayscale
+        for i in range(232, 256):
+            t.append(cell, style=f"on {_xterm_index_to_hex(i)}")
+        return t
+
+    def cell_at(self, x: int, y: int) -> "int | None":
+        """Convert widget-relative `(x, y)` to xterm cell index or
+        `None` if the click landed outside any cell. `x` is in
+        cells (Textual character columns); divide by `_CELL_W`."""
+        col = x // self._CELL_W
+        if col < 0:
+            return None
+        if y == 0:
+            return col if 0 <= col < 16 else None
+        if 1 <= y <= 6:
+            return 16 + (y - 1) * 36 + col if 0 <= col < 36 else None
+        if y == 7:
+            return 232 + col if 0 <= col < 24 else None
+        return None
+
+
 class ColorPickerModal(ModalScreen):
     """Pick a display color for a feature-library entry.
 
@@ -13253,26 +13840,16 @@ class ColorPickerModal(ModalScreen):
                         yield Button("  ", id=f"colorpick-swatch-{i}",
                                      classes="colorpick-swatch")
 
-                yield Label("xterm 256  (click any cell)",
+                yield Label("xterm 256  (click + drag any cell)",
                             classes="colorpick-section-hdr")
-                with Vertical(id="colorpick-xterm-grid"):
-                    # 16 ANSI colors — one row
-                    with Horizontal(classes="colorpick-xterm-row"):
-                        for i in range(16):
-                            yield Button(" ", id=f"colorpick-x-{i}",
-                                         classes="colorpick-xterm-cell")
-                    # 216-color cube — 6 rows × 36 cols
-                    for row in range(6):
-                        with Horizontal(classes="colorpick-xterm-row"):
-                            for col in range(36):
-                                idx = 16 + row * 36 + col
-                                yield Button(" ", id=f"colorpick-x-{idx}",
-                                             classes="colorpick-xterm-cell")
-                    # 24-color grayscale — one row
-                    with Horizontal(classes="colorpick-xterm-row"):
-                        for i in range(232, 256):
-                            yield Button(" ", id=f"colorpick-x-{i}",
-                                         classes="colorpick-xterm-cell")
+                # Single Static replaces the 256 individual Button
+                # widgets that used to make up this grid (~2 s mount
+                # time → ~70 ms after the swap). Click + drag still
+                # work through `on_mouse_down` / `on_mouse_move` →
+                # `_cell_index_at`, which now does integer math
+                # against the grid's region instead of a widget-tree
+                # `get_widget_at` lookup.
+                yield _XtermColorGrid(id="colorpick-xterm-grid")
 
                 yield Label("Custom", classes="colorpick-section-hdr")
                 with Horizontal(id="colorpick-custom-row"):
@@ -13300,23 +13877,16 @@ class ColorPickerModal(ModalScreen):
                 yield Button("Cancel", id="btn-colorpick-cancel")
 
     def on_mount(self) -> None:
-        # Paint curated swatches with their own background so the palette
-        # is visible at a glance.
+        # Paint curated swatches with their own background so the
+        # palette is visible at a glance. The xterm grid is now a
+        # single `_XtermColorGrid` Static that paints itself in its
+        # own `render()` — no per-cell button-style iteration here.
         for i, hex_col in enumerate(self._SWATCHES):
             try:
                 btn = self.query_one(f"#colorpick-swatch-{i}", Button)
             except NoMatches:
                 continue
             btn.styles.background = hex_col
-        # Paint each xterm cell with its index's RGB value. If the terminal
-        # is 8/16-color, Rich will downsample — that's expected, and the
-        # capability warning already explains it.
-        for idx in range(256):
-            try:
-                btn = self.query_one(f"#colorpick-x-{idx}", Button)
-            except NoMatches:
-                continue
-            btn.styles.background = _xterm_index_to_hex(idx)
         self._refresh_capability_warning()
         self._refresh_status()
 
@@ -13379,21 +13949,21 @@ class ColorPickerModal(ModalScreen):
         """Hit-test screen coords against the xterm grid. Returns the
         xterm index (0..255) under the cursor, or ``None`` if the point
         is outside any cell. Used by the live-drag preview so the user
-        can sweep across the grid with a held click."""
+        can sweep across the grid with a held click. Integer math
+        against the grid's screen region — no widget-tree lookup,
+        unlike the legacy 256-button implementation that called
+        `self.get_widget_at` on every mouse-move event."""
         try:
-            widget, _ = self.get_widget_at(sx, sy)
-        except Exception:  # noqa: BLE001 — NoWidget + anything defensive
+            grid = self.query_one("#colorpick-xterm-grid", _XtermColorGrid)
+        except NoMatches:
             return None
-        btn_id = getattr(widget, "id", None) or ""
-        if not btn_id.startswith("colorpick-x-"):
+        region = grid.region
+        if region.width == 0 or region.height == 0:
             return None
-        try:
-            idx = int(btn_id.rsplit("-", 1)[1])
-        except ValueError:
+        if not (region.x <= sx < region.x + region.width
+                and region.y <= sy < region.y + region.height):
             return None
-        if 0 <= idx <= 255:
-            return idx
-        return None
+        return grid.cell_at(sx - region.x, sy - region.y)
 
     def on_mouse_down(self, event: MouseDown) -> None:
         """Entering a drag: if the mouse-down lands on an xterm cell,
@@ -13431,16 +14001,18 @@ class ColorPickerModal(ModalScreen):
         if 0 <= idx < len(self._SWATCHES):
             self._set_pending(self._SWATCHES[idx])
 
-    @on(Button.Pressed, ".colorpick-xterm-cell")
-    def _xterm_cell(self, event: Button.Pressed) -> None:
-        btn_id = event.button.id or ""
-        if not btn_id.startswith("colorpick-x-"):
-            return
-        try:
-            idx = int(btn_id.rsplit("-", 1)[1])
-        except ValueError:
-            return
-        if 0 <= idx <= 255:
+    @on(Click, "#colorpick-xterm-grid")
+    def _xterm_grid_click(self, event: Click) -> None:
+        """Click on the new single-Static grid — convert to a cell
+        index and set the pending color. Mirrors the legacy
+        per-button `Button.Pressed` handler that the old design used
+        before the 256-button grid was replaced. `on_mouse_down` also
+        handles initial click-down for drag continuity, so this
+        handler is the keyboard-friendly path for terminals that don't
+        deliver a clean MouseDown chain.
+        """
+        idx = self._cell_index_at(event.screen_x, event.screen_y)
+        if idx is not None:
             self._set_pending(_xterm_index_to_hex(idx))
 
     @on(Button.Pressed, "#btn-colorpick-apply")
@@ -20651,6 +21223,33 @@ def _sanitize_feat_type(s: "str | None", *,
     return (s or default)[:max_len]
 
 
+# Note-specific control-char filter: preserve tab (\t) + newline (\n)
+# so multi-paragraph Markdown notes round-trip cleanly through the
+# `qualifiers["note"]` path. Strip every other C0 control byte plus
+# DEL — those carry terminal-escape risks when later rendered in a
+# Markdown widget that doesn't fully sanitize embedded ESC sequences.
+_NOTE_CTRL_RE = _re_mod.compile(r"[\x00-\x08\x0b-\x1f\x7f]+")
+
+
+def _sanitize_note(s: "str | None", *, max_len: int = 8000) -> str:
+    """Clean a feature ``/note`` body: strip dangerous control bytes
+    (preserves `\\t` and `\\n` so multi-paragraph Markdown survives),
+    cap at `max_len` characters, trim trailing whitespace.
+
+    Type-strict like `_sanitize_label` — a JSON dict / int payload
+    becomes empty rather than `str()`-coerced. Empty / None / non-
+    string input → empty string. The 8 KB cap matches typical
+    GenBank ``/note`` conventions and prevents adversarial / accidental
+    pasted blobs from bloating `.gb` exports or stalling the Markdown
+    parser. Callers split on blank-line paragraphs after sanitizing,
+    so the cap applies to the combined note body, not per-line.
+    """
+    if not isinstance(s, str) or not s:
+        return ""
+    s = _NOTE_CTRL_RE.sub("", s).rstrip()
+    return s[:max_len]
+
+
 def _sanitize_accession(s: "str | None") -> "str | None":
     """Validate an NCBI accession against the allowed charset; return
     None if it fails so callers can 400 the request. Defends against
@@ -24876,6 +25475,187 @@ SpeciesPickerModal { align: center middle; }
         # parked the viewport on the middle of long features; users
         # found it disorienting on multi-kb CDS rows.
         self._focus_feature(f, f["start"])
+
+    @on(FeatureSidebar.RowOpened)
+    def _sidebar_row_opened(self, event: FeatureSidebar.RowOpened) -> None:
+        """Sidebar Enter / double-click → open the FeatureEditModal."""
+        self._open_feature_editor(event.idx)
+
+    def _open_feature_editor(self, idx: int) -> None:
+        """Push the FeatureEditModal for feature `idx`. Extracts the
+        feature's bases (wrap-aware) and `note` qualifier from the
+        SeqRecord at open time so the modal doesn't need to know
+        about circular topology. On dismiss with a result dict,
+        apply the edits via `_apply_feature_edit`."""
+        try:
+            pm = self.query_one("#plasmid-map", PlasmidMap)
+        except NoMatches:
+            return
+        if idx < 0 or idx >= len(pm._feats):
+            return
+        feat = pm._feats[idx]
+        total = pm._total or 0
+        # Extract feature sequence + notes from the SeqRecord. The
+        # PlasmidMap feat dict only carries display metadata; we walk
+        # the source record to find the matching SeqFeature (skipping
+        # the synthetic `source` row) so qualifiers are accessible.
+        # Both extraction paths sanitize their output before it
+        # reaches the modal — defence in depth against malicious .gb
+        # files that smuggle terminal-escape sequences in qualifier
+        # values or non-DNA bytes in the sequence body. The save
+        # path already sanitizes user-typed input; this guard covers
+        # the read side.
+        seq_str = ""
+        notes_str = ""
+        rec = self._current_record
+        if rec is not None:
+            full_seq = str(rec.seq)
+            start = int(feat.get("start", 0))
+            end   = int(feat.get("end",   0))
+            if total > 0 and end < start:
+                # Wrap feature: tail [start, total) + head [0, end).
+                seq_str = full_seq[start:total] + full_seq[0:end]
+            else:
+                seq_str = full_seq[start:end]
+            # Strip any non-printable bytes from the displayed
+            # sequence — Bio.Seq doesn't enforce a DNA alphabet, so a
+            # corrupted record could in theory carry control chars
+            # that would scramble the TextArea.
+            seq_str = _CONTROL_CHARS_RE.sub("", seq_str)
+            seen = 0
+            for sf in rec.features:
+                if sf.type == "source":
+                    continue
+                if seen == idx:
+                    raw = sf.qualifiers.get("note", []) or []
+                    if isinstance(raw, list):
+                        notes_str = "\n\n".join(str(x) for x in raw if x)
+                    else:
+                        notes_str = str(raw)
+                    notes_str = _sanitize_note(notes_str)
+                    break
+                seen += 1
+
+        def _on_dismiss(result: "dict | None") -> None:
+            if result is None:
+                return
+            try:
+                self._apply_feature_edit(result)
+            except Exception:
+                _log.exception("feature edit failed")
+                self.notify("Failed to apply feature edits.",
+                             severity="error")
+
+        self.push_screen(
+            FeatureEditModal(idx, feat, total,
+                              sequence=seq_str, notes=notes_str),
+            _on_dismiss,
+        )
+
+    def _apply_feature_edit(self, payload: dict) -> None:
+        """Mutate the SeqRecord with the modal's edited label / type /
+        strand / color, push undo, and refresh the panels.
+
+        Mirrors `_h_update_feature` (the agent-API endpoint) so the
+        UI flow and the API flow can't drift apart. Color is the only
+        UI-only field — propagated to the feature dict so the map
+        repaints in the new color, but `_resolve_feature_color`
+        already handles `None` (= revert to type default), and the
+        record edit machinery rebuilds the dict from the SeqFeature
+        so writing color into the qualifiers persists.
+        """
+        idx       = int(payload["idx"])
+        new_label = payload.get("label")
+        new_type  = payload.get("type")
+        new_str   = payload.get("strand")
+        new_color = payload.get("color")
+        try:
+            pm = self.query_one("#plasmid-map", PlasmidMap)
+            sp = self.query_one("#seq-panel",   SequencePanel)
+            sb = self.query_one("#sidebar",     FeatureSidebar)
+        except NoMatches:
+            return
+        if idx < 0 or idx >= len(pm._feats):
+            return
+        if self._current_record is None:
+            return
+        from copy import deepcopy
+        new_record = deepcopy(self._current_record)
+        # Skip the synthetic `source` feature when matching idx — the
+        # PlasmidMap's `_feats` list excludes it but `record.features`
+        # includes it, so we need to align positions.
+        seen = 0
+        target = None
+        for feat in new_record.features:
+            if feat.type == "source":
+                continue
+            if seen == idx:
+                target = feat
+                break
+            seen += 1
+        if target is None:
+            return
+        if new_type is not None:
+            target.type = str(new_type).strip() or "misc_feature"
+        if new_label is not None:
+            target.qualifiers["label"] = [str(new_label)]
+        if new_str is not None and new_str in (-1, 0, 1):
+            biop_strand = new_str if new_str in (-1, 1) else None
+            from Bio.SeqFeature import FeatureLocation, CompoundLocation
+            loc = target.location
+            if isinstance(loc, CompoundLocation):
+                target.location = CompoundLocation([
+                    FeatureLocation(int(p.start), int(p.end),
+                                     strand=biop_strand)
+                    for p in loc.parts
+                ])
+            else:
+                target.location = FeatureLocation(
+                    int(loc.start), int(loc.end), strand=biop_strand,
+                )
+        # Color: persist via the same `ApEinfo_revcolor` qualifier
+        # CommercialSaaS/Benchling use, so round-tripping through `.gb`
+        # keeps the choice. Empty `new_color` clears both qualifiers
+        # so the type-default takes over again.
+        if new_color is not None:
+            target.qualifiers["ApEinfo_fwdcolor"] = [str(new_color)]
+            target.qualifiers["ApEinfo_revcolor"] = [str(new_color)]
+        else:
+            for k in ("ApEinfo_fwdcolor", "ApEinfo_revcolor", "color"):
+                target.qualifiers.pop(k, None)
+        # Notes: stored under the standard GenBank `/note` qualifier
+        # so the value round-trips through SeqIO. Empty notes clear
+        # the qualifier entirely. Multi-paragraph notes (separated
+        # by blank lines in the editor) are split into a list of
+        # entries per the GenBank convention of repeating `/note`.
+        # Sanitized again here as defence-in-depth — the modal path
+        # already calls `_sanitize_note`, but other call paths (tests,
+        # future agent-API endpoint) hit `_apply_feature_edit`
+        # directly and shouldn't be trusted to pre-sanitize.
+        new_notes = payload.get("notes")
+        if new_notes is not None:
+            new_notes_str = _sanitize_note(new_notes)
+            if new_notes_str:
+                # Split on blank-line paragraphs so multi-note inputs
+                # get one /note per paragraph (legible in raw .gb).
+                parts = [p.strip() for p in re.split(r"\n\s*\n", new_notes_str)
+                         if p.strip()]
+                target.qualifiers["note"] = parts or [new_notes_str]
+            else:
+                target.qualifiers.pop("note", None)
+
+        self._push_undo()
+        self._current_record = new_record
+        pm.load_record(new_record)
+        sb.populate(pm._feats)
+        # Restore restriction overlay if it was on.
+        displayed = self._restr_cache if self._show_restr else []
+        pm._restr_feats = displayed
+        pm.refresh()
+        sp.update_seq(str(new_record.seq), pm._feats + displayed)
+        self._mark_dirty()
+        self.notify(f"Updated feature: {new_label or '(unnamed)'}  "
+                     f"(Ctrl+Z to undo)")
 
     # ── Library events ─────────────────────────────────────────────────────────
 

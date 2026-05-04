@@ -3651,6 +3651,411 @@ class TestShiftClickFeatureExtend:
             assert int(app.query_one("#library").styles.width.value) == 26
             assert int(app.query_one("#sidebar").styles.width.value) == 32
 
+    async def test_feature_edit_modal_opens_read_only(
+            self, isolated_library):
+        """The FeatureEditModal opens with every input disabled —
+        the user can inspect the feature but can't change anything
+        until they press Edit."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 1000), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(100, 400, strand=1), type="CDS",
+                        qualifiers={"label": ["lacZ"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert isinstance(app.screen, sc.FeatureEditModal)
+            modal = app.screen
+            from textual.widgets import Input, Select, RadioSet, Button
+            # Every editable input must start `disabled=True`.
+            assert modal.query_one("#featedit-name", Input).disabled
+            assert modal.query_one("#featedit-type", Select).disabled
+            assert modal.query_one("#featedit-strand", RadioSet).disabled
+            # Save button starts disabled (gated behind the Edit press).
+            assert modal.query_one("#btn-featedit-save", Button).disabled
+
+    async def test_feature_edit_modal_edit_button_unlocks_form(
+            self, isolated_library):
+        """Pressing Edit flips every input to editable and enables
+        the Save button so the user can commit changes."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 1000), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(100, 400, strand=1), type="CDS",
+                        qualifiers={"label": ["lacZ"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            assert isinstance(modal, sc.FeatureEditModal)
+            modal.query_one("#btn-featedit-edit",
+                            sc.Button).action_press()
+            await pilot.pause()
+            from textual.widgets import Input, Select, RadioSet, Button
+            assert not modal.query_one("#featedit-name", Input).disabled
+            assert not modal.query_one("#featedit-type", Select).disabled
+            assert not modal.query_one("#featedit-strand", RadioSet).disabled
+            assert not modal.query_one("#btn-featedit-save", Button).disabled
+
+    async def test_feature_edit_modal_save_applies_edits(
+            self, isolated_library):
+        """End-to-end: open the modal, press Edit, change the label,
+        press Save → the new label appears on the plasmid map's
+        feature dict and the record's qualifiers."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 1000), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(100, 400, strand=1), type="CDS",
+                        qualifiers={"label": ["lacZ"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            from textual.widgets import Input, Button
+            modal.query_one("#btn-featedit-edit", Button).action_press()
+            await pilot.pause()
+            modal.query_one("#featedit-name", Input).value = "lacZ-α"
+            modal.query_one("#btn-featedit-save", Button).action_press()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            assert pm._feats[0]["label"] == "lacZ-α"
+            # Record-side: qualifiers reflect the new label too.
+            target = next(f for f in app._current_record.features
+                            if f.type == "CDS")
+            assert target.qualifiers.get("label") == ["lacZ-α"]
+
+    async def test_feature_edit_modal_cancel_discards_edits(
+            self, isolated_library):
+        """Cancel keeps the original label even if the user typed
+        something else into the (post-Edit) name input."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 1000), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(100, 400, strand=1), type="CDS",
+                        qualifiers={"label": ["lacZ"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            from textual.widgets import Input, Button
+            modal.query_one("#btn-featedit-edit", Button).action_press()
+            await pilot.pause()
+            modal.query_one("#featedit-name", Input).value = "garbage"
+            modal.query_one("#btn-featedit-cancel", Button).action_press()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            assert pm._feats[0]["label"] == "lacZ"
+
+    async def test_seq_panel_enter_opens_editor_on_selected_feature(
+            self, isolated_library):
+        """End-to-end: select a feature on the map, focus the seq
+        panel, press Enter — the FeatureEditModal opens for that
+        feature."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 1000), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(100, 400, strand=1), type="CDS",
+                        qualifiers={"label": ["lacZ"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm.select_feature(0)
+            await pilot.pause()
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp.action_open_selected_feature()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert isinstance(app.screen, sc.FeatureEditModal)
+            assert app.screen._idx == 0
+
+    async def test_seq_panel_enter_no_op_without_selection(
+            self, isolated_library):
+        """Enter on the seq panel with nothing selected on the map
+        must NOT open the modal — it just notifies the user."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 1000), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(100, 400, strand=1), type="CDS",
+                        qualifiers={"label": ["lacZ"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm.selected_idx = -1   # nothing selected
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp.action_open_selected_feature()
+            await pilot.pause()
+            assert not isinstance(app.screen, sc.FeatureEditModal)
+
+    async def test_feature_edit_modal_shows_sequence(
+            self, isolated_library):
+        """The sequence box renders the feature's 5'→3' bases pulled
+        from the SeqRecord. Wrap-aware extraction is exercised by
+        the wrap-feature variant below."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        # Make the seq distinctive so we can string-match.
+        seq = "ATG" + "TAA" + ("CG" * 50) + "GCG"
+        rec = SeqRecord(Seq(seq), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(0, 6, strand=1), type="CDS",
+                        qualifiers={"label": ["start_codon_pair"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            assert isinstance(modal, sc.FeatureEditModal)
+            assert modal._sequence == "ATGTAA"
+            from textual.widgets import TextArea
+            ta = modal.query_one("#featedit-seq", TextArea)
+            assert ta.read_only is True
+            assert "ATGTAA" in ta.text
+
+    async def test_feature_edit_modal_wrap_feature_sequence(
+            self, isolated_library):
+        """A feature whose `end < start` (wraps the origin) gets its
+        bases assembled as `seq[start:total] + seq[0:end]` so the
+        modal shows a contiguous 5'→3' string instead of an empty
+        slice."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        # 30 bp circular plasmid; wrap feature spans 25..30 + 0..5.
+        seq = "TTTTT" + ("A" * 20) + "GGGGG"  # 30 bp; tail = "GGGGG", head = "TTTTT"
+        rec = SeqRecord(Seq(seq), id="W", name="W",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        # join(26..30, 1..5) → wrap from 25 to 5 (0-indexed).
+        rec.features = [
+            SeqFeature(CompoundLocation([
+                FeatureLocation(25, 30, strand=1),
+                FeatureLocation(0,  5,  strand=1),
+            ]), type="misc_feature",
+                qualifiers={"label": ["origin_spanner"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            assert isinstance(modal, sc.FeatureEditModal)
+            # Tail then head — `GGGGG` + `TTTTT`.
+            assert modal._sequence == "GGGGGTTTTT"
+
+    def test_sanitize_note_strips_dangerous_control_bytes(self):
+        """`/note` body sanitizer strips `\\x00..\\x08`, `\\x0b..\\x1f`, and
+        DEL but preserves `\\t` (\\x09) and `\\n` (\\x0a) so multi-paragraph
+        Markdown notes round-trip cleanly. Caps total length at 8 KB so
+        adversarial pasted blobs can't bloat `.gb` exports."""
+        # Tab and newline survive; raw ESC + form feed get stripped.
+        nasty = "Para 1\n\nPara 2\twith tab\n\x1b[31mRED\x1b[0m\x0c\x00bad"
+        out = sc._sanitize_note(nasty)
+        assert "\n\n" in out      # paragraph break preserved
+        assert "\t" in out         # tab preserved
+        assert "\x1b" not in out   # ESC stripped
+        assert "\x00" not in out   # NUL stripped
+        assert "\x0c" not in out   # FF stripped
+        # Type-strict like _sanitize_label.
+        assert sc._sanitize_note(None) == ""
+        assert sc._sanitize_note(123) == ""           # type: ignore[arg-type]
+        assert sc._sanitize_note({"x": 1}) == ""      # type: ignore[arg-type]
+        # Length cap.
+        assert len(sc._sanitize_note("X" * 100_000)) == 8_000
+
+    async def test_feature_edit_modal_notes_sanitized_on_read(
+            self, isolated_library):
+        """Defence-in-depth: a malicious `.gb` whose `/note` qualifier
+        carries terminal-escape bytes is cleaned when the modal opens,
+        not just when the user hits Save. Without this, a hostile
+        record could smuggle ANSI sequences into the Markdown widget's
+        rendering buffer. Regression guard for 2026-05-04 hardening."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 1000), id="N", name="N",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(0, 100, strand=1), type="CDS",
+                        qualifiers={"label": ["lacZ"],
+                                    "note":  ["\x1b[31mRED ALERT\x1b[0m\nOK"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            assert isinstance(modal, sc.FeatureEditModal)
+            assert "\x1b" not in modal._notes_md
+            # The textual content survives — only the escape bytes are gone.
+            assert "RED ALERT" in modal._notes_md
+            assert "OK" in modal._notes_md
+
+    async def test_feature_edit_modal_sequence_strips_control_bytes(
+            self, isolated_library):
+        """A corrupted SeqRecord whose sequence contains control bytes
+        (which `Bio.Seq` doesn't validate) renders as plain DNA in the
+        modal — control bytes are stripped before display so they
+        can't scramble the TextArea or carry terminal escapes."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        # Synthesize a sequence with embedded ESC + NUL.
+        rec = SeqRecord(Seq("ATG\x1b[31mCG\x00CG"), id="S", name="S",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "linear"})
+        rec.features = [
+            SeqFeature(FeatureLocation(0, 13, strand=1), type="CDS",
+                        qualifiers={"label": ["X"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            assert isinstance(modal, sc.FeatureEditModal)
+            assert "\x1b" not in modal._sequence
+            assert "\x00" not in modal._sequence
+            # Bases themselves come through.
+            assert "ATG" in modal._sequence
+
+    async def test_feature_edit_modal_notes_round_trip(
+            self, isolated_library):
+        """Notes text from `qualifiers['note']` populates the modal,
+        and editing + saving stores the new notes back as `/note`
+        qualifiers (one per blank-line paragraph)."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 1000), id="N", name="N",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(0, 100, strand=1), type="CDS",
+                        qualifiers={"label": ["lacZ"],
+                                    "note":  ["Original note"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app._open_feature_editor(0)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            assert isinstance(modal, sc.FeatureEditModal)
+            assert "Original note" in modal._notes_md
+            from textual.widgets import TextArea, Button
+            modal.query_one("#btn-featedit-edit", Button).action_press()
+            await pilot.pause()
+            new_notes = (
+                "First paragraph.\n\n"
+                "Second paragraph with a [link](https://example.com)."
+            )
+            modal.query_one("#featedit-notes-edit", TextArea).text = new_notes
+            modal.query_one("#btn-featedit-save", Button).action_press()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            target = next(f for f in app._current_record.features
+                            if f.type == "CDS")
+            stored = target.qualifiers.get("note", [])
+            # Two paragraphs → two `/note` entries.
+            assert len(stored) == 2
+            assert stored[0].startswith("First paragraph")
+            assert "https://example.com" in stored[1]
+
+    async def test_sidebar_row_opened_message_opens_editor(
+            self, isolated_library):
+        """The sidebar's `RowOpened` message routes through
+        `_sidebar_row_opened` and pushes the FeatureEditModal."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 1000), id="L", name="L",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [
+            SeqFeature(FeatureLocation(100, 400, strand=1), type="CDS",
+                        qualifiers={"label": ["lacZ"]}),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sb = app.query_one("#sidebar", sc.FeatureSidebar)
+            sb.action_open_feature_at_cursor()
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert isinstance(app.screen, sc.FeatureEditModal)
+
     def test_pairwise_align_basic(self):
         """1-bp substitution in a 300 bp sequence aligns with no gaps,
         99.67% identity, 1 mismatch, 0 gaps."""
