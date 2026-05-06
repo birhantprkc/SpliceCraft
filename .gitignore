@@ -17,6 +17,13 @@ parts_bin.json
 primers.json
 *.json.bak
 
+# Stray plasmid files dropped in the working directory during testing.
+# Scoped to the repo root only so the committed `tests/*.dna` /
+# `tests/*.gb` fixtures stay tracked.
+/*.dna
+/*.gb
+/*.gbk
+
 # Editor / OS
 .vscode/
 .idea/
