@@ -1266,6 +1266,21 @@ class TestSearchCollectionsLibrary:
         out = sc._search_collections_library("")
         assert [m["name"] for m in out] == ["good"]
 
+    def test_skips_entries_without_id(self):
+        """Regression guard for 2026-05-06: entries with no `id` would
+        round-trip a `("collection", "")` payload that the loader then
+        aliased to whichever entry it happened to find first. Helper
+        now skips them outright."""
+        sc._save_collections([
+            {"name": "X", "plasmids": [
+                {"id": "real", "name": "real", "size": 1, "gb_text": "x"},
+                {"name": "no-id-here", "size": 1, "gb_text": "y"},
+                {"id": "", "name": "blank-id", "size": 1, "gb_text": "z"},
+            ]},
+        ])
+        out = sc._search_collections_library("")
+        assert [m["name"] for m in out] == ["real"]
+
 
 class TestActionFindPlasmid:
     """`PlasmidApp.action_find_plasmid` opens `LibrarySearchModal` and,

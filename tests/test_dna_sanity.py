@@ -1097,3 +1097,21 @@ class TestAnnotationTransfer:
         tgt = self._rec(body)
         out = sc._find_annotation_transfers(src, tgt, min_len=30)
         assert out == []
+
+    def test_whole_plasmid_match_emits_one_transfer(self):
+        """Regression guard for 2026-05-06: when `feat_len == n_tgt`
+        the wrap-fold collapsed `t_e` to `t_s` and the dedupe key
+        aliased every full match. Now special-cased to a single
+        full-record transfer at `[0, n_tgt)`."""
+        body = "ATG" + "GCC" * 30 + "TAA"   # 99 bp
+        src = self._rec(body, feats=[(0, len(body), 1, "CDS", "full")])
+        tgt = self._rec(body)
+        out = sc._find_annotation_transfers(src, tgt, min_len=30)
+        # At least one match (forward); shape should be a non-wrap
+        # full-record span so the apply path emits a normal
+        # FeatureLocation rather than a degenerate CompoundLocation.
+        full_matches = [t for t in out
+                        if t["target_start"] == 0
+                        and t["target_end"] == len(body)
+                        and t["target_strand"] == 1]
+        assert len(full_matches) == 1

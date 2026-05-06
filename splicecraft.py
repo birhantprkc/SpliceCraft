@@ -4994,8 +4994,16 @@ def _find_annotation_transfers(source_rec, target_rec, *,
                           if is_circular else n_tgt - hit
                 if not is_circular and (t_s < 0 or t_e > n_tgt):
                     continue
+                # Whole-plasmid match (feat_len == n_tgt): wrap-fold
+                # would collapse t_e to t_s and the seen-spans key
+                # `(t_s, t_s, strand)` would alias every full match.
+                # Emit a single full-record transfer with t_s=0,
+                # t_e=n_tgt and skip the dedupe key.
+                if is_circular and feat_len == n_tgt:
+                    t_s = 0
+                    t_e = n_tgt
                 # Wrap representation: end < start.
-                if is_circular and t_e > n_tgt:
+                elif is_circular and t_e > n_tgt:
                     t_e -= n_tgt
                 key = (t_s, t_e, t_strand)
                 if key in seen_target_spans:
@@ -7311,13 +7319,20 @@ def _search_collections_library(query: str, *,
         for entry in c.get("plasmids", []) or []:
             if not isinstance(entry, dict):
                 continue
-            name = entry.get("name") or entry.get("id") or "?"
+            entry_id = entry.get("id") or ""
+            # Skip entries without an `id` — without one we can't
+            # round-trip the dismiss payload to `_apply_record`, and
+            # the loader would alias every untagged entry to the
+            # first one it finds.
+            if not entry_id:
+                continue
+            name = entry.get("name") or entry_id
             if q and not _fuzzy_match(q, name):
                 continue
             out.append({
                 "collection": cname,
                 "name":       name,
-                "id":         entry.get("id", ""),
+                "id":         entry_id,
                 "size":       entry.get("size", 0),
                 "status":     _sanitize_plasmid_status(entry.get("status")),
                 "n_feats":    entry.get("n_feats", 0),
@@ -27801,8 +27816,11 @@ def _h_find_orfs(app, payload):
     if min_aa < 1:
         return ({"error": "'min_aa' must be ≥ 1"}, 400)
     alt = bool(payload.get("include_alt_starts", False))
-    seq = str(rec.seq)
-    is_circular = (rec.annotations or {}).get("topology") == "circular"
+    seq = str(rec.seq) if rec.seq is not None else ""
+    if not seq:
+        return {"orfs": [], "count": 0}
+    annotations = getattr(rec, "annotations", None) or {}
+    is_circular = annotations.get("topology") == "circular"
     orfs = _find_orfs(
         seq,
         min_aa=min_aa,
@@ -31563,10 +31581,16 @@ SpeciesPickerModal { align: center middle; }
             t_e = int(tr["target_end"])
             t_strand = int(tr["target_strand"])
             if t_e < t_s and n > 0:
-                loc = CompoundLocation([
-                    FeatureLocation(t_s, n, strand=t_strand),
-                    FeatureLocation(0, t_e, strand=t_strand),
-                ])
+                # `FeatureLocation(0, 0)` is rejected by Biopython on
+                # serialise; degenerate wrap with end exactly at the
+                # origin collapses to a single tail FeatureLocation.
+                if t_e == 0:
+                    loc = FeatureLocation(t_s, n, strand=t_strand)
+                else:
+                    loc = CompoundLocation([
+                        FeatureLocation(t_s, n, strand=t_strand),
+                        FeatureLocation(0, t_e, strand=t_strand),
+                    ])
             else:
                 loc = FeatureLocation(t_s, t_e, strand=t_strand)
             qual = {}
@@ -31663,7 +31687,16 @@ SpeciesPickerModal { align: center middle; }
         the `AlignmentScreen` on completion. Pairwise alignment of two
         ~150 kb plasmids takes ~1–2 s in PairwiseAligner; doing it
         synchronously would freeze the cursor.
+
+        Captures `_record_load_counter` at entry so a user who pages
+        to a different plasmid mid-flight gets the result silently
+        discarded — same stale-load contract `_restr_scan_worker`
+        and `_seed_default_library` already follow. PairwiseAligner's
+        C loop can't be cancelled mid-flight, so a long alignment
+        keeps running until completion; we just refuse to apply its
+        result if the canvas has moved on.
         """
+        entry_counter = self._record_load_counter
         try:
             result = _pairwise_align(
                 str(query_record.seq),
@@ -31683,6 +31716,10 @@ SpeciesPickerModal { align: center middle; }
             return
 
         def _show():
+            if self._record_load_counter != entry_counter:
+                # User loaded a different plasmid while we were aligning;
+                # the result no longer reflects what's on screen.
+                return
             self.push_screen(AlignmentScreen(
                 query_label=query_record.name or query_record.id or "query",
                 target_label=target_record.name or target_record.id or "target",

@@ -479,6 +479,22 @@ class TestFindOrfsHandler:
         result = sc._h_find_orfs(app, {"min_aa": 0})
         assert isinstance(result, tuple) and result[1] == 400
 
+    def test_empty_seq_returns_empty_orf_list(self):
+        """Regression guard for 2026-05-06: an empty `rec.seq` used to
+        traverse `(rec.annotations or {})` — fine — but
+        `_find_orfs(seq="")` itself returned `[]`; the agent path
+        wrapper is now explicit about the shortcut so a missing /
+        empty annotations dict can't surprise."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        rec = SeqRecord(Seq(""), id="empty", name="empty")
+        # Force a missing annotations attr to mimic a freshly-built
+        # record from a partial Biopython parse.
+        rec.annotations = None
+        app = MockApp(record=rec)
+        result = sc._h_find_orfs(app, {})
+        assert result == {"orfs": [], "count": 0}
+
 
 class TestLoadFileSizeCap:
     """Regression guard for 2026-05-06 fix: `_h_load_file` previously

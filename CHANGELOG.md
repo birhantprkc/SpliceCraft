@@ -2,6 +2,26 @@
 
 ---
 
+## [Unreleased] — Phase 4 stability gate
+
+### Fixed
+
+- **`_diff_align_worker` now captures `_record_load_counter` at entry** and refuses to push `AlignmentScreen` if the user paged to a different plasmid mid-alignment. Brings the new diff worker in line with the same stale-load contract `_restr_scan_worker` and `_seed_default_library` follow.
+- **`_find_annotation_transfers` whole-plasmid match.** When `feat_len == n_tgt` the wrap-fold collapsed `t_e` to `t_s` and the dedupe key aliased every full match — a circular permutation of the same plasmid returned 0 transfers. Now special-cased to a single `[0, n_tgt)` transfer.
+- **`_apply_annotation_transfers` degenerate wrap.** `t_e == 0` (origin-spanning end at the origin itself) used to construct `FeatureLocation(0, 0)` which Biopython rejects on serialise; now collapses to a single tail `FeatureLocation(t_s, n)`.
+- **`_h_find_orfs` empty-record guard.** A record with `seq=""` or `annotations=None` (partial-parse edge case) used to traverse `(rec.annotations or {})` then call `_find_orfs` on an empty string. Now short-circuits to `{orfs: [], count: 0}`.
+- **`_search_collections_library` skips id-less entries.** Library entries with no `id` would round-trip as `(collection, "")` and the loader's `entry.get("id") == ""` match aliased every untagged entry to the first one found — picking the wrong plasmid.
+
+### Added (CLAUDE.md)
+
+- Sacred-invariants entries #26–#30 covering GFF3 off-by-one + wrap-split convention, annotation-transfer exact-match contract + whole-plasmid case, pairwise-alignment cancellation semantics, cross-collection search id requirement, and agent-endpoint active-collection scope.
+
+### Tests
+
+- +3 regression guards: whole-plasmid annotation-transfer match, `_h_find_orfs` on empty / no-annotations record, `_search_collections_library` skipping id-less entries.
+
+---
+
 ## [0.7.0.0] — 2026-05-06
 
 ### Added
