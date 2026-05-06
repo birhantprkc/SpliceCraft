@@ -853,7 +853,15 @@ class TestCrashRecoveryAutosave:
             app._unsaved = True
             app._do_autosave()
             path = app._autosave_path(app._current_record)
-            assert path is not None and path.exists()
+            # Autosave is now a thread worker (2026-05-06) — poll for
+            # the file to appear instead of expecting a synchronous
+            # write. Cap at ~2 s.
+            assert path is not None
+            for _ in range(20):
+                await pilot.pause(0.1)
+                if path.exists():
+                    break
+            assert path.exists()
             # Should be parseable GenBank
             from Bio import SeqIO
             roundtrip = SeqIO.read(str(path), "genbank")
@@ -871,6 +879,12 @@ class TestCrashRecoveryAutosave:
             app._unsaved = True
             app._do_autosave()
             path = app._autosave_path(app._current_record)
+            # Wait for the autosave worker (now threaded) to land the
+            # file before asserting on its existence.
+            for _ in range(20):
+                await pilot.pause(0.1)
+                if path.exists():
+                    break
             assert path.exists()
             app._mark_clean()
             assert not path.exists()

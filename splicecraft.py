@@ -2701,31 +2701,29 @@ def _pack_features_2d(feats: list[dict], chunk_start: int,
     of its column range — the smallest legal y where all needed
     rows are free. If nothing overlaps the feature, max_top is -1
     and the feature lands at row 0 (bar adjacent to DNA).
+
+    `col_top` is a fixed-size list indexed by the chunk-local column
+    offset rather than a dict keyed on absolute column. The two hot
+    operations — range-max query and range-assign — collapse to
+    `max(col_top[a:b])` and `col_top[a:b] = [top_row] * (b - a)`,
+    which run in C inside CPython and shave a ~10× constant off the
+    per-chunk pack cost. The algorithm itself is unchanged.
     """
-    # Stable sort by feature-type tier only: CDS still gets the
-    # AA-row-included height (3 vs 2), but no longer pre-empts other
-    # features for lane 0 — that lets a freshly added non-CDS pin a
-    # CDS up by one row, matching the user-facing rule "new on top".
-    # Within each tier insertion order is preserved by Python's
-    # stable sort, so older features pack first.
-    sorted_f = list(feats)
+    width = chunk_end - chunk_start
+    if width <= 0 or not feats:
+        return []
     placements: list[tuple[dict, int]] = []
-    col_top: dict[int, int] = {}
-    for f in sorted_f:
-        bar_s = max(f["start"], chunk_start)
-        bar_e = min(f["end"],   chunk_end)
+    col_top = [-1] * width
+    for f in feats:
+        bar_s = max(f["start"], chunk_start) - chunk_start
+        bar_e = min(f["end"],   chunk_end)   - chunk_start
         if bar_e <= bar_s:
             continue
         height = _feat_stack_height(f)
-        max_top = -1
-        for col in range(bar_s, bar_e):
-            t = col_top.get(col, -1)
-            if t > max_top:
-                max_top = t
+        max_top = max(col_top[bar_s:bar_e])
         bottom_row = max_top + 1
         top_row = bottom_row + height - 1
-        for col in range(bar_s, bar_e):
-            col_top[col] = top_row
+        col_top[bar_s:bar_e] = [top_row] * (bar_e - bar_s)
         placements.append((f, bottom_row))
     return placements
 
@@ -2856,7 +2854,13 @@ def _build_seq_inputs(seq: str, feats: list[dict]) -> tuple[list[str], list[dict
     """Return (styles, annot_feats) for a given sequence/feature pair,
     memoised by identity. Both outputs are expensive on large plasmids and
     independent of cursor/selection state."""
-    key = (id(seq), id(feats), len(seq), len(feats))
+    # `hash(seq)` rather than `id(seq)`: id-based keys collide for
+    # transient strings (allocator recycles addresses) — the same fix
+    # applied to `_RESTR_SCAN_CACHE` and `_ENZYME_CUTS_CACHE`. CPython
+    # interns the string hash on first call, so subsequent lookups are
+    # O(1). `id(feats)` remains correct per CLAUDE.md invariant #4
+    # (lists are reassigned on load, not mutated in place).
+    key = (hash(seq), id(feats), len(seq), len(feats))
     hit = _BUILD_SEQ_CACHE.get(key)
     if hit is not None:
         return hit
@@ -2905,7 +2909,9 @@ def _chunk_layout(seq: str, feats: list[dict], line_width: int):
       ``prefix_dna2[i] + (rpg - 2) * prefix_lanes[i]``
     """
     n = len(seq)
-    key = (id(seq), id(feats), line_width, n, len(feats))
+    # See `_build_seq_inputs` comment: hash(seq) for transient-string
+    # safety; id(feats) is OK per CLAUDE.md invariant #4.
+    key = (hash(seq), id(feats), line_width, n, len(feats))
     hit = _CHUNK_LAYOUT_CACHE.get(key)
     if hit is not None:
         return hit
@@ -3052,7 +3058,8 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     #     untouched lane art on every click.
     #   - Cursor moves within a selection: overlay cache hits for
     #     all selection-overlap chunks; cursor chunk re-renders.
-    static_key = (id(seq), id(feats), line_width, show_connectors)
+    # `hash(seq)` instead of `id(seq)` — see `_build_seq_inputs`.
+    static_key = (hash(seq), id(feats), line_width, show_connectors)
     static_cache = _CHUNK_STATIC_CACHE.get(static_key)
     if static_cache is None or len(static_cache) != len(chunks_layout):
         static_cache = [None] * len(chunks_layout)
@@ -3065,7 +3072,18 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
         if len(_CHUNK_STATIC_CACHE) > 16:
             _CHUNK_STATIC_CACHE.pop(next(iter(_CHUNK_STATIC_CACHE)))
 
-    aa_id = id(aa_highlight) if aa_highlight is not None else 0
+    # Content-derived aa-highlight key: (start, end, strand) uniquely
+    # identifies the active CDS regardless of dict identity. Pre-fix
+    # used `id(aa_highlight)` which collides if two distinct dicts
+    # land at the same allocator slot — the broader id()-keying issue
+    # we cleaned up across the chunk caches. `aa_highlight` is one of
+    # the feature dicts in `feats` (line 2569 `f is aa_highlight`
+    # check), so its coords are a stable identity.
+    aa_id = (
+        (aa_highlight["start"], aa_highlight["end"],
+         aa_highlight.get("strand", 0))
+        if aa_highlight is not None else None
+    )
     overlay_key = (static_key, sel_s, sel_e, usr_s, usr_e,
                    reh_s, reh_e, reh_top_cut, reh_bot_cut, aa_id)
     overlay_cache = _CHUNK_OVERLAY_CACHE.get(overlay_key)
@@ -3373,7 +3391,8 @@ def _cds_aa_list(seq: str, f: dict) -> tuple[list[str], int, int]:
     s = f.get("_orig_start", f["start"])
     e = f.get("_orig_end",   f["end"])
     strand = f.get("strand", 1)
-    key = (id(seq), s, e, strand)
+    # hash(seq) instead of id(seq) — see `_build_seq_inputs`.
+    key = (hash(seq), s, e, strand)
     cached = _CDS_AA_CACHE.get(key)
     if cached is not None:
         return cached
@@ -5192,6 +5211,13 @@ class PlasmidMap(Widget):
             range(len(self._feats)),
             key=lambda i: self._feats[i]["start"],
         )
+        # Pre-extracted starts in `_feats_by_start` order so the linear
+        # draw paths can `bisect_right` directly without rebuilding the
+        # list every render frame. On dense plasmids that comprehension
+        # was the per-frame O(F) tax; this drops it to O(1).
+        self._feats_starts_sorted = [
+            self._feats[i]["start"] for i in self._feats_by_start
+        ]
         self._restr_feats = []
         # Default the map view to match the record's topology. The
         # GenBank `topology` annotation is the authoritative answer
@@ -6223,12 +6249,12 @@ class PlasmidMap(Widget):
         sorted_idx = getattr(self, "_feats_by_start", None) \
                      or list(range(len(self._feats)))
         import bisect as _bs
-        # bisect_right on an array of starts — but `sorted_idx` holds
-        # indices into _feats, not starts. We need the first position
-        # in sorted_idx whose feature.start > view_e to set the upper
-        # walk bound. Build a tiny key-extracting helper that bisect
-        # doesn't natively support, then linear-walk up to it.
-        starts = [self._feats[i]["start"] for i in sorted_idx]
+        # `_feats_starts_sorted` is precomputed in `load_record` so the
+        # bisect upper-bound costs O(log F) per frame instead of an
+        # O(F) list comprehension. Falls back to a one-shot rebuild
+        # when called before `load_record` has stamped the cache.
+        starts = getattr(self, "_feats_starts_sorted", None) \
+                  or [self._feats[i]["start"] for i in sorted_idx]
         upper = _bs.bisect_right(starts, view_e)
         for k in range(upper):
             i  = sorted_idx[k]
@@ -6429,7 +6455,10 @@ class PlasmidMap(Widget):
         sorted_idx = getattr(self, "_feats_by_start", None) \
                      or list(range(len(self._feats)))
         import bisect as _bs
-        starts = [self._feats[i]["start"] for i in sorted_idx]
+        # See `_draw_linear_centered`: starts list is precomputed in
+        # `load_record` to avoid a per-frame list-comp.
+        starts = getattr(self, "_feats_starts_sorted", None) \
+                  or [self._feats[i]["start"] for i in sorted_idx]
         upper  = _bs.bisect_right(starts, view_e)
         for k in range(upper):
             i  = sorted_idx[k]
@@ -8797,6 +8826,7 @@ class SequencePanel(Widget):
             self._last_click_debug = {"reason": "scroll_query_fail"}
             return -1
 
+        import bisect as _bs
         n           = len(self._seq)
         num_w       = len(str(n)) if n else 1
         line_width  = max(20, self._seq_render_width() - (num_w + 2))
@@ -8805,34 +8835,38 @@ class SequencePanel(Widget):
         # actually drawn. Sorting by length here would diverge.
         annot_feats = [f for f in self._feats
                        if f.get("type") not in ("site", "recut")]
-        rpg     = 2 + (1 if self._show_connectors else 0)  # rows per feature group
-        row     = 0
         seq_col = vp_x - (num_w + 2)   # offset past the num+2-space prefix
 
-        def _check_lane(lane):
-            """Check if click hit a feature in this lane; return bp or None.
-            Sets `_last_lane_click=True` so on_click can route a lane hit
-            to a whole-feature highlight while a DNA-row hit just places
-            the cursor."""
-            for f in lane:
-                bar_s = max(f["start"], chunk_start) - chunk_start
-                bar_e = min(f["end"],   chunk_end)   - chunk_start
-                if bar_s <= seq_col < bar_e:
-                    if f.get("type") == "resite":
-                        self._last_resite_click = f
-                    else:
-                        self._last_lane_click = True
-                    return (f["start"] + f["end"]) // 2
+        # Bisect into the cached chunk layout — pre-2026-05-06 this
+        # function walked every chunk in the record on each click, so
+        # a click on a 200 kb cosmid did ~1500 chunk decompositions
+        # (each O(F)). `_hover_at` already uses this pattern; mirror it.
+        chunks_layout, prefix_dna2, _pf_lanes = _chunk_layout(
+            self._seq, self._feats, line_width,
+        )
+        if not chunks_layout:
+            self._last_click_debug = {"reason": "no_chunks"}
             return -1
+        idx = _bs.bisect_right(prefix_dna2, content_row) - 1
+        if idx < 0 or idx >= len(chunks_layout):
+            self._last_click_debug = {
+                "reason": "past_content",
+                "content_row": content_row,
+                "total_rows": prefix_dna2[-1] if prefix_dna2 else 0,
+            }
+            return -1
+        chunk_start, chunk_end, groups, *_extra = chunks_layout[idx]
+        above_p, below_p, above_rows, below_rows = groups
+        # Only the target chunk's feature decomposition is needed for
+        # the lane-hit closure below; the layout cache already holds
+        # placements for every chunk, but `_feats_in_chunk` is the
+        # fallback the lane-fallback search consults.
+        chunk_feats = _feats_in_chunk(
+            annot_feats, chunk_start, chunk_end, n,
+        )
+        row_in_chunk = content_row - prefix_dna2[idx]
 
-        for chunk_start in range(0, n, line_width):
-            chunk_end   = min(chunk_start + line_width, n)
-            chunk_feats = _feats_in_chunk(annot_feats, chunk_start, chunk_end, n)
-            above_p, below_p, above_rows, below_rows = (
-                _chunk_lane_groups(chunk_feats, chunk_start, chunk_end)
-            )
-
-            def _check_packed(placements, screen_row_idx_from_top: int,
+        def _check_packed(placements, screen_row_idx_from_top: int,
                               total_rows: int, is_below: bool):
                 """Map a screen-row offset within the strand stack to a
                 feature lane click. `screen_row_idx_from_top=0` is the
@@ -9014,69 +9048,54 @@ class SequencePanel(Widget):
                     return (f["start"] + f["end"]) // 2
                 return -1
 
-            # Above traversal: top of stack first (row index from top = 0).
-            for k in range(above_rows):
-                if row == content_row:
-                    bp = _check_packed(above_p, k, above_rows, False)
-                    if bp < 0:
-                        self._last_click_debug = {
-                            "reason": "lane_miss_above",
-                            "chunk": chunk_start // line_width,
-                            "row_in_chunk": k,
-                            "above_rows": above_rows,
-                            "seq_col": seq_col, "line_width": line_width,
-                            "n_above": len(above_p),
-                        }
-                    return bp
-                row += 1
-
-            # DNA rows: fwd strand + RC strand (2 rows)
-            for strand_i in range(2):
-                if row == content_row:
-                    if 0 <= seq_col < (chunk_end - chunk_start):
-                        return chunk_start + seq_col
-                    self._last_click_debug = {
-                        "reason": "dna_off_strand",
-                        "chunk": chunk_start // line_width,
-                        "strand": "fwd" if strand_i == 0 else "rc",
-                        "seq_col": seq_col, "line_width": line_width,
-                        "chunk_len": chunk_end - chunk_start,
-                    }
-                    return -1
-                row += 1
-
-            # Below traversal: closest to DNA first (row index from top = 0).
-            for k in range(below_rows):
-                if row == content_row:
-                    bp = _check_packed(below_p, k, below_rows, True)
-                    if bp < 0:
-                        self._last_click_debug = {
-                            "reason": "lane_miss_below",
-                            "chunk": chunk_start // line_width,
-                            "row_in_chunk": k,
-                            "below_rows": below_rows,
-                            "seq_col": seq_col, "line_width": line_width,
-                            "n_below": len(below_p),
-                        }
-                    return bp
-                row += 1
-
-            # Trailing blank row appended in `_render_chunk` for
-            # inter-chunk spacing — clicks here are no-ops.
-            if row == content_row:
+        # Per-chunk row layout (top → bottom):
+        #   [0, above_rows)                              → above stack
+        #   [above_rows, above_rows + 2)                 → fwd/rc DNA
+        #   [above_rows + 2, above_rows + 2 + below_rows) → below stack
+        #   above_rows + 2 + below_rows                  → trailing gap
+        if row_in_chunk < above_rows:
+            k  = row_in_chunk
+            bp = _check_packed(above_p, k, above_rows, False)
+            if bp < 0:
                 self._last_click_debug = {
-                    "reason": "inter_chunk_gap",
+                    "reason": "lane_miss_above",
                     "chunk": chunk_start // line_width,
-                    "seq_col": seq_col,
+                    "row_in_chunk": k,
+                    "above_rows": above_rows,
+                    "seq_col": seq_col, "line_width": line_width,
+                    "n_above": len(above_p),
                 }
-                return -1
-            row += 1
-
-            if row > content_row:
-                break
+            return bp
+        if row_in_chunk < above_rows + 2:
+            if 0 <= seq_col < (chunk_end - chunk_start):
+                return chunk_start + seq_col
+            self._last_click_debug = {
+                "reason": "dna_off_strand",
+                "chunk": chunk_start // line_width,
+                "strand": "fwd" if row_in_chunk == above_rows else "rc",
+                "seq_col": seq_col, "line_width": line_width,
+                "chunk_len": chunk_end - chunk_start,
+            }
+            return -1
+        if row_in_chunk < above_rows + 2 + below_rows:
+            k  = row_in_chunk - above_rows - 2
+            bp = _check_packed(below_p, k, below_rows, True)
+            if bp < 0:
+                self._last_click_debug = {
+                    "reason": "lane_miss_below",
+                    "chunk": chunk_start // line_width,
+                    "row_in_chunk": k,
+                    "below_rows": below_rows,
+                    "seq_col": seq_col, "line_width": line_width,
+                    "n_below": len(below_p),
+                }
+            return bp
+        # Trailing blank row appended in `_render_chunk` for
+        # inter-chunk spacing — clicks here are no-ops.
         self._last_click_debug = {
-            "reason": "past_content",
-            "content_row": content_row, "final_row": row,
+            "reason": "inter_chunk_gap",
+            "chunk": chunk_start // line_width,
+            "seq_col": seq_col,
         }
         return -1
 
@@ -9289,7 +9308,14 @@ class SequencePanel(Widget):
         reh_key = (
             self._re_highlight["start"], self._re_highlight["end"]
         ) if self._re_highlight else None
-        aa_key = id(self._aa_highlight) if self._aa_highlight is not None else None
+        # Content-derived key matches the inner _CHUNK_OVERLAY_CACHE
+        # so both invalidation layers see the same notion of "changed
+        # active CDS".
+        aa_key = (
+            (self._aa_highlight["start"], self._aa_highlight["end"],
+             self._aa_highlight.get("strand", 0))
+            if self._aa_highlight is not None else None
+        )
         # Lazy-render viewport: only chunks whose row range overlaps
         # the visible scroll window get fresh-rendered. Above the
         # `_LAZY_RENDER_THRESHOLD_BP` threshold the gain matters
@@ -28732,23 +28758,27 @@ SpeciesPickerModal { align: center middle; }
 
         new_cursor = s + len(new_bases)
 
-        self._restr_cache = _scan_restriction_sites(
-            new_seq, min_recognition_len=self._restr_min_len, unique_only=self._restr_unique_only
-        )
-        displayed = self._restr_cache if self._show_restr else []
+        # Restriction scan deferred to the worker. The edit path
+        # rebuilds the record + repopulates panels with empty
+        # restriction overlays; the worker fades them in once it
+        # finishes. Bumping `_record_load_counter` lets any earlier
+        # in-flight scan discard its result.
+        self._restr_cache = []
+        self._record_load_counter += 1
         if self._current_record is not None:
             new_record = self._rebuild_record_with_edit(new_seq, mode, s, e, new_bases)
             self._current_record = new_record
             pm.load_record(new_record)
             self.query_one("#sidebar", FeatureSidebar).populate(pm._feats)
-            pm._restr_feats = displayed
+            pm._restr_feats = []
             pm.refresh()
-            sp.update_seq(new_seq, pm._feats + displayed)
+            sp.update_seq(new_seq, pm._feats)
             self._notify_success(f"Sequence updated  ({len(new_seq):,} bp)")
         else:
-            pm._restr_feats = displayed
+            pm._restr_feats = []
             pm.refresh()
-            sp.update_seq(new_seq, pm._feats + displayed)
+            sp.update_seq(new_seq, pm._feats)
+        self._restr_scan_worker(new_seq, self._record_load_counter)
 
         self._mark_dirty()
 
@@ -29128,20 +29158,30 @@ SpeciesPickerModal { align: center middle; }
             # set_timer can fail during test teardown; autosave is best-effort.
             self._autosave_timer = None
 
+    @work(thread=True, exclusive=True, group="autosave")
     def _do_autosave(self) -> None:
-        """Write the current record to its autosave file (atomic)."""
-        if self._current_record is None or not self._unsaved:
+        """Write the current record to its autosave file (atomic).
+
+        Worker-threaded since 2026-05-06: previously this fired
+        synchronously 3 s after every edit and could freeze the UI
+        for ~1–2 s on a 5 Mb plasmid (the `_record_to_gb_text` +
+        atomic write dominates). Off the UI thread the user keeps
+        typing while disk I/O happens in the background.
+        Captures `_current_record` at entry so a record-swap mid-flight
+        can't make us write the wrong record under the old autosave
+        path; the `exclusive=True` + group ensures only the freshest
+        autosave attempt runs.
+        """
+        record = self._current_record
+        if record is None or not self._unsaved:
             return
-        path = self._autosave_path(self._current_record)
+        path = self._autosave_path(record)
         if path is None:
             return
         try:
-            _atomic_write_text(
-                path, _record_to_gb_text(self._current_record),
-            )
+            _atomic_write_text(path, _record_to_gb_text(record))
             _log.info("Autosaved %s to %s (%d bp)",
-                      self._current_record.name, path,
-                      len(self._current_record.seq))
+                      record.name, path, len(record.seq))
         except Exception:
             # Autosave is a safety net — never interrupt the user if it fails.
             _log.exception("Autosave to %s failed", path)
@@ -29282,6 +29322,49 @@ SpeciesPickerModal { align: center middle; }
         except Exception:
             # First-run seed is best-effort: silent in UI, logged for debugging.
             _log.exception("Default library seed (MW463917.1) failed")
+
+    @work(thread=True, exclusive=True, group="restr_scan")
+    def _restr_scan_worker(self, seq: str, entry_counter: int) -> None:
+        """Worker: scan `seq` for restriction sites and apply the
+        result if no record load has happened since entry. The scan
+        itself is pure CPU and dominates `_apply_record` for big
+        plasmids (up to ~3 s on 5 Mb). Decoupling it from the load
+        path lets the map + seq panel paint immediately; restriction
+        overlays fade in once the worker reports back. `_RESTR_SCAN_CACHE`
+        already short-circuits cache-hit cases so a re-load of the same
+        record is effectively free even with the worker round-trip.
+
+        `exclusive=True` + `group="restr_scan"` ensures only the most-
+        recent scan request lives — if the user pages quickly through
+        five plasmids, the four mid-flight scans get cancelled instead
+        of all racing to apply.
+        """
+        try:
+            result = _scan_restriction_sites(
+                seq,
+                min_recognition_len=self._restr_min_len,
+                unique_only=self._restr_unique_only,
+            )
+        except Exception:
+            _log.exception("Restriction scan worker failed")
+            return
+
+        def _apply():
+            # Stale-record guard: discard if user loaded another plasmid.
+            if self._record_load_counter != entry_counter:
+                return
+            self._restr_cache = result
+            try:
+                pm = self.query_one("#plasmid-map", PlasmidMap)
+                sp = self.query_one("#seq-panel",   SequencePanel)
+            except NoMatches:
+                return
+            displayed = self._restr_cache if self._show_restr else []
+            pm._restr_feats = displayed
+            pm.refresh()
+            sp.update_seq(seq, pm._feats + displayed)
+
+        self.call_from_thread(_apply)
 
     # ── Keyboard: cursor movement, copy, undo/redo ─────────────────────────────
 
@@ -29738,16 +29821,21 @@ SpeciesPickerModal { align: center middle; }
         sidebar = self.query_one("#sidebar",      FeatureSidebar)
         sp      = self.query_one("#seq-panel",    SequencePanel)
         self._current_record = record
+        # Bump the load counter so any in-flight `_restr_scan_worker`
+        # from a pre-undo state discards its result rather than
+        # painting onto the snapshot we just applied.
+        self._record_load_counter += 1
         if record is not None:
             pm.load_record(record)
             sidebar.populate(pm._feats)
-            self._restr_cache = _scan_restriction_sites(
-                seq, min_recognition_len=self._restr_min_len, unique_only=self._restr_unique_only
-            )
-            displayed = self._restr_cache if self._show_restr else []
-            pm._restr_feats = displayed
+            # Restriction scan deferred to the worker — see
+            # `_apply_record` for the rationale. Undo/redo is the
+            # other place a cold scan used to freeze the UI.
+            self._restr_cache = []
+            pm._restr_feats   = []
             pm.refresh()
-            sp.update_seq(seq, pm._feats + displayed)
+            sp.update_seq(seq, pm._feats)
+            self._restr_scan_worker(seq, self._record_load_counter)
         else:
             sp.update_seq(seq, [])
         sp._cursor_pos = cursor_pos
@@ -29946,7 +30034,112 @@ SpeciesPickerModal { align: center middle; }
         return True
 
     def action_save(self) -> None:
-        self._do_save()
+        # Async path for the user-facing Ctrl+S keystroke. The synchronous
+        # `_do_save` is preserved for the quit flow + agent API, where
+        # the caller depends on the bool return value.
+        self._save_worker()
+
+    @work(thread=True, exclusive=True, group="save")
+    def _save_worker(self) -> None:
+        """Worker: serialize record + atomic write + library mirror,
+        all off the UI thread. Up to ~8 s on a 5 Mb plasmid in a 50 MB
+        library when running synchronously; threading keeps the cursor
+        responsive while I/O happens in the background.
+
+        Captures record reference + source path at entry so a
+        record-swap mid-write can't leave the wrong content on disk.
+        `exclusive=True` + `group="save"` collapse rapid Ctrl+S spam
+        into a single in-flight save.
+        """
+        record = self._current_record
+        if record is None:
+            self.call_from_thread(
+                self.notify, "Nothing to save.", severity="warning",
+            )
+            _log_event("save.no_record")
+            return
+        source_path = self._source_path
+        record_name = record.name
+        record_id   = record.id
+        _log_event(
+            "save.start",
+            name=record_name,
+            source_path=source_path,
+            length=len(record.seq),
+            n_features=len(record.features),
+        )
+
+        try:
+            gb_text = _record_to_gb_text(record)
+        except Exception as exc:
+            _log.exception("Save serialize failed")
+            self.call_from_thread(
+                self.notify, f"Save failed: {exc}", severity="error",
+            )
+            _log_event("save.failed", target="serialize", error=str(exc))
+            return
+
+        if source_path:
+            try:
+                _atomic_write_text(Path(source_path), gb_text)
+            except Exception as exc:
+                _log.exception("Save to %s failed", source_path)
+                self.call_from_thread(
+                    self.notify, f"Save failed: {exc}", severity="error",
+                )
+                _log_event("save.failed", target="source", error=str(exc))
+                return
+
+        # Library mirror: read → modify → write. The whole transaction
+        # runs on this worker thread so the 50 MB JSON write never
+        # blocks the UI. `_save_library` is itself atomic via the
+        # `_safe_save_json` envelope (see CLAUDE.md sacred invariant
+        # #7), so an interruption here can't corrupt the on-disk file.
+        try:
+            entries = _load_library()
+            prev_status = ""
+            for e in entries:
+                if e.get("id") == record_id:
+                    prev_status = _sanitize_plasmid_status(e.get("status"))
+                    break
+            entries = [e for e in entries if e.get("id") != record_id]
+            entries.insert(0, {
+                "name":    record_name or record_id,
+                "id":      record_id,
+                "size":    len(record.seq),
+                "n_feats": len([f for f in record.features
+                                 if f.type != "source"]),
+                "source":  getattr(record, "_tui_source", f"id:{record_id}"),
+                "added":   _date.today().isoformat(),
+                "gb_text": gb_text,
+                "status":  prev_status,
+            })
+            _save_library(entries)
+        except Exception as exc:
+            _log.exception("Library update failed during save")
+            self.call_from_thread(
+                self.notify, f"Library update failed: {exc}",
+                severity="error",
+            )
+            _log_event("save.failed", target="library", error=str(exc))
+            return
+
+        def _finish():
+            try:
+                lib = self.query_one("#library", LibraryPanel)
+                if lib._view_mode == "plasmids":
+                    lib._apply_panel_width()
+                    lib._repopulate_plasmids()
+            except NoMatches:
+                pass
+            self._mark_clean()
+            _log_event("save.ok", source_path=source_path)
+            if source_path:
+                self._notify_success(f"Saved → {source_path}")
+            else:
+                self._notify_success(f"Saved {record_name} to library")
+
+        self.call_from_thread(_finish)
 
     def action_quit(self) -> None:
         # Two paths: with unsaved edits → Save / Abandon / Cancel modal;
@@ -30191,17 +30384,19 @@ SpeciesPickerModal { align: center middle; }
         sidebar.populate(pm._feats)
 
         seq_str = str(record.seq)
-        self._restr_cache = _scan_restriction_sites(
-            seq_str, min_recognition_len=self._restr_min_len, unique_only=self._restr_unique_only
-        )
-        displayed = self._restr_cache if self._show_restr else []
-
-        # Store restriction sites on the map for visual overlay
-        pm._restr_feats = displayed
+        # Restriction scan moved to `_restr_scan_worker` — paints the
+        # map + seq panel immediately, restriction overlays fade in
+        # once the worker reports. Saves up to ~3 s of frozen UI on
+        # multi-Mb plasmids; cache-hit paths complete in microseconds
+        # so small plasmids look unchanged.
+        self._restr_cache = []
+        pm._restr_feats   = []
         pm.refresh()
 
-        # Sequence panel: feature coloring = record feats + restriction sites
-        seq_pnl.update_seq(seq_str, pm._feats + displayed)
+        # Sequence panel: feature coloring = record feats only for
+        # now; the worker callback merges restriction sites in once
+        # the scan completes.
+        seq_pnl.update_seq(seq_str, pm._feats)
 
         try:
             self.query_one("#library", LibraryPanel).set_active(record.id)
@@ -30210,8 +30405,14 @@ SpeciesPickerModal { align: center middle; }
         self._mark_clean()
         self.notify(
             f"Loaded {record.name}  ({len(record.seq):,} bp, "
-            f"{len(pm._feats)} features, {len(self._restr_cache)} restriction sites)"
+            f"{len(pm._feats)} features)"
         )
+
+        # Kick off the deferred scan. `_record_load_counter` was
+        # already incremented above; pass it as the stale-load token
+        # so the worker discards its result if the user loads something
+        # else before the scan finishes.
+        self._restr_scan_worker(seq_str, self._record_load_counter)
 
         # Heads-up for non-fatal import oddities that the user should know
         # about: skipped features (UnknownPosition), compound locations

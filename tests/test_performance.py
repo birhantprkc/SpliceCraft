@@ -245,7 +245,10 @@ class TestBuildSeqTextPerformance:
 
         # First call populates the cache
         sc._build_seq_text(seq_str, feats, line_width=127)
-        key = (id(seq_str), id(feats), len(seq_str), len(feats))
+        # Cache key tracks _build_seq_inputs (hash(seq) since the
+        # 2026-05-06 fix that killed the id() collision flake; id(feats)
+        # is still safe per CLAUDE.md invariant #4).
+        key = (hash(seq_str), id(feats), len(seq_str), len(feats))
         assert key in sc._BUILD_SEQ_CACHE
 
         # Subsequent calls with SAME (seq, feats) but DIFFERENT cursor must

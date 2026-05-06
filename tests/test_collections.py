@@ -877,7 +877,16 @@ class TestNewCollectionModalFlow:
             # Bypass the DirectoryTree click → set the selection directly.
             modal._selected_folder = fixtures_dir
             modal.query_one("#btn-newcoll-ok").action_press()
-            await pilot.pause(0.5)
+            # Poll instead of fixed pause: bulk-import worker walks the
+            # fixtures dir, parses each file, and only then dispatches
+            # the dismiss callback that writes the collection. Wall
+            # time is filesystem-dependent so a fixed 0.5 s flaked
+            # under CI load. Cap at ~5 s.
+            for _ in range(50):
+                await pilot.pause(0.1)
+                if any(c["name"] == "FFE Trial"
+                        for c in sc._load_collections()):
+                    break
             colls = sc._load_collections()
             ffe = [c for c in colls if c["name"] == "FFE Trial"]
             assert len(ffe) == 1
