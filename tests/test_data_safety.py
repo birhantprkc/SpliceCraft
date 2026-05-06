@@ -84,6 +84,272 @@ class TestSafeSaveJson:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Multi-generation backups (Layer 1, added 2026-05-06 after a user reported
+# a library wipe). Two consecutive bad saves used to be enough to lose
+# history because the single `.bak` rotated. Now `.bak.YYYYMMDD-HHMMSS`
+# files accumulate — last `_BACKUP_RETENTION_COUNT` are kept on disk.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSafeSaveJsonMultiGenBackup:
+    def test_timestamped_backup_written_alongside_legacy(self, tmp_path):
+        p = tmp_path / "test.json"
+        sc._safe_save_json(p, [{"id": "v1"}], "test")
+        sc._safe_save_json(p, [{"id": "v2"}], "test")
+        # Legacy single-generation .bak still exists for back-compat.
+        assert (tmp_path / "test.json.bak").exists()
+        # Plus at least one timestamped sibling.
+        timestamped = list(tmp_path.glob("test.json.bak.????????-??????"))
+        assert len(timestamped) >= 1
+        # Both backups carry the same prior content.
+        legacy = json.loads((tmp_path / "test.json.bak").read_text())
+        assert legacy["entries"] == [{"id": "v1"}]
+
+    def test_rotation_caps_at_retention_count(self, tmp_path,
+                                                 monkeypatch):
+        """Force the retention cap down to 3 and write 6 generations —
+        only the most recent 3 timestamped backups must survive."""
+        p = tmp_path / "test.json"
+        monkeypatch.setattr(sc, "_BACKUP_RETENTION_COUNT", 3)
+        # Seed the file so subsequent saves see prior content.
+        sc._safe_save_json(p, [{"id": "0"}], "test")
+        # Manually create older timestamped backups so we don't have
+        # to wait a wallclock second between writes.
+        for i, ts in enumerate(
+            ["20260101-000000", "20260102-000000",
+             "20260103-000000", "20260104-000000",
+             "20260105-000000"]
+        ):
+            (tmp_path / f"test.json.bak.{ts}").write_text(
+                json.dumps({"_schema_version": 1,
+                             "entries": [{"id": str(i)}]})
+            )
+        # Save once more — this triggers `_prune_backups`.
+        sc._safe_save_json(p, [{"id": "live"}], "test")
+        survivors = sorted(p.parent.glob(
+            "test.json.bak.????????-??????"
+        ))
+        # Retention is `keep`-most-recent (3). The most recent ones
+        # are the highest timestamps including the one this call just
+        # wrote, so the older synthetic backups beyond 3 are gone.
+        assert len(survivors) == 3
+        # Old fakes 20260101 + 20260102 must be among the pruned.
+        names = {p.name for p in survivors}
+        assert "test.json.bak.20260101-000000" not in names
+        assert "test.json.bak.20260102-000000" not in names
+
+    def test_no_timestamped_backup_on_first_write(self, tmp_path):
+        p = tmp_path / "test.json"
+        sc._safe_save_json(p, [{"id": "first"}], "test")
+        timestamped = list(tmp_path.glob("test.json.bak.*"))
+        assert timestamped == []
+
+
+class TestSnapshotDataFiles:
+    """Layer 2 of the data-safety net (added 2026-05-06): on every
+    new calendar day, copy each persistent JSON file to
+    `<DATA_DIR>/snapshots/<stem>-YYYY-MM-DD.<ext>`. Last
+    `_SNAPSHOT_RETENTION_DAYS` (30) days are retained; older are
+    pruned."""
+
+    def test_writes_snapshot_for_each_existing_file(self, tmp_path):
+        a = tmp_path / "lib.json"
+        b = tmp_path / "coll.json"
+        a.write_text(json.dumps({"_schema_version": 1,
+                                   "entries": [{"id": "x"}]}))
+        b.write_text(json.dumps({"_schema_version": 1,
+                                   "entries": [{"id": "y"}]}))
+        written = sc._snapshot_data_files(tmp_path, paths=[a, b])
+        assert len(written) == 2
+        snap_dir = tmp_path / "snapshots"
+        from datetime import date as _d
+        today = _d.today().isoformat()
+        assert (snap_dir / f"lib-{today}.json").exists()
+        assert (snap_dir / f"coll-{today}.json").exists()
+
+    def test_skips_already_existing_snapshot(self, tmp_path):
+        a = tmp_path / "lib.json"
+        a.write_text(json.dumps({"_schema_version": 1,
+                                   "entries": [{"id": "x"}]}))
+        first = sc._snapshot_data_files(tmp_path, paths=[a])
+        assert len(first) == 1
+        # Second call same day → no new file written.
+        second = sc._snapshot_data_files(tmp_path, paths=[a])
+        assert second == []
+
+    def test_skips_missing_files(self, tmp_path):
+        ghost = tmp_path / "missing.json"
+        out = sc._snapshot_data_files(tmp_path, paths=[ghost])
+        assert out == []
+        snap_dir = tmp_path / "snapshots"
+        # The dir is created by `_snapshot_data_files` even if no
+        # snapshots were written (mkdir is unconditional). Just
+        # assert nothing matching the missing-file stem landed.
+        if snap_dir.exists():
+            assert not list(snap_dir.glob("missing-*"))
+
+    def test_skips_empty_files(self, tmp_path):
+        empty = tmp_path / "empty.json"
+        empty.write_text("")
+        out = sc._snapshot_data_files(tmp_path, paths=[empty])
+        assert out == []
+
+    def test_prunes_older_than_retention(self, tmp_path, monkeypatch):
+        snap_dir = tmp_path / "snapshots"
+        snap_dir.mkdir()
+        # Plant a snapshot dated 60 days ago and another from yesterday.
+        from datetime import date as _d, timedelta
+        old   = (_d.today() - timedelta(days=60)).isoformat()
+        fresh = (_d.today() - timedelta(days=1)).isoformat()
+        (snap_dir / f"lib-{old}.json").write_text("{}")
+        (snap_dir / f"lib-{fresh}.json").write_text("{}")
+        monkeypatch.setattr(sc, "_SNAPSHOT_RETENTION_DAYS", 30)
+        sc._prune_old_snapshots(snap_dir)
+        names = {p.name for p in snap_dir.iterdir()}
+        assert f"lib-{old}.json" not in names
+        assert f"lib-{fresh}.json" in names
+
+    def test_oserror_during_snapshot_does_not_raise(self, tmp_path,
+                                                       monkeypatch):
+        """The launch path must not abort if the snapshots dir is
+        unwritable (e.g. sandboxed install). Best-effort by design."""
+        a = tmp_path / "lib.json"
+        a.write_text("{}")
+        # Force `mkdir` to fail.
+        original_mkdir = type(tmp_path).mkdir
+        def bad_mkdir(self, *args, **kwargs):
+            if self.name == "snapshots":
+                raise OSError("simulated read-only filesystem")
+            return original_mkdir(self, *args, **kwargs)
+        monkeypatch.setattr(type(tmp_path), "mkdir", bad_mkdir)
+        # Should silently return [] rather than raise.
+        assert sc._snapshot_data_files(tmp_path, paths=[a]) == []
+
+
+class TestListAndRestoreBackups:
+    """`_list_recoverable_backups` enumerates every storage tier
+    (legacy `.bak`, rotating timestamped, daily snapshot, lost-entries
+    spillover); `_restore_from_backup` copies a chosen one back via
+    `_safe_save_json`. These power Settings → Restore from backup…
+    (`RestoreFromBackupModal`)."""
+
+    def test_lists_legacy_and_rotating_backups(self, tmp_path):
+        p = tmp_path / "lib.json"
+        sc._safe_save_json(p, [{"id": "v1"}], "library")
+        sc._safe_save_json(p, [{"id": "v2"}], "library")
+        sc._safe_save_json(p, [{"id": "v3"}], "library")
+        backups = sc._list_recoverable_backups(p)
+        kinds = [b["kind"] for b in backups]
+        assert "legacy_bak" in kinds
+        assert "rotating_bak" in kinds
+
+    def test_lists_snapshots(self, tmp_path):
+        p = tmp_path / "lib.json"
+        p.write_text(json.dumps({"_schema_version": 1,
+                                   "entries": [{"id": "x"}]}))
+        sc._snapshot_data_files(tmp_path, paths=[p])
+        backups = sc._list_recoverable_backups(p)
+        assert any(b["kind"] == "snapshot" for b in backups)
+
+    def test_lists_lost_entries_spillover(self, tmp_path):
+        p = tmp_path / "lib.json"
+        # Trigger a suspicious shrink so the spillover lands.
+        sc._safe_save_json(p, [{"id": str(i)} for i in range(20)],
+                            "library")
+        sc._safe_save_json(p, [{"id": "0"}], "library")
+        backups = sc._list_recoverable_backups(p)
+        assert any(b["kind"] == "lost_entries" for b in backups)
+
+    def test_restore_from_legacy_bak(self, tmp_path):
+        p = tmp_path / "lib.json"
+        sc._safe_save_json(p, [{"id": "good"}], "library")
+        sc._safe_save_json(p, [{"id": "bad"}], "library")
+        # `lib.json.bak` now holds the prior "good" state.
+        legacy = tmp_path / "lib.json.bak"
+        n = sc._restore_from_backup(p, legacy, "library")
+        assert n == 1
+        assert json.loads(p.read_text())["entries"] == [{"id": "good"}]
+
+    def test_restore_creates_backup_of_pre_restore_state(self, tmp_path):
+        """The restore itself must back up the current contents
+        before overwriting — so an accidental restore is one click
+        away from being undone."""
+        p = tmp_path / "lib.json"
+        sc._safe_save_json(p, [{"id": "good"}], "library")
+        sc._safe_save_json(p, [{"id": "current"}], "library")
+        # Restore from the legacy backup (= "good"). The current
+        # state ("current") must land in a fresh rotating backup.
+        legacy = tmp_path / "lib.json.bak"
+        sc._restore_from_backup(p, legacy, "library")
+        # Find the rotating backup that holds "current".
+        rotating = sorted(tmp_path.glob("lib.json.bak.????????-??????"))
+        assert rotating, "restore must create a rotating backup"
+        latest = rotating[-1]
+        assert json.loads(latest.read_text())["entries"] == [{"id": "current"}]
+
+    def test_restore_unparseable_source_raises(self, tmp_path):
+        p = tmp_path / "lib.json"
+        bad = tmp_path / "bad.json"
+        bad.write_text("not valid json {{{")
+        with pytest.raises(ValueError, match="unreadable"):
+            sc._restore_from_backup(p, bad, "library")
+
+
+class TestSafeSaveJsonShrinkSpillover:
+    """Layer 3 of the data-safety net (added 2026-05-06): when a save
+    would discard >50% of a populated library, the dropped entries
+    are first written to `lost_entries/<file>-<ts>.json` so the data
+    is never silently destroyed even if every backup also fails."""
+
+    def test_suspicious_shrink_spills_lost_entries(self, tmp_path):
+        p = tmp_path / "lib.json"
+        sc._safe_save_json(p, [
+            {"id": str(i), "name": f"p{i}"} for i in range(20)
+        ], "library")
+        # Drop to 1 entry — losing 19 is well past the 50% threshold.
+        sc._safe_save_json(p, [{"id": "0", "name": "p0"}], "library")
+        spill_dir = tmp_path / "lost_entries"
+        assert spill_dir.exists()
+        spilled = list(spill_dir.glob("lib-*.json"))
+        assert len(spilled) == 1
+        payload = json.loads(spilled[0].read_text())
+        # 19 entries (p1..p19) preserved.
+        assert len(payload["entries"]) == 19
+        kept_ids = {e["id"] for e in payload["entries"]}
+        assert "0" not in kept_ids   # p0 was kept in the live file
+        assert "1" in kept_ids       # p1..p19 are recoverable from spill
+
+    def test_routine_delete_does_not_spill(self, tmp_path):
+        """A routine "delete one plasmid" save (10 → 9) is not
+        suspicious and must not generate a spill file."""
+        p = tmp_path / "lib.json"
+        entries = [{"id": str(i)} for i in range(10)]
+        sc._safe_save_json(p, entries, "library")
+        sc._safe_save_json(p, entries[:-1], "library")
+        spill_dir = tmp_path / "lost_entries"
+        assert not spill_dir.exists() or not list(spill_dir.iterdir())
+
+    def test_small_library_no_spill_threshold(self, tmp_path):
+        """Below 5 prior entries the suspicious-shrink check is
+        suppressed — too easy to false-positive on a fresh library."""
+        p = tmp_path / "lib.json"
+        sc._safe_save_json(p, [{"id": "a"}, {"id": "b"},
+                                  {"id": "c"}, {"id": "d"}], "library")
+        sc._safe_save_json(p, [], "library")
+        spill_dir = tmp_path / "lost_entries"
+        assert not spill_dir.exists() or not list(spill_dir.iterdir())
+
+    def test_save_still_proceeds_after_spill(self, tmp_path):
+        """Spilling lost entries must not block the save itself —
+        the user did request the new state and it must land on disk."""
+        p = tmp_path / "lib.json"
+        sc._safe_save_json(p, [{"id": str(i)} for i in range(10)],
+                            "library")
+        sc._safe_save_json(p, [{"id": "kept"}], "library")
+        # Live file holds only the new state.
+        assert json.loads(p.read_text())["entries"] == [{"id": "kept"}]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # _safe_load_json — corrupt file recovery
 # ═══════════════════════════════════════════════════════════════════════════════
 

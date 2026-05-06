@@ -2,6 +2,67 @@
 
 ---
 
+## [0.7.1.0] — 2026-05-06
+
+### Fixed (data safety — defense in depth)
+
+A user-reported library wipe motivated a four-layer hardening of the
+JSON persistence path. None of these change the on-disk schema; every
+existing library + collections file keeps loading without migration.
+
+- **Layer 1 — multi-generation rotating backups.** `_safe_save_json`
+  now writes the prior content to BOTH `<file>.bak` (the legacy single-
+  generation kept for back-compat with existing tooling) AND
+  `<file>.bak.YYYYMMDD-HHMMSS` (timestamped, lex-sortable). The last
+  `_BACKUP_RETENTION_COUNT` (10) rotating backups are retained on disk;
+  older ones pruned after each save. Two consecutive bad saves can no
+  longer wipe history.
+- **Layer 2 — daily launch-time snapshot.** On every new calendar day
+  the user starts SpliceCraft, `_snapshot_data_files` copies each
+  persistent JSON file (`plasmid_library.json`, `collections.json`,
+  `parts_bin.json`, `primers.json`) to
+  `<DATA_DIR>/snapshots/<stem>-YYYY-MM-DD.json`. Last
+  `_SNAPSHOT_RETENTION_DAYS` (30) days are retained. Best-effort —
+  silent on permission / disk-full failures so a sandboxed install
+  never aborts the launch.
+- **Layer 3 — suspicious-shrink spillover.** When a save would discard
+  >50% of a populated library (with at least 5 prior entries), the
+  dropped entries are dumped to
+  `<DATA_DIR>/lost_entries/<stem>-<timestamp>.json` BEFORE the save
+  proceeds. The save itself still runs (the user may have legitimately
+  pruned the library), but the data is never silently destroyed.
+
+### Added (data safety — recovery surface)
+
+- **Layer 4 — Settings → Restore library / collections from backup…**
+  opens `RestoreFromBackupModal` listing every recoverable copy across
+  the four storage tiers (legacy bak, rotating bak, daily snapshot,
+  lost-entries spillover) for a chosen target file. Pick a row and the
+  live file is overwritten with the chosen source — itself routed
+  through `_safe_save_json` so the *current* state lands in a fresh
+  rotating backup. Every restore is reversible.
+
+### Tests
+
+- 18 new tests in `tests/test_data_safety.py`:
+  - `TestSafeSaveJsonMultiGenBackup` — rotation, retention cap, no
+    spurious backup on first write.
+  - `TestSafeSaveJsonShrinkSpillover` — suspicious-shrink dumps, routine-
+    delete passthrough, threshold suppression on small libraries.
+  - `TestSnapshotDataFiles` — write-once-per-day, missing/empty file
+    skip, retention prune, OSError tolerance.
+  - `TestListAndRestoreBackups` — discovery across all four tiers,
+    restore-creates-fresh-backup, unparseable-source rejection.
+- New modal-baseline coverage for `RestoreFromBackupModal`.
+
+### Roadmap
+
+- v1.0.0.0 scope status: 6/6 v1.0 features done; the data-safety
+  hardening backfills a "STABLE" requirement from before features.
+  SnapGene .dna round-trip remains the long-pole.
+
+---
+
 ## [Unreleased] — Phase 4 stability gate
 
 ### Fixed

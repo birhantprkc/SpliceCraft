@@ -176,6 +176,7 @@ _MODAL_CASES = [
                                                target_label="tgt",
                                                transfers=[])),
     ("CollectionsModal",           lambda: sc.CollectionsModal()),
+    ("RestoreFromBackupModal",     lambda: sc.RestoreFromBackupModal()),
     ("CollectionNameModal",        lambda: sc.CollectionNameModal(
                                                "New collection", "")),
     ("NewCollectionModal",         lambda: sc.NewCollectionModal()),

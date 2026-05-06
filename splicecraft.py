@@ -31,7 +31,7 @@ import shutil
 import sys
 import uuid as _uuid
 from collections import OrderedDict as _OD
-from datetime import date as _date
+from datetime import date as _date, datetime as _datetime
 from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -442,67 +442,207 @@ def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
         raise
 
 
+# Multi-generation backup retention. Each `_safe_save_json` keeps the
+# previous file content under TWO names:
+#   * `<file>.bak` (single, latest) — kept for legacy compat with
+#     `_safe_load_json`'s recovery path AND existing user runbooks.
+#   * `<file>.bak.YYYYMMDD-HHMMSS` (timestamped, rotating) — last
+#     `_BACKUP_RETENTION_COUNT` generations are preserved on disk so
+#     two consecutive bad saves can't wipe history.
+# Lost-entries spillover lives in a sibling `lost_entries/` directory.
+# Rationale: see CLAUDE.md sacred invariant on data safety.
+_BACKUP_RETENTION_COUNT = 10
+_LOST_ENTRIES_DIR_NAME  = "lost_entries"
+
+
+def _backup_filename_pattern(path: Path) -> str:
+    """Glob pattern matching every timestamped backup of `path`."""
+    return f"{path.name}.bak.????????-??????"
+
+
+def _prune_backups(path: Path, keep: "int | None" = None) -> None:
+    """Delete all but the most recent `keep` timestamped backups of
+    `path`. The plain `<file>.bak` (legacy single-generation) is never
+    pruned by this function — it's overwritten on every save.
+
+    `keep` defaults to `_BACKUP_RETENTION_COUNT`, but is read at call
+    time (not bound as a default argument) so a test can monkeypatch
+    the module constant and observe the new value."""
+    if keep is None:
+        keep = _BACKUP_RETENTION_COUNT
+    try:
+        candidates = sorted(
+            path.parent.glob(_backup_filename_pattern(path)),
+            key=lambda p: p.name,
+        )
+    except OSError:
+        return
+    # Sort descending (newest first by lex-sortable timestamp), keep
+    # the head, prune the tail.
+    candidates.reverse()
+    for old in candidates[keep:]:
+        try:
+            old.unlink()
+        except OSError:
+            _log.debug("Could not prune old backup %s", old)
+
+
+def _spill_lost_entries(path: Path, lost: list, label: str) -> "Path | None":
+    """Persist `lost` (entries that the new save would discard) under
+    `<DATA_DIR>/lost_entries/<file_stem>-<ts>.json`. Returns the
+    written path or None on failure. Never raises — this is the
+    last-resort safety net and must not interfere with the parent
+    save call."""
+    if not lost:
+        return None
+    try:
+        lost_dir = path.parent / _LOST_ENTRIES_DIR_NAME
+        lost_dir.mkdir(parents=True, exist_ok=True)
+        ts = _datetime.now().strftime("%Y%m%d-%H%M%S")
+        out = lost_dir / f"{path.stem}-{ts}.json"
+        out.write_text(
+            json.dumps({
+                "_schema_version": _CURRENT_SCHEMA_VERSION,
+                "_label":          label,
+                "_recovered_from": str(path),
+                "_recovered_at":   ts,
+                "entries":         lost,
+            }, indent=2),
+            encoding="utf-8",
+        )
+        return out
+    except Exception:
+        _log.exception("Could not spill lost entries for %s", label)
+        return None
+
+
+def _diff_lost_entries(prev_entries: list, new_entries: list) -> list:
+    """Return entries that exist in `prev_entries` but not in
+    `new_entries`. Match by `id` first (every plasmid library entry
+    carries one); fall back to identity equality for entries that
+    don't have an id."""
+    if not prev_entries:
+        return []
+    new_ids = {e.get("id") for e in new_entries
+               if isinstance(e, dict) and e.get("id")}
+    new_no_id = [e for e in new_entries
+                 if isinstance(e, dict) and not e.get("id")]
+    lost = []
+    for e in prev_entries:
+        if not isinstance(e, dict):
+            # Pass through non-dict legacy entries — better to over-
+            # spill than under-spill here.
+            lost.append(e)
+            continue
+        eid = e.get("id")
+        if eid:
+            if eid not in new_ids:
+                lost.append(e)
+        else:
+            # Best-effort identity match for id-less entries.
+            if e not in new_no_id:
+                lost.append(e)
+    return lost
+
+
 def _safe_save_json(path: Path, entries: list, label: str,
                     schema_version: int = _CURRENT_SCHEMA_VERSION) -> None:
     """Atomically write `entries` as JSON to `path`, backing up first.
 
     Writes the envelope format `{"_schema_version": N, "entries": [...]}`.
 
-    The .bak file is the user's safety net — if a write goes wrong or the
-    app crashes mid-save, the previous version survives as path.bak.
+    Triple-layer data safety:
 
-    **Shrink guard**: if the file currently has N entries and we're about to
-    write M < N, we still write (the user may have legitimately deleted
-    entries) BUT we log a loud warning so accidental nukes are visible in
-    the session log for post-mortem debugging. The .bak always preserves
-    the pre-write state regardless.
+      1. **Atomic write** (tempfile + fsync + os.replace).
+      2. **Multi-generation backup**: the previous file content is
+         copied to `<file>.bak` (single, latest — legacy compat) AND
+         to `<file>.bak.YYYYMMDD-HHMMSS` (timestamped). Last
+         `_BACKUP_RETENTION_COUNT` (10) timestamped generations are
+         retained on disk; older ones pruned.
+      3. **Lost-entries spillover**: if the new write would shrink
+         the entry count by >50% (with at least 5 prior entries), the
+         discarded entries are dumped to
+         `<DATA_DIR>/lost_entries/<file_stem>-<ts>.json` BEFORE the
+         save proceeds. The save still runs (the user may have
+         legitimately deleted entries), but the dropped data is never
+         silently destroyed.
+
+    Errors (disk full, RO mount, permission denied) are logged AND
+    re-raised so callers can `notify` the user. Silent swallow used
+    to desync UI state from disk — sacred invariant #7.
     """
     import os
     import tempfile
 
-    # 1. Back up the existing file (if it has content)
+    # Step 1: read prior content for backup + shrink-guard analysis.
     existing_count = 0
+    prev_entries: "list | None" = None
     if path.exists():
         try:
             existing = path.read_bytes()
             if existing.strip():
-                bak = path.with_suffix(path.suffix + ".bak")
-                bak.write_bytes(existing)
-                # Count existing entries for the shrink guard. Accept both
-                # envelope and legacy formats so upgrades don't trip the
-                # shrink guard on their first save.
+                # Legacy single-generation backup — `_safe_load_json`'s
+                # recovery path still reads this exact name, and many
+                # tests depend on it. Keep it overwriting per save.
+                bak_legacy = path.with_suffix(path.suffix + ".bak")
+                try:
+                    bak_legacy.write_bytes(existing)
+                except OSError:
+                    _log.warning(
+                        "Could not write legacy .bak for %s", path,
+                    )
+                # Timestamped multi-generation backup.
+                ts = _datetime.now().strftime("%Y%m%d-%H%M%S")
+                bak_ts = path.with_name(
+                    f"{path.name}.bak.{ts}",
+                )
+                try:
+                    bak_ts.write_bytes(existing)
+                except OSError:
+                    _log.warning(
+                        "Could not write timestamped backup for %s", path,
+                    )
+                # Count + extract entries for the shrink guard. Accept
+                # both envelope and legacy bare-list formats so the
+                # first save after an upgrade doesn't false-positive.
                 try:
                     prev = json.loads(existing)
-                    prev_entries, _ = _extract_entries(prev, label)
-                    if prev_entries is not None:
-                        existing_count = len(prev_entries)
+                    extracted, _ = _extract_entries(prev, label)
+                    if extracted is not None:
+                        prev_entries = extracted
+                        existing_count = len(extracted)
                 except (json.JSONDecodeError, ValueError):
-                    # Corrupt / unreadable — shrink guard will treat as 0.
                     pass
         except OSError:
-            _log.warning("Could not create backup for %s", path)
+            _log.warning("Could not read prior content for %s", path)
 
-    # Shrink guard: log a loud warning if we're about to lose entries.
-    # Any shrink is logged so accidental nukes are auditable; going to zero
-    # from a populated file is almost always a bug (user never legitimately
-    # empties the whole library at once) so the .bak is explicitly preserved
-    # and the warning cites the path for recovery.
+    # Step 2: shrink guard with spillover. Any shrink logs a warning;
+    # a *suspicious* shrink (>50% loss, base population >=5) ALSO
+    # spills the discarded entries to `lost_entries/` so the data
+    # never silently disappears. The threshold is tuned to flag
+    # accidental nukes while letting routine "delete a few plasmids"
+    # CRUD pass quietly.
     if existing_count > 0 and len(entries) < existing_count:
         _log.warning(
             "SHRINK GUARD: %s is being overwritten with %d entries "
-            "(was %d). If this is unexpected, restore from %s.bak",
-            label, len(entries), existing_count, path,
+            "(was %d). If this is unexpected, restore from %s.bak "
+            "or %s.bak.<timestamp>.",
+            label, len(entries), existing_count, path, path,
         )
+        suspicious = (existing_count >= 5
+                      and len(entries) < existing_count // 2)
+        if suspicious and prev_entries is not None:
+            lost = _diff_lost_entries(prev_entries, entries)
+            spilled = _spill_lost_entries(path, lost, label)
+            if spilled is not None:
+                _log.warning(
+                    "SHRINK GUARD: %d %s entries dumped to %s before "
+                    "overwrite — recoverable on user request.",
+                    len(lost), label, spilled,
+                )
 
+    # Step 3: atomic write — tempfile in same dir → os.replace.
     payload = {"_schema_version": schema_version, "entries": entries}
-
-    # 2. Atomic write: tempfile in same dir → os.replace
-    #
-    # Errors here (disk full, permission denied, RO mount) are logged via
-    # `_log.exception` AND re-raised so callers can notify the user.
-    # Silently swallowing means the in-memory state diverges from disk;
-    # the user thinks the save succeeded and then loses work on the next
-    # session.
     try:
         fd, tmp_name = tempfile.mkstemp(
             prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent),
@@ -519,7 +659,6 @@ def _safe_save_json(path: Path, entries: list, label: str,
             _log.info("Saved %s: %d entries to %s (schema v%d)",
                       label, len(entries), path, schema_version)
         except Exception:
-            # Clean up the temp file on failure
             try:
                 os.unlink(tmp_name)
             except OSError:
@@ -528,6 +667,232 @@ def _safe_save_json(path: Path, entries: list, label: str,
     except Exception:
         _log.exception("Failed to save %s to %s", label, path)
         raise
+
+    # Step 4: prune timestamped backups outside the retention window.
+    # Done AFTER a successful save so a write failure doesn't prune
+    # the very backup we'd want to recover from.
+    _prune_backups(path)
+
+
+# ── Daily launch-time snapshot ────────────────────────────────────────────────
+#
+# Belt-and-braces above `_safe_save_json`'s rotating backups: on every
+# new calendar day the user starts the app, we copy each persistent
+# JSON file to `<DATA_DIR>/snapshots/<file>-YYYY-MM-DD.json`. That way a
+# bad upgrade or worker race that writes empty data over the weekend can
+# always be reverted from a known-good snapshot up to a month old.
+#
+# Snapshots are pruned once they're older than `_SNAPSHOT_RETENTION_DAYS`
+# (30) so the directory doesn't grow without bound. Per-file size is
+# tiny (~100 KB typical library), so 30 days × 4 files ≈ 12 MB at most.
+#
+# Files snapshotted: plasmid library, collections, parts bin, primers.
+# (.dna sidecars and feature library are deliberately excluded — the
+# former is byte-identical to the user's source files, the latter is
+# rebuildable from the active library.)
+_SNAPSHOT_DIR_NAME       = "snapshots"
+_SNAPSHOT_RETENTION_DAYS = 30
+
+
+def _snapshot_data_files(data_dir: Path,
+                          paths: "list[Path] | None" = None) -> "list[Path]":
+    """Copy each path in `paths` to `data_dir/snapshots/<stem>-YYYY-MM-DD.<ext>`
+    if today's snapshot doesn't already exist. Skips missing / empty
+    files (no point preserving an empty library). Returns the list of
+    snapshot paths that were freshly written this call (empty if all
+    were already up-to-date).
+
+    Best-effort by design: any OSError is caught and logged so a
+    locked / read-only data dir never crashes the launch path. The
+    user's worst-case is a missed snapshot day, not an aborted app.
+
+    `paths` defaults to the four user-data files
+    (`plasmid_library`, `collections`, `parts_bin`, `primers`). Passing
+    a custom list keeps the helper test-friendly without exposing
+    fragile module globals to the test.
+    """
+    if paths is None:
+        paths = [_LIBRARY_FILE, _COLLECTIONS_FILE,
+                 _PARTS_BIN_FILE, _PRIMERS_FILE]
+    snap_dir = data_dir / _SNAPSHOT_DIR_NAME
+    today = _date.today().isoformat()  # YYYY-MM-DD
+    written: list[Path] = []
+    try:
+        snap_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        _log.warning("Could not create snapshot dir %s", snap_dir)
+        return written
+    for src in paths:
+        if not src.exists():
+            continue
+        try:
+            if src.stat().st_size == 0:
+                continue
+        except OSError:
+            continue
+        dest = snap_dir / f"{src.stem}-{today}{src.suffix}"
+        if dest.exists():
+            continue
+        try:
+            dest.write_bytes(src.read_bytes())
+            written.append(dest)
+            _log.info(
+                "Snapshotted %s → %s (%d bytes)",
+                src.name, dest.name, dest.stat().st_size,
+            )
+        except OSError:
+            _log.exception("Could not snapshot %s", src)
+    _prune_old_snapshots(snap_dir)
+    return written
+
+
+def _prune_old_snapshots(snap_dir: Path,
+                          retain_days: "int | None" = None) -> None:
+    """Delete snapshots whose date stamp is older than
+    `retain_days`. `retain_days` defaults to
+    `_SNAPSHOT_RETENTION_DAYS`, but is read at call time so a test
+    can monkeypatch the module constant. Best-effort — never raises."""
+    import re as _re
+    if retain_days is None:
+        retain_days = _SNAPSHOT_RETENTION_DAYS
+    today = _date.today()
+    # Snapshot filenames look like `<stem>-YYYY-MM-DD.<ext>`. The
+    # regex pulls the date out of the trailing portion of the stem so
+    # arbitrary stems (with their own dashes) round-trip cleanly.
+    date_re = _re.compile(r"-(\d{4})-(\d{2})-(\d{2})$")
+    try:
+        candidates = list(snap_dir.iterdir())
+    except OSError:
+        return
+    for snap in candidates:
+        if not snap.is_file():
+            continue
+        m = date_re.search(snap.stem)
+        if m is None:
+            continue
+        try:
+            snap_date = _date(int(m.group(1)), int(m.group(2)),
+                               int(m.group(3)))
+        except ValueError:
+            continue
+        if (today - snap_date).days > retain_days:
+            try:
+                snap.unlink()
+            except OSError:
+                _log.debug("Could not prune old snapshot %s", snap)
+
+
+# ── Backup discovery + restore ──────────────────────────────────────────────
+#
+# Helpers powering Settings → Restore from backup… (`RestoreFromBackupModal`).
+# Discovers every recoverable copy of a target JSON file across the
+# four storage tiers — legacy single-gen `.bak`, rotating timestamped
+# backups, daily snapshots, and shrink-guard spillover — and exposes a
+# single function to apply one back to the live file.
+
+def _backup_info(path: Path) -> "dict | None":
+    """Parse `path` as a SpliceCraft persistence file (envelope or
+    legacy bare-list) and return ``{n_entries, mtime_str}`` or None
+    if unreadable. The mtime is used as the user-visible timestamp
+    so even an undated `.bak` shows when it was written."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(raw, list):
+        n = len(raw)
+    elif isinstance(raw, dict):
+        entries = raw.get("entries", [])
+        n = len(entries) if isinstance(entries, list) else 0
+    else:
+        return None
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    ts = _datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+    return {"n_entries": n, "mtime_str": ts}
+
+
+def _list_recoverable_backups(target_path: Path) -> "list[dict]":
+    """Return every recoverable copy of `target_path` across the four
+    storage tiers, sorted newest first.
+
+    Each entry: ``{kind, source_path, n_entries, mtime_str}`` where
+    ``kind`` is one of:
+      * ``"legacy_bak"``    — single-generation `<file>.bak`
+      * ``"rotating_bak"``  — timestamped `<file>.bak.YYYYMMDD-HHMMSS`
+      * ``"snapshot"``      — daily snapshot in `<DATA_DIR>/snapshots/`
+      * ``"lost_entries"``  — shrink-guard spillover in
+                               `<DATA_DIR>/lost_entries/`
+    """
+    found: list[dict] = []
+    data_dir = target_path.parent
+    # Legacy single-gen backup.
+    legacy = target_path.with_suffix(target_path.suffix + ".bak")
+    if legacy.exists():
+        info = _backup_info(legacy)
+        if info:
+            found.append({"kind": "legacy_bak",
+                          "source_path": legacy, **info})
+    # Rotating multi-gen backups.
+    try:
+        for bak in data_dir.glob(_backup_filename_pattern(target_path)):
+            info = _backup_info(bak)
+            if info:
+                found.append({"kind": "rotating_bak",
+                              "source_path": bak, **info})
+    except OSError:
+        pass
+    # Daily snapshots.
+    snap_dir = data_dir / _SNAPSHOT_DIR_NAME
+    if snap_dir.exists():
+        try:
+            stem = target_path.stem
+            ext = target_path.suffix
+            for snap in snap_dir.glob(f"{stem}-*{ext}"):
+                info = _backup_info(snap)
+                if info:
+                    found.append({"kind": "snapshot",
+                                  "source_path": snap, **info})
+        except OSError:
+            pass
+    # Lost-entries spillover.
+    lost_dir = data_dir / _LOST_ENTRIES_DIR_NAME
+    if lost_dir.exists():
+        try:
+            for lost in lost_dir.glob(f"{target_path.stem}-*.json"):
+                info = _backup_info(lost)
+                if info:
+                    found.append({"kind": "lost_entries",
+                                  "source_path": lost, **info})
+        except OSError:
+            pass
+    # Newest first by mtime string (lex-sortable).
+    found.sort(key=lambda x: x["mtime_str"], reverse=True)
+    return found
+
+
+def _restore_from_backup(target_path: Path, source_path: Path,
+                          label: str) -> int:
+    """Read entries from `source_path` and write them onto
+    `target_path` via `_safe_save_json` so the current state is
+    automatically backed up under the new rotating-backup discipline
+    before being overwritten. Returns the number of entries
+    restored. Raises ValueError on unparseable source, OSError on
+    write failure."""
+    try:
+        raw = json.loads(source_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unreadable backup: {exc}") from exc
+    entries, _shape_warn = _extract_entries(raw, label)
+    if entries is None:
+        raise ValueError(
+            f"backup {source_path.name} is not a recognisable "
+            f"{label} payload"
+        )
+    _safe_save_json(target_path, entries, label)
+    return len(entries)
 
 
 _SAFE_LOAD_JSON_MAX_BYTES = 50 * 1024 * 1024   # 50 MB — same as bulk import
@@ -25839,6 +26204,186 @@ class PlasmidPickerModal(ModalScreen):
         self.dismiss(None)
 
 
+class RestoreFromBackupModal(ModalScreen):
+    """Settings → Restore from backup… recovery UI.
+
+    Lists every recoverable copy of the four user-data files
+    (library, collections, parts bin, primers) across all four
+    storage tiers — single-gen `.bak`, rotating timestamped backups,
+    daily snapshots, lost-entries spillover — and lets the user pick
+    one to overwrite the live file with.
+
+    The restore itself routes through `_safe_save_json`, so the
+    current state gets its own rotating backup before being
+    replaced. Even an accidental restore is one click away from
+    being undone.
+
+    Dismiss payload:
+      None        — cancelled
+      dict        — `{target, source_path, n_entries}` summary so
+                    the caller can refresh panels and notify.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next",   show=False),
+    ]
+
+    # (label, attr_name) — attr_name resolves to the live Path on the
+    # `splicecraft` module so tests' monkeypatches of `_LIBRARY_FILE`
+    # etc. flow through.
+    _TARGETS = [
+        ("Plasmid library",      "_LIBRARY_FILE"),
+        ("Collections",          "_COLLECTIONS_FILE"),
+        ("Parts bin",            "_PARTS_BIN_FILE"),
+        ("Primers",              "_PRIMERS_FILE"),
+    ]
+
+    def __init__(self, initial_target: str = "_LIBRARY_FILE") -> None:
+        super().__init__()
+        self._initial_target = initial_target
+        self._backups: list[dict] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="restore-box"):
+            yield Static(" Restore from backup ", id="restore-title")
+            yield Label(
+                "Pick a target file, then a backup row.",
+                id="restore-help1",
+            )
+            yield Label(
+                "The current contents are backed up before "
+                "overwrite — every restore is reversible.",
+                id="restore-help2",
+            )
+            yield Label("Restore which file?")
+            yield Select(
+                [(label, attr) for label, attr in self._TARGETS],
+                value=self._initial_target,
+                id="restore-target",
+                allow_blank=False,
+            )
+            yield DataTable(id="restore-table",
+                            cursor_type="row",
+                            zebra_stripes=True)
+            yield Static("", id="restore-status", markup=True)
+            with Horizontal(id="restore-btns"):
+                yield Button("Restore selected", id="btn-restore-ok",
+                             variant="primary")
+                yield Button("Cancel", id="btn-restore-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            t = self.query_one("#restore-table", DataTable)
+        except NoMatches:
+            return
+        t.add_columns("Source", "Kind", "Entries", "Saved at")
+        self._refresh_table()
+
+    def _current_target_path(self) -> "Path | None":
+        try:
+            attr = self.query_one("#restore-target", Select).value
+        except NoMatches:
+            return None
+        if not isinstance(attr, str):
+            return None
+        # Resolve the attr name to the LIVE Path object on the module
+        # so tests' monkeypatch of `_LIBRARY_FILE` is respected.
+        import splicecraft as _sc
+        return getattr(_sc, attr, None)
+
+    def _refresh_table(self) -> None:
+        try:
+            t = self.query_one("#restore-table", DataTable)
+            status = self.query_one("#restore-status", Static)
+        except NoMatches:
+            return
+        t.clear()
+        target = self._current_target_path()
+        if target is None:
+            status.update("[red]Could not resolve target path.[/red]")
+            self._backups = []
+            return
+        self._backups = _list_recoverable_backups(target)
+        if not self._backups:
+            status.update(
+                "[dim]No recoverable backups found for this file. "
+                "Backups appear after the second save.[/dim]"
+            )
+            return
+        for b in self._backups:
+            t.add_row(
+                Path(b["source_path"]).name,
+                b["kind"],
+                str(b["n_entries"]),
+                b["mtime_str"],
+            )
+        status.update(
+            f"[dim]{len(self._backups)} recoverable copy(s).[/dim]"
+        )
+
+    @on(Select.Changed, "#restore-target")
+    def _on_target_changed(self, _event: Select.Changed) -> None:
+        self._refresh_table()
+
+    @on(Button.Pressed, "#btn-restore-ok")
+    def _restore_btn(self, _) -> None:
+        try:
+            t = self.query_one("#restore-table", DataTable)
+            status = self.query_one("#restore-status", Static)
+        except NoMatches:
+            return
+        idx = t.cursor_row
+        if idx is None or not (0 <= idx < len(self._backups)):
+            status.update("[yellow]Pick a backup row first.[/yellow]")
+            return
+        target = self._current_target_path()
+        if target is None:
+            return
+        backup = self._backups[idx]
+        # Resolve the user-facing label for the active target so the
+        # `_safe_save_json` call uses a recognisable name in logs.
+        target_label = next(
+            (lbl for lbl, attr in self._TARGETS
+             if attr == self.query_one("#restore-target", Select).value),
+            "data file",
+        )
+        try:
+            n = _restore_from_backup(
+                target, Path(backup["source_path"]), target_label,
+            )
+        except (ValueError, OSError) as exc:
+            _log.exception("Restore failed")
+            status.update(
+                f"[red]Restore failed: {exc}[/red]"
+            )
+            return
+        # Bust the in-memory caches so the next read picks up the
+        # restored state. The actual cache invalidation hooks live
+        # alongside each loader; mirror them here so an agent-driven
+        # restore picks up the new state without an app restart.
+        try:
+            _sc = __import__("splicecraft")
+            _sc._library_cache     = None
+            _sc._collections_cache = None
+            _sc._parts_bin_cache   = None
+            _sc._primers_cache     = None
+        except (AttributeError, ImportError):
+            pass
+        self.dismiss({
+            "target":      target_label,
+            "source_path": str(backup["source_path"]),
+            "n_entries":   n,
+        })
+
+    @on(Button.Pressed, "#btn-restore-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class CollectionsModal(ModalScreen):
     """Browse, save, and load named collections of plasmids.
 
@@ -28771,6 +29316,11 @@ class PlasmidApp(App):
     # `_current_record` to the seeded record, and pollute fixtures that
     # assume a clean app. `main()` flips this to False for production.
     _skip_seed: bool              = True
+    # Daily launch-time data snapshot. Default-True for tests so
+    # `_snapshot_data_files` doesn't fan out to disk inside every
+    # async test. Production launch flips this to False so users
+    # always have a 30-day rolling window of recoverable snapshots.
+    _skip_snapshot: bool          = True
     # Hydrated from the persisted `check_updates` setting in compose();
     # the in-memory mirror is read by the worker and the menu toggle.
     _check_updates: bool          = True
@@ -29016,6 +29566,20 @@ PlasmidPickerModal { align: center middle; }
 #pick-table  { height: 1fr; }
 #pick-btns   { height: 3; margin-top: 1; }
 #pick-btns Button { margin-right: 1; min-width: 14; }
+
+/* ── Restore-from-backup modal ─────────────────────────── */
+RestoreFromBackupModal { align: center middle; }
+#restore-box {
+    width: 110; height: 36;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#restore-title  { background: $primary; padding: 0 1; margin-bottom: 1; }
+#restore-box Label { color: $text-muted; margin-top: 1; }
+#restore-box Select { margin-bottom: 1; }
+#restore-table  { height: 1fr; margin-top: 1; }
+#restore-status { height: 1; margin-top: 1; }
+#restore-btns   { height: 3; margin-top: 1; }
+#restore-btns Button { margin-right: 1; }
 
 /* ── Plasmid collections modal ───────────────────────────── */
 CollectionsModal { align: center middle; }
@@ -30226,6 +30790,20 @@ SpeciesPickerModal { align: center middle; }
         # write. Cleared whenever the record is saved / marked clean.
         self._autosave_timer = None
         self._AUTOSAVE_DEBOUNCE_S = 3.0
+        # Daily snapshot of the persistent JSON files BEFORE any
+        # validation or save fires. Belt-and-braces above
+        # `_safe_save_json`'s rotating backups: a bad worker race or
+        # botched migration that lands today still leaves yesterday's
+        # snapshot recoverable from `<DATA_DIR>/snapshots/` for up
+        # to `_SNAPSHOT_RETENTION_DAYS`. Guarded by `_skip_snapshot`
+        # so tests don't fan out to disk on every async run.
+        if not getattr(self, "_skip_snapshot", False):
+            try:
+                _snapshot_data_files(_DATA_DIR)
+            except Exception:
+                # The snapshot path is purely defensive. Never let it
+                # crash the launch.
+                _log.exception("Daily snapshot failed (non-fatal)")
         # Validate all user-data files before anything else. Corrupt files
         # are auto-restored from .bak if possible; the user is notified
         # either way so they know the state of their data.
@@ -31432,6 +32010,38 @@ SpeciesPickerModal { align: center middle; }
             ExportGenBankModal(self._current_record, default_path=default),
             callback=_on_done,
         )
+
+    def action_restore_from_backup(self) -> None:
+        """Open the multi-tier backup-restore modal. On commit, the
+        chosen target file is overwritten with the picked source —
+        which itself triggers a fresh rotating backup of the *current*
+        state, so nothing is irreversibly destroyed.
+
+        After a successful restore we bust the in-memory caches and
+        repopulate the library panel + (optionally) re-apply the
+        active record so the UI reflects the restored state without
+        an app restart.
+        """
+        def _on_done(result):
+            if not result:
+                return
+            target_label = result.get("target", "data file")
+            n = result.get("n_entries", 0)
+            self._notify_success(
+                f"Restored {n} entries to {target_label}. "
+                "Previous state is in the rotating backup ring.",
+                timeout=10,
+            )
+            # Library / collections cache invalidation (the modal
+            # already touched the module attrs but a fresh load is
+            # the safest way to refresh the panel).
+            try:
+                lib = self.query_one("#library", LibraryPanel)
+                lib._repopulate()
+            except NoMatches:
+                pass
+
+        self.push_screen(RestoreFromBackupModal(), callback=_on_done)
 
     def action_export_gff(self) -> None:
         """Prompt for a path and write the loaded record as GFF3.
@@ -33149,6 +33759,9 @@ SpeciesPickerModal { align: center middle; }
                                                           "toggle_linear_layout"),
                 (f"Min primer binding: {self._min_primer_binding} bp → cycle",
                                                           "cycle_min_primer_binding"),
+                ("---",                                   None),
+                ("Restore library / collections from backup…",
+                                                          "restore_from_backup"),
             ],
             "Edit": [
                 ("Edit Sequence  [^E]",            "edit_seq"),
@@ -34002,6 +34615,11 @@ def main():
     # pACYC184 so users see something on a fresh install. Tests leave
     # this True (class default) so the suite never hits NCBI.
     app._skip_seed = False
+    # Production launch also opts in to the daily JSON snapshot. Tests
+    # leave this True so `_snapshot_data_files` doesn't fan out to disk
+    # inside every async run; production users always have a 30-day
+    # rolling snapshot window.
+    app._skip_snapshot = False
     if enable_agent_api:
         app._agent_api_port = agent_port
 
