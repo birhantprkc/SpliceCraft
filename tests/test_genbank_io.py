@@ -833,3 +833,37 @@ class TestExportFastaToPath:
         out = tmp_path / "my parts" / "weird name.fa"
         sc._export_fasta_to_path("seq", "ATGC", out)
         assert out.exists()
+
+
+class TestActionExportFasta:
+    """Whole-plasmid FASTA export wired in 0.6.0.0: File → Export as
+    FASTA pushes `FastaExportModal` pre-populated with the loaded
+    record's sequence, mirroring `action_export_genbank` for the .gb
+    side. Bare app (no record) must surface a friendly notify rather
+    than push a modal with empty content."""
+
+    @pytest.mark.asyncio
+    async def test_action_export_fasta_pushes_modal(self, tiny_record):
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.action_export_fasta()
+            await pilot.pause()
+            top = app.screen
+            assert isinstance(top, sc.FastaExportModal)
+            assert top._name == tiny_record.name
+            assert top._sequence == str(tiny_record.seq)
+            assert top._default_path.endswith(".fa")
+
+    @pytest.mark.asyncio
+    async def test_action_export_fasta_no_record_notifies(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.action_export_fasta()
+            await pilot.pause()
+            # No modal pushed — still on the bare app screen.
+            assert not isinstance(app.screen, sc.FastaExportModal)

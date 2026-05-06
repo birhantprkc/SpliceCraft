@@ -1204,3 +1204,117 @@ class TestSaveLoadedPlasmidToCollection:
             ids = [p.get("id") for p in coll["plasmids"]]
             assert tiny_record.id in ids
             app.exit()
+
+
+class TestSearchCollectionsLibrary:
+    """Pure helper test for `_search_collections_library` — fuzzy matches
+    plasmid names across every collection on disk. The agent endpoint
+    (`_h_search_library`) is covered separately in test_agent_api.py."""
+
+    def test_empty_query_returns_everything(self):
+        sc._save_collections([
+            {"name": "A", "plasmids": [
+                {"id": "x", "name": "x", "size": 1, "gb_text": "x"},
+                {"id": "y", "name": "y", "size": 1, "gb_text": "y"},
+            ]},
+            {"name": "B", "plasmids": [
+                {"id": "z", "name": "z", "size": 1, "gb_text": "z"},
+            ]},
+        ])
+        out = sc._search_collections_library("")
+        assert {(m["collection"], m["name"]) for m in out} == {
+            ("A", "x"), ("A", "y"), ("B", "z"),
+        }
+
+    def test_fuzzy_match_filters_across_collections(self):
+        sc._save_collections([
+            {"name": "A", "plasmids": [
+                {"id": "p1", "name": "pUC19_alpha", "size": 1,
+                 "gb_text": "x"},
+                {"id": "p2", "name": "pET28b",     "size": 1,
+                 "gb_text": "x"},
+            ]},
+            {"name": "B", "plasmids": [
+                {"id": "p3", "name": "pUC19_beta",  "size": 1,
+                 "gb_text": "x"},
+            ]},
+        ])
+        out = sc._search_collections_library("puc19")
+        names = {(m["collection"], m["name"]) for m in out}
+        assert names == {("A", "pUC19_alpha"), ("B", "pUC19_beta")}
+
+    def test_limit_caps_results(self):
+        sc._save_collections([
+            {"name": "Big", "plasmids": [
+                {"id": str(i), "name": f"p{i}", "size": 1, "gb_text": "x"}
+                for i in range(20)
+            ]},
+        ])
+        out = sc._search_collections_library("", limit=7)
+        assert len(out) == 7
+
+    def test_skips_non_dict_entries(self):
+        """A corrupted collection with stray non-dict members must
+        not crash the iterator."""
+        sc._save_collections([
+            {"name": "Ugly", "plasmids": [
+                {"id": "good", "name": "good", "size": 1, "gb_text": "x"},
+                "not-a-dict",  # type: ignore[list-item]
+                42,            # type: ignore[list-item]
+            ]},
+        ])
+        out = sc._search_collections_library("")
+        assert [m["name"] for m in out] == ["good"]
+
+
+class TestActionFindPlasmid:
+    """`PlasmidApp.action_find_plasmid` opens `LibrarySearchModal` and,
+    on row pick, switches to the match's collection and loads the
+    plasmid via the existing `_apply_record` flow."""
+
+    @pytest.fixture(autouse=True)
+    def _no_seed(self, monkeypatch):
+        monkeypatch.setattr(sc.PlasmidApp, "_seed_default_library",
+                            lambda self: None)
+
+    async def test_action_pushes_search_modal(self):
+        sc._save_collections([{"name": "C", "plasmids": []}])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.action_find_plasmid()
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, sc.LibrarySearchModal)
+            app.exit()
+
+    async def test_pick_switches_collection_and_loads(self, tiny_record):
+        # Two collections; the target plasmid lives in the non-active one.
+        sc._save_collections([
+            {"name": "Active", "plasmids": []},
+            {"name": "OtherCol", "plasmids": [{
+                "id":      tiny_record.id,
+                "name":    tiny_record.name,
+                "size":    len(tiny_record.seq),
+                "n_feats": 0,
+                "gb_text": sc._record_to_gb_text(tiny_record),
+            }]},
+        ])
+        sc._set_active_collection_name("Active")
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Synthesise the modal-dismiss callback directly — pilot
+            # row clicks on a freshly composed DataTable inside a modal
+            # are flake-prone (cf. the bulk-import test fix).
+            app.action_find_plasmid()
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert isinstance(modal, sc.LibrarySearchModal)
+            modal.dismiss(("OtherCol", tiny_record.id))
+            await pilot.pause(0.2)
+            assert sc._get_active_collection_name() == "OtherCol"
+            assert app._current_record is not None
+            assert app._current_record.id == tiny_record.id
+            app.exit()

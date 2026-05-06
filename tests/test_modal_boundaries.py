@@ -164,6 +164,10 @@ _MODAL_CASES = [
                                                name="demo",
                                                sequence="ATGCATGC",
                                                default_path="/tmp/demo.fa")),
+    ("ORFFinderModal",             lambda: sc.ORFFinderModal(
+                                               "ATGGCCGCCGCCGCCTAA" * 5,
+                                               circular=True)),
+    ("LibrarySearchModal",         lambda: sc.LibrarySearchModal()),
     ("CollectionsModal",           lambda: sc.CollectionsModal()),
     ("CollectionNameModal",        lambda: sc.CollectionNameModal(
                                                "New collection", "")),

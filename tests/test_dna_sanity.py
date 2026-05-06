@@ -860,3 +860,113 @@ class TestWrapCDSInlineTranslation:
             for i in range(7)
         ]
         assert painted == expected
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ORF finder — six-frame open-reading-frame scan, wrap-aware
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFindOrfs:
+    """`_find_orfs` six-frame scan. Standard table 1, ATG-only by
+    default. Wrap-aware on circular plasmids: ORFs that cross the
+    origin are reported with `end < start` matching the wrap-feature
+    convention used elsewhere."""
+
+    def test_single_forward_orf(self):
+        """ATG…TAA with 30 GCC codons in between → 1 ORF (+) strand.
+        `length_aa` excludes the stop, so M + 30 GCC = 31 residues."""
+        seq = "AA" + "ATG" + "GCC" * 30 + "TAA" + "AA"
+        orfs = sc._find_orfs(seq, min_aa=30, circular=False)
+        assert len(orfs) == 1
+        o = orfs[0]
+        assert o["strand"] == 1
+        assert o["length_aa"] == 31
+        assert o["start"] == 2
+        assert o["end"] == 2 + 3 + 30 * 3 + 3
+        # AA seq starts with M and ends with *
+        assert o["aa_seq"].startswith("M")
+        assert o["aa_seq"].endswith("*")
+
+    def test_min_length_filter(self):
+        """An ORF below `min_aa` must be filtered out."""
+        # M + 19 GCC = 20 coded residues (excluding stop).
+        seq = "ATG" + "GCC" * 19 + "TAA"
+        assert sc._find_orfs(seq, min_aa=30, circular=False) == []
+        assert len(sc._find_orfs(seq, min_aa=20, circular=False)) == 1
+
+    def test_reverse_strand_orf(self):
+        """An ORF on the (-) strand: forward seq carries the RC of the
+        ATG…TAA pattern. The reported forward-strand coords cover the
+        recognition span on the top strand even though the ORF itself
+        reads on the bottom."""
+        body = "ATG" + "GCC" * 30 + "TAA"
+        rc_body = sc._rc(body)
+        seq = "AAA" + rc_body + "AAA"
+        orfs = sc._find_orfs(seq, min_aa=30, circular=False)
+        assert len(orfs) == 1
+        o = orfs[0]
+        assert o["strand"] == -1
+        assert o["length_aa"] == 31  # M + 30 GCC, excluding stop
+        # Forward coords cover [3, 3 + len(body)) since rc_body starts at 3.
+        assert o["start"] == 3
+        assert o["end"] == 3 + len(body)
+
+    def test_alt_starts_off_by_default(self):
+        """GTG / TTG must NOT start an ORF unless `include_alt_starts=True`."""
+        seq = "GTG" + "GCC" * 30 + "TAA"
+        assert sc._find_orfs(seq, min_aa=30, circular=False) == []
+        orfs = sc._find_orfs(seq, min_aa=30, circular=False,
+                              include_alt_starts=True)
+        assert len(orfs) == 1
+        # The AA seq from a GTG start translates as Val (or Met by the
+        # alt-start convention; we use the canonical table so it's V).
+        assert orfs[0]["aa_seq"][0] in {"V", "M"}
+
+    def test_circular_wrap_orf(self):
+        """An ORF that crosses the origin on a circular plasmid is
+        reported with `end < start`. Reproduce the case by placing
+        the start codon near the right edge so the body wraps."""
+        # n = 120; place ATG at bp 110, body+stop wraps to bp 110 + 3 + 90 + 3 - 120 = 86.
+        body = "ATG" + "GCC" * 30 + "TAA"   # 99 bp
+        n = 120
+        prefix_len = 110
+        wrapped = body[(n - prefix_len):]   # the part that goes back to start
+        leading = body[:n - prefix_len]
+        seq = "A" * prefix_len + leading + "G" * (n - prefix_len - len(wrapped))
+        # Hand-build a clean circular layout instead — the splicing above
+        # is fiddly. Use seq = filler[0:110] + "ATG..." with the body
+        # split at bp 120.
+        filler = "A" * 110
+        seq = filler + body[:10]            # bp 110..120 holds first 10 bp of body
+        seq = seq + body[10:]               # then the rest hangs off the end
+        # That's 110 + len(body) = 209 bp. Now make the SEQUENCE itself n=120
+        # by taking the first 120 chars and stuffing the tail at the front.
+        full_with_tail = filler + body
+        n = 120
+        head = full_with_tail[n:]           # bp the wrap should cover at the start
+        seq_circ = head + filler[len(head):] + body[:n - 110]
+        # `seq_circ` is 120 bp with ATG at bp 110 and the body wrapping to bp `len(head)`.
+        assert len(seq_circ) == 120
+        orfs = sc._find_orfs(seq_circ, min_aa=30, circular=True)
+        # At least one wrap ORF expected; some non-wrap junk ORFs may
+        # also appear depending on filler — pick the wrap one and
+        # verify its shape.
+        wrap_orfs = [o for o in orfs if o["end"] < o["start"]]
+        assert wrap_orfs, "expected at least one wrap ORF"
+        o = wrap_orfs[0]
+        assert o["strand"] == 1
+        assert o["length_aa"] == 31  # M + 30 GCC, excluding stop
+
+    def test_too_short_sequence(self):
+        """A 5 bp seq has no room for any ORF."""
+        assert sc._find_orfs("ACGTA", circular=False) == []
+
+    def test_dedupe_no_duplicate_in_doubled_scan(self):
+        """A circular ORF that does NOT wrap should not be reported twice
+        even though the doubled-scan visits the same region twice."""
+        body = "ATG" + "GCC" * 30 + "TAA"     # 99 bp
+        seq = body + "G" * 21                  # 120 bp circular plasmid
+        orfs = sc._find_orfs(seq, min_aa=30, circular=True)
+        # The ATG at position 0 should map to exactly one ORF.
+        zero_starts = [o for o in orfs if o["start"] == 0 and o["strand"] == 1]
+        assert len(zero_starts) == 1

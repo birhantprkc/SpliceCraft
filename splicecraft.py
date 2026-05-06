@@ -3444,6 +3444,116 @@ def _translate_cds(full_seq: str, start: int, end: int, strand: int) -> str:
     return result
 
 
+# ── ORF finder ────────────────────────────────────────────────────────────────
+#
+# Six-frame open-reading-frame scan over the loaded record. Standard
+# table 1 (canonical ATG start, TAA / TAG / TGA stops); alternative
+# bacterial starts (GTG, TTG) are opt-in. Wrap-aware: an ORF that
+# crosses the origin on a circular plasmid is reported with `end < start`
+# the same way other parts of the codebase represent wrap features.
+
+_STOP_CODONS = frozenset(("TAA", "TAG", "TGA"))
+
+
+def _find_orfs(seq: str, *,
+               min_aa: int = 30,
+               include_alt_starts: bool = False,
+               circular: bool = True) -> list[dict]:
+    """Six-frame ORF scan. Returns
+    ``[{start, end, strand, length_aa, aa_seq}, ...]`` sorted by length
+    descending. Wrap-aware on circular plasmids: an ORF crossing the
+    origin is reported with ``end < start``, matching the wrap-feature
+    convention `_feat_len` / `_bp_in` already implement.
+
+    `min_aa` excludes the stop codon (so ``min_aa=30`` ⇒ ORFs ≥ 30
+    coded residues, i.e. ≥ 93 bp including the trailing stop).
+    `include_alt_starts=True` adds GTG and TTG to the start-codon
+    set — useful for bacterial genomes; off by default since most
+    plasmid CDSes use ATG.
+    """
+    n = len(seq)
+    if n < 6:
+        return []
+    seq_u = seq.upper()
+    starts = {"ATG"}
+    if include_alt_starts:
+        starts |= {"GTG", "TTG"}
+
+    orfs: list[dict] = []
+
+    for strand in (1, -1):
+        if strand == 1:
+            scan_seq = (seq_u + seq_u) if circular else seq_u
+        else:
+            rc_seq = _rc(seq_u)
+            scan_seq = (rc_seq + rc_seq) if circular else rc_seq
+        scan_n = len(scan_seq)
+
+        for frame in range(3):
+            current_start = -1
+            i = frame
+            while i + 3 <= scan_n:
+                codon = scan_seq[i:i+3]
+                if current_start < 0:
+                    if codon in starts:
+                        current_start = i
+                else:
+                    if codon in _STOP_CODONS:
+                        aa_len = (i - current_start) // 3
+                        # Drop ORFs whose start codon falls in the
+                        # second copy of the doubled scan — they're
+                        # duplicates of one we already found from the
+                        # first copy.
+                        if (circular and current_start >= n) \
+                                or aa_len < min_aa:
+                            current_start = -1
+                            i += 3
+                            continue
+                        nt_seq = scan_seq[current_start:i + 3]  # incl. stop
+                        aa_seq = "".join(
+                            _CODON_TABLE.get(nt_seq[k:k+3], "?")
+                            for k in range(0, len(nt_seq), 3)
+                        )
+                        if strand == 1:
+                            o_s = current_start
+                            o_e = i + 3
+                            if circular and o_e > n:
+                                o_e -= n   # wrap: end < start
+                        else:
+                            p_rc = current_start
+                            e_rc = i + 3
+                            if circular:
+                                o_s = (n - e_rc) % n
+                                o_e = (n - p_rc) % n
+                            else:
+                                o_s = n - e_rc
+                                o_e = n - p_rc
+                        orfs.append({
+                            "start":     o_s,
+                            "end":       o_e,
+                            "strand":    strand,
+                            "length_aa": aa_len,
+                            "aa_seq":    aa_seq,
+                        })
+                        current_start = -1
+                i += 3
+
+    # Dedupe identical (start, end, strand) tuples — can happen when the
+    # doubled-scan cycles past the origin and re-finds the same ORF, or
+    # when alt-starts inside an ATG-bounded region produce nested hits
+    # that then collapse onto the same boundary.
+    orfs.sort(key=lambda o: o["length_aa"], reverse=True)
+    seen: set[tuple] = set()
+    unique: list[dict] = []
+    for o in orfs:
+        k = (o["start"], o["end"], o["strand"])
+        if k in seen:
+            continue
+        seen.add(k)
+        unique.append(o)
+    return unique
+
+
 # ── Char aspect detection ──────────────────────────────────────────────────────
 
 def _detect_char_aspect() -> float:
@@ -6831,6 +6941,43 @@ def _fuzzy_match(query: str, name: str) -> bool:
             return False
         i += 1
     return True
+
+
+def _search_collections_library(query: str, *,
+                                  limit: int = 200) -> list[dict]:
+    """Cross-collection plasmid search. Returns up to `limit` matches
+    across every collection on disk. Each match is
+    ``{collection, name, id, size, status, n_feats}``. The query is
+    fuzzy-matched against the plasmid name (same `_fuzzy_match`
+    semantics as the library panel's in-collection search) so a user
+    typing `puc` finds `pUC19`. An empty `query` returns the first
+    `limit` plasmids across all collections (useful as a "list
+    everything" affordance for agents).
+
+    Used by the cross-collection search modal (`LibrarySearchModal`,
+    Edit → Find plasmid…) and the `search-library` agent endpoint.
+    """
+    out: list[dict] = []
+    q = (query or "").strip()
+    for c in _load_collections():
+        cname = c.get("name") or "?"
+        for entry in c.get("plasmids", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name") or entry.get("id") or "?"
+            if q and not _fuzzy_match(q, name):
+                continue
+            out.append({
+                "collection": cname,
+                "name":       name,
+                "id":         entry.get("id", ""),
+                "size":       entry.get("size", 0),
+                "status":     _sanitize_plasmid_status(entry.get("status")),
+                "n_feats":    entry.get("n_feats", 0),
+            })
+            if len(out) >= limit:
+                return out
+    return out
 
 
 _NATURAL_SORT_RE = re.compile(r"(\d+)")
@@ -10652,6 +10799,119 @@ class FastaExportModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-fasta-export-cancel")
     def _cancel_btn(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ORFFinderModal(ModalScreen):
+    """Find open reading frames in the loaded record.
+
+    Six-frame scan via `_find_orfs`. Default min length is 30 aa
+    (≈ 90 bp); the alt-starts checkbox enables GTG / TTG which is
+    relevant for bacterial genomes but rare in plasmid CDSes.
+    Selecting a row dismisses with the ORF dict so the caller can
+    apply a feature-style highlight (cursor + selection range) in
+    the seq panel + map.
+
+    Dismiss payload:
+      None        — cancelled / closed
+      dict (ORF)  — user picked an ORF to highlight
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next",   show=False),
+    ]
+
+    def __init__(self, sequence: str, *, circular: bool = True) -> None:
+        super().__init__()
+        self._seq = sequence
+        self._circular = circular
+        self._orfs: list[dict] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="orf-box"):
+            yield Static(" Find ORFs ", id="orf-title")
+            yield Label(f"Sequence: {len(self._seq):,} bp · "
+                        f"{'circular' if self._circular else 'linear'}")
+            with Horizontal(id="orf-controls"):
+                yield Label("Min aa:")
+                yield Input(value="30",
+                            placeholder="30",
+                            id="orf-min-aa", restrict=r"[0-9]*")
+                yield Checkbox("GTG / TTG starts",
+                               value=False, id="orf-alt-starts")
+            with Horizontal(id="orf-btns-top"):
+                yield Button("Scan", id="btn-orf-scan", variant="primary")
+                yield Button("Close", id="btn-orf-close")
+            yield DataTable(id="orf-table", cursor_type="row",
+                            zebra_stripes=True)
+            yield Static("", id="orf-status", markup=True)
+
+    def on_mount(self) -> None:
+        t = self.query_one("#orf-table", DataTable)
+        t.add_columns("Start", "End", "Strand", "Length (aa)", "Preview")
+        # Initial scan with defaults so the user sees something
+        # immediately; rescan via the Scan button after editing controls.
+        self._scan()
+
+    def _scan(self) -> None:
+        try:
+            min_aa = int(
+                self.query_one("#orf-min-aa", Input).value or "30"
+            )
+        except (ValueError, NoMatches):
+            min_aa = 30
+        try:
+            alt = bool(self.query_one("#orf-alt-starts", Checkbox).value)
+        except NoMatches:
+            alt = False
+        self._orfs = _find_orfs(
+            self._seq,
+            min_aa=max(1, min_aa),
+            include_alt_starts=alt,
+            circular=self._circular,
+        )
+        try:
+            t = self.query_one("#orf-table", DataTable)
+        except NoMatches:
+            return
+        t.clear()
+        for o in self._orfs:
+            preview = o["aa_seq"][:24]
+            if len(o["aa_seq"]) > 24:
+                preview += "…"
+            # 1-based bp display matches GenBank coordinates the user
+            # reads in features lane / sidebar.
+            t.add_row(
+                f"{o['start'] + 1:,}",
+                f"{o['end']:,}" if o["end"] >= o["start"]
+                                else f"{o['end']:,} (wrap)",
+                "+" if o["strand"] == 1 else "-",
+                str(o["length_aa"]),
+                preview,
+            )
+        try:
+            self.query_one("#orf-status", Static).update(
+                f"[dim]{len(self._orfs)} ORF(s) ≥ {min_aa} aa[/dim]"
+            )
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-orf-scan")
+    def _scan_btn(self, _) -> None:
+        self._scan()
+
+    @on(DataTable.RowSelected, "#orf-table")
+    def _row_selected(self, event: DataTable.RowSelected) -> None:
+        idx = event.cursor_row
+        if 0 <= idx < len(self._orfs):
+            self.dismiss(self._orfs[idx])
+
+    @on(Button.Pressed, "#btn-orf-close")
+    def _close_btn(self, _) -> None:
         self.dismiss(None)
 
     def action_cancel(self) -> None:
@@ -24853,6 +25113,142 @@ class UnsavedNavigateModal(ModalScreen):
     def action_cancel(self): self.dismiss(None)
 
 
+class LibrarySearchModal(ModalScreen):
+    """Cross-collection plasmid search.
+
+    Lists every plasmid across every collection on disk, fuzzy-
+    filtered as the user types in the input box. The current
+    library panel only filters within the active collection — this
+    modal is the "where did I save that pUC19 variant" affordance.
+
+    Dismiss payload:
+      None                    — cancelled
+      (collection, entry_id)  — user picked a row; caller switches
+                                to that collection and loads the
+                                plasmid via the existing
+                                `_apply_record` flow.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next",   show=False),
+    ]
+
+    def __init__(self, *, initial_query: str = "") -> None:
+        super().__init__()
+        self._initial_query = initial_query
+        self._matches: list[dict] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="libsearch-box"):
+            yield Static(" Find plasmid (across all collections) ",
+                         id="libsearch-title")
+            yield Input(
+                value=self._initial_query,
+                placeholder="type to filter (fuzzy match)…",
+                id="libsearch-input",
+            )
+            yield DataTable(id="libsearch-table",
+                            cursor_type="row",
+                            zebra_stripes=True)
+            yield Static("", id="libsearch-status", markup=True)
+            with Horizontal(id="libsearch-btns"):
+                yield Button("Open", id="btn-libsearch-ok",
+                             variant="primary")
+                yield Button("Close", id="btn-libsearch-close")
+
+    def on_mount(self) -> None:
+        try:
+            t = self.query_one("#libsearch-table", DataTable)
+        except NoMatches:
+            return
+        t.add_columns("Plasmid", "Collection", "Status", "bp")
+        # Initial population — user sees something immediately even
+        # before they start typing. Cap at 200 (matches the helper
+        # default; large libraries get a hint to narrow the query).
+        self._refresh()
+        try:
+            self.query_one("#libsearch-input", Input).focus()
+        except NoMatches:
+            pass
+
+    def _refresh(self) -> None:
+        try:
+            inp = self.query_one("#libsearch-input", Input)
+            t   = self.query_one("#libsearch-table", DataTable)
+        except NoMatches:
+            return
+        query = (inp.value or "").strip()
+        # Strip the prefill text so a user who hasn't focused the
+        # input yet sees all plasmids instead of "search for the
+        # word `Search`".
+        if query == _SearchInput.PREFILL:
+            query = ""
+        self._matches = _search_collections_library(query, limit=300)
+        t.clear()
+        for m in self._matches:
+            status = m.get("status") or ""
+            color  = _PLASMID_STATUS_COLORS.get(status)
+            status_cell = (Text(status, style=f"{color} bold")
+                           if status and color is not None
+                           else Text("—", style="dim"))
+            t.add_row(
+                Text(m["name"], no_wrap=True, overflow="ellipsis"),
+                Text(m["collection"], no_wrap=True, overflow="ellipsis"),
+                status_cell,
+                f"{m.get('size', 0):,}",
+                key=f"{m['collection']}\x00{m['id']}",
+            )
+        try:
+            self.query_one("#libsearch-status", Static).update(
+                f"[dim]{len(self._matches)} match(es)"
+                + (" — refine the query to see more"
+                   if len(self._matches) >= 300 else "")
+                + "[/dim]"
+            )
+        except NoMatches:
+            pass
+
+    @on(Input.Changed, "#libsearch-input")
+    def _on_query_changed(self, _event: Input.Changed) -> None:
+        # Live filter as the user types. The matcher is fast on the
+        # ~few-thousand-plasmid scale collections live at; if it
+        # becomes a bottleneck we can debounce.
+        self._refresh()
+
+    @on(Input.Submitted, "#libsearch-input")
+    def _on_query_submitted(self, _event: Input.Submitted) -> None:
+        # Enter in the input == press Open if there's a match.
+        if not self._matches:
+            return
+        try:
+            t = self.query_one("#libsearch-table", DataTable)
+        except NoMatches:
+            return
+        idx = t.cursor_row if t.cursor_row is not None else 0
+        if 0 <= idx < len(self._matches):
+            m = self._matches[idx]
+            self.dismiss((m["collection"], m["id"]))
+
+    @on(Button.Pressed, "#btn-libsearch-ok")
+    def _ok_btn(self, _) -> None:
+        self._on_query_submitted(None)  # type: ignore[arg-type]
+
+    @on(DataTable.RowSelected, "#libsearch-table")
+    def _row_selected(self, event: DataTable.RowSelected) -> None:
+        idx = event.cursor_row
+        if 0 <= idx < len(self._matches):
+            m = self._matches[idx]
+            self.dismiss((m["collection"], m["id"]))
+
+    @on(Button.Pressed, "#btn-libsearch-close")
+    def _close_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class PlasmidPickerModal(ModalScreen):
     """Scrollable plasmid-picker modal. Shows all entries from the library.
     Dismisses with the selected entry's id, or None on cancel.
@@ -26645,6 +27041,29 @@ def _h_list_collections(app, payload):
     }
 
 
+@_agent_endpoint("search-library")
+def _h_search_library(app, payload):
+    """Cross-collection plasmid name search. Body: ``{query?: str,
+    limit?: int}``. Empty `query` returns the first `limit` plasmids
+    across all collections (default `limit` = 200, capped at 1000).
+    Each match is ``{collection, name, id, size, status, n_feats}``.
+
+    Use `set-active-collection` + `load-entry` (or the GUI
+    equivalent) to actually load a hit. The fuzzy matcher is the
+    same one the library panel's in-collection search uses, so a
+    query of `puc` matches `pUC19`."""
+    query = payload.get("query")
+    if query is not None and not isinstance(query, str):
+        return ({"error": "'query' must be a string"}, 400)
+    raw_limit = payload.get("limit", 200)
+    limit, lim_err = _coerce_int(raw_limit, name="limit")
+    if lim_err is not None:
+        return ({"error": lim_err}, 400)
+    limit = max(1, min(1000, limit))
+    matches = _search_collections_library(query or "", limit=limit)
+    return {"matches": matches, "count": len(matches)}
+
+
 @_agent_endpoint("delete-from-library", write=True)
 def _h_delete_from_library(app, payload):
     """Remove a plasmid library entry by `name`. Body: ``{name}``.
@@ -26711,6 +27130,34 @@ def _h_list_restriction_sites(app, payload):
             "cut_bp":  s.get("top_cut_bp", -1),
         })
     return {"sites": out, "count": len(out)}
+
+
+@_agent_endpoint("find-orfs")
+def _h_find_orfs(app, payload):
+    """Six-frame ORF scan over the loaded record. Body:
+    ``{min_aa?: int, include_alt_starts?: bool}``. Defaults: 30 aa,
+    ATG only. Returns ``{orfs: [{start, end, strand, length_aa, aa_seq}, ...]}``
+    sorted by length descending. ORFs that cross the origin on a
+    circular plasmid are reported with `end < start` — the same
+    wrap-feature convention used elsewhere."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    min_aa, ma_err = _coerce_int(payload.get("min_aa", 30), name="min_aa")
+    if ma_err is not None:
+        return ({"error": ma_err}, 400)
+    if min_aa < 1:
+        return ({"error": "'min_aa' must be ≥ 1"}, 400)
+    alt = bool(payload.get("include_alt_starts", False))
+    seq = str(rec.seq)
+    is_circular = (rec.annotations or {}).get("topology") == "circular"
+    orfs = _find_orfs(
+        seq,
+        min_aa=min_aa,
+        include_alt_starts=alt,
+        circular=is_circular,
+    )
+    return {"orfs": orfs, "count": len(orfs)}
 
 
 @_agent_endpoint("list-codon-tables")
@@ -27764,6 +28211,35 @@ FastaExportModal { align: center middle; }
 #fasta-export-btns { height: 3; margin-top: 1; }
 #fasta-export-btns Button { margin-right: 1; }
 #fasta-export-status { height: 2; margin-top: 1; }
+
+/* ── Cross-collection library search modal ──────────────── */
+LibrarySearchModal { align: center middle; }
+#libsearch-box {
+    width: 100; height: 36;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#libsearch-title  { background: $primary; padding: 0 1; margin-bottom: 1; }
+#libsearch-input  { height: 3; }
+#libsearch-table  { height: 1fr; margin-top: 1; }
+#libsearch-status { height: 1; margin-top: 1; }
+#libsearch-btns   { height: 3; margin-top: 1; }
+#libsearch-btns Button { margin-right: 1; }
+
+/* ── ORF finder modal ────────────────────────────────────── */
+ORFFinderModal { align: center middle; }
+#orf-box {
+    width: 90; height: 36;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#orf-title { background: $primary; padding: 0 1; margin-bottom: 1; }
+#orf-box Label { color: $text-muted; margin-right: 1; }
+#orf-controls { height: 3; }
+#orf-controls Input { width: 8; }
+#orf-controls Checkbox { width: auto; margin-left: 1; }
+#orf-btns-top { height: 3; margin-top: 1; }
+#orf-btns-top Button { margin-right: 1; }
+#orf-table { height: 1fr; margin-top: 1; }
+#orf-status { height: 1; margin-top: 1; }
 
 /* ── Edit-sequence dialog ────────────────────────────────── */
 EditSeqDialog { align: center middle; }
@@ -30263,6 +30739,147 @@ SpeciesPickerModal { align: center middle; }
             callback=_on_done,
         )
 
+    def action_export_fasta(self) -> None:
+        """Prompt for a path and write the current record as FASTA.
+
+        Default: `<record.name>.fa` in the cwd (FASTA is independent
+        of the record's source path; .gb / .dna sources don't carry
+        a useful FASTA default). Single-record output with the
+        plasmid name as the header — matches what Biopython's
+        `SeqIO` writer emits and keeps downstream awk/grep simple.
+        """
+        if self._current_record is None:
+            self.notify("No plasmid loaded.", severity="warning")
+            return
+        name = self._current_record.name or self._current_record.id or "plasmid"
+        default = f"{name}.fa"
+
+        def _on_done(summary):
+            if not summary:
+                return
+            self._notify_success(
+                f"Exported {summary['bp']} bp → {summary['path']}",
+                timeout=8,
+            )
+
+        self.push_screen(
+            FastaExportModal(
+                name=name,
+                sequence=str(self._current_record.seq),
+                default_path=default,
+            ),
+            callback=_on_done,
+        )
+
+    def action_find_plasmid(self) -> None:
+        """Open the cross-collection plasmid search modal. Pre-fix the
+        library panel's search input only filtered within the active
+        collection — finding "that pUC19 variant from last quarter"
+        meant flipping through every collection by hand. This modal
+        covers all collections at once; on row pick we switch to the
+        match's collection (if needed) and load the plasmid through
+        the same `_apply_record` path a regular library row uses.
+        """
+        def _on_done(result):
+            if not result:
+                return
+            coll_name, entry_id = result
+            # Switch active collection if the match isn't already in it.
+            if coll_name != _get_active_collection_name():
+                coll = _find_collection(coll_name)
+                if coll is None:
+                    self.notify(
+                        f"Collection '{coll_name}' is no longer present.",
+                        severity="warning",
+                    )
+                    return
+                _set_active_collection_name(coll_name)
+                plasmids = [dict(p)
+                            for p in (coll.get("plasmids") or [])
+                            if isinstance(p, dict)]
+                _save_library(plasmids)
+                # Tell the LibraryPanel so it repopulates against the
+                # newly-active collection (mirrors the click-twice flow).
+                try:
+                    lib = self.query_one("#library", LibraryPanel)
+                    lib._view_mode = "plasmids"
+                    lib._apply_view_mode()
+                    lib._repopulate_plasmids()
+                except NoMatches:
+                    pass
+            # Load the picked entry from the (now-active) library.
+            for e in _load_library():
+                if e.get("id") == entry_id:
+                    gb_text = e.get("gb_text", "")
+                    if not gb_text:
+                        self.notify(
+                            "Library entry has no embedded sequence.",
+                            severity="warning",
+                        )
+                        return
+                    try:
+                        record = _gb_text_to_record(gb_text)
+                    except Exception as exc:
+                        _log.exception(
+                            "Failed to parse library entry %r", entry_id,
+                        )
+                        self.notify(
+                            f"Could not load plasmid: {exc}",
+                            severity="error",
+                        )
+                        return
+                    self._apply_record(record)
+                    return
+            self.notify(
+                "Plasmid not found in the active collection — it may "
+                "have been deleted or renamed.",
+                severity="warning",
+            )
+
+        self.push_screen(LibrarySearchModal(), callback=_on_done)
+
+    def action_find_orfs(self) -> None:
+        """Open the ORF finder modal. On row pick, highlight the
+        chosen ORF in the sequence panel (sel range + cursor) and on
+        the map, the same way feature clicks do.
+        """
+        if self._current_record is None:
+            self.notify("No plasmid loaded.", severity="warning")
+            return
+        seq_str = str(self._current_record.seq)
+        topology = ""
+        try:
+            topology = (self._current_record.annotations or {}).get(
+                "topology", "") or ""
+        except (AttributeError, KeyError):
+            pass
+        circular = topology.lower() != "linear"
+
+        def _on_done(result):
+            if not result:
+                return
+            sp = self.query_one("#seq-panel", SequencePanel)
+            # Synthesise a feature-like dict so highlight_feature's
+            # existing wrap-aware sel_range logic just works. The seq
+            # panel's `_sel_range = (start, end)` accepts end < start
+            # for wrap features; ORFs that cross the origin slot in
+            # the same way.
+            sp.highlight_feature(
+                {
+                    "start":  result["start"],
+                    "end":    result["end"],
+                    "strand": result["strand"],
+                    "type":   "CDS",
+                    "label":  f"ORF [{result['length_aa']} aa]",
+                },
+                cursor_bp=result["start"],
+            )
+
+        self.push_screen(
+            ORFFinderModal(seq_str, circular=circular),
+            callback=_on_done,
+        )
+
     def action_export_commercialsaas(self) -> None:
         """Prompt for a path and write the current record as CommercialSaaS
         `.dna`. Only available for plasmids that have a sidecar from
@@ -31550,8 +32167,10 @@ SpeciesPickerModal { align: center middle; }
                 ("Fetch from NCBI  [f]",         "fetch"),
                 ("---",                          None),
                 ("Add to Library  [^⇧A]",        "add_to_library"),
+                ("Find plasmid (all collections)…", "find_plasmid"),
                 ("Save  [^S]",                   "save"),
                 ("Export as GenBank (.gb)...",   "export_genbank"),
+                ("Export as FASTA (.fa)...",     "export_fasta"),
                 ("Export as .dna...", "export_commercialsaas"),
                 ("---",                          None),
                 ("Collections...",               "open_collections"),
@@ -31580,6 +32199,8 @@ SpeciesPickerModal { align: center middle; }
                 ("Add Feature...  [^F]",            "add_feature"),
                 ("Capture selection → feat-lib  [^⇧F]", "capture_to_features"),
                 ("Delete Feature",                  "delete_feature"),
+                ("---",                             None),
+                ("Find ORFs…",                      "find_orfs"),
             ],
             "Enzymes": [
                 (f"[{rs}] Show RE sites  [r]",   "toggle_restr"),

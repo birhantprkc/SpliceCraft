@@ -303,6 +303,58 @@ class TestFeaturesHandler:
                     for f in feats)
 
 
+class TestFindOrfsHandler:
+    """`_h_find_orfs` exposes the six-frame ORF scan (added 0.6.0.0).
+    Wraps `_find_orfs` — the algorithm itself is covered by
+    test_dna_sanity.py::TestFindOrfs; here we just verify the agent
+    path returns/normalises shape correctly."""
+
+    def test_empty_when_no_record(self):
+        app = MockApp(record=None)
+        result = sc._h_find_orfs(app, {})
+        assert result == ({"error": "no plasmid loaded"}, 422)
+
+    def test_default_min_aa(self):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        body = "ATG" + "GCC" * 30 + "TAA"   # 99 bp, 31 aa coding
+        rec = SeqRecord(Seq(body + "G" * 21), id="t", name="t")
+        rec.annotations["topology"] = "circular"
+        app = MockApp(record=rec)
+        result = sc._h_find_orfs(app, {})
+        assert "orfs" in result and "count" in result
+        assert result["count"] >= 1
+        # The ATG-stop ORF we built must be present.
+        starts = {(o["start"], o["strand"]) for o in result["orfs"]}
+        assert (0, 1) in starts
+
+    def test_min_aa_filter(self):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        body = "ATG" + "GCC" * 19 + "TAA"   # 20 aa coding
+        rec = SeqRecord(Seq(body), id="t", name="t")
+        app = MockApp(record=rec)
+        # 30 aa rejects, 20 aa keeps.
+        assert sc._h_find_orfs(app, {"min_aa": 30})["count"] == 0
+        assert sc._h_find_orfs(app, {"min_aa": 20})["count"] >= 1
+
+    def test_min_aa_invalid(self):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        rec = SeqRecord(Seq("ATGAAA"), id="t", name="t")
+        app = MockApp(record=rec)
+        result = sc._h_find_orfs(app, {"min_aa": "notanint"})
+        assert isinstance(result, tuple) and result[1] == 400
+
+    def test_min_aa_below_one_rejected(self):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        rec = SeqRecord(Seq("ATGAAA"), id="t", name="t")
+        app = MockApp(record=rec)
+        result = sc._h_find_orfs(app, {"min_aa": 0})
+        assert isinstance(result, tuple) and result[1] == 400
+
+
 class TestLoadFileSizeCap:
     """Regression guard for 2026-05-06 fix: `_h_load_file` previously
     had NO size cap on disk reads — a malicious or buggy agent script
@@ -877,6 +929,75 @@ class TestNewLibraryEndpoints:
             body={"folder": "/no/such/dir/anywhere",
                   "collection": "X"},
             token=token,
+        )
+        assert status == 400
+
+    def test_search_library_across_collections(self, http_server,
+                                                  isolated_library):
+        """`search-library` walks every collection on disk and returns
+        fuzzy-matching plasmids regardless of which one is active."""
+        sc._save_collections([
+            {"name": "ColA", "plasmids": [
+                {"id": "p1", "name": "pUC19_alpha", "size": 100,
+                 "gb_text": "X", "n_feats": 3},
+                {"id": "p2", "name": "pET28b", "size": 200,
+                 "gb_text": "X", "n_feats": 4},
+            ]},
+            {"name": "ColB", "plasmids": [
+                {"id": "p3", "name": "pUC19_beta", "size": 150,
+                 "gb_text": "X", "n_feats": 5},
+            ]},
+        ])
+        sc._set_active_collection_name("ColA")
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/search-library", method="POST",
+            body={"query": "puc19"}, token=token,
+        )
+        assert status == 200, payload
+        names = {(m["collection"], m["name"]) for m in payload["matches"]}
+        assert ("ColA", "pUC19_alpha") in names
+        assert ("ColB", "pUC19_beta") in names
+        # pET28b doesn't match `puc19`.
+        assert ("ColA", "pET28b") not in names
+
+    def test_search_library_empty_query_lists_everything(
+        self, http_server, isolated_library
+    ):
+        sc._save_collections([
+            {"name": "X", "plasmids": [
+                {"id": "a", "name": "a", "size": 1, "gb_text": "x"},
+                {"id": "b", "name": "b", "size": 1, "gb_text": "x"},
+            ]},
+        ])
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/search-library", method="POST", body={}, token=token,
+        )
+        assert status == 200
+        assert payload["count"] == 2
+
+    def test_search_library_limit_clamped(self, http_server,
+                                            isolated_library):
+        sc._save_collections([
+            {"name": "X", "plasmids": [
+                {"id": str(i), "name": f"p{i}", "size": 1, "gb_text": "x"}
+                for i in range(50)
+            ]},
+        ])
+        base, token, _ = http_server
+        status, payload = _http(
+            f"{base}/search-library", method="POST",
+            body={"limit": 5}, token=token,
+        )
+        assert status == 200
+        assert payload["count"] == 5
+
+    def test_search_library_rejects_non_string_query(self, http_server):
+        base, token, _ = http_server
+        status, _ = _http(
+            f"{base}/search-library", method="POST",
+            body={"query": 42}, token=token,
         )
         assert status == 400
 

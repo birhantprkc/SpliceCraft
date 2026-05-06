@@ -2,6 +2,24 @@
 
 ---
 
+## [0.6.0.0] — 2026-05-06
+
+### Added
+
+- **Whole-plasmid FASTA export** — File → Export as FASTA (.fa)…  Pushes `FastaExportModal` (already used by the feature-library + parts-bin export flows) pre-populated with the loaded record's name + sequence. The `_h_export_fasta` agent endpoint already existed; this wires the GUI front-door.
+- **ORF finder** — Edit → Find ORFs… opens `ORFFinderModal` showing every six-frame ORF over the loaded record. Configurable min length (default 30 aa) + opt-in alternative bacterial starts (GTG / TTG). Wrap-aware on circular plasmids: ORFs crossing the origin are reported with `end < start` matching the existing wrap-feature convention. Row pick highlights the ORF in the seq panel + map. New `_find_orfs` helper + `_h_find_orfs` agent endpoint.
+- **Cross-collection plasmid search** — File → Find plasmid (all collections)… opens `LibrarySearchModal` with a fuzzy-matched live-filtered table of every plasmid across every collection on disk. Selecting a row switches the active collection (if needed) and loads the plasmid through the existing `_apply_record` flow. New `_search_collections_library` helper + `_h_search_library` agent endpoint.
+
+### Tests
+
+- 26 new tests covering `_find_orfs` (forward / reverse / wrap / alt-starts / dedupe), `action_export_fasta`, `_search_collections_library`, `action_find_plasmid`, the new agent endpoints (`find-orfs`, `search-library`), and modal-fits-in-baseline-terminal coverage for `ORFFinderModal` and `LibrarySearchModal`.
+
+### Roadmap
+
+- v1.0.0.0 scope locked: FASTA export ✓, GFF export, diff view, ORF finder ✓, annotation transfer, cross-collection search ✓, SnapGene .dna round-trip (in flight), stability gate. No CLI — every new feature ships an agent-API endpoint instead.
+
+---
+
 ## [0.5.13.0] — 2026-05-06
 
 ### Security
