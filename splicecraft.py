@@ -6050,6 +6050,12 @@ class PlasmidMap(Widget):
         Binding("shift+[",     "rotate_ccw_lg",    "Rotate ←←",     show=False),
         Binding("shift+]",     "rotate_cw_lg",     "Rotate →→",     show=False),
         Binding("home",        "reset_origin",     "Reset",         show=False),
+        # Alt+O — re-anchor the display origin at the highlighted
+        # feature's start. Cascades through the OriginChanged watcher
+        # to reorder the sidebar + shift the seq panel. Hidden from
+        # the Footer; documented in the Help modal.
+        Binding("alt+o",       "set_origin_to_selected",
+                                                  "Set origin (Alt+O)", show=False),
         Binding("comma",       "aspect_dec",       "Circle wider",   show=False),
         Binding("full_stop",   "aspect_inc",       "Circle taller",  show=False),
         Binding("v",           "toggle_map_view",  "Toggle view",    show=False),
@@ -6096,6 +6102,17 @@ class PlasmidMap(Widget):
             # convention: anchor stays the originally-selected feature;
             # subsequent shift+clicks redefine the END of the span only.
             self.shift     = bool(shift)
+            super().__init__()
+
+    class OriginChanged(Message):
+        """Emitted whenever `origin_bp` changes (rotation, reset, or
+        Alt+O set-origin-to-feature). The App listens and cascades the
+        new origin to the FeatureSidebar (re-sort) and SequencePanel
+        (re-render with the rotated origin). Carries `total_bp` so
+        receivers don't need to re-query the record's length."""
+        def __init__(self, origin_bp: int, total_bp: int):
+            self.origin_bp = int(origin_bp)
+            self.total_bp  = int(total_bp)
             super().__init__()
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -6424,6 +6441,64 @@ class PlasmidMap(Widget):
             self.action_linear_reset_zoom()
             return
         self.origin_bp = 0
+
+    def action_set_origin_to_selected(self) -> None:
+        """Alt+O — re-anchor the display origin at the currently
+        selected feature's start. Mirror of `action_reset_origin` but
+        for the highlighted feature instead of bp 0. Cascades to the
+        sidebar (re-sort) and seq panel (rotate display) via the
+        ``OriginChanged`` watcher.
+
+        No-op when nothing is selected, when the feature has no usable
+        ``start``, or in linear-view mode (rotation only makes sense
+        on a circular topology). Notifies in the linear case so the
+        user knows why the keystroke didn't take.
+        """
+        if not self._total or self._map_mode == "linear":
+            try:
+                self.app.notify(
+                    "Set origin only works on circular maps "
+                    "(press 'v' to switch).",
+                    severity="information", timeout=3,
+                )
+            except Exception:
+                pass
+            return
+        idx = self.selected_idx
+        if idx < 0 or idx >= len(self._feats):
+            try:
+                self.app.notify(
+                    "Pick a feature first — Alt+O re-anchors the "
+                    "origin at the highlighted feature's start.",
+                    severity="information", timeout=3,
+                )
+            except Exception:
+                pass
+            return
+        f = self._feats[idx]
+        try:
+            new_origin = int(f.get("start", 0)) % self._total
+        except (TypeError, ValueError):
+            return
+        self.origin_bp = new_origin
+
+    def watch_origin_bp(self, old: int, new: int) -> None:
+        """Cascade rotation to the sidebar + seq panel via the
+        ``OriginChanged`` message. Textual fires this watcher whenever
+        ``self.origin_bp`` is reassigned (rotation actions, set-origin-
+        to-feature, reset). The widget itself already re-renders on
+        reactive change; this watcher only adds the cross-panel sync
+        so the feature list reorders + sequence viewer shifts to put
+        the new origin at the top.
+
+        ``old != new`` guard skips the synthetic initial fire (Textual
+        fires once on first read with `old == new`)."""
+        if old == new:
+            return
+        try:
+            self.post_message(self.OriginChanged(int(new), int(self._total)))
+        except Exception:
+            pass
 
     # ── Linear-view zoom + pan ─────────────────────────────────────────────
     # Zoom factor 1.0 = the whole record fits in the visible width.
@@ -7533,6 +7608,12 @@ class FeatureSidebar(Widget):
     BINDINGS = [
         Binding("enter", "open_feature_at_cursor",
                 "Open feature", priority=True, show=False),
+        # Alt+O — re-anchor the display origin at the highlighted
+        # row's feature. Mirrors the map's binding so the user can
+        # set origin without leaving the sidebar (the cursor row
+        # carries the same intent as the map's selected feature).
+        Binding("alt+o", "set_origin_to_row",
+                "Set origin", priority=True, show=False),
     ]
 
     class RowActivated(Message):
@@ -7562,33 +7643,76 @@ class FeatureSidebar(Widget):
     def on_mount(self):
         t = self.query_one("#feat-table", DataTable)
         t.add_columns("Type", "Label", "bp", "±")
+        # `_view_origin_bp` mirrors the plasmid map's rotation so the
+        # row order matches what the user sees on the circular map —
+        # rotating the map's origin by N reorders the sidebar to start
+        # with the feature nearest the new origin going clockwise.
+        # Updated by the App on `PlasmidMap.OriginChanged` events.
+        self._view_origin_bp: int = 0
+        self._total_bp:        int = 0
+
+    def set_view_origin(self, origin_bp: int, total_bp: int) -> None:
+        """Re-anchor the row order around `origin_bp` (display origin).
+        Pure UI rotation — feature dicts retain their absolute coords.
+        `total_bp` is the record length so the modular sort wraps
+        correctly. Both parameters round-trip on every populate; this
+        method just refreshes the table without rebuilding from the
+        record. Called from the App's `OriginChanged` handler.
+        """
+        if origin_bp == self._view_origin_bp and total_bp == self._total_bp:
+            return
+        self._view_origin_bp = max(0, int(origin_bp))
+        self._total_bp       = max(0, int(total_bp))
+        # Find the feats list the table was last populated with — we
+        # stash a reference so re-sort doesn't need a round-trip
+        # through the App.
+        if getattr(self, "_last_feats", None) is not None:
+            self.populate(self._last_feats)
 
     @staticmethod
-    def _sort_key(f: dict) -> tuple:
-        """Sort features by appearance order from origin (clockwise on
-        circular plasmids; left-to-right on linear).
+    def _sort_key(f: dict, origin_bp: int = 0, total_bp: int = 0) -> tuple:
+        """Sort features by appearance order from the display origin
+        (clockwise on circular plasmids; left-to-right on linear),
+        so the sidebar stays in sync with the plasmid map's rotation.
 
-        Primary key: ``start`` ASC — the position where the feature is
-        first encountered traversing from the origin. A wrap feature's
-        ``start`` is its physical position (e.g. 5800 on a 6000 bp
-        plasmid) so it sorts to the end of the list, which matches
-        the "going clockwise from 0, when do we hit it" intuition.
+        Primary key: ``(start - origin) % total`` ASC — the distance
+        from the display origin going clockwise. With ``origin == 0``
+        this is the original ``start`` ASC. When the user rotates the
+        map (or hits Alt+O on a feature), the same feature stays at
+        the top of the list while everything else shifts.
 
-        Secondary key: ``end`` ASC — when two features start at the
-        same bp, the shorter one (smaller end, "span closest to the
-        origin") wins the tie. This puts a tightly-scoped feature
-        like a `primer_bind` ahead of a CDS that nests around it,
-        which feels right when the user is scanning a list.
+        Secondary key: ``(end - origin) % total`` ASC — when two
+        features start at the same bp, the shorter one wins the tie
+        (smaller end → "span closer to the origin"). Puts a tightly-
+        scoped feature like a `primer_bind` ahead of a CDS that nests
+        around it, which feels right when scanning a list.
+
+        Wrap features (``end < start``) get the same modular shift so
+        they land at the correct rotated position — a wrap feature at
+        (5800, 200) on a 6000 bp plasmid rotated by ``origin=5500``
+        lands at distance 300 clockwise from the new origin.
+
+        With ``origin_bp == 0`` (or ``total_bp == 0``, the typical
+        unrotated path) the function reduces to the historical
+        ``(start, end)`` tuple — verified by the existing sort tests.
 
         Falls back to ``0`` for missing / non-int coords so a malformed
         feature dict can't trip the sort with a TypeError.
         """
         start = int(f.get("start", 0) or 0)
         end   = int(f.get("end",   0) or 0)
+        n = int(total_bp or 0)
+        o = int(origin_bp or 0)
+        if n > 0 and o > 0:
+            return ((start - o) % n, (end - o) % n)
         return (start, end)
 
     def populate(self, feats: list[dict]) -> None:
         t = self.query_one("#feat-table", DataTable)
+        # Stash for `set_view_origin` so map rotation can re-sort
+        # without bouncing through the App. Same reference, not a
+        # copy — sidebar reads but never mutates the list.
+        self._last_feats = feats
         # Suppress the RowHighlighted cascade that fires when DataTable auto-
         # moves the cursor to row 0 after clear()+add_row. Without this guard,
         # every record load triggers a redundant SequencePanel rebuild (the
@@ -7611,7 +7735,9 @@ class FeatureSidebar(Widget):
         # idx, used by `highlight_row(idx)` from the App side.
         sorted_feat_idxs = sorted(
             range(len(feats)),
-            key=lambda i: self._sort_key(feats[i]),
+            key=lambda i: self._sort_key(
+                feats[i], self._view_origin_bp, self._total_bp,
+            ),
         )
         self._row_to_feat_idx = sorted_feat_idxs
         self._feat_idx_to_row = {
@@ -7804,6 +7930,31 @@ class FeatureSidebar(Widget):
         if feat_idx < 0:
             return
         self.post_message(self.RowOpened(feat_idx))
+
+    def action_set_origin_to_row(self) -> None:
+        """Alt+O on the sidebar — re-anchor the map's display origin
+        at the row the table cursor is currently on. Defers to the
+        plasmid map's `action_set_origin_to_selected` after first
+        nudging the map's `selected_idx` to match the cursor row, so
+        the keystroke works the same way whether the user pressed
+        Alt+O on the map or here.
+        """
+        try:
+            t = self.query_one("#feat-table", DataTable)
+        except NoMatches:
+            return
+        cursor_row = t.cursor_row
+        if cursor_row is None or cursor_row < 0:
+            return
+        feat_idx = self._row_to_feat(cursor_row)
+        if feat_idx < 0:
+            return
+        try:
+            pm = self.app.query_one("#plasmid-map", PlasmidMap)
+        except (NoMatches, AttributeError):
+            return
+        pm.selected_idx = feat_idx
+        pm.action_set_origin_to_selected()
 
 
 # ── Library panel ──────────────────────────────────────────────────────────────
@@ -8803,6 +8954,12 @@ class SequencePanel(Widget):
         # action no-ops when no feature is currently selected on the
         # plasmid map, so plain Enter outside a feature is harmless.
         Binding("enter", "open_selected_feature", "Open feature", show=False),
+        # Alt+O — re-anchor the display origin at the currently
+        # highlighted feature (= same `selected_idx` the map shows).
+        # Mirrors the map / sidebar bindings so the user can set
+        # origin from any focused panel.
+        Binding("alt+o", "set_origin_to_selected",
+                "Set origin", show=False),
     ]
 
     DEFAULT_CSS = """
@@ -8852,6 +9009,20 @@ class SequencePanel(Widget):
             self.app._open_feature_editor(idx)
         except AttributeError:
             pass
+
+    def action_set_origin_to_selected(self) -> None:
+        """Alt+O on the seq panel — re-anchor the map's display
+        origin at the currently-highlighted feature's start.
+        Routes through the map's `action_set_origin_to_selected`
+        so the cascade (sidebar re-sort + seq panel rotation) fires
+        from a single source of truth — same code path as the map
+        + sidebar Alt+O bindings.
+        """
+        try:
+            pm = self.app.query_one("#plasmid-map", PlasmidMap)
+        except (NoMatches, AttributeError):
+            return
+        pm.action_set_origin_to_selected()
 
     def action_toggle_debug(self) -> None:
         """Alt+D — show / hide the seq-panel hover-status diagnostic
@@ -9158,6 +9329,25 @@ class SequencePanel(Widget):
         super().__init__(**kwargs)
         self._seq:          str                     = ""
         self._feats:        list[dict]              = []
+        # Display rotation: when non-zero, the seq panel renders the
+        # sequence + feature lanes starting at this absolute bp instead
+        # of bp 0 — same convention as the plasmid map's `origin_bp`.
+        # Set by the App's `OriginChanged` handler whenever the user
+        # rotates the map (← / → / [ / ] / Alt+O / mouse wheel) so all
+        # three views (map / sidebar / seq) share one notion of origin.
+        # `self._seq` and `self._feats` stay in absolute coords; the
+        # rotation is applied on the way to the renderer + click
+        # resolution via `_get_rotated_state`. Display ↔ absolute
+        # conversions are `(disp + O) % n` and `(abs - O) % n`.
+        self._view_origin_bp: int = 0
+        # Cache of the rotated (seq, feats) for the current origin.
+        # Keyed on (id(self._seq), id(self._feats), origin_bp).
+        # Keeps `_refresh_view` + `_click_to_bp` + `_bp_to_content_row`
+        # from re-rotating on every interaction; invalidated on
+        # `update_seq` (new identities) or `set_view_origin` (new key).
+        self._rotated_cache_key: "tuple | None" = None
+        self._rotated_seq:       "str | None"   = None
+        self._rotated_feats:     "list[dict] | None" = None
         # Last mouse position seen by `on_mouse_move` — captured so
         # `H` can re-run `_hover_at` and copy the verbatim status to
         # the system clipboard. Initial (-1, -1) sentinel means
@@ -9289,7 +9479,17 @@ class SequencePanel(Widget):
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def update_seq(self, seq: str, feats: list[dict]) -> None:
-        """Called after loading a record or committing an edit."""
+        """Called after loading a record or committing an edit.
+
+        Does NOT reset `_view_origin_bp` — the plasmid map owns the
+        origin and posts `OriginChanged` whenever it changes. New
+        record loads cascade through the watcher (the map's
+        `load_record` resets `origin_bp` to 0); in-place edits leave
+        the rotation untouched so the view doesn't snap back to bp 0
+        every time the user types Ctrl+E. The rotated cache is
+        invalidated unconditionally because `seq` and `feats`
+        identities changed.
+        """
         self._seq          = seq
         self._feats        = feats
         self._sorted_feats_cache = None
@@ -9300,7 +9500,94 @@ class SequencePanel(Widget):
         self._re_highlight = None
         self._aa_highlight = None
         self._sel_anchor   = -1
+        self._rotated_cache_key = None
+        self._rotated_seq = None
+        self._rotated_feats = None
         self._refresh_view()
+
+    def set_view_origin(self, origin_bp: int) -> None:
+        """Re-render starting at absolute bp ``origin_bp``. Pure UI
+        rotation — `self._seq` / `self._feats` stay in absolute coords.
+        Called from the App's `OriginChanged` handler whenever the
+        user rotates the plasmid map.
+
+        ``origin_bp == 0`` (or out-of-range) restores the historical
+        unrotated view. The cache is invalidated unconditionally on
+        change so a stale rotated copy can't outlive a reset.
+        """
+        try:
+            o = int(origin_bp) % len(self._seq) if self._seq else 0
+        except (TypeError, ValueError):
+            return
+        if o == self._view_origin_bp:
+            return
+        self._view_origin_bp = o
+        self._rotated_cache_key = None
+        self._rotated_seq = None
+        self._rotated_feats = None
+        self._refresh_view()
+        # The cursor + selection ranges are stored in absolute coords;
+        # after rotation the same absolute positions map to different
+        # display rows, so re-scroll if a cursor is set.
+        if self._cursor_pos >= 0:
+            self._ensure_cursor_visible()
+
+    def _get_rotated_state(self) -> "tuple[str, list[dict]]":
+        """Return ``(display_seq, display_feats)`` for the current
+        rotation. ``display_seq`` is ``self._seq`` rotated so the byte
+        at index 0 corresponds to absolute bp ``self._view_origin_bp``.
+        Each feature's ``start`` / ``end`` are shifted by
+        ``-origin_bp (mod n)`` so a non-wrap feature whose original
+        span straddles the new origin becomes a wrap feature in
+        display coords (and vice versa); the existing wrap-aware
+        renderer handles both cases.
+
+        Cached on (seq id, feats id, origin) so repeat calls during a
+        single render pass + the matched click path share one
+        rotation. The cache is invalidated by `update_seq` and
+        `set_view_origin`. Origin 0 is the fast path — returns the
+        original references unchanged so the unrotated view pays no
+        extra allocation cost.
+        """
+        n = len(self._seq)
+        o = int(self._view_origin_bp) if n > 0 else 0
+        if o <= 0 or n == 0:
+            return self._seq, self._feats
+        key = (id(self._seq), id(self._feats), o)
+        if (self._rotated_cache_key == key
+                and self._rotated_seq is not None
+                and self._rotated_feats is not None):
+            return self._rotated_seq, self._rotated_feats
+        rot_seq = self._seq[o:] + self._seq[:o]
+        rot_feats: list[dict] = []
+        for f in self._feats:
+            try:
+                s = int(f.get("start", 0))
+                e = int(f.get("end",   0))
+            except (TypeError, ValueError):
+                continue
+            new = dict(f)
+            new["start"] = (s - o) % n
+            new["end"]   = (e - o) % n
+            rot_feats.append(new)
+        self._rotated_cache_key = key
+        self._rotated_seq       = rot_seq
+        self._rotated_feats     = rot_feats
+        return rot_seq, rot_feats
+
+    def _abs_to_disp(self, bp: int) -> int:
+        """Absolute bp → display bp under current rotation. ``bp == -1``
+        passes through (no-cursor / no-selection sentinel)."""
+        if bp < 0 or self._view_origin_bp == 0 or not self._seq:
+            return bp
+        return (bp - self._view_origin_bp) % len(self._seq)
+
+    def _disp_to_abs(self, bp: int) -> int:
+        """Display bp → absolute bp under current rotation. ``bp == -1``
+        passes through."""
+        if bp < 0 or self._view_origin_bp == 0 or not self._seq:
+            return bp
+        return (bp + self._view_origin_bp) % len(self._seq)
 
     def highlight_feature(self, feat: "dict | None", cursor_bp: int = -1,
                             scroll: bool = True) -> None:
@@ -9555,8 +9842,14 @@ class SequencePanel(Widget):
         # chunk containing `content_row` is the largest `i` with
         # `prefix_dna2[i] <= content_row`. show_connectors path is
         # unused (rpg==2 always); kept simple.
+        # Hover uses the rotated views so feature-owner lookups land
+        # on the right feature when the map is rotated. The `bp`
+        # field returned for DNA-strand hovers is converted back to
+        # absolute coords for the hover-status row, which displays
+        # the user's original record position.
+        disp_seq, disp_feats = self._get_rotated_state()
         chunks_layout, prefix_dna2, _pf_lanes = _chunk_layout(
-            self._seq, self._feats, line_width,
+            disp_seq, disp_feats, line_width,
         )
         if not chunks_layout:
             return {"kind": "no_chunks"}
@@ -9615,7 +9908,11 @@ class SequencePanel(Widget):
                     "strand": "fwd" if row_after_above == 0 else "rev",
                     "chunk": chunk_idx,
                     "seq_col": seq_col,
-                    "bp": chunk_start + seq_col,
+                    # `chunk_start + seq_col` is in display coords;
+                    # report absolute bp so the hover-status / tooltip
+                    # show the user's record position even when the
+                    # map is rotated.
+                    "bp": self._disp_to_abs(chunk_start + seq_col),
                 }
             return {"kind": "dna_off",
                     "chunk": chunk_idx,
@@ -9913,10 +10210,17 @@ class SequencePanel(Widget):
         n           = len(self._seq)
         num_w       = len(str(n)) if n else 1
         line_width  = max(20, self._seq_render_width() - (num_w + 2))
+        # Click resolution must use the SAME (seq, feats) the renderer
+        # used — so when the map's origin is rotated, we resolve
+        # clicks against the rotated views and convert the resulting
+        # display bp back to absolute at the end. Without this, a
+        # click on display row 0 col 0 with a non-zero origin would
+        # land on absolute bp 0 (= the wrong base).
+        disp_seq, disp_feats = self._get_rotated_state()
         # Insertion order — must match the renderer's `_build_seq_inputs`
         # so click resolution lands on the SAME packed_row as what's
         # actually drawn. Sorting by length here would diverge.
-        annot_feats = [f for f in self._feats
+        annot_feats = [f for f in disp_feats
                        if f.get("type") not in ("site", "recut")]
         seq_col = vp_x - (num_w + 2)   # offset past the num+2-space prefix
 
@@ -9925,7 +10229,7 @@ class SequencePanel(Widget):
         # a click on a 200 kb cosmid did ~1500 chunk decompositions
         # (each O(F)). `_hover_at` already uses this pattern; mirror it.
         chunks_layout, prefix_dna2, _pf_lanes = _chunk_layout(
-            self._seq, self._feats, line_width,
+            disp_seq, disp_feats, line_width,
         )
         if not chunks_layout:
             self._last_click_debug = {"reason": "no_chunks"}
@@ -10080,10 +10384,21 @@ class SequencePanel(Widget):
                                 cs = click_bp - 1
                                 ce = click_bp + 2
                                 if 0 <= cs and ce <= n:
-                                    self._last_aa_codon_click = (cs, ce)
+                                    # Codon coords go through to
+                                    # `_user_sel` (the seq-panel range
+                                    # selection) which lives in
+                                    # absolute coords; convert from the
+                                    # display coords we computed above
+                                    # so a rotated view's codon click
+                                    # still selects the right 3 bases
+                                    # of the underlying record.
+                                    self._last_aa_codon_click = (
+                                        self._disp_to_abs(cs),
+                                        self._disp_to_abs(ce),
+                                    )
                                 self._last_lane_click = True
                                 self._last_lane_feat  = f
-                                return click_bp
+                                return self._disp_to_abs(click_bp)
                             # Click in an empty AA-row cell (between
                             # letters) — treat it as a click on the
                             # CDS itself so the previous selection
@@ -10095,7 +10410,9 @@ class SequencePanel(Widget):
                             # within an overlapping CDS's footprint.
                             self._last_lane_click = True
                             self._last_lane_feat  = f
-                            return (f["start"] + f["end"]) // 2
+                            return self._disp_to_abs(
+                                (f["start"] + f["end"]) // 2,
+                            )
                         else:
                             self._last_lane_click = True
                         # Stash the actual feature dict so the App
@@ -10104,7 +10421,9 @@ class SequencePanel(Widget):
                         # a small inner feature when the user's click
                         # landed on a larger overlapping bar).
                         self._last_lane_feat = f
-                        return (f["start"] + f["end"]) // 2
+                        return self._disp_to_abs(
+                            (f["start"] + f["end"]) // 2,
+                        )
                 # Conservative lenient fallback — owner-fill missed
                 # AND footprint loop missed (= click cell is outside
                 # every feature's rectangle on this strand). If the
@@ -10128,7 +10447,9 @@ class SequencePanel(Widget):
                         self._last_lane_click = True
                     self._last_lane_feat = f
                     self._last_resolve_via = "lenient_solo"
-                    return (f["start"] + f["end"]) // 2
+                    return self._disp_to_abs(
+                        (f["start"] + f["end"]) // 2,
+                    )
                 return -1
 
         # Per-chunk row layout (top → bottom):
@@ -10138,6 +10459,8 @@ class SequencePanel(Widget):
         #   above_rows + 2 + below_rows                  → trailing gap
         if row_in_chunk < above_rows:
             k  = row_in_chunk
+            # `_check_packed` returns absolute bp already (its returns
+            # all run through `_disp_to_abs`). No re-conversion here.
             bp = _check_packed(above_p, k, above_rows, False)
             if bp < 0:
                 self._last_click_debug = {
@@ -10151,7 +10474,11 @@ class SequencePanel(Widget):
             return bp
         if row_in_chunk < above_rows + 2:
             if 0 <= seq_col < (chunk_end - chunk_start):
-                return chunk_start + seq_col
+                # `chunk_start + seq_col` is in DISPLAY coords (chunks
+                # were built from the rotated views); convert back so
+                # the caller's `_cursor_pos = bp` lands on the right
+                # absolute base under a non-zero rotation.
+                return self._disp_to_abs(chunk_start + seq_col)
             self._last_click_debug = {
                 "reason": "dna_off_strand",
                 "chunk": chunk_start // line_width,
@@ -10187,6 +10514,11 @@ class SequencePanel(Widget):
     def _bp_to_content_row(self, bp: int) -> int:
         """Return the content row index (0-based) of the DNA line containing bp.
 
+        Accepts ``bp`` in ABSOLUTE record coords; converts to display
+        coords for the chunk lookup so `center_on_bp` / `_ensure_
+        cursor_visible` scroll to the right row under a non-zero
+        rotation.
+
         O(1) via `_chunk_layout` prefix sums — direct index by `bp //
         line_width` plus arithmetic on cached above/below pair counts. The
         previous chunk-by-chunk re-scan was the bottleneck for cursor
@@ -10198,8 +10530,12 @@ class SequencePanel(Widget):
         line_width = self._line_width()
         if line_width <= 0:
             return 0
+        # Use the rotated views so the chunk layout matches what's
+        # rendered. `_chunk_layout` is keyed on object id, so calling
+        # with rotated views misses the unrotated cache (correctly).
+        disp_seq, disp_feats = self._get_rotated_state()
         chunks_layout, prefix_dna2, prefix_lanes = _chunk_layout(
-            self._seq, self._feats, line_width
+            disp_seq, disp_feats, line_width
         )
         if not chunks_layout:
             return 0
@@ -10207,7 +10543,9 @@ class SequencePanel(Widget):
         # chunk reports literal row counts directly); ignore connectors
         # for now — the show_connectors path is unused after the
         # 2026-04-30 packing refactor.
-        chunk_idx = min(bp // line_width, len(chunks_layout) - 1)
+        # Convert absolute bp → display bp before chunk lookup.
+        disp_bp = self._abs_to_disp(bp)
+        chunk_idx = min(disp_bp // line_width, len(chunks_layout) - 1)
         chunk_info  = chunks_layout[chunk_idx]
         above_rows  = chunk_info[3]
         rows_before = prefix_dna2[chunk_idx]
@@ -10384,20 +10722,55 @@ class SequencePanel(Widget):
         if not self._seq:
             view.update(Text("  No sequence loaded.", style="dim italic"))
             return
+        # Rotated views: when `_view_origin_bp == 0` these alias the
+        # absolute lists (no allocation); otherwise we render against
+        # the rotated copy so display row 0 starts at the new origin.
+        # Internal state (_cursor_pos, _sel_range, _user_sel,
+        # _re_highlight, _aa_highlight) lives in absolute coords; we
+        # shift to display coords ON THE WAY into `_build_seq_text`.
+        disp_seq, disp_feats = self._get_rotated_state()
         # num_w-char line number + "  " (2) + seq = num_w + 2 overhead
         # Use actual scroll-container content width (excludes 2-col vertical scrollbar)
         num_w      = len(str(len(self._seq))) if self._seq else 1
         line_width = max(20, self._seq_render_width() - (num_w + 2))
+        # Shift the cursor + selection ranges into display coords so
+        # the renderer paints the highlight at the right cell after
+        # rotation. Wrap-around selections (display end < start after
+        # rotation) get the same handling that wrap features already
+        # have in `_build_seq_text`.
+        disp_cursor = self._abs_to_disp(self._cursor_pos)
+        disp_sel    = (
+            (self._abs_to_disp(self._sel_range[0]),
+             self._abs_to_disp(self._sel_range[1]))
+            if self._sel_range else None
+        )
+        disp_user_sel = (
+            (self._abs_to_disp(self._user_sel[0]),
+             self._abs_to_disp(self._user_sel[1]))
+            if self._user_sel else None
+        )
+        disp_re_hi: "dict | None" = None
+        if self._re_highlight:
+            disp_re_hi = dict(self._re_highlight)
+            disp_re_hi["start"]         = self._abs_to_disp(self._re_highlight["start"])
+            disp_re_hi["end"]           = self._abs_to_disp(self._re_highlight["end"])
+            disp_re_hi["top_cut_bp"]    = self._abs_to_disp(self._re_highlight.get("top_cut_bp", -1))
+            disp_re_hi["bottom_cut_bp"] = self._abs_to_disp(self._re_highlight.get("bottom_cut_bp", -1))
+        disp_aa_hi: "dict | None" = None
+        if self._aa_highlight is not None:
+            disp_aa_hi = dict(self._aa_highlight)
+            disp_aa_hi["start"] = self._abs_to_disp(self._aa_highlight["start"])
+            disp_aa_hi["end"]   = self._abs_to_disp(self._aa_highlight["end"])
         reh_key = (
-            self._re_highlight["start"], self._re_highlight["end"]
-        ) if self._re_highlight else None
+            disp_re_hi["start"], disp_re_hi["end"]
+        ) if disp_re_hi else None
         # Content-derived key matches the inner _CHUNK_OVERLAY_CACHE
         # so both invalidation layers see the same notion of "changed
         # active CDS".
         aa_key = (
-            (self._aa_highlight["start"], self._aa_highlight["end"],
-             self._aa_highlight.get("strand", 0))
-            if self._aa_highlight is not None else None
+            (disp_aa_hi["start"], disp_aa_hi["end"],
+             disp_aa_hi.get("strand", 0))
+            if disp_aa_hi is not None else None
         )
         # Lazy-render viewport: only chunks whose row range overlaps
         # the visible scroll window get fresh-rendered. Above the
@@ -10423,20 +10796,21 @@ class SequencePanel(Widget):
                 vp = (lo, hi)
             except Exception:
                 vp = None
-        key = (id(self._seq), id(self._feats), line_width,
-               self._sel_range, self._user_sel, self._cursor_pos,
-               self._show_connectors, reh_key, aa_key, vp)
+        key = (id(disp_seq), id(disp_feats), line_width,
+               disp_sel, disp_user_sel, disp_cursor,
+               self._show_connectors, reh_key, aa_key, vp,
+               self._view_origin_bp)
         if key != self._view_cache_key:
             with _log_timing("seq.build_text"):
                 self._view_cache_txt = _build_seq_text(
-                    self._seq, self._feats,
+                    disp_seq, disp_feats,
                     line_width      = line_width,
-                    sel_range       = self._sel_range,
-                    user_sel        = self._user_sel,
-                    cursor_pos      = self._cursor_pos,
+                    sel_range       = disp_sel,
+                    user_sel        = disp_user_sel,
+                    cursor_pos      = disp_cursor,
                     show_connectors = self._show_connectors,
-                    re_highlight    = self._re_highlight,
-                    aa_highlight    = self._aa_highlight,
+                    re_highlight    = disp_re_hi,
+                    aa_highlight    = disp_aa_hi,
                     viewport_y_range = vp,
                 )
             self._view_cache_key = key
@@ -10686,7 +11060,9 @@ _HELP_BODY_MD = """\
 |---|---|
 | `←` `→` | Rotate (circular map) · pan (linear map) · move cursor (seq focus) |
 | `Shift+←/→` | Coarse rotate / pan, or extend selection |
+| `[` `]` | Rotate (alternate keys, no-conflict with text edit) |
 | `Home` | Reset map origin / jump to row start (seq) |
+| `Alt+O` | Set highlighted feature as new origin (rotates map · re-sorts sidebar · shifts seq panel — works from any panel) |
 | `End` | Jump to row end (seq panel) |
 | `v` | Toggle linear / circular map |
 | `+` / `=` | Zoom IN (linear map only) |
@@ -35925,6 +36301,31 @@ SpeciesPickerModal { align: center middle; }
             if seq_pnl._aa_highlight is not None:
                 seq_pnl._aa_highlight = None
                 seq_pnl._refresh_view()
+
+    @on(PlasmidMap.OriginChanged)
+    def _on_origin_changed(self, event: PlasmidMap.OriginChanged) -> None:
+        """Cascade map rotation to the sidebar + sequence panel so all
+        three views share a single notion of "where does the plasmid
+        start". The map already re-renders itself (the reactive does
+        it); this handler propagates the new origin to the panels
+        that don't watch ``origin_bp`` directly.
+
+        Sidebar: re-sort by distance from the new origin.
+        Seq panel: rotate the displayed sequence so the new origin
+                   is the first base of the viewer.
+        """
+        try:
+            sidebar = self.query_one("#sidebar", FeatureSidebar)
+        except NoMatches:
+            sidebar = None
+        if sidebar is not None:
+            sidebar.set_view_origin(event.origin_bp, event.total_bp)
+        try:
+            seq_pnl = self.query_one("#seq-panel", SequencePanel)
+        except NoMatches:
+            seq_pnl = None
+        if seq_pnl is not None:
+            seq_pnl.set_view_origin(event.origin_bp)
 
     @on(PlasmidMap.FeatureSelected)
     def _map_feat_selected(self, event: PlasmidMap.FeatureSelected):

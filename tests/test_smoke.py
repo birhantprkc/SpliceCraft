@@ -1993,6 +1993,38 @@ class TestSidebarSortOrder:
         # head, middle, wrap (wrap last because start=5800).
         assert ranked == [1, 2, 0]
 
+    def test_sort_key_with_origin_rotation(self):
+        # When the user rotates the plasmid map's origin, the sidebar
+        # re-sorts so the feature nearest the new origin (clockwise)
+        # comes first. Distance is `(start - origin) % total`.
+        n = 6000
+        a = {"start": 100,  "end": 200,  "strand": 1}
+        b = {"start": 1000, "end": 1100, "strand": 1}
+        c = {"start": 4000, "end": 4500, "strand": 1}
+        feats = [a, b, c]
+        # Rotate origin to bp 500. Distances: a=(100-500)%6000=5600,
+        # b=(1000-500)%6000=500, c=(4000-500)%6000=3500. So b comes
+        # first (closest clockwise from origin), then c, then a.
+        ranked = sorted(range(len(feats)),
+                        key=lambda i: sc.FeatureSidebar._sort_key(
+                            feats[i], origin_bp=500, total_bp=n,
+                        ))
+        assert ranked == [1, 2, 0]   # b, c, a
+
+    def test_sort_key_with_origin_zero_unrotated(self):
+        # `origin_bp=0` (or `total_bp=0`) is the unrotated path —
+        # falls back to the historical `(start, end)` sort. Verifies
+        # the rotation parameter doesn't change historical behaviour
+        # when the user hasn't rotated.
+        a = {"start": 100, "end": 200, "strand": 1}
+        b = {"start": 50,  "end": 150, "strand": 1}
+        feats = [a, b]
+        ranked = sorted(range(len(feats)),
+                        key=lambda i: sc.FeatureSidebar._sort_key(
+                            feats[i], origin_bp=0, total_bp=6000,
+                        ))
+        assert ranked == [1, 0]   # b (start=50) before a (start=100)
+
     def test_sort_key_handles_missing_or_garbage_coords(self):
         # Defensive: a feature dict missing start/end (or with None)
         # should sort to position 0 without raising.
@@ -2048,6 +2080,141 @@ class TestSidebarSortOrder:
             # Inverse mapping resolves the right way too.
             for row, feat_idx in enumerate(sidebar._row_to_feat_idx):
                 assert sidebar._feat_idx_to_row[feat_idx] == row
+
+
+class TestOriginRotationCascade:
+    """When the user rotates the plasmid map's origin, the change
+    cascades through the OriginChanged message: the sidebar
+    re-sorts so the feature nearest the new origin (clockwise)
+    becomes row 0, and the seq panel rotates so display row 0
+    starts at the new origin's base.
+
+    Regression guard for the 2026-05-07 cross-panel rotation feature.
+    """
+
+    async def test_rotation_reorders_sidebar(self, isolated_library):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 6000), id="rotTest",
+                         annotations={"molecule_type": "DNA",
+                                      "topology": "circular"})
+        # Three features at bp 100, 1000, 4000.
+        rec.features.append(SeqFeature(
+            FeatureLocation(100, 200, strand=1), type="CDS",
+            qualifiers={"label": ["alpha"]},
+        ))
+        rec.features.append(SeqFeature(
+            FeatureLocation(1000, 1100, strand=1), type="CDS",
+            qualifiers={"label": ["beta"]},
+        ))
+        rec.features.append(SeqFeature(
+            FeatureLocation(4000, 4200, strand=1), type="CDS",
+            qualifiers={"label": ["gamma"]},
+        ))
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            sidebar = app.query_one("#sidebar", sc.FeatureSidebar)
+            # Unrotated: alpha (100), beta (1000), gamma (4000).
+            order = [
+                pm._feats[sidebar._row_to_feat_idx[r]]["label"]
+                for r in range(len(sidebar._row_to_feat_idx))
+            ]
+            assert order == ["alpha", "beta", "gamma"]
+            # Rotate origin to bp 500 (between alpha and beta).
+            # Distances: alpha=(100-500)%6000=5600, beta=500, gamma=3500.
+            # New row order: beta, gamma, alpha.
+            pm.origin_bp = 500
+            await pilot.pause()
+            await pilot.pause(0.1)
+            order = [
+                pm._feats[sidebar._row_to_feat_idx[r]]["label"]
+                for r in range(len(sidebar._row_to_feat_idx))
+            ]
+            assert order == ["beta", "gamma", "alpha"], (
+                f"Sidebar didn't reorder after map rotation: {order}"
+            )
+
+    async def test_rotation_shifts_seq_panel_view_origin(
+            self, isolated_library):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ACGT" * 1000), id="seqRot",   # 4000 bp
+                         annotations={"molecule_type": "DNA",
+                                      "topology": "circular"})
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            assert sp._view_origin_bp == 0
+            pm.origin_bp = 500
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert sp._view_origin_bp == 500, (
+                f"SequencePanel.view_origin_bp didn't sync to map's "
+                f"origin_bp: got {sp._view_origin_bp}"
+            )
+            # Reset back to 0 — the cascade must clear too.
+            pm.origin_bp = 0
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert sp._view_origin_bp == 0
+
+    async def test_alt_o_sets_origin_to_selected_feature(
+            self, isolated_library):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("A" * 6000), id="altO",
+                         annotations={"molecule_type": "DNA",
+                                      "topology": "circular"})
+        rec.features.append(SeqFeature(
+            FeatureLocation(2500, 2700, strand=1), type="CDS",
+            qualifiers={"label": ["target"]},
+        ))
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            assert pm.origin_bp == 0
+            # Highlight the target feature, then trigger Alt+O via the
+            # action method (the binding routes to the same code).
+            pm.selected_idx = 0
+            pm.action_set_origin_to_selected()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert pm.origin_bp == 2500, (
+                f"Alt+O should anchor origin at feature start (2500); "
+                f"got {pm.origin_bp}"
+            )
+
+    def test_seq_panel_disp_to_abs_round_trip(self):
+        """The display ↔ absolute conversion helpers must round-trip
+        — wrap arithmetic is easy to get wrong, and the click
+        handler relies on them inverting cleanly."""
+        sp = sc.SequencePanel()
+        sp._seq = "A" * 1000
+        sp._view_origin_bp = 250
+        # Round-trip through both directions.
+        for abs_bp in (0, 100, 250, 600, 999):
+            disp = sp._abs_to_disp(abs_bp)
+            assert sp._disp_to_abs(disp) == abs_bp
+        # Sentinel -1 passes through unchanged.
+        assert sp._abs_to_disp(-1) == -1
+        assert sp._disp_to_abs(-1) == -1
+        # Origin == 0 fast path returns input unchanged.
+        sp._view_origin_bp = 0
+        assert sp._abs_to_disp(500) == 500
+        assert sp._disp_to_abs(500) == 500
 
 
 class TestSidebarClickCentersSeqPanel:

@@ -2,6 +2,64 @@
 
 ---
 
+## [0.7.4.0] — 2026-05-07
+
+### Added — origin rotation cascades across all three views
+
+- **Map rotation now reorders the feature sidebar.** When the user
+  rotates the plasmid map (← / → / [ / ] / Shift+ / mouse wheel),
+  the FeatureSidebar re-sorts so the feature nearest the new
+  origin (clockwise) lands at row 0. Sort key is the modular
+  distance ``(start - origin_bp) % total`` with a tiebreak on
+  ``end``; wrap features get the same modular shift so they land
+  at the right position. With ``origin_bp == 0`` the sort reduces
+  to the historical ``(start, end)`` ordering — no change for
+  users who don't rotate.
+- **Map rotation now shifts the sequence viewer.** The seq panel
+  rotates its display so the new origin's base is the first cell
+  of the viewer (display row 0, column 0). Internal state stays
+  in absolute record coords — clicks, hover tooltips, edits,
+  saves, undo / redo, and selection ranges are all converted at
+  the boundary so the rotation is purely cosmetic. Line numbers
+  show display coords (1, 61, 121, ... starting from the new
+  origin); ``Home`` resets to the absolute origin.
+- **Alt+O sets the highlighted feature as the new origin.** Bound
+  on the plasmid map, feature sidebar, and sequence panel — all
+  three route through ``PlasmidMap.action_set_origin_to_selected``
+  so a single keystroke from any panel re-anchors the display
+  origin at the highlighted feature's start. No-op on linear maps
+  (rotation only makes sense on a circular topology); notifies
+  the user when nothing is selected.
+- **OriginChanged Message** — the cascade backbone. Whenever
+  ``origin_bp`` reassigns on PlasmidMap, the watcher posts
+  ``OriginChanged(origin_bp, total_bp)``; the App handler calls
+  ``FeatureSidebar.set_view_origin`` and ``SequencePanel.set_view_
+  origin``. Decouples the panels — they don't need to know about
+  PlasmidMap directly.
+
+### Internal
+
+- ``SequencePanel`` gains ``_view_origin_bp``, ``_get_rotated_state()``
+  (cached on ``(seq id, feats id, origin)``), and the
+  ``_abs_to_disp`` / ``_disp_to_abs`` coordinate-conversion helpers.
+- ``_click_to_bp``, ``_bp_to_content_row``, ``_hover_at`` now use
+  the rotated views for chunk lookup + convert back to absolute
+  on return so click resolution + hover stay correct under
+  rotation. Hover-tooltip ``bp`` field reports absolute coords so
+  the user always sees their record position.
+- 6 new tests in ``test_smoke.py``: 2 sort-key tests for the
+  origin-rotation math, 4 cascade integration tests covering the
+  full ``map rotation → sidebar reorder → seq panel rotate``
+  pipeline + the Alt+O binding + the absolute↔display round-trip.
+
+### Documentation
+
+- Help modal (``?``) lists Alt+O and the ``[`` / ``]`` rotation
+  keys. Existing rotation entry now mentions all the supported
+  keystrokes.
+
+---
+
 ## [0.7.3.0] — 2026-05-07
 
 ### Fixed (correctness — Golden Braid L0 cloning simulation)
