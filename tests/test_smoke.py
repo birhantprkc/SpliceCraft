@@ -1728,6 +1728,91 @@ class TestTypeIISCutRegionHighlight:
             f"expected gray (spacer) bg; styles: {styles_used}"
         )
 
+    async def test_dna_click_after_rotation_doesnt_select_feature(
+            self, isolated_library):
+        """Regression guard for 2026-05-08: after origin shift, a
+        DNA-strand click landing OUTSIDE any feature's bp range
+        must NOT highlight a feature on the map. Pre-fix the
+        owner-cell cache returned stale unrotated owners; the
+        click resolver could mis-route the DNA click as a lane
+        click and post `SequenceClick(from_lane=True)`, which the
+        App handler treats as "user picked a feature here" and
+        sets `pm.selected_idx`.
+        """
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        seq = "A" * 100 + "GAATTC" + "A" * 100
+        rec = SeqRecord(
+            Seq(seq), id="rotclick", name="rotclick",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        rec.features.append(SeqFeature(
+            FeatureLocation(50, 80, strand=1), type="CDS",
+            qualifiers={"label": ["midCDS"]},
+        ))
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            sites = sc._scan_restriction_sites(seq, circular=True)
+            ecori = next(
+                s for s in sites
+                if s.get("type") == "resite" and s.get("label") == "EcoRI"
+            )
+            sp.update_seq(seq, pm._feats + [ecori])
+            await pilot.pause(0.1)
+
+            # Click before rotation to populate any caches.
+            line_w = sp._line_width()
+            num_w  = len(str(len(seq)))
+            chunks_layout, _, _ = sc._chunk_layout(
+                *sp._get_rotated_state(), line_w,
+            )
+            _ap, _bp, above_rows, _br = chunks_layout[0][2]
+            # Pre-rotation: click DNA at col 5 (absolute bp 5,
+            # OUTSIDE any feature). Should be a clean DNA click.
+            await pilot.click(
+                "#seq-scroll", offset=(5 + num_w + 2, above_rows),
+            )
+            await pilot.pause(0.1)
+            assert sp._cursor_pos == 5
+            assert pm.selected_idx == -1, (
+                "pre-rotation: DNA click outside features must "
+                "not select a feature"
+            )
+
+            # Rotate origin to bp 50.
+            pm.origin_bp = 50
+            await pilot.pause()
+            await pilot.pause(0.2)
+
+            # Post-rotation: click DNA at display col 100
+            # (= absolute bp 150, which is outside both midCDS
+            # and EcoRI). Must remain a DNA click.
+            chunks_layout, _, _ = sc._chunk_layout(
+                *sp._get_rotated_state(), line_w,
+            )
+            _ap, _bp, above_rows, _br = chunks_layout[0][2]
+            await pilot.click(
+                "#seq-scroll", offset=(100 + num_w + 2, above_rows),
+            )
+            await pilot.pause(0.1)
+            assert sp._cursor_pos == 150, (
+                f"post-rotation DNA click should land on absolute "
+                f"bp 150; got {sp._cursor_pos}"
+            )
+            assert pm.selected_idx == -1, (
+                f"post-rotation: DNA click outside features must "
+                f"NOT select a feature; pm.selected_idx="
+                f"{pm.selected_idx}"
+            )
+            assert sp._sel_range is None
+            assert sp._re_highlight is None
+
     def test_rotation_invalidates_owner_cache_for_resite_clicks(self):
         """Pre-2026-05-08 the owner cache (`_chunks_owners`) keyed
         only on `id(self._feats)`, which doesn't change under
