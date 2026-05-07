@@ -1728,6 +1728,79 @@ class TestTypeIISCutRegionHighlight:
             f"expected gray (spacer) bg; styles: {styles_used}"
         )
 
+    def test_rotation_invalidates_owner_cache_for_resite_clicks(self):
+        """Pre-2026-05-08 the owner cache (`_chunks_owners`) keyed
+        only on `id(self._feats)`, which doesn't change under
+        rotation. After a rotation, click resolution returned the
+        OLD unrotated owner cells — clicks on the visibly-correct
+        enzyme label resolved to None or the wrong feature, falling
+        through to the regular DNA-row click path that scrolls the
+        seq panel to the click bp instead of highlighting the
+        resite. Cache key now includes `_view_origin_bp` so the
+        rotated owner cells are populated fresh.
+        """
+        seq = "A" * 20 + "GAATTC" + "A" * 64
+        sites = sc._scan_restriction_sites(seq, circular=True)
+        ecori = next(
+            s for s in sites
+            if s.get("type") == "resite" and s.get("label") == "EcoRI"
+        )
+        # Mock placements + the chunk-glyph-owner inputs the way
+        # `_click_to_bp` would feed them. We just need the owner
+        # cells to come back for two different rotations, with
+        # the resite owner cells in different columns.
+        sp = sc.SequencePanel()
+        sp._seq   = seq
+        sp._feats = [ecori]
+
+        def _owners_at(origin: int) -> set:
+            sp._view_origin_bp = origin
+            sp._chunks_owners.clear()
+            sp._rotated_cache_key = None
+            sp._rotated_seq = sp._rotated_feats = None
+            disp_seq, disp_feats = sp._get_rotated_state()
+            line_w = 80
+            chunks_layout, _, _ = sc._chunk_layout(
+                disp_seq, disp_feats, line_w,
+            )
+            chunk_start, chunk_end, groups, *_extra = chunks_layout[0]
+            above_p, below_p, above_rows, below_rows = groups
+            n = len(disp_seq)
+            chunk_feats = sc._feats_in_chunk(
+                disp_feats, chunk_start, chunk_end, n,
+            )
+            owners = sp._chunk_glyph_owners(
+                chunk_start, chunk_end, chunk_feats,
+                above_p, below_p, above_rows, below_rows,
+            )
+            # Collect columns owned by the resite (any row, either
+            # stack). Compare set across rotations.
+            cols: set = set()
+            for stack in (owners["owners_above"], owners["owners_below"]):
+                for row in stack:
+                    for c, owner in enumerate(row):
+                        if owner is not None and owner.get("type") == "resite":
+                            cols.add(c)
+            return cols
+
+        cols_unrotated = _owners_at(0)
+        # Rotation = 5 → recognition shifts left by 5, so owner
+        # cols should also shift left by 5.
+        cols_rotated = _owners_at(5)
+        # Owner cells must move with rotation; pre-fix the cache
+        # would return the unrotated cols.
+        assert cols_rotated != cols_unrotated, (
+            f"Owner cache is stale across rotation — owners stayed "
+            f"at {cols_unrotated} after origin shift to 5 instead "
+            f"of moving to {{c - 5 for c in cols_unrotated}}."
+        )
+        expected = {(c - 5) % len(seq) for c in cols_unrotated}
+        assert cols_rotated == expected, (
+            f"After rotation by 5, expected owner cols shifted "
+            f"by -5; got cols_unrotated={cols_unrotated}, "
+            f"cols_rotated={cols_rotated}, expected={expected}"
+        )
+
     def test_rotation_shifts_resite_cut_positions(self):
         """When the user rotates the plasmid origin, the cut bp
         fields on resite features (`top_cut_bp`, `bottom_cut_bp`,

@@ -9624,6 +9624,12 @@ class SequencePanel(Widget):
         self._rotated_cache_key = None
         self._rotated_seq = None
         self._rotated_feats = None
+        # Owner cells are computed against the rotated feats list,
+        # so old entries in `_chunks_owners` are stale (and the
+        # cache key is now keyed on `_view_origin_bp` so they'd
+        # never be returned anyway, just sit there). Clear so
+        # memory matches the active rotation.
+        self._chunks_owners.clear()
         # Snap cursor to the first base of the rotated view (= the
         # new origin in absolute coords). Clearing _sel_range and
         # _user_sel keeps the highlight from pointing at the old
@@ -10265,7 +10271,19 @@ class SequencePanel(Widget):
             owners_below[packed_row][col] -> dict | None
             above_rows, below_rows         (mirrored for caller)
         """
-        cache_key = (chunk_start, chunk_end, id(self._feats))
+        # Include `_view_origin_bp` in the cache key — under
+        # rotation the rotated feats list shifts every feature's
+        # `start` / `end` by `-origin_bp (mod n)`, so the owner
+        # cells move with them. Pre-2026-05-08 the cache only
+        # keyed on `id(self._feats)` (the unrotated list, whose
+        # identity is stable), which returned stale unrotated
+        # owner positions after a rotation — clicks on enzyme
+        # labels then resolved to the wrong (or no) feature, and
+        # fell through to the regular DNA-row click path that
+        # scrolled the panel to the click bp instead of
+        # highlighting the resite.
+        cache_key = (chunk_start, chunk_end, id(self._feats),
+                     self._view_origin_bp)
         cached = self._chunks_owners.get(cache_key)
         if cached is not None:
             return cached
