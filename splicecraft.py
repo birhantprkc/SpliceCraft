@@ -23229,11 +23229,35 @@ class _ExtensionAwareDirectoryTree(DirectoryTree):
         styled.stylize(self._highlight_map.get(suffix, self._other_style))
         return styled
 
+    def _populate_node(self, node, content):
+        """Re-sort directory contents with `_natural_sort_key` before
+        the base populates the tree, so ``FFE 2`` sorts before
+        ``FFE 10`` (numerical-aware), not after (lexicographic).
+
+        The base ``DirectoryTree._load_directory`` sorts by
+        ``(not is_dir, name.lower())`` — directories first, files
+        alphabetically by case-insensitive name. We keep the
+        directories-first half but swap the file-name comparator
+        to the same natural-sort key the plasmid library panel uses,
+        so a folder full of `FFE 2 ENTRY A1.dna` / `FFE 10 …` sorts
+        as a human would expect.
+        """
+        sorted_content = sorted(
+            content,
+            key=lambda p: (
+                not self._safe_is_dir(p),
+                _natural_sort_key(p.name),
+            ),
+        )
+        super()._populate_node(node, sorted_content)
+
 
 class _FastaAwareDirectoryTree(DirectoryTree):
     """DirectoryTree variant that colours FASTA files lime green and
     every other file white. Directories are left alone so Textual's
-    default folder styling still applies."""
+    default folder styling still applies. Sorts via the natural-key
+    comparator so ``FFE 2`` precedes ``FFE 10`` — same convention
+    the plasmid library panel uses."""
 
     def render_label(self, node, base_style, style):
         label = super().render_label(node, base_style, style)
@@ -23254,6 +23278,16 @@ class _FastaAwareDirectoryTree(DirectoryTree):
         else:
             styled.stylize(_FASTA_PICKER_OTHER_STYLE)
         return styled
+
+    def _populate_node(self, node, content):
+        sorted_content = sorted(
+            content,
+            key=lambda p: (
+                not self._safe_is_dir(p),
+                _natural_sort_key(p.name),
+            ),
+        )
+        super()._populate_node(node, sorted_content)
 
 
 class FastaFilePickerModal(ModalScreen):
@@ -23358,7 +23392,8 @@ def _is_seq_zip_path(path) -> bool:
 class _ZipAwareDirectoryTree(DirectoryTree):
     """DirectoryTree variant that colours .zip archives lime green so
     the user can scan a downloads folder for the Plasmidsaurus run.
-    Mirrors `_FastaAwareDirectoryTree`'s contract."""
+    Mirrors `_FastaAwareDirectoryTree`'s contract — including the
+    natural-key sort so `run_2.zip` precedes `run_10.zip`."""
 
     def render_label(self, node, base_style, style):
         label = super().render_label(node, base_style, style)
@@ -23379,6 +23414,16 @@ class _ZipAwareDirectoryTree(DirectoryTree):
         else:
             styled.stylize(_SEQ_ZIP_OTHER_STYLE)
         return styled
+
+    def _populate_node(self, node, content):
+        sorted_content = sorted(
+            content,
+            key=lambda p: (
+                not self._safe_is_dir(p),
+                _natural_sort_key(p.name),
+            ),
+        )
+        super()._populate_node(node, sorted_content)
 
 
 # ── Plasmidsaurus alignment ingestion ─────────────────────────────────────────

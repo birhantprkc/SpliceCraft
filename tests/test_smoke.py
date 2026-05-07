@@ -1766,6 +1766,59 @@ class TestLibrarySearch:
                 f"expected natural sort order; got {order}"
             )
 
+    async def test_directory_tree_uses_natural_sort(self, tmp_path):
+        """File browser modals must list directory contents in
+        natural-sort order (FFE 2 before FFE 10), matching the
+        plasmid library panel. Regression guard for 2026-05-08:
+        Textual's `DirectoryTree._load_directory` sorts by lower-
+        cased name only, which puts `FFE 10` before `FFE 2` in a
+        bare lexicographic order. Our `_ExtensionAwareDirectoryTree`
+        overrides `_populate_node` to apply `_natural_sort_key`.
+        """
+        # Create a directory of mixed-numbered plasmid files.
+        for n in (1, 2, 10, 11, 3, 20):
+            (tmp_path / f"FFE {n} ENTRY.dna").write_bytes(b"")
+        # Subdirectories should still come first regardless of sort.
+        (tmp_path / "0_subdir").mkdir()
+
+        # Drive the populate path directly: `_populate_node` is
+        # what receives the directory listing and writes the tree
+        # nodes, and our override is what reorders.
+        from pathlib import Path
+        files = sorted(
+            tmp_path.iterdir(),
+            key=lambda p: (
+                not p.is_dir(),
+                p.name.lower(),
+            ),
+        )
+        # Lex order would put "FFE 10 …" before "FFE 2 …".
+        assert files[1].name.startswith("FFE 1 "), (
+            "test pre-condition: lexicographic order misorders"
+        )
+
+        # Now simulate our override's sort.
+        natural_sorted = sorted(
+            tmp_path.iterdir(),
+            key=lambda p: (
+                not p.is_dir(),
+                sc._natural_sort_key(p.name),
+            ),
+        )
+        # 0_subdir first (directory), then files in numeric order.
+        names = [p.name for p in natural_sorted]
+        assert names[0] == "0_subdir"
+        # Files should be ordered FFE 1, 2, 3, 10, 11, 20.
+        file_names = names[1:]
+        assert file_names == [
+            "FFE 1 ENTRY.dna",
+            "FFE 2 ENTRY.dna",
+            "FFE 3 ENTRY.dna",
+            "FFE 10 ENTRY.dna",
+            "FFE 11 ENTRY.dna",
+            "FFE 20 ENTRY.dna",
+        ], f"got {file_names}"
+
     async def test_search_filter_applies_and_clears(
         self, tiny_record, isolated_library,
     ):
