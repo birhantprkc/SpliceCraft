@@ -25617,20 +25617,21 @@ _CONSTRUCTOR_GRAMMARS_FOR_TABS: list[tuple[str, str]] = [
 # can click a button to switch within a grammar's options.
 _CONSTRUCTOR_BACKBONES: dict[str, dict[str, dict]] = {
     "gb_l0": {
-        # Default L1 acceptor IDs use the FFE naming convention
-        # (Binomica's pDGB1 derivatives). Users can override per
-        # role via the Constructor's "Change…" button — the override
-        # persists in `entry_vectors.json` keyed by (grammar_id,
-        # role) so a different lab's acceptor library cleanly
-        # replaces the defaults.
-        "Alpha1": {"id": "FFE 2 ENTRY A1", "selection": "Spectinomycin", "note": "L1 alpha forward"},
-        "Alpha2": {"id": "FFE 3 ENTRY A2", "selection": "Spectinomycin", "note": "L1 alpha reverse"},
-        "Omega1": {"id": "FFE 4 ENTRY O1", "selection": "Kanamycin",     "note": "L1 omega forward"},
-        "Omega2": {"id": "FFE 5 ENTRY O2", "selection": "Kanamycin",     "note": "L1 omega reverse"},
+        # Backbone roles are slots, not specific plasmids. Each
+        # binds to whatever plasmid the user picks via the
+        # Constructor's "Change…" button; the binding persists in
+        # `entry_vectors.json` keyed by (grammar_id, role). The
+        # selection-marker note is informational — it only tells
+        # the user what selection antibiotic the corresponding L1
+        # vector should carry.
+        "Alpha1": {"selection": "Spectinomycin", "note": "L1 alpha forward"},
+        "Alpha2": {"selection": "Spectinomycin", "note": "L1 alpha reverse"},
+        "Omega1": {"selection": "Kanamycin",     "note": "L1 omega forward"},
+        "Omega2": {"selection": "Kanamycin",     "note": "L1 omega reverse"},
     },
     "moclo_plant": {
-        "Acceptor1": {"id": "pAGM4673", "selection": "Kanamycin", "note": "MoClo L1 forward acceptor"},
-        "Acceptor2": {"id": "pAGM4626", "selection": "Kanamycin", "note": "MoClo L1 reverse acceptor"},
+        "Acceptor1": {"selection": "Kanamycin", "note": "MoClo L1 forward acceptor"},
+        "Acceptor2": {"selection": "Kanamycin", "note": "MoClo L1 reverse acceptor"},
     },
 }
 
@@ -26024,14 +26025,22 @@ class ConstructorModal(ModalScreen):
         t.append_text(self._build_chain(gid))
         t.append("\n")
         if is_valid:
-            bb_id   = bb.get("id", "?")
-            bb_sel  = bb.get("selection", "?")
+            # Resolve the bound vector for the selected role; fall
+            # back to the role's selection-marker hint when no
+            # vector is bound yet so the user sees what acceptor the
+            # role expects without us naming a specific plasmid.
+            bound = _get_entry_vector(gid, bb_key) if bb_key else None
+            bb_sel  = bb.get("selection", "")
             bb_note = bb.get("note", "")
+            if isinstance(bound, dict) and bound.get("name"):
+                target = str(bound.get("name") or "?")
+            else:
+                target = "(none — pick from library →)"
+            sel_part = f", {bb_sel} selection" if bb_sel else ""
+            note_part = f", {bb_note}" if bb_note else ""
             t.append(
                 f"✓  Valid TU — assembles into {bb_key} "
-                f"({bb_id}, {bb_sel} selection"
-                + (f", {bb_note}" if bb_note else "")
-                + ")",
+                f"({target}{sel_part}{note_part})",
                 style="bold green",
             )
         else:
@@ -26174,17 +26183,14 @@ class ConstructorModal(ModalScreen):
 
     def _entry_vector_summary_for_grammar(self, gid: str) -> str:
         """Markup string for the entry-vector banner for grammar
-        ``gid`` and the currently-selected backbone role. Resolution:
+        ``gid`` and the currently-selected backbone role.
 
-          1. **Per-role override** in entry_vectors.json keyed by
-             ``(gid, role)`` — what the user picked via the
-             Constructor's "Change…" button.
-          2. **Default acceptor metadata** from
-             ``_CONSTRUCTOR_BACKBONES[gid][role]`` — the catalog
-             id + selection marker the role binds to (FFE 2 / 3 /
-             4 / 5 for GB Alpha1/2/Omega1/2, pAGM*** for MoClo).
-             Shown when no per-role override exists yet, with a
-             hint that the user can pick one.
+        Reads the per-role override from `entry_vectors.json`
+        keyed by ``(gid, role)`` — what the user picked via the
+        Constructor's "Change…" button. With no role selected
+        (or no override set) the banner shows a "pick from
+        library" hint plus the role's expected selection marker
+        from `_CONSTRUCTOR_BACKBONES`.
 
         Untrusted name / path strings go through `rich.markup.escape`
         so a vector named `pUC[18]` renders literally rather than
@@ -26201,17 +26207,16 @@ class ConstructorModal(ModalScreen):
             size = int(v.get("size") or 0)
             nm   = _esc(str(v.get("name") or "?"))
             return f"{prefix}[green]{nm}[/green]  ({size:,} bp)"
-        # Fallback: surface the default acceptor id from the
-        # catalog so the user knows what plasmid the role expects.
-        defaults = (_CONSTRUCTOR_BACKBONES.get(gid, {})
-                    .get(role, {}))
-        if defaults:
-            default_id = _esc(str(defaults.get("id") or "?"))
-            sel        = _esc(str(defaults.get("selection") or ""))
-            sel_part   = f" · {sel}" if sel else ""
-            return (f"{prefix}[yellow]{default_id}[/yellow]"
-                    f"{sel_part}  [dim](pick from library →)[/dim]")
-        return prefix + "[dim](none — pick from library)[/dim]"
+        # No override yet — surface the role's selection marker
+        # so the user knows what L1 vector the role expects without
+        # naming any specific plasmid.
+        sel = ""
+        if role:
+            sel = str(_CONSTRUCTOR_BACKBONES.get(gid, {})
+                      .get(role, {}).get("selection") or "")
+        sel_part = f"  [dim]({_esc(sel)} selection)[/dim]" if sel else ""
+        return (prefix + "[dim](none — pick from library →)[/dim]"
+                + sel_part)
 
     def _refresh_entry_vector_banner(self, gid: str) -> None:
         try:

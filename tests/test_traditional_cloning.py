@@ -1183,14 +1183,14 @@ class TestConstructorMultiGrammarTabs:
             assert "FFE4_test" in banner
             assert "Omega1"    in banner
 
-    async def test_default_acceptor_id_in_banner_when_no_override(
+    async def test_unbound_role_banner_shows_pick_from_library(
             self, tiny_record, isolated_library, isolated_parts_bin,
             tmp_path, monkeypatch,
     ):
         # With nothing configured for any role, each backbone's banner
-        # falls back to the default acceptor id from
-        # `_CONSTRUCTOR_BACKBONES` so the user can see what plasmid
-        # the role expects (FFE 2/3/4/5 for GB Alpha1/2/Omega1/2).
+        # surfaces the role label + a "pick from library" hint + the
+        # selection marker the role expects. No specific plasmid is
+        # named — backbones are slots, not pre-bound vectors.
         ev_file = tmp_path / "entry_vectors.json"
         monkeypatch.setattr(sc, "_ENTRY_VECTORS_FILE", ev_file)
         monkeypatch.setattr(sc, "_entry_vectors_cache", None)
@@ -1203,16 +1203,30 @@ class TestConstructorMultiGrammarTabs:
             await app.push_screen(modal)
             await pilot.pause()
             await pilot.pause(0.05)
-            for role, expected_id in (
-                ("Alpha1", "FFE 2 ENTRY A1"),
-                ("Alpha2", "FFE 3 ENTRY A2"),
-                ("Omega1", "FFE 4 ENTRY O1"),
-                ("Omega2", "FFE 5 ENTRY O2"),
+            for role, expected_sel in (
+                ("Alpha1", "Spectinomycin"),
+                ("Alpha2", "Spectinomycin"),
+                ("Omega1", "Kanamycin"),
+                ("Omega2", "Kanamycin"),
             ):
                 modal._select_backbone("gb_l0", role)
                 banner = modal._entry_vector_summary_for_grammar("gb_l0")
-                assert role        in banner
-                assert expected_id in banner
+                assert role           in banner
+                assert "pick"         in banner.lower()
+                assert expected_sel   in banner
+
+    def test_no_hardcoded_acceptor_ids_in_constructor_backbones(self):
+        """Regression guard for 2026-05-08 (do-not-hardcode):
+        `_CONSTRUCTOR_BACKBONES` must not contain a fixed ``id``
+        field for any role. Roles are slots — the user binds a
+        plasmid to each via "Change…" — never pre-bound to a
+        specific vector by the source code."""
+        for gid, roles in sc._CONSTRUCTOR_BACKBONES.items():
+            for role, meta in roles.items():
+                assert "id" not in meta, (
+                    f"{gid}.{role} hardcodes id={meta.get('id')!r} "
+                    f"— roles must not be pre-bound."
+                )
 
     def test_set_get_entry_vector_role_isolation(
             self, tmp_path, monkeypatch,
