@@ -1139,32 +1139,31 @@ class TestConstructorMultiGrammarTabs:
                 "constructor_filter_by_grammar", True,
             ) is False
 
-    async def test_per_grammar_entry_vector_banner(
+    async def test_per_role_entry_vector_banner(
             self, tiny_record, isolated_library, isolated_parts_bin,
             tmp_path, monkeypatch,
     ):
-        # Configure different entry vectors for gb_l0 and moclo_plant;
-        # each tab's banner should show its OWN vector, not the
-        # globally-active grammar's vector.
+        # Configure different L1 acceptors for the four GB roles
+        # (Alpha1 / Alpha2 / Omega1 / Omega2). The banner should
+        # reflect the currently-selected role's vector — switching
+        # backbones swaps the banner.
         ev_file = tmp_path / "entry_vectors.json"
         monkeypatch.setattr(sc, "_ENTRY_VECTORS_FILE", ev_file)
         monkeypatch.setattr(sc, "_entry_vectors_cache", None)
-        sc._set_entry_vector("gb_l0", {
-            "name": "pUPD2_test", "size": 2200, "source": "test",
-            "gb_text": (
-                "LOCUS       pUPD2_test  2200 bp DNA circular SYN 01-JAN-2026\n"
-                "FEATURES             Location/Qualifiers\n"
-                "ORIGIN\n        1 " + "a" * 60 + "\n//\n"
-            ),
-        })
-        sc._set_entry_vector("moclo_plant", {
-            "name": "pAGM4673_test", "size": 3500, "source": "test",
-            "gb_text": (
-                "LOCUS       pAGM4673_t  3500 bp DNA circular SYN 01-JAN-2026\n"
-                "FEATURES             Location/Qualifiers\n"
-                "ORIGIN\n        1 " + "a" * 60 + "\n//\n"
-            ),
-        })
+        for role, name in (
+            ("Alpha1", "FFE2_test"),
+            ("Alpha2", "FFE3_test"),
+            ("Omega1", "FFE4_test"),
+            ("Omega2", "FFE5_test"),
+        ):
+            sc._set_entry_vector("gb_l0", {
+                "name":   name, "size": 2500, "source": "test",
+                "gb_text": (
+                    f"LOCUS       {name}_locus  2500 bp DNA circular SYN 01-JAN-2026\n"
+                    "FEATURES             Location/Qualifiers\n"
+                    "ORIGIN\n        1 " + "a" * 60 + "\n//\n"
+                ),
+            }, role=role)
         from tests.test_smoke import _build_app, TERMINAL_SIZE
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
@@ -1174,12 +1173,74 @@ class TestConstructorMultiGrammarTabs:
             await app.push_screen(modal)
             await pilot.pause()
             await pilot.pause(0.05)
-            # Read the banner's underlying text via the modal's helper
-            # rather than poking at Static internals (Textual's Static
-            # doesn't expose `renderable` as a public attribute).
-            assert "pUPD2_test" in modal._entry_vector_summary_for_grammar(
-                "gb_l0",
-            )
-            assert "pAGM4673_test" in modal._entry_vector_summary_for_grammar(
-                "moclo_plant",
-            )
+            # Default backbone is Alpha1 → banner should show FFE2.
+            banner = modal._entry_vector_summary_for_grammar("gb_l0")
+            assert "FFE2_test" in banner
+            assert "Alpha1"    in banner
+            # Switch to Omega1 → banner swaps.
+            modal._select_backbone("gb_l0", "Omega1")
+            banner = modal._entry_vector_summary_for_grammar("gb_l0")
+            assert "FFE4_test" in banner
+            assert "Omega1"    in banner
+
+    async def test_default_acceptor_id_in_banner_when_no_override(
+            self, tiny_record, isolated_library, isolated_parts_bin,
+            tmp_path, monkeypatch,
+    ):
+        # With nothing configured for any role, each backbone's banner
+        # falls back to the default acceptor id from
+        # `_CONSTRUCTOR_BACKBONES` so the user can see what plasmid
+        # the role expects (FFE 2/3/4/5 for GB Alpha1/2/Omega1/2).
+        ev_file = tmp_path / "entry_vectors.json"
+        monkeypatch.setattr(sc, "_ENTRY_VECTORS_FILE", ev_file)
+        monkeypatch.setattr(sc, "_entry_vectors_cache", None)
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            for role, expected_id in (
+                ("Alpha1", "FFE 2 ENTRY A1"),
+                ("Alpha2", "FFE 3 ENTRY A2"),
+                ("Omega1", "FFE 4 ENTRY O1"),
+                ("Omega2", "FFE 5 ENTRY O2"),
+            ):
+                modal._select_backbone("gb_l0", role)
+                banner = modal._entry_vector_summary_for_grammar("gb_l0")
+                assert role        in banner
+                assert expected_id in banner
+
+    def test_set_get_entry_vector_role_isolation(
+            self, tmp_path, monkeypatch,
+    ):
+        # Setting a vector for Alpha1 doesn't disturb Alpha2 / Omega1
+        # / Omega2 / the legacy singleton (role="").
+        ev_file = tmp_path / "entry_vectors.json"
+        monkeypatch.setattr(sc, "_ENTRY_VECTORS_FILE", ev_file)
+        monkeypatch.setattr(sc, "_entry_vectors_cache", None)
+        sc._set_entry_vector("gb_l0", {
+            "name": "L0_singleton", "size": 1, "source": "t",
+            "gb_text": "",
+        })
+        sc._set_entry_vector("gb_l0", {
+            "name": "alpha1_vec", "size": 2, "source": "t",
+            "gb_text": "",
+        }, role="Alpha1")
+        sc._set_entry_vector("gb_l0", {
+            "name": "omega1_vec", "size": 3, "source": "t",
+            "gb_text": "",
+        }, role="Omega1")
+        # All three coexist.
+        assert sc._get_entry_vector("gb_l0")["name"] == "L0_singleton"
+        assert sc._get_entry_vector("gb_l0", "Alpha1")["name"] == "alpha1_vec"
+        assert sc._get_entry_vector("gb_l0", "Omega1")["name"] == "omega1_vec"
+        assert sc._get_entry_vector("gb_l0", "Alpha2") is None
+        # Clearing one role doesn't disturb the others.
+        sc._set_entry_vector("gb_l0", None, role="Alpha1")
+        assert sc._get_entry_vector("gb_l0", "Alpha1") is None
+        assert sc._get_entry_vector("gb_l0")["name"] == "L0_singleton"
+        assert sc._get_entry_vector("gb_l0", "Omega1")["name"] == "omega1_vec"

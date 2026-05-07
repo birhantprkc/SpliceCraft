@@ -14195,27 +14195,53 @@ def _save_entry_vectors(entries: list[dict]) -> None:
     _entry_vectors_cache = deepcopy(entries)
 
 
-def _get_entry_vector(grammar_id: str) -> "dict | None":
-    """Return the entry-vector dict for the named grammar, or None
-    if none has been assigned yet."""
+def _get_entry_vector(
+    grammar_id: str, role: str = "",
+) -> "dict | None":
+    """Return the entry-vector dict for ``(grammar_id, role)``, or
+    None if none has been assigned yet.
+
+    `role` is the per-grammar slot — for Golden Braid the Constructor
+    has four roles (``Alpha1``, ``Alpha2``, ``Omega1``, ``Omega2``)
+    so a single grammar carries multiple L1 acceptors. The empty
+    role (default) is the singleton L0 entry vector used by the
+    Domesticator / `_clone_part_into_entry_vector` workflow — kept
+    backward-compat with pre-2026-05-07 entry_vectors.json files
+    where every entry has no `role` field.
+    """
     if not isinstance(grammar_id, str) or not grammar_id:
         return None
+    role = role or ""
     for e in _load_entry_vectors():
-        if e.get("grammar_id") == grammar_id:
+        if e.get("grammar_id") == grammar_id and (e.get("role") or "") == role:
             return e
     return None
 
 
-def _set_entry_vector(grammar_id: str, vector: "dict | None") -> None:
-    """Replace (or remove, with `vector=None`) the entry vector for
-    `grammar_id`. Persists via `_safe_save_json`."""
+def _set_entry_vector(
+    grammar_id: str, vector: "dict | None", role: str = "",
+) -> None:
+    """Replace (or remove, with ``vector=None``) the entry vector
+    bound to ``(grammar_id, role)``. Persists via `_safe_save_json`.
+
+    Only the matching ``(grammar_id, role)`` entry is replaced —
+    other roles for the same grammar (e.g. Alpha2 / Omega1 / Omega2
+    when setting Alpha1) survive untouched.
+    """
     if not isinstance(grammar_id, str) or not grammar_id:
         return
-    entries = [e for e in _load_entry_vectors()
-                 if e.get("grammar_id") != grammar_id]
+    role = role or ""
+    entries = [
+        e for e in _load_entry_vectors()
+        if not (
+            e.get("grammar_id") == grammar_id
+            and (e.get("role") or "") == role
+        )
+    ]
     if vector is not None:
         v = dict(vector)
         v["grammar_id"] = grammar_id
+        v["role"]       = role
         entries.append(v)
     _save_entry_vectors(entries)
 
@@ -25591,10 +25617,16 @@ _CONSTRUCTOR_GRAMMARS_FOR_TABS: list[tuple[str, str]] = [
 # can click a button to switch within a grammar's options.
 _CONSTRUCTOR_BACKBONES: dict[str, dict[str, dict]] = {
     "gb_l0": {
-        "Alpha1": {"id": "pDGB1_alpha1", "selection": "Spectinomycin", "note": "L1 alpha orientation"},
-        "Alpha2": {"id": "pDGB1_alpha2", "selection": "Spectinomycin", "note": "L1 alpha orientation"},
-        "Omega1": {"id": "pDGB1_omega1", "selection": "Kanamycin",     "note": "L1 omega orientation"},
-        "Omega2": {"id": "pDGB1_omega2", "selection": "Kanamycin",     "note": "L1 omega orientation"},
+        # Default L1 acceptor IDs use the FFE naming convention
+        # (Binomica's pDGB1 derivatives). Users can override per
+        # role via the Constructor's "Change…" button — the override
+        # persists in `entry_vectors.json` keyed by (grammar_id,
+        # role) so a different lab's acceptor library cleanly
+        # replaces the defaults.
+        "Alpha1": {"id": "FFE 2 ENTRY A1", "selection": "Spectinomycin", "note": "L1 alpha forward"},
+        "Alpha2": {"id": "FFE 3 ENTRY A2", "selection": "Spectinomycin", "note": "L1 alpha reverse"},
+        "Omega1": {"id": "FFE 4 ENTRY O1", "selection": "Kanamycin",     "note": "L1 omega forward"},
+        "Omega2": {"id": "FFE 5 ENTRY O2", "selection": "Kanamycin",     "note": "L1 omega reverse"},
     },
     "moclo_plant": {
         "Acceptor1": {"id": "pAGM4673", "selection": "Kanamycin", "note": "MoClo L1 forward acceptor"},
@@ -26052,11 +26084,7 @@ class ConstructorModal(ModalScreen):
             self._refresh_validation(gid)
         elif stem == f"btn-ctor-vector-change":
             event.stop()
-
-            def _on_dismissed(_result, _gid=gid):
-                self._refresh_entry_vector_banner(_gid)
-
-            self.app.push_screen(GrammarEditorModal(gid), _on_dismissed)
+            self._pick_acceptor_for_role(gid)
         elif stem.startswith("btn-bb-"):
             # `btn-bb-{gid}-{name}` — strip stem prefix to recover backbone
             # name. The bid format is `btn-bb-{gid}-{name}`, so the
@@ -26104,6 +26132,9 @@ class ConstructorModal(ModalScreen):
             except NoMatches:
                 continue
             btn.set_class(bb == name, "bb-active")
+        # Banner is role-keyed (per-role override or default catalog
+        # id), so swap it to match the new backbone selection.
+        self._refresh_entry_vector_banner(gid)
         self._refresh_validation(gid)
 
     # ── Filter checkbox ─────────────────────────────────────────────────
@@ -26143,18 +26174,44 @@ class ConstructorModal(ModalScreen):
 
     def _entry_vector_summary_for_grammar(self, gid: str) -> str:
         """Markup string for the entry-vector banner for grammar
-        ``gid`` (NOT the globally-active grammar). Untrusted name /
-        path strings go through `rich.markup.escape` so a vector
-        named `pUC[18]` renders literally rather than tripping
-        Rich's markup lexer."""
+        ``gid`` and the currently-selected backbone role. Resolution:
+
+          1. **Per-role override** in entry_vectors.json keyed by
+             ``(gid, role)`` — what the user picked via the
+             Constructor's "Change…" button.
+          2. **Default acceptor metadata** from
+             ``_CONSTRUCTOR_BACKBONES[gid][role]`` — the catalog
+             id + selection marker the role binds to (FFE 2 / 3 /
+             4 / 5 for GB Alpha1/2/Omega1/2, pAGM*** for MoClo).
+             Shown when no per-role override exists yet, with a
+             hint that the user can pick one.
+
+        Untrusted name / path strings go through `rich.markup.escape`
+        so a vector named `pUC[18]` renders literally rather than
+        tripping Rich's markup lexer.
+        """
         from rich.markup import escape as _esc
-        v   = _get_entry_vector(gid)
-        prefix = "[bold]Entry vector:[/bold]  "
-        if not isinstance(v, dict) or not v.get("name"):
-            return prefix + "[dim](none — set in Grammar editor)[/dim]"
-        size = int(v.get("size") or 0)
-        nm   = _esc(str(v.get("name") or "?"))
-        return f"{prefix}[green]{nm}[/green]  ({size:,} bp)"
+        role = self._backbones.get(gid, "") or ""
+        v    = _get_entry_vector(gid, role) if role else None
+        prefix = (
+            f"[bold]{_esc(role)} acceptor:[/bold]  " if role
+            else "[bold]Entry vector:[/bold]  "
+        )
+        if isinstance(v, dict) and v.get("name"):
+            size = int(v.get("size") or 0)
+            nm   = _esc(str(v.get("name") or "?"))
+            return f"{prefix}[green]{nm}[/green]  ({size:,} bp)"
+        # Fallback: surface the default acceptor id from the
+        # catalog so the user knows what plasmid the role expects.
+        defaults = (_CONSTRUCTOR_BACKBONES.get(gid, {})
+                    .get(role, {}))
+        if defaults:
+            default_id = _esc(str(defaults.get("id") or "?"))
+            sel        = _esc(str(defaults.get("selection") or ""))
+            sel_part   = f" · {sel}" if sel else ""
+            return (f"{prefix}[yellow]{default_id}[/yellow]"
+                    f"{sel_part}  [dim](pick from library →)[/dim]")
+        return prefix + "[dim](none — pick from library)[/dim]"
 
     def _refresh_entry_vector_banner(self, gid: str) -> None:
         try:
@@ -26162,6 +26219,55 @@ class ConstructorModal(ModalScreen):
         except NoMatches:
             return
         info.update(self._entry_vector_summary_for_grammar(gid))
+
+    def _pick_acceptor_for_role(self, gid: str) -> None:
+        """Open the library picker so the user can bind a plasmid to
+        the currently-selected backbone role (Alpha1 / Alpha2 / etc.
+        for GB; Acceptor1 / Acceptor2 for MoClo). The picked
+        plasmid is saved to entry_vectors.json keyed by ``(gid,
+        role)``; the role-specific banner refreshes immediately.
+
+        Empty role (no backbone selected) falls back to the
+        legacy single-vector picker — preserves the old behaviour
+        on grammars that don't expose backbone roles.
+        """
+        role = self._backbones.get(gid, "") or ""
+        if not role:
+            # No backbone selected → set the singleton L0 entry
+            # vector instead. Same UX as pre-2026-05-08.
+            def _on_dismissed(_result, _gid=gid):
+                self._refresh_entry_vector_banner(_gid)
+            self.app.push_screen(GrammarEditorModal(gid), _on_dismissed)
+            return
+
+        def _picked(plasmid_id: "str | None",
+                    _gid=gid, _role=role) -> None:
+            if not plasmid_id:
+                return
+            for entry in _load_library():
+                if entry.get("id") == plasmid_id:
+                    _set_entry_vector(_gid, {
+                        "name":    str(entry.get("name") or plasmid_id),
+                        "size":    int(entry.get("size") or 0),
+                        "source":  f"library:{plasmid_id}",
+                        "gb_text": str(entry.get("gb_text") or ""),
+                    }, role=_role)
+                    self._refresh_entry_vector_banner(_gid)
+                    self._refresh_validation(_gid)
+                    return
+
+        # Pre-select the currently-bound plasmid (if any) so the
+        # picker opens with the cursor on the user's last choice.
+        current = _get_entry_vector(gid, role)
+        current_id = ""
+        if isinstance(current, dict):
+            src = str(current.get("source") or "")
+            if src.startswith("library:"):
+                current_id = src.split(":", 1)[1]
+        self.app.push_screen(
+            PlasmidPickerModal(current_id=current_id or None),
+            _picked,
+        )
 
 
 # ── NCBI taxon picker (sub-modal for species-name → taxid lookup) ─────────────
