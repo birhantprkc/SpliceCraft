@@ -3725,56 +3725,57 @@ def _render_chunk(result: "Text", chunk_start: int, chunk_end: int,
                 rev_sty = fwd_sty
             elif in_re:
                 # RE highlight (2026-05-08 final palette):
-                #   Recognition base:        top blue / bot red
-                #   Spacer (Type IIS only):  gray bg both strands
-                #   Type IIS overhang:       top green / bot orange
-                #   Type IIP / palindromic
-                #   overhang (cut inside
-                #   recognition):            top blue / bot red
-                #                            (= recognition treatment;
-                #                             no special overhang colours
-                #                             because the recognition is
-                #                             still the recognition)
-                # All overlays use bold + black foreground so the
-                # base letter stays legible against the bright bg.
+                #
+                # Inside recognition: blue = base ends up on the
+                #   UPSTREAM fragment after cutting, red = base
+                #   ends up on the DOWNSTREAM fragment. Resolved
+                #   per-strand from the cut bp (`i < cut` → blue
+                #   = left of cut = upstream; `i >= cut` → red).
+                #   For palindromic enzymes (cuts inside recognition)
+                #   this paints the staggered cut clearly: top and
+                #   bot disagree across the overhang region (e.g.
+                #   EcoRI's AATT inside GAATTC reads top-red /
+                #   bot-blue, showing the 4-nt overhang on both
+                #   fragments). For Type IIS the recognition sits
+                #   fully on one fragment so both strands match
+                #   (forward → both blue; reverse → both red).
+                #
+                # Outside recognition (Type IIS only):
+                #   Spacer: gray bg both strands (paired, between
+                #     recognition and the cut).
+                #   Overhang region (between top and bot cuts):
+                #     top → green bg, bot → orange bg.
+                #
+                # All overlays use bold + black foreground.
                 in_recognition = (
                     reh_rec_s >= 0 and reh_rec_s <= i < reh_rec_e
                 )
-                # Overhang region = bases between the two cuts. Use
-                # min/max so 5' AND 3' overhangs resolve uniformly
-                # (BsaI: top<bot; MmeI: top>bot).
                 if reh_top_cut >= 0 and reh_bot_cut >= 0:
                     lo_cut = min(reh_top_cut, reh_bot_cut)
                     hi_cut = max(reh_top_cut, reh_bot_cut)
                     in_overhang = (lo_cut <= i < hi_cut)
-                    # "Cuts inside recognition" = palindromic /
-                    # Type IIP (EcoRI / HindIII / BamHI). For these
-                    # the overhang is INSIDE the recognition; the
-                    # user reads it as "the recognition", not as a
-                    # separate sticky-end region — so we keep the
-                    # blue/red recognition treatment instead of the
-                    # green/orange Type IIS treatment.
-                    cuts_inside_rec = (
-                        reh_rec_s >= 0
-                        and reh_rec_s <= reh_top_cut < reh_rec_e
-                        and reh_rec_s <= reh_bot_cut < reh_rec_e
-                    )
                 else:
                     in_overhang = False
-                    cuts_inside_rec = False
-                if in_overhang and not cuts_inside_rec:
-                    # Type IIS overhang: top single-stranded on
-                    # right fragment (5' OH) or left (3' OH) etc.
-                    # Per the user's spec, top → green, bot →
-                    # orange1 (Rich's named orange).
+                if in_recognition:
+                    # Per-strand upstream/downstream split based
+                    # on each strand's cut position.
+                    if reh_top_cut >= 0:
+                        fwd_sty = ("black on blue bold"
+                                   if i < reh_top_cut
+                                   else "black on red bold")
+                    else:
+                        fwd_sty = "black on white bold"
+                    if reh_bot_cut >= 0:
+                        rev_sty = ("black on blue bold"
+                                   if i < reh_bot_cut
+                                   else "black on red bold")
+                    else:
+                        rev_sty = "black on white bold"
+                elif in_overhang:
+                    # Type IIS overhang (outside recognition):
+                    # top green, bot orange.
                     fwd_sty = "black on green bold"
                     rev_sty = "black on orange1 bold"
-                elif in_recognition:
-                    # Recognition: top blue, bot red. Always.
-                    # Conveys "this is the binding site" + which
-                    # strand reads 5'→3' as the canonical recog.
-                    fwd_sty = "black on blue bold"
-                    rev_sty = "black on red bold"
                 else:
                     # Spacer (Type IIS): paired, outside recognition,
                     # not in overhang. Both strands gray.

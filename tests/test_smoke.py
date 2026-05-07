@@ -1728,17 +1728,24 @@ class TestTypeIISCutRegionHighlight:
             f"expected gray (spacer) bg; styles: {styles_used}"
         )
 
-    def test_typeiip_overhang_keeps_blue_red_recognition_treatment(self):
-        """When the enzyme cuts INSIDE its recognition (Type IIP /
-        palindromic — EcoRI, HindIII, BamHI), the bases between
-        the two cuts ARE part of the recognition. Per user spec
-        2026-05-08: "Do not do overhang visualization coloring if
-        the enzyme cuts where it binds. If it cuts where it binds,
-        show the top overhang blue and bottom overhang red."
+    def test_typeiip_recognition_split_blue_upstream_red_downstream(self):
+        """Inside the recognition the per-base colour signals which
+        fragment the base ends up on after cutting: blue = upstream,
+        red = downstream. For palindromic EcoRI (`GAATTC`, top cut
+        at p+1, bot cut at p+5) the recognition splits as:
+          * Position 0 (G):     top blue,  bot blue.
+          * Positions 1..4
+            (AATT overhang):    top red    (right of top cut),
+                                bot blue   (left of bot cut).
+          * Position 5 (C):     top red,   bot red.
 
-        That's the same treatment as the rest of the recognition,
-        so the green/orange Type IIS overhang palette must NOT
-        appear on EcoRI / HindIII / BamHI clicks.
+        That's the user's "show the two pieces that form" goal —
+        across the recognition the user can read off which bases
+        flow to the upstream fragment vs the downstream fragment.
+
+        Type IIS overhang colours (green / orange) only fire on
+        bases OUTSIDE the recognition, so palindromes never use
+        them.
         """
         seq = "A" * 10 + "GAATTC" + "A" * 84
         sites = sc._scan_restriction_sites(seq, circular=True)
@@ -1754,10 +1761,13 @@ class TestTypeIISCutRegionHighlight:
         )
         styles_used = {str(span.style or "") for span in text.spans}
         sty_blob = " ".join(styles_used).lower()
-        # Type IIP: should NOT use the Type IIS overhang palette.
-        # Check for `on green` / `on orange` BACKGROUNDS specifically
-        # — the resite's active label uses `bold green` foreground
-        # which is unrelated to the overhang region.
+        # Both blue (upstream) and red (downstream) bg colours
+        # should appear on the recognition.
+        assert "on blue" in sty_blob
+        assert "on red"  in sty_blob
+        # Type IIS overhang palette must NOT appear: the
+        # recognition stays blue/red even where it overlaps the
+        # cut overhang region.
         assert "on green"  not in sty_blob, (
             f"EcoRI cuts INSIDE recognition — must NOT paint "
             f"green-bg; got styles: {sorted(styles_used)}"
@@ -1766,9 +1776,6 @@ class TestTypeIISCutRegionHighlight:
             f"EcoRI cuts INSIDE recognition — must NOT paint "
             f"orange-bg; got styles: {sorted(styles_used)}"
         )
-        # Should use the recognition palette (blue bg + red bg).
-        assert "on blue" in sty_blob
-        assert "on red"  in sty_blob
 
     def test_3prime_overhang_mmei_overhang_renders_green_yellow(self):
         """MmeI is `TCCRAC(20/18)` — top cut (20) sits FURTHER
