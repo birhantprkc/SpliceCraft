@@ -6166,13 +6166,15 @@ class PlasmidMap(Widget):
     # so pan can't scroll past either end.
     _linear_zoom:      reactive[float] = reactive(1.0)
     _linear_offset_bp: reactive[int]   = reactive(0)
-    # Linear feature layout style. "centered" = backbone runs through
-    # the middle of the 2-row arrow (canonical look). "flag" = backbone
-    # is an uninterrupted thin rail; features sit above (forward) or
-    # below (reverse) with a vertical stem connecting block → label.
-    # Hydrated from `settings.json` in `PlasmidApp.compose()`; toggled
-    # via the Settings menu.
-    _linear_layout:    reactive[str]   = reactive("centered")
+    # Linear feature layout style — fixed at "flag" since 2026-05-08.
+    # Backbone is an uninterrupted thin rail; features sit above
+    # (forward) or below (reverse) with a vertical stem connecting
+    # block → label. The legacy "centered" layout (single-lane,
+    # arrow-through-backbone) was dropped per user request — flag
+    # reads better for plasmids with many overlapping features.
+    # Reactive kept as `str` for back-compat with persisted settings
+    # files that still carry the field; only "flag" is honoured.
+    _linear_layout:    reactive[str]   = reactive("flag")
 
     # ── Messages ───────────────────────────────────────────────────────────────
 
@@ -7172,268 +7174,11 @@ class PlasmidMap(Widget):
         return (best_idx, bp) if best_idx >= 0 else (-1, -1)
 
     def _draw_linear(self, w: int, h: int) -> Text:
-        # Layout dispatcher: backbone-centered (default) vs flag-style
-        # (features hang from a thin rail with a stem connecting them
-        # to a label). Both honour the same zoom + pan + click-target
-        # bbox conventions; only the per-row vertical placement
-        # differs. Toggleable via Settings → "Linear features layout".
-        if getattr(self, "_linear_layout", "centered") == "flag":
-            return self._draw_linear_flag(w, h)
-        return self._draw_linear_centered(w, h)
-
-    def _draw_linear_centered(self, w: int, h: int) -> Text:
-        """Render a horizontal linear plasmid map.
-
-        Layout (single-lane, backbone-centered):
-
-          row -2: feature label (above bar)
-          row -1: feature TOP half — `█` body, `◤`/`◥` arrowhead
-          row  0: BACKBONE — `─` outside features, untouched inside
-          row +1: feature BOTTOM half — `█` body, `◣`/`◢` arrowhead
-          row +2: bp tick labels
-
-        All features (forward + reverse) share the SAME row pair; the
-        strand is encoded by which end the arrowhead lands on:
-
-          forward:   ████◥        reverse:  ◤████
-                     ████◢                  ◣████
-
-        The backbone runs THROUGH the middle of the feature line art.
-        Renderer respects the current zoom + pan: only the visible bp
-        range `[view_s, view_e)` is painted, so a 5 Mbp chromosome
-        opens zoomed in to a readable ~50 kb window (auto-fog-of-war).
-        """
-        canvas = _Canvas(w, h)
-        # Empty braille canvas just so we can use the existing
-        # `combine()` plumbing to convert the cell grid to a Rich Text.
-        bc     = _BrailleCanvas(w, h)
-        total  = self._total
-
-        # Reset click-target bboxes for this draw pass; populated as
-        # feature labels are painted below.
-        self._label_bboxes = []
-
-        if not total:
-            canvas.put_text(w // 2 - 9, h // 2, "No record loaded", "dim")
-            return bc.combine(canvas)
-
-        # ── Layout ──
-        margin_l     = 5
-        margin_r     = 2
-        usable_w     = w - margin_l - margin_r
-        backbone_row = max(4, h // 2)
-        # `_LINEAR_BAR_ROWS` is still 2 — split above and below the
-        # backbone so the backbone runs through the centre.
-        bar_top_row    = backbone_row - 1
-        bar_bottom_row = backbone_row + 1
-        label_row_fwd  = backbone_row - 2
-        label_row_rev  = backbone_row + 2
-        tick_label_row = backbone_row + 3
-        # Visible bp window from zoom + pan.
-        view_s, view_e = self._linear_view_range()
-        if view_e <= view_s:
-            view_e = view_s + 1
-        visible_bp = max(1, view_e - view_s)
-
-        def bp_to_col(bp: int) -> int:
-            return margin_l + int(
-                (bp - view_s) / visible_bp * usable_w
-            )
-
-        # ── Backbone (single horizontal line through the middle) ──
-        for cx in range(margin_l, margin_l + usable_w + 1):
-            canvas.put(cx, backbone_row, "─", "color(238)")
-
-        # ── Ticks + bp labels ──
-        tick_int  = max(1, _nice_tick(visible_bp))
-        # Anchor ticks to multiples of tick_int that fall in view.
-        first_tick = (view_s // tick_int) * tick_int
-        if first_tick < view_s:
-            first_tick += tick_int
-        bp = first_tick
-        while bp <= view_e:
-            tx = bp_to_col(bp)
-            if margin_l <= tx <= margin_l + usable_w:
-                canvas.put(tx, backbone_row, "┼", "color(250)")
-                lbl = _format_bp(bp)
-                lx  = tx - len(lbl) // 2
-                if 0 <= tick_label_row < h:
-                    canvas.put_text(lx, tick_label_row, lbl, "color(245)")
-            bp += tick_int
-        # Left / right caps — always anchored to the viewport edges so
-        # the user sees where the visible window starts and ends.
-        canvas.put(margin_l, backbone_row,
-                    "├" if view_s == 0 else "─",
-                    "color(250)")
-        end_tx = min(margin_l + usable_w, w - 1)
-        canvas.put(end_tx, backbone_row,
-                    "┤" if view_e >= total else "─",
-                    "color(250)")
-
-        # ── Restriction site marks ──
-        # Drawn at the backbone row itself: resite spans get the
-        # body filled `█` to overlay the backbone (so the user sees
-        # exactly which bp range the recognition site covers); the
-        # recut `┼` overlays the resite at the cut column. Strand
-        # association comes from the resite color (set in
-        # _scan_restriction_sites) — the strand-encoding via
-        # different rows isn't useful in the new single-lane layout,
-        # since features overlap with restriction-site visualisation
-        # whenever they coincide on the backbone.
-        for rf in self._restr_feats:
-            color = rf["color"]
-            r_start = rf.get("start", 0)
-            r_end   = rf.get("end",   0)
-            # Skip restriction sites entirely outside the visible
-            # window — the auto-fog principle applies here too.
-            if r_end <= view_s or r_start >= view_e:
-                continue
-            r_start = max(view_s, min(view_e, r_start))
-            r_end   = max(view_s, min(view_e, r_end))
-            if rf["type"] == "resite":
-                x0 = bp_to_col(r_start)
-                x1 = bp_to_col(r_end)
-                x0 = max(margin_l, min(x0, w - margin_r - 1))
-                x1 = max(margin_l, min(x1, w - margin_r))
-                # Mark the resite span on the row JUST ABOVE the
-                # backbone (forward) or BELOW (reverse) — distinct
-                # from feature top/bottom rows so they don't fight.
-                bar_row = (backbone_row - 1
-                            if rf["strand"] >= 0
-                            else backbone_row + 1)
-                if 0 <= bar_row < h:
-                    for cx in range(x0, x1 + 1):
-                        canvas.put(cx, bar_row, "─", color)
-            elif rf["type"] == "recut":
-                cut_x = bp_to_col(r_start)
-                if margin_l <= cut_x < w - margin_r:
-                    canvas.put(cut_x, backbone_row, "┼", color)
-
-        # ── Single-lane feature draw ──
-        # All features (forward + reverse) render on the same two
-        # rows that straddle the backbone. Strand encoded purely by
-        # arrowhead column:
-        #   forward: arrowhead at the END column → ◥/◢
-        #   reverse: arrowhead at the START column → ◤/◣
-        # Render order: largest first, so smaller annotations land
-        # ON TOP and stay visible inside larger surrounding features.
-        feats_in_view = []
-        # Walk non-wrap features via the sorted-by-start index so we
-        # can stop as soon as `start >= view_e`. For records with
-        # thousands of features (WGS contigs, metagenomic chunks),
-        # this drops the per-frame scan from O(n) to O(log n + visible).
-        # Wrap features (end < start) are rare enough that a separate
-        # linear sweep is fine; their bp range can land anywhere
-        # relative to a sort-by-start key, so the index can't bound them.
-        sorted_idx = getattr(self, "_feats_by_start", None) \
-                     or list(range(len(self._feats)))
-        import bisect as _bs
-        # `_feats_starts_sorted` is precomputed in `load_record` so the
-        # bisect upper-bound costs O(log F) per frame instead of an
-        # O(F) list comprehension. Falls back to a one-shot rebuild
-        # when called before `load_record` has stamped the cache.
-        starts = getattr(self, "_feats_starts_sorted", None) \
-                  or [self._feats[i]["start"] for i in sorted_idx]
-        upper = _bs.bisect_right(starts, view_e)
-        for k in range(upper):
-            i  = sorted_idx[k]
-            feat = self._feats[i]
-            sb = feat["start"]
-            eb = feat["end"]
-            if eb < sb:
-                # Wrap feature; handled in the second pass below.
-                continue
-            if eb <= view_s:
-                continue
-            segs = [(max(view_s, sb), min(view_e, eb))]
-            span = _feat_len(sb, eb, total) or 0
-            feats_in_view.append((-span, i, feat, segs))
-        # Wrap-feature pass — full sweep, but typically <5 wrap features
-        # per record so the cost is negligible.
-        for i, feat in enumerate(self._feats):
-            sb = feat["start"]
-            eb = feat["end"]
-            if eb >= sb:
-                continue
-            segs = []
-            if view_s < eb:
-                segs.append((view_s, min(view_e, eb)))
-            if sb < view_e:
-                segs.append((max(view_s, sb), min(view_e, total)))
-            if not segs:
-                continue
-            span = _feat_len(sb, eb, total) or 0
-            feats_in_view.append((-span, i, feat, segs))
-        feats_in_view.sort()  # largest span first (negative key)
-
-        for _neg_span, i, feat, segments in feats_in_view:
-            strand = feat["strand"]
-            color  = feat["color"]
-            label  = feat.get("label", feat.get("type", ""))
-            is_sel = (i == self.selected_idx)
-            style  = ("reverse " + color) if is_sel else color
-            is_fwd = strand >= 0
-
-            for seg_start, seg_end in segments:
-                cx0 = bp_to_col(seg_start)
-                cx1 = bp_to_col(seg_end)
-                cx0 = max(margin_l, min(cx0, w - margin_r - 1))
-                cx1 = max(margin_l, min(cx1, w - margin_r))
-                if cx1 <= cx0:
-                    cx1 = cx0 + 1   # at least show the arrowhead
-                bar_w = cx1 - cx0
-                # Choose the label row by strand: forward labels go
-                # above, reverse below — so the user's eye can scan
-                # one strand without dropping into the other's text.
-                label_row = label_row_fwd if is_fwd else label_row_rev
-
-                # Fill the body. Forward: arrowhead occupies the LAST
-                # column; reverse: arrowhead occupies the FIRST column
-                # (leftmost). Single-col features become pure
-                # arrowhead — no body fill — so they remain visible.
-                if strand >= 0:
-                    head_col  = cx1 - 1
-                    body_cols = range(cx0, cx1 - 1)
-                    # Half-triangle corner glyphs:
-                    #   ◥  upper-right triangle (top half of right-arrow)
-                    #   ◢  lower-right triangle (bottom half)
-                    head_top, head_bot = "◥", "◢"
-                else:
-                    head_col  = cx0
-                    body_cols = range(cx0 + 1, cx1)
-                    #   ◤  upper-left  (top half of left-arrow)
-                    #   ◣  lower-left  (bottom half)
-                    head_top, head_bot = "◤", "◣"
-
-                for col in body_cols:
-                    canvas.put(col, bar_top_row,    "█", style)
-                    canvas.put(col, bar_bottom_row, "█", style)
-                # Arrowhead column. Always paint, even for very narrow
-                # features — the user needs a directional cue more
-                # than they need a body fill.
-                if 0 <= head_col < w:
-                    canvas.put(head_col, bar_top_row,    head_top, style)
-                    canvas.put(head_col, bar_bottom_row, head_bot, style)
-
-                # Label centred over the bar's column range. Truncate
-                # to fit; if the bar is narrower than the label, the
-                # label still renders truncated rather than spilling
-                # into adjacent columns of other features.
-                if 0 <= label_row < h and bar_w >= 1:
-                    lbl = label[:max(1, bar_w)]
-                    lx  = cx0 + (bar_w - len(lbl)) // 2
-                    canvas.put_text(lx, label_row, lbl, style)
-                    self._label_bboxes.append(
-                        (lx, lx + len(lbl) - 1, label_row, i)
-                    )
-
-        # ── Header ──
-        name = (self.record.name or self.record.id or "?")[:w // 3]
-        canvas.put_text(margin_l, 0, f"{name}  {total:,} bp", "bold white")
-        hint = "[ linear  ·  v = circular ]"
-        canvas.put_text(w - len(hint) - 1, 0, hint, "dim")
-
-        return bc.combine(canvas)
+        # Linear view always uses the flag layout (2026-05-08 user
+        # request). The legacy `_draw_linear_centered` dispatcher
+        # branch was dropped — flag reads better when features
+        # overlap and removes a UX choice the user didn't need.
+        return self._draw_linear_flag(w, h)
 
     def _draw_linear_flag(self, w: int, h: int) -> Text:
         """Render a horizontal linear plasmid map — flag-style.
@@ -32881,8 +32626,6 @@ _AGENT_SETTINGS_ALLOWLIST: "dict[str, tuple]" = {
     "show_connectors":       (_settings_validator_bool,                  False),
     "restr_min_len":         (_settings_validator_min_len_4_or_6,        6),
     "min_primer_binding":    (_settings_validator_int_range(1, 60),      15),
-    "linear_layout":         (_settings_validator_choice("centered", "flag"),
-                              "centered"),
     "active_collection":     (_settings_validator_collection_name,       ""),
     "active_grammar":        (_settings_validator_grammar_id,            "gb_l0"),
     "constructor_filter_by_grammar": (_settings_validator_bool,           True),
@@ -34246,13 +33989,9 @@ SpeciesPickerModal { align: center middle; }
         # circular is the canonical default for every plasmid load,
         # and `PlasmidMap.load_record` resets the mode on every
         # record. Persisting would override that intent.
-        # `linear_layout` IS persisted — it's a pure cosmetic preference
-        # ("centered" vs "flag") and doesn't depend on the record. The
-        # PlasmidMap reactive defaults to "centered"; we forward the
-        # hydrated value here. Read into a pending attr because the
-        # PlasmidMap child hasn't composed yet — `on_mount` applies it.
-        _layout = str(_get_setting("linear_layout", "centered"))
-        self._pending_linear_layout = _layout if _layout in ("centered", "flag") else "centered"
+        # `linear_layout` removed 2026-05-08 — flag is the only
+        # linear layout. Legacy persisted "centered" values are
+        # ignored on load.
         yield Header()
         yield MenuBar()
         # Three side-by-side panels share the top row; the sequence
@@ -34648,12 +34387,8 @@ SpeciesPickerModal { align: center middle; }
                 pm._show_connectors = True
             # map_mode intentionally NOT hydrated — circular is the
             # canonical default and `PlasmidMap.load_record` resets
-            # it on every plasmid load.
-            # linear_layout IS hydrated: it's a pure cosmetic
-            # preference and doesn't depend on the loaded record.
-            _pending_layout = getattr(self, "_pending_linear_layout", "centered")
-            if _pending_layout in ("centered", "flag"):
-                pm._linear_layout = _pending_layout
+            # it on every plasmid load. linear_layout removed
+            # 2026-05-08 — flag is the only linear layout.
         except (NoMatches, AttributeError):
             pass
         # Agent API: opt-in localhost server for external CLI/IDE
@@ -37862,13 +37597,6 @@ SpeciesPickerModal { align: center middle; }
         cu  = "✓" if self._check_updates                 else " "
         cfg = "✓" if self._constructor_filter_by_grammar else " "
         # Linear layout is a tri-label since it's NOT a binary toggle —
-        # show the *current* layout name so the menu reads as the
-        # action that will fire ("Switch to flag" vs "Switch to centered").
-        try:
-            pm_layout = self.query_one("#plasmid-map", PlasmidMap)._linear_layout
-        except (NoMatches, AttributeError):
-            pm_layout = getattr(self, "_pending_linear_layout", "centered")
-        ll_next = "flag" if pm_layout == "centered" else "centered"
         menus = {
             "File": [
                 ("Open file (.gb / .dna)  [^O]", "open_file"),
@@ -37897,8 +37625,6 @@ SpeciesPickerModal { align: center middle; }
                 (f"[{cu}] Check for updates on launch",  "toggle_check_updates"),
                 (f"[{cfg}] Filter Constructor parts by grammar",
                                                           "toggle_constructor_filter"),
-                (f"Linear layout: {pm_layout} → switch to {ll_next}",
-                                                          "toggle_linear_layout"),
                 (f"Min primer binding: {self._min_primer_binding} bp → set…",
                                                           "set_min_primer_binding"),
                 ("---",                                   None),
@@ -38208,28 +37934,11 @@ SpeciesPickerModal { align: center middle; }
             severity="information",
         )
 
-    def action_toggle_linear_layout(self) -> None:
-        """Settings → 'Linear layout'. Cycles between 'centered' (single
-        backbone-bisecting lane, default) and 'flag' (multi-lane greedy
-        packing with stems to a thin rail). Persists across sessions.
-        Refreshes the map only when in linear mode — circular mode
-        ignores the setting until the user toggles back to linear."""
-        try:
-            pm = self.query_one("#plasmid-map", PlasmidMap)
-        except NoMatches:
-            return
-        new_layout = "flag" if pm._linear_layout == "centered" else "centered"
-        pm._linear_layout = new_layout
-        _set_setting("linear_layout", new_layout)
-        # Force a redraw if we're currently in linear mode. Reactive
-        # auto-invalidates on assignment, but the map widget caches its
-        # canvas via `render()` so call `refresh()` to be sure.
-        if pm._map_mode == "linear":
-            pm.refresh()
-        self.notify(
-            f"Linear layout: {new_layout}",
-            severity="information",
-        )
+    # `action_toggle_linear_layout` was removed 2026-05-08 — flag is
+    # now the only linear layout. The legacy "centered" alternative
+    # is gone. Existing agent / settings paths that still reference
+    # `linear_layout` resolve to "flag" via the `_get_setting`
+    # validator clamp.
 
     def action_toggle_restr_unique(self) -> None:
         self._restr_unique_only = not self._restr_unique_only

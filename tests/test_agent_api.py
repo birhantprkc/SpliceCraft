@@ -1743,7 +1743,7 @@ class TestSettingsEndpoints:
         # keys are not.
         keys = set(payload["settings"].keys())
         for required in ("show_feature_tooltips", "min_primer_binding",
-                          "linear_layout", "active_grammar"):
+                          "active_grammar"):
             assert required in keys
         for excluded in ("last_known_latest", "last_seen_version",
                           "last_update_check_ts", "hmm_db_path"):
@@ -1778,14 +1778,19 @@ class TestSettingsEndpoints:
         assert status == 400
         assert "[1, 60]" in payload["error"]
 
-    def test_set_setting_choice_rejects_garbage(self, http_server):
+    def test_set_setting_unknown_key_after_linear_layout_removed(
+            self, http_server):
+        # `linear_layout` was removed from the allowlist 2026-05-08
+        # — flag is the only linear layout. Setting it through the
+        # agent now returns an "unknown key" error, NOT the choice-
+        # validator's "must be one of …" error.
         base, token, _ = http_server
         status, payload = _http(
             f"{base}/set-setting", method="POST",
-            body={"key": "linear_layout", "value": "spiral"}, token=token,
+            body={"key": "linear_layout", "value": "flag"}, token=token,
         )
         assert status == 400
-        assert "centered" in payload["error"] or "flag" in payload["error"]
+        assert "unknown" in payload["error"].lower()
 
     def test_set_setting_bool_rejects_string(self, http_server):
         base, token, _ = http_server

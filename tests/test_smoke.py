@@ -4376,44 +4376,6 @@ class TestShiftClickFeatureExtend:
             pm = app.query_one("#plasmid-map", sc.PlasmidMap)
             assert pm._map_mode == "circular"
 
-    async def test_linear_view_uses_double_row_arrows(self,
-                                                          isolated_library):
-        """Regression: linear plasmid view paints features as 2-row
-        cell-based bars with corner-triangle heads (◥/◢ for forward,
-        ◤/◣ for reverse), not the old single-row braille arrows."""
-        from Bio.Seq import Seq
-        from Bio.SeqRecord import SeqRecord
-        from Bio.SeqFeature import SeqFeature, FeatureLocation
-        rec = SeqRecord(Seq("A" * 1000), id="L", name="L",
-                        annotations={"molecule_type": "DNA",
-                                       "topology": "circular"})
-        rec.features = [
-            SeqFeature(FeatureLocation(100, 400, strand=1), type="CDS",
-                        qualifiers={"label": ["fwd"]}),
-            SeqFeature(FeatureLocation(500, 800, strand=-1),
-                        type="misc_feature",
-                        qualifiers={"label": ["rev"]}),
-        ]
-        app = _build_app(rec, isolated_library)
-        async with app.run_test(size=TERMINAL_SIZE) as pilot:
-            await pilot.pause()
-            await pilot.pause(0.05)
-            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
-            pm._map_mode = "linear"
-            pm.refresh()
-            await pilot.pause(0.1)
-            # Render the linear view to its Text representation and
-            # confirm the new corner-triangle glyphs appear. Old
-            # braille-only renderer never emitted ◥ / ◢.
-            text = pm.render()
-            plain = text.plain if hasattr(text, "plain") else str(text)
-            assert "◥" in plain or "◢" in plain, (
-                "expected forward arrowhead corner triangle in linear view"
-            )
-            assert "◤" in plain or "◣" in plain, (
-                "expected reverse arrowhead corner triangle in linear view"
-            )
-
     async def test_linear_flag_layout_renders_with_arrow_glyphs(
             self, isolated_library):
         """Flag layout renders forward features with `▶` and reverse
@@ -4451,11 +4413,12 @@ class TestShiftClickFeatureExtend:
             # Header should advertise the flag mode.
             assert "flag" in plain
 
-    async def test_linear_flag_layout_default_is_centered(
+    async def test_linear_layout_default_is_flag(
             self, isolated_library):
-        """A fresh PlasmidMap defaults to the centered layout. Tests
-        that the reactive starts at 'centered' and the centered-only
-        glyphs are produced when no explicit layout has been set."""
+        """A fresh PlasmidMap defaults to the flag layout — the only
+        linear layout since 2026-05-08. The reactive starts at
+        'flag'; pressing `v` (toggle map view) just flips between
+        circular and linear, with linear always rendered as flag."""
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
         from Bio.SeqFeature import SeqFeature, FeatureLocation
@@ -4471,40 +4434,16 @@ class TestShiftClickFeatureExtend:
             await pilot.pause()
             await pilot.pause(0.05)
             pm = app.query_one("#plasmid-map", sc.PlasmidMap)
-            assert pm._linear_layout == "centered"
+            assert pm._linear_layout == "flag"
             pm._map_mode = "linear"
             pm.refresh()
             await pilot.pause(0.1)
             text = pm.render()
             plain = text.plain if hasattr(text, "plain") else str(text)
-            # Centered layout uses corner triangles, not ▶
-            assert "◥" in plain or "◢" in plain
-            assert "▶" not in plain  # flag-only glyph
-
-    async def test_linear_flag_layout_action_toggles_and_persists(
-            self, isolated_library):
-        """The PlasmidApp action flips between the two layouts and
-        writes the new value to settings.json so the choice survives
-        a session restart."""
-        from Bio.Seq import Seq
-        from Bio.SeqRecord import SeqRecord
-        rec = SeqRecord(Seq("A" * 500), id="L", name="L",
-                        annotations={"molecule_type": "DNA",
-                                     "topology": "circular"})
-        app = _build_app(rec, isolated_library)
-        async with app.run_test(size=TERMINAL_SIZE) as pilot:
-            await pilot.pause()
-            await pilot.pause(0.05)
-            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
-            assert pm._linear_layout == "centered"
-            app.action_toggle_linear_layout()
-            await pilot.pause()
-            assert pm._linear_layout == "flag"
-            assert sc._get_setting("linear_layout") == "flag"
-            app.action_toggle_linear_layout()
-            await pilot.pause()
-            assert pm._linear_layout == "centered"
-            assert sc._get_setting("linear_layout") == "centered"
+            # Flag layout uses ▶ for forward, NOT the centered-layout
+            # corner triangles.
+            assert "▶" in plain
+            assert "◥" not in plain and "◢" not in plain
 
     async def test_linear_flag_layout_handles_overlapping_features(
             self, isolated_library):
