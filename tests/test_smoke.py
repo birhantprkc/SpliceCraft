@@ -1342,18 +1342,27 @@ class TestSeqHomeEndAndCtrlArrow:
             )
 
 
-class TestRotationDoesNotMoveSeqCursor:
-    """Regression guard for 2026-04-29: arrow keys with PlasmidMap focused
-    rotate the plasmid origin, and MUST NOT move the seq cursor as a
-    side effect. Pre-fix the App-level on_key handler also fired and
-    advanced the cursor on every Left/Right rotation keystroke."""
+class TestRotationCursorSnap:
+    """Rotation cursor-snap behaviour (2026-05-07).
 
-    async def test_left_arrow_rotates_without_moving_cursor(
+    Originally (2026-04-29 regression guard) rotation was required
+    NOT to move the seq cursor — the App-level on_key handler used
+    to fire alongside the rotation binding and drag the cursor.
+    The focus-gating fix kept rotation isolated from cursor moves.
+
+    The 2026-05-07 origin-rotation cascade (sidebar reorder + seq
+    panel shift) intentionally re-purposed this: rotation now snaps
+    the cursor to the FIRST BASE of the new view (= absolute bp
+    ``origin_bp``) so the user has a clear anchor at the rotated
+    view's starting position. The arrow-keys-don't-bleed-into-cursor
+    invariant is still preserved — what changed is that the
+    rotation itself now drives the cursor, deliberately."""
+
+    async def test_left_arrow_rotates_and_snaps_cursor_to_new_origin(
         self, tiny_record, isolated_library,
     ):
-        """Left arrow on focused map should rotate counterclockwise
-        (origin_bp INCREASES — `_rotate_ccw`) and leave the seq cursor
-        alone. Pre-2026-04-29 it rotated CW and dragged the cursor."""
+        """Left arrow on focused map rotates CCW (origin_bp ↑) and
+        snaps the seq cursor to the new origin's first base."""
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
@@ -1362,6 +1371,7 @@ class TestRotationDoesNotMoveSeqCursor:
             pm = app.query_one("#plasmid-map", sc.PlasmidMap)
             sp._cursor_pos = 50
             pm.origin_bp = 100
+            await pilot.pause(0.05)
             app.set_focus(pm)
             await pilot.pause(0.05)
             await pilot.press("left")
@@ -1371,9 +1381,11 @@ class TestRotationDoesNotMoveSeqCursor:
                 f"Left arrow should rotate CCW (origin_bp ↑); "
                 f"got {pm.origin_bp}"
             )
-            assert sp._cursor_pos == 50, (
-                f"Rotation must not move seq cursor; "
-                f"expected 50, got {sp._cursor_pos}"
+            # Cursor snaps to the new origin = first base of the
+            # rotated display.
+            assert sp._cursor_pos == pm.origin_bp, (
+                f"Cursor should snap to new origin "
+                f"({pm.origin_bp}); got {sp._cursor_pos}"
             )
 
     async def test_right_arrow_rotates_clockwise(
@@ -1396,11 +1408,13 @@ class TestRotationDoesNotMoveSeqCursor:
                 f"got {pm.origin_bp}"
             )
 
-    async def test_up_arrow_resets_origin(
+    async def test_up_arrow_resets_origin_and_snaps_cursor_to_zero(
         self, tiny_record, isolated_library,
     ):
-        """Up arrow on the focused map snaps origin_bp back to 0 — the
-        arrow-key partner to the seldom-used Home binding."""
+        """Up arrow on the focused map snaps origin_bp back to 0,
+        and the cursor snaps with it — same cascade as any other
+        rotation. Reset is just rotation to bp 0; the cursor lands
+        at bp 0 (the rotated view's first base)."""
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
@@ -1408,6 +1422,7 @@ class TestRotationDoesNotMoveSeqCursor:
             sp = app.query_one("#seq-panel", sc.SequencePanel)
             pm = app.query_one("#plasmid-map", sc.PlasmidMap)
             pm.origin_bp = 42
+            await pilot.pause(0.05)
             sp._cursor_pos = 50
             app.set_focus(pm)
             await pilot.pause(0.05)
@@ -1417,8 +1432,11 @@ class TestRotationDoesNotMoveSeqCursor:
                 f"Up arrow on focused map should reset origin to 0; "
                 f"got {pm.origin_bp}"
             )
-            # And reset must NOT yank the seq cursor with it.
-            assert sp._cursor_pos == 50
+            # Cursor snaps to bp 0 (the new origin's first base).
+            assert sp._cursor_pos == 0, (
+                f"Reset origin should snap cursor to bp 0; "
+                f"got {sp._cursor_pos}"
+            )
 
 
 class TestRestrictionEnzymeClickHighlight:

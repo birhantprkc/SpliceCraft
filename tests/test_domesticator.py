@@ -446,11 +446,18 @@ class TestGBConstants:
 
     def test_tu_boundaries_match_constructor(self):
         """The first position's 5' OH (GGAG) and last position's 3' OH (CGCT)
-        must match the ConstructorModal._TU_START / _TU_END constants."""
+        must match what `_grammar_tu_overhangs` derives from the gb_l0
+        grammar — the source of truth the Constructor's validator now
+        uses. Pre-2026-05-07 these lived as `ConstructorModal._TU_START`
+        / `_TU_END` class constants; they're grammar-derived now so
+        custom grammars get the same treatment without a code edit.
+        """
         _, oh5_first, _ = sc._GB_POSITIONS["Promoter"]
         _, _, oh3_last  = sc._GB_POSITIONS["Terminator"]
-        assert oh5_first == sc.ConstructorModal._TU_START
-        assert oh3_last  == sc.ConstructorModal._TU_END
+        gb_l0 = sc._BUILTIN_GRAMMARS["gb_l0"]
+        tu_start, tu_end = sc._grammar_tu_overhangs(gb_l0)
+        assert oh5_first == tu_start
+        assert oh3_last  == tu_end
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -25523,278 +25523,502 @@ class TraditionalCloningPane(Vertical):
         )
 
 
+def _palette_rows_for_grammar(
+    grammar_id: str, *, filter_enabled: bool,
+) -> list[tuple]:
+    """Build the modular Constructor's parts-palette rows for the
+    given grammar. Each row is a tuple matching the legacy
+    ``_GB_L0_PARTS`` shape so the existing lane-management code can
+    consume both built-in catalog rows and user parts uniformly:
+
+        (name, type, position, oh5, oh3, backbone, marker)
+
+    Source priority:
+      1. **User parts** from ``parts_bin.json`` (the user's saved
+         work — what the Constructor's "parts bin" should reflect).
+         Filtered by ``part.get("grammar") == grammar_id`` when
+         ``filter_enabled`` is True.
+      2. **Built-in catalog** for the grammar — kept as a fallback
+         so a brand-new install with an empty parts bin still shows
+         the canonical Golden Braid promoters / CDSs / terminators
+         the user can scan against; deduplicated against any
+         user-saved part with the same name so a custom-domesticated
+         eGFP doesn't appear twice.
+
+    User parts come first because they reflect the user's actual
+    saved work; the built-in catalog sits below as a reference set.
+    Sorted within each group by position then name so the palette
+    has a stable scan order.
+    """
+    grammar = _all_grammars().get(grammar_id) or _BUILTIN_GRAMMARS.get(
+        "gb_l0", {},
+    )
+    rows: list[tuple] = []
+    seen_names: set[str] = set()
+
+    # 1) User parts (filtered by grammar when the toggle is on).
+    user_parts = _load_parts_bin()
+    if filter_enabled:
+        user_parts = [
+            p for p in user_parts
+            if (p.get("grammar") or "gb_l0") == grammar_id
+        ]
+    user_parts.sort(key=lambda p: (
+        str(p.get("position") or ""), str(p.get("name") or ""),
+    ))
+    for p in user_parts:
+        name = str(p.get("name") or "?")
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        rows.append((
+            name,
+            str(p.get("type") or "?"),
+            str(p.get("position") or ""),
+            str(p.get("oh5") or ""),
+            str(p.get("oh3") or ""),
+            str(p.get("backbone") or ""),
+            str(p.get("marker") or ""),
+        ))
+
+    # 2) Built-in catalog for this grammar — sit below user parts.
+    catalog = grammar.get("catalog") or []
+    for entry in catalog:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 5:
+            continue
+        name = str(entry[0])
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        # Pad short tuples to the canonical 7-field shape.
+        row = list(entry) + [""] * (7 - len(entry))
+        rows.append(tuple(row[:7]))
+
+    return rows
+
+
+# Per-grammar tab list for ConstructorModal. Order = display order
+# left-to-right after the Traditional tab. The first tab is the
+# default-opened one when the modal mounts.
+_CONSTRUCTOR_GRAMMARS_FOR_TABS: list[tuple[str, str]] = [
+    ("gb_l0",       "Golden Braid (L0 → L1)"),
+    ("moclo_plant", "MoClo Plant (L0 → L1)"),
+]
+
+# Per-grammar L1 destination acceptors. GB uses pDGB1_*; MoClo uses
+# the pAGM family. Both are "first-match wins" defaults — the user
+# can click a button to switch within a grammar's options.
+_CONSTRUCTOR_BACKBONES: dict[str, dict[str, dict]] = {
+    "gb_l0": {
+        "Alpha1": {"id": "pDGB1_alpha1", "selection": "Spectinomycin", "note": "L1 alpha orientation"},
+        "Alpha2": {"id": "pDGB1_alpha2", "selection": "Spectinomycin", "note": "L1 alpha orientation"},
+        "Omega1": {"id": "pDGB1_omega1", "selection": "Kanamycin",     "note": "L1 omega orientation"},
+        "Omega2": {"id": "pDGB1_omega2", "selection": "Kanamycin",     "note": "L1 omega orientation"},
+    },
+    "moclo_plant": {
+        "Acceptor1": {"id": "pAGM4673", "selection": "Kanamycin", "note": "MoClo L1 forward acceptor"},
+        "Acceptor2": {"id": "pAGM4626", "selection": "Kanamycin", "note": "MoClo L1 reverse acceptor"},
+    },
+}
+
+
+def _grammar_pos_slots(grammar: dict) -> dict[str, int]:
+    """Map each part-type to its 1-based positional slot in the
+    grammar. Used by `ConstructorModal._validate` to detect a
+    duplicate slot occupancy (e.g. two Promoters in one TU).
+
+    CDS-NS always shares the CDS slot — they're alternative ways
+    to fill the same biological position (no-stop variant intended
+    for C-tag fusion). gb_l0's positions list happens to contain
+    both as separate entries, but they MUST collide on the slot
+    number for the duplicate-occupancy check to flag a lane that
+    pairs both with no C-tag.
+    """
+    slots: dict[str, int] = {}
+    for i, p in enumerate(grammar.get("positions", []) or []):
+        ptype = p.get("type")
+        if isinstance(ptype, str):
+            slots[ptype] = i + 1
+    if "CDS" in slots:
+        slots["CDS-NS"] = slots["CDS"]
+    return slots
+
+
+def _grammar_tu_overhangs(grammar: dict) -> tuple[str, str]:
+    """Return ``(tu_start, tu_end)`` — the boundary overhangs of a
+    full TU under this grammar. ``tu_start`` is the first position's
+    `oh5` (Promoter side); ``tu_end`` is the last position's `oh3`
+    (Terminator side)."""
+    positions = grammar.get("positions") or []
+    if not positions:
+        return ("", "")
+    return (
+        str(positions[0].get("oh5") or ""),
+        str(positions[-1].get("oh3") or ""),
+    )
+
+
 class ConstructorModal(ModalScreen):
-    """Golden Braid TU Constructor — assemble L0 parts into a transcription unit."""
+    """Modular + Traditional cloning constructor.
+
+    Tabs:
+      - **Traditional** — restriction-digest + ligate via
+        `TraditionalCloningPane`.
+      - **Golden Braid (L0 → L1)** — assemble L0 parts into a TU
+        using the gb_l0 grammar.
+      - **MoClo Plant (L0 → L1)** — same workflow under the
+        moclo_plant grammar.
+
+    Each modular tab owns its own state (lane + backbone choice) so
+    switching tabs preserves whatever the user was building. The
+    parts palette per tab pulls from `parts_bin.json`, filtered by
+    the tab's grammar when ``constructor_filter_by_grammar`` is on
+    (default). The built-in grammar catalog sits below user parts
+    as a reference set.
+    """
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
-    # L1 destination backbone info
-    _BACKBONES: dict = {
-        "Alpha1": {"id": "pDGB1_alpha1", "selection": "Spectinomycin", "note": "L1 alpha orientation"},
-        "Alpha2": {"id": "pDGB1_alpha2", "selection": "Spectinomycin", "note": "L1 alpha orientation"},
-        "Omega1": {"id": "pDGB1_omega1", "selection": "Kanamycin",     "note": "L1 omega orientation"},
-        "Omega2": {"id": "pDGB1_omega2", "selection": "Kanamycin",     "note": "L1 omega orientation"},
-    }
-
-    # Golden Braid L1 boundary overhangs
-    _TU_START = "GGAG"
-    _TU_END   = "CGCT"
-
-    # Part types that occupy each positional slot (for duplicate detection)
-    _POS_SLOT: dict = {
-        "Promoter":   1,
-        "5' UTR":     2,
-        "CDS":        3,
-        "CDS-NS":     3,
-        "C-tag":      4,
-        "Terminator": 5,
-    }
-
     def __init__(self) -> None:
         super().__init__()
-        self._lane:     list[tuple] = []
-        self._backbone: str         = "Alpha1"
+        # Per-grammar lane state (each lane is a list of part-row
+        # tuples in the legacy `(name, type, pos, oh5, oh3, ...)`
+        # shape so the validation code stays grammar-agnostic).
+        self._lanes: dict[str, list[tuple]] = {
+            gid: [] for gid, _ in _CONSTRUCTOR_GRAMMARS_FOR_TABS
+        }
+        # Per-grammar backbone choice — stored as the dict key
+        # (e.g. "Alpha1" for GB) into _CONSTRUCTOR_BACKBONES[gid].
+        # Defaults to the grammar's first declared backbone.
+        self._backbones: dict[str, str] = {}
+        for gid, _ in _CONSTRUCTOR_GRAMMARS_FOR_TABS:
+            backbones = _CONSTRUCTOR_BACKBONES.get(gid, {})
+            self._backbones[gid] = (
+                next(iter(backbones), "") if backbones else ""
+            )
+        # Per-grammar palette rows — cached so the row-index → tuple
+        # lookup in `_add_selected_part` doesn't re-load parts_bin
+        # on every keystroke. Re-built on filter toggle + on mount.
+        self._palette_rows: dict[str, list[tuple]] = {}
+
+    @staticmethod
+    def _filter_enabled() -> bool:
+        return bool(_get_setting("constructor_filter_by_grammar", True))
 
     # ── Layout ────────────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
         with Vertical(id="ctor-box"):
             yield Static(" Constructor ", id="ctor-title")
-            with TabbedContent(initial="ctor-tab-modular", id="ctor-tabs"):
-                with TabPane("Modular  (Golden Braid / MoClo)",
-                              id="ctor-tab-modular"):
-                    # Entry-vector banner — pulls the user-configured
-                    # destination plasmid for the active grammar (set in
-                    # GrammarEditorModal). Provides at-a-glance
-                    # confirmation of which vector the assembly will
-                    # land in. The Change button jumps directly into
-                    # the grammar editor's entry-vector row so users
-                    # can swap without leaving the Constructor.
-                    with Horizontal(id="ctor-vector-row"):
-                        yield Static(
-                            self._entry_vector_summary_for_active_grammar(),
-                            id="ctor-vector-info", markup=True,
-                        )
-                        yield Button("Change…", id="btn-ctor-vector-change",
-                                       variant="default")
-                    with Horizontal(id="ctor-main"):
-                        # Left: parts palette
-                        with Vertical(id="ctor-palette-col"):
-                            yield Static(" Parts Palette ",
-                                          id="ctor-palette-hdr")
-                            yield DataTable(id="ctor-palette",
-                                              cursor_type="row",
-                                              zebra_stripes=True)
-                            yield Button("→  Add to Lane", id="btn-ctor-add",
-                                           variant="primary")
-                        # Right: assembly lane
-                        with Vertical(id="ctor-lane-col"):
-                            yield Static(" Assembly Lane ",
-                                          id="ctor-lane-hdr")
-                            yield DataTable(id="ctor-lane",
-                                              cursor_type="row",
-                                              zebra_stripes=True)
-                            with Horizontal(id="ctor-lane-btns"):
-                                yield Button("↑",        id="btn-lane-up")
-                                yield Button("↓",        id="btn-lane-down")
-                                yield Button("✕ Remove", id="btn-lane-remove",
-                                               variant="error")
-                    # Backbone selector
-                    with Horizontal(id="ctor-backbone-row"):
-                        yield Static("Backbone:", id="ctor-backbone-label")
-                        for bb in self._BACKBONES:
-                            classes = ("bb-btn bb-active"
-                                        if bb == self._backbone
-                                        else "bb-btn")
-                            yield Button(bb, id=f"btn-bb-{bb}",
-                                           classes=classes)
-                    # Overhang chain + validation messages
-                    yield Static("", id="ctor-validation")
-                    # Per-tab bottom actions
-                    with Horizontal(id="ctor-btns"):
-                        yield Button(
-                            "Simulate Assembly", id="btn-ctor-simulate",
-                            variant="primary", disabled=True,
-                        )
-                        yield Button("Clear Lane", id="btn-ctor-clear",
-                                       variant="default")
+            with TabbedContent(initial="ctor-tab-traditional", id="ctor-tabs"):
                 with TabPane("Traditional  (Restriction digest + ligate)",
                               id="ctor-tab-traditional"):
                     yield TraditionalCloningPane(id="ctor-trad-pane")
+                for gid, label in _CONSTRUCTOR_GRAMMARS_FOR_TABS:
+                    with TabPane(label, id=f"ctor-tab-{gid}"):
+                        yield from self._compose_modular_pane(gid)
             # Modal-level close — works regardless of active tab.
             with Horizontal(id="ctor-bottom"):
                 yield Button("Close", id="btn-ctor-close")
 
+    def _compose_modular_pane(self, gid: str):
+        """Yield the widget tree for one modular tab. Widget IDs are
+        suffixed by ``gid`` so the two modular tabs (GB + MoClo)
+        don't collide on `query_one` lookups."""
+        # Entry-vector banner — pulls the configured destination
+        # plasmid for THIS grammar (not the globally-active one) so
+        # the GB tab stays GB even when MoClo is active elsewhere.
+        with Horizontal(id=f"ctor-vector-row-{gid}"):
+            yield Static(
+                self._entry_vector_summary_for_grammar(gid),
+                id=f"ctor-vector-info-{gid}", markup=True,
+            )
+            yield Button("Change…", id=f"btn-ctor-vector-change-{gid}",
+                           variant="default")
+        # Filter checkbox — toggles the per-grammar palette filter.
+        # Default value pulls from the persisted setting so a fresh
+        # mount starts with the user's last choice.
+        with Horizontal(id=f"ctor-filter-row-{gid}"):
+            yield Checkbox(
+                f"Filter parts by {gid}",
+                value=self._filter_enabled(),
+                id=f"chk-ctor-filter-{gid}",
+            )
+        with Horizontal(id=f"ctor-main-{gid}"):
+            with Vertical(id=f"ctor-palette-col-{gid}"):
+                yield Static(" Parts Palette ",
+                              id=f"ctor-palette-hdr-{gid}")
+                yield DataTable(id=f"ctor-palette-{gid}",
+                                  cursor_type="row",
+                                  zebra_stripes=True)
+                yield Button("→  Add to Lane",
+                               id=f"btn-ctor-add-{gid}",
+                               variant="primary")
+            with Vertical(id=f"ctor-lane-col-{gid}"):
+                yield Static(" Assembly Lane ",
+                              id=f"ctor-lane-hdr-{gid}")
+                yield DataTable(id=f"ctor-lane-{gid}",
+                                  cursor_type="row",
+                                  zebra_stripes=True)
+                with Horizontal(id=f"ctor-lane-btns-{gid}"):
+                    yield Button("↑",        id=f"btn-lane-up-{gid}")
+                    yield Button("↓",        id=f"btn-lane-down-{gid}")
+                    yield Button("✕ Remove", id=f"btn-lane-remove-{gid}",
+                                   variant="error")
+        # Backbone selector
+        with Horizontal(id=f"ctor-backbone-row-{gid}"):
+            yield Static("Backbone:", id=f"ctor-backbone-label-{gid}")
+            backbones = _CONSTRUCTOR_BACKBONES.get(gid, {})
+            for bb in backbones:
+                classes = ("bb-btn bb-active"
+                            if bb == self._backbones.get(gid)
+                            else "bb-btn")
+                # Button id includes the grammar so the .bb-btn class
+                # handler can recover both gid + backbone name from
+                # the button id alone.
+                yield Button(bb, id=f"btn-bb-{gid}-{bb}",
+                               classes=classes)
+        yield Static("", id=f"ctor-validation-{gid}")
+        with Horizontal(id=f"ctor-btns-{gid}"):
+            yield Button("Simulate Assembly",
+                           id=f"btn-ctor-simulate-{gid}",
+                           variant="primary", disabled=True)
+            yield Button("Clear Lane", id=f"btn-ctor-clear-{gid}",
+                           variant="default")
+
     def on_mount(self) -> None:
-        # Populate palette
-        pt = self.query_one("#ctor-palette", DataTable)
-        pt.add_columns("Name", "Type", "Pos", "5' OH", "3' OH")
-        for row in _GB_L0_PARTS:
-            name, ptype, pos, oh5, oh3, *_ = row
+        for gid, _ in _CONSTRUCTOR_GRAMMARS_FOR_TABS:
+            pt = self.query_one(f"#ctor-palette-{gid}", DataTable)
+            pt.add_columns("Name", "Type", "Pos", "5' OH", "3' OH")
+            lt = self.query_one(f"#ctor-lane-{gid}", DataTable)
+            lt.add_columns("#", "Name", "Type", "5' OH", "3' OH")
+            self._refresh_palette(gid)
+            self._refresh_validation(gid)
+
+    # ── Tab id ↔ grammar id ──────────────────────────────────────────────
+
+    def _gid_from_button(self, btn_id: str) -> str:
+        """Extract the grammar id from a per-tab button id like
+        ``btn-ctor-add-gb_l0``. Returns "" when the button isn't
+        per-tab (e.g., the close button)."""
+        if not btn_id:
+            return ""
+        for gid, _ in _CONSTRUCTOR_GRAMMARS_FOR_TABS:
+            if btn_id.endswith("-" + gid):
+                return gid
+        return ""
+
+    # ── Palette ──────────────────────────────────────────────────────────
+
+    def _refresh_palette(self, gid: str) -> None:
+        """Rebuild the parts palette table for grammar ``gid``."""
+        try:
+            pt = self.query_one(f"#ctor-palette-{gid}", DataTable)
+        except NoMatches:
+            return
+        rows = _palette_rows_for_grammar(
+            gid, filter_enabled=self._filter_enabled(),
+        )
+        self._palette_rows[gid] = rows
+        pt.clear()
+        for row in rows:
+            name, ptype, pos, oh5, oh3, *_rest = row
             color = _GB_TYPE_COLORS.get(ptype, "white")
             pt.add_row(
-                Text(name,  style=color),
-                Text(ptype, style=f"dim {color}"),
-                pos,
-                Text(oh5,   style="bold cyan"),
-                Text(oh3,   style="bold cyan"),
+                Text(str(name),  style=color),
+                Text(str(ptype), style=f"dim {color}"),
+                str(pos or ""),
+                Text(str(oh5),   style="bold cyan"),
+                Text(str(oh3),   style="bold cyan"),
             )
-        # Set up lane columns
-        lt = self.query_one("#ctor-lane", DataTable)
-        lt.add_columns("#", "Name", "Type", "5' OH", "3' OH")
-        self._refresh_validation()
 
-    # ── Lane management ───────────────────────────────────────────────────────
+    # ── Lane ──────────────────────────────────────────────────────────────
 
-    def _refresh_lane(self, restore_cursor: int = -1) -> None:
-        lt = self.query_one("#ctor-lane", DataTable)
+    def _refresh_lane(self, gid: str, restore_cursor: int = -1) -> None:
+        try:
+            lt = self.query_one(f"#ctor-lane-{gid}", DataTable)
+        except NoMatches:
+            return
+        lane = self._lanes.get(gid, [])
         lt.clear()
-        for i, row in enumerate(self._lane):
-            name, ptype, pos, oh5, oh3, *_ = row
+        for i, row in enumerate(lane):
+            name, ptype, pos, oh5, oh3, *_rest = row
             color = _GB_TYPE_COLORS.get(ptype, "white")
             lt.add_row(
                 str(i + 1),
-                Text(name,  style=color),
-                Text(ptype, style=f"dim {color}"),
-                Text(oh5,   style="bold cyan"),
-                Text(oh3,   style="bold cyan"),
+                Text(str(name),  style=color),
+                Text(str(ptype), style=f"dim {color}"),
+                Text(str(oh5),   style="bold cyan"),
+                Text(str(oh3),   style="bold cyan"),
             )
-        if restore_cursor >= 0 and restore_cursor < len(self._lane):
+        if restore_cursor >= 0 and restore_cursor < len(lane):
             try:
                 lt.move_cursor(row=restore_cursor)
             except Exception:
                 pass
 
-    def _add_selected_part(self) -> None:
-        pt  = self.query_one("#ctor-palette", DataTable)
-        idx = pt.cursor_row
-        if 0 <= idx < len(_GB_L0_PARTS):
-            self._lane.append(_GB_L0_PARTS[idx])
-            self._refresh_lane(restore_cursor=len(self._lane) - 1)
-            self._refresh_validation()
+    def _add_selected_part(self, gid: str) -> None:
+        try:
+            pt = self.query_one(f"#ctor-palette-{gid}", DataTable)
+        except NoMatches:
+            return
+        rows = self._palette_rows.get(gid, [])
+        idx  = pt.cursor_row
+        if not (0 <= idx < len(rows)):
+            return
+        lane = self._lanes.setdefault(gid, [])
+        lane.append(rows[idx])
+        self._refresh_lane(gid, restore_cursor=len(lane) - 1)
+        self._refresh_validation(gid)
 
-    # ── Grammar validation ────────────────────────────────────────────────────
+    # ── Grammar validation ────────────────────────────────────────────────
 
-    def _validate(self) -> tuple[bool, list[str]]:
-        """Return (is_valid, error_list). Valid = complete, correctly-chained TU."""
-        if not self._lane:
+    def _validate(self, gid: str) -> tuple[bool, list[str]]:
+        """Return ``(is_valid, errors)`` for grammar ``gid``'s lane.
+        Validity is grammar-derived: positions / overhangs / mandatory
+        types come from the grammar dict itself rather than hardcoded
+        constants, so adding a custom grammar with a different
+        position layout works without touching this function.
+        """
+        lane = self._lanes.get(gid, [])
+        if not lane:
             return False, ["Lane is empty — add L0 parts to build a TU."]
 
+        grammar = _all_grammars().get(gid) or _BUILTIN_GRAMMARS.get("gb_l0", {})
+        tu_start, tu_end = _grammar_tu_overhangs(grammar)
+        pos_slots = _grammar_pos_slots(grammar)
         errors: list[str] = []
 
-        # 1. Boundary overhangs
-        if self._lane[0][3] != self._TU_START:
+        # 1. Boundary overhangs.
+        if tu_start and lane[0][3] != tu_start:
             errors.append(
-                f"First part must carry the {self._TU_START} overhang "
-                f"(Promoter, Pos 1). Got {self._lane[0][3]!r}."
+                f"First part must carry the {tu_start} overhang. "
+                f"Got {lane[0][3]!r}."
             )
-        if self._lane[-1][4] != self._TU_END:
+        if tu_end and lane[-1][4] != tu_end:
             errors.append(
-                f"Last part must carry the {self._TU_END} overhang "
-                f"(Terminator, Pos 5). Got {self._lane[-1][4]!r}."
+                f"Last part must carry the {tu_end} overhang. "
+                f"Got {lane[-1][4]!r}."
             )
 
-        # 2. Overhang continuity
-        for i in range(len(self._lane) - 1):
-            oh3 = self._lane[i][4]
-            oh5 = self._lane[i + 1][3]
+        # 2. Overhang continuity at every junction.
+        for i in range(len(lane) - 1):
+            oh3 = lane[i][4]
+            oh5 = lane[i + 1][3]
             if oh3 != oh5:
                 errors.append(
                     f"Overhang mismatch at junction {i+1}→{i+2}: "
-                    f"{self._lane[i][0]!r} ends {oh3!r} but "
-                    f"{self._lane[i+1][0]!r} starts {oh5!r}."
+                    f"{lane[i][0]!r} ends {oh3!r} but "
+                    f"{lane[i+1][0]!r} starts {oh5!r}."
                 )
 
-        # 3. Duplicate positional slots
+        # 3. Duplicate positional slots.
         seen: dict[int, str] = {}
-        for row in self._lane:
+        for row in lane:
             name, ptype = row[0], row[1]
-            slot = self._POS_SLOT.get(ptype)
+            slot = pos_slots.get(ptype)
             if slot is not None:
                 if slot in seen:
                     errors.append(
-                        f"Slot {slot} occupied twice: {seen[slot]!r} and {name!r}."
+                        f"Slot {slot} occupied twice: "
+                        f"{seen[slot]!r} and {name!r}."
                     )
                 else:
                     seen[slot] = name
 
-        # 4. CDS-NS ↔ C-tag pairing
-        for i, row in enumerate(self._lane):
-            if row[1] == "CDS-NS":
-                nxt = self._lane[i + 1][1] if i + 1 < len(self._lane) else None
-                if nxt != "C-tag":
-                    errors.append(
-                        f"{row[0]!r} has no stop codon — must be immediately "
-                        f"followed by a C-terminal tag (Pos 4)."
-                    )
-            elif row[1] == "C-tag":
-                prv = self._lane[i - 1][1] if i > 0 else None
-                if prv != "CDS-NS":
-                    errors.append(
-                        f"{row[0]!r} (C-tag, Pos 4) must follow a no-stop CDS "
-                        f"(Pos 3). Found: {prv!r}."
-                    )
+        # 4. CDS-NS ↔ C-tag pairing — only meaningful when both
+        # types exist in the grammar.
+        if "CDS-NS" in pos_slots and "C-tag" in pos_slots:
+            for i, row in enumerate(lane):
+                if row[1] == "CDS-NS":
+                    nxt = lane[i + 1][1] if i + 1 < len(lane) else None
+                    if nxt != "C-tag":
+                        errors.append(
+                            f"{row[0]!r} has no stop codon — must be "
+                            f"immediately followed by a C-terminal tag."
+                        )
+                elif row[1] == "C-tag":
+                    prv = lane[i - 1][1] if i > 0 else None
+                    if prv != "CDS-NS":
+                        errors.append(
+                            f"{row[0]!r} (C-tag) must follow a no-stop "
+                            f"CDS. Found: {prv!r}."
+                        )
 
-        # 5. Mandatory parts
-        types = {r[1] for r in self._lane}
-        if "Promoter" not in types:
-            errors.append("Missing Promoter (Pos 1, 5' OH: GGAG).")
-        if "CDS" not in types and not ("CDS-NS" in types and "C-tag" in types):
-            errors.append(
-                "Missing CDS (Pos 3-4). Add a CDS, or a CDS-NS + C-tag pair."
+        # 5. Mandatory parts: Promoter, CDS (or CDS-NS+C-tag), Terminator.
+        types = {r[1] for r in lane}
+        if "Promoter" in pos_slots and "Promoter" not in types:
+            errors.append(f"Missing Promoter (5' OH: {tu_start}).")
+        if "CDS" in pos_slots:
+            has_cds = "CDS" in types or (
+                "CDS-NS" in types and "C-tag" in types
             )
-        if "Terminator" not in types:
-            errors.append("Missing Terminator (Pos 5, 3' OH: CGCT).")
+            if not has_cds:
+                errors.append("Missing CDS. Add a CDS, or a CDS-NS + C-tag pair.")
+        if "Terminator" in pos_slots and "Terminator" not in types:
+            errors.append(f"Missing Terminator (3' OH: {tu_end}).")
 
         return len(errors) == 0, errors
 
-    def _build_chain(self) -> Text:
-        """Render the overhang chain with colour-coded junctions."""
+    def _build_chain(self, gid: str) -> Text:
+        """Render the overhang chain for grammar ``gid``'s lane with
+        colour-coded junctions (green = matches expected, red = mismatch).
+        """
         t = Text()
-        if not self._lane:
+        lane = self._lanes.get(gid, [])
+        if not lane:
             t.append("(empty)", style="dim")
             return t
 
-        # Opening backbone overhang
-        start_ok = (self._lane[0][3] == self._TU_START)
-        t.append("5'-", style="dim")
-        t.append(self._TU_START, style="bold green" if start_ok else "bold red")
+        grammar = _all_grammars().get(gid) or _BUILTIN_GRAMMARS.get("gb_l0", {})
+        tu_start, tu_end = _grammar_tu_overhangs(grammar)
 
-        for i, row in enumerate(self._lane):
-            name, ptype, pos, oh5, oh3, *_ = row
+        start_ok = (lane[0][3] == tu_start)
+        t.append("5'-", style="dim")
+        t.append(tu_start, style="bold green" if start_ok else "bold red")
+
+        for i, row in enumerate(lane):
+            name, ptype, _pos, oh5, oh3, *_rest = row
             color   = _GB_TYPE_COLORS.get(ptype, "white")
-            # incoming junction colour
-            exp_in  = self._TU_START if i == 0 else self._lane[i - 1][4]
+            exp_in  = tu_start if i == 0 else lane[i - 1][4]
             junc_ok = (oh5 == exp_in)
-            dash    = "—" if junc_ok else "≠"
-            t.append(dash, style="white" if junc_ok else "bold red")
+            t.append("—" if junc_ok else "≠",
+                     style="white" if junc_ok else "bold red")
             t.append(f"[{name}]", style=color)
             t.append("—", style="white")
-            # outgoing OH colour
-            exp_out  = self._lane[i + 1][3] if i + 1 < len(self._lane) else self._TU_END
+            exp_out  = lane[i + 1][3] if i + 1 < len(lane) else tu_end
             oh3_ok   = (oh3 == exp_out)
             t.append(oh3, style="bold cyan" if oh3_ok else "bold red")
 
         t.append("-3'", style="dim")
         return t
 
-    def _refresh_validation(self) -> None:
-        is_valid, errors = self._validate()
-        bb     = self._BACKBONES[self._backbone]
-        vbox   = self.query_one("#ctor-validation", Static)
-        sim    = self.query_one("#btn-ctor-simulate", Button)
+    def _refresh_validation(self, gid: str) -> None:
+        try:
+            vbox = self.query_one(f"#ctor-validation-{gid}", Static)
+            sim  = self.query_one(f"#btn-ctor-simulate-{gid}", Button)
+        except NoMatches:
+            return
+        is_valid, errors = self._validate(gid)
         sim.disabled = not is_valid
+        bb_key   = self._backbones.get(gid, "")
+        bb       = _CONSTRUCTOR_BACKBONES.get(gid, {}).get(bb_key, {})
 
         t = Text()
-        t.append_text(self._build_chain())
+        t.append_text(self._build_chain(gid))
         t.append("\n")
         if is_valid:
+            bb_id   = bb.get("id", "?")
+            bb_sel  = bb.get("selection", "?")
+            bb_note = bb.get("note", "")
             t.append(
-                f"✓  Valid TU — assembles into {self._backbone} "
-                f"({bb['id']}, {bb['selection']} selection, {bb['note']})",
+                f"✓  Valid TU — assembles into {bb_key} "
+                f"({bb_id}, {bb_sel} selection"
+                + (f", {bb_note}" if bb_note else "")
+                + ")",
                 style="bold green",
             )
         else:
@@ -25802,83 +26026,147 @@ class ConstructorModal(ModalScreen):
                 t.append(f"✗  {err}\n", style="bold red")
         vbox.update(t)
 
-    # ── Button handlers ───────────────────────────────────────────────────────
+    # ── Button handlers ───────────────────────────────────────────────────
 
-    @on(Button.Pressed, "#btn-ctor-add")
-    def _on_add(self, _) -> None:
-        self._add_selected_part()
-
-    @on(Button.Pressed, "#btn-lane-up")
-    def _on_up(self, _) -> None:
-        lt  = self.query_one("#ctor-lane", DataTable)
-        idx = lt.cursor_row
-        if idx <= 0 or idx >= len(self._lane):
+    @on(Button.Pressed)
+    def _on_button(self, event: Button.Pressed) -> None:
+        """Single dispatch point for every per-tab button — uses the
+        button id's grammar suffix to route to the right tab's state.
+        Cleaner than ~12 `@on(Button.Pressed, "#btn-...")` decorators
+        spread across the class, especially with two grammar suffixes
+        each. Modal-level buttons (Close) are matched first."""
+        bid = event.button.id or ""
+        if bid == "btn-ctor-close":
+            event.stop()
+            self.dismiss(None)
             return
-        self._lane[idx - 1], self._lane[idx] = self._lane[idx], self._lane[idx - 1]
-        self._refresh_lane(restore_cursor=idx - 1)
-        self._refresh_validation()
-
-    @on(Button.Pressed, "#btn-lane-down")
-    def _on_down(self, _) -> None:
-        lt  = self.query_one("#ctor-lane", DataTable)
-        idx = lt.cursor_row
-        if idx < 0 or idx >= len(self._lane) - 1:
+        # Per-grammar buttons all carry a `-{gid}` suffix.
+        gid = self._gid_from_button(bid)
+        if not gid:
             return
-        self._lane[idx], self._lane[idx + 1] = self._lane[idx + 1], self._lane[idx]
-        self._refresh_lane(restore_cursor=idx + 1)
-        self._refresh_validation()
+        # Add Lane-button stems with their suffix-stripped names.
+        stem = bid[:len(bid) - len(gid) - 1]
+        if stem == f"btn-ctor-add":
+            event.stop()
+            self._add_selected_part(gid)
+        elif stem == f"btn-lane-up":
+            event.stop()
+            self._lane_move(gid, -1)
+        elif stem == f"btn-lane-down":
+            event.stop()
+            self._lane_move(gid, +1)
+        elif stem == f"btn-lane-remove":
+            event.stop()
+            self._lane_remove(gid)
+        elif stem == f"btn-ctor-simulate":
+            event.stop()
+            self.app.notify(
+                "Simulate Assembly: coming soon.",
+                severity="information",
+            )
+        elif stem == f"btn-ctor-clear":
+            event.stop()
+            self._lanes[gid] = []
+            self._refresh_lane(gid)
+            self._refresh_validation(gid)
+        elif stem == f"btn-ctor-vector-change":
+            event.stop()
 
-    @on(Button.Pressed, "#btn-lane-remove")
-    def _on_remove(self, _) -> None:
-        lt  = self.query_one("#ctor-lane", DataTable)
-        idx = lt.cursor_row
-        if 0 <= idx < len(self._lane):
-            self._lane.pop(idx)
-            self._refresh_lane(restore_cursor=min(idx, len(self._lane) - 1))
-            self._refresh_validation()
+            def _on_dismissed(_result, _gid=gid):
+                self._refresh_entry_vector_banner(_gid)
 
-    @on(Button.Pressed, ".bb-btn")
-    def _on_backbone(self, event: Button.Pressed) -> None:
-        bb = (event.button.id or "").replace("btn-bb-", "")
-        if bb not in self._BACKBONES:
+            self.app.push_screen(GrammarEditorModal(gid), _on_dismissed)
+        elif stem.startswith("btn-bb-"):
+            # `btn-bb-{gid}-{name}` — strip stem prefix to recover backbone
+            # name. The bid format is `btn-bb-{gid}-{name}`, so the
+            # backbone name is everything after `btn-bb-{gid}-`.
+            prefix = f"btn-bb-{gid}-"
+            if bid.startswith(prefix):
+                event.stop()
+                self._select_backbone(gid, bid[len(prefix):])
+
+    def _lane_move(self, gid: str, delta: int) -> None:
+        try:
+            lt = self.query_one(f"#ctor-lane-{gid}", DataTable)
+        except NoMatches:
             return
-        self._backbone = bb
-        for name in self._BACKBONES:
-            btn = self.query_one(f"#btn-bb-{name}", Button)
-            btn.set_class(name == bb, "bb-active")
-        self._refresh_validation()
+        lane = self._lanes.get(gid, [])
+        idx  = lt.cursor_row
+        new  = idx + delta
+        if not (0 <= idx < len(lane) and 0 <= new < len(lane)):
+            return
+        lane[idx], lane[new] = lane[new], lane[idx]
+        self._refresh_lane(gid, restore_cursor=new)
+        self._refresh_validation(gid)
 
-    @on(Button.Pressed, "#btn-ctor-simulate")
-    def _on_simulate(self, _) -> None:
-        self.app.notify("Simulate Assembly: coming soon.", severity="information")
+    def _lane_remove(self, gid: str) -> None:
+        try:
+            lt = self.query_one(f"#ctor-lane-{gid}", DataTable)
+        except NoMatches:
+            return
+        lane = self._lanes.get(gid, [])
+        idx  = lt.cursor_row
+        if 0 <= idx < len(lane):
+            lane.pop(idx)
+            self._refresh_lane(gid,
+                               restore_cursor=min(idx, len(lane) - 1))
+            self._refresh_validation(gid)
 
-    @on(Button.Pressed, "#btn-ctor-clear")
-    def _on_clear(self, _) -> None:
-        self._lane.clear()
-        self._refresh_lane()
-        self._refresh_validation()
+    def _select_backbone(self, gid: str, name: str) -> None:
+        backbones = _CONSTRUCTOR_BACKBONES.get(gid, {})
+        if name not in backbones:
+            return
+        self._backbones[gid] = name
+        for bb in backbones:
+            try:
+                btn = self.query_one(f"#btn-bb-{gid}-{bb}", Button)
+            except NoMatches:
+                continue
+            btn.set_class(bb == name, "bb-active")
+        self._refresh_validation(gid)
 
-    @on(Button.Pressed, "#btn-ctor-close")
-    def _on_close(self, _) -> None:
-        self.dismiss(None)
+    # ── Filter checkbox ─────────────────────────────────────────────────
+
+    @on(Checkbox.Changed)
+    def _on_filter_toggle(self, event: Checkbox.Changed) -> None:
+        """Persist the filter setting + rebuild every modular palette
+        so both tabs reflect the same toggle state. Both checkboxes
+        always agree (one shared setting); we keep two checkboxes so
+        the user doesn't have to leave the current tab to flip it."""
+        cid = event.checkbox.id or ""
+        if not cid.startswith("chk-ctor-filter-"):
+            return
+        new_val = bool(event.value)
+        if _get_setting("constructor_filter_by_grammar") == new_val:
+            return
+        _set_setting("constructor_filter_by_grammar", new_val)
+        try:
+            self.app._constructor_filter_by_grammar = new_val
+        except AttributeError:
+            pass
+        for gid, _ in _CONSTRUCTOR_GRAMMARS_FOR_TABS:
+            self._refresh_palette(gid)
+            try:
+                chk = self.query_one(
+                    f"#chk-ctor-filter-{gid}", Checkbox,
+                )
+            except NoMatches:
+                continue
+            if chk.value != new_val:
+                chk.value = new_val
 
     def action_cancel(self) -> None:
         self.dismiss(None)
 
-    # ── Entry-vector helpers ───────────────────────────────────────────────
+    # ── Entry-vector helpers ───────────────────────────────────────────
 
-    def _entry_vector_summary_for_active_grammar(self) -> str:
-        """Markup string for the entry-vector banner. Resolves the
-        active grammar id at call time so the banner stays in sync
-        if the user changes grammar from the Domesticator.
-
-        Reuses the same `(name) (size bp) · from <source>` shape as
-        `GrammarEditorModal._entry_vector_summary` for visual
-        consistency. Untrusted name / path strings are run through
-        `rich.markup.escape` so a vector named `pUC[18]` renders
-        literally rather than tripping Rich's markup lexer."""
+    def _entry_vector_summary_for_grammar(self, gid: str) -> str:
+        """Markup string for the entry-vector banner for grammar
+        ``gid`` (NOT the globally-active grammar). Untrusted name /
+        path strings go through `rich.markup.escape` so a vector
+        named `pUC[18]` renders literally rather than tripping
+        Rich's markup lexer."""
         from rich.markup import escape as _esc
-        gid = _get_setting("active_grammar", "gb_l0")
         v   = _get_entry_vector(gid)
         prefix = "[bold]Entry vector:[/bold]  "
         if not isinstance(v, dict) or not v.get("name"):
@@ -25887,24 +26175,12 @@ class ConstructorModal(ModalScreen):
         nm   = _esc(str(v.get("name") or "?"))
         return f"{prefix}[green]{nm}[/green]  ({size:,} bp)"
 
-    def _refresh_entry_vector_banner(self) -> None:
+    def _refresh_entry_vector_banner(self, gid: str) -> None:
         try:
-            info = self.query_one("#ctor-vector-info", Static)
+            info = self.query_one(f"#ctor-vector-info-{gid}", Static)
         except NoMatches:
             return
-        info.update(self._entry_vector_summary_for_active_grammar())
-
-    @on(Button.Pressed, "#btn-ctor-vector-change")
-    def _on_change_vector(self, _: Button.Pressed) -> None:
-        """Open the Grammar editor for the active grammar so the user
-        can pick / clear the entry vector. On dismiss, refresh the
-        banner so a fresh choice shows up immediately."""
-        gid = _get_setting("active_grammar", "gb_l0")
-
-        def _on_dismissed(_result):
-            self._refresh_entry_vector_banner()
-
-        self.app.push_screen(GrammarEditorModal(gid), _on_dismissed)
+        info.update(self._entry_vector_summary_for_grammar(gid))
 
 
 # ── NCBI taxon picker (sub-modal for species-name → taxid lookup) ─────────────
@@ -32148,7 +32424,7 @@ def _settings_validator_grammar_id(value):
 # those are session bookkeeping, not user preferences.
 _AGENT_SETTINGS_ALLOWLIST: "dict[str, tuple]" = {
     # key: (validator, default)
-    "show_feature_tooltips": (_settings_validator_bool,                  True),
+    "show_feature_tooltips": (_settings_validator_bool,                  False),
     "click_debug":           (_settings_validator_bool,                  False),
     "check_updates":         (_settings_validator_bool,                  True),
     "show_restr":            (_settings_validator_bool,                  False),
@@ -32160,6 +32436,7 @@ _AGENT_SETTINGS_ALLOWLIST: "dict[str, tuple]" = {
                               "centered"),
     "active_collection":     (_settings_validator_collection_name,       ""),
     "active_grammar":        (_settings_validator_grammar_id,            "gb_l0"),
+    "constructor_filter_by_grammar": (_settings_validator_bool,           True),
 }
 
 
@@ -32444,7 +32721,18 @@ class PlasmidApp(App):
     # time. Keep the schema flat so adding future toggles stays
     # mechanical: add the bool here, add the menu line in `open_menu`,
     # add the `action_toggle_*` method, and load it in `on_mount`.
-    _show_feature_tooltips: bool = True
+    # Default OFF as of 2026-05-07 — the popup gets in the way more
+    # than it helps for users who already see feature info on the
+    # sidebar / map. Toggle via Settings → "Show feature tooltips"
+    # to bring it back. Existing users keep their persisted choice
+    # (only the default changed).
+    _show_feature_tooltips: bool = False
+    # Filter the Constructor's parts palette by the focused tab's
+    # grammar. Default True so the Golden Braid tab shows only L0
+    # parts and the MoClo tab shows only MoClo parts. Per-tab
+    # checkbox toggles it; persisted in `settings.json` via
+    # `_constructor_filter_by_grammar`.
+    _constructor_filter_by_grammar: bool = True
     # Splash screen on launch — skip via CLI `--no-splash` or by setting
     # `app._skip_splash = True` before run() (the test conftest sets this
     # because the splash modal blocks pilot.click before the suite drives
@@ -33452,7 +33740,15 @@ SpeciesPickerModal { align: center middle; }
         # `_set_setting(...)` call to the matching `action_toggle_*`
         # method, and surface it in the Settings (or relevant) menu.
         self._show_feature_tooltips = bool(
-            _get_setting("show_feature_tooltips", True)
+            _get_setting("show_feature_tooltips", False)
+        )
+        # Filter the Constructor's parts palette by the focused
+        # tab's grammar (gb_l0 / moclo_plant / custom). Default ON
+        # so a user with mixed parts only sees the relevant subset
+        # when switching to a grammar tab; toggle via the per-tab
+        # checkbox in the Constructor.
+        self._constructor_filter_by_grammar = bool(
+            _get_setting("constructor_filter_by_grammar", True)
         )
         self._click_debug          = bool(_get_setting("click_debug", False))
         self._check_updates        = bool(_get_setting("check_updates", True))
@@ -37072,9 +37368,10 @@ SpeciesPickerModal { align: center middle; }
         # `_get_setting` in `on_mount`. Non-toggle settings (numeric,
         # enum, file path) will need their own modal — keep this list
         # for simple booleans only.
-        ft = "✓" if self._show_feature_tooltips else " "
-        cd = "✓" if self._click_debug          else " "
-        cu = "✓" if self._check_updates        else " "
+        ft  = "✓" if self._show_feature_tooltips         else " "
+        cd  = "✓" if self._click_debug                   else " "
+        cu  = "✓" if self._check_updates                 else " "
+        cfg = "✓" if self._constructor_filter_by_grammar else " "
         # Linear layout is a tri-label since it's NOT a binary toggle —
         # show the *current* layout name so the menu reads as the
         # action that will fire ("Switch to flag" vs "Switch to centered").
@@ -37109,6 +37406,8 @@ SpeciesPickerModal { align: center middle; }
                 (f"[{ft}] Show feature hover tooltips",  "toggle_feature_tooltips"),
                 (f"[{cd}] Click debug echo  [Alt+M]",    "toggle_click_debug"),
                 (f"[{cu}] Check for updates on launch",  "toggle_check_updates"),
+                (f"[{cfg}] Filter Constructor parts by grammar",
+                                                          "toggle_constructor_filter"),
                 (f"Linear layout: {pm_layout} → switch to {ll_next}",
                                                           "toggle_linear_layout"),
                 (f"Min primer binding: {self._min_primer_binding} bp → set…",
@@ -37384,6 +37683,39 @@ SpeciesPickerModal { align: center middle; }
         self.notify(
             f"Feature hover tooltips "
             f"{'ON' if self._show_feature_tooltips else 'OFF'}",
+            severity="information",
+        )
+
+    def action_toggle_constructor_filter(self) -> None:
+        """Settings → 'Filter Constructor parts by grammar'. When ON
+        (default), each modular Constructor tab's parts palette
+        shows only parts whose ``grammar`` field matches the tab's
+        grammar id. Toggling propagates to any open Constructor
+        modal so the palettes refresh in-place."""
+        self._constructor_filter_by_grammar = (
+            not self._constructor_filter_by_grammar
+        )
+        _set_setting(
+            "constructor_filter_by_grammar",
+            self._constructor_filter_by_grammar,
+        )
+        # Refresh any open ConstructorModal so the palettes reflect
+        # the toggle without forcing the user to close + re-open.
+        for screen in self.screen_stack:
+            if isinstance(screen, ConstructorModal):
+                for gid, _ in _CONSTRUCTOR_GRAMMARS_FOR_TABS:
+                    try:
+                        screen._refresh_palette(gid)
+                        chk = screen.query_one(
+                            f"#chk-ctor-filter-{gid}", Checkbox,
+                        )
+                        if chk.value != self._constructor_filter_by_grammar:
+                            chk.value = self._constructor_filter_by_grammar
+                    except (NoMatches, AttributeError):
+                        continue
+        self.notify(
+            f"Constructor parts-bin grammar filter "
+            f"{'ON' if self._constructor_filter_by_grammar else 'OFF'}",
             severity="information",
         )
 

@@ -514,12 +514,16 @@ class TestSimulateTraditionalCloning:
             await pilot.pause()
             from textual.widgets import TabbedContent
             tabs = modal.query_one("#ctor-tabs", TabbedContent)
-            # Two tabs registered.
+            # Three tabs registered (2026-05-07): the single modular
+            # tab was split into per-grammar tabs (Golden Braid,
+            # MoClo Plant) so each gets its own parts palette filtered
+            # by the active grammar.
             tab_ids = [p.id for p in modal.query("TabPane")]
-            assert "ctor-tab-modular"     in tab_ids
             assert "ctor-tab-traditional" in tab_ids
-            # Modular is the default active tab.
-            assert tabs.active == "ctor-tab-modular"
+            assert "ctor-tab-gb_l0"       in tab_ids
+            assert "ctor-tab-moclo_plant" in tab_ids
+            # Traditional opens by default.
+            assert tabs.active == "ctor-tab-traditional"
 
     async def test_traditional_pane_pcr_mode_simulate(
             self, tiny_record, isolated_library):
@@ -882,3 +886,270 @@ class TestSimulateTraditionalCloning:
         labels = {f["label"]: (f["start"], f["end"]) for f in fwd_feats}
         assert labels["vec-feat"] == (5, 10)
         assert labels["in-feat"]  == (22, 25)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Constructor modal — multi-grammar tabs (2026-05-07)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# The Constructor was refactored from a single Modular tab (gb_l0
+# only) into per-grammar tabs (Golden Braid + MoClo Plant) plus the
+# pre-existing Traditional tab. Each modular tab pulls its parts
+# palette from `parts_bin.json` filtered by the tab's grammar id
+# when the `constructor_filter_by_grammar` setting is on (default).
+# These tests cover the wiring: tabs exist, palette filters, palette
+# reflects user parts, per-grammar entry vector is independent.
+
+import pytest as _ctor_pytest
+
+
+@_ctor_pytest.fixture
+def isolated_parts_bin(tmp_path, monkeypatch):
+    """Redirect `_PARTS_BIN_FILE` to a tmp path so the Constructor
+    palette tests don't touch the real parts_bin.json. Mirrors the
+    fixture in test_domesticator.py."""
+    tmp_bin = tmp_path / "parts_bin.json"
+    monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_bin)
+    monkeypatch.setattr(sc, "_parts_bin_cache", None)
+    return tmp_bin
+
+
+class TestConstructorMultiGrammarTabs:
+    """The Constructor exposes Traditional + Golden Braid + MoClo
+    Plant tabs. Each modular tab uses its own grammar context for
+    palette filtering, validation, and entry-vector banner."""
+
+    def test_palette_helper_filters_by_grammar(self, isolated_parts_bin):
+        # Save two parts with different grammar ids; the helper
+        # filtered by grammar should only return the matching one.
+        sc._save_parts_bin([
+            {
+                "name": "myProm", "type": "Promoter", "position": "Pos 1",
+                "oh5": "GGAG", "oh3": "TGAC", "grammar": "gb_l0",
+                "sequence": "ACGT" * 10,
+            },
+            {
+                "name": "myMocloProm", "type": "Promoter",
+                "position": "Pos 1", "oh5": "GGAG", "oh3": "AATG",
+                "grammar": "moclo_plant", "sequence": "ACGT" * 10,
+            },
+        ])
+        gb_rows = sc._palette_rows_for_grammar(
+            "gb_l0", filter_enabled=True,
+        )
+        names = {r[0] for r in gb_rows}
+        assert "myProm" in names
+        assert "myMocloProm" not in names
+        moclo_rows = sc._palette_rows_for_grammar(
+            "moclo_plant", filter_enabled=True,
+        )
+        names = {r[0] for r in moclo_rows}
+        assert "myMocloProm" in names
+        assert "myProm" not in names
+
+    def test_palette_helper_unfiltered_shows_all_user_parts(
+            self, isolated_parts_bin):
+        sc._save_parts_bin([
+            {
+                "name": "myProm", "type": "Promoter", "position": "Pos 1",
+                "oh5": "GGAG", "oh3": "TGAC", "grammar": "gb_l0",
+                "sequence": "ACGT" * 10,
+            },
+            {
+                "name": "myMocloProm", "type": "Promoter",
+                "position": "Pos 1", "oh5": "GGAG", "oh3": "AATG",
+                "grammar": "moclo_plant", "sequence": "ACGT" * 10,
+            },
+        ])
+        rows = sc._palette_rows_for_grammar(
+            "gb_l0", filter_enabled=False,
+        )
+        names = {r[0] for r in rows}
+        assert "myProm" in names
+        assert "myMocloProm" in names
+
+    def test_grammar_tu_overhangs_derives_from_positions(self):
+        # gb_l0: first position oh5=GGAG (Promoter), last oh3=CGCT (Term).
+        gb_l0 = sc._BUILTIN_GRAMMARS["gb_l0"]
+        assert sc._grammar_tu_overhangs(gb_l0) == ("GGAG", "CGCT")
+        # MoClo Plant: first oh5=GGAG, last oh3=CGCT (same TU
+        # boundaries by Engler 2014 convention, different junctions).
+        moclo = sc._BUILTIN_GRAMMARS["moclo_plant"]
+        assert sc._grammar_tu_overhangs(moclo) == ("GGAG", "CGCT")
+
+    def test_grammar_pos_slots_includes_cds_ns_alias(self):
+        gb_l0 = sc._BUILTIN_GRAMMARS["gb_l0"]
+        slots = sc._grammar_pos_slots(gb_l0)
+        # CDS at pos 3 (gb_l0 has Promoter, 5' UTR, CDS, ...).
+        assert slots["CDS"] == 3
+        # CDS-NS shares the CDS slot via alias-fallback.
+        assert slots["CDS-NS"] == 3
+
+    async def test_constructor_modal_has_three_tabs(
+            self, tiny_record, isolated_library):
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            tab_ids = [p.id for p in modal.query("TabPane")]
+            assert "ctor-tab-traditional" in tab_ids
+            assert "ctor-tab-gb_l0"       in tab_ids
+            assert "ctor-tab-moclo_plant" in tab_ids
+            # Each grammar tab has its own palette + lane.
+            from textual.widgets import DataTable
+            assert modal.query_one("#ctor-palette-gb_l0", DataTable)
+            assert modal.query_one("#ctor-lane-gb_l0",    DataTable)
+            assert modal.query_one("#ctor-palette-moclo_plant", DataTable)
+            assert modal.query_one("#ctor-lane-moclo_plant",    DataTable)
+
+    async def test_modular_tab_palette_reflects_parts_bin(
+            self, tiny_record, isolated_library, isolated_parts_bin,
+    ):
+        # User saves a Golden Braid CDS + a MoClo CDS. The GB
+        # tab's palette should show only the GB part by default
+        # (filter ON); the MoClo tab shows only the MoClo part.
+        sc._save_parts_bin([
+            {
+                "name": "MyGBgene", "type": "CDS", "position": "Pos 3-4",
+                "oh5": "AATG", "oh3": "GCTT", "grammar": "gb_l0",
+                "sequence": "ATG" + "AAA" * 30 + "TAA",
+            },
+            {
+                "name": "MyMocloGene", "type": "CDS",
+                "position": "Pos 3", "oh5": "AGGT", "oh3": "GCTT",
+                "grammar": "moclo_plant",
+                "sequence": "ATG" + "GGG" * 30 + "TAA",
+            },
+        ])
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            gb_names = {r[0] for r in modal._palette_rows.get("gb_l0", [])}
+            mc_names = {r[0] for r in modal._palette_rows.get("moclo_plant", [])}
+            assert "MyGBgene"     in gb_names
+            assert "MyMocloGene"  not in gb_names
+            assert "MyMocloGene"  in mc_names
+            assert "MyGBgene"     not in mc_names
+
+    async def test_modular_tab_per_grammar_lane_state(
+            self, tiny_record, isolated_library, isolated_parts_bin,
+    ):
+        # Adding a part on the GB tab doesn't pollute the MoClo
+        # tab's lane — each tab owns its own state.
+        sc._save_parts_bin([
+            {
+                "name": "GBProm", "type": "Promoter", "position": "Pos 1",
+                "oh5": "GGAG", "oh3": "TGAC", "grammar": "gb_l0",
+                "sequence": "ACGT" * 10,
+            },
+        ])
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal._add_selected_part("gb_l0")
+            assert len(modal._lanes["gb_l0"])       == 1
+            assert len(modal._lanes["moclo_plant"]) == 0
+
+    async def test_filter_setting_default_on(
+            self, tiny_record, isolated_library, isolated_parts_bin,
+    ):
+        # The persisted setting defaults to True; the filter checkbox
+        # in each modular tab inherits that default value.
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            from textual.widgets import Checkbox
+            chk_gb = modal.query_one(
+                "#chk-ctor-filter-gb_l0", Checkbox,
+            )
+            chk_mc = modal.query_one(
+                "#chk-ctor-filter-moclo_plant", Checkbox,
+            )
+            assert chk_gb.value is True
+            assert chk_mc.value is True
+
+    async def test_filter_setting_persists_to_disk(
+            self, tiny_record, isolated_library, isolated_parts_bin,
+    ):
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert sc._get_setting(
+                "constructor_filter_by_grammar", True,
+            ) is True
+            app.action_toggle_constructor_filter()
+            await pilot.pause()
+            sc._settings_flush_sync()
+            assert sc._get_setting(
+                "constructor_filter_by_grammar", True,
+            ) is False
+
+    async def test_per_grammar_entry_vector_banner(
+            self, tiny_record, isolated_library, isolated_parts_bin,
+            tmp_path, monkeypatch,
+    ):
+        # Configure different entry vectors for gb_l0 and moclo_plant;
+        # each tab's banner should show its OWN vector, not the
+        # globally-active grammar's vector.
+        ev_file = tmp_path / "entry_vectors.json"
+        monkeypatch.setattr(sc, "_ENTRY_VECTORS_FILE", ev_file)
+        monkeypatch.setattr(sc, "_entry_vectors_cache", None)
+        sc._set_entry_vector("gb_l0", {
+            "name": "pUPD2_test", "size": 2200, "source": "test",
+            "gb_text": (
+                "LOCUS       pUPD2_test  2200 bp DNA circular SYN 01-JAN-2026\n"
+                "FEATURES             Location/Qualifiers\n"
+                "ORIGIN\n        1 " + "a" * 60 + "\n//\n"
+            ),
+        })
+        sc._set_entry_vector("moclo_plant", {
+            "name": "pAGM4673_test", "size": 3500, "source": "test",
+            "gb_text": (
+                "LOCUS       pAGM4673_t  3500 bp DNA circular SYN 01-JAN-2026\n"
+                "FEATURES             Location/Qualifiers\n"
+                "ORIGIN\n        1 " + "a" * 60 + "\n//\n"
+            ),
+        })
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Read the banner's underlying text via the modal's helper
+            # rather than poking at Static internals (Textual's Static
+            # doesn't expose `renderable` as a public attribute).
+            assert "pUPD2_test" in modal._entry_vector_summary_for_grammar(
+                "gb_l0",
+            )
+            assert "pAGM4673_test" in modal._entry_vector_summary_for_grammar(
+                "moclo_plant",
+            )
