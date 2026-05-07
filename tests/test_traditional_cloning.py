@@ -1144,9 +1144,9 @@ class TestConstructorMultiGrammarTabs:
             tmp_path, monkeypatch,
     ):
         # Configure different L1 acceptors for the four GB roles
-        # (Alpha1 / Alpha2 / Omega1 / Omega2). The banner should
-        # reflect the currently-selected role's vector — switching
-        # backbones swaps the banner.
+        # (Alpha1 / Alpha2 / Omega1 / Omega2). After the user picks
+        # a backbone via `_select_backbone`, the banner-style
+        # summary reflects the active role's bound vector.
         ev_file = tmp_path / "entry_vectors.json"
         monkeypatch.setattr(sc, "_ENTRY_VECTORS_FILE", ev_file)
         monkeypatch.setattr(sc, "_entry_vectors_cache", None)
@@ -1173,7 +1173,9 @@ class TestConstructorMultiGrammarTabs:
             await app.push_screen(modal)
             await pilot.pause()
             await pilot.pause(0.05)
-            # Default backbone is Alpha1 → banner should show FFE2.
+            # No backbone active by default — the user has to press
+            # one to set it (matches the 2026-05-08 click-to-set UX).
+            modal._select_backbone("gb_l0", "Alpha1")
             banner = modal._entry_vector_summary_for_grammar("gb_l0")
             assert "FFE2_test" in banner
             assert "Alpha1"    in banner
@@ -1183,14 +1185,53 @@ class TestConstructorMultiGrammarTabs:
             assert "FFE4_test" in banner
             assert "Omega1"    in banner
 
-    async def test_unbound_role_banner_shows_pick_from_library(
+    async def test_role_button_label_shows_bound_vector_name(
             self, tiny_record, isolated_library, isolated_parts_bin,
             tmp_path, monkeypatch,
     ):
-        # With nothing configured for any role, each backbone's banner
-        # surfaces the role label + a "pick from library" hint + the
-        # selection marker the role expects. No specific plasmid is
-        # named — backbones are slots, not pre-bound vectors.
+        # Per-role static label ABOVE each backbone button shows the
+        # bound vector's name (truncated for the column width). With
+        # no binding the label reads "(none)".
+        ev_file = tmp_path / "entry_vectors.json"
+        monkeypatch.setattr(sc, "_ENTRY_VECTORS_FILE", ev_file)
+        monkeypatch.setattr(sc, "_entry_vectors_cache", None)
+        sc._set_entry_vector("gb_l0", {
+            "name":   "MyAcceptor", "size": 3000, "source": "test",
+            "gb_text": "",
+        }, role="Alpha1")
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Alpha1 label shows the bound vector name.
+            assert "MyAcceptor" in modal._backbone_name_label("gb_l0", "Alpha1")
+            # Omega1 has nothing bound — label says "(none)".
+            assert "(none)" in modal._backbone_name_label("gb_l0", "Omega1")
+            from textual.widgets import Static
+            lbl_a1 = modal.query_one(
+                "#lbl-bb-gb_l0-Alpha1", Static,
+            )
+            lbl_o1 = modal.query_one(
+                "#lbl-bb-gb_l0-Omega1", Static,
+            )
+            assert "MyAcceptor" in str(lbl_a1.render())
+            assert "(none)"     in str(lbl_o1.render())
+
+    async def test_unbound_button_press_opens_picker(
+            self, tiny_record, isolated_library, isolated_parts_bin,
+            tmp_path, monkeypatch,
+    ):
+        # When the user clicks a role button that has no plasmid
+        # bound yet, `_select_backbone` should hand off to
+        # `_pick_acceptor_for_role(then_activate=True)` rather than
+        # silently activating an empty role. We verify by stubbing
+        # `_pick_acceptor_for_role` and checking it gets called with
+        # the right role + activate flag.
         ev_file = tmp_path / "entry_vectors.json"
         monkeypatch.setattr(sc, "_ENTRY_VECTORS_FILE", ev_file)
         monkeypatch.setattr(sc, "_entry_vectors_cache", None)
@@ -1203,17 +1244,16 @@ class TestConstructorMultiGrammarTabs:
             await app.push_screen(modal)
             await pilot.pause()
             await pilot.pause(0.05)
-            for role, expected_sel in (
-                ("Alpha1", "Spectinomycin"),
-                ("Alpha2", "Spectinomycin"),
-                ("Omega1", "Kanamycin"),
-                ("Omega2", "Kanamycin"),
-            ):
-                modal._select_backbone("gb_l0", role)
-                banner = modal._entry_vector_summary_for_grammar("gb_l0")
-                assert role           in banner
-                assert "pick"         in banner.lower()
-                assert expected_sel   in banner
+            calls: list[tuple] = []
+
+            def _stub(gid, role="", *, then_activate=False):
+                calls.append((gid, role, then_activate))
+
+            modal._pick_acceptor_for_role = _stub
+            modal._select_backbone("gb_l0", "Alpha2")
+            assert calls == [("gb_l0", "Alpha2", True)], (
+                f"Unbound click should open picker; got {calls}"
+            )
 
     def test_no_hardcoded_acceptor_ids_in_constructor_backbones(self):
         """Regression guard for 2026-05-08 (do-not-hardcode):

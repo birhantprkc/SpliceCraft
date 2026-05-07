@@ -25705,14 +25705,15 @@ class ConstructorModal(ModalScreen):
             gid: [] for gid, _ in _CONSTRUCTOR_GRAMMARS_FOR_TABS
         }
         # Per-grammar backbone choice — stored as the dict key
-        # (e.g. "Alpha1" for GB) into _CONSTRUCTOR_BACKBONES[gid].
-        # Defaults to the grammar's first declared backbone.
-        self._backbones: dict[str, str] = {}
-        for gid, _ in _CONSTRUCTOR_GRAMMARS_FOR_TABS:
-            backbones = _CONSTRUCTOR_BACKBONES.get(gid, {})
-            self._backbones[gid] = (
-                next(iter(backbones), "") if backbones else ""
-            )
+        # (e.g. "Alpha1" for GB) into _CONSTRUCTOR_BACKBONES[gid],
+        # or "" when the user hasn't picked one yet. The user has
+        # to actively press a role button to set it; we don't pre-
+        # select a default because the role-button press is what
+        # "establishes the construction level" per the
+        # 2026-05-08 UX spec.
+        self._backbones: dict[str, str] = {
+            gid: "" for gid, _ in _CONSTRUCTOR_GRAMMARS_FOR_TABS
+        }
         # Per-grammar palette rows — cached so the row-index → tuple
         # lookup in `_add_selected_part` doesn't re-load parts_bin
         # on every keystroke. Re-built on filter toggle + on mount.
@@ -25741,17 +25742,20 @@ class ConstructorModal(ModalScreen):
     def _compose_modular_pane(self, gid: str):
         """Yield the widget tree for one modular tab. Widget IDs are
         suffixed by ``gid`` so the two modular tabs (GB + MoClo)
-        don't collide on `query_one` lookups."""
-        # Entry-vector banner — pulls the configured destination
-        # plasmid for THIS grammar (not the globally-active one) so
-        # the GB tab stays GB even when MoClo is active elsewhere.
-        with Horizontal(id=f"ctor-vector-row-{gid}"):
-            yield Static(
-                self._entry_vector_summary_for_grammar(gid),
-                id=f"ctor-vector-info-{gid}", markup=True,
-            )
-            yield Button("Change…", id=f"btn-ctor-vector-change-{gid}",
-                           variant="default")
+        don't collide on `query_one` lookups.
+
+        Backbone-selector layout (2026-05-08): the row of role
+        buttons replaces the older "banner + Change…" pattern.
+        Each role renders as a Vertical(name_static, button):
+
+            [Pseudo­_alpha_v2]  [pAGM4673]  [(none)]  [(none)]
+            [   Alpha 1     ]  [Alpha 2 ]  [Omega 1]  [Omega 2]
+
+        The static above each button shows the bound L1 acceptor's
+        name (or `(none)` until the user picks one). Clicking an
+        unbound button opens the plasmid picker; clicking a bound
+        button activates that backbone for the assembly.
+        """
         # Filter checkbox — toggles the per-grammar palette filter.
         # Default value pulls from the persisted setting so a fresh
         # mount starts with the user's last choice.
@@ -25782,7 +25786,10 @@ class ConstructorModal(ModalScreen):
                     yield Button("↓",        id=f"btn-lane-down-{gid}")
                     yield Button("✕ Remove", id=f"btn-lane-remove-{gid}",
                                    variant="error")
-        # Backbone selector
+        # Backbone selector — 4 (or 2) per-role columns. Each column
+        # is a Vertical so the bound vector name renders ABOVE the
+        # button; queries on `lbl-bb-…` update the name when the
+        # binding changes.
         with Horizontal(id=f"ctor-backbone-row-{gid}"):
             yield Static("Backbone:", id=f"ctor-backbone-label-{gid}")
             backbones = _CONSTRUCTOR_BACKBONES.get(gid, {})
@@ -25790,11 +25797,18 @@ class ConstructorModal(ModalScreen):
                 classes = ("bb-btn bb-active"
                             if bb == self._backbones.get(gid)
                             else "bb-btn")
-                # Button id includes the grammar so the .bb-btn class
-                # handler can recover both gid + backbone name from
-                # the button id alone.
-                yield Button(bb, id=f"btn-bb-{gid}-{bb}",
-                               classes=classes)
+                with Vertical(id=f"bb-col-{gid}-{bb}",
+                                classes="bb-col"):
+                    yield Static(
+                        self._backbone_name_label(gid, bb),
+                        id=f"lbl-bb-{gid}-{bb}",
+                        classes="bb-name",
+                    )
+                    # Button id includes the grammar so the .bb-btn class
+                    # handler can recover both gid + backbone name from
+                    # the button id alone.
+                    yield Button(bb, id=f"btn-bb-{gid}-{bb}",
+                                   classes=classes)
         yield Static("", id=f"ctor-validation-{gid}")
         with Horizontal(id=f"ctor-btns-{gid}"):
             yield Button("Simulate Assembly",
@@ -26025,24 +26039,30 @@ class ConstructorModal(ModalScreen):
         t.append_text(self._build_chain(gid))
         t.append("\n")
         if is_valid:
-            # Resolve the bound vector for the selected role; fall
-            # back to the role's selection-marker hint when no
-            # vector is bound yet so the user sees what acceptor the
-            # role expects without us naming a specific plasmid.
-            bound = _get_entry_vector(gid, bb_key) if bb_key else None
-            bb_sel  = bb.get("selection", "")
-            bb_note = bb.get("note", "")
-            if isinstance(bound, dict) and bound.get("name"):
-                target = str(bound.get("name") or "?")
+            if not bb_key:
+                # Lane chains correctly but no backbone is active.
+                # Yellow (not green) so the user sees there's still
+                # one decision left before assembly is meaningful.
+                t.append(
+                    "✓  Lane is valid — press a backbone button "
+                    "below to set the L1 destination.",
+                    style="bold yellow",
+                )
             else:
-                target = "(none — pick from library →)"
-            sel_part = f", {bb_sel} selection" if bb_sel else ""
-            note_part = f", {bb_note}" if bb_note else ""
-            t.append(
-                f"✓  Valid TU — assembles into {bb_key} "
-                f"({target}{sel_part}{note_part})",
-                style="bold green",
-            )
+                bound = _get_entry_vector(gid, bb_key)
+                bb_sel  = bb.get("selection", "")
+                bb_note = bb.get("note", "")
+                if isinstance(bound, dict) and bound.get("name"):
+                    target = str(bound.get("name") or "?")
+                else:
+                    target = "(none — pick from library →)"
+                sel_part  = f", {bb_sel} selection" if bb_sel else ""
+                note_part = f", {bb_note}" if bb_note else ""
+                t.append(
+                    f"✓  Valid TU — assembles into {bb_key} "
+                    f"({target}{sel_part}{note_part})",
+                    style="bold green",
+                )
         else:
             for err in errors:
                 t.append(f"✗  {err}\n", style="bold red")
@@ -26091,9 +26111,6 @@ class ConstructorModal(ModalScreen):
             self._lanes[gid] = []
             self._refresh_lane(gid)
             self._refresh_validation(gid)
-        elif stem == f"btn-ctor-vector-change":
-            event.stop()
-            self._pick_acceptor_for_role(gid)
         elif stem.startswith("btn-bb-"):
             # `btn-bb-{gid}-{name}` — strip stem prefix to recover backbone
             # name. The bid format is `btn-bb-{gid}-{name}`, so the
@@ -26130,9 +26147,61 @@ class ConstructorModal(ModalScreen):
                                restore_cursor=min(idx, len(lane) - 1))
             self._refresh_validation(gid)
 
+    def _backbone_name_label(self, gid: str, role: str) -> str:
+        """Static text rendered ABOVE the role's button. Shows the
+        bound L1 acceptor's name (truncated for the column width)
+        or ``(none)`` when the role has no plasmid bound yet.
+
+        Truncation: the role buttons sit in a fixed-width column,
+        so a long plasmid name like ``pUC57_with_long_descriptive_
+        name`` would push the layout. Hard-cap at 16 chars with an
+        ellipsis suffix so every label fits the same column."""
+        from rich.markup import escape as _esc
+        v = _get_entry_vector(gid, role)
+        if isinstance(v, dict) and v.get("name"):
+            nm = str(v.get("name") or "")
+            if len(nm) > 16:
+                nm = nm[:15] + "…"
+            return f"[green]{_esc(nm)}[/green]"
+        return "[dim](none)[/dim]"
+
+    def _refresh_backbone_labels(self, gid: str) -> None:
+        """Re-render every role's name label for grammar ``gid``.
+        Called after a binding change (`_pick_acceptor_for_role`
+        commits or `_set_entry_vector` clears) so all four buttons
+        reflect their current state without a full pane rebuild."""
+        for bb in _CONSTRUCTOR_BACKBONES.get(gid, {}):
+            try:
+                lbl = self.query_one(
+                    f"#lbl-bb-{gid}-{bb}", Static,
+                )
+            except NoMatches:
+                continue
+            lbl.update(self._backbone_name_label(gid, bb))
+
     def _select_backbone(self, gid: str, name: str) -> None:
+        """Activate the backbone role ``name`` for grammar ``gid``.
+
+        Resolution split (2026-05-08):
+          * Unbound role (no plasmid in entry_vectors.json for
+            ``(gid, name)``) → open the library picker so the user
+            binds a plasmid first. The picker's `_picked` callback
+            ALSO activates the role, so the click flows naturally
+            into "now this is my active backbone".
+          * Bound role → just activate (existing behaviour).
+
+        Activation = mark the button as ``bb-active`` and refresh
+        the validation message. Other roles get their `bb-active`
+        class cleared so only one button looks selected at a time.
+        """
         backbones = _CONSTRUCTOR_BACKBONES.get(gid, {})
         if name not in backbones:
+            return
+        if not isinstance(_get_entry_vector(gid, name), dict):
+            # Unbound role — bind first, activate inside the picker
+            # callback so a single click "press to define" → bind +
+            # activate without a second user action.
+            self._pick_acceptor_for_role(gid, role=name, then_activate=True)
             return
         self._backbones[gid] = name
         for bb in backbones:
@@ -26141,9 +26210,6 @@ class ConstructorModal(ModalScreen):
             except NoMatches:
                 continue
             btn.set_class(bb == name, "bb-active")
-        # Banner is role-keyed (per-role override or default catalog
-        # id), so swap it to match the new backbone selection.
-        self._refresh_entry_vector_banner(gid)
         self._refresh_validation(gid)
 
     # ── Filter checkbox ─────────────────────────────────────────────────
@@ -26218,35 +26284,39 @@ class ConstructorModal(ModalScreen):
         return (prefix + "[dim](none — pick from library →)[/dim]"
                 + sel_part)
 
-    def _refresh_entry_vector_banner(self, gid: str) -> None:
-        try:
-            info = self.query_one(f"#ctor-vector-info-{gid}", Static)
-        except NoMatches:
-            return
-        info.update(self._entry_vector_summary_for_grammar(gid))
 
-    def _pick_acceptor_for_role(self, gid: str) -> None:
+    def _pick_acceptor_for_role(
+        self, gid: str, role: str = "",
+        *, then_activate: bool = False,
+    ) -> None:
         """Open the library picker so the user can bind a plasmid to
-        the currently-selected backbone role (Alpha1 / Alpha2 / etc.
-        for GB; Acceptor1 / Acceptor2 for MoClo). The picked
-        plasmid is saved to entry_vectors.json keyed by ``(gid,
-        role)``; the role-specific banner refreshes immediately.
+        an acceptor role for grammar ``gid``. The picked plasmid is
+        saved to entry_vectors.json keyed by ``(gid, role)``; the
+        role's name label refreshes immediately.
 
-        Empty role (no backbone selected) falls back to the
-        legacy single-vector picker — preserves the old behaviour
-        on grammars that don't expose backbone roles.
+        ``role=""`` falls back to the currently-selected backbone for
+        that grammar (the older "Change…" semantics, kept for
+        callers that don't carry an explicit role). With no backbone
+        selected at all, defers to the singleton L0 picker via
+        `GrammarEditorModal` — preserves the historical flow on
+        grammars without backbone roles.
+
+        ``then_activate=True`` (used by `_select_backbone` when the
+        user clicks an unbound role button): after the user picks a
+        plasmid, immediately activate the role for assembly. Without
+        this flag the binding happens but the active backbone stays
+        whatever it was.
         """
-        role = self._backbones.get(gid, "") or ""
+        role = role or self._backbones.get(gid, "") or ""
         if not role:
-            # No backbone selected → set the singleton L0 entry
-            # vector instead. Same UX as pre-2026-05-08.
             def _on_dismissed(_result, _gid=gid):
-                self._refresh_entry_vector_banner(_gid)
+                self._refresh_backbone_labels(_gid)
             self.app.push_screen(GrammarEditorModal(gid), _on_dismissed)
             return
 
         def _picked(plasmid_id: "str | None",
-                    _gid=gid, _role=role) -> None:
+                    _gid=gid, _role=role,
+                    _activate=then_activate) -> None:
             if not plasmid_id:
                 return
             for entry in _load_library():
@@ -26257,8 +26327,15 @@ class ConstructorModal(ModalScreen):
                         "source":  f"library:{plasmid_id}",
                         "gb_text": str(entry.get("gb_text") or ""),
                     }, role=_role)
-                    self._refresh_entry_vector_banner(_gid)
-                    self._refresh_validation(_gid)
+                    self._refresh_backbone_labels(_gid)
+                    if _activate:
+                        # Activate via _select_backbone so the
+                        # bb-active class flip + validation refresh
+                        # use the same code path as a plain
+                        # already-bound click.
+                        self._select_backbone(_gid, _role)
+                    else:
+                        self._refresh_validation(_gid)
                     return
 
         # Pre-select the currently-bound plasmid (if any) so the
@@ -33344,9 +33421,17 @@ ConstructorModal { align: center middle; }
 #ctor-lane        { height: 1fr; }
 #ctor-lane-btns   { height: 3; margin-top: 0; }
 #ctor-lane-btns Button { min-width: 5; margin-right: 1; }
-#ctor-backbone-row { height: 3; margin-top: 1; align: left middle; }
+/* Backbone row: each role is a column (bb-col) holding a name
+   label above the role button. Row height = 4 (1 label + 3 button)
+   so the bound-vector name has space without crowding the button. */
+#ctor-backbone-row { height: 4; margin-top: 1; align: left middle; }
 #ctor-backbone-label { width: auto; padding: 0 1; color: $text-muted; }
-.bb-btn           { min-width: 9; margin-right: 1; }
+.bb-col           { width: 14; height: 4; margin-right: 1; }
+.bb-name          {
+    height: 1; width: 1fr; content-align: center middle;
+    color: $text-muted;
+}
+.bb-btn           { min-width: 12; width: 1fr; }
 .bb-active        { background: $accent; color: $text; }
 #ctor-validation  {
     height: 4; border: solid $primary-darken-2;
