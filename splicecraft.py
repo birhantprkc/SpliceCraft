@@ -9511,6 +9511,19 @@ class SequencePanel(Widget):
         Called from the App's `OriginChanged` handler whenever the
         user rotates the plasmid map.
 
+        Side effects on rotation:
+          * Cursor snaps to the new origin (= display position 0,
+            absolute bp ``origin_bp``). The user expects the cursor
+            to land at the start of the rotated view — without this,
+            it would still point at its old absolute position which
+            now lives somewhere mid-display.
+          * Feature highlight + drag selection are cleared (they
+            highlighted positions valid only under the previous
+            rotation).
+          * Scroll position resets to display row 0 so the new
+            origin is visible. Matches the semantic of ``Home`` on
+            the map (reset origin → seq panel goes to top).
+
         ``origin_bp == 0`` (or out-of-range) restores the historical
         unrotated view. The cache is invalidated unconditionally on
         change so a stale rotated copy can't outlive a reset.
@@ -9525,12 +9538,26 @@ class SequencePanel(Widget):
         self._rotated_cache_key = None
         self._rotated_seq = None
         self._rotated_feats = None
+        # Snap cursor to the first base of the rotated view (= the
+        # new origin in absolute coords). Clearing _sel_range and
+        # _user_sel keeps the highlight from pointing at the old
+        # position — which would render at a now-different display
+        # row and confuse the user.
+        self._cursor_pos = o
+        self._sel_range  = None
+        self._user_sel   = None
+        self._sel_anchor = -1
         self._refresh_view()
-        # The cursor + selection ranges are stored in absolute coords;
-        # after rotation the same absolute positions map to different
-        # display rows, so re-scroll if a cursor is set.
-        if self._cursor_pos >= 0:
-            self._ensure_cursor_visible()
+        # Scroll to the top so display row 0 (= the new origin) is
+        # visible. `center_on_bp(o)` would put the cursor in the
+        # middle of the viewport; for set-origin the user expects
+        # the new starting base at the top of the panel — same way
+        # `Home` (reset origin) returns the view to the start.
+        try:
+            scroll = self.query_one("#seq-scroll", ScrollableContainer)
+            scroll.scroll_to(y=0, force=True, animate=False)
+        except (NoMatches, AttributeError):
+            pass
 
     def _get_rotated_state(self) -> "tuple[str, list[dict]]":
         """Return ``(display_seq, display_feats)`` for the current

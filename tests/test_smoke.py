@@ -2161,11 +2161,55 @@ class TestOriginRotationCascade:
                 f"SequencePanel.view_origin_bp didn't sync to map's "
                 f"origin_bp: got {sp._view_origin_bp}"
             )
+            # Cursor snaps to the new origin so the user has a clear
+            # "you are here" anchor at the first base of the rotated
+            # view. Selection / highlight clear too — they pointed at
+            # positions valid only under the previous rotation.
+            assert sp._cursor_pos == 500, (
+                f"Cursor should snap to new origin (500); "
+                f"got {sp._cursor_pos}"
+            )
+            assert sp._sel_range is None
+            assert sp._user_sel is None
             # Reset back to 0 — the cascade must clear too.
             pm.origin_bp = 0
             await pilot.pause()
             await pilot.pause(0.1)
             assert sp._view_origin_bp == 0
+            assert sp._cursor_pos == 0   # cursor follows back to bp 0
+
+    async def test_rotation_scrolls_seq_panel_to_top(
+            self, isolated_library):
+        # After rotation the new origin's base lives at display row 0;
+        # the seq panel must scroll there so the user sees the new
+        # starting base, not whatever row they were on before.
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ACGT" * 2500), id="scrollRot",   # 10000 bp
+                         annotations={"molecule_type": "DNA",
+                                      "topology": "circular"})
+        app = sc.PlasmidApp()
+        app._preload_record = rec
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            scroll = app.query_one("#seq-scroll")
+            # Manually scroll the seq panel down so we can verify the
+            # rotation snaps it back to the top.
+            scroll.scroll_to(y=20, force=True, animate=False)
+            await pilot.pause()
+            assert scroll.scroll_y > 5, "test pre-condition: scroll moved"
+            pm.origin_bp = 4000
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # After rotation, scroll lands at display row 0 (= the
+            # new origin's base).
+            assert scroll.scroll_y == 0, (
+                f"Seq panel should scroll to top after rotation; "
+                f"got scroll_y={scroll.scroll_y}"
+            )
 
     async def test_alt_o_sets_origin_to_selected_feature(
             self, isolated_library):

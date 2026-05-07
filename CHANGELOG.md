@@ -2,6 +2,26 @@
 
 ---
 
+## [0.7.4.1] — 2026-05-07
+
+### Fixed
+
+- **Cursor + scroll snap to the new origin on rotation.** Previously
+  rotating the map (Alt+O / ← / → / wheel) updated the seq panel's
+  display rotation and the sidebar order, but left the cursor at
+  its old absolute position and the seq panel scrolled wherever
+  the user had been reading. Now ``set_view_origin`` snaps the
+  cursor to the rotated view's first base (= absolute bp
+  ``origin_bp``), clears feature highlight + drag selection (they
+  pointed at positions valid only under the previous rotation),
+  and scrolls the seq panel to display row 0 so the new starting
+  base is at the top — matches the semantic of ``Home`` (reset
+  origin → seq panel back to top).
+- 2 new regression tests in ``test_smoke.py::TestOriginRotation
+  Cascade`` covering the cursor snap + scroll behaviour.
+
+---
+
 ## [0.7.4.0] — 2026-05-07
 
 ### Added — origin rotation cascades across all three views
