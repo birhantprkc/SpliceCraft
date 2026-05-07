@@ -1627,16 +1627,29 @@ class TestTypeIISCutRegionHighlight:
         sp = sc.SequencePanel()
         sp._seq = seq
         hi = sp._resite_highlight_dict(bsai_resite)
-        # Recognition: 20..26 (6 bp). Cut region extends to bottom
-        # cut (31), inclusive — final end = 32 (exclusive).
+        # Recognition: 20..26 (6 bp). Cut region:
+        #   - position 26 → spacer (1 bp between recognition and
+        #     top cut at 27).
+        #   - positions 27..30 → overhang region (top cut at 27,
+        #     bottom cut at 31, 4 nt overhang).
+        # `bottom_cut_bp = 31` is the FIRST base of the right
+        # fragment on the bottom strand — NOT part of the cut
+        # footprint. Highlight end (exclusive) = 31, so positions
+        # 20..30 are highlighted (recognition + spacer + overhang).
         assert hi["start"] == 20
-        assert hi["end"]   == 32, (
-            f"BsaI highlight should span recognition (20..26) "
-            f"+ spacer + overhang to bottom cut (31), inclusive "
-            f"of cut position; got [{hi['start']}, {hi['end']})"
+        assert hi["end"]   == 31, (
+            f"BsaI highlight should be [20, 31) — recognition "
+            f"+ spacer (26) + overhang (27..30). Position 31 is "
+            f"the first base of the right fragment, NOT part of "
+            f"the cut region. got [{hi['start']}, {hi['end']})"
         )
         assert hi["top_cut_bp"]    == 27
         assert hi["bottom_cut_bp"] == 31
+        # Recognition bounds preserved separately so the renderer
+        # can paint recognition / spacer / overhang in distinct
+        # colours.
+        assert hi["rec_start"] == 20
+        assert hi["rec_end"]   == 26
 
     def test_palindromic_resite_highlight_dict_unchanged(self):
         # EcoRI cuts INSIDE its recognition (top at p+1, bot at p+5
@@ -1654,6 +1667,64 @@ class TestTypeIISCutRegionHighlight:
         hi = sp._resite_highlight_dict(ecori)
         assert hi["start"] == 10
         assert hi["end"]   == 16  # unchanged: cuts are inside recognition
+
+    def test_typeiis_render_uses_region_specific_palette(self):
+        """The 2026-05-08 region-aware palette paints recognition,
+        spacer, and overhang in distinct colours so the cut footprint
+        reads at a glance:
+          * recognition (left of both cuts) — blue bg
+          * spacer (paired, outside recognition, not in overhang) — gray bg
+          * overhang top strand — green bg (single-stranded)
+          * overhang bot strand — yellow bg (single-stranded)
+        Black foreground on every overlay so the base letter stays
+        legible against the bright bg.
+        """
+        seq = "A" * 20 + "GGTCTC" + "N" * 10 + "A" * 64
+        sites = sc._scan_restriction_sites(seq, circular=True)
+        bsai = next(
+            s for s in sites
+            if s.get("type") == "resite" and s.get("label") == "BsaI"
+        )
+        sp = sc.SequencePanel()
+        sp._seq = seq
+        feats = [bsai]
+        text = sc._build_seq_text(
+            seq, feats, line_width=80,
+            re_highlight=sp._resite_highlight_dict(bsai),
+        )
+        # Walk the rendered Text spans and bin each character +
+        # style by position. Spans are RLE — track current x as
+        # we go.
+        rendered = text.plain
+        # The top strand should appear before the bottom strand;
+        # find both lines that contain the recognition `GGTCTC`.
+        # The Text renders as plain text concatenated with style
+        # markers. Use the lowest-level API: walk `text.spans` and
+        # the character at each absolute index.
+        # Verify the per-position styles by checking key positions.
+        # Position 20 (recognition, top): should have "blue" in style.
+        # Position 26 (spacer): "grey" in style.
+        # Position 27 (overhang top strand): "green" in style.
+        # Position 27 bottom strand: "yellow" in style.
+        # We can't easily index by absolute bp because of the
+        # line numbering prefix + newlines. Instead verify the
+        # set of background colors that appear in the highlight
+        # range — green, yellow, and grey50 should all be present.
+        styles_used: set[str] = set()
+        for span in text.spans:
+            sty = str(span.style or "")
+            styles_used.add(sty)
+        # The Type IIS render should produce all three new colours.
+        sty_blob = " ".join(styles_used).lower()
+        assert "green"  in sty_blob, (
+            f"expected `green` (overhang top) bg; styles: {styles_used}"
+        )
+        assert "yellow" in sty_blob, (
+            f"expected `yellow` (overhang bot) bg; styles: {styles_used}"
+        )
+        assert "grey50" in sty_blob or "grey" in sty_blob, (
+            f"expected gray (spacer) bg; styles: {styles_used}"
+        )
 
     def test_reverse_strand_typeiis_extends_left(self):
         # Reverse-strand BsaI (recognition GAGACC = rc(GGTCTC))
@@ -6377,19 +6448,27 @@ class TestShiftClickFeatureExtend:
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            # Default: on
+            # Default: OFF as of 2026-05-07 — the popup got in the
+            # way for users who already see feature info on the
+            # sidebar / map. Toggle to bring it back.
+            assert app._show_feature_tooltips is False
+            assert sc._get_setting(
+                "show_feature_tooltips", False,
+            ) is False
+            # Toggle ON via the action.
+            app.action_toggle_feature_tooltips()
+            await pilot.pause(0.05)
             assert app._show_feature_tooltips is True
-            assert sc._get_setting("show_feature_tooltips", True) is True
-            # Toggle off via the action
+            assert sc._get_setting(
+                "show_feature_tooltips", False,
+            ) is True
+            # Toggle back off.
             app.action_toggle_feature_tooltips()
             await pilot.pause(0.05)
             assert app._show_feature_tooltips is False
-            assert sc._get_setting("show_feature_tooltips", True) is False
-            # Toggle back on
-            app.action_toggle_feature_tooltips()
-            await pilot.pause(0.05)
-            assert app._show_feature_tooltips is True
-            assert sc._get_setting("show_feature_tooltips", True) is True
+            assert sc._get_setting(
+                "show_feature_tooltips", False,
+            ) is False
 
     async def test_tooltip_off_clears_widget_tooltip(self, tiny_record,
                                                       isolated_library):

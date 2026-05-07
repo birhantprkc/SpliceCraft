@@ -3403,6 +3403,14 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     reh_e       = re_highlight["end"]           if re_highlight else -1
     reh_top_cut = re_highlight["top_cut_bp"]    if re_highlight else -1
     reh_bot_cut = re_highlight["bottom_cut_bp"] if re_highlight else -1
+    # Original recognition bounds (pre-cut-extension). Lets the
+    # per-base renderer paint recognition / spacer / overhang in
+    # distinct colours. Falls back to (-1, -1) — the legacy "all
+    # one region" behaviour — when not supplied.
+    reh_rec_s   = (re_highlight.get("rec_start", -1)
+                   if re_highlight else -1)
+    reh_rec_e   = (re_highlight.get("rec_end",   -1)
+                   if re_highlight else -1)
     reh_color   = re_highlight["color"]         if re_highlight else ""
 
     seq_upper = seq.upper()
@@ -3491,7 +3499,8 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
         if aa_highlight is not None else None
     )
     overlay_key = (static_key, sel_s, sel_e, usr_s, usr_e,
-                   reh_s, reh_e, reh_top_cut, reh_bot_cut, aa_id)
+                   reh_s, reh_e, reh_top_cut, reh_bot_cut,
+                   reh_rec_s, reh_rec_e, aa_id)
     overlay_cache: "list | None" = _CHUNK_OVERLAY_CACHE.get(overlay_key)
     if overlay_cache is None or len(overlay_cache) != len(chunks_layout):
         overlay_cache = [None] * len(chunks_layout)
@@ -3553,6 +3562,7 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
                           num_w, seq_upper, show_connectors,
                           sel_s, sel_e, usr_s, usr_e,
                           reh_s, reh_e, reh_top_cut, reh_bot_cut,
+                          reh_rec_s, reh_rec_e,
                           cursor_pos, aa_highlight)
         elif chunk_has_overlay:
             cached = overlay_cache[i]
@@ -3562,7 +3572,7 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
                               num_w, seq_upper, show_connectors,
                               sel_s, sel_e, usr_s, usr_e,
                               reh_s, reh_e, reh_top_cut, reh_bot_cut,
-                              -1, aa_highlight)
+                              reh_rec_s, reh_rec_e, -1, aa_highlight)
                 overlay_cache[i] = cached
             result.append(cached)
         else:
@@ -3571,7 +3581,10 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
                 cached = Text(no_wrap=True, overflow="crop")
                 _render_chunk(cached, chunk_start, chunk_end, groups, styles,
                               num_w, seq_upper, show_connectors,
-                              -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                              -1, -1, -1, -1,    # sel_s, sel_e, usr_s, usr_e
+                              -1, -1, -1, -1,    # reh_s, reh_e, top_cut, bot_cut
+                              -1, -1,            # rec_start, rec_end
+                              -1,                # cursor_pos
                               aa_highlight)
                 static_cache[i] = cached
             result.append(cached)
@@ -3585,6 +3598,7 @@ def _render_chunk(result: "Text", chunk_start: int, chunk_end: int,
                    sel_s: int, sel_e: int, usr_s: int, usr_e: int,
                    reh_s: int, reh_e: int,
                    reh_top_cut: int, reh_bot_cut: int,
+                   reh_rec_s: int, reh_rec_e: int,
                    cursor_pos: int,
                    aa_highlight: "dict | None" = None) -> None:
     """Render one chunk into `result`. The DNA pair takes a fast RLE path
@@ -3676,25 +3690,57 @@ def _render_chunk(result: "Text", chunk_start: int, chunk_end: int,
                 fwd_sty = "black on white bold"
                 rev_sty = fwd_sty
             elif in_re:
-                # RE highlight: black letters on a side-of-cut tinted
-                # background. Blue background = upstream of cut (left
-                # fragment); red background = at/after cut (right
-                # fragment). Per-strand because sticky-end enzymes
-                # cleave at offset positions on top vs bottom (e.g.
-                # EcoRI: top at p+1, bottom at p+5), so the staggered
-                # overhang bases show two different bg colors above
-                # vs below the DNA pair. Legacy resites without baked
-                # cut bps fall back to plain white-bg.
-                if reh_top_cut >= 0:
-                    fwd_sty = ("black on blue bold" if i < reh_top_cut
-                               else "black on red bold")
+                # RE highlight (2026-05-08 region-aware palette):
+                #   Recognition + left of both cuts:  blue bg (left fragment)
+                #   Recognition + right of both cuts: red bg  (right fragment)
+                #   Spacer (paired, outside recognition, not in
+                #          overhang region): gray bg
+                #   Overhang region (between top and bot cuts):
+                #          top strand → green bg (single-stranded
+                #          on right fragment); bot strand → yellow
+                #          bg (single-stranded on left fragment)
+                # Distinguishing recognition / spacer / overhang
+                # makes the cut footprint legible at a glance —
+                # pre-2026-05-08 a Type IIS click painted everything
+                # blue/red and the user had to count bases to find
+                # the spacer + overhang.
+                #
+                # All overlays use bold + black foreground so the
+                # base letter stays legible against the bright
+                # backgrounds.
+                in_recognition = (
+                    reh_rec_s >= 0 and reh_rec_s <= i < reh_rec_e
+                )
+                in_overhang = (
+                    reh_top_cut >= 0 and reh_bot_cut >= 0
+                    and reh_top_cut <= i < reh_bot_cut
+                )
+                if in_overhang:
+                    fwd_sty = "black on green bold"
+                    rev_sty = "black on yellow bold"
+                elif not in_recognition:
+                    # Spacer: paired, outside recognition, not in
+                    # overhang. Same gray on both strands since
+                    # neither strand is single-stranded yet.
+                    fwd_sty = "black on grey50 bold"
+                    rev_sty = fwd_sty
                 else:
-                    fwd_sty = "black on white bold"
-                if reh_bot_cut >= 0:
-                    rev_sty = ("black on blue bold" if i < reh_bot_cut
-                               else "black on red bold")
-                else:
-                    rev_sty = "black on white bold"
+                    # Recognition base, not in overhang. Blue if
+                    # left of both cuts (left fragment), red if
+                    # right (right fragment). Legacy resites
+                    # without baked cut bps fall back to white-bg.
+                    if reh_top_cut >= 0:
+                        fwd_sty = ("black on blue bold"
+                                   if i < reh_top_cut
+                                   else "black on red bold")
+                    else:
+                        fwd_sty = "black on white bold"
+                    if reh_bot_cut >= 0:
+                        rev_sty = ("black on blue bold"
+                                   if i < reh_bot_cut
+                                   else "black on red bold")
+                    else:
+                        rev_sty = "black on white bold"
             elif in_usr:
                 fwd_sty = "black on white"
                 rev_sty = fwd_sty
@@ -10208,10 +10254,24 @@ class SequencePanel(Widget):
         per-strand cut markers (reverse video) still render at
         their exact positions inside that span.
 
+        Coordinate convention (sacred): ``top_cut_bp`` is the
+        absolute top-strand position where the cut HAPPENS — the
+        cut is between positions ``cut-1`` and ``cut``, so the
+        LEFT fragment's top strand goes up to ``cut-1`` (inclusive)
+        and ``cut`` is the FIRST base of the right fragment. Same
+        on the bottom strand for ``bottom_cut_bp``. The
+        ``[hi_start, hi_end)`` highlight span is half-open:
+        ``hi_end`` is exclusive, so we set ``hi_end = max_cut``
+        (NOT ``max_cut + 1``) — the cut position itself is the
+        first base of the right fragment, NOT part of the cut
+        footprint. Pre-2026-05-08 the code did ``cut + 1`` which
+        highlighted one base past the overhang into the
+        right-fragment territory.
+
         For Type IIP / palindromic enzymes (EcoRI / HindIII / etc.)
         the cuts are inside the recognition, so the recognition
         span already covers them — the loop is a no-op and the
-        highlight is unchanged from pre-2026-05-08 behaviour.
+        highlight matches pre-2026-05-08 behaviour exactly.
 
         Returns a dict with keys ``start``, ``end``, ``top_cut_bp``,
         ``bottom_cut_bp``, ``color``, ``name``. Caller assigns the
@@ -10226,15 +10286,32 @@ class SequencePanel(Widget):
         for cut in (top_cut, bot_cut, ext_cut):
             if cut is None or cut < 0:
                 continue
+            # Inclusive lower bound: when a cut sits BEFORE the
+            # recognition (reverse-strand Type IIS hit), the cut
+            # position IS the leftmost overhang base of the right
+            # fragment — should be in the highlight.
             if cut < hi_start:
                 hi_start = cut
-            if cut >= hi_end:
-                hi_end = min(cut + 1, n)
+            # Exclusive upper bound: when a cut sits PAST the
+            # recognition (forward Type IIS), the cut position is
+            # the leftmost base of the right fragment — fully
+            # released and NOT part of the cut footprint. Setting
+            # `hi_end = cut` keeps that base out of the highlight
+            # so the visual ends right at the cut boundary.
+            if cut > hi_end:
+                hi_end = min(cut, n)
         return {
             "start":         hi_start,
             "end":           hi_end,
             "top_cut_bp":    top_cut,
             "bottom_cut_bp": bot_cut,
+            # Original recognition bounds (pre-cut-extension). Lets
+            # the renderer distinguish recognition bases from
+            # spacer / overhang bases under the per-region colour
+            # scheme: recognition stays blue/red, spacer is gray,
+            # overhang region is green (top) / yellow (bot).
+            "rec_start":     resite["start"],
+            "rec_end":       min(resite["end"], n),
             "color":         resite["color"],
             "name":          resite["label"],
         }
