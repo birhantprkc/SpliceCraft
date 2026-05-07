@@ -3711,10 +3711,24 @@ def _render_chunk(result: "Text", chunk_start: int, chunk_end: int,
                 in_recognition = (
                     reh_rec_s >= 0 and reh_rec_s <= i < reh_rec_e
                 )
-                in_overhang = (
-                    reh_top_cut >= 0 and reh_bot_cut >= 0
-                    and reh_top_cut <= i < reh_bot_cut
-                )
+                # Overhang region = bases between the two cuts.
+                # For 5' overhangs (e.g. EcoRI, BsaI): top_cut < bot_cut.
+                # For 3' overhangs (e.g. MmeI's TCCRAC(20/18), PstI):
+                #   top_cut > bot_cut. The unpaired bases sit on the
+                #   OPPOSITE strands compared to 5' overhangs (top
+                #   strand on the LEFT fragment, bot on the RIGHT)
+                #   but the bp range is still `[min_cut, max_cut)`.
+                # Pre-2026-05-08 used `top_cut <= i < bot_cut` which
+                # never matched for 3' overhangs and dropped the
+                # overhang highlight entirely on MmeI (and reverse-
+                # strand hits where cut order flips). min/max
+                # handles both sticky-end directions uniformly.
+                if reh_top_cut >= 0 and reh_bot_cut >= 0:
+                    lo_cut = min(reh_top_cut, reh_bot_cut)
+                    hi_cut = max(reh_top_cut, reh_bot_cut)
+                    in_overhang = (lo_cut <= i < hi_cut)
+                else:
+                    in_overhang = False
                 if in_overhang:
                     fwd_sty = "black on green bold"
                     rev_sty = "black on yellow bold"

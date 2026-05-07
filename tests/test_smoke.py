@@ -1726,6 +1726,93 @@ class TestTypeIISCutRegionHighlight:
             f"expected gray (spacer) bg; styles: {styles_used}"
         )
 
+    def test_3prime_overhang_mmei_overhang_renders_green_yellow(self):
+        """MmeI is `TCCRAC(20/18)` — top cut (20) sits FURTHER
+        from the recognition than the bottom cut (18), so
+        ``top_cut > bot_cut`` and the enzyme makes a 3' overhang.
+
+        Pre-2026-05-08 the renderer used ``top_cut <= i < bot_cut``
+        for the overhang check, which never matched on 3' overhangs
+        (range is empty). The MmeI overhang silently fell through
+        to the gray spacer treatment instead of green/yellow.
+
+        Fix uses ``min(top, bot) <= i < max(top, bot)`` which
+        handles both sticky-end directions. This test pins the
+        forward-strand 3' overhang case."""
+        # `TCCAAC` matches the IUPAC `TCCRAC` (R = A/G).
+        seq = "TCCAAC" + "N" * 30 + "A" * 64
+        sites = sc._scan_restriction_sites(seq, circular=True)
+        mmei = next(
+            s for s in sites
+            if s.get("type") == "resite" and s.get("label") == "MmeI"
+        )
+        # MmeI(20/18): site at 0..6, top cut at 20, bot cut at 18.
+        assert mmei["top_cut_bp"]    == 20
+        assert mmei["bottom_cut_bp"] == 18
+        assert mmei["top_cut_bp"] > mmei["bottom_cut_bp"], (
+            "MmeI is a 3' overhang enzyme — top_cut should exceed bot_cut"
+        )
+
+        sp = sc.SequencePanel()
+        sp._seq = seq
+        text = sc._build_seq_text(
+            seq, [mmei], line_width=80,
+            re_highlight=sp._resite_highlight_dict(mmei),
+        )
+        styles_used = {str(span.style or "") for span in text.spans}
+        sty_blob = " ".join(styles_used).lower()
+        assert "green"  in sty_blob, (
+            f"3' overhang MmeI must paint top strand green; "
+            f"got styles: {sorted(styles_used)}"
+        )
+        assert "yellow" in sty_blob, (
+            f"3' overhang MmeI must paint bot strand yellow; "
+            f"got styles: {sorted(styles_used)}"
+        )
+
+    def test_3prime_overhang_reverse_strand_mmei_renders_correctly(self):
+        """Reverse-strand MmeI hit (`GTYGGA` = rc of `TCCRAC`)
+        with cuts UPSTREAM of the recognition. For the reverse
+        hit the cut order also flips (top_cut < bot_cut becomes
+        top_cut > bot_cut depending on the strand), and the
+        overhang region MUST still render in green/yellow."""
+        # `GTTGGA` is the rc of `TCCAAC`; place it past p=30 so
+        # both cuts (which are 12-14 bp upstream) land at
+        # positive positions.
+        seq = "A" * 30 + "GTTGGA" + "T" * 64
+        sites = sc._scan_restriction_sites(seq, circular=True)
+        mmei_rev = next(
+            s for s in sites
+            if s.get("type") == "resite" and s.get("label") == "MmeI"
+        )
+        # Sanity: cuts are upstream of the recognition (low bp).
+        assert mmei_rev["top_cut_bp"]    < 30
+        assert mmei_rev["bottom_cut_bp"] < 30
+
+        sp = sc.SequencePanel()
+        sp._seq = seq
+        hi = sp._resite_highlight_dict(mmei_rev)
+        # hi_start should extend back to the further-upstream
+        # cut; hi_end should reach the recognition end.
+        assert hi["start"] == min(
+            mmei_rev["top_cut_bp"], mmei_rev["bottom_cut_bp"],
+        )
+        assert hi["end"] >= mmei_rev["end"]
+        text = sc._build_seq_text(
+            seq, [mmei_rev], line_width=80,
+            re_highlight=hi,
+        )
+        styles_used = {str(span.style or "") for span in text.spans}
+        sty_blob = " ".join(styles_used).lower()
+        assert "green"  in sty_blob, (
+            f"Reverse MmeI must paint overhang top strand green; "
+            f"got styles: {sorted(styles_used)}"
+        )
+        assert "yellow" in sty_blob, (
+            f"Reverse MmeI must paint overhang bot strand yellow; "
+            f"got styles: {sorted(styles_used)}"
+        )
+
     def test_reverse_strand_typeiis_extends_left(self):
         # Reverse-strand BsaI (recognition GAGACC = rc(GGTCTC))
         # cuts on the OPPOSITE side: top cut is 5 bp before the
