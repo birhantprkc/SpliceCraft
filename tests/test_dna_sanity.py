@@ -592,6 +592,61 @@ class TestRestrictionScan:
         assert eco[0]["start"] == 8 and eco[0]["end"] == 14
 
 
+class TestRestrictionScanLinearVsCircular:
+    """Linear records must NOT scan past their end. Pre-2026-05-08
+    every caller of `_scan_restriction_sites` defaulted to
+    ``circular=True``, so an EcoRI site that only exists by joining
+    a linear record's tail + head would still appear in the panel —
+    biologically impossible because the linear ends don't ligate.
+    """
+
+    def test_circular_finds_origin_spanning_site(self):
+        # Recognition GAATTC straddles the origin: 'GAA' at the
+        # tail, 'TTC' at the head. Only valid on circular records.
+        seq = "TTC" + "AAAAAA" + "GAA"   # 12 bp
+        circular = sc._scan_restriction_sites(
+            seq, min_recognition_len=6,
+            unique_only=True, circular=True,
+        )
+        eco = [f for f in circular
+               if f["type"] == "resite" and f["label"] == "EcoRI"]
+        assert len(eco) == 1, (
+            f"circular EcoRI scan should find the origin-spanning "
+            f"site; got {len(eco)}"
+        )
+        # Wrap site emits two pieces — one tail, one head.
+        assert eco[0]["start"] == 9 or eco[0]["end"] == 12
+
+    def test_linear_does_not_find_origin_spanning_site(self):
+        # Same sequence, but as a linear record — the recognition
+        # only exists by joining bp 11 → bp 0, which a linear
+        # molecule can't do. Scanner must return zero EcoRI hits.
+        seq = "TTC" + "AAAAAA" + "GAA"   # 12 bp
+        linear = sc._scan_restriction_sites(
+            seq, min_recognition_len=6,
+            unique_only=True, circular=False,
+        )
+        eco = [f for f in linear
+               if f["type"] == "resite" and f["label"] == "EcoRI"]
+        assert eco == [], (
+            f"linear EcoRI scan must NOT report the origin-spanning "
+            f"site; got {len(eco)} resites: {eco}"
+        )
+
+    def test_linear_in_body_site_still_found(self):
+        # Sanity: a normal mid-record EcoRI site is still found in
+        # linear mode — only the wrap-spanning one is suppressed.
+        seq = "AAA" + "GAATTC" + "AAAA"  # 13 bp, EcoRI at pos 3
+        linear = sc._scan_restriction_sites(
+            seq, min_recognition_len=6,
+            unique_only=True, circular=False,
+        )
+        eco = [f for f in linear
+               if f["type"] == "resite" and f["label"] == "EcoRI"]
+        assert len(eco) == 1
+        assert eco[0]["start"] == 3 and eco[0]["end"] == 9
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CDS translation
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -3739,22 +3739,22 @@ def _render_chunk(result: "Text", chunk_start: int, chunk_end: int,
                     fwd_sty = "black on grey50 bold"
                     rev_sty = fwd_sty
                 else:
-                    # Recognition base, not in overhang. Blue if
-                    # left of both cuts (left fragment), red if
-                    # right (right fragment). Legacy resites
-                    # without baked cut bps fall back to white-bg.
-                    if reh_top_cut >= 0:
-                        fwd_sty = ("black on blue bold"
-                                   if i < reh_top_cut
-                                   else "black on red bold")
-                    else:
-                        fwd_sty = "black on white bold"
-                    if reh_bot_cut >= 0:
-                        rev_sty = ("black on blue bold"
-                                   if i < reh_bot_cut
-                                   else "black on red bold")
-                    else:
-                        rev_sty = "black on white bold"
+                    # Recognition base, not in overhang — always
+                    # blue. Pre-2026-05-08 the recognition split
+                    # into blue (left of cut) / red (right of cut),
+                    # which gave reverse-strand Type IIS hits an
+                    # asymmetric look: the recognition rendered red
+                    # because both cuts sit before it. The user
+                    # reads "the recognition site" identically
+                    # whether bound on forward or reverse strand,
+                    # so the colour should be the same too. Cut
+                    # direction info is already conveyed by the
+                    # location of the green/yellow overhang
+                    # relative to the recognition; the per-strand
+                    # cut markers (reverse video) inside the span
+                    # mark the precise cut boundaries.
+                    fwd_sty = "black on blue bold"
+                    rev_sty = "black on blue bold"
             elif in_usr:
                 fwd_sty = "black on white"
                 rev_sty = fwd_sty
@@ -31595,6 +31595,7 @@ def _h_replace_sequence(app, payload):
                 new_seq,
                 min_recognition_len=app._restr_min_len,
                 unique_only=app._restr_unique_only,
+                circular=app._current_record_is_circular(),
             )
             displayed = app._restr_cache if app._show_restr else []
             pm._restr_feats = displayed
@@ -34965,6 +34966,7 @@ SpeciesPickerModal { align: center middle; }
                 seq,
                 min_recognition_len=self._restr_min_len,
                 unique_only=self._restr_unique_only,
+                circular=self._current_record_is_circular(),
             )
         except Exception:
             _log.exception("Restriction scan worker failed")
@@ -37663,6 +37665,28 @@ SpeciesPickerModal { align: center middle; }
 
     # ── Menu bar ───────────────────────────────────────────────────────────────
 
+    def _current_record_is_circular(self) -> bool:
+        """Authoritative answer to "is the current record circular?"
+        Reads ``record.annotations["topology"]`` — the GenBank
+        topology field is the source of truth. Anything that ISN'T
+        explicitly ``"linear"`` defaults to circular (matches
+        GenBank convention: missing / unknown topology on a plasmid
+        viewer = circular by default).
+
+        Used to gate wrap-aware behaviour in
+        ``_scan_restriction_sites`` etc.: a record saved as linear
+        must NEVER scan past its own end into the start, so a
+        recognition site that would only exist by joining the tail
+        + head is correctly suppressed."""
+        rec = self._current_record
+        if rec is None:
+            return True
+        try:
+            topology = (rec.annotations or {}).get("topology", "") or ""
+        except (AttributeError, TypeError):
+            return True
+        return str(topology).lower() != "linear"
+
     def _rescan_restrictions(self) -> None:
         """Re-scan restriction sites with current settings and update UI."""
         sp = self.query_one("#seq-panel", SequencePanel)
@@ -37673,6 +37697,7 @@ SpeciesPickerModal { align: center middle; }
             sp._seq,
             min_recognition_len=self._restr_min_len,
             unique_only=self._restr_unique_only,
+            circular=self._current_record_is_circular(),
         )
         displayed = self._restr_cache if self._show_restr else []
         pm._restr_feats = displayed
@@ -37691,6 +37716,7 @@ SpeciesPickerModal { align: center middle; }
                 sp._seq,
                 min_recognition_len=self._restr_min_len,
                 unique_only=self._restr_unique_only,
+                circular=self._current_record_is_circular(),
             )
         displayed = self._restr_cache if self._show_restr else []
         pm._restr_feats = displayed
@@ -38451,6 +38477,7 @@ SpeciesPickerModal { align: center middle; }
             seq_str,
             min_recognition_len=self._restr_min_len,
             unique_only=self._restr_unique_only,
+            circular=self._current_record_is_circular(),
         )
         displayed = self._restr_cache if self._show_restr else []
         pm._restr_feats = displayed
@@ -38569,6 +38596,7 @@ SpeciesPickerModal { align: center middle; }
             event.seq,
             min_recognition_len=self._restr_min_len,
             unique_only=self._restr_unique_only,
+            circular=self._current_record_is_circular(),
         )
         displayed = self._restr_cache if self._show_restr else []
         pm._restr_feats = displayed
