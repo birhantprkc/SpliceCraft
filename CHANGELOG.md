@@ -2,6 +2,29 @@
 
 ---
 
+## [0.7.4.3] — 2026-05-07
+
+### Fixed
+
+- **Mutagenize AA click is no longer off by one amino acid.**
+  ``_MutPreview.on_click`` was using ``event.screen_x - self.region.x``
+  which includes the widget's CSS ``border: solid`` + ``padding: 0 1``
+  (4 cols of horizontal chrome, 2 on each side); the resolved column
+  was 2 cols right of the click target so each click landed on the
+  codon ~one AA to the LEFT of where the user actually clicked. The
+  handler now reads ``event.x`` / ``event.y`` directly — Textual
+  reports those in widget-content coordinates, so the click coord
+  matches the rendered AA position exactly. Same fix applies to clicks
+  on the lane art (label / bar) and DNA-row rows; they all share the
+  ``_click_to_aa`` codon math.
+- 1 new end-to-end regression test in
+  ``tests/test_codon.py::TestMutagenizeClickAlignment`` mounts the
+  modal under a real CSS context, drives synthetic ``Click`` events
+  with content-relative ``event.x`` for codons 0 / 1 / 2, and asserts
+  the cursor lands on the clicked AA.
+
+---
+
 ## [0.7.4.2] — 2026-05-07
 
 ### Changed — Mutagenize preview + Feature Library snippet share SequencePanel pipeline

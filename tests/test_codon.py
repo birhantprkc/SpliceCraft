@@ -891,3 +891,78 @@ class TestLibrarySourceWrapFeature:
                 assert wrap_feat["end"]   == end
                 app.exit()
         asyncio.run(go())
+
+
+# ── AA click resolution under real CSS  (2026-05-07 regression guard) ────────
+
+class TestMutagenizeClickAlignment:
+    """End-to-end check that clicking an amino acid in the mutagenize
+    preview lands on the codon the user actually clicked. Pre-fix
+    ``on_click`` used ``event.screen_x - self.region.x`` which includes
+    the widget's CSS ``border: solid`` + ``padding: 0 1`` overhead (4
+    cols of horizontal chrome on the left edge); the resolved column
+    was 2 cols right of the click target, so each click resolved to the
+    codon ~one AA to the LEFT of where the user clicked. ``on_click``
+    now uses ``event.x`` (already content-relative) so the click coord
+    matches the rendered AA position exactly."""
+
+    async def test_aa_click_lands_on_clicked_codon(self):
+        # 33-bp CDS = 11 aa. The CDS feature filter requires >= 30 bp
+        # and len % 3 == 0; 33 satisfies both. AA letters at content
+        # cols 1 / 4 / 7 / 10 / ... within the data area.
+        cds = "ATGGCCAGCAAATTCCATTGGGCAGAAGCCTAA"   # 33 bp → M A S K F H W A E A *
+        assert len(cds) == 33 and len(cds) % 3 == 0
+        feats = [{"type": "CDS", "label": "testCDS",
+                  "start": 0, "end": len(cds), "strand": 1}]
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.MutagenizeModal(cds, feats, "TEST"))
+            await pilot.pause(0.3)
+            modal = app.screen
+            cds_select = modal.query_one("#mut-cds")
+            cds_select.value = f"0:{len(cds)}:1"
+            await pilot.pause(0.3)
+            preview = modal.query_one("#mut-preview", sc._MutPreview)
+            assert preview._dna_mode is True
+            assert preview._protein.startswith("MASKFHW")
+            # Drive a synthetic Click at ``event.x = pad+4, event.y = 2``
+            # (the codon-1 AA-row column of chunk 0). With the CSS-aware
+            # fix ``on_click`` reads ``event.x`` directly, so this
+            # resolves to aa_idx=1 ('A'). Pre-fix the same click landed
+            # on aa_idx=0 ('M') because ``event.screen_x - region.x``
+            # included the 2-col CSS border + padding overhead.
+            from types import SimpleNamespace
+            n = len(cds)
+            num_w = len(str(n))
+            pad = num_w + 2
+            preview._cursor_aa = -1
+            click_evt = SimpleNamespace(
+                x=pad + 4, y=2, screen_x=pad + 4, screen_y=2,
+                chain=1, button=1,
+            )
+            preview.on_click(click_evt)
+            await pilot.pause(0.05)
+            assert preview._cursor_aa == 1, (
+                f"expected cursor on AA 1 ('A'), got {preview._cursor_aa} "
+                f"('{preview._protein[preview._cursor_aa] if preview._cursor_aa >= 0 else 'NONE'}')"
+            )
+            # Click the codon-2 column ('S' at content col pad+7).
+            preview._cursor_aa = -1
+            click_evt2 = SimpleNamespace(
+                x=pad + 7, y=2, screen_x=pad + 7, screen_y=2,
+                chain=1, button=1,
+            )
+            preview.on_click(click_evt2)
+            await pilot.pause(0.05)
+            assert preview._cursor_aa == 2
+            # Click codon 0 ('M' at content col pad+1).
+            preview._cursor_aa = -1
+            click_evt3 = SimpleNamespace(
+                x=pad + 1, y=2, screen_x=pad + 1, screen_y=2,
+                chain=1, button=1,
+            )
+            preview.on_click(click_evt3)
+            await pilot.pause(0.05)
+            assert preview._cursor_aa == 0
+            app.exit()

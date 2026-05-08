@@ -26903,21 +26903,25 @@ class _MutPreview(Static):
             return
         self.focus()
         try:
-            reg  = self.region
-            vp_x = event.screen_x - reg.x
-            vp_y = event.screen_y - reg.y
-            if vp_x < 0 or vp_y < 0 or vp_x >= reg.width or vp_y >= reg.height:
-                return
+            # ``event.x`` / ``event.y`` are widget-relative AND already
+            # account for our CSS ``border: solid`` + ``padding: 0 1``
+            # — using ``event.screen_x - self.region.x`` would include
+            # the 2-col border+padding overhead and shift every click
+            # right by 2 cols, resolving to the codon ~one AA to the
+            # left of the click target (2026-05-07 user report:
+            # "amino acid click is off by exactly one amino acid").
+            vp_x = int(event.x)
+            vp_y = int(event.y)
             content_row = vp_y + int(self.scroll_y)
+            content_col = vp_x + int(self.scroll_x)
         except (AttributeError, TypeError, ValueError):
-            # AttributeError: widget unmounted (no `region` / `scroll_y`).
+            # AttributeError: widget unmounted (no `scroll_y`).
             # TypeError / ValueError: defensive against an event whose
-            # screen_{x,y} is None / non-numeric — Textual normally
-            # wouldn't surface that, but we'd rather drop the click than
-            # raise out of an event handler. Narrow on the actual
-            # arithmetic / attribute failures (avoid bare `except`).
+            # ``x`` / ``y`` is None / non-numeric — Textual normally
+            # wouldn't surface that, but we'd rather drop the click
+            # than raise out of an event handler.
             return
-        aa_idx = self._click_to_aa(vp_x, content_row)
+        aa_idx = self._click_to_aa(content_col, content_row)
         if aa_idx < 0:
             return
         aa_letter = self._protein[aa_idx]
