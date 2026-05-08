@@ -70,6 +70,34 @@ def _protect_user_data(tmp_path, monkeypatch):
     # _DATA_DIR/dna_originals on disk. Same isolation pattern.
     monkeypatch.setattr(sc, "_DNA_ORIGINALS_DIR",
                           tmp_path / "dna_originals")
+    # Plugin namespace (reserved): redirect so a test that triggers
+    # `_check_and_stamp_data_version` doesn't `mkdir` the user's real
+    # _DATA_DIR/plugins, and so any snapshot test that includes
+    # `_PLUGINS_DIR` reads from the tmp tree.
+    monkeypatch.setattr(sc, "_PLUGINS_DIR", tmp_path / "plugins")
+    # Data-version stamp file: same reasoning — keeps every test from
+    # competing for / racing on the real ~/.local/share/.../.splicecraft-
+    # data-version file.
+    monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
+                          tmp_path / ".splicecraft-data-version")
+    # UI snapshot directory (Alt+D in the running app + the
+    # `splicecraft logs --bundle` CLI command both write here):
+    # redirect so tests of the snapshot system don't litter the
+    # user's real ~/.local/share/splicecraft/ui_snapshots/.
+    monkeypatch.setattr(sc, "_UI_SNAPSHOTS_DIR", tmp_path / "ui_snapshots")
+
+    # Pre-update snapshot directory (`splicecraft update` data-safety net):
+    # tests that exercise the `update` subcommand all the way through to
+    # `subprocess.run` go through `_create_pre_update_snapshot`, which by
+    # default writes a sibling directory next to `_DATA_DIR` — i.e. in
+    # the user's REAL home directory. Redirect the env var so tests
+    # always write to tmp_path. Also redirect `_DATA_DIR` to a tmp
+    # location for the same reason (so any code that reads it directly
+    # — e.g. unsafe-config check inside the update flow — sees a
+    # writable, isolated directory).
+    monkeypatch.setenv("SPLICECRAFT_UPDATE_BACKUP_DIR",
+                         str(tmp_path / "update-backups"))
+    monkeypatch.setattr(sc, "_DATA_DIR", tmp_path)
 
     # Skip the launch splash for every test by default — the splash modal
     # blocks input until dismissed, which would break every `pilot.click`

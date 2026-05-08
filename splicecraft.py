@@ -28,6 +28,7 @@ import os
 import platform
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import uuid as _uuid
@@ -40,6 +41,18 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 __version__ = "0.7.5.0"
+
+# Snapshot the runtime platform string ONCE at module import. On some
+# OSes `platform.platform()` shells out via `subprocess.run` to learn
+# kernel + glibc details — and tests that monkeypatch `subprocess.run`
+# (e.g. to capture the upgrade command in `splicecraft update`) would
+# otherwise re-trigger that subprocess call and crash on the mock.
+# Anything that needs the runtime platform string in a hot path
+# should read this constant rather than re-invoke `platform.platform()`.
+try:
+    _RUNTIME_PLATFORM: str = platform.platform()
+except Exception:  # pragma: no cover — defensive against weird platforms
+    _RUNTIME_PLATFORM = "?"
 
 # ── Biopython warning filters ─────────────────────────────────────────
 # Some real-world records (notably NCBI Entrez exports that picked up
@@ -171,8 +184,13 @@ _log.setLevel(logging.INFO)
 _log.propagate = False
 if not _log.handlers:
     try:
+        # Rotation: 5 MB per file × 4 backups = ~20 MB total, enough
+        # depth to capture a multi-day session for diagnostic email
+        # without runaway disk growth. Bumped from 2 MB × 2 (= 6 MB)
+        # in 0.7.6 — see CLAUDE.md invariant on diagnostic bundling.
         _handler = RotatingFileHandler(
-            _LOG_PATH, maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8"
+            _LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=4,
+            encoding="utf-8",
         )
         _handler.setFormatter(logging.Formatter(
             fmt="%(asctime)s [%(session)s] %(levelname)-5s "
@@ -180,9 +198,66 @@ if not _log.handlers:
         ))
         _handler.addFilter(_SessionFilter())
         _log.addHandler(_handler)
+        # Tighten permissions on the log file. POSIX-only — on
+        # multi-user hosts the log can carry file paths and error
+        # messages that shouldn't be world-readable.
+        if sys.platform != "win32":
+            try:
+                os.chmod(_LOG_PATH, 0o600)
+            except OSError:
+                pass
     except OSError:
         # Last-resort no-op handler if the log dir is read-only.
         _log.addHandler(logging.NullHandler())
+
+
+def _chmod_user_only(path: "Path | str") -> None:
+    """Tighten file permissions to 0o600 (owner read/write only).
+    Best-effort: a no-op on Windows (where POSIX mode bits don't
+    apply meaningfully) and silent on permission failures (the file
+    already exists and is in use; nothing to do).
+
+    Used for the rotating log + diagnostic bundle ZIP, both of which
+    can carry path/error info that shouldn't be world-readable on a
+    multi-user host.
+    """
+    if sys.platform == "win32":
+        return
+    try:
+        os.chmod(str(path), 0o600)
+    except OSError:
+        pass
+
+
+def _repr_for_log(value, max_len: int = 100) -> str:
+    """Compact, bounded `repr()` for log lines. Long sequences,
+    nested dicts, and accidentally-huge values are truncated so a
+    single chatty log line can't blow out the rotation window. The
+    prefix preserves the type ("[123 items]") so a grepper can still
+    find the relevant entry. Plasmid sequences are NOT logged (callers
+    avoid passing them) but this guard keeps an accidental long-string
+    log call from leaking content."""
+    try:
+        if isinstance(value, str):
+            if len(value) > max_len:
+                return f"{value[:max_len // 2]!r}…[{len(value)} chars]"
+            return repr(value)
+        if isinstance(value, (list, tuple, set)):
+            n = len(value)
+            if n > 10:
+                return f"<{type(value).__name__} of {n} items>"
+            return repr(value)[:max_len]
+        if isinstance(value, dict):
+            if len(value) > 10:
+                return f"<dict with {len(value)} keys>"
+            return repr(value)[:max_len]
+        out = repr(value)
+        if len(out) > max_len:
+            return out[:max_len] + f"…[{len(out)} chars]"
+        return out
+    except Exception:
+        return "<unrepr-able>"
+
 
 # ── Hang-debug helper: SIGUSR1 → Python stack dump ──────────────────────────
 # When the user reports "the app is hung", running `kill -USR1 <pid>`
@@ -412,26 +487,144 @@ _FEATURE_PALETTE: list[str] = [
 _CURRENT_SCHEMA_VERSION = 1
 
 
+# ── Entry-level migration framework ──────────────────────────────────────────
+#
+# When `_CURRENT_SCHEMA_VERSION` bumps from N to N+1 in a future release, any
+# load of an N-schema file is silently funnelled through `_migrate_entries`
+# below before the in-memory representation is handed back to the caller.
+# That keeps every loader (`_load_library`, `_load_collections`, `_load_parts_bin`,
+# etc.) ignorant of versioning concerns — they always see entries shaped for
+# the current schema regardless of what shipped on disk.
+#
+# Registering a migration:
+#   1. Bump `_CURRENT_SCHEMA_VERSION` to N+1.
+#   2. Write a function `(entry: dict) -> dict` that promotes a single
+#      entry from version N to N+1. Return a NEW dict (don't mutate the
+#      input — caller may have it referenced from a deepcopied cache).
+#   3. Register it under the file's label and `(N, N+1)` key:
+#         _ENTRY_MIGRATIONS["Plasmid library"][(1, 2)] = my_migrator
+#   4. Add a regression test that loads a hand-crafted v1 file and
+#      verifies the v2 shape comes out.
+#
+# Migrations chain across multiple version steps (`_migrate_entries`
+# walks (1→2), (2→3), … in order). Missing intermediate migrations
+# are tolerated as no-ops — most schema bumps are additive (new
+# `.get(field, default)` reads paper over them) and don't need
+# explicit migrations. Register one only when fields are *renamed*,
+# *split*, *merged*, or *deleted* — the cases where defaults can't
+# silently cover the gap.
+from typing import Callable as _Callable
+
+_ENTRY_MIGRATIONS: "dict[str, dict[tuple[int, int], _Callable[[dict], dict]]]" = {
+    # No migrations registered yet — schema is at v1 across every file.
+    # Populate this when the schema bumps.
+}
+
+
+def _migrate_entries(entries: list,
+                     from_version: int,
+                     to_version: int,
+                     label: str) -> "tuple[list, list[str]]":
+    """Walk registered migrations from `from_version` up to
+    `to_version` for the given file `label`. Returns
+    `(migrated_entries, warnings)`. Each missing intermediate step
+    is a no-op (the entries pass through unchanged).
+
+    Pure (no I/O), idempotent for any range with no registered
+    migrations. The function never returns the input list directly
+    — it always returns a fresh list (even if no transformation
+    happened) so callers can assume independence from the cache."""
+    warnings: list[str] = []
+    if from_version >= to_version:
+        return list(entries), warnings
+    if not isinstance(entries, list):
+        warnings.append(f"{label}: refusing to migrate non-list entries")
+        return [], warnings
+    out: list = list(entries)
+    migrations = _ENTRY_MIGRATIONS.get(label, {})
+    current = from_version
+    while current < to_version:
+        next_step = current + 1
+        migrator = migrations.get((current, next_step))
+        if migrator is None:
+            # No registered migration for this step — assume the
+            # bump was additive and entries pass through. Defensive
+            # default-handling at field-read time covers missing keys.
+            current = next_step
+            continue
+        migrated: list = []
+        for entry in out:
+            if not isinstance(entry, dict):
+                # Non-dict entries can't be migrated; surface a
+                # warning and drop them rather than crash the loader.
+                warnings.append(
+                    f"{label}: dropped non-dict entry during "
+                    f"v{current} → v{next_step} migration: {type(entry).__name__}"
+                )
+                continue
+            try:
+                # Migrators MUST return a fresh dict; we don't deep-
+                # copy here (the cache layer above does that on its
+                # own read/save path).
+                migrated.append(migrator(entry))
+            except (KeyError, ValueError, TypeError) as exc:
+                warnings.append(
+                    f"{label}: v{current} → v{next_step} migration "
+                    f"failed for entry: {exc}"
+                )
+                # Keep the entry as-is rather than drop it; better to
+                # surface a v1-shaped entry in a v2 list than to lose
+                # the user's data outright.
+                migrated.append(entry)
+        out = migrated
+        current = next_step
+    return out, warnings
+
+
 def _extract_entries(raw, label: str) -> "tuple[list | None, str | None]":
     """Return (entries, warning) from a parsed-JSON payload.
 
     Accepts both the envelope format `{"_schema_version": N, "entries": [...]}`
     and the legacy bare-list format. Returns (None, warning) on unknown shape
     so the caller can fall through to the .bak.
+
+    Forward-compat: a higher schema_version loads with a warning (entries
+    flow through unchanged; deepcopy preserves unknown fields across a
+    save round-trip).
+    Backward-compat: a lower schema_version is funnelled through the
+    `_migrate_entries` registry so every consumer sees the current shape.
     """
     if isinstance(raw, list):
-        return raw, None
+        # Legacy bare-list format predates `_schema_version` so the
+        # entries are version-0 by definition. Run them through any
+        # registered 0→1 migration before handing back.
+        if 0 < _CURRENT_SCHEMA_VERSION:
+            migrated, _ = _migrate_entries(raw, 0, _CURRENT_SCHEMA_VERSION, label)
+            return migrated, None
+        return list(raw), None
     if isinstance(raw, dict) and isinstance(raw.get("entries"), list):
         version = raw.get("_schema_version")
-        if version is not None and version > _CURRENT_SCHEMA_VERSION:
+        entries_raw = list(raw["entries"])
+        if version is not None and isinstance(version, int) and \
+                version > _CURRENT_SCHEMA_VERSION:
             # Written by a newer SpliceCraft. Load the entries but warn so
             # the user knows fields may be silently dropped on re-save.
-            return list(raw["entries"]), (
+            return entries_raw, (
                 f"{label} was written by a newer SpliceCraft "
                 f"(schema v{version} > v{_CURRENT_SCHEMA_VERSION}) — some "
                 f"fields may be lost on save."
             )
-        return list(raw["entries"]), None
+        # Apply any registered migrations to bring older payloads up
+        # to the current schema. v=None falls back to 1 (the first
+        # explicit version) — older bare-list files never had it.
+        from_v = int(version) if isinstance(version, int) else 1
+        if from_v < _CURRENT_SCHEMA_VERSION:
+            migrated, warns = _migrate_entries(
+                entries_raw, from_v, _CURRENT_SCHEMA_VERSION, label
+            )
+            warning = warns[0] if warns else None
+            return migrated, warning
+        return entries_raw, None
     return None, f"{label}: unexpected JSON shape ({type(raw).__name__})"
 
 
@@ -721,6 +914,12 @@ def _safe_save_json(path: Path, entries: list, label: str,
 # rebuildable from the active library.)
 _SNAPSHOT_DIR_NAME       = "snapshots"
 _SNAPSHOT_RETENTION_DAYS = 30
+# Per-file cap for daily snapshots. A user with a 1 GB plasmid library
+# would otherwise see 30 × 1 GB = 30 GB of daily snapshots accumulate.
+# Files above this size skip the daily-snapshot copy; rollback is still
+# available via `_safe_save_json`'s .bak rotation (last 10 generations)
+# and the pre-update snapshot system (last 5 update points).
+_SNAPSHOT_FILE_SIZE_CAP  = 50 * 1024 * 1024  # 50 MB
 
 
 def _snapshot_data_files(data_dir: Path,
@@ -755,9 +954,22 @@ def _snapshot_data_files(data_dir: Path,
         if not src.exists():
             continue
         try:
-            if src.stat().st_size == 0:
-                continue
+            src_size = src.stat().st_size
         except OSError:
+            continue
+        if src_size == 0:
+            continue
+        # Per-file size cap: a 1 GB plasmid library × 30 daily
+        # snapshots = 30 GB of effectively-redundant copies (the
+        # `.bak` rotation already provides recent rollback). Skip
+        # any individual file larger than `_SNAPSHOT_FILE_SIZE_CAP`
+        # so a heavy user doesn't accidentally fill their disk.
+        if src_size > _SNAPSHOT_FILE_SIZE_CAP:
+            _log.warning(
+                "Skipping daily snapshot of %s: %d bytes > cap %d "
+                "(use _safe_save_json's .bak rotation for rollback)",
+                src.name, src_size, _SNAPSHOT_FILE_SIZE_CAP,
+            )
             continue
         dest = snap_dir / f"{src.stem}-{today}{src.suffix}"
         if dest.exists():
@@ -1012,6 +1224,881 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
 
 _DNA_ORIGINALS_DIR = _DATA_DIR / "dna_originals"
 _DNA_SIDECAR_MAX_BYTES = 50 * 1024 * 1024   # 50 MB — same as bulk import
+
+# ── Data-dir version stamp ────────────────────────────────────────────────────
+#
+# Tiny file at `<DATA_DIR>/.splicecraft-data-version` recording the
+# SpliceCraft version that last successfully launched against this
+# data dir. Used to:
+#   * Detect downgrades (running an older SpliceCraft against a data
+#     dir written by a newer one) and warn the user — fields they
+#     created in the newer version may be silently dropped on save.
+#   * Surface the most-recent-touch version in support reports.
+# Operational, not user data: see `_OPERATIONAL_FILE_ATTRS`.
+_DATA_VERSION_FILE = _DATA_DIR / ".splicecraft-data-version"
+
+# Reserved subdirectory for future plugin data. Created at launch
+# (empty) so that the layout is stable for plugin authors and any
+# field named `_plugin_data` on entries is namespaced + future-
+# proof — see `_check_and_stamp_data_version` for creation.
+_PLUGINS_DIR = _DATA_DIR / "plugins"
+
+
+def _check_and_stamp_data_version() -> "str | None":
+    """Compare the persisted "last-touched" version stamp against the
+    running `__version__`. Returns a one-line warning if a downgrade
+    is detected (older SpliceCraft running against newer data),
+    else None. Always overwrites the stamp with the running version
+    on success — even on downgrade, since the data dir IS now being
+    touched by this version.
+
+    Atomic via `_atomic_write_text`. Side-effect free under read-only
+    or unreachable filesystems (logs + returns None).
+
+    Also creates the reserved `_PLUGINS_DIR` (no-op if already
+    present) so future plugin-aware code can rely on it existing.
+    """
+    warning: str | None = None
+    try:
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _log.warning("Could not create _DATA_DIR for version stamp: %s", exc)
+        return None
+    # Reserve the plugins directory at the same launch checkpoint —
+    # creating it is idempotent and bounded.
+    try:
+        _PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _log.warning("Could not create _PLUGINS_DIR: %s", exc)
+    # Read the existing stamp, if any. Cap length so a malformed
+    # 1 GB stamp file can't OOM us.
+    try:
+        if _DATA_VERSION_FILE.is_file():
+            raw = _DATA_VERSION_FILE.read_text(encoding="utf-8",
+                                                  errors="replace")[:128]
+            stamp = raw.strip()
+            if stamp and stamp != __version__:
+                # Compare numerically when both parse as canonical
+                # versions; otherwise fall back to a string-equality
+                # warning. `_parse_pypi_version` returns None on
+                # anything non-canonical, which is fine here — we
+                # treat that as "different but not classifiable" and
+                # surface the literal mismatch.
+                stamp_v = _parse_pypi_version(stamp)
+                self_v = _parse_pypi_version(__version__)
+                if stamp_v and self_v and stamp_v > self_v:
+                    warning = (
+                        f"Data dir was last touched by splicecraft "
+                        f"{stamp} — you are running {__version__}. "
+                        "Newer-version fields may be silently dropped "
+                        "on save."
+                    )
+                # Equal or older: just refresh stamp silently.
+    except (OSError, UnicodeDecodeError) as exc:
+        _log.debug("Reading data-version stamp failed: %s", exc)
+    # Always rewrite the stamp atomically — it's the simplest way to
+    # keep it accurate and survives concurrent launches (a later
+    # rewrite just wins).
+    try:
+        _atomic_write_text(_DATA_VERSION_FILE, __version__ + "\n")
+    except OSError as exc:
+        _log.warning("Could not write data-version stamp: %s", exc)
+    return warning
+
+
+# ── Data-dir lock (refuse concurrent splicecraft instances) ──────────────────
+#
+# Two splicecraft processes against the same `_DATA_DIR` race on cache
+# coherence: process A reads `plasmid_library.json`, process B saves a
+# new entry, process A's in-memory cache is now stale and its next save
+# silently overwrites B's entry. The atomic per-file write guarantees
+# integrity of one-process saves but doesn't synchronise across procs.
+#
+# Solution: cooperative file lock at `<DATA_DIR>/splicecraft.lock`,
+# acquired in `main()` before the app launches and held for the
+# lifetime of the process. fcntl.flock on POSIX, msvcrt.locking on
+# Windows. Tests / advanced users can opt out via
+# `$SPLICECRAFT_SKIP_LOCK=1`.
+
+_DATA_DIR_LOCKFILE = _DATA_DIR / "splicecraft.lock"
+
+
+class DataDirLockError(RuntimeError):
+    """Raised when the data-dir lock can't be acquired (another
+    splicecraft is running). Caller is expected to surface the
+    message verbatim."""
+
+
+def _acquire_data_dir_lock(
+    data_dir: "Path | None" = None,
+    lockfile_override: "Path | None" = None,
+) -> "tuple[int | None, Path | None]":
+    """Acquire an exclusive lock on the data directory. Returns
+    `(fd, path)`. The file descriptor MUST be kept alive for the
+    lifetime of the process — releasing it (or letting the process
+    exit) frees the lock. Set `$SPLICECRAFT_SKIP_LOCK=1` to bypass
+    (used by tests, and by advanced users who really want concurrent
+    instances and accept the data-coherence risk).
+
+    Raises `DataDirLockError` if another instance holds the lock.
+    Raises `OSError` if the lockfile can't be created (read-only data
+    dir, etc.) — caller decides whether to abort or proceed without
+    the lock.
+    """
+    if os.environ.get("SPLICECRAFT_SKIP_LOCK", "").strip().lower() in (
+        "1", "true", "yes"
+    ):
+        return None, None
+
+    target_dir = data_dir if data_dir is not None else _DATA_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    lockfile = lockfile_override if lockfile_override is not None else (
+        target_dir / _DATA_DIR_LOCKFILE.name
+    )
+
+    # Open with O_RDWR so we can both lock AND write the holder PID.
+    # 0o600 keeps the lockfile (which carries PID + version) private.
+    fd = os.open(str(lockfile), os.O_CREAT | os.O_RDWR, 0o600)
+
+    held_by: "str | None" = None
+    locked = False
+    try:
+        if sys.platform == "win32":
+            try:
+                import msvcrt  # type: ignore[import-not-found]
+                # LK_NBLCK = non-blocking exclusive lock on byte 0.
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                locked = True
+            except ImportError:
+                # No msvcrt — pre-3.0 weirdness or alternative
+                # interpreter. Treat as best-effort: don't lock,
+                # don't crash. Cache-coherence risk reverts to
+                # pre-lock behaviour.
+                _log.warning("msvcrt unavailable; skipping data-dir lock")
+                return fd, lockfile
+            except OSError:
+                # Lock contention. Try to read the holder PID so the
+                # error message is actionable.
+                pass
+        else:
+            try:
+                import fcntl  # type: ignore[import-not-found]
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except ImportError:
+                _log.warning("fcntl unavailable; skipping data-dir lock")
+                return fd, lockfile
+            except (BlockingIOError, OSError):
+                # Lock contention.
+                pass
+
+        if not locked:
+            # Best-effort PID readout from the holder.
+            try:
+                os.lseek(fd, 0, 0)
+                payload = os.read(fd, 256).decode("utf-8", errors="replace").strip()
+                if payload:
+                    held_by = payload.splitlines()[0]
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            hint = f" (held by PID {held_by})" if held_by else ""
+            raise DataDirLockError(
+                f"Another splicecraft instance is already running"
+                f"{hint}. Data is at {target_dir}. Quit the other "
+                "instance or set SPLICECRAFT_SKIP_LOCK=1 to override "
+                "(NOT RECOMMENDED — concurrent instances can corrupt "
+                "the library cache)."
+            )
+
+        # Write our PID + version + start-time to the file so a
+        # second-instance error message has something useful.
+        try:
+            os.lseek(fd, 0, 0)
+            os.ftruncate(fd, 0)
+            stamp = f"{os.getpid()}\n{__version__}\n".encode("utf-8")
+            os.write(fd, stamp)
+        except OSError as exc:
+            _log.warning("Could not write lockfile metadata: %s", exc)
+        return fd, lockfile
+    except DataDirLockError:
+        raise
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+def _release_data_dir_lock(fd: "int | None") -> None:
+    """Release a previously acquired lock. Best-effort — never
+    raises. Called from `main()`'s `finally` block but the kernel
+    cleans up on process exit anyway, so this is mainly cosmetic."""
+    if fd is None:
+        return
+    try:
+        if sys.platform == "win32":
+            try:
+                import msvcrt  # type: ignore[import-not-found]
+                os.lseek(fd, 0, 0)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            except (ImportError, OSError):
+                pass
+        else:
+            try:
+                import fcntl  # type: ignore[import-not-found]
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _drain_in_flight_workers(timeout_s: float = 2.0) -> "list[str]":
+    """Wait up to `timeout_s` for non-daemon worker threads to
+    finish. Returns the names of any threads still alive at the
+    deadline (logged as a warning so the diagnostic bundle reflects
+    what was running at exit).
+
+    Uses `threading.enumerate()` to discover live threads — works
+    for `@work(thread=True)` Textual workers and any plain
+    `threading.Thread` we may add later. The current thread + main
+    thread are skipped. Daemon threads are skipped too (the
+    interpreter kills those on exit anyway)."""
+    import time as _time
+    deadline = _time.monotonic() + max(0.0, timeout_s)
+    me = threading.current_thread()
+    main = threading.main_thread()
+    leftover: list[str] = []
+    for t in list(threading.enumerate()):
+        if t is me or t is main:
+            continue
+        if t.daemon:
+            # Daemon threads die with the process; don't block on
+            # them. The dedicated `_settings_flush_sync` already
+            # handled the settings-flush daemon thread above.
+            continue
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            leftover.append(t.name)
+            continue
+        try:
+            t.join(timeout=remaining)
+        except RuntimeError:
+            # Joining yourself / non-started thread; skip.
+            continue
+        if t.is_alive():
+            leftover.append(t.name)
+    if leftover:
+        _log.warning(
+            "Workers still in flight at exit (timeout=%.1fs): %s",
+            timeout_s, leftover,
+        )
+    return leftover
+
+
+# ── UI snapshot for diagnostic email ──────────────────────────────────────────
+#
+# `Alt+D` saves a Markdown-formatted dump of the current UI state to
+# `<DATA_DIR>/ui_snapshots/ui-snapshot-<ts>.md` so a user reporting a
+# bug can email the file. The format is optimised for AI-assisted
+# debugging: structured fields + a tail of the rotating log + a list
+# of the modal screen stack. NEVER includes plasmid sequence content
+# or NCBI-search emails — only metadata and IDs. Output is one
+# self-contained file the user can attach without zipping.
+#
+# Hardening: every accessor wrapped in try/except so a snapshot
+# capture never crashes (the user is reporting a bug — they can't
+# afford another one). Atomic write via `_atomic_write_text`. Old
+# snapshots are pruned beyond `_UI_SNAPSHOT_RETENTION` to bound disk
+# growth on a chatty user.
+
+_UI_SNAPSHOTS_DIR = _DATA_DIR / "ui_snapshots"
+_UI_SNAPSHOT_RETENTION = 20
+_UI_SNAPSHOT_LOG_TAIL_LINES = 200
+_UI_SNAPSHOT_MAX_LOG_BYTES = 256 * 1024  # cap log read so a huge log doesn't OOM
+
+
+def _scrub_path(text: str) -> str:
+    """Replace home-directory paths with `~` so a snapshot/bundle is
+    safe to share without exposing the user's username. Best-effort:
+    if `Path.home()` is unset (rare), the input is returned as-is.
+
+    Always returns a string. Multi-platform — handles Linux/Mac
+    (`/home/<user>`, `/Users/<user>`) and Windows
+    (`C:\\Users\\<user>`, `%USERPROFILE%`).
+    """
+    if not isinstance(text, str):
+        return str(text)
+    try:
+        home = str(Path.home())
+    except (RuntimeError, OSError):
+        return text
+    if not home:
+        return text
+    out = text.replace(home, "~")
+    # Cross-OS: if the user runs the bundle command on a different
+    # filesystem layout from where the log was written (rare but
+    # possible: WSL / network home dirs), the literal /home/<user>
+    # pattern may still appear. Fall back to a regex scrub.
+    try:
+        out = re.sub(r"(?:/home|/Users)/[A-Za-z0-9_.\-]+", "~", out)
+        # Windows: handle both forward and back slashes.
+        out = re.sub(
+            r"[A-Za-z]:[\\/]Users[\\/][A-Za-z0-9_.\-]+",
+            "~",
+            out,
+        )
+    except re.error:
+        pass
+    return out
+
+
+def _read_log_tail(path: "Path | None" = None,
+                   n_lines: int = _UI_SNAPSHOT_LOG_TAIL_LINES,
+                   max_bytes: int = _UI_SNAPSHOT_MAX_LOG_BYTES,
+                   ) -> str:
+    """Return the last `n_lines` of the rotating log file as a
+    string. Reads at most `max_bytes` from the END of the file (so
+    a multi-MB log doesn't slurp into memory). Returns an empty
+    string on any failure — never raises (a snapshot capture during
+    a bug report is exactly the worst time to add another exception).
+    """
+    p = Path(path) if path is not None else Path(_LOG_PATH)
+    if not p.is_file():
+        return ""
+    try:
+        size = p.stat().st_size
+        with open(p, "rb") as f:
+            if size > max_bytes:
+                f.seek(-max_bytes, 2)
+                # Drop the partial first line which we likely sliced
+                # mid-way through.
+                f.readline()
+            data = f.read()
+        text = data.decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    lines = text.splitlines()
+    if n_lines > 0 and len(lines) > n_lines:
+        lines = lines[-n_lines:]
+    return "\n".join(lines)
+
+
+def _collect_ui_snapshot(app=None) -> dict:
+    """Return a dict describing every piece of UI state an AI-assisted
+    debugger would want. Defensive against half-mounted apps, missing
+    records, and missing widgets — every getter is wrapped in
+    try/except.
+
+    Pure (no I/O beyond reading the log tail). Format independent —
+    `_format_ui_snapshot` renders the dict as Markdown.
+    """
+    import datetime as _dt
+    snap: dict = {
+        "captured_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        "session_id": _SESSION_ID,
+        "splicecraft_version": __version__,
+        "python_version": "{}.{}.{}".format(
+            sys.version_info[0], sys.version_info[1], sys.version_info[2]
+        ),
+        "platform": _RUNTIME_PLATFORM,
+        "log_path": str(_LOG_PATH),
+        "data_dir": str(_DATA_DIR),
+        "screen_stack": [],
+        "focused_widget": None,
+        "mouse_position": None,
+        "terminal_size": None,
+        "current_record": None,
+        "active_collection": None,
+        "active_grammar": None,
+        "settings": {},
+        "log_tail": "",
+    }
+    if app is not None:
+        try:
+            stack = list(getattr(app, "screen_stack", []) or [])
+            snap["screen_stack"] = [type(s).__name__ for s in stack]
+        except Exception:
+            pass
+        try:
+            focused = getattr(app, "focused", None)
+            if focused is not None:
+                snap["focused_widget"] = {
+                    "class": type(focused).__name__,
+                    "id": getattr(focused, "id", None),
+                    "classes": list(getattr(focused, "classes", []) or []),
+                }
+        except Exception:
+            pass
+        try:
+            xy = getattr(app, "_last_mouse_xy", None)
+            if xy is not None and len(xy) == 2:
+                snap["mouse_position"] = {"x": int(xy[0]), "y": int(xy[1])}
+        except Exception:
+            pass
+        try:
+            size = getattr(app, "size", None)
+            if size is not None:
+                snap["terminal_size"] = {
+                    "cols": int(getattr(size, "width", 0)),
+                    "rows": int(getattr(size, "height", 0)),
+                }
+        except Exception:
+            pass
+        # Current record summary — NO sequence content.
+        try:
+            rec = getattr(app, "_current_record", None)
+            if rec is not None:
+                annotations = getattr(rec, "annotations", {}) or {}
+                snap["current_record"] = {
+                    "id": getattr(rec, "id", "?"),
+                    "name": getattr(rec, "name", "?"),
+                    "length": int(len(getattr(rec, "seq", "") or "")),
+                    "topology": annotations.get("topology", "?"),
+                    "molecule_type": annotations.get("molecule_type", "?"),
+                    "n_features": len(getattr(rec, "features", []) or []),
+                    "source_path": _scrub_path(
+                        str(getattr(app, "_source_path", "") or "")
+                    ),
+                    "dirty": bool(getattr(app, "_dirty", False)),
+                    "cursor_pos": getattr(app, "_cursor_pos", None),
+                    "view_origin_bp": getattr(app, "_view_origin_bp", None),
+                    "rotation": getattr(app, "_rotation", None),
+                    "map_mode": getattr(app, "map_mode", None),
+                    "selected_idx": getattr(app, "_selected_idx", None),
+                }
+        except Exception:
+            pass
+        # App-level user-toggleable settings.
+        try:
+            snap["active_collection"] = getattr(app, "_active_collection", None)
+            snap["active_grammar"] = getattr(app, "_active_grammar", None)
+        except Exception:
+            pass
+    # Settings from disk — same view a fresh launch would see.
+    try:
+        snap["settings"] = dict(_load_settings() or {})
+    except Exception:
+        pass
+    # Log tail — scrubbed of home directory paths.
+    try:
+        snap["log_tail"] = _scrub_path(_read_log_tail())
+    except Exception:
+        snap["log_tail"] = ""
+    return snap
+
+
+def _format_ui_snapshot(snap: dict) -> str:
+    """Render the snapshot dict as a self-contained Markdown document
+    optimised for AI-assisted debugging. The user can attach the
+    output file to an email or paste it directly into a chat with an
+    AI assistant — every field is structured, named, and bounded.
+
+    Sequence content is never included (callers don't pass it).
+    """
+    def _kv_block(d: dict, indent: str = "  ") -> str:
+        if not d:
+            return f"{indent}(none)\n"
+        out = []
+        for k, v in d.items():
+            if isinstance(v, (dict, list)):
+                v_repr = _repr_for_log(v, max_len=200)
+            else:
+                v_repr = str(v) if v is not None else "(none)"
+            out.append(f"{indent}- **{k}**: {v_repr}")
+        return "\n".join(out) + "\n"
+
+    lines: list[str] = []
+    lines.append("# SpliceCraft UI Snapshot")
+    lines.append("")
+    lines.append(f"**Captured**: `{snap.get('captured_at', '?')}`  ")
+    lines.append(f"**Session**: `{snap.get('session_id', '?')}`  ")
+    lines.append(f"**SpliceCraft**: `{snap.get('splicecraft_version', '?')}` "
+                  f"on Python `{snap.get('python_version', '?')}` "
+                  f"(`{snap.get('platform', '?')}`)")
+    lines.append("")
+    lines.append("## App state")
+    stack = snap.get("screen_stack") or []
+    lines.append(f"- **Screen stack** ({len(stack)} screen(s)): "
+                  f"{' → '.join(stack) if stack else '(empty)'}")
+    fw = snap.get("focused_widget") or {}
+    if fw:
+        lines.append(f"- **Focused widget**: `{fw.get('class', '?')}`"
+                      f"{'#' + fw['id'] if fw.get('id') else ''}"
+                      f"{' .' + '.'.join(fw.get('classes') or []) if fw.get('classes') else ''}")
+    else:
+        lines.append("- **Focused widget**: (none)")
+    mp = snap.get("mouse_position")
+    if mp:
+        lines.append(f"- **Last mouse position**: col={mp['x']}, row={mp['y']}")
+    else:
+        lines.append("- **Last mouse position**: (unknown)")
+    ts = snap.get("terminal_size")
+    if ts:
+        lines.append(f"- **Terminal size**: {ts['cols']}×{ts['rows']}")
+    lines.append("")
+    lines.append("## Current record")
+    rec = snap.get("current_record")
+    if rec:
+        lines.append(_kv_block(rec))
+    else:
+        lines.append("  (no record loaded)\n")
+    lines.append("## Active workspace")
+    lines.append(f"- **Active collection**: "
+                  f"{snap.get('active_collection') or '(default)'}")
+    lines.append(f"- **Active grammar**: "
+                  f"{snap.get('active_grammar') or '(default)'}")
+    lines.append("")
+    lines.append("## Persisted settings")
+    lines.append(_kv_block(snap.get("settings") or {}))
+    lines.append("## Log tail (last %d lines, paths scrubbed)" %
+                  _UI_SNAPSHOT_LOG_TAIL_LINES)
+    lines.append("```")
+    log_tail = snap.get("log_tail") or "(log unavailable)"
+    lines.append(log_tail)
+    lines.append("```")
+    lines.append("")
+    lines.append("## Diagnostic file paths")
+    lines.append(f"- **Log file**: `{_scrub_path(snap.get('log_path', '?'))}`")
+    lines.append(f"- **Data dir**: `{_scrub_path(snap.get('data_dir', '?'))}`")
+    lines.append("")
+    lines.append("---")
+    lines.append("Email this snapshot (or paste it into your bug report) so "
+                  "the developer / AI assistant can diagnose the issue. The "
+                  "log tail above has been scrubbed of your home-directory "
+                  "username, but review it before sharing if you've opened "
+                  "files outside `$HOME`.")
+    return "\n".join(lines) + "\n"
+
+
+def _enforce_ui_snapshot_retention(
+        snapshots_dir: "Path | None" = None,
+        keep: int = _UI_SNAPSHOT_RETENTION) -> None:
+    """Prune oldest UI snapshots so disk doesn't grow without bound
+    after months of bug-report captures. Best-effort; never raises."""
+    d = snapshots_dir if snapshots_dir is not None else _UI_SNAPSHOTS_DIR
+    if keep < 0:
+        keep = 0
+    try:
+        if not d.is_dir():
+            return
+        snaps = []
+        for p in d.iterdir():
+            if not p.is_file():
+                continue
+            if not p.name.startswith("ui-snapshot-") or \
+                    not p.name.endswith(".md"):
+                continue
+            try:
+                snaps.append((p.stat().st_mtime, p))
+            except OSError:
+                continue
+        snaps.sort(reverse=True)
+        for _, old in snaps[keep:]:
+            try:
+                old.unlink()
+            except OSError as exc:
+                _log.warning("Could not prune UI snapshot %s: %s", old, exc)
+    except OSError as exc:
+        _log.warning("UI snapshot retention sweep failed: %s", exc)
+
+
+def _save_ui_snapshot(text: str,
+                       dest_dir: "Path | None" = None) -> Path:
+    """Atomically write a UI snapshot Markdown file. Returns the
+    saved path. Raises OSError on disk failure (caller's call to
+    notify the user — typically wrapped in try/except by the action
+    handler so a captured snapshot never explodes the keypress
+    handler)."""
+    import datetime as _dt
+    d = dest_dir if dest_dir is not None else _UI_SNAPSHOTS_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = d / f"ui-snapshot-{ts}.md"
+    bump = 0
+    while path.exists():
+        bump += 1
+        path = d / f"ui-snapshot-{ts}.{bump}.md"
+    _atomic_write_text(path, text)
+    _enforce_ui_snapshot_retention(d)
+    return path
+
+
+# ── Diagnostic bundle (`splicecraft logs --bundle`) ───────────────────────────
+#
+# Single ZIP that combines:
+#   * Rotating log files (splicecraft.log + .1 + .2 + ...)
+#   * Last N UI snapshots (markdown)
+#   * Sanitized snapshot of settings.json (paths scrubbed)
+#   * system_info.json (versions, platform, data-dir layout)
+# The user attaches the ZIP to a bug report; the developer / AI
+# assistant feeds it back for diagnosis. Path-scrubbing keeps
+# `/home/<username>/...` out of every text artifact so the bundle
+# is shareable without exposing the user's account name.
+
+_DIAGNOSTIC_BUNDLE_MAX_UI_SNAPSHOTS = 5
+_DIAGNOSTIC_BUNDLE_HELP_TEXT = (
+    "splicecraft logs — manage diagnostic logs\n"
+    "\n"
+    "Usage:\n"
+    "  splicecraft logs --bundle [--out PATH]    Pack logs + UI snapshots\n"
+    "                                             into a shareable ZIP.\n"
+    "  splicecraft logs --where                  Print the log file path.\n"
+    "  splicecraft logs --help, -h               Show this help.\n"
+    "\n"
+    "The bundle includes the rotating log files, the most recent UI\n"
+    "snapshots (Alt+D in the running app), a sanitized copy of your\n"
+    "settings.json, and system info. Home-directory paths are\n"
+    "replaced with `~` so you can email the bundle without exposing\n"
+    "your username.\n"
+)
+
+
+def _build_system_info() -> dict:
+    """Return a structured-but-bounded summary of the runtime
+    environment for inclusion in a diagnostic bundle. NEVER includes
+    plasmid sequences, full file contents, or env vars. All paths
+    pass through `_scrub_path`."""
+    info = {
+        "splicecraft_version": __version__,
+        "python_version": sys.version.replace("\n", " "),
+        "platform": _RUNTIME_PLATFORM,
+        "session_id": _SESSION_ID,
+        "log_path": _scrub_path(str(_LOG_PATH)),
+        "data_dir": _scrub_path(str(_DATA_DIR)),
+        "data_dir_exists": _DATA_DIR.is_dir(),
+        "user_data_files_present": [],
+        "user_data_dirs_present": [],
+        "operational_files_present": [],
+    }
+    try:
+        for attr in _USER_DATA_FILE_ATTRS:
+            p = globals().get(attr)
+            if isinstance(p, Path) and p.is_file():
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    size = -1
+                info["user_data_files_present"].append({
+                    "attr": attr, "name": p.name, "size": size,
+                })
+        for attr in _USER_DATA_DIR_ATTRS:
+            p = globals().get(attr)
+            if isinstance(p, Path) and p.is_dir():
+                try:
+                    n = sum(1 for _ in p.rglob("*") if _.is_file())
+                except OSError:
+                    n = -1
+                info["user_data_dirs_present"].append({
+                    "attr": attr, "name": p.name, "file_count": n,
+                })
+        for attr in _OPERATIONAL_FILE_ATTRS:
+            p = globals().get(attr)
+            if isinstance(p, Path) and p.is_file():
+                info["operational_files_present"].append({
+                    "attr": attr, "name": p.name,
+                })
+    except Exception:
+        pass
+    return info
+
+
+def _create_diagnostic_bundle(out_path: "Path | None" = None) -> Path:
+    """Pack logs + UI snapshots + sanitized settings + system info
+    into a single ZIP. Returns the path to the saved bundle.
+
+    Hardening:
+      * Atomic via tempfile + os.replace.
+      * Path scrubbing on every text artifact (settings.json, log
+        contents, system_info).
+      * Read-caps on the log so a runaway log can't blow memory.
+      * Skips files that don't exist gracefully (a fresh install
+        has no rotated backups).
+    """
+    import datetime as _dt
+    import io as _io
+    import tempfile
+    import zipfile
+
+    if out_path is None:
+        ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_path = Path.cwd() / (
+            f"splicecraft-debug-{_SESSION_ID}-{ts}.zip"
+        )
+    out_path = Path(out_path).resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build into a temp file in the same directory so the final
+    # rename is on the same filesystem.
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{out_path.name}.", suffix=".zip",
+        dir=str(out_path.parent),
+    )
+    try:
+        os.close(fd)  # we'll reopen for writing via zipfile
+        with zipfile.ZipFile(tmp_name, "w", zipfile.ZIP_DEFLATED) as zf:
+            # 1. Log files (current + rotated backups). Each is
+            # scrubbed for home-directory paths before write.
+            log_path = Path(_LOG_PATH)
+            log_dir = log_path.parent
+            log_glob = log_path.name + "*"
+            try:
+                for p in sorted(log_dir.glob(log_glob)):
+                    if not p.is_file():
+                        continue
+                    try:
+                        # Cap log read to 5 MB per file (rotation
+                        # ceiling) so the ZIP can never balloon on
+                        # a misconfigured handler.
+                        text = p.read_text(
+                            encoding="utf-8", errors="replace",
+                        )[:5 * 1024 * 1024]
+                    except OSError:
+                        continue
+                    zf.writestr(f"logs/{p.name}", _scrub_path(text))
+            except OSError:
+                pass
+
+            # 2. Recent UI snapshots (most recent N, already
+            # scrubbed when written via Alt+D).
+            try:
+                if _UI_SNAPSHOTS_DIR.is_dir():
+                    snaps = sorted(
+                        _UI_SNAPSHOTS_DIR.glob("ui-snapshot-*.md"),
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )[:_DIAGNOSTIC_BUNDLE_MAX_UI_SNAPSHOTS]
+                    for s in snaps:
+                        try:
+                            text = s.read_text(
+                                encoding="utf-8", errors="replace",
+                            )[:1 * 1024 * 1024]
+                        except OSError:
+                            continue
+                        zf.writestr(f"ui_snapshots/{s.name}", text)
+            except OSError:
+                pass
+
+            # 3. Sanitized settings.json — strip absolute paths.
+            try:
+                settings_path = globals().get("_SETTINGS_FILE")
+                if isinstance(settings_path, Path) and settings_path.is_file():
+                    raw = settings_path.read_text(
+                        encoding="utf-8", errors="replace",
+                    )[:256 * 1024]
+                    zf.writestr("settings.json", _scrub_path(raw))
+            except OSError:
+                pass
+
+            # 4. System info JSON.
+            try:
+                info = _build_system_info()
+                zf.writestr("system_info.json",
+                              json.dumps(info, indent=2))
+            except Exception:
+                pass
+
+            # 5. README pointing at how to use the bundle.
+            zf.writestr(
+                "README.md",
+                "# SpliceCraft diagnostic bundle\n\n"
+                f"Generated: {_dt.datetime.now().isoformat(timespec='seconds')}\n"
+                f"Session: `{_SESSION_ID}`\n"
+                f"SpliceCraft: `{__version__}`\n\n"
+                "Contents:\n"
+                "- `logs/` — rotating log files (last ~20 MB, scrubbed)\n"
+                f"- `ui_snapshots/` — last {_DIAGNOSTIC_BUNDLE_MAX_UI_SNAPSHOTS} "
+                "UI snapshots captured via Alt+D\n"
+                "- `settings.json` — your persisted toggles (paths scrubbed)\n"
+                "- `system_info.json` — version + platform metadata\n\n"
+                "Email this archive (or paste the relevant log lines) "
+                "to your bug report.\n",
+            )
+        # Atomic finalisation: rename temp → final.
+        os.replace(tmp_name, out_path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    # Tighten permissions on the bundle ZIP. POSIX-only — bundles
+    # contain log content + system info that may include file paths;
+    # 0o600 keeps them owner-readable only on a shared host.
+    _chmod_user_only(out_path)
+    return out_path
+
+
+def _run_logs_subcommand(argv: "list[str]") -> int:
+    """Entry point for `splicecraft logs`. Returns a shell exit code."""
+    bundle = False
+    where = False
+    out_path: "Path | None" = None
+
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--bundle":
+            bundle = True
+            i += 1
+        elif a == "--where":
+            where = True
+            i += 1
+        elif a == "--out":
+            if i + 1 >= len(argv):
+                print("splicecraft logs: --out requires a path argument",
+                      file=sys.stderr)
+                return 2
+            out_path = Path(argv[i + 1]).expanduser()
+            i += 2
+        elif a.startswith("--out="):
+            out_path = Path(a.split("=", 1)[1]).expanduser()
+            i += 1
+        elif a in ("--help", "-h"):
+            print(_DIAGNOSTIC_BUNDLE_HELP_TEXT)
+            return 0
+        else:
+            print(
+                f"splicecraft logs: unknown argument {a!r}.  "
+                "Run `splicecraft logs --help` for usage.",
+                file=sys.stderr,
+            )
+            return 2
+
+    if where:
+        print(_LOG_PATH)
+        return 0
+
+    if not bundle:
+        # No-arg invocation: print log path + brief help.
+        print(f"Log file: {_LOG_PATH}")
+        print()
+        print(_DIAGNOSTIC_BUNDLE_HELP_TEXT)
+        return 0
+
+    try:
+        path = _create_diagnostic_bundle(out_path)
+    except OSError as exc:
+        _log.exception("diagnostic bundle creation failed")
+        print(f"Could not create diagnostic bundle: {exc}",
+              file=sys.stderr)
+        return 1
+    print(f"Diagnostic bundle saved to:\n  {path}")
+    print(
+        "\nAttach this file to a bug report or email. The bundle\n"
+        "contains your logs, recent UI snapshots, your settings, and\n"
+        "platform metadata — home-directory paths have been replaced\n"
+        "with `~` so it's safe to share."
+    )
+    return 0
 
 
 def _dna_sidecar_path(entry_id: str) -> "Path":
@@ -3861,6 +4948,61 @@ def _copy_to_clipboard_osc52(text: str) -> bool:
         return False
 
 
+def _copy_to_clipboard_with_fallback(
+    app, text: str, label: str = "copy"
+) -> "tuple[str, Path | None]":
+    """Copy `text` to the system clipboard with a multi-tier
+    fallback chain so the user always has a way to retrieve their
+    copy even on a broken / SSH-without-X11 / unprivileged terminal:
+
+      1. Textual's `app.copy_to_clipboard` (when an app is available)
+      2. OSC 52 terminal escape (most modern terminals)
+      3. Atomic write to `<DATA_DIR>/clipboard/<ts>-<label>.txt`
+         (last resort — never hits a network and works on any
+         platform with a writable home dir)
+
+    Returns `(mode, detail)`:
+      mode    — `"clipboard"` | `"osc52"` | `"file"` | `"log_only"`
+      detail  — Path to the temp file (when mode == "file"); else None
+
+    The full text is also logged at INFO level so a diagnostic
+    bundle preserves it regardless of which tier succeeded.
+    """
+    _log.info("clipboard copy %r (%d chars)", label, len(text))
+    if app is not None:
+        try:
+            app.copy_to_clipboard(text)
+            return ("clipboard", None)
+        except Exception:
+            # Continue to OSC 52 — Textual's clipboard call can fail
+            # on remote SSH sessions where the terminal proxy hasn't
+            # negotiated a clipboard channel.
+            pass
+    if _copy_to_clipboard_osc52(text):
+        return ("osc52", None)
+    # Tier 3: write to disk and tell the caller the path.
+    try:
+        import datetime as _dt
+        clip_dir = _DATA_DIR / "clipboard"
+        clip_dir.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", label)[:40] or "copy"
+        ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = clip_dir / f"{ts}-{safe}.txt"
+        # Bump on collision so multiple rapid copies don't overwrite.
+        bump = 0
+        while path.exists():
+            bump += 1
+            path = clip_dir / f"{ts}-{safe}.{bump}.txt"
+        _atomic_write_text(path, text)
+        # Tighten perms — clipboard contents may be sensitive.
+        _chmod_user_only(path)
+        return ("file", path)
+    except OSError as exc:
+        _log.warning("Clipboard file fallback failed: %s", exc)
+    # Last resort: only the log captured it.
+    return ("log_only", None)
+
+
 _MARKUP_TAG_RE = re.compile(r"\[/?[^\[\]]*\]")
 
 
@@ -4260,19 +5402,45 @@ def fetch_genbank(accession: str, email: str = "splicecraft@local"):
     """
     import io
     import socket
+    import time as _time
     from Bio import Entrez, SeqIO
     Entrez.email = email
     prev_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(_NCBI_TIMEOUT_S)
+    # One-retry pattern with 250 ms backoff to absorb transient
+    # NCBI flakes (rate-limited 429, brief gateway 502, etc.). Two
+    # attempts total — bounded by 2 × 30 s socket timeout + backoff.
+    raw: "bytes | str | None" = None
+    last_exc: "BaseException | None" = None
     try:
-        with Entrez.efetch(
-            db="nucleotide", id=accession, rettype="gb", retmode="text"
-        ) as handle:
-            # Bounded read: ask for one byte over the cap so we can
-            # distinguish "exactly at cap" from "exceeded".
-            raw = handle.read(_NCBI_GB_MAX_RESPONSE_BYTES + 1)
+        for attempt in range(2):
+            try:
+                with Entrez.efetch(
+                    db="nucleotide", id=accession,
+                    rettype="gb", retmode="text"
+                ) as handle:
+                    raw = handle.read(_NCBI_GB_MAX_RESPONSE_BYTES + 1)
+                break
+            except (OSError, socket.timeout) as exc:
+                last_exc = exc
+                if attempt == 0:
+                    _log.debug(
+                        "NCBI fetch attempt 1 failed for %r (%s); retrying",
+                        accession, exc,
+                    )
+                    _time.sleep(0.25)
+                    continue
+                # Both attempts failed — re-raise so the caller's
+                # outer handler turns this into a user-facing error.
+                raise
     finally:
         socket.setdefaulttimeout(prev_timeout)
+    if raw is None:
+        # Defensive — if we got here without raw, something went
+        # wrong that the loop didn't catch. Fall back to last_exc.
+        raise last_exc if last_exc is not None else OSError(
+            f"NCBI fetch failed for {accession!r}"
+        )
     # Entrez handles return either bytes or str depending on Biopython
     # version; normalise to text for SeqIO.
     if isinstance(raw, bytes):
@@ -8897,7 +10065,12 @@ class SequencePanel(Widget):
         # internally; Alt+D is the always-available toggle.
         Binding("h",     "copy_hover_status", "Copy hover", show=False),
         Binding("d",     "dump_hover_chunk",  "Dump chunk", show=False),
-        Binding("alt+d", "toggle_debug",      "Debug mode", show=False),
+        # Seq-panel debug-mode toggle. Moved from `alt+d` → `alt+shift+d`
+        # in 0.7.6 because `alt+d` was repurposed for the always-
+        # available UI-snapshot capture (App-level binding). H / D
+        # are still gated on `_debug_mode` so they don't capture
+        # literal IUPAC codes during normal sequence editing.
+        Binding("alt+shift+d", "toggle_debug", "Seq debug mode", show=False),
         # Enter on a highlighted feature opens the FeatureEditModal.
         # Routed through the App via post_message so the seq panel
         # doesn't need to know about modals or feature lists. The
@@ -11714,6 +12887,39 @@ class WhatsNewModal(ModalScreen):
 # package archive itself — just the metadata blob.
 _PYPI_JSON_URL = "https://pypi.org/pypi/splicecraft/json"
 
+
+def _resolve_pypi_url() -> str:
+    """Return the URL that the PyPI update-check should hit. Honours
+    `$SPLICECRAFT_PYPI_URL` so ops / corporate environments behind a
+    PyPI mirror or an air-gapped index can redirect the check without
+    a code patch.
+
+    Validation: the override MUST be `http://` or `https://` to
+    prevent `file://` / `ftp://` schemes that could exfiltrate
+    information or read the local filesystem (Python's urllib will
+    happily follow `file://`). Falls back to the default on any
+    invalid / suspicious value, with a debug log so misconfiguration
+    is diagnosable."""
+    override = os.environ.get("SPLICECRAFT_PYPI_URL", "").strip()
+    if not override:
+        return _PYPI_JSON_URL
+    lower = override.lower()
+    if not (lower.startswith("https://") or lower.startswith("http://")):
+        _log.warning(
+            "$SPLICECRAFT_PYPI_URL=%r ignored: must be http(s)://",
+            override,
+        )
+        return _PYPI_JSON_URL
+    # Bound length too — a 10 MB env var would be silly but
+    # someone could try.
+    if len(override) > 2048:
+        _log.warning(
+            "$SPLICECRAFT_PYPI_URL ignored: too long (%d chars)",
+            len(override),
+        )
+        return _PYPI_JSON_URL
+    return override
+
 # How long to trust a cached "latest version" answer before
 # re-asking PyPI. 24 h keeps the chatter low while still surfacing
 # new releases promptly for daily users.
@@ -11783,21 +12989,41 @@ def _fetch_latest_pypi_version(timeout: float = _UPDATE_CHECK_TIMEOUT_S
     or misconfigured upstream); the parsed version string is
     capped at 64 chars (PEP 440 versions are far shorter).
     """
+    import time as _time
     import urllib.request
     import urllib.error
+    url = _resolve_pypi_url()
     req = urllib.request.Request(
-        _PYPI_JSON_URL,
+        url,
         headers={
             "User-Agent": f"splicecraft/{__version__} (update-check)",
             "Accept": "application/json",
         },
     )
+    # Single retry with 250 ms backoff to absorb transient flakiness
+    # (DNS race on a flaky train Wi-Fi, brief 502 from a CDN edge,
+    # etc.). Two attempts total — keeps the worst-case latency
+    # bounded by 2 × timeout + backoff so the foreground UI doesn't
+    # appear hung. Logged at DEBUG so the diagnostic bundle reflects
+    # whether retries fire often.
+    raw: "bytes | None" = None
+    last_exc: "BaseException | None" = None
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read(_PYPI_MAX_RESPONSE_BYTES + 1)
+            break
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            last_exc = exc
+            if attempt == 0:
+                _log.debug("PyPI fetch attempt 1 failed (%s); retrying", exc)
+                _time.sleep(0.25)
+                continue
+            # Both attempts failed — fall through to the error path.
+            raw = None
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            # Cap the read so a malformed / hostile upstream can't
-            # OOM the worker. PyPI's JSON for splicecraft is ~10 KB
-            # in practice; 256 KB leaves comfortable headroom.
-            raw = resp.read(_PYPI_MAX_RESPONSE_BYTES + 1)
+        if raw is None:
+            raise last_exc if last_exc is not None else OSError("unknown PyPI fetch failure")
         if len(raw) > _PYPI_MAX_RESPONSE_BYTES:
             _log.debug("PyPI update check: response exceeded %d-byte cap",
                         _PYPI_MAX_RESPONSE_BYTES)
@@ -11818,6 +13044,1619 @@ def _fetch_latest_pypi_version(timeout: float = _UPDATE_CHECK_TIMEOUT_S
         return None
     latest = latest.strip()[:64]
     return latest or None
+
+
+# ── Self-update subcommand (`splicecraft update`) ─────────────────────────────
+#
+# Detects how SpliceCraft was installed (pipx / pip --user / pip in venv /
+# system pip / editable / source clone / unknown) and runs the matching
+# upgrade command — so end users can `splicecraft update` instead of
+# remembering whichever pip/pipx incantation they originally used.
+#
+# Hardening notes:
+#   * subprocess invoked list-form (no shell, no env injection).
+#   * Editable + source-clone installs refuse to run pip; they suggest
+#     `git pull` instead — clobbering a developer's working tree with a
+#     PyPI build would be hostile.
+#   * System-wide pip installs print the sudo command but do NOT auto-run
+#     sudo (interactive password prompts from inside an app are dangerous
+#     and the surrounding TTY state is unpredictable).
+#   * PyPI fetch reuses `_fetch_latest_pypi_version` (already timeout-
+#     bounded + size-capped per the network-reads rule in CLAUDE.md).
+#   * Confirmation prompt defaults to "no"; `--yes`/`-y` skips.
+#   * `--check` is read-only — never invokes pip/pipx.
+#   * Exit codes follow shell convention: 0 success, 1 runtime failure,
+#     2 bad usage, 130 user-cancelled at the confirmation prompt.
+
+# Names of upgrade methods returned by `_detect_install_method`. These
+# strings appear in user-facing output and in the test suite, so they
+# are deliberately stable.
+_INSTALL_METHODS = (
+    "pipx",          # pipx-managed venv (`pipx install splicecraft`)
+    "uv-tool",       # `uv tool install splicecraft` (Astral uv)
+    "uv-venv",       # `uv pip install splicecraft` inside a uv-created venv
+    "pixi-global",   # `pixi global install splicecraft` (prefix.dev pixi)
+    "pixi-project",  # splicecraft is in a pixi project env (`.pixi/envs/...`)
+    "pip-user",      # `pip install --user splicecraft`
+    "pip-venv",      # `pip install splicecraft` inside a virtualenv
+    "pip-system",    # system-wide pip (e.g. /usr/lib/python*/site-packages)
+    "editable",      # `pip install -e .` from a checkout
+    "source",        # `python splicecraft.py` from a git clone, no install
+    "unknown",       # everything else — we'll suggest a generic command
+)
+
+
+def _find_dist_info_dir(pkg_name: str = "splicecraft") -> "Path | None":
+    """Return the *.dist-info directory for `pkg_name`, or None if the
+    package isn't installed (e.g. running from a source clone) or the
+    metadata location can't be determined.
+
+    Pure-stdlib via `importlib.metadata`. We need the dist-info dir
+    (rather than just the Distribution) so we can read its
+    `direct_url.json` (PEP 610) to detect editable installs.
+    """
+    try:
+        import importlib.metadata as ilm
+    except ImportError:  # pragma: no cover — stdlib on 3.10+
+        return None
+    try:
+        dist = ilm.distribution(pkg_name)
+    except ilm.PackageNotFoundError:
+        return None
+    # `Distribution._path` is technically private but is the documented
+    # location attribute on CPython's PathDistribution. Falling back to
+    # walking RECORD covers the (rare) zipapp / non-PathDistribution
+    # case without crashing.
+    loc = getattr(dist, "_path", None)
+    if loc is not None:
+        try:
+            p = Path(str(loc))
+            if p.is_dir():
+                return p
+        except (OSError, ValueError):
+            pass
+    try:
+        files = dist.files or []
+    except (OSError, AttributeError):
+        files = []
+    for f in files:
+        try:
+            if f.name == "RECORD":
+                return Path(str(f.locate())).parent
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _detect_install_method() -> dict:
+    """Inspect the running process to infer how SpliceCraft was
+    installed. Returns a dict with these keys:
+
+        method     — one of `_INSTALL_METHODS`
+        module     — absolute path to the splicecraft.py being executed
+                     (str; "" if `__file__` is unavailable)
+        python     — sys.executable
+        venv       — venv root (pipx / pip-venv) or None
+        git_clone  — repo root if running from a git clone, else None
+        details    — short human-readable explanation for `--check`
+                     output and error messages
+
+    Order of checks matters:
+      1. editable (PEP 610 direct_url.json) — overrides path heuristics
+      2. pipx (path component) — overrides generic venv detection
+      3. source clone (`__file__` next to .git/ + pyproject.toml)
+      4. pip-venv (sys.prefix differs from base_prefix)
+      5. pip-user (`~/.local/` or `%APPDATA%`)
+      6. pip-system (anything else with site-packages on the path)
+      7. unknown
+    """
+    info: dict = {
+        "method": "unknown",
+        "module": "",
+        "python": sys.executable,
+        "venv": None,
+        "git_clone": None,
+        "details": "",
+    }
+    try:
+        mod_path = Path(__file__).resolve()
+    except (OSError, ValueError, NameError):
+        info["details"] = "Cannot determine module location (__file__ unavailable)"
+        return info
+    info["module"] = str(mod_path)
+
+    in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    if in_venv:
+        info["venv"] = sys.prefix
+
+    # Editable install? PEP 610: `direct_url.json` with
+    # `dir_info.editable: true` lives in the dist-info dir.
+    dist_info = _find_dist_info_dir("splicecraft")
+    if dist_info is not None:
+        durl = dist_info / "direct_url.json"
+        if durl.is_file():
+            try:
+                d = json.loads(durl.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                d = None
+            if isinstance(d, dict):
+                dir_info = d.get("dir_info")
+                if isinstance(dir_info, dict) and dir_info.get("editable") is True:
+                    info["method"] = "editable"
+                    src = d.get("url", "") or ""
+                    info["details"] = (
+                        f"Editable install (dist-info at {dist_info})"
+                        if not src else
+                        f"Editable install of {src}"
+                    )
+                    return info
+
+    # Normalise path separators so the substring tests work the same
+    # way on Linux, Mac, and Windows.
+    mod_str = str(mod_path).replace("\\", "/")
+    mod_lower = mod_str.lower()
+
+    # uv tool — Astral's pipx-equivalent. Tools live in
+    #   Linux/Mac:  ~/.local/share/uv/tools/splicecraft/
+    #   Windows:    %APPDATA%/uv/tools/splicecraft/
+    # Substring `/uv/tools/splicecraft/` is unique to this layout.
+    if "/uv/tools/splicecraft/" in mod_lower:
+        info["method"] = "uv-tool"
+        for ancestor in mod_path.parents:
+            if ancestor.name.lower() == "splicecraft" and \
+                    ancestor.parent.name.lower() == "tools":
+                info["venv"] = str(ancestor)
+                break
+        info["details"] = (
+            f"uv-managed tool install (venv: {info['venv']})"
+            if info["venv"] else
+            "uv-managed tool install"
+        )
+        return info
+
+    # pixi global — prefix.dev's pipx-equivalent. Envs at
+    #   Linux/Mac:  ~/.pixi/envs/splicecraft/   ← hidden `.pixi`
+    #   Windows:    %LOCALAPPDATA%/pixi/envs/splicecraft/   ← no dot
+    # The leading-dot form on Linux/Mac means a substring match for
+    # `/pixi/envs/splicecraft/` would NOT fire (the `/` precedes a
+    # `.`, not a `p`), so we check both shapes. This must run BEFORE
+    # the broader pixi-project check below — pixi-global is a subset
+    # of that pattern, and the specific match must win.
+    if (
+        "/.pixi/envs/splicecraft/" in mod_lower
+        or "/pixi/envs/splicecraft/" in mod_lower
+    ):
+        info["method"] = "pixi-global"
+        for ancestor in mod_path.parents:
+            if ancestor.name.lower() == "splicecraft" and \
+                    ancestor.parent.name.lower() == "envs":
+                info["venv"] = str(ancestor)
+                break
+        info["details"] = (
+            f"pixi-managed global install (env: {info['venv']})"
+            if info["venv"] else
+            "pixi-managed global install"
+        )
+        return info
+
+    # pixi project — splicecraft pulled in as a dependency of a pixi
+    # project. Envs live at `<project>/.pixi/envs/<env_name>/` on
+    # every platform (project-level config follows Unix dot-prefix
+    # convention). We refuse to auto-upgrade these (the project
+    # manifest, not PyPI, is the source of truth).
+    if "/.pixi/envs/" in mod_lower or "/pixi/envs/" in mod_lower:
+        info["method"] = "pixi-project"
+        # Walk up to find the project root (the dir containing .pixi/).
+        for ancestor in mod_path.parents:
+            if ancestor.name.lower() in (".pixi", "pixi"):
+                info["git_clone"] = str(ancestor.parent)
+                break
+        info["details"] = (
+            f"pixi-managed project env (project: {info['git_clone']})"
+            if info["git_clone"] else
+            "pixi-managed project env"
+        )
+        return info
+
+    # pipx — most reliable signal is the canonical path component.
+    # Linux / Mac:  ~/.local/share/pipx/venvs/splicecraft/lib/...
+    # Windows:      %USERPROFILE%/pipx/venvs/splicecraft/Lib/...
+    # Some distros put pipx data at /opt/pipx; covered by the same
+    # `/pipx/venvs/splicecraft/` substring.
+    if "/pipx/venvs/splicecraft/" in mod_lower or "/pipx/shared/" in mod_lower:
+        info["method"] = "pipx"
+        # Walk up to find the venv root (parent of the splicecraft venv).
+        for ancestor in mod_path.parents:
+            if ancestor.name.lower() == "splicecraft" and \
+                    ancestor.parent.name.lower() == "venvs":
+                info["venv"] = str(ancestor)
+                break
+        info["details"] = (
+            f"pipx-managed install (venv: {info['venv']})"
+            if info["venv"] else
+            "pipx-managed install"
+        )
+        return info
+
+    # Source clone — running splicecraft.py directly from a git checkout
+    # (no install). Detected by `__file__` sitting next to .git/ and
+    # pyproject.toml. Editable installs were already handled above.
+    parent = mod_path.parent
+    try:
+        is_git_clone = (parent / ".git").is_dir() and (parent / "pyproject.toml").is_file()
+    except OSError:
+        is_git_clone = False
+    if is_git_clone:
+        info["method"] = "source"
+        info["git_clone"] = str(parent)
+        info["details"] = f"Running from git clone at {parent}"
+        return info
+
+    # Generic venv — pip install inside a non-pipx, non-pixi-global,
+    # non-uv-tool virtualenv. uv-created venvs are distinguished by a
+    # `uv = <version>` line in `pyvenv.cfg` (uv writes this when it
+    # creates the venv). Fall back to pip-venv if the cfg is missing,
+    # unreadable, or doesn't carry the uv signature.
+    if in_venv:
+        is_uv_venv = False
+        try:
+            cfg = Path(sys.prefix) / "pyvenv.cfg"
+            if cfg.is_file():
+                # `pyvenv.cfg` is a tiny key=value file (~6 lines);
+                # 16 KB is wildly more than any real one. Cap the read
+                # so a bogus replacement on disk can't blow up RAM.
+                text = cfg.read_text(encoding="utf-8", errors="replace")[:16384]
+                for line in text.splitlines():
+                    key = line.split("=", 1)[0].strip().lower()
+                    if key == "uv":
+                        is_uv_venv = True
+                        break
+        except (OSError, UnicodeDecodeError):
+            pass
+        if is_uv_venv:
+            info["method"] = "uv-venv"
+            info["details"] = f"uv-managed venv at {sys.prefix}"
+        else:
+            info["method"] = "pip-venv"
+            info["details"] = f"pip install in virtualenv at {sys.prefix}"
+        return info
+
+    # User-site install — `~/.local/lib/.../site-packages/` on Linux,
+    # `~/Library/Python/.../site-packages/` on Mac, `%APPDATA%/Python/`
+    # on Windows.
+    if (
+        "/.local/lib/" in mod_lower
+        or "/library/python/" in mod_lower
+        or "/appdata/roaming/python/" in mod_lower
+    ):
+        info["method"] = "pip-user"
+        info["details"] = "user-site pip install"
+        return info
+
+    # System site-packages — any other location with /site-packages/
+    # in the path.
+    if "/site-packages/" in mod_lower:
+        info["method"] = "pip-system"
+        info["details"] = f"system-wide install at {mod_path.parent}"
+        return info
+
+    # Couldn't classify — caller will recommend a generic command and
+    # ask for confirmation before running anything.
+    info["details"] = f"Unable to classify install at {mod_path}"
+    return info
+
+
+def _build_upgrade_command(method: str, *, force: bool, pre: bool = False) -> "list[str] | None":
+    """Translate a detected install method into the argv list for the
+    upgrade command. Returns None for methods that we refuse to upgrade
+    automatically (`editable`, `source`, `pixi-project` — for the last,
+    the project manifest is the source of truth).
+
+    For `pip-system` we DO return a command list — but the caller is
+    expected to print it for the user to run with sudo rather than
+    invoking it directly.
+    """
+    if method in ("editable", "source", "pixi-project"):
+        return None
+    if method == "pipx":
+        if force:
+            # `pipx upgrade` is a no-op when versions match; `install
+            # --force` re-runs the install end-to-end.
+            return ["pipx", "install", "--force", "splicecraft"]
+        return ["pipx", "upgrade", "splicecraft"]
+    if method == "uv-tool":
+        if force:
+            # `uv tool upgrade` is also a no-op when versions match;
+            # `install --force` is the canonical re-run for uv tools.
+            return ["uv", "tool", "install", "--force", "splicecraft"]
+        return ["uv", "tool", "upgrade", "splicecraft"]
+    if method == "uv-venv":
+        # uv-managed venv: prefer the uv front-end over plain pip so
+        # the user's lockfile / cache stay consistent with how the
+        # venv was built.
+        cmd = ["uv", "pip", "install", "--upgrade", "splicecraft"]
+        if force:
+            cmd.append("--force-reinstall")
+        if pre:
+            cmd.insert(3, "--prerelease=allow")
+        return cmd
+    if method == "pixi-global":
+        if force:
+            # pixi global has no `--force` on update; the canonical
+            # force-reinstall is `install --force`.
+            return ["pixi", "global", "install", "--force", "splicecraft"]
+        return ["pixi", "global", "update", "splicecraft"]
+    if method == "pip-user":
+        cmd = [sys.executable, "-m", "pip", "install", "--user",
+               "--upgrade", "splicecraft"]
+        if force:
+            cmd.append("--force-reinstall")
+        if pre:
+            cmd.insert(4, "--pre")
+        return cmd
+    # pip-venv, pip-system, unknown — same baseline command. Caller
+    # decides whether to run it or just print it.
+    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "splicecraft"]
+    if force:
+        cmd.append("--force-reinstall")
+    if pre:
+        cmd.insert(3, "--pre")
+    return cmd
+
+
+# ── Pre-update user-data snapshot (SACRED INVARIANT) ──────────────────────────
+#
+# Every running upgrade path (pipx / uv-tool / uv-venv / pixi-global / pip-*)
+# MUST take a complete, atomic snapshot of the user's library, collections,
+# parts bin, primers, feature library, custom grammars, codon tables,
+# settings, crash-recovery autosaves, and `.dna` sidecars BEFORE the install
+# subprocess starts. If the snapshot can't be made, the upgrade aborts —
+# it is never acceptable to risk overwriting user data without a known-good
+# copy first. This is enforced by `test_update_snapshot_taken_before_subprocess`
+# in tests/test_smoke.py and must remain enforced by any future change.
+#
+# Snapshots live OUTSIDE `_DATA_DIR` (sibling at `<data_dir>/../<name>-update-
+# backups/`) so a hypothetical bug in a new version that recursively wipes
+# `_DATA_DIR` doesn't take the recovery copy with it. The location is
+# overridable via $SPLICECRAFT_UPDATE_BACKUP_DIR.
+
+# Canonical user-data files. Order matters for the manifest so a future
+# audit can replay the snapshot in deterministic sequence; do not reorder.
+_USER_DATA_FILE_ATTRS: tuple = (
+    "_LIBRARY_FILE",          # plasmid_library.json — the user's plasmids
+    "_COLLECTIONS_FILE",      # collections.json — collection definitions
+    "_PARTS_BIN_FILE",        # parts_bin.json — Golden Braid / MoClo parts
+    "_PRIMERS_FILE",          # primers.json — primer designs
+    "_FEATURES_FILE",         # features.json — feature library
+    "_FEATURE_COLORS_FILE",   # feature_colors.json — feature colours
+    "_GRAMMARS_FILE",         # cloning_grammars.json — custom grammars
+    "_ENTRY_VECTORS_FILE",    # entry_vectors.json — entry vectors
+    "_CODON_TABLES_FILE",     # codon_tables.json — codon usage tables
+    "_SETTINGS_FILE",         # settings.json — persisted user toggles
+)
+
+# User-data sub-directories — autosaved unsaved-edits + .dna sidecars.
+# Both are user-generated content the user might be relying on for recovery.
+_USER_DATA_DIR_ATTRS: tuple = (
+    "_CRASH_RECOVERY_DIR",   # autosaved .gb files for unsaved records
+    "_DNA_ORIGINALS_DIR",    # .dna sidecars (CommercialSaaS round-trip)
+    "_PLUGINS_DIR",          # reserved for future plugin storage (empty for now)
+)
+
+# Reserved field name for forward-compat plugin metadata on entries.
+# Any entry in any user-data file may carry an `_plugin_data` dict
+# whose keys are plugin names and whose values are arbitrary plugin
+# state (must be JSON-serialisable). Round-trip preservation is
+# enforced by `test_plugin_data_field_round_trip` in
+# tests/test_smoke.py — the existing deepcopy-on-read + write-as-is
+# loader pipeline already preserves unknown fields, but reserving
+# the name explicitly here means we won't accidentally introduce a
+# native field with the same name in a future schema.
+_RESERVED_ENTRY_FIELDS: tuple = (
+    "_plugin_data",
+)
+
+# Operational files: NOT user data. These are listed explicitly so that
+# the `test_every_data_file_constant_is_classified` audit catches any
+# new `_*_FILE` constant that a future contributor adds without
+# deciding which list it belongs in. If you add a new `_*_FILE` and
+# the audit fails, either:
+#   * append it to `_USER_DATA_FILE_ATTRS` (it carries data the user
+#     would lose if it were destroyed), OR
+#   * append it here (it's regenerated/transient — agent tokens,
+#     migration markers, ephemeral state).
+_OPERATIONAL_FILE_ATTRS: tuple = (
+    "_AGENT_TOKEN_FILE",      # ephemeral; regenerated each --agent-api launch
+    "_DATA_VERSION_FILE",     # last-touched-version stamp; tiny, regenerated
+)
+
+# How many pre-update snapshots to keep before pruning oldest. 5 covers
+# the realistic "I updated last week and now things look weird" window
+# while bounding worst-case disk usage to ~5× the user's library size.
+_PRE_UPDATE_SNAPSHOT_RETENTION = 5
+
+# Filenames inside each snapshot directory.
+_PRE_UPDATE_MANIFEST_NAME = "manifest.json"
+_PRE_UPDATE_STAGING_PREFIX = ".tmp-"
+
+# Snapshot manifest schema version. Bump this when the on-disk shape
+# changes incompatibly (e.g., a new required field). Restore code
+# refuses any manifest whose `schema_version` exceeds this — better
+# to surface a clear error than to risk a silent partial restore. A
+# manifest with a *lower* version still loads (additive fields are
+# read with `.get(...)` defaults).
+_PRE_UPDATE_SCHEMA_VERSION = 1
+
+# Anchored regex for snapshot directory names. Retention pruning uses
+# this so a maliciously symlinked or misconfigured `backup_dir` (e.g.
+# pointing at `/`, `~`, or a system path with bin/etc/home subdirs)
+# still cannot rmtree directories we did not create. The pattern
+# matches every name `_create_pre_update_snapshot` ever produces —
+# `<8-digit date>-<6-digit time>-<8-hex random>__from-<token>` plus
+# an optional `.<int>` collision-bump suffix.
+_PRE_UPDATE_NAME_RE = re.compile(
+    r"^\d{8}-\d{6}-[0-9a-f]{8}__from-[A-Za-z0-9._-]+(?:\.\d+)?$"
+)
+
+# Front-end binary → homepage URL, surfaced in the "tool not on PATH"
+# error message. Module-level (vs. inlined inside the function) so the
+# table is one source of truth and easy to audit at a glance.
+_MANAGER_HOMEPAGES = {
+    "pipx": "https://pipx.pypa.io",
+    "uv":   "https://docs.astral.sh/uv/",
+    "pixi": "https://pixi.sh",
+}
+
+
+def _fsync_path(path: Path) -> None:
+    """Best-effort fsync of a file or directory. Silently no-ops on
+    platforms / filesystems that can't fsync the target (Windows
+    refuses fsync on directories; some networked filesystems return
+    ENOSYS). Used by the pre-update snapshot writer so a power loss
+    between copy + os.replace can't leave a half-written manifest.
+
+    Mirrors the durability convention `_safe_save_json` follows for
+    JSON registry writes."""
+    try:
+        flag = os.O_RDONLY
+        # Some POSIX flavours need O_DIRECTORY for dir fsync; missing
+        # on Windows so we guard with getattr.
+        if path.is_dir():
+            flag |= getattr(os, "O_DIRECTORY", 0)
+        fd = os.open(str(path), flag)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except (OSError, AttributeError, ValueError):
+        # fsync is durability insurance; never let it crash a backup.
+        pass
+
+
+def _resolve_pre_update_backup_dir(data_dir: "Path | None" = None) -> Path:
+    """Where pre-update snapshots are stored. Sibling of `_DATA_DIR` by
+    default so a recursive wipe of `_DATA_DIR` doesn't take the
+    snapshots with it. Overridable via $SPLICECRAFT_UPDATE_BACKUP_DIR
+    (also honoured by tests so they never write to the user's real
+    home directory).
+
+    Hardened: resolves both inputs to canonical absolute paths so
+    relative `_DATA_DIR` values, trailing slashes, and intermediate
+    symlinks don't subtly change where snapshots land. Refuses paths
+    that already exist as a file (won't silently overwrite), or
+    derive into a filesystem root (parent.parent == parent) which
+    almost certainly indicates a misconfigured data dir.
+    """
+    override = os.environ.get("SPLICECRAFT_UPDATE_BACKUP_DIR", "").strip()
+    if override:
+        candidate = Path(override).expanduser()
+        # Resolve, but tolerate the common "doesn't exist yet" case —
+        # `Path.resolve()` is non-strict by default since 3.6.
+        candidate = candidate.resolve()
+        if candidate.exists() and not candidate.is_dir():
+            raise OSError(
+                f"$SPLICECRAFT_UPDATE_BACKUP_DIR points at a non-directory "
+                f"({candidate}). Set it to a writable directory path."
+            )
+        return candidate
+    base = (data_dir if data_dir is not None else _DATA_DIR).resolve()
+    parent = base.parent
+    # Defensive guard: refuse to write a snapshot into a filesystem
+    # root or any path where the parent is the same as the path
+    # itself. `parent.parent == parent` is the cross-platform "is
+    # filesystem root" check (covers `/`, `C:\`, network shares).
+    if parent == base or parent.parent == parent:
+        raise OSError(
+            f"Refusing to derive a backup location next to {base!r} — "
+            "set $SPLICECRAFT_UPDATE_BACKUP_DIR to a writable directory."
+        )
+    candidate = parent / f"{base.name}-update-backups"
+    if candidate.exists() and not candidate.is_dir():
+        raise OSError(
+            f"Default backup location {candidate} is not a directory. "
+            "Set $SPLICECRAFT_UPDATE_BACKUP_DIR to override."
+        )
+    return candidate
+
+
+def _data_dir_inside_install_path() -> bool:
+    """True if `_DATA_DIR` is somewhere underneath the install path
+    (so a pip/pipx/uv/pixi reinstall would also wipe the user's
+    library). Detects the only realistic path that defeats every
+    other safeguard. Returns False if either path can't be resolved
+    (no false positives)."""
+    try:
+        data = _DATA_DIR.resolve()
+        mod = Path(__file__).resolve().parent
+    except (OSError, ValueError, NameError):
+        return False
+    if data == mod:
+        return True
+    return mod in data.parents
+
+
+def _iter_user_data_paths() -> "list[tuple[str, str, Path, str]]":
+    """Yield `(attr_name, kind, path, name)` for every user-data file
+    or directory that currently exists on disk.
+
+    `kind` is `"file"` or `"dir"`. `name` is the basename used inside
+    the snapshot. Reads the live module attribute each call so the
+    autouse `_protect_user_data` test fixture's monkeypatched paths
+    are picked up correctly.
+    """
+    out: list[tuple[str, str, Path, str]] = []
+    for attr in _USER_DATA_FILE_ATTRS:
+        p = globals().get(attr)
+        if isinstance(p, Path) and p.is_file():
+            out.append((attr, "file", p, p.name))
+    for attr in _USER_DATA_DIR_ATTRS:
+        p = globals().get(attr)
+        if isinstance(p, Path) and p.is_dir():
+            out.append((attr, "dir", p, p.name))
+    return out
+
+
+def _sha256_file(path: Path) -> str:
+    """SHA-256 of a file, computed in 64 KB chunks. Used in the
+    manifest so a partial / truncated copy in a snapshot can be
+    detected at restore time."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(64 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _safe_snapshot_token(s: str, max_len: int = 32) -> str:
+    """Sanitise a string for use inside a snapshot directory name.
+    Strips path separators, leading dots, and anything outside a
+    conservative ASCII set so the resulting filename is portable
+    across Linux/Mac/Windows."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", s)
+    cleaned = cleaned.lstrip(".") or "x"
+    return cleaned[:max_len]
+
+
+def _enforce_pre_update_retention(backup_dir: Path,
+                                    keep: int = _PRE_UPDATE_SNAPSHOT_RETENTION
+                                    ) -> None:
+    """Prune oldest snapshots in `backup_dir` so at most `keep`
+    remain. Best-effort: a failed delete is logged but never raised
+    (the snapshot we just took is more important than reaping old
+    ones).
+
+    SAFETY: rmtree is restricted to subdirectories whose names match
+    the strict regex `_PRE_UPDATE_NAME_RE`. Without that filter, a
+    misconfigured (or symlinked) `backup_dir` pointing at `/` or `~`
+    could match `bin`/`etc`/`home`/etc. against the previous loose
+    `not name.startswith(staging-prefix)` check — and rmtree the
+    user's entire system. The regex names cannot occur anywhere
+    except in directories `_create_pre_update_snapshot` itself
+    produced. This is enforced by
+    `test_retention_only_rmtrees_snapshot_named_dirs`.
+
+    A symlinked backup_dir is also refused outright: if the user (or
+    an attacker) replaces the backup location with a symlink, we
+    don't follow it for cleanup purposes.
+    """
+    if keep < 0:
+        keep = 0
+    try:
+        if not backup_dir.is_dir():
+            return
+        # Refuse to walk into a symlinked backup_dir. `is_symlink`
+        # works on POSIX + Windows (NTFS junctions read as symlinks).
+        if backup_dir.is_symlink():
+            _log.warning(
+                "Refusing retention sweep: %s is a symlink", backup_dir
+            )
+            return
+        # Resolve to canonical path and re-check it isn't a system
+        # root. Belt + suspenders against `SPLICECRAFT_UPDATE_BACKUP_DIR=/`.
+        resolved = backup_dir.resolve()
+        if resolved.parent == resolved:
+            _log.warning(
+                "Refusing retention sweep: %s resolves to a filesystem root",
+                backup_dir,
+            )
+            return
+        snaps = []
+        for p in backup_dir.iterdir():
+            if not p.is_dir():
+                continue
+            if p.is_symlink():
+                # Don't follow symlinks during cleanup either.
+                continue
+            if not _PRE_UPDATE_NAME_RE.match(p.name):
+                # Foreign directory — not one of ours. Leave alone.
+                continue
+            try:
+                snaps.append((p.stat().st_mtime, p))
+            except OSError:
+                continue
+        snaps.sort(reverse=True)  # newest first
+        for _, old in snaps[keep:]:
+            try:
+                shutil.rmtree(old, ignore_errors=False)
+            except OSError as exc:
+                _log.warning("Could not prune old snapshot %s: %s", old, exc)
+    except OSError as exc:
+        _log.warning("Pre-update retention sweep failed: %s", exc)
+
+
+def _create_pre_update_snapshot(version_from: str,
+                                 *,
+                                 backup_dir: "Path | None" = None,
+                                 retention: int = _PRE_UPDATE_SNAPSHOT_RETENTION,
+                                 ) -> Path:
+    """Atomically snapshot every user-data file + directory into a
+    fresh subdirectory of `backup_dir`. Returns the path to the
+    completed snapshot. Raises `OSError` (or a subclass) if anything
+    goes wrong — callers MUST treat that as "abort the upgrade".
+
+    Atomicity: copying happens under a hidden staging directory on
+    the same filesystem. The staging directory is renamed to its
+    final name (`os.replace`) only after every file copy and the
+    manifest write succeed. A partially-written staging directory is
+    cleaned up before re-raising. The temp-dir + atomic-rename pattern
+    mirrors `_safe_save_json`.
+
+    The snapshot lives OUTSIDE `_DATA_DIR` (default sibling) so a
+    bug in a new version that recursively wipes `_DATA_DIR` cannot
+    destroy the recovery copy.
+    """
+    import datetime as _dt
+    import secrets as _secrets
+
+    if backup_dir is None:
+        backup_dir = _resolve_pre_update_backup_dir()
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    # Hardened: refuse to write into a symlinked backup_dir. Combined
+    # with the symlink-aware retention sweep, this means even a
+    # malicious environment variable can't trick us into writing to —
+    # or later deleting from — a system path.
+    if backup_dir.is_symlink():
+        raise OSError(
+            f"Refusing to use {backup_dir} as backup location: "
+            "the path is a symlink."
+        )
+
+    ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    rand = _secrets.token_hex(4)
+    safe_ver = _safe_snapshot_token(version_from)
+    staging = backup_dir / f"{_PRE_UPDATE_STAGING_PREFIX}{ts}-{rand}"
+    final_name = f"{ts}-{rand}__from-{safe_ver}"
+    final_path = backup_dir / final_name
+    # Even with random hex, defensively bump the suffix if the final
+    # name already exists (would only happen on a clock-rewind + hash
+    # collision, but cheap insurance).
+    bump = 0
+    while final_path.exists():
+        bump += 1
+        final_path = backup_dir / f"{final_name}.{bump}"
+
+    try:
+        staging.mkdir(parents=True, exist_ok=False)
+        sources = _iter_user_data_paths()
+        manifest: dict = {
+            "schema_version": _PRE_UPDATE_SCHEMA_VERSION,
+            "from_version": version_from,
+            "timestamp": ts,
+            "data_dir": str(_DATA_DIR),
+            # Capture the runtime Python + platform that wrote the
+            # snapshot. Restore-time consumers (and `--list-snapshots`
+            # display) use this to flag cross-platform / cross-Python
+            # restores that may have unexpected side-effects (e.g.
+            # binary-pickle state we may add later won't survive a
+            # 3.10 → 3.14 jump). Additive — older readers ignore via
+            # `.get(...)` defaults so this stays back-compatible.
+            #
+            # `_RUNTIME_PLATFORM` is computed once at module import so
+            # we don't re-call `platform.platform()` every snapshot —
+            # on some OSes that helper shells out via `subprocess`,
+            # which conflicts with tests that monkeypatch `subprocess.run`
+            # to capture the upgrade command.
+            "from_python_version": "{}.{}.{}".format(
+                sys.version_info[0], sys.version_info[1], sys.version_info[2]
+            ),
+            "from_platform": _RUNTIME_PLATFORM,
+            "files": [],
+            "directories": [],
+        }
+        for attr, kind, src, name in sources:
+            dst = staging / name
+            if kind == "file":
+                shutil.copy2(src, dst)
+                # Durability: fsync the copy before the atomic
+                # rename so a power loss between copy and replace
+                # can't leave a half-written file with a manifest
+                # that claims it's complete. Mirrors `_safe_save_json`.
+                _fsync_path(dst)
+                # Hash the destination (post-copy) so a silent corrupt
+                # would be visible in the manifest.
+                manifest["files"].append({
+                    "attr": attr,
+                    "name": name,
+                    "size": dst.stat().st_size,
+                    "sha256": _sha256_file(dst),
+                })
+            else:  # kind == "dir"
+                shutil.copytree(src, dst)
+                # Best-effort fsync of every file inside the copied
+                # tree. We don't error out if a single file can't be
+                # fsynced (read-only mounts, network FS quirks).
+                try:
+                    for f in dst.rglob("*"):
+                        if f.is_file():
+                            _fsync_path(f)
+                except OSError:
+                    pass
+                # Counting + size for directories is informational only;
+                # restoring uses the directory tree as-is.
+                file_count = sum(1 for _ in dst.rglob("*") if _.is_file())
+                manifest["directories"].append({
+                    "attr": attr,
+                    "name": name,
+                    "file_count": file_count,
+                })
+        # Manifest goes in last so its presence is itself a "snapshot
+        # is complete" marker. Restore code refuses to operate on a
+        # snapshot dir without a manifest. Fsync it so the manifest's
+        # existence is durable before the directory rename below.
+        manifest_path = staging / _PRE_UPDATE_MANIFEST_NAME
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2),
+            encoding="utf-8",
+        )
+        _fsync_path(manifest_path)
+        # Fsync the staging directory so the new entries (manifest +
+        # copies) are durable in the directory's metadata before we
+        # rename it to its final visible name. POSIX-only; the helper
+        # silently no-ops on Windows.
+        _fsync_path(staging)
+        # Atomic rename — single filesystem op on POSIX, transactional
+        # MoveFileEx on Windows. After this point the snapshot is
+        # visible at its final name; before it, only `.tmp-...` exists.
+        os.replace(staging, final_path)
+        # Fsync the parent so the rename itself is durable.
+        _fsync_path(backup_dir)
+    except (OSError, shutil.Error):
+        # Best-effort cleanup of the partial staging dir.
+        try:
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+        except OSError:
+            pass
+        raise
+
+    # Retention: prune oldest snapshots beyond N. Best-effort — never
+    # let a retention failure invalidate the snapshot we just took.
+    _enforce_pre_update_retention(backup_dir, keep=retention)
+    return final_path
+
+
+def _list_pre_update_snapshots(backup_dir: "Path | None" = None
+                                ) -> "list[dict]":
+    """Return a list of snapshot summaries, newest first. Each entry:
+        {id, path, mtime, from_version, n_files, n_dirs, total_size}
+    `id` is the directory's basename (what the user passes to
+    --restore-pre-update). Snapshots without a manifest are skipped
+    (those are partially-written or hand-corrupted)."""
+    if backup_dir is None:
+        try:
+            backup_dir = _resolve_pre_update_backup_dir()
+        except OSError:
+            return []
+    if not backup_dir.is_dir():
+        return []
+    out: list[dict] = []
+    for p in backup_dir.iterdir():
+        if not p.is_dir():
+            continue
+        if p.name.startswith(_PRE_UPDATE_STAGING_PREFIX):
+            continue
+        manifest = p / _PRE_UPDATE_MANIFEST_NAME
+        if not manifest.is_file():
+            continue
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue
+        total = 0
+        try:
+            for f in p.rglob("*"):
+                if f.is_file():
+                    total += f.stat().st_size
+        except OSError:
+            pass
+        out.append({
+            "id": p.name,
+            "path": p,
+            "mtime": mtime,
+            "from_version": data.get("from_version", "?"),
+            # Newer fields — older snapshots return defaults so the
+            # listing stays backward-compatible.
+            "from_python_version": data.get("from_python_version", "?"),
+            "from_platform": data.get("from_platform", "?"),
+            "schema_version": data.get("schema_version", 1),
+            "n_files": len(data.get("files", [])) if isinstance(data.get("files"), list) else 0,
+            "n_dirs": len(data.get("directories", [])) if isinstance(data.get("directories"), list) else 0,
+            "total_size": total,
+        })
+    out.sort(key=lambda e: e["mtime"], reverse=True)
+    return out
+
+
+def _validate_snapshot_member(snap_path: Path, name: str) -> "Path | None":
+    """Return the absolute path of a manifest-named snapshot member,
+    or None if the name would escape the snapshot directory (path
+    traversal) or contain a separator. Pure validation — never
+    touches the filesystem.
+
+    A manifest is JSON, and JSON is plaintext: anyone with write
+    access to the backup directory could craft `name: "../../foo"`
+    to read or overwrite arbitrary files. This guard reduces every
+    `name` to a single basename and verifies the resolved path is
+    still under the snapshot directory.
+    """
+    if not isinstance(name, str) or not name:
+        return None
+    # Reject anything that smells like a path component vs. a basename.
+    if "/" in name or "\\" in name or name in (".", ".."):
+        return None
+    candidate = (snap_path / name).resolve()
+    snap_resolved = snap_path.resolve()
+    try:
+        # Python 3.9+ has Path.is_relative_to. We're on 3.10+ per
+        # pyproject; safe to use directly.
+        if not candidate.is_relative_to(snap_resolved):
+            return None
+    except (AttributeError, ValueError):
+        return None
+    return candidate
+
+
+def _restore_pre_update_snapshot(snap_id_or_path: "str | Path",
+                                  *,
+                                  backup_dir: "Path | None" = None,
+                                  ) -> dict:
+    """Restore a pre-update snapshot. Each canonical JSON is replaced
+    via the temp-file + os.replace pattern (same as `_safe_save_json`).
+    Sub-directories are restored by atomically renaming the current
+    directory aside, copying the snapshot in, then removing the
+    stash. A pre-restore snapshot is taken first so the user can
+    undo a bad restore.
+
+    Hardening (sacred — do not relax without a corresponding test):
+      * `schema_version` must be ≤ `_PRE_UPDATE_SCHEMA_VERSION`. A
+        higher version means the snapshot was written by a newer
+        SpliceCraft we don't know how to read; refuse rather than
+        silently restore an unfamiliar shape.
+      * Each `attr` in the manifest must be in `_USER_DATA_FILE_ATTRS`
+        or `_USER_DATA_DIR_ATTRS`. A tampered manifest cannot target
+        arbitrary `_*_FILE` attributes (e.g. agent token, install
+        marker) for overwrite.
+      * Each `name` must be basename-only and resolve under the
+        snapshot directory. Blocks path-traversal reads.
+      * Each file's SHA-256 (per the manifest) is recomputed on the
+        copy BEFORE the atomic os.replace overwrites the user's
+        current file. A bit-rotted snapshot cannot silently corrupt
+        good live data.
+      * Directory restore rolls back fully on partial copytree:
+        delete the partial target, then rename stash back.
+
+    Returns a summary dict:
+        {pre_restore_snapshot, restored_files, restored_dirs,
+         failed: [(name, reason), ...]}
+    Raises FileNotFoundError if the snapshot id doesn't exist.
+    Raises ValueError on unsupported schema version.
+    """
+    if backup_dir is None:
+        backup_dir = _resolve_pre_update_backup_dir()
+    if isinstance(snap_id_or_path, Path):
+        snap_path = snap_id_or_path
+    else:
+        # Allow either a bare snapshot id (basename) or 'latest'.
+        snap_id = str(snap_id_or_path).strip()
+        if snap_id.lower() == "latest":
+            snaps = _list_pre_update_snapshots(backup_dir)
+            if not snaps:
+                raise FileNotFoundError(
+                    f"No pre-update snapshots in {backup_dir}"
+                )
+            snap_path = snaps[0]["path"]
+        else:
+            snap_path = backup_dir / snap_id
+    if not snap_path.is_dir():
+        raise FileNotFoundError(f"snapshot not found: {snap_path}")
+    manifest_path = snap_path / _PRE_UPDATE_MANIFEST_NAME
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"snapshot is incomplete (no manifest): {snap_path}"
+        )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError(f"manifest is not a JSON object: {manifest_path}")
+
+    # Schema-version negotiation: forward-compat refuses anything
+    # newer than we understand (would require migration logic we
+    # don't yet have). Older schemas load with `.get(...)` defaults.
+    snap_schema = manifest.get("schema_version", 1)
+    try:
+        snap_schema_int = int(snap_schema)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"manifest schema_version is not an int: {snap_schema!r}"
+        )
+    if snap_schema_int > _PRE_UPDATE_SCHEMA_VERSION:
+        raise ValueError(
+            f"snapshot {snap_path.name} was created by a newer SpliceCraft "
+            f"(manifest schema_version={snap_schema_int}, this build supports "
+            f"≤{_PRE_UPDATE_SCHEMA_VERSION}). Upgrade SpliceCraft and retry, "
+            "or use the matching version to restore."
+        )
+
+    # Whitelists: the manifest CANNOT name an attribute or path
+    # outside our published user-data set. Tamper-resistance.
+    file_attrs = set(_USER_DATA_FILE_ATTRS)
+    dir_attrs = set(_USER_DATA_DIR_ATTRS)
+
+    # Pre-restore snapshot — gives the user one click of undo if the
+    # restored data turns out to be older than what they had.
+    pre_restore = _create_pre_update_snapshot(
+        f"{__version__}-pre-restore",
+        backup_dir=backup_dir,
+    )
+
+    summary: dict = {
+        "pre_restore_snapshot": str(pre_restore),
+        "restored_files": [],
+        "restored_dirs": [],
+        "failed": [],
+    }
+
+    files_list = manifest.get("files")
+    if not isinstance(files_list, list):
+        files_list = []
+    for entry in files_list:
+        if not isinstance(entry, dict):
+            continue
+        attr = entry.get("attr", "")
+        name = entry.get("name", "")
+        # Hardening #1: attr must be in the published user-data set.
+        if attr not in file_attrs:
+            summary["failed"].append(
+                (name or "(no name)",
+                 f"manifest attr {attr!r} is not a recognised user-data file")
+            )
+            continue
+        # Hardening #2: name must be a safe basename inside snap_path.
+        src = _validate_snapshot_member(snap_path, name)
+        if src is None or not src.is_file():
+            summary["failed"].append(
+                (name, "snapshot member name is invalid or src absent")
+            )
+            continue
+        target = globals().get(attr)
+        if not isinstance(target, Path):
+            # Production code never has this happen (attrs are module
+            # constants), but defending anyway: skip the entry rather
+            # than write to whatever non-Path object happens to live
+            # at that name in globals().
+            summary["failed"].append(
+                (name, f"runtime attr {attr!r} is not a Path")
+            )
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_name(target.name + ".restoring")
+            shutil.copy2(src, tmp)
+            _fsync_path(tmp)
+            # Hardening #3: verify SHA-256 against the manifest BEFORE
+            # the atomic overwrite of the live file. A bit-rotted /
+            # tampered snapshot cannot silently corrupt good live data.
+            expected = entry.get("sha256")
+            if isinstance(expected, str) and expected:
+                actual = _sha256_file(tmp)
+                if actual != expected:
+                    # Discard the staged copy and skip the rename. The
+                    # user's live file remains intact.
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
+                    summary["failed"].append(
+                        (name,
+                         f"sha256 mismatch (snapshot corrupted): "
+                         f"expected {expected[:16]}…, got {actual[:16]}…")
+                    )
+                    continue
+            os.replace(tmp, target)
+            _fsync_path(target.parent)
+            summary["restored_files"].append(name)
+        except (OSError, shutil.Error) as exc:
+            # Best-effort: clean up any half-written staging file.
+            try:
+                if 'tmp' in locals() and tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            summary["failed"].append((name, str(exc)))
+
+    dirs_list = manifest.get("directories")
+    if not isinstance(dirs_list, list):
+        dirs_list = []
+    for entry in dirs_list:
+        if not isinstance(entry, dict):
+            continue
+        attr = entry.get("attr", "")
+        name = entry.get("name", "")
+        if attr not in dir_attrs:
+            summary["failed"].append(
+                (name or "(no name)",
+                 f"manifest attr {attr!r} is not a recognised user-data dir")
+            )
+            continue
+        src = _validate_snapshot_member(snap_path, name)
+        if src is None or not src.is_dir():
+            summary["failed"].append(
+                (name, "snapshot member name is invalid or src absent")
+            )
+            continue
+        target = globals().get(attr)
+        if not isinstance(target, Path):
+            summary["failed"].append(
+                (name, f"runtime attr {attr!r} is not a Path")
+            )
+            continue
+        stash = target.with_name(target.name + ".restoring-old")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if stash.exists():
+                shutil.rmtree(stash, ignore_errors=True)
+            if target.exists():
+                os.rename(target, stash)
+            shutil.copytree(src, target)
+            if stash.exists():
+                shutil.rmtree(stash, ignore_errors=True)
+            summary["restored_dirs"].append(name)
+        except (OSError, shutil.Error) as exc:
+            # Hardening #4: rollback handles the partial-copytree
+            # case. Previous logic only rolled back if `not target.
+            # exists()` — but copytree often creates `target` first
+            # and then fails partway through, leaving a partial dir.
+            # Now: always rmtree the partial target, then move stash
+            # back. The `try` around `os.rename(stash, target)` is
+            # belt-and-suspenders since the previous `shutil.rmtree`
+            # would have raised if it couldn't clean up.
+            try:
+                if target.exists():
+                    shutil.rmtree(target, ignore_errors=True)
+                if stash.exists():
+                    os.rename(stash, target)
+            except OSError:
+                pass
+            summary["failed"].append((name, str(exc)))
+
+    return summary
+
+
+_UPDATE_HELP_TEXT = (
+    "splicecraft update — upgrade SpliceCraft to the latest PyPI release\n"
+    "\n"
+    "Usage:\n"
+    "  splicecraft update [--check|--dry-run] [--force] [--yes|-y] [--help|-h]\n"
+    "  splicecraft update --list-snapshots\n"
+    "  splicecraft update --restore-pre-update [ID|latest]\n"
+    "\n"
+    "  --check                Report status only; don't install or snapshot.\n"
+    "  --dry-run              Detect, fetch PyPI, take the safety snapshot,\n"
+    "                         and print the install command — but DON'T run\n"
+    "                         pip/pipx/uv/pixi. Useful for CI verification.\n"
+    "  --force                Reinstall even if the local version matches PyPI.\n"
+    "  --yes,-y               Skip the confirmation prompt before installing.\n"
+    "  --list-snapshots       List recoverable pre-update snapshots and exit.\n"
+    "  --restore-pre-update   Restore the user library/collections/parts/primers\n"
+    "                         from a pre-update snapshot. With no ID, lists\n"
+    "                         available snapshots; with `latest`, restores the\n"
+    "                         most recent.\n"
+    "  --help,-h              Show this help.\n"
+    "\n"
+    "Environment overrides (advanced):\n"
+    "  SPLICECRAFT_PYPI_URL          override PyPI metadata endpoint (http(s)://)\n"
+    "  SPLICECRAFT_UPDATE_BACKUP_DIR override pre-update snapshot location\n"
+    "\n"
+    "Auto-detects how SpliceCraft was installed and runs the matching\n"
+    "upgrade command:\n"
+    "  pipx          → pipx upgrade splicecraft\n"
+    "  uv tool       → uv tool upgrade splicecraft\n"
+    "  uv venv       → uv pip install --upgrade splicecraft\n"
+    "  pixi global   → pixi global update splicecraft\n"
+    "  pip --user    → pip install --user --upgrade splicecraft\n"
+    "  pip venv      → pip install --upgrade splicecraft\n"
+    "  pip system    → printed only (run with sudo yourself)\n"
+    "  editable      → refused — git pull from the source tree\n"
+    "  git clone     → refused — git pull from the source tree\n"
+    "  pixi project  → refused — run `pixi update splicecraft` from\n"
+    "                  the project root\n"
+    "\n"
+    "Data safety: every install runs a complete, atomic snapshot of your\n"
+    "library, collections, parts bin, primers, feature library, custom\n"
+    "grammars, codon tables, settings, crash-recovery autosaves, and .dna\n"
+    "sidecars BEFORE invoking pip/pipx/uv/pixi. If the snapshot can't be\n"
+    "made, the upgrade aborts. Snapshots live next to your data directory\n"
+    "(default: <data_dir>-update-backups/) and survive a recursive wipe of\n"
+    "the data dir itself. Use --restore-pre-update to recover.\n"
+)
+
+
+def _confirm_proceed(prompt: str = "Proceed? [y/N] ") -> bool:
+    """Return True iff the user typed an affirmative answer.
+    Defaults to False on empty input, EOF, or Ctrl+C — never run a
+    destructive action without explicit consent."""
+    try:
+        answer = input(prompt).strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print("", flush=True)  # newline so terminal prompt isn't stuck on the input line
+        return False
+    return answer in ("y", "yes")
+
+
+def _format_pre_update_snapshot_table(snaps: "list[dict]") -> str:
+    """Render `_list_pre_update_snapshots()` output as a human-readable
+    table for printing to the terminal. Returns the empty string for
+    no snapshots so the caller can compose its own "no snapshots
+    found" message."""
+    import datetime as _dt
+    if not snaps:
+        return ""
+    lines = ["    Snapshot ID                                 From       Files  Dirs   Size",
+             "    " + "─" * 80]
+    for s in snaps:
+        when = _dt.datetime.fromtimestamp(s["mtime"]).strftime("%Y-%m-%d %H:%M")
+        size_kb = s["total_size"] / 1024.0
+        if size_kb < 1024:
+            size_str = f"{size_kb:7.1f} KB"
+        else:
+            size_str = f"{size_kb / 1024.0:7.1f} MB"
+        # Truncate long ids only in display; they remain copy-pasteable
+        # because we print the full id below the table.
+        sid_disp = s["id"] if len(s["id"]) <= 44 else s["id"][:41] + "…"
+        lines.append(
+            f"    {sid_disp:<44} {s['from_version']:<10} "
+            f"{s['n_files']:>4}  {s['n_dirs']:>4}  {size_str:>10}    "
+            f"({when})"
+        )
+    return "\n".join(lines)
+
+
+def _run_update_subcommand(argv: "list[str]") -> int:
+    """Entry point for `splicecraft update`. Returns a shell exit
+    code. Never raises — every failure path is converted to a printed
+    message + numeric exit code."""
+    # Parse flags. Accept either order; reject unknown flags loudly so
+    # typos don't silently no-op.
+    check_only = False
+    force = False
+    assume_yes = False
+    list_snapshots = False
+    restore_mode = False
+    restore_id: str | None = None
+    dry_run = False
+
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--check":
+            check_only = True
+            i += 1
+        elif a == "--force":
+            force = True
+            i += 1
+        elif a in ("--yes", "-y"):
+            assume_yes = True
+            i += 1
+        elif a == "--list-snapshots":
+            list_snapshots = True
+            i += 1
+        elif a == "--dry-run":
+            dry_run = True
+            i += 1
+        elif a == "--restore-pre-update":
+            restore_mode = True
+            # Optional next arg as ID (must not start with `-`).
+            if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                restore_id = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+        elif a.startswith("--restore-pre-update="):
+            restore_mode = True
+            restore_id = a.split("=", 1)[1] or None
+            i += 1
+        elif a in ("--help", "-h"):
+            print(_UPDATE_HELP_TEXT)
+            return 0
+        else:
+            print(
+                f"splicecraft update: unknown argument {a!r}.  "
+                "Run `splicecraft update --help` for usage.",
+                file=sys.stderr,
+            )
+            return 2
+
+    # `--check` and `--dry-run` are mutually exclusive: `--check` skips
+    # the snapshot (read-only); `--dry-run` exercises everything up to
+    # but not including the install. Allowing both would be ambiguous.
+    if check_only and dry_run:
+        print(
+            "splicecraft update: --check and --dry-run are mutually "
+            "exclusive. --check is read-only; --dry-run exercises the "
+            "snapshot pipeline without installing.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # ── Listing / restore early-exit branches (no PyPI fetch needed) ──
+    if list_snapshots:
+        try:
+            backup_dir = _resolve_pre_update_backup_dir()
+        except OSError as exc:
+            print(f"Could not resolve backup directory: {exc}",
+                  file=sys.stderr)
+            return 1
+        snaps = _list_pre_update_snapshots(backup_dir)
+        if not snaps:
+            print(
+                f"No pre-update snapshots in {backup_dir}.\n"
+                "Snapshots are taken automatically before each "
+                "`splicecraft update` install.")
+            return 0
+        print(f"Pre-update snapshots in {backup_dir}:")
+        print(_format_pre_update_snapshot_table(snaps))
+        return 0
+
+    if restore_mode:
+        try:
+            backup_dir = _resolve_pre_update_backup_dir()
+        except OSError as exc:
+            print(f"Could not resolve backup directory: {exc}",
+                  file=sys.stderr)
+            return 1
+        snaps = _list_pre_update_snapshots(backup_dir)
+        if not snaps:
+            print(
+                f"No pre-update snapshots in {backup_dir}.\n"
+                "Nothing to restore.",
+                file=sys.stderr)
+            return 1
+        if restore_id is None:
+            # No ID — print the listing so the user can copy-paste one.
+            print(
+                "No snapshot id given. Pick one and re-run with\n"
+                "  splicecraft update --restore-pre-update <id>\n"
+                "(or pass `latest` to restore the most recent):\n")
+            print(_format_pre_update_snapshot_table(snaps))
+            return 0
+        # Resolve "latest" or the literal id.
+        if restore_id.lower() == "latest":
+            chosen = snaps[0]["path"]
+        else:
+            chosen_path = backup_dir / restore_id
+            if not chosen_path.is_dir():
+                print(
+                    f"Snapshot not found: {restore_id!r}\n"
+                    f"Searched: {backup_dir}\n"
+                    "Run `splicecraft update --list-snapshots` "
+                    "to see available ids.",
+                    file=sys.stderr)
+                return 1
+            chosen = chosen_path
+        print(
+            f"About to restore snapshot:\n"
+            f"  {chosen.name}\n"
+            f"This will OVERWRITE the current contents of:\n"
+            f"  library, collections, parts bin, primers, features,\n"
+            f"  feature colors, grammars, entry vectors, codon tables,\n"
+            f"  settings, crash-recovery autosaves, .dna sidecars\n"
+            "A pre-restore snapshot will be taken first so the restore "
+            "is reversible."
+        )
+        if not assume_yes and not _confirm_proceed("Proceed with restore? [y/N] "):
+            print("Cancelled.", file=sys.stderr)
+            return 130
+        try:
+            summary = _restore_pre_update_snapshot(
+                chosen, backup_dir=backup_dir
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            _log.exception("restore-pre-update: failed")
+            print(f"Restore failed: {exc}", file=sys.stderr)
+            return 1
+        print(f"\nRestore complete.")
+        print(f"  Pre-restore snapshot: {summary['pre_restore_snapshot']}")
+        print(f"  Files restored:  {len(summary['restored_files'])}  "
+              f"({', '.join(summary['restored_files']) or '(none)'})")
+        print(f"  Dirs restored:   {len(summary['restored_dirs'])}  "
+              f"({', '.join(summary['restored_dirs']) or '(none)'})")
+        if summary["failed"]:
+            print(f"  Failed entries: {len(summary['failed'])}",
+                  file=sys.stderr)
+            for name, reason in summary["failed"]:
+                print(f"    - {name}: {reason}", file=sys.stderr)
+            return 1
+        return 0
+
+    print(f"SpliceCraft {__version__} — checking for updates…", flush=True)
+    info = _detect_install_method()
+    method = info["method"]
+
+    # Hit PyPI for the latest released version. `_fetch_latest_pypi_version`
+    # is already timeout-bounded (3 s) and size-capped, so this can't hang
+    # the terminal. Returns None on any failure (network, parse, cap).
+    latest = _fetch_latest_pypi_version()
+    if latest is None:
+        print(
+            "Could not reach PyPI to check the latest version.\n"
+            "  • Check your network connection.\n"
+            "  • Try again in a moment (PyPI's CDN may be slow).\n"
+            f"You are currently on splicecraft {__version__}.",
+            file=sys.stderr,
+        )
+        # Surface install method so the user can fall back to manual upgrade.
+        if method != "unknown":
+            print(f"Install method: {method} ({info['details']})", file=sys.stderr)
+        return 1
+
+    is_newer = _is_newer_pypi_version(latest, __version__)
+    same_version = (latest.strip() == __version__.strip())
+    print(f"  Local : {__version__}")
+    print(f"  PyPI  : {latest}")
+    print(f"  Method: {method}  ({info['details']})")
+
+    # No upgrade needed and not forcing.
+    if not is_newer and not force:
+        if same_version:
+            print("You're on the latest released version. Nothing to do.")
+        else:
+            # Local is newer than PyPI (e.g. dev build, pre-release, or
+            # PyPI returned a non-canonical string we can't compare).
+            # Don't auto-downgrade.
+            print(
+                "Your local version doesn't appear to be older than PyPI's. "
+                "Nothing to do.\n"
+                "Pass --force to reinstall anyway."
+            )
+        return 0
+
+    # Editable / source-clone refusal — respect the user's working tree.
+    if method in ("editable", "source"):
+        target = info.get("git_clone") or info.get("module") or "(unknown)"
+        print(
+            f"\nThis SpliceCraft is a {method} install at {target}.\n"
+            "Refusing to overwrite a developer install with a PyPI build.\n"
+            "Update it from the source tree instead:\n"
+            f"  cd {target}\n"
+            "  git pull",
+            file=sys.stderr,
+        )
+        return 1
+
+    # pixi-project refusal — the project's pixi manifest is the source
+    # of truth for which version is pinned, so a PyPI build would
+    # silently desynchronise the lockfile. Tell the user to run pixi's
+    # own update from the project root instead.
+    if method == "pixi-project":
+        target = info.get("git_clone") or info.get("module") or "(unknown)"
+        print(
+            f"\nThis SpliceCraft is in a pixi-managed project env at {target}.\n"
+            "Refusing to bypass the project manifest with a direct PyPI install.\n"
+            "Update the project's pinned version instead:\n"
+            f"  cd {target}\n"
+            "  pixi update splicecraft",
+            file=sys.stderr,
+        )
+        return 1
+
+    cmd = _build_upgrade_command(method, force=force)
+    if cmd is None:
+        # _build_upgrade_command only returns None for editable/source,
+        # which we already handled above; this branch is defensive.
+        print(
+            f"Don't know how to upgrade a {method!r} install automatically.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # System-wide pip — print, don't run. sudo from inside an app is a
+    # support nightmare (TTY state, password caching, $PATH for sudo).
+    if method == "pip-system":
+        print(
+            "\nThis is a system-wide install. Run the upgrade yourself:\n"
+            f"  sudo {' '.join(cmd)}\n"
+            "Or migrate to an isolated user-level install via:\n"
+            "  python3 -m pip install --user pipx && pipx install splicecraft\n"
+            "  uv tool install splicecraft     "
+            "(https://docs.astral.sh/uv/)\n"
+            "  pixi global install splicecraft "
+            "(https://pixi.sh)",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Front-end binary not on PATH — common when the user installed
+    # the package manager (pipx / uv / pixi) into a different shell or
+    # forgot to source their shell rc. Refuse to run, but print the
+    # exact command they'd need to execute themselves. Homepage table
+    # lives at module level so it's a single source of truth.
+    front_end = cmd[0]
+    needs_external = method in (
+        "pipx", "uv-tool", "uv-venv", "pixi-global"
+    )
+    if needs_external and shutil.which(front_end) is None:
+        homepage = _MANAGER_HOMEPAGES.get(front_end, "")
+        suffix = f"\nOr reinstall {front_end} ({homepage})." if homepage else ""
+        print(
+            f"\nDetected a {method} install, but `{front_end}` isn't on PATH.\n"
+            f"Open a shell where {front_end} is available and run:\n"
+            f"  {' '.join(cmd)}"
+            f"{suffix}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if check_only:
+        print("\nUpdate available." if is_newer else "\nForce flag set.")
+        print("To upgrade, run:")
+        print(f"  {' '.join(cmd)}")
+        print("Or simply:  splicecraft update")
+        return 0
+
+    # Defence-in-depth: if `_DATA_DIR` is *inside* the install path
+    # (e.g. user pointed $SPLICECRAFT_DATA_DIR at site-packages), an
+    # upgrade would wipe the user's library along with the package.
+    # Refuse to proceed before we even take the snapshot — the
+    # snapshot lives next to `_DATA_DIR` and would be on the chopping
+    # block too. The user has to move their data dir first.
+    if _data_dir_inside_install_path():
+        print(
+            f"\nUNSAFE CONFIGURATION: your data directory ({_DATA_DIR}) "
+            f"is inside the SpliceCraft install path. An upgrade would "
+            "destroy your library, collections, parts bin, and primers.\n"
+            "Refusing to proceed.\n"
+            "Move your data elsewhere and re-point $SPLICECRAFT_DATA_DIR:\n"
+            "  export SPLICECRAFT_DATA_DIR=$HOME/.local/share/splicecraft\n"
+            "  mkdir -p $SPLICECRAFT_DATA_DIR\n"
+            f"  mv {_DATA_DIR}/* $SPLICECRAFT_DATA_DIR/  # then retry the update",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"\nWill run:  {' '.join(cmd)}")
+    if not assume_yes:
+        if not _confirm_proceed():
+            print("Cancelled.", file=sys.stderr)
+            return 130
+
+    # ── SACRED INVARIANT ──────────────────────────────────────────
+    # Snapshot the user's library, collections, parts bin, primers,
+    # feature library, custom grammars, codon tables, settings,
+    # crash-recovery autosaves, and .dna sidecars BEFORE invoking
+    # the install subprocess. If the snapshot can't be made for any
+    # reason (disk full, permission denied, refused config), abort
+    # the upgrade — it is NEVER acceptable to risk destroying user
+    # data without a recoverable copy first. Tested by
+    # `test_update_snapshot_taken_before_subprocess` in tests/test_smoke.py.
+    print("Snapshotting user data before update…", flush=True)
+    try:
+        snap_path = _create_pre_update_snapshot(__version__)
+    except (OSError, shutil.Error) as exc:
+        _log.exception("pre-update snapshot failed")
+        print(
+            f"\nABORTING: could not snapshot user data before the upgrade.\n"
+            f"  Reason: {exc}\n"
+            "Refusing to proceed without a recoverable copy of your "
+            "library, collections, parts bin, and primers. Free up disk "
+            "space, fix permissions on the backup directory, and retry. "
+            "(Override the location with $SPLICECRAFT_UPDATE_BACKUP_DIR.)",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"  ✓ Snapshot saved: {snap_path}")
+
+    # `--dry-run` short-circuits HERE: we've gone all the way through
+    # detection + PyPI fetch + snapshot, but we don't actually run the
+    # install. Useful for verifying the snapshot pipeline works on a
+    # given machine, for CI smoke-checks, and for documenting the
+    # exact command an automated workflow would run.
+    if dry_run:
+        print(
+            "\n[dry-run] No install was run. Snapshot is intact at:\n"
+            f"  {snap_path}\n"
+            f"To actually upgrade, re-run without --dry-run:\n"
+            f"  {' '.join(cmd)}"
+        )
+        return 0
+
+    # Inherit stdout/stderr so the user sees pip/pipx progress live.
+    # `check=False` because we report the return code ourselves; let
+    # the user see whatever pip wrote on failure.
+    try:
+        result = subprocess.run(cmd, check=False)
+    except FileNotFoundError:
+        print(
+            f"Command not found: {cmd[0]!r}.  "
+            "Install the matching package manager and retry.\n"
+            f"(Pre-update snapshot is intact at {snap_path}.)",
+            file=sys.stderr,
+        )
+        return 127
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log.exception("splicecraft update: subprocess failed")
+        print(
+            f"Update failed to launch: {exc}\n"
+            f"(Pre-update snapshot is intact at {snap_path}.)",
+            file=sys.stderr,
+        )
+        return 1
+
+    rc = int(result.returncode or 0)
+    if rc == 0:
+        print("\nUpgrade complete.")
+        # Best-effort: try to read the freshly installed version so the
+        # user sees the new number without restarting. Ignore any failure
+        # — the success message above already covered the happy path.
+        try:
+            import importlib.metadata as ilm
+            try:
+                installed = ilm.version("splicecraft")
+                if installed and installed != __version__:
+                    print(f"  splicecraft {__version__} → {installed}")
+            except ilm.PackageNotFoundError:
+                pass
+        except ImportError:
+            pass
+        print(f"  Pre-update snapshot: {snap_path}")
+        print(
+            "  If anything looks wrong on the new version, restore with:\n"
+            f"    splicecraft update --restore-pre-update {snap_path.name}"
+        )
+    else:
+        print(
+            f"\nUpgrade command exited with status {rc}. "
+            "See output above for details.\n"
+            f"Your pre-update snapshot is intact at:\n"
+            f"  {snap_path}\n"
+            "If your data ended up corrupted, run:\n"
+            f"  splicecraft update --restore-pre-update {snap_path.name}",
+            file=sys.stderr,
+        )
+    return rc
 
 
 # ── Fetch modal ────────────────────────────────────────────────────────────────
@@ -14535,6 +17374,87 @@ def _grammar_dropdown_options() -> list[tuple[str, str]]:
 _SETTINGS_FILE = _DATA_DIR / "settings.json"
 _settings_cache: "dict | None" = None
 
+# Type schema for the persisted settings file. Used by
+# `_validate_settings` to coerce or strip values that arrive in the
+# wrong type (hand-edited JSON, partial restore from a future-version
+# snapshot, etc.). Each entry maps key → (allowed_types, default)
+# where `allowed_types` is a tuple suitable for `isinstance`.
+# Unknown keys are PRESERVED (forward-compat: a future SpliceCraft
+# might add a setting that this build doesn't know about).
+#
+# Adding a new persisted setting? Append the row here so a stray
+# `null` / `"true"` / `[]` from a hand-edit doesn't propagate into
+# the reactive UI as the wrong type. The default is what the
+# validator falls back to when the value is irrecoverable.
+_SETTINGS_SCHEMA: "dict[str, tuple[tuple, object]]" = {
+    "show_feature_tooltips":   ((bool,),               False),
+    "click_debug":             ((bool,),               False),
+    "check_updates":           ((bool,),               True),
+    "show_restr":              ((bool,),               False),
+    "restr_unique_only":       ((bool,),               True),
+    "restr_min_len":           ((int,),                6),
+    "min_primer_binding":      ((int,),                15),
+    "show_connectors":         ((bool,),               False),
+    "linear_layout":           ((bool,),               False),
+    "active_collection":       ((str,),                ""),
+    "active_grammar":          ((str,),                ""),
+    "constructor_filter_by_grammar": ((bool,),         True),
+    "last_seen_version":       ((str,),                ""),
+    "last_known_latest":       ((str,),                ""),
+    "last_update_check_ts":    ((int, float),          0),
+    "hmm_db_path":             ((str,),                ""),
+}
+
+
+def _validate_settings(raw: dict) -> "tuple[dict, list[str]]":
+    """Coerce every known key in `raw` to the type declared in
+    `_SETTINGS_SCHEMA`. Returns `(cleaned_dict, warnings)`. Unknown
+    keys are passed through (forward-compat). Wrong-typed values
+    are replaced with the schema default and a warning is appended.
+
+    Cheap (O(n_settings)). Called from `_load_settings` so every
+    consumer sees a typed view regardless of how the file got
+    corrupted.
+    """
+    if not isinstance(raw, dict):
+        return {}, [f"settings: not a dict ({type(raw).__name__}); "
+                     "starting fresh"]
+    out: dict = {}
+    warnings: list[str] = []
+    for k, v in raw.items():
+        if k in _SETTINGS_SCHEMA:
+            allowed, default = _SETTINGS_SCHEMA[k]
+            if isinstance(v, allowed) and not isinstance(v, bool) is False:
+                # The `not isinstance(v, bool)` clause: bool is a
+                # subclass of int in Python, so a `bool` setting
+                # whose schema is `(int,)` should NOT be accepted
+                # (a stray True would propagate as `1`). Allow only
+                # exact-type matches for non-bool numeric keys.
+                pass
+            # Strict bool/int discrimination: bool matches int
+            # isinstance check, so we have to special-case.
+            if isinstance(v, bool) and bool not in allowed:
+                warnings.append(
+                    f"settings.{k}: ignored (got bool, expected "
+                    f"{[t.__name__ for t in allowed]}); using default {default!r}"
+                )
+                out[k] = default
+                continue
+            if not isinstance(v, allowed):
+                warnings.append(
+                    f"settings.{k}: ignored (got {type(v).__name__}, expected "
+                    f"{[t.__name__ for t in allowed]}); using default {default!r}"
+                )
+                out[k] = default
+                continue
+            out[k] = v
+        else:
+            # Unknown key — pass through for forward-compat. A future
+            # build may have added this setting and we don't want to
+            # destroy it on a downgrade-then-upgrade round trip.
+            out[k] = v
+    return out, warnings
+
 # Async-flush plumbing for `_set_setting`. Persistent settings are
 # safety-net data (worst case: the user's last toggle doesn't survive a
 # crash before the flush completes), so the disk write happens on a
@@ -14551,7 +17471,13 @@ _settings_flush_running: bool = False
 def _load_settings() -> dict:
     """Return the persistent settings dict. Stored on disk as a list of
     ``{"key": ..., "value": ...}`` envelope entries so it shares the
-    schema layout (sacred invariant #7) with every other JSON file."""
+    schema layout (sacred invariant #7) with every other JSON file.
+
+    Type-validates against `_SETTINGS_SCHEMA` so a hand-edited
+    settings.json (or a partial restore from a future-version
+    snapshot) can't propagate wrong-type values into the reactive
+    UI. Unknown keys are preserved for forward-compat.
+    """
     global _settings_cache
     if _settings_cache is not None:
         return dict(_settings_cache)
@@ -14565,7 +17491,10 @@ def _load_settings() -> dict:
         k, v = e.get("key"), e.get("value")
         if isinstance(k, str):
             settings[k] = v
-    _settings_cache = settings
+    cleaned, warns = _validate_settings(settings)
+    for w in warns:
+        _log.warning(w)
+    _settings_cache = cleaned
     return dict(_settings_cache)
 
 
@@ -14617,6 +17546,13 @@ def _set_setting(key: str, value) -> None:
     fsync. Coalesces bursts of toggles into fewer disk writes."""
     global _settings_cache, _settings_flush_pending, _settings_flush_running
     settings = _load_settings()
+    # Log only when the value actually changes — avoids spamming the
+    # log when callers re-set the same value on settings hydration.
+    # Truncate the value repr to keep log lines bounded for big lists.
+    prev = settings.get(key, "<unset>")
+    if prev != value:
+        _log.info("setting changed: %s = %r (was %r)",
+                    key, _repr_for_log(value), _repr_for_log(prev))
     settings[key] = value
     _settings_cache = dict(settings)
     with _settings_flush_lock:
@@ -34529,6 +37465,13 @@ SpeciesPickerModal { align: center middle; }
         Binding("ctrl+shift+a","add_to_library",   "Add to lib",    show=False),
         Binding("ctrl+e",      "edit_seq",         "Edit seq",      show=False),
         Binding("ctrl+shift+f","capture_to_features", "→ Feat lib", show=False, priority=True),
+        # Alt+D — capture a Markdown UI snapshot to <DATA_DIR>/
+        # ui_snapshots/. Always available (priority=True so it fires
+        # even from inside modals where the user is most likely to
+        # hit a bug worth reporting). Existing seq-panel debug-mode
+        # toggle moved to alt+shift+d. See `action_capture_ui_snapshot`.
+        Binding("alt+d",       "capture_ui_snapshot",
+                "UI snapshot", show=False, priority=True),
         # Panel focus shortcuts: each F-key collapses the multi-panel
         # layout to just one panel; F5 restores. priority=True so they
         # fire even when an inner DataTable / Input has focus.
@@ -36990,6 +39933,14 @@ SpeciesPickerModal { align: center middle; }
                 severity="warning",
             )
 
+    # Above this size, render + restriction-scan + auto-translate
+    # operations on the new record will visibly stutter. The user
+    # gets a one-shot warning so they understand "the UI feels
+    # heavy" isn't a bug. Threshold is conservative — Textual + the
+    # braille canvas + biopython feature traversal hold up to ~5 Mb
+    # before the frame budget gets uncomfortable.
+    _LARGE_PLASMID_BP = 5_000_000
+
     def _apply_record(self, record, *, clear_undo: bool = True) -> None:
         """Load a SeqRecord into all panels.
 
@@ -37007,6 +39958,32 @@ SpeciesPickerModal { align: center middle; }
         """
         if record is None:
             return
+        # Big-plasmid heads-up: the user gets a one-shot warning so
+        # "the UI feels heavy" doesn't read as a bug. Logged so the
+        # diagnostic bundle records when the user is operating on
+        # records that strain the renderer.
+        try:
+            seq_len = len(getattr(record, "seq", "") or "")
+            if seq_len >= self._LARGE_PLASMID_BP:
+                _log.warning(
+                    "Large plasmid loaded: %r (%d bp) — render and "
+                    "restriction-scan workers may run slowly",
+                    getattr(record, "id", "?"), seq_len,
+                )
+                try:
+                    self.notify(
+                        f"Large plasmid loaded ({seq_len:,} bp). The "
+                        "map / seq panel may take a moment to redraw "
+                        "after edits, and restriction scans run in "
+                        "the background.",
+                        title="Large plasmid",
+                        severity="information",
+                        timeout=8,
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
         if clear_undo:
             new_key = record.id if record.id else None
             self._stash_current_undo_and_load(new_key)
@@ -39073,10 +42050,109 @@ SpeciesPickerModal { align: center middle; }
             pass
         self.push_screen(MutagenizeModal(seq, feats, name))
 
+    # Soft cap on modal stack depth. Anything sane lives below ~5
+    # (a Splash → Main → Picker → Confirm chain might briefly hit 4).
+    # 12 is generous but catches a runaway loop where a modal's
+    # `compose` or `on_mount` fires another `push_screen` during
+    # mount → infinite recursion. Logged + notified so a future bug
+    # report shows the failed push.
+    _MODAL_STACK_SOFT_CAP = 12
+
+    def push_screen(self, screen, *args, **kwargs):
+        # Defensive: refuse pushes that would blow past the soft cap.
+        # Returns the awaitable that Textual normally returns so
+        # callers `await app.push_screen(...)` keep working — but
+        # the awaitable is a no-op when capped.
+        try:
+            depth = len(self.screen_stack)
+        except Exception:
+            depth = 0
+        if depth >= self._MODAL_STACK_SOFT_CAP:
+            screen_name = (
+                type(screen).__name__ if not isinstance(screen, str)
+                else screen
+            )
+            _log.warning(
+                "Refusing modal push: stack depth %d ≥ cap %d "
+                "(would have pushed %s)",
+                depth, self._MODAL_STACK_SOFT_CAP, screen_name,
+            )
+            try:
+                self.notify(
+                    f"Too many modals open ({depth}). Close some "
+                    "before opening more.",
+                    title="Modal stack full",
+                    severity="warning",
+                )
+            except Exception:
+                pass
+            # Return a completed awaitable so `await` works.
+            async def _noop():
+                return None
+            return _noop()
+        return super().push_screen(screen, *args, **kwargs)
+
+    def action_capture_ui_snapshot(self) -> None:
+        """Alt+D — write a Markdown dump of the current UI state to
+        `<DATA_DIR>/ui_snapshots/`. The user can attach the file to
+        a bug report or paste it into a chat with an AI assistant.
+
+        Defensive: every accessor in `_collect_ui_snapshot` is wrapped
+        in try/except so a half-mounted app can still capture. Disk
+        failures are notified, never raised — alt+d should NEVER be
+        a way to crash the app.
+        """
+        try:
+            snap = _collect_ui_snapshot(self)
+            text = _format_ui_snapshot(snap)
+            path = _save_ui_snapshot(text)
+            _log.info("UI snapshot captured: %s", path)
+            self.notify(
+                f"UI snapshot saved to:\n{path}\n"
+                "Email this file to your bug report.",
+                title="Snapshot captured",
+                severity="information",
+                timeout=10,
+            )
+        except OSError as exc:
+            _log.exception("UI snapshot capture failed")
+            self.notify(
+                f"Could not save UI snapshot: {exc}",
+                title="Snapshot failed",
+                severity="error",
+                timeout=8,
+            )
+        except Exception as exc:
+            # Defensive — capture must never propagate. The point of
+            # this binding is to help debug existing bugs; raising
+            # would defeat the purpose.
+            _log.exception("UI snapshot capture failed unexpectedly")
+            try:
+                self.notify(
+                    f"Could not save UI snapshot: {exc}",
+                    title="Snapshot failed",
+                    severity="error",
+                    timeout=8,
+                )
+            except Exception:
+                pass
+
     def action_undo(self) -> None:
+        # Log every undo so a diagnostic bundle can replay the user's
+        # sequence of edits. Cheap (one line per keystroke).
+        try:
+            n = len(self._undo_stack) if hasattr(self, "_undo_stack") else 0
+        except Exception:
+            n = -1
+        _log.info("user action: undo (stack depth before=%d)", n)
         self._action_undo()
 
     def action_redo(self) -> None:
+        try:
+            n = len(self._redo_stack) if hasattr(self, "_redo_stack") else 0
+        except Exception:
+            n = -1
+        _log.info("user action: redo (redo stack before=%d)", n)
         self._action_redo()
 
     # ── Sequence edits ─────────────────────────────────────────────────────────
@@ -39138,11 +42214,15 @@ def main():
     if arg in ("--help", "-h"):
         print(
             f"splicecraft {__version__}\n"
-            "Usage: splicecraft [ACCESSION | FILE.gb] [--no-splash] "
+            "Usage: splicecraft [ACCESSION | FILE.gb | update | logs] [--no-splash] "
             "[--agent-api[-port=PORT]]\n\n"
             "  splicecraft               # empty canvas\n"
             "  splicecraft L09137        # fetch pUC19 from NCBI\n"
             "  splicecraft my.gb         # open a local GenBank file\n"
+            "  splicecraft update        # upgrade to the latest PyPI release\n"
+            "                            # (run `splicecraft update --help` for flags)\n"
+            "  splicecraft logs --bundle # pack logs + UI snapshots into a ZIP\n"
+            "                            # for emailing in a bug report\n"
             "  splicecraft --no-splash   # skip the launcher splash\n"
             "  splicecraft --agent-api   # expose JSON API on "
             f"127.0.0.1:{_AGENT_API_PORT_DEFAULT}\n"
@@ -39150,9 +42230,44 @@ def main():
             " from another shell)\n\n"
             "Data files (library, parts, primers) live in:\n"
             f"  {_DATA_DIR}\n"
-            "Override with $SPLICECRAFT_DATA_DIR."
+            "Override with $SPLICECRAFT_DATA_DIR.\n"
+            "Inside the running app: Alt+D captures a UI snapshot for bug reports."
         )
         return
+    # `splicecraft update` — self-update subcommand. Dispatches BEFORE the
+    # `Path(arg).exists()` file-load check so a stray file named "update"
+    # in the CWD doesn't shadow the subcommand. If such a file exists,
+    # warn the user and explain the disambiguation (`./update`).
+    if arg == "update":
+        try:
+            shadowed = Path("update").exists()
+        except OSError:
+            shadowed = False
+        if shadowed:
+            print(
+                "Note: a file named 'update' exists in the current "
+                "directory; it's being ignored in favour of the update "
+                "subcommand. Pass './update' (with the leading ./) to "
+                "load that file instead.",
+                file=sys.stderr,
+            )
+        sys.exit(_run_update_subcommand(args[1:]))
+    # `splicecraft logs` — diagnostic bundle / log path subcommand.
+    # Same dispatch shape as `update`: handled before the file-load
+    # check so a file named `logs` doesn't shadow the subcommand.
+    if arg == "logs":
+        try:
+            shadowed = Path("logs").exists()
+        except OSError:
+            shadowed = False
+        if shadowed:
+            print(
+                "Note: a file named 'logs' exists in the current "
+                "directory; it's being ignored in favour of the logs "
+                "subcommand. Pass './logs' to load it as a file.",
+                file=sys.stderr,
+            )
+        sys.exit(_run_logs_subcommand(args[1:]))
     if len(args) > 1:
         print(
             f"splicecraft takes at most one positional argument (got "
@@ -39180,6 +42295,55 @@ def main():
         sys.exit(2)
 
     _log_startup_banner()
+
+    # Multi-instance lock: refuse to launch a second splicecraft
+    # against the same data dir (cache coherence safety). Bypass
+    # via SPLICECRAFT_SKIP_LOCK=1 if you really know what you're
+    # doing. Acquired BEFORE any other startup work touches the
+    # data dir so a second instance bails out cleanly without
+    # racing on the daily snapshot or the version stamp.
+    _data_lock_fd = None
+    try:
+        _data_lock_fd, _ = _acquire_data_dir_lock()
+    except DataDirLockError as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        _log.error("Refusing to launch: %s", exc)
+        sys.exit(1)
+    except OSError as exc:
+        # Read-only data dir, full disk, etc. Log + continue without
+        # the lock; the existing data-safety net still catches most
+        # corruption modes.
+        _log.warning("Could not acquire data-dir lock: %s", exc)
+
+    # Install a thread-level excepthook so an unhandled exception in
+    # any background worker (BLAST/HMMER/Primer3/restriction scan/
+    # pairwise align/etc.) lands in the rotating log instead of
+    # dying silently. CLAUDE.md mandates the convention via try/
+    # except in worker bodies, but this hook is a safety net for any
+    # try/except that gets missed in a future change.
+    def _thread_excepthook(args):
+        # SystemExit is normal thread teardown; don't log it.
+        if args.exc_type is SystemExit:
+            return
+        thread_name = getattr(args.thread, "name", "?") if args.thread else "?"
+        _log.error(
+            "unhandled exception in thread %r",
+            thread_name,
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+    threading.excepthook = _thread_excepthook
+
+    # Future-proofing: stamp the data dir with the version that's
+    # currently touching it. If a downgrade is detected (data dir
+    # was previously written by a newer SpliceCraft), surface the
+    # warning to the user before launch — they may otherwise be
+    # surprised when fields they created in the newer version are
+    # silently dropped on save. Best-effort: any I/O failure logs +
+    # continues so a read-only data dir doesn't block startup.
+    _data_version_warning = _check_and_stamp_data_version()
+    if _data_version_warning:
+        print(f"⚠  {_data_version_warning}", file=sys.stderr, flush=True)
+        _log.warning(_data_version_warning)
     app = PlasmidApp()
     app._skip_splash = skip_splash
     # Production launch opts in to the background PyPI update check
@@ -39262,7 +42426,21 @@ def main():
             _settings_flush_sync()
         except Exception:
             _log.exception("Settings flush-on-exit failed")
+        # Drain non-daemon worker threads with a 2 s budget. Most
+        # `@work(thread=True)` tasks finish well within this; if a
+        # BLAST run is still in flight, log which threads are pending
+        # so the diagnostic bundle reflects what was running at exit.
+        try:
+            _drain_in_flight_workers(timeout_s=2.0)
+        except Exception:
+            _log.exception("Worker drain at exit failed")
         _log.info("SpliceCraft session %s ending", _SESSION_ID)
+        # Release the data-dir lock. Best-effort; the kernel cleans
+        # up the FD anyway on process exit.
+        try:
+            _release_data_dir_lock(_data_lock_fd)
+        except Exception:
+            _log.exception("Lock release failed")
         # Flush the rotating-file log handlers so the final session
         # banner + any pending DEBUG records hit disk before the
         # process exits. The stdlib's atexit hook does this for us

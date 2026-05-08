@@ -2,6 +2,151 @@
 
 ---
 
+## [0.7.6.0] — 2026-05-08 — self-update + diagnostics + robustness pass
+
+> Pre-1.0 sweep adding three connected operational surfaces — a
+> cross-package-manager `splicecraft update` subcommand, a diagnostic
+> bundle workflow for bug reports, and a 10-item robustness pass —
+> plus six future-proofing scaffolds for the upcoming 1.0 freeze.
+> NOT v1.0.0; the 1.0 tag remains gated on the SnapGene round-trip
+> work + explicit user sign-off.
+
+### New: `splicecraft update` subcommand
+
+- Auto-detects the install method (pipx, uv tool, uv venv, pixi
+  global, pip --user, pip in venv, system pip, editable install,
+  source clone, pixi project) and runs the matching upgrade command.
+- **Pre-update snapshot is sacred**: every running upgrade path
+  takes a complete, atomic copy of the user's library, collections,
+  parts bin, primers, feature library, custom grammars, codon
+  tables, settings, crash-recovery autosaves, and `.dna` sidecars
+  BEFORE invoking pip / pipx / uv / pixi. Stored at the sibling
+  `<DATA_DIR>/../<DATA_DIR.name>-update-backups/` so a hypothetical
+  bug that recursively wipes `_DATA_DIR` cannot destroy the recovery
+  copy. Override location with `$SPLICECRAFT_UPDATE_BACKUP_DIR`.
+- Refusal paths: editable + git-clone + pixi-project installs are
+  read-only here (pull from git / run `pixi update splicecraft`
+  yourself). System-wide pip prints the sudo command but never
+  auto-runs sudo.
+- `--check`, `--dry-run`, `--force`, `--yes`/`-y` flags for the
+  expected variations.
+- `--list-snapshots` and `--restore-pre-update [<id>|latest]` for
+  recovering from a botched upgrade. Restore validates the
+  manifest's schema_version, restricts `attr` to the published
+  user-data whitelist, rejects path-traversal in `name` fields, and
+  re-verifies SHA-256 before overwriting live data — all four
+  checks are sacred and have dedicated regression tests.
+- See CLAUDE.md invariant #39 for the complete contract.
+
+### New: diagnostic logging + UI snapshot + bundle
+
+- **Alt+D** captures a Markdown UI snapshot to
+  `<DATA_DIR>/ui_snapshots/ui-snapshot-<ts>.md` containing app
+  version + Python + platform, screen stack, focused widget, last
+  mouse position, terminal size, current record metadata (id /
+  name / topology / length / cursor / view origin / rotation /
+  dirty — **never sequence content**), persisted settings, active
+  collection / grammar, and a 200-line tail of the rotating log
+  with home-directory paths scrubbed (`/home/<user>` → `~`).
+  Defensive: every accessor wrapped in try/except so a half-mounted
+  app can still capture. The previous Alt+D (seq-panel hover-debug
+  toggle) moved to Alt+Shift+D.
+- **`splicecraft logs --bundle [--out PATH]`** packs the rotating
+  log files + last 5 UI snapshots + sanitized `settings.json` +
+  `system_info.json` + a README into a single ZIP, atomically.
+  Path scrubbing on every text artifact handles `/home/<user>`,
+  `/Users/<user>`, `C:\Users\<user>`, plus `Path.home()` literal.
+  Default filename `splicecraft-debug-<sessionID>-<ts>.zip` lands in
+  CWD. The user attaches the ZIP to a bug report; no usernames leak.
+- Rotating log bumped from 2 MB × 2 backups → 5 MB × 4 backups
+  (~20 MB ceiling) for diagnostic depth.
+- Structured event logs added to undo / redo, settings changes
+  (with bounded `_repr_for_log` so a chatty toggle can't blow out
+  the rotation window).
+- See CLAUDE.md invariant #38 for the complete diagnostic surface.
+
+### Robustness pass (10 items)
+
+- **Multi-instance lock** at `<DATA_DIR>/splicecraft.lock` (POSIX
+  `fcntl.flock` / Windows `msvcrt.locking`) refuses a second
+  concurrent splicecraft against the same data dir — without it,
+  two processes can desync on the in-memory library cache and
+  silently overwrite each other's saves. Lockfile carries holder
+  PID for the contention message. Bypass with
+  `$SPLICECRAFT_SKIP_LOCK=1`.
+- **`threading.excepthook` global hook** routes any unhandled
+  worker exception through `_log.error` so a missed try/except in a
+  background thread lands in the diagnostic bundle instead of dying
+  silently.
+- **0o600 perms** on the rotating log + every diagnostic bundle
+  ZIP via `_chmod_user_only` (POSIX-only). Protects path/error
+  metadata on multi-user hosts.
+- **Settings type validation** (`_SETTINGS_SCHEMA` +
+  `_validate_settings`): coerces wrong-typed settings.json values
+  (`"yes"` for a bool, `True` for an int) back to the schema
+  default + logs a warning. Strict bool-vs-int discrimination —
+  `True` does NOT slip into an `int` field.
+- **Worker drain at exit**
+  (`_drain_in_flight_workers(timeout_s=2.0)`) joins non-daemon
+  threads with the budget, logs leftovers so the diagnostic bundle
+  reflects what was running.
+- **One-retry network fetches** for both PyPI (update check) and
+  NCBI (`fetch_genbank`) — 250 ms backoff between attempts.
+- **Clipboard fallback chain**: app clipboard → OSC 52 → atomic
+  file at `<DATA_DIR>/clipboard/<ts>-<label>.txt` (0o600) →
+  log-only. Always logs the text so SSH-without-X11 sessions still
+  have a way to retrieve copies.
+- **Modal stack soft cap** of 12; refuses pushes past the cap
+  with a no-op awaitable + warning notification (catches runaway
+  `compose`/`on_mount` recursion).
+- **Big-plasmid heads-up** when loading a record ≥ 5 Mb so the
+  user knows render lag is expected, not a bug.
+- **Daily snapshot per-file size cap** of 50 MB. A 1 GB library
+  × 30 days = 30 GB of mostly-redundant snapshots; the existing
+  `.bak` rotation + pre-update snapshots cover rollback for huge
+  files. See CLAUDE.md invariant #37 for the complete list.
+
+### Future-proofing scaffolds
+
+- **Entry-level migration framework**: `_ENTRY_MIGRATIONS`
+  registry (per-label `(from_v, to_v)` → callable) walks chained
+  migrations on load so every consumer sees current-schema
+  entries. Missing intermediate steps are no-ops; failed migrators
+  preserve the entry + warn rather than drop user data.
+- **PyPI URL override** via `$SPLICECRAFT_PYPI_URL` (validated
+  http/https only; rejects `file://`, `javascript:`, etc.).
+- **Manifest provenance**: pre-update snapshots record
+  `from_python_version` + `from_platform` so cross-Python /
+  cross-platform restores are diagnosable.
+- **Data-dir version stamp** at `.splicecraft-data-version`
+  detects downgrades (older SpliceCraft against newer data) and
+  warns the user.
+- **Plugin namespace reservation**: `<DATA_DIR>/plugins/` created
+  empty at launch + included in `_USER_DATA_DIR_ATTRS` so future
+  plugin data is auto-snapshotted. Reserved field name
+  `_plugin_data` on entries; round-trip preservation tested.
+- **Self-audit tests**: every `_*_FILE` constant is classified
+  user-vs-operational; every `_INSTALL_METHODS` entry is
+  buildable-or-refused; every method appears in the help text. A
+  contributor adding a new persisted file or install method now
+  trips an explicit test rather than silently shipping a gap.
+- See CLAUDE.md invariant #36 for the complete list.
+
+### Test coverage
+
+- 122 new tests (24 robustness + 39 diagnostics + 36
+  future-proofing + 23 update flow). Targeted suite (`test_smoke`
+  + `test_dna_sanity` + `test_data_safety`) now runs 631 tests in
+  ~1m54s. Full suite ~5 min on 8 cores.
+
+### Documentation
+
+- 4 new sacred invariants in CLAUDE.md (#36 future-proofing, #37
+  robustness, #38 diagnostics, #39 update-snapshot). Cross-
+  references the test classes that protect each invariant.
+
+---
+
 ## [0.7.5.0] — 2026-05-08 — audit + hardening sweep
 
 > Pre-1.0 readiness sweep — bug fixes, cache discipline, worker

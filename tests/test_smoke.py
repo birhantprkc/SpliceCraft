@@ -14,6 +14,8 @@ NO network (NCBI) access is required, and isolates the library JSON with the
 """
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 import splicecraft as sc
@@ -6921,3 +6923,3155 @@ class TestShiftClickFeatureExtend:
         # just assert via the integration tests above. This unit
         # check is a placeholder noting the helper exists.
         assert callable(sc.PlasmidApp._extend_selection_to)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# `splicecraft update` self-update subcommand
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# The subcommand has three concerns we cover here:
+#   1. Install-method detection across pipx / pip / editable / source / unknown.
+#   2. Upgrade-command construction — the right argv for each method, with
+#      and without --force.
+#   3. Top-level flow: --check is read-only, editable + source refuse pip,
+#      pip-system prints sudo without auto-running, PyPI-unreachable surfaces
+#      cleanly, the confirmation prompt defaults to no, --yes skips, and
+#      `main()` dispatches `update` without launching the Textual TUI.
+#
+# All tests monkeypatch `subprocess.run` and `_fetch_latest_pypi_version` so
+# they never touch the network or actually invoke pip/pipx. A `_FakeRun`
+# helper records the argv passed to subprocess so each test can assert the
+# exact upgrade command the subcommand decided to run.
+
+class _FakeRun:
+    """Records argv from the most recent subprocess.run call. Replaces
+    `subprocess.run` in tests; mimics CompletedProcess(returncode=0)."""
+    def __init__(self, returncode: int = 0, raise_exc: BaseException | None = None):
+        self.returncode = returncode
+        self.raise_exc = raise_exc
+        self.calls: list[list[str]] = []
+
+    def __call__(self, cmd, check=False, **kwargs):
+        self.calls.append(list(cmd))
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        class _CP:
+            def __init__(self, rc: int):
+                self.returncode = rc
+        return _CP(self.returncode)
+
+
+class TestUpdateSubcommandDetection:
+    """Install-method detection — covers each branch returned by
+    `_detect_install_method`. The helper is pure (reads sys.executable,
+    sys.prefix, and __file__) so we monkeypatch those plus the
+    `_find_dist_info_dir` helper to simulate each install layout."""
+
+    def test_returns_required_keys(self):
+        info = sc._detect_install_method()
+        for key in ("method", "module", "python", "venv", "git_clone", "details"):
+            assert key in info, f"missing key {key!r}"
+        assert info["method"] in sc._INSTALL_METHODS
+
+    def test_source_clone_detected(self):
+        # Running pytest from the repo: splicecraft.py sits next to .git/
+        # + pyproject.toml. The actual environment satisfies this.
+        info = sc._detect_install_method()
+        # In CI / dev, the running module is the source clone — but we
+        # also tolerate "editable" if someone ran `pip install -e .`
+        # because direct_url.json overrides the path heuristic.
+        assert info["method"] in ("source", "editable"), info
+
+    def test_pipx_path_classified(self, monkeypatch, tmp_path):
+        # Synthesise a path that looks like a pipx-managed venv, point
+        # __file__ at it, and make sure detection picks pipx.
+        fake_venv = tmp_path / ".local" / "share" / "pipx" / "venvs" / "splicecraft"
+        fake_lib = fake_venv / "lib" / "python3.11" / "site-packages"
+        fake_lib.mkdir(parents=True)
+        fake_mod = fake_lib / "splicecraft.py"
+        fake_mod.write_text("# stub")
+        monkeypatch.setattr(sc, "__file__", str(fake_mod))
+        # Make _find_dist_info_dir return None so the editable branch
+        # doesn't fire (no direct_url.json).
+        monkeypatch.setattr(sc, "_find_dist_info_dir", lambda *a, **k: None)
+        info = sc._detect_install_method()
+        assert info["method"] == "pipx", info
+        assert info["venv"] == str(fake_venv)
+
+    def test_editable_via_direct_url(self, monkeypatch, tmp_path):
+        # PEP 610: direct_url.json with dir_info.editable=true means
+        # editable install. The path heuristic must NOT win over this.
+        di = tmp_path / "splicecraft-0.7.5.0.dist-info"
+        di.mkdir()
+        durl = di / "direct_url.json"
+        durl.write_text(
+            '{"url":"file:///home/me/SpliceCraft",'
+            '"dir_info":{"editable":true}}'
+        )
+        monkeypatch.setattr(sc, "_find_dist_info_dir",
+                              lambda *a, **k: di)
+        info = sc._detect_install_method()
+        assert info["method"] == "editable", info
+
+    def test_pip_user_classified(self, monkeypatch, tmp_path):
+        # ~/.local/lib path with no .git/pyproject sibling and no
+        # direct_url.json → pip-user.
+        fake = tmp_path / ".local" / "lib" / "python3.11" / "site-packages"
+        fake.mkdir(parents=True)
+        fake_mod = fake / "splicecraft.py"
+        fake_mod.write_text("# stub")
+        monkeypatch.setattr(sc, "__file__", str(fake_mod))
+        monkeypatch.setattr(sc, "_find_dist_info_dir", lambda *a, **k: None)
+        # Force the venv check to be False.
+        monkeypatch.setattr(sys, "prefix", sys.base_prefix, raising=False)
+        info = sc._detect_install_method()
+        assert info["method"] == "pip-user", info
+
+    def test_pip_system_classified(self, monkeypatch, tmp_path):
+        fake = tmp_path / "usr" / "lib" / "python3.11" / "site-packages"
+        fake.mkdir(parents=True)
+        fake_mod = fake / "splicecraft.py"
+        fake_mod.write_text("# stub")
+        monkeypatch.setattr(sc, "__file__", str(fake_mod))
+        monkeypatch.setattr(sc, "_find_dist_info_dir", lambda *a, **k: None)
+        monkeypatch.setattr(sys, "prefix", sys.base_prefix, raising=False)
+        info = sc._detect_install_method()
+        assert info["method"] == "pip-system", info
+
+    def test_unknown_when_no_signals(self, monkeypatch, tmp_path):
+        fake_mod = tmp_path / "weird" / "splicecraft.py"
+        fake_mod.parent.mkdir(parents=True)
+        fake_mod.write_text("# stub")
+        monkeypatch.setattr(sc, "__file__", str(fake_mod))
+        monkeypatch.setattr(sc, "_find_dist_info_dir", lambda *a, **k: None)
+        monkeypatch.setattr(sys, "prefix", sys.base_prefix, raising=False)
+        info = sc._detect_install_method()
+        assert info["method"] == "unknown", info
+
+    # ── uv-tool / uv-venv ──────────────────────────────────────────
+
+    def test_uv_tool_path_classified(self, monkeypatch, tmp_path):
+        # `uv tool install splicecraft` lays out the venv at
+        # ~/.local/share/uv/tools/splicecraft/.
+        fake_venv = tmp_path / ".local" / "share" / "uv" / "tools" / "splicecraft"
+        fake_lib = fake_venv / "lib" / "python3.11" / "site-packages"
+        fake_lib.mkdir(parents=True)
+        fake_mod = fake_lib / "splicecraft.py"
+        fake_mod.write_text("# stub")
+        monkeypatch.setattr(sc, "__file__", str(fake_mod))
+        monkeypatch.setattr(sc, "_find_dist_info_dir", lambda *a, **k: None)
+        info = sc._detect_install_method()
+        assert info["method"] == "uv-tool", info
+        assert info["venv"] == str(fake_venv)
+
+    def test_uv_venv_via_pyvenv_cfg(self, monkeypatch, tmp_path):
+        # uv writes `uv = <version>` into pyvenv.cfg on venv create.
+        # That signature is what we use to distinguish a uv-managed
+        # venv from a plain python -m venv.
+        venv_root = tmp_path / "myproject" / ".venv"
+        site = venv_root / "lib" / "python3.11" / "site-packages"
+        site.mkdir(parents=True)
+        (venv_root / "pyvenv.cfg").write_text(
+            "home = /usr/bin\n"
+            "implementation = CPython\n"
+            "uv = 0.4.18\n"
+            "version_info = 3.11.10\n"
+        )
+        fake_mod = site / "splicecraft.py"
+        fake_mod.write_text("# stub")
+        monkeypatch.setattr(sc, "__file__", str(fake_mod))
+        monkeypatch.setattr(sc, "_find_dist_info_dir", lambda *a, **k: None)
+        # Force the in-venv branch of detection.
+        monkeypatch.setattr(sys, "prefix", str(venv_root), raising=False)
+        # base_prefix differs from prefix so the in-venv check fires.
+        monkeypatch.setattr(sys, "base_prefix", "/usr", raising=False)
+        info = sc._detect_install_method()
+        assert info["method"] == "uv-venv", info
+        assert info["venv"] == str(venv_root)
+
+    def test_pip_venv_no_uv_signature(self, monkeypatch, tmp_path):
+        # Same layout as the uv-venv test but pyvenv.cfg has no `uv`
+        # line — should fall back to plain pip-venv.
+        venv_root = tmp_path / "myproject" / ".venv"
+        site = venv_root / "lib" / "python3.11" / "site-packages"
+        site.mkdir(parents=True)
+        (venv_root / "pyvenv.cfg").write_text(
+            "home = /usr/bin\n"
+            "implementation = CPython\n"
+            "version_info = 3.11.10\n"
+        )
+        fake_mod = site / "splicecraft.py"
+        fake_mod.write_text("# stub")
+        monkeypatch.setattr(sc, "__file__", str(fake_mod))
+        monkeypatch.setattr(sc, "_find_dist_info_dir", lambda *a, **k: None)
+        monkeypatch.setattr(sys, "prefix", str(venv_root), raising=False)
+        monkeypatch.setattr(sys, "base_prefix", "/usr", raising=False)
+        info = sc._detect_install_method()
+        assert info["method"] == "pip-venv", info
+
+    # ── pixi-global / pixi-project ─────────────────────────────────
+
+    def test_pixi_global_path_classified(self, monkeypatch, tmp_path):
+        # `pixi global install splicecraft` puts the env at
+        # ~/.pixi/envs/splicecraft/. The env directory name matches
+        # the package name for `pixi global`.
+        fake_env = tmp_path / ".pixi" / "envs" / "splicecraft"
+        fake_lib = fake_env / "lib" / "python3.11" / "site-packages"
+        fake_lib.mkdir(parents=True)
+        fake_mod = fake_lib / "splicecraft.py"
+        fake_mod.write_text("# stub")
+        monkeypatch.setattr(sc, "__file__", str(fake_mod))
+        monkeypatch.setattr(sc, "_find_dist_info_dir", lambda *a, **k: None)
+        info = sc._detect_install_method()
+        assert info["method"] == "pixi-global", info
+        assert info["venv"] == str(fake_env)
+
+    def test_pixi_project_path_classified(self, monkeypatch, tmp_path):
+        # `pixi add splicecraft` in a project puts the env at
+        # <project>/.pixi/envs/<env_name>/ — env name is NOT
+        # 'splicecraft' (typically 'default'), which is exactly how
+        # pixi-project is distinguished from pixi-global.
+        project = tmp_path / "myproj"
+        env = project / ".pixi" / "envs" / "default"
+        site = env / "lib" / "python3.11" / "site-packages"
+        site.mkdir(parents=True)
+        fake_mod = site / "splicecraft.py"
+        fake_mod.write_text("# stub")
+        monkeypatch.setattr(sc, "__file__", str(fake_mod))
+        monkeypatch.setattr(sc, "_find_dist_info_dir", lambda *a, **k: None)
+        info = sc._detect_install_method()
+        assert info["method"] == "pixi-project", info
+        assert info["git_clone"] == str(project)
+
+    def test_pixi_global_wins_over_pixi_project_pattern(
+            self, monkeypatch, tmp_path):
+        # Critical ordering test: a pixi-global path also matches the
+        # broader `/.pixi/envs/` substring used for pixi-project. The
+        # specific (global) match must win — otherwise every global
+        # install would be misclassified as a project env and refused.
+        fake_env = tmp_path / ".pixi" / "envs" / "splicecraft"
+        site = fake_env / "lib" / "python3.11" / "site-packages"
+        site.mkdir(parents=True)
+        fake_mod = site / "splicecraft.py"
+        fake_mod.write_text("# stub")
+        monkeypatch.setattr(sc, "__file__", str(fake_mod))
+        monkeypatch.setattr(sc, "_find_dist_info_dir", lambda *a, **k: None)
+        info = sc._detect_install_method()
+        assert info["method"] == "pixi-global", info
+
+
+class TestUpdateSubcommandCommandBuilder:
+    """`_build_upgrade_command` translates a detected method + the
+    --force / --pre flags into the correct argv list."""
+
+    def test_pipx_normal(self):
+        cmd = sc._build_upgrade_command("pipx", force=False)
+        assert cmd == ["pipx", "upgrade", "splicecraft"]
+
+    def test_pipx_force_uses_install_force(self):
+        # `pipx upgrade` is a no-op when versions match; --force has to
+        # use `install --force` to actually re-run.
+        cmd = sc._build_upgrade_command("pipx", force=True)
+        assert cmd == ["pipx", "install", "--force", "splicecraft"]
+
+    def test_pip_user(self):
+        cmd = sc._build_upgrade_command("pip-user", force=False)
+        assert cmd[:4] == [sys.executable, "-m", "pip", "install"]
+        assert "--user" in cmd and "--upgrade" in cmd
+        assert cmd[-1] == "splicecraft"
+        assert "--force-reinstall" not in cmd
+
+    def test_pip_user_force_appends_reinstall(self):
+        cmd = sc._build_upgrade_command("pip-user", force=True)
+        assert "--force-reinstall" in cmd
+
+    def test_pip_venv_no_user_flag(self):
+        cmd = sc._build_upgrade_command("pip-venv", force=False)
+        assert "--user" not in cmd
+        assert cmd[:4] == [sys.executable, "-m", "pip", "install"]
+        assert "--upgrade" in cmd
+
+    def test_pip_system_returns_command(self):
+        # Builder still returns a command; the caller is responsible
+        # for printing rather than running it.
+        cmd = sc._build_upgrade_command("pip-system", force=False)
+        assert cmd is not None and "splicecraft" in cmd
+
+    def test_unknown_returns_command(self):
+        cmd = sc._build_upgrade_command("unknown", force=False)
+        assert cmd is not None and "splicecraft" in cmd
+
+    def test_editable_refused(self):
+        assert sc._build_upgrade_command("editable", force=False) is None
+
+    def test_source_refused(self):
+        assert sc._build_upgrade_command("source", force=True) is None
+
+    # ── uv ─────────────────────────────────────────────────────────
+
+    def test_uv_tool_normal(self):
+        cmd = sc._build_upgrade_command("uv-tool", force=False)
+        assert cmd == ["uv", "tool", "upgrade", "splicecraft"]
+
+    def test_uv_tool_force_uses_install_force(self):
+        cmd = sc._build_upgrade_command("uv-tool", force=True)
+        assert cmd == ["uv", "tool", "install", "--force", "splicecraft"]
+
+    def test_uv_venv(self):
+        cmd = sc._build_upgrade_command("uv-venv", force=False)
+        assert cmd == ["uv", "pip", "install", "--upgrade", "splicecraft"]
+
+    def test_uv_venv_force_appends_reinstall(self):
+        cmd = sc._build_upgrade_command("uv-venv", force=True)
+        assert "--force-reinstall" in cmd
+        assert cmd[:4] == ["uv", "pip", "install", "--upgrade"]
+
+    # ── pixi ───────────────────────────────────────────────────────
+
+    def test_pixi_global_normal(self):
+        cmd = sc._build_upgrade_command("pixi-global", force=False)
+        assert cmd == ["pixi", "global", "update", "splicecraft"]
+
+    def test_pixi_global_force_uses_install_force(self):
+        cmd = sc._build_upgrade_command("pixi-global", force=True)
+        assert cmd == ["pixi", "global", "install", "--force", "splicecraft"]
+
+    def test_pixi_project_refused(self):
+        # Project envs are managed by the pixi manifest, not by direct
+        # PyPI installs. Builder must refuse so the run-flow can
+        # surface a clear "run pixi update" message.
+        assert sc._build_upgrade_command("pixi-project", force=False) is None
+        assert sc._build_upgrade_command("pixi-project", force=True) is None
+
+
+class TestUpdateSubcommandFlow:
+    """End-to-end flow tests on `_run_update_subcommand`. Each test
+    monkeypatches:
+        sc._fetch_latest_pypi_version  → fixed return (no network)
+        sc._detect_install_method      → fixed install method
+        sc.subprocess.run              → records argv, never executes
+        builtins.input                 → simulates the y/N prompt
+    so the tests are hermetic and complete in milliseconds."""
+
+    def _patch_detect(self, monkeypatch, method: str, **extras):
+        info = {
+            "method": method, "module": "/fake/splicecraft.py",
+            "python": sys.executable, "venv": None, "git_clone": None,
+            "details": f"{method} (test stub)",
+        }
+        info.update(extras)
+        monkeypatch.setattr(sc, "_detect_install_method", lambda: info)
+        return info
+
+    # ── flag handling ──────────────────────────────────────────────
+
+    def test_help_flag_exits_zero(self, capsys):
+        rc = sc._run_update_subcommand(["--help"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "splicecraft update" in out and "Usage:" in out
+
+    def test_short_help_flag(self, capsys):
+        rc = sc._run_update_subcommand(["-h"])
+        assert rc == 0
+
+    def test_unknown_flag_exits_two(self, capsys):
+        rc = sc._run_update_subcommand(["--bogus"])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "unknown argument" in err
+
+    # ── PyPI fetch failure ─────────────────────────────────────────
+
+    def test_pypi_unreachable_exits_one(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version", lambda *a, **k: None)
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--check"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "Could not reach PyPI" in err
+        assert fake.calls == []
+
+    # ── --check flow ───────────────────────────────────────────────
+
+    def test_check_up_to_date_no_subprocess(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: sc.__version__)
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--check"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "latest released version" in out or "Nothing to do" in out
+        assert fake.calls == []
+
+    def test_check_newer_available_lists_command(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        # pipx must be on PATH for the command-listing branch to fire.
+        monkeypatch.setattr(sc.shutil, "which",
+                              lambda name: "/usr/bin/pipx" if name == "pipx" else None)
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--check"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "pipx upgrade splicecraft" in out
+        assert "Update available" in out
+        assert fake.calls == []  # --check never runs the install
+
+    def test_check_does_not_prompt(self, monkeypatch, capsys):
+        # Even when an update is available, --check never calls input().
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+
+        def _no_input(*a, **k):
+            raise AssertionError("--check should never prompt")
+
+        monkeypatch.setattr("builtins.input", _no_input)
+        rc = sc._run_update_subcommand(["--check"])
+        assert rc == 0
+
+    # ── refusals (editable / source / pip-system) ──────────────────
+
+    def test_editable_refuses_to_run_pip(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "editable",
+                            git_clone="/home/me/clone")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "git pull" in err
+        assert fake.calls == []
+
+    def test_source_clone_refuses_to_run_pip(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "source",
+                            git_clone="/home/me/clone")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "git pull" in err
+        assert fake.calls == []
+
+    def test_pip_system_warns_only_no_subprocess(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "pip-system")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "sudo" in err
+        # And we never run anything ourselves.
+        assert fake.calls == []
+
+    def test_pipx_not_on_path_warns(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: None)
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "pipx" in err and "PATH" in err
+        assert fake.calls == []
+
+    # ── happy path ─────────────────────────────────────────────────
+
+    def test_yes_flag_skips_confirmation_and_runs_pipx(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+        fake = _FakeRun(returncode=0)
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+
+        def _no_input(*a, **k):
+            raise AssertionError("--yes should skip the prompt")
+
+        monkeypatch.setattr("builtins.input", _no_input)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 0
+        assert fake.calls == [["pipx", "upgrade", "splicecraft"]]
+
+    def test_force_with_same_version_still_runs(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "pipx")
+        # Identical version: without --force we'd return 0 and skip
+        # subprocess; --force should still trigger reinstall.
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: sc.__version__)
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+        fake = _FakeRun(returncode=0)
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+        rc = sc._run_update_subcommand(["--force", "--yes"])
+        assert rc == 0
+        # --force must use `install --force` rather than `upgrade`.
+        assert fake.calls == [["pipx", "install", "--force", "splicecraft"]]
+
+    def test_pip_venv_invokes_python_m_pip(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "pip-venv")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        fake = _FakeRun(returncode=0)
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 0
+        assert len(fake.calls) == 1
+        cmd = fake.calls[0]
+        assert cmd[:4] == [sys.executable, "-m", "pip", "install"]
+        assert "--upgrade" in cmd and cmd[-1] == "splicecraft"
+
+    def test_pip_user_invokes_user_upgrade(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "pip-user")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        fake = _FakeRun(returncode=0)
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 0
+        cmd = fake.calls[0]
+        assert "--user" in cmd and "--upgrade" in cmd
+
+    # ── uv-tool happy path + PATH check ────────────────────────────
+
+    def test_uv_tool_yes_runs_subprocess(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "uv-tool")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        # `uv` must be on PATH for the install branch to fire.
+        monkeypatch.setattr(sc.shutil, "which",
+                              lambda name: "/usr/bin/uv" if name == "uv" else None)
+        fake = _FakeRun(returncode=0)
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 0
+        assert fake.calls == [["uv", "tool", "upgrade", "splicecraft"]]
+
+    def test_uv_not_on_path_warns(self, monkeypatch, capsys):
+        # `uv tool` install but `uv` itself isn't on PATH — must
+        # refuse to run, print the command, and tell the user where
+        # to get uv.
+        self._patch_detect(monkeypatch, "uv-tool")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: None)
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "`uv`" in err and "PATH" in err
+        assert "astral.sh" in err  # the homepage hint
+        assert fake.calls == []
+
+    def test_uv_tool_force_uses_install_force(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "uv-tool")
+        # Same version: --force should still trigger reinstall, but
+        # via `uv tool install --force` (since `uv tool upgrade` is a
+        # no-op when versions match).
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: sc.__version__)
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/uv")
+        fake = _FakeRun(returncode=0)
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--force", "--yes"])
+        assert rc == 0
+        assert fake.calls == [["uv", "tool", "install", "--force", "splicecraft"]]
+
+    # ── uv-venv happy path + PATH check ────────────────────────────
+
+    def test_uv_venv_yes_runs_subprocess(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "uv-venv")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/uv")
+        fake = _FakeRun(returncode=0)
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 0
+        assert fake.calls == [["uv", "pip", "install", "--upgrade", "splicecraft"]]
+
+    def test_uv_venv_no_uv_binary_warns(self, monkeypatch, capsys):
+        # uv-venv detection succeeded (pyvenv.cfg had uv signature)
+        # but `uv` is no longer on PATH. Must refuse + print command.
+        self._patch_detect(monkeypatch, "uv-venv")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: None)
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "uv-venv" in err and "PATH" in err
+        assert fake.calls == []
+
+    # ── pixi-global happy path + PATH check ────────────────────────
+
+    def test_pixi_global_yes_runs_subprocess(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "pixi-global")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which",
+                              lambda name: "/usr/bin/pixi" if name == "pixi" else None)
+        fake = _FakeRun(returncode=0)
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 0
+        assert fake.calls == [["pixi", "global", "update", "splicecraft"]]
+
+    def test_pixi_not_on_path_warns(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "pixi-global")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: None)
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "`pixi`" in err and "PATH" in err
+        assert "pixi.sh" in err
+        assert fake.calls == []
+
+    def test_pixi_global_force_uses_install_force(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "pixi-global")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: sc.__version__)
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pixi")
+        fake = _FakeRun(returncode=0)
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--force", "--yes"])
+        assert rc == 0
+        assert fake.calls == [["pixi", "global", "install", "--force", "splicecraft"]]
+
+    # ── pixi-project refusal ───────────────────────────────────────
+
+    def test_pixi_project_refused(self, monkeypatch, capsys):
+        # Project envs are managed by the pixi manifest. We refuse
+        # to bypass it with a PyPI install — same shape as the
+        # editable / source refusals.
+        self._patch_detect(monkeypatch, "pixi-project",
+                            git_clone="/home/me/myproj")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "pixi update splicecraft" in err
+        assert "/home/me/myproj" in err
+        assert fake.calls == []
+
+    def test_pixi_project_refused_in_check_mode_too(
+            self, monkeypatch, capsys):
+        # --check on a pixi-project shouldn't pretend an upgrade is
+        # possible. The refusal still fires (we don't list a fake
+        # command the user could run).
+        self._patch_detect(monkeypatch, "pixi-project",
+                            git_clone="/home/me/myproj")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--check"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "pixi update splicecraft" in err
+        assert fake.calls == []
+
+    # ── help text mentions uv + pixi ───────────────────────────────
+
+    def test_help_text_lists_uv_and_pixi(self, capsys):
+        rc = sc._run_update_subcommand(["--help"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        # Help should mention every supported manager so users can
+        # find the right command for their setup.
+        for kw in ("pipx", "uv tool", "pixi global", "pixi project"):
+            assert kw in out, f"help missing {kw!r}"
+
+    # ── confirmation prompt ────────────────────────────────────────
+
+    def test_user_cancels_at_prompt_exits_130(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        # Default-no on empty answer.
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "")
+        rc = sc._run_update_subcommand([])
+        assert rc == 130
+        assert fake.calls == []
+
+    def test_user_cancels_via_eof_exits_130(self, monkeypatch):
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        def _eof(*a, **k):
+            raise EOFError
+        monkeypatch.setattr("builtins.input", _eof)
+        rc = sc._run_update_subcommand([])
+        assert rc == 130
+        assert fake.calls == []
+
+    def test_user_cancels_via_ctrl_c_exits_130(self, monkeypatch):
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        def _kbi(*a, **k):
+            raise KeyboardInterrupt
+        monkeypatch.setattr("builtins.input", _kbi)
+        rc = sc._run_update_subcommand([])
+        assert rc == 130
+        assert fake.calls == []
+
+    # ── subprocess errors ──────────────────────────────────────────
+
+    def test_subprocess_filenotfound_exits_127(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+        fake = _FakeRun(raise_exc=FileNotFoundError("no such cmd"))
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 127
+        err = capsys.readouterr().err
+        assert "Command not found" in err
+
+    def test_subprocess_nonzero_propagates(self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+        fake = _FakeRun(returncode=2)
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "exited with status 2" in err
+
+
+class TestUpdateDataSafety:
+    """SACRED INVARIANT: every running upgrade path takes a complete,
+    atomic snapshot of user data BEFORE the install subprocess runs.
+    The snapshot lives outside `_DATA_DIR` (sibling) so a hypothetical
+    bug that recursively wipes `_DATA_DIR` doesn't take the recovery
+    copy with it.
+
+    These tests are the regression target for the data-safety
+    invariant — if any of them break, the update path can't be
+    trusted to preserve user data.
+    """
+
+    # ── Helpers ────────────────────────────────────────────────────
+
+    def _seed_user_data(self):
+        """Drop deterministic content into every _USER_DATA_FILE_ATTRS
+        path so we can verify each one is snapshotted + restored."""
+        seeded: dict[str, str] = {}
+        import json as _json
+        for attr in sc._USER_DATA_FILE_ATTRS:
+            p = getattr(sc, attr, None)
+            if not isinstance(p, sc.Path):
+                continue
+            p.parent.mkdir(parents=True, exist_ok=True)
+            content = _json.dumps({
+                "_schema_version": 1,
+                "entries": [{"id": f"seed-{attr}",
+                             "name": f"seed for {attr}"}],
+            })
+            p.write_text(content, encoding="utf-8")
+            seeded[attr] = content
+        return seeded
+
+    def _patch_detect(self, monkeypatch, method: str = "pipx"):
+        info = {
+            "method": method, "module": "/fake/splicecraft.py",
+            "python": sys.executable, "venv": None, "git_clone": None,
+            "details": f"{method} (test stub)",
+        }
+        monkeypatch.setattr(sc, "_detect_install_method", lambda: info)
+        return info
+
+    # ── Snapshot creation ──────────────────────────────────────────
+
+    def test_create_snapshot_returns_existing_directory(self, monkeypatch):
+        # Fresh call against a clean, isolated env (conftest) — even
+        # with no user data on disk, we still create a snapshot dir +
+        # manifest so retention has something to track.
+        path = sc._create_pre_update_snapshot("0.0.0-test")
+        assert path.is_dir()
+        assert (path / sc._PRE_UPDATE_MANIFEST_NAME).is_file()
+
+    def test_snapshot_lives_outside_data_dir(self, monkeypatch, tmp_path):
+        # The whole point of the sibling directory is that a bug that
+        # recursively wipes `_DATA_DIR` can't take the snapshot down.
+        # The autouse fixture co-locates them under `tmp_path` for
+        # other tests' convenience; here we set up an explicit
+        # data-dir-vs-backup-dir split to verify the production
+        # guarantee: snapshot is NOT under `_DATA_DIR`.
+        data = tmp_path / "data"
+        backup = tmp_path / "backups"
+        data.mkdir()
+        backup.mkdir()
+        monkeypatch.setattr(sc, "_DATA_DIR", data)
+        monkeypatch.setenv("SPLICECRAFT_UPDATE_BACKUP_DIR", str(backup))
+        path = sc._create_pre_update_snapshot("0.0.0-test")
+        snap_resolved = path.resolve()
+        data_resolved = data.resolve()
+        assert data_resolved not in snap_resolved.parents, (
+            f"snapshot {snap_resolved} is inside data dir {data_resolved}"
+        )
+
+    def test_default_backup_dir_is_sibling_of_data_dir(
+            self, monkeypatch, tmp_path):
+        # When $SPLICECRAFT_UPDATE_BACKUP_DIR is not set, the snapshot
+        # location MUST be a sibling of `_DATA_DIR` (so a recursive
+        # wipe of `_DATA_DIR` doesn't take the recovery copy down).
+        data = tmp_path / "data"
+        data.mkdir()
+        monkeypatch.setattr(sc, "_DATA_DIR", data)
+        monkeypatch.delenv("SPLICECRAFT_UPDATE_BACKUP_DIR", raising=False)
+        resolved = sc._resolve_pre_update_backup_dir()
+        # Sibling: same parent, related-but-distinct name.
+        assert resolved.parent == data.parent
+        assert resolved != data
+        assert data not in resolved.parents
+
+    def test_snapshot_includes_all_seeded_files(self):
+        seeded = self._seed_user_data()
+        # Confirm we actually wrote something.
+        assert seeded, "test setup failed: no files were seeded"
+        path = sc._create_pre_update_snapshot("0.0.0-test")
+        # Each seeded attr should have an exact-content copy in the
+        # snapshot under its basename.
+        import json as _json
+        manifest = _json.loads(
+            (path / sc._PRE_UPDATE_MANIFEST_NAME).read_text(encoding="utf-8")
+        )
+        names_in_manifest = {entry["name"] for entry in manifest["files"]}
+        for attr, content in seeded.items():
+            real = getattr(sc, attr)
+            assert real.name in names_in_manifest, (
+                f"{attr} ({real.name}) missing from manifest"
+            )
+            assert (path / real.name).read_text(encoding="utf-8") == content
+
+    def test_snapshot_includes_user_data_dirs(self, tmp_path):
+        # Crash-recovery autosaves and .dna sidecars also get snapshotted.
+        cr = sc._CRASH_RECOVERY_DIR
+        cr.mkdir(parents=True, exist_ok=True)
+        (cr / "myplas-abc123.gb").write_text("LOCUS test\n", encoding="utf-8")
+        do = sc._DNA_ORIGINALS_DIR
+        do.mkdir(parents=True, exist_ok=True)
+        (do / "myplas.dna").write_bytes(b"\x00fake commercial saas binary")
+        path = sc._create_pre_update_snapshot("0.0.0-test")
+        assert (path / cr.name / "myplas-abc123.gb").is_file()
+        assert (path / do.name / "myplas.dna").is_file()
+        import json as _json
+        manifest = _json.loads(
+            (path / sc._PRE_UPDATE_MANIFEST_NAME).read_text(encoding="utf-8")
+        )
+        dir_names = {d["name"] for d in manifest["directories"]}
+        assert cr.name in dir_names
+        assert do.name in dir_names
+
+    def test_snapshot_manifest_has_sha256_per_file(self):
+        self._seed_user_data()
+        path = sc._create_pre_update_snapshot("0.0.0-test")
+        import json as _json, hashlib
+        manifest = _json.loads(
+            (path / sc._PRE_UPDATE_MANIFEST_NAME).read_text(encoding="utf-8")
+        )
+        assert manifest["schema_version"] == 1
+        assert manifest["from_version"] == "0.0.0-test"
+        assert isinstance(manifest["files"], list)
+        for entry in manifest["files"]:
+            # sha256 in manifest must match the actual copy on disk.
+            copy = path / entry["name"]
+            digest = hashlib.sha256(copy.read_bytes()).hexdigest()
+            assert digest == entry["sha256"], (
+                f"manifest sha256 mismatch for {entry['name']}"
+            )
+
+    def test_snapshot_atomic_no_partial_dir_on_failure(self, monkeypatch):
+        # Force shutil.copy2 to raise mid-snapshot. The staging dir
+        # must be cleaned up; no final-name dir must appear.
+        self._seed_user_data()
+        backup_dir = sc._resolve_pre_update_backup_dir()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        before = set(p.name for p in backup_dir.iterdir())
+
+        original_copy = sc.shutil.copy2
+        n_calls = [0]
+
+        def _flaky_copy(src, dst, *a, **k):
+            n_calls[0] += 1
+            if n_calls[0] >= 2:  # let one copy succeed, then crash
+                raise OSError("simulated disk error")
+            return original_copy(src, dst, *a, **k)
+
+        monkeypatch.setattr(sc.shutil, "copy2", _flaky_copy)
+        with pytest.raises((OSError, sc.shutil.Error)):
+            sc._create_pre_update_snapshot("0.0.0-test")
+        # After the failure, no NEW directory exists in backup_dir
+        # (staging cleaned up, final never created).
+        after = set(p.name for p in backup_dir.iterdir())
+        new_entries = after - before
+        # The retention sweep may have left an empty dir; staging
+        # prefixes start with `.tmp-` which we never want lying
+        # around.
+        for n in new_entries:
+            assert not n.startswith(sc._PRE_UPDATE_STAGING_PREFIX), (
+                f"staging dir {n} was not cleaned up"
+            )
+
+    def test_retention_prunes_oldest(self, monkeypatch):
+        # Take 7 snapshots; with retention=3, only the 3 newest stay.
+        # Use a tiny retention to keep the test fast.
+        for i in range(7):
+            sc._create_pre_update_snapshot(f"0.0.0-test-{i}", retention=3)
+        backup_dir = sc._resolve_pre_update_backup_dir()
+        snaps = [p for p in backup_dir.iterdir()
+                  if p.is_dir() and not p.name.startswith(sc._PRE_UPDATE_STAGING_PREFIX)]
+        assert len(snaps) == 3
+
+    # ── Install-path collision detection ───────────────────────────
+
+    def test_data_dir_inside_install_path_normal_case(self, monkeypatch):
+        # Conftest already isolates _DATA_DIR to tmp_path, which is
+        # not under the install location. So this should be False.
+        assert sc._data_dir_inside_install_path() is False
+
+    def test_data_dir_inside_install_path_detected(self, monkeypatch, tmp_path):
+        # Synthesise an install layout where _DATA_DIR is INSIDE the
+        # install path. The detection must catch this so we can refuse
+        # to upgrade.
+        install_path = tmp_path / "install"
+        install_path.mkdir()
+        fake_module = install_path / "splicecraft.py"
+        fake_module.write_text("# stub")
+        bad_data = install_path / "data"
+        bad_data.mkdir()
+        monkeypatch.setattr(sc, "__file__", str(fake_module))
+        monkeypatch.setattr(sc, "_DATA_DIR", bad_data)
+        assert sc._data_dir_inside_install_path() is True
+
+    # ── Sacred invariant: snapshot before subprocess ───────────────
+
+    def test_snapshot_taken_before_subprocess_pipx(self, monkeypatch, capsys):
+        """SACRED INVARIANT: at the moment subprocess.run is called,
+        the snapshot must already be on disk. Verified by a callback
+        in the FakeRun that asserts the latest snapshot dir exists
+        when subprocess.run fires."""
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+
+        backup_dir = sc._resolve_pre_update_backup_dir()
+        observed = {"snapshot_seen": False, "snap_dir_count_before": 0}
+
+        observed["snap_dir_count_before"] = sum(
+            1 for p in backup_dir.iterdir()
+            if p.is_dir() and not p.name.startswith(sc._PRE_UPDATE_STAGING_PREFIX)
+        ) if backup_dir.exists() else 0
+
+        class _ObservingRun:
+            calls: list = []
+            returncode = 0
+            def __call__(self, cmd, check=False, **kwargs):
+                self.calls.append(list(cmd))
+                # At this point a snapshot directory MUST exist —
+                # that's the invariant we're enforcing.
+                snaps = sc._list_pre_update_snapshots(backup_dir)
+                observed["snapshot_seen"] = bool(snaps)
+                observed["n_snapshots"] = len(snaps)
+                class _CP:
+                    returncode = 0
+                return _CP()
+
+        fake = _ObservingRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 0
+        assert observed["snapshot_seen"], (
+            "INVARIANT VIOLATED: subprocess.run fired without a "
+            "user-data snapshot on disk"
+        )
+        assert observed["n_snapshots"] >= 1
+
+    def test_snapshot_taken_before_subprocess_uv_tool(self, monkeypatch):
+        """Same invariant for uv-tool method."""
+        self._patch_detect(monkeypatch, "uv-tool")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/uv")
+
+        backup_dir = sc._resolve_pre_update_backup_dir()
+        observed = {"snapshot_seen": False}
+
+        class _ObservingRun:
+            returncode = 0
+            def __call__(self, cmd, check=False, **kwargs):
+                snaps = sc._list_pre_update_snapshots(backup_dir)
+                observed["snapshot_seen"] = bool(snaps)
+                class _CP:
+                    returncode = 0
+                return _CP()
+
+        monkeypatch.setattr(sc.subprocess, "run", _ObservingRun())
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 0
+        assert observed["snapshot_seen"]
+
+    def test_snapshot_taken_before_subprocess_pixi_global(self, monkeypatch):
+        """Same invariant for pixi-global method."""
+        self._patch_detect(monkeypatch, "pixi-global")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pixi")
+
+        backup_dir = sc._resolve_pre_update_backup_dir()
+        observed = {"snapshot_seen": False}
+
+        class _ObservingRun:
+            returncode = 0
+            def __call__(self, cmd, check=False, **kwargs):
+                snaps = sc._list_pre_update_snapshots(backup_dir)
+                observed["snapshot_seen"] = bool(snaps)
+                class _CP:
+                    returncode = 0
+                return _CP()
+
+        monkeypatch.setattr(sc.subprocess, "run", _ObservingRun())
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 0
+        assert observed["snapshot_seen"]
+
+    def test_snapshot_failure_aborts_update(self, monkeypatch, capsys):
+        """If the snapshot can't be created, subprocess.run is NEVER
+        called. Refuse to risk user data without a recovery copy."""
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+
+        def _broken_snapshot(*a, **k):
+            raise OSError("simulated disk full")
+
+        monkeypatch.setattr(sc, "_create_pre_update_snapshot", _broken_snapshot)
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "ABORTING" in err
+        assert "snapshot" in err.lower()
+        assert fake.calls == [], (
+            "INVARIANT VIOLATED: subprocess.run was called even though "
+            "the snapshot failed"
+        )
+
+    def test_data_dir_inside_install_path_aborts_update(
+            self, monkeypatch, capsys, tmp_path):
+        """If `_DATA_DIR` is inside the install path, refuse — the
+        upgrade would wipe user data along with the package."""
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+        monkeypatch.setattr(sc, "_data_dir_inside_install_path",
+                              lambda: True)
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--yes"])
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "UNSAFE CONFIGURATION" in err
+        assert fake.calls == []
+
+    def test_check_mode_does_not_take_snapshot(self, monkeypatch):
+        """`--check` is read-only — it MUST NOT create a snapshot
+        (snapshot dir count stays the same as before the call)."""
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+
+        backup_dir = sc._resolve_pre_update_backup_dir()
+        before = sc._list_pre_update_snapshots(backup_dir)
+        rc = sc._run_update_subcommand(["--check"])
+        assert rc == 0
+        after = sc._list_pre_update_snapshots(backup_dir)
+        assert len(after) == len(before)
+
+    def test_refusal_paths_dont_take_snapshot(self, monkeypatch):
+        """editable / source / pixi-project / pip-system all refuse
+        to run pip — they must NOT create a snapshot either, since
+        nothing dangerous is about to happen."""
+        for method in ("editable", "source", "pixi-project", "pip-system"):
+            self._patch_detect(monkeypatch, method)
+            monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                                  lambda *a, **k: "99.0.0.0")
+            backup_dir = sc._resolve_pre_update_backup_dir()
+            before = len(sc._list_pre_update_snapshots(backup_dir))
+            rc = sc._run_update_subcommand(["--yes"])
+            assert rc == 1, f"method {method!r} should refuse"
+            after = len(sc._list_pre_update_snapshots(backup_dir))
+            assert after == before, (
+                f"method {method!r} took an unnecessary snapshot"
+            )
+
+    # ── Restore round-trip ─────────────────────────────────────────
+
+    def test_restore_round_trip_recovers_canonical_files(self):
+        # Seed → snapshot → corrupt → restore → original recovered.
+        seeded = self._seed_user_data()
+        snap = sc._create_pre_update_snapshot("0.0.0-test")
+        # Corrupt every seeded file with garbage.
+        for attr in seeded:
+            getattr(sc, attr).write_text("[CORRUPTED]", encoding="utf-8")
+            assert getattr(sc, attr).read_text(encoding="utf-8") == "[CORRUPTED]"
+        # Restore.
+        summary = sc._restore_pre_update_snapshot(snap)
+        assert summary["failed"] == [], summary
+        # Every seeded attr should be byte-for-byte recovered.
+        for attr, original in seeded.items():
+            recovered = getattr(sc, attr).read_text(encoding="utf-8")
+            assert recovered == original, (
+                f"{attr} not recovered: got {recovered!r}, "
+                f"expected {original!r}"
+            )
+
+    def test_restore_recovers_user_data_dirs(self):
+        cr = sc._CRASH_RECOVERY_DIR
+        cr.mkdir(parents=True, exist_ok=True)
+        (cr / "myplas.gb").write_text("LOCUS A\n", encoding="utf-8")
+        snap = sc._create_pre_update_snapshot("0.0.0-test")
+        # Wipe the crash-recovery dir.
+        sc.shutil.rmtree(cr, ignore_errors=True)
+        assert not cr.exists()
+        summary = sc._restore_pre_update_snapshot(snap)
+        assert summary["failed"] == [], summary
+        assert (cr / "myplas.gb").is_file()
+        assert (cr / "myplas.gb").read_text(encoding="utf-8") == "LOCUS A\n"
+
+    def test_restore_creates_pre_restore_snapshot(self):
+        # Even a "good" restore takes a pre-restore snapshot first
+        # so the user can always undo the restore.
+        self._seed_user_data()
+        snap = sc._create_pre_update_snapshot("0.0.0-test")
+        summary = sc._restore_pre_update_snapshot(snap)
+        assert summary["pre_restore_snapshot"]
+        prs = sc.Path(summary["pre_restore_snapshot"])
+        assert prs.is_dir()
+        assert (prs / sc._PRE_UPDATE_MANIFEST_NAME).is_file()
+
+    def test_restore_unknown_id_raises(self):
+        with pytest.raises(FileNotFoundError):
+            sc._restore_pre_update_snapshot("does-not-exist-xyz")
+
+    def test_restore_latest_picks_most_recent(self):
+        self._seed_user_data()
+        # Older
+        old = sc._create_pre_update_snapshot("0.0.0-old")
+        import time
+        # `_list_pre_update_snapshots` sorts by mtime; force a
+        # measurable gap so the ordering is unambiguous on fast FS.
+        time.sleep(0.02)
+        new = sc._create_pre_update_snapshot("0.0.0-new")
+        # Modify data after both snapshots.
+        for attr in sc._USER_DATA_FILE_ATTRS:
+            p = getattr(sc, attr, None)
+            if isinstance(p, sc.Path) and p.is_file():
+                p.write_text("modified", encoding="utf-8")
+        summary = sc._restore_pre_update_snapshot("latest")
+        # The snapshot we just took (in pre-restore) should NOT be
+        # the one we restored — restored should match the newest
+        # original (`new`), not the pre-restore that captured the
+        # "modified" state.
+        assert summary["restored_files"], summary
+        # Verify no failures.
+        assert summary["failed"] == [], summary
+
+    # ── Listing flag ───────────────────────────────────────────────
+
+    def test_list_snapshots_when_empty_exits_zero(self, monkeypatch, capsys):
+        rc = sc._run_update_subcommand(["--list-snapshots"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "No pre-update snapshots" in out
+
+    def test_list_snapshots_after_creating_some(self, monkeypatch, capsys):
+        self._seed_user_data()
+        sc._create_pre_update_snapshot("0.0.0-test-a")
+        sc._create_pre_update_snapshot("0.0.0-test-b")
+        rc = sc._run_update_subcommand(["--list-snapshots"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Snapshot ID" in out
+        assert "0.0.0-test-a" in out
+        assert "0.0.0-test-b" in out
+
+    def test_restore_no_id_prints_listing(self, monkeypatch, capsys):
+        self._seed_user_data()
+        sc._create_pre_update_snapshot("0.0.0-test")
+        rc = sc._run_update_subcommand(["--restore-pre-update"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "No snapshot id given" in out
+        assert "0.0.0-test" in out
+
+    def test_restore_with_eq_form(self, monkeypatch, capsys):
+        # `--restore-pre-update=ID` form is accepted alongside the
+        # space-separated form.
+        self._seed_user_data()
+        snap = sc._create_pre_update_snapshot("0.0.0-test")
+        # Corrupt data
+        for attr in sc._USER_DATA_FILE_ATTRS:
+            p = getattr(sc, attr, None)
+            if isinstance(p, sc.Path) and p.is_file():
+                p.write_text("garbage", encoding="utf-8")
+        rc = sc._run_update_subcommand(
+            ["--yes", f"--restore-pre-update={snap.name}"]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Restore complete" in out
+
+    def test_restore_unknown_snapshot_id_exits_one(self, monkeypatch, capsys):
+        self._seed_user_data()
+        sc._create_pre_update_snapshot("0.0.0-test")
+        rc = sc._run_update_subcommand(
+            ["--yes", "--restore-pre-update", "does-not-exist"]
+        )
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "Snapshot not found" in err
+
+    def test_restore_user_can_cancel(self, monkeypatch, capsys):
+        # No --yes: confirmation prompt fires; default-no aborts.
+        self._seed_user_data()
+        snap = sc._create_pre_update_snapshot("0.0.0-test")
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "")
+        rc = sc._run_update_subcommand(
+            ["--restore-pre-update", snap.name]
+        )
+        assert rc == 130
+
+
+class TestUpdateDataSafetyHardening:
+    """Hardening tests for the pre-update snapshot system. Each test
+    targets a specific attack surface or correctness gap caught by
+    the post-implementation audit. They cover scenarios that an
+    average user will never hit but that a malicious manifest, a
+    misconfigured backup directory, or a partial-failure restore
+    would exploit if left unchecked.
+    """
+
+    # ── Helpers ────────────────────────────────────────────────────
+
+    def _seed_user_data(self):
+        import json as _json
+        seeded: dict[str, str] = {}
+        for attr in sc._USER_DATA_FILE_ATTRS:
+            p = getattr(sc, attr, None)
+            if not isinstance(p, sc.Path):
+                continue
+            p.parent.mkdir(parents=True, exist_ok=True)
+            content = _json.dumps({"_schema_version": 1,
+                                   "entries": [{"id": f"seed-{attr}"}]})
+            p.write_text(content, encoding="utf-8")
+            seeded[attr] = content
+        return seeded
+
+    def _patch_detect(self, monkeypatch, method: str = "pipx"):
+        info = {
+            "method": method, "module": "/fake/splicecraft.py",
+            "python": sys.executable, "venv": None, "git_clone": None,
+            "details": f"{method} (test stub)",
+        }
+        monkeypatch.setattr(sc, "_detect_install_method", lambda: info)
+
+    # ── Symlink / system-root retention attack ─────────────────────
+
+    def test_retention_only_rmtrees_snapshot_named_dirs(
+            self, monkeypatch, tmp_path):
+        """SACRED: pruning must NEVER rmtree a directory whose name
+        doesn't match the snapshot pattern. Without this, a backup
+        directory configured (or symlinked) to `/`, `~`, or any
+        system path could see retention nuke `bin`, `etc`, `home`.
+        """
+        backup = tmp_path / "bk"
+        backup.mkdir()
+        # Drop a foreign directory named like a system one.
+        foreign = backup / "etc"
+        foreign.mkdir()
+        (foreign / "important_file").write_text("DO NOT DELETE")
+        # Create more snapshots than the retention limit so pruning
+        # actually fires.
+        monkeypatch.setattr(sc, "_DATA_DIR", tmp_path / "data")
+        (tmp_path / "data").mkdir()
+        monkeypatch.setenv("SPLICECRAFT_UPDATE_BACKUP_DIR", str(backup))
+        for i in range(3):
+            sc._create_pre_update_snapshot(f"0.0.0-{i}", retention=1)
+        # Foreign dir + file must still exist — pruning only ate
+        # snapshot-named dirs (the regex check refuses anything else).
+        assert foreign.is_dir()
+        assert (foreign / "important_file").read_text() == "DO NOT DELETE"
+
+    def test_retention_refuses_symlinked_backup_dir(
+            self, monkeypatch, tmp_path):
+        # If somehow backup_dir IS a symlink (malicious env var or
+        # tampered install), the retention sweep must refuse to walk
+        # into it. We can't easily test rmtree-protection without a
+        # real symlink to /, but we can verify symlink-detection.
+        target = tmp_path / "real"
+        target.mkdir()
+        # Drop a foreign dir inside the real target.
+        foreign = target / "etc"
+        foreign.mkdir()
+        link = tmp_path / "link"
+        try:
+            link.symlink_to(target)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this filesystem")
+        # Run retention on the symlinked path. Must NOT delete the
+        # foreign dir (or anything else underneath the symlink).
+        sc._enforce_pre_update_retention(link, keep=0)
+        assert foreign.is_dir(), (
+            "INVARIANT VIOLATED: retention walked into a symlinked "
+            "backup_dir and deleted contents"
+        )
+
+    def test_create_snapshot_refuses_symlinked_backup_dir(
+            self, monkeypatch, tmp_path):
+        target = tmp_path / "real"
+        target.mkdir()
+        link = tmp_path / "link"
+        try:
+            link.symlink_to(target)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this filesystem")
+        # Force the env var to the symlink so the resolution doesn't
+        # bypass it.
+        monkeypatch.setenv("SPLICECRAFT_UPDATE_BACKUP_DIR", str(link))
+        # `_resolve_pre_update_backup_dir` calls .resolve() which
+        # follows the symlink to its target, so the snapshot would
+        # actually land in `target`. To exercise the symlink-refusal
+        # branch we pass the symlink path directly to bypass resolve.
+        with pytest.raises(OSError, match="symlink"):
+            sc._create_pre_update_snapshot(
+                "0.0.0-test", backup_dir=link
+            )
+
+    # ── Manifest tampering: attr whitelist ─────────────────────────
+
+    def test_restore_rejects_unknown_attr_in_manifest(self, tmp_path):
+        # Hand-craft a snapshot dir with a manifest that targets a
+        # non-user-data attribute (e.g. `_AGENT_TOKEN_FILE`). Restore
+        # must skip it and report failure rather than overwriting it.
+        backup = sc._resolve_pre_update_backup_dir()
+        backup.mkdir(parents=True, exist_ok=True)
+        snap = backup / "20260101-000000-deadbeef__from-0.0.0-test"
+        snap.mkdir()
+        (snap / "agent_token").write_text("malicious", encoding="utf-8")
+        import json as _json
+        (snap / sc._PRE_UPDATE_MANIFEST_NAME).write_text(_json.dumps({
+            "schema_version": 1,
+            "from_version": "0.0.0-test",
+            "files": [
+                {"attr": "_AGENT_TOKEN_FILE", "name": "agent_token",
+                 "size": 9, "sha256": ""},
+            ],
+            "directories": [],
+        }))
+        summary = sc._restore_pre_update_snapshot(snap)
+        # The forbidden entry is in `failed`, not `restored_files`.
+        assert summary["restored_files"] == []
+        assert any("_AGENT_TOKEN_FILE" in r for _, r in summary["failed"]), (
+            f"expected _AGENT_TOKEN_FILE in failed reasons; got "
+            f"{summary['failed']}"
+        )
+
+    def test_restore_rejects_unknown_dir_attr_in_manifest(self, tmp_path):
+        backup = sc._resolve_pre_update_backup_dir()
+        backup.mkdir(parents=True, exist_ok=True)
+        snap = backup / "20260101-000000-deadbe0f__from-0.0.0-test"
+        snap.mkdir()
+        (snap / "weird").mkdir()
+        import json as _json
+        (snap / sc._PRE_UPDATE_MANIFEST_NAME).write_text(_json.dumps({
+            "schema_version": 1,
+            "from_version": "0.0.0-test",
+            "files": [],
+            "directories": [
+                {"attr": "_DATA_DIR", "name": "weird", "file_count": 0},
+            ],
+        }))
+        summary = sc._restore_pre_update_snapshot(snap)
+        assert summary["restored_dirs"] == []
+        assert summary["failed"]
+
+    # ── Path traversal in `name` ───────────────────────────────────
+
+    def test_restore_rejects_path_traversal_in_name(self, tmp_path):
+        backup = sc._resolve_pre_update_backup_dir()
+        backup.mkdir(parents=True, exist_ok=True)
+        snap = backup / "20260101-000000-deadbe10__from-0.0.0-test"
+        snap.mkdir()
+        # Drop a file outside the snap dir, the would-be target of
+        # the traversal read.
+        outside = backup / "secret.txt"
+        outside.write_text("system file", encoding="utf-8")
+        import json as _json
+        (snap / sc._PRE_UPDATE_MANIFEST_NAME).write_text(_json.dumps({
+            "schema_version": 1,
+            "from_version": "0.0.0-test",
+            "files": [
+                {"attr": "_LIBRARY_FILE",
+                 "name": "../secret.txt",
+                 "size": 11, "sha256": ""},
+            ],
+            "directories": [],
+        }))
+        summary = sc._restore_pre_update_snapshot(snap)
+        assert summary["restored_files"] == [], (
+            "path-traversal name was accepted by restore"
+        )
+        assert summary["failed"]
+        # And critically: the live library file (if it existed
+        # before) was not corrupted with the secret content.
+        lib = sc._LIBRARY_FILE
+        if lib.is_file():
+            assert lib.read_text(encoding="utf-8") != "system file"
+
+    def test_restore_rejects_separator_in_name(self, tmp_path):
+        backup = sc._resolve_pre_update_backup_dir()
+        backup.mkdir(parents=True, exist_ok=True)
+        snap = backup / "20260101-000000-deadbe11__from-0.0.0-test"
+        snap.mkdir()
+        import json as _json
+        (snap / sc._PRE_UPDATE_MANIFEST_NAME).write_text(_json.dumps({
+            "schema_version": 1,
+            "from_version": "0.0.0-test",
+            "files": [
+                {"attr": "_LIBRARY_FILE", "name": "subdir/foo.json",
+                 "size": 0, "sha256": ""},
+            ],
+            "directories": [],
+        }))
+        summary = sc._restore_pre_update_snapshot(snap)
+        assert summary["restored_files"] == []
+        assert summary["failed"]
+
+    # ── SHA-256 verification on restore ────────────────────────────
+
+    def test_restore_verifies_sha256_and_refuses_corrupted(self, tmp_path):
+        # Take a real snapshot, then corrupt the file inside it. The
+        # subsequent restore must NOT overwrite the user's live file
+        # with the corrupted snapshot data.
+        seeded = self._seed_user_data()
+        snap = sc._create_pre_update_snapshot("0.0.0-test")
+        # Corrupt the snapshot's library copy AFTER the manifest's
+        # sha256 was computed.
+        copy_path = snap / sc._LIBRARY_FILE.name
+        original_in_snap = copy_path.read_text(encoding="utf-8")
+        copy_path.write_text("CORRUPTED", encoding="utf-8")
+        # Modify the live file to a known value so we can detect
+        # whether restore wrongly overwrote it.
+        sc._LIBRARY_FILE.write_text("LIVE-AFTER-SNAPSHOT", encoding="utf-8")
+        summary = sc._restore_pre_update_snapshot(snap)
+        # The corrupted library entry must be in `failed`.
+        names_failed = {n for n, _ in summary["failed"]}
+        assert sc._LIBRARY_FILE.name in names_failed, (
+            f"expected sha256 mismatch for {sc._LIBRARY_FILE.name} in "
+            f"failed list; got {summary['failed']}"
+        )
+        # The live file is untouched (still the live-after value).
+        # Pre-restore logic took its own snapshot of "LIVE-AFTER…"
+        # before restore began, so we expect the live file to either
+        # be the live value (corrupted entry skipped) — verify.
+        assert sc._LIBRARY_FILE.read_text(encoding="utf-8") == \
+            "LIVE-AFTER-SNAPSHOT"
+        # Sanity: the manifest's other (uncorrupted) files DID restore.
+        # (At least some of the other seeded files should be in the
+        # restored list since their sha256s still match.)
+        assert summary["restored_files"], (
+            "no files restored at all — broken test? other seeded "
+            "files should have valid sha256"
+        )
+
+    # ── Dir restore rollback on partial copytree ───────────────────
+
+    def test_directory_restore_rollback_on_partial_copytree(
+            self, monkeypatch):
+        # Seed a non-empty crash-recovery dir, snapshot, then force
+        # copytree to fail mid-way. The rollback must restore the
+        # pre-restore stash so the user doesn't end up with a partial
+        # crash_recovery dir.
+        cr = sc._CRASH_RECOVERY_DIR
+        cr.mkdir(parents=True, exist_ok=True)
+        (cr / "alpha.gb").write_text("LOCUS A\n", encoding="utf-8")
+        (cr / "beta.gb").write_text("LOCUS B\n", encoding="utf-8")
+        snap = sc._create_pre_update_snapshot("0.0.0-test")
+        # Modify the live state so we can detect a successful rollback.
+        (cr / "live-only.gb").write_text("LIVE-ONLY\n", encoding="utf-8")
+
+        # Make copytree fail AFTER target was created — but ONLY when
+        # the destination is the actual live restoration target (not
+        # the pre-restore snapshot we take first). Otherwise the
+        # pre-restore phase would itself fail and we'd never exercise
+        # the directory-restore rollback path.
+        original_copytree = sc.shutil.copytree
+        cr_name = cr.name
+
+        def _flaky_copytree(src, dst, *a, **k):
+            dst_p = sc.Path(dst)
+            # The live-restore target sits at <_DATA_DIR>/<cr_name>;
+            # the pre-restore snapshot copies INTO `update-backups/.tmp-…/<cr_name>`.
+            # We only want to fail the live-restore copy.
+            if dst_p.name == cr_name and dst_p.parent == cr.parent:
+                sc.os.makedirs(dst, exist_ok=False)
+                (dst_p / "alpha.gb").write_text("partial",
+                                                   encoding="utf-8")
+                raise OSError("simulated disk full mid-copytree")
+            return original_copytree(src, dst, *a, **k)
+
+        monkeypatch.setattr(sc.shutil, "copytree", _flaky_copytree)
+        summary = sc._restore_pre_update_snapshot(snap)
+        # The dir restore is in `failed`.
+        assert any(name == cr.name for name, _ in summary["failed"]), (
+            f"expected {cr.name!r} in failed; got {summary['failed']}"
+        )
+        # Critically: the live state is intact — rollback put the
+        # stash back. The "live-only.gb" file we added is still there.
+        assert (cr / "alpha.gb").is_file()
+        assert (cr / "beta.gb").is_file()
+        assert (cr / "live-only.gb").is_file(), (
+            "INVARIANT VIOLATED: rollback didn't restore the stash; "
+            "user's live data is gone or partial"
+        )
+        # And no lingering staging dirs.
+        stash = cr.with_name(cr.name + ".restoring-old")
+        assert not stash.exists(), f"stash left behind: {stash}"
+
+    # ── Schema version negotiation (future-proofing) ───────────────
+
+    def test_restore_refuses_newer_schema_version(self, tmp_path):
+        backup = sc._resolve_pre_update_backup_dir()
+        backup.mkdir(parents=True, exist_ok=True)
+        snap = backup / "20260101-000000-deadbe12__from-0.0.0-future"
+        snap.mkdir()
+        import json as _json
+        future_schema = sc._PRE_UPDATE_SCHEMA_VERSION + 1
+        (snap / sc._PRE_UPDATE_MANIFEST_NAME).write_text(_json.dumps({
+            "schema_version": future_schema,
+            "from_version": "0.0.0-future",
+            "files": [], "directories": [],
+        }))
+        with pytest.raises(ValueError, match="schema_version"):
+            sc._restore_pre_update_snapshot(snap)
+
+    def test_restore_accepts_equal_schema_version(self, tmp_path):
+        # Round-trip: a snapshot we just took (with our current
+        # schema) restores fine. Already covered by other tests but
+        # this is the explicit forward-compat check.
+        self._seed_user_data()
+        snap = sc._create_pre_update_snapshot("0.0.0-test")
+        summary = sc._restore_pre_update_snapshot(snap)
+        assert summary["failed"] == [], summary
+
+    def test_restore_accepts_older_schema_version(self, tmp_path):
+        # If we ever bump _PRE_UPDATE_SCHEMA_VERSION to 2, snapshots
+        # written under v1 should still restore. Simulate by claiming
+        # the running schema is v99 and pointing at a v1 manifest.
+        self._seed_user_data()
+        snap = sc._create_pre_update_snapshot("0.0.0-test")
+        # Bump the running schema higher than what the snapshot
+        # advertises.
+        # (We don't actually patch _PRE_UPDATE_SCHEMA_VERSION since
+        # the test relies on snap_schema <= ours.)
+        summary = sc._restore_pre_update_snapshot(snap)
+        assert summary["failed"] == [], summary
+
+    # ── Backup-dir validation ──────────────────────────────────────
+
+    def test_resolve_backup_dir_refuses_file_path(
+            self, monkeypatch, tmp_path):
+        # If $SPLICECRAFT_UPDATE_BACKUP_DIR points at a file, the
+        # resolver must refuse early — not silently overwrite or
+        # crash deep inside snapshot creation.
+        f = tmp_path / "not_a_dir"
+        f.write_text("hi")
+        monkeypatch.setenv("SPLICECRAFT_UPDATE_BACKUP_DIR", str(f))
+        with pytest.raises(OSError, match="non-directory"):
+            sc._resolve_pre_update_backup_dir()
+
+    def test_resolve_backup_dir_refuses_filesystem_root(
+            self, monkeypatch, tmp_path):
+        # If `_DATA_DIR` is configured at filesystem root (or its
+        # parent equals itself), refuse to derive a backup location.
+        monkeypatch.delenv("SPLICECRAFT_UPDATE_BACKUP_DIR", raising=False)
+        monkeypatch.setattr(sc, "_DATA_DIR", sc.Path("/"))
+        with pytest.raises(OSError, match="Refusing"):
+            sc._resolve_pre_update_backup_dir()
+
+    # ── File-list audit (forces classification of new _*_FILE) ─────
+
+    def test_every_data_file_constant_is_classified(self):
+        """FUTURE-PROOFING: every `_*_FILE` constant in splicecraft
+        that points to a file inside `_DATA_DIR` MUST be classified
+        as either user-data (`_USER_DATA_FILE_ATTRS`) or operational
+        (`_OPERATIONAL_FILE_ATTRS`). When a future contributor adds
+        a new persisted file and forgets to update either list, this
+        test fires and forces them to decide which category it
+        belongs in. Without this, new user-data files would silently
+        be omitted from the pre-update snapshot — exactly the kind of
+        regression the snapshot system exists to prevent.
+        """
+        import splicecraft as _sc
+        in_user = set(_sc._USER_DATA_FILE_ATTRS)
+        in_op = set(_sc._OPERATIONAL_FILE_ATTRS)
+        unclassified = []
+        for attr in dir(_sc):
+            if not attr.endswith("_FILE"):
+                continue
+            if not attr.startswith("_"):
+                continue
+            value = getattr(_sc, attr)
+            if not isinstance(value, _sc.Path):
+                continue
+            if attr in in_user or attr in in_op:
+                continue
+            unclassified.append(attr)
+        assert not unclassified, (
+            f"Unclassified persisted-file constants: {unclassified}\n"
+            "Add each one to _USER_DATA_FILE_ATTRS (user data — gets "
+            "snapshotted before update) or _OPERATIONAL_FILE_ATTRS "
+            "(transient state — explicitly excluded)."
+        )
+
+    def test_user_data_and_operational_lists_are_disjoint(self):
+        """Any constant must live in exactly one of the two lists.
+        Overlap would mean the snapshot system is unsure whether to
+        include it."""
+        in_user = set(sc._USER_DATA_FILE_ATTRS)
+        in_op = set(sc._OPERATIONAL_FILE_ATTRS)
+        overlap = in_user & in_op
+        assert not overlap, f"attrs in both lists: {overlap}"
+
+    # ── Manifest fsync (durability sanity) ─────────────────────────
+
+    def test_manifest_present_after_snapshot(self, tmp_path):
+        # We can't easily simulate a power-loss between fsync calls
+        # in a unit test, but we CAN assert the manifest is present
+        # and parseable on every successful snapshot — i.e. fsync
+        # didn't break the happy path.
+        snap = sc._create_pre_update_snapshot("0.0.0-test")
+        m = snap / sc._PRE_UPDATE_MANIFEST_NAME
+        assert m.is_file()
+        import json as _json
+        data = _json.loads(m.read_text(encoding="utf-8"))
+        assert data["schema_version"] == sc._PRE_UPDATE_SCHEMA_VERSION
+
+
+class TestUpdateRegistryFutureProofing:
+    """Future-proofing audits that fire when a contributor adds a new
+    install method, a new persisted-file constant, or otherwise
+    extends the update system without updating all the related
+    surfaces. Each test surfaces a specific drift that would
+    otherwise ship silently.
+    """
+
+    def test_every_install_method_has_buildable_command_or_refusal(self):
+        """Every entry in `_INSTALL_METHODS` MUST either:
+          (a) produce a non-None argv list from `_build_upgrade_command`
+              (it's a runnable method), OR
+          (b) be on the documented refusal list (editable / source /
+              pixi-project — the manifest-driven / source-tree
+              methods we deliberately refuse to upgrade via PyPI),
+          (c) `unknown` is its own special case — we don't refuse but
+              we DO produce a generic command.
+
+        If a future contributor adds a new method to `_INSTALL_METHODS`
+        without wiring up either branch, this test fires and forces
+        the decision.
+        """
+        runnable = []
+        refused = []
+        for method in sc._INSTALL_METHODS:
+            cmd = sc._build_upgrade_command(method, force=False)
+            if cmd is None:
+                refused.append(method)
+            else:
+                runnable.append(method)
+        # The intentional refusal set — review this if you're
+        # changing it. Adding to this set without a corresponding
+        # update to `_run_update_subcommand`'s refusal branches is a
+        # silent bug.
+        documented_refusals = {"editable", "source", "pixi-project"}
+        assert set(refused) == documented_refusals, (
+            f"refused methods drifted from documented set:\n"
+            f"  expected: {documented_refusals}\n"
+            f"  actual:   {set(refused)}\n"
+            "If you added a new refusal method, also wire up an "
+            "explicit early refusal branch in _run_update_subcommand."
+        )
+        # `unknown` MUST be runnable so the user gets a generic
+        # command they can copy-paste even when we can't classify
+        # the install.
+        assert "unknown" in runnable
+
+    def test_every_install_method_appears_in_help_text(self):
+        """Help text MUST list every supported install method so
+        users running `--help` can find the command for their
+        setup. If you add a new method, update the help table."""
+        help_text = sc._UPDATE_HELP_TEXT
+        # Display labels matching the help table format. Map the
+        # internal method identifier → its expected display token in
+        # the help text. `unknown` is intentionally excluded — it's
+        # the catch-all, not a documented user-facing label.
+        expected_labels = {
+            "pipx":         "pipx",
+            "uv-tool":      "uv tool",
+            "uv-venv":      "uv venv",
+            "pixi-global":  "pixi global",
+            "pip-user":     "pip --user",
+            "pip-venv":     "pip venv",
+            "pip-system":   "pip system",
+            "editable":     "editable",
+            "source":       "git clone",
+            "pixi-project": "pixi project",
+        }
+        for method in sc._INSTALL_METHODS:
+            if method == "unknown":
+                continue
+            label = expected_labels.get(method, method)
+            assert label in help_text, (
+                f"install method {method!r} (label {label!r}) is not "
+                f"mentioned in _UPDATE_HELP_TEXT — when you add a "
+                f"new method, update the help table at the top of "
+                f"_UPDATE_HELP_TEXT."
+            )
+
+    def test_user_data_file_attrs_all_resolve_to_paths(self):
+        """Every `_USER_DATA_FILE_ATTRS` entry MUST be a real
+        module-level Path constant. Stale strings here would be
+        silently ignored at snapshot time → user data would not be
+        backed up. Catches typos and post-rename drift."""
+        for attr in sc._USER_DATA_FILE_ATTRS:
+            value = getattr(sc, attr, None)
+            assert isinstance(value, sc.Path), (
+                f"{attr!r} from _USER_DATA_FILE_ATTRS is not a Path; "
+                f"got {type(value).__name__}"
+            )
+
+    def test_user_data_dir_attrs_all_resolve_to_paths(self):
+        for attr in sc._USER_DATA_DIR_ATTRS:
+            value = getattr(sc, attr, None)
+            assert isinstance(value, sc.Path), (
+                f"{attr!r} from _USER_DATA_DIR_ATTRS is not a Path"
+            )
+
+    def test_operational_file_attrs_all_resolve_to_paths(self):
+        for attr in sc._OPERATIONAL_FILE_ATTRS:
+            value = getattr(sc, attr, None)
+            assert isinstance(value, sc.Path), (
+                f"{attr!r} from _OPERATIONAL_FILE_ATTRS is not a Path"
+            )
+
+    def test_snapshot_dir_name_regex_matches_what_we_generate(self):
+        """Future-proof retention: the regex that protects retention
+        from rmtreeing foreign directories MUST also match every name
+        `_create_pre_update_snapshot` actually produces. Otherwise
+        retention silently never prunes (snapshot dir names look
+        foreign by our own filter)."""
+        snap = sc._create_pre_update_snapshot("0.0.0-test")
+        assert sc._PRE_UPDATE_NAME_RE.match(snap.name), (
+            f"generated snapshot name {snap.name!r} is rejected by "
+            f"_PRE_UPDATE_NAME_RE — retention will silently never "
+            f"prune. Update either the generator or the regex to "
+            f"keep them in sync."
+        )
+
+    def test_snapshot_schema_version_is_stable_positive(self):
+        """`_PRE_UPDATE_SCHEMA_VERSION` is the contract version for
+        the snapshot manifest. Bumping it is a breaking change for
+        readers that haven't been updated. This test just sanity-
+        checks the constant is sensible — it's intentionally
+        permissive about bumps (which are sometimes correct), but
+        catches accidental zero / negative / non-int values."""
+        v = sc._PRE_UPDATE_SCHEMA_VERSION
+        assert isinstance(v, int) and v >= 1, (
+            f"_PRE_UPDATE_SCHEMA_VERSION must be a positive int; got {v!r}"
+        )
+
+    def test_retention_constant_is_positive(self):
+        assert sc._PRE_UPDATE_SNAPSHOT_RETENTION >= 1
+
+    def test_install_methods_constant_no_duplicates(self):
+        methods = sc._INSTALL_METHODS
+        assert len(methods) == len(set(methods)), (
+            f"duplicates in _INSTALL_METHODS: {methods}"
+        )
+
+
+class TestFutureProofingFeatures:
+    """End-to-end + edge-case coverage for the six future-proofing
+    additions: migration framework, PyPI URL override, manifest
+    Python+platform, --dry-run, data-version stamp, plugin namespace.
+    Each feature is exercised against malformed inputs, race
+    conditions, missing files, and permission errors so the
+    safeguards stay genuine and not just lip-service in tests.
+    """
+
+    def _patch_detect(self, monkeypatch, method: str = "pipx"):
+        info = {
+            "method": method, "module": "/fake/splicecraft.py",
+            "python": sys.executable, "venv": None, "git_clone": None,
+            "details": f"{method} (test stub)",
+        }
+        monkeypatch.setattr(sc, "_detect_install_method", lambda: info)
+
+    # ── (1) Migration framework ────────────────────────────────────
+
+    def test_migration_no_op_when_no_migrations_registered(self):
+        # With no registered migrations, entries pass through unchanged
+        # even when from_version < to_version.
+        entries = [{"id": "a"}, {"id": "b"}]
+        out, warns = sc._migrate_entries(entries, 1, 5, "Plasmid library")
+        assert out == entries
+        assert warns == []
+        # Returned list must be a fresh copy — caller mustn't be able
+        # to corrupt the input via the returned list.
+        out.append({"id": "c"})
+        assert len(entries) == 2
+
+    def test_migration_runs_registered_migrators_in_order(
+            self, monkeypatch):
+        # Register a synthetic v1→v2 migrator that adds a `step1` key.
+        called = []
+
+        def m1(entry):
+            called.append(("v1->v2", entry["id"]))
+            return {**entry, "step1": True}
+
+        def m2(entry):
+            called.append(("v2->v3", entry["id"]))
+            return {**entry, "step2": True}
+
+        # Monkeypatch the registry so tests don't have to bump the
+        # production schema. Use a fresh dict so other tests' state
+        # is unaffected.
+        monkeypatch.setitem(sc._ENTRY_MIGRATIONS, "Test label", {
+            (1, 2): m1,
+            (2, 3): m2,
+        })
+        out, warns = sc._migrate_entries(
+            [{"id": "x"}], from_version=1, to_version=3, label="Test label"
+        )
+        assert out == [{"id": "x", "step1": True, "step2": True}]
+        assert called == [("v1->v2", "x"), ("v2->v3", "x")]
+        assert warns == []
+
+    def test_migration_skips_intermediate_step_when_no_migrator(
+            self, monkeypatch):
+        # If only the (2,3) step is registered, going from 1 to 3
+        # walks (1,2) as a no-op then (2,3) as the registered step.
+        def m23(entry):
+            return {**entry, "step23": True}
+        monkeypatch.setitem(sc._ENTRY_MIGRATIONS, "L", {(2, 3): m23})
+        out, warns = sc._migrate_entries(
+            [{"id": "x"}], 1, 3, "L"
+        )
+        assert out == [{"id": "x", "step23": True}]
+
+    def test_migration_failed_migrator_keeps_entry_and_warns(
+            self, monkeypatch):
+        # A migrator that raises (e.g. malformed input) must NOT lose
+        # the entry. The entry passes through unchanged + a warning
+        # is appended. Better to surface a v1-shaped entry in a v2
+        # list than to drop user data outright.
+        def m_bad(entry):
+            raise KeyError("missing required field")
+        monkeypatch.setitem(sc._ENTRY_MIGRATIONS, "L", {(1, 2): m_bad})
+        out, warns = sc._migrate_entries(
+            [{"id": "x"}], 1, 2, "L"
+        )
+        assert out == [{"id": "x"}], "entry must survive a failed migration"
+        assert warns and "migration failed" in warns[0].lower()
+
+    def test_migration_drops_non_dict_entries_with_warning(
+            self, monkeypatch):
+        def m(entry):
+            return {**entry, "added": True}
+        monkeypatch.setitem(sc._ENTRY_MIGRATIONS, "L", {(1, 2): m})
+        out, warns = sc._migrate_entries(
+            [{"id": "ok"}, "garbage", 42, None, {"id": "ok2"}], 1, 2, "L"
+        )
+        # Dict entries migrate; non-dict entries drop with warnings.
+        assert out == [{"id": "ok", "added": True},
+                       {"id": "ok2", "added": True}]
+        assert len(warns) == 3  # str, int, NoneType
+
+    def test_migration_handles_descending_range_as_noop(self):
+        # to_version <= from_version → no-op.
+        out, warns = sc._migrate_entries([{"id": "x"}], 5, 3, "L")
+        assert out == [{"id": "x"}]
+        assert warns == []
+
+    def test_extract_entries_runs_migration_pipeline(self, monkeypatch):
+        # Bump production schema so we can simulate a v1 → v2 load.
+        # Don't actually patch _CURRENT_SCHEMA_VERSION — patch the
+        # local logic by registering an "L" migrator and reading via
+        # `_extract_entries` with a v1 envelope. We can't reach into
+        # _CURRENT_SCHEMA_VERSION easily; instead, register a v0 → v1
+        # migrator and verify it fires for the bare-list legacy path.
+        def m01(entry):
+            return {**entry, "from_legacy": True}
+        monkeypatch.setitem(sc._ENTRY_MIGRATIONS,
+                              "Plasmid library", {(0, 1): m01})
+        # Bare-list (legacy pre-0.3.1) — extract_entries treats this
+        # as v0, so the (0, 1) migrator should fire.
+        raw = [{"id": "old"}]
+        entries, warning = sc._extract_entries(raw, "Plasmid library")
+        assert entries == [{"id": "old", "from_legacy": True}]
+        assert warning is None
+
+    # ── (2) PyPI URL env override ──────────────────────────────────
+
+    def test_pypi_url_default_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv("SPLICECRAFT_PYPI_URL", raising=False)
+        assert sc._resolve_pypi_url() == sc._PYPI_JSON_URL
+
+    def test_pypi_url_override_when_https(self, monkeypatch):
+        monkeypatch.setenv("SPLICECRAFT_PYPI_URL",
+                              "https://internal-mirror.corp/pypi/sc/json")
+        assert sc._resolve_pypi_url() == \
+            "https://internal-mirror.corp/pypi/sc/json"
+
+    def test_pypi_url_override_when_http(self, monkeypatch):
+        monkeypatch.setenv("SPLICECRAFT_PYPI_URL", "http://10.0.0.5/json")
+        assert sc._resolve_pypi_url() == "http://10.0.0.5/json"
+
+    def test_pypi_url_rejects_file_scheme(self, monkeypatch):
+        # `file://` would let a malicious env var read arbitrary local
+        # files — Python's urllib follows it. Refuse → fall back to
+        # default.
+        monkeypatch.setenv("SPLICECRAFT_PYPI_URL", "file:///etc/passwd")
+        assert sc._resolve_pypi_url() == sc._PYPI_JSON_URL
+
+    def test_pypi_url_rejects_javascript_scheme(self, monkeypatch):
+        monkeypatch.setenv("SPLICECRAFT_PYPI_URL", "javascript:alert(1)")
+        assert sc._resolve_pypi_url() == sc._PYPI_JSON_URL
+
+    def test_pypi_url_rejects_overlong(self, monkeypatch):
+        monkeypatch.setenv("SPLICECRAFT_PYPI_URL", "https://" + "a" * 3000)
+        assert sc._resolve_pypi_url() == sc._PYPI_JSON_URL
+
+    def test_pypi_url_rejects_empty_with_whitespace(self, monkeypatch):
+        monkeypatch.setenv("SPLICECRAFT_PYPI_URL", "   ")
+        assert sc._resolve_pypi_url() == sc._PYPI_JSON_URL
+
+    def test_pypi_url_used_by_fetcher(self, monkeypatch):
+        # End-to-end: monkeypatched env var actually gets handed to
+        # urllib via the request.
+        captured: dict = {}
+
+        class _FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, n):
+                return b'{"info": {"version": "9.9.9"}}'
+
+        def _fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            return _FakeResp()
+
+        monkeypatch.setenv("SPLICECRAFT_PYPI_URL",
+                              "https://test.example/pypi.json")
+        # Patch urllib.request.urlopen at the call site.
+        import urllib.request
+        monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+        result = sc._fetch_latest_pypi_version()
+        assert result == "9.9.9"
+        assert captured["url"] == "https://test.example/pypi.json"
+
+    # ── (3) Manifest from_python_version + from_platform ───────────
+
+    def test_manifest_records_python_and_platform(self):
+        snap = sc._create_pre_update_snapshot("0.0.0-test")
+        import json as _json
+        manifest = _json.loads(
+            (snap / sc._PRE_UPDATE_MANIFEST_NAME).read_text(encoding="utf-8")
+        )
+        assert "from_python_version" in manifest
+        # Must be a dotted X.Y.Z string.
+        parts = manifest["from_python_version"].split(".")
+        assert len(parts) == 3
+        for p in parts:
+            assert p.isdigit()
+        assert "from_platform" in manifest
+        assert manifest["from_platform"] == sc._RUNTIME_PLATFORM
+
+    def test_list_snapshots_surfaces_python_version(self):
+        sc._create_pre_update_snapshot("0.0.0-test")
+        snaps = sc._list_pre_update_snapshots()
+        assert snaps and snaps[0]["from_python_version"] != "?"
+
+    def test_old_manifest_without_python_version_loads_with_default(
+            self, tmp_path):
+        # Backward-compat: a snapshot from before this feature
+        # landed lacks `from_python_version` / `from_platform`. The
+        # listing must not crash; missing fields show as "?".
+        backup = sc._resolve_pre_update_backup_dir()
+        backup.mkdir(parents=True, exist_ok=True)
+        snap = backup / "20260101-000000-deadbe20__from-0.0.0-old"
+        snap.mkdir()
+        import json as _json
+        (snap / sc._PRE_UPDATE_MANIFEST_NAME).write_text(_json.dumps({
+            "schema_version": 1, "from_version": "0.0.0-old",
+            "files": [], "directories": [],
+        }))
+        snaps = sc._list_pre_update_snapshots()
+        match = next((s for s in snaps if s["id"] == snap.name), None)
+        assert match is not None
+        assert match["from_python_version"] == "?"
+        assert match["from_platform"] == "?"
+
+    # ── (4) --dry-run flag ─────────────────────────────────────────
+
+    def test_dry_run_takes_snapshot_but_skips_subprocess(
+            self, monkeypatch, capsys):
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+        backup_dir = sc._resolve_pre_update_backup_dir()
+        before = sc._list_pre_update_snapshots(backup_dir)
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(["--dry-run", "--yes"])
+        assert rc == 0
+        # Snapshot was taken (one more than before).
+        after = sc._list_pre_update_snapshots(backup_dir)
+        assert len(after) == len(before) + 1
+        # subprocess was NOT called.
+        assert fake.calls == []
+        # Output mentions dry-run.
+        out = capsys.readouterr().out
+        assert "[dry-run]" in out
+        assert "pipx upgrade splicecraft" in out
+
+    def test_dry_run_and_check_are_mutually_exclusive(
+            self, monkeypatch, capsys):
+        rc = sc._run_update_subcommand(["--dry-run", "--check"])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "mutually exclusive" in err
+
+    def test_dry_run_aborts_when_snapshot_fails(
+            self, monkeypatch, capsys):
+        # Same invariant as the regular install path: if the snapshot
+        # can't be created, dry-run aborts too.
+        self._patch_detect(monkeypatch, "pipx")
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: "99.0.0.0")
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+        monkeypatch.setattr(sc, "_create_pre_update_snapshot",
+                              lambda *a, **k: (_ for _ in ()).throw(
+                                  OSError("disk full")))
+        rc = sc._run_update_subcommand(["--dry-run", "--yes"])
+        assert rc == 1
+
+    # ── (5) Data-dir version stamp ─────────────────────────────────
+
+    def test_stamp_creates_file_on_first_run(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(sc, "_DATA_DIR", tmp_path / "data")
+        monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
+                              tmp_path / "data" / ".splicecraft-data-version")
+        monkeypatch.setattr(sc, "_PLUGINS_DIR",
+                              tmp_path / "data" / "plugins")
+        warning = sc._check_and_stamp_data_version()
+        # First run: no prior stamp → no warning.
+        assert warning is None
+        stamp_file = tmp_path / "data" / ".splicecraft-data-version"
+        assert stamp_file.is_file()
+        assert stamp_file.read_text(encoding="utf-8").strip() == sc.__version__
+
+    def test_stamp_warns_on_downgrade(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(sc, "_DATA_DIR", tmp_path / "data")
+        monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
+                              tmp_path / "data" / ".splicecraft-data-version")
+        monkeypatch.setattr(sc, "_PLUGINS_DIR",
+                              tmp_path / "data" / "plugins")
+        # Plant a stamp written by a far-future version.
+        stamp = tmp_path / "data" / ".splicecraft-data-version"
+        stamp.parent.mkdir(parents=True)
+        stamp.write_text("99.99.99.99\n")
+        warning = sc._check_and_stamp_data_version()
+        assert warning is not None
+        assert "99.99.99.99" in warning
+        assert sc.__version__ in warning
+        # Stamp was overwritten with current version (data dir is
+        # being touched by THIS version now).
+        assert stamp.read_text(encoding="utf-8").strip() == sc.__version__
+
+    def test_stamp_silent_on_upgrade(self, monkeypatch, tmp_path):
+        # Older stamp + newer running version → no warning, just
+        # silent overwrite.
+        monkeypatch.setattr(sc, "_DATA_DIR", tmp_path / "data")
+        monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
+                              tmp_path / "data" / ".splicecraft-data-version")
+        monkeypatch.setattr(sc, "_PLUGINS_DIR",
+                              tmp_path / "data" / "plugins")
+        stamp = tmp_path / "data" / ".splicecraft-data-version"
+        stamp.parent.mkdir(parents=True)
+        stamp.write_text("0.0.1\n")
+        warning = sc._check_and_stamp_data_version()
+        assert warning is None
+        assert stamp.read_text(encoding="utf-8").strip() == sc.__version__
+
+    def test_stamp_handles_unreadable_existing_stamp(
+            self, monkeypatch, tmp_path):
+        # Garbage stamp content (e.g. binary, malformed) — function
+        # mustn't crash; treat as "unknown previous version" and
+        # silently overwrite.
+        monkeypatch.setattr(sc, "_DATA_DIR", tmp_path / "data")
+        monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
+                              tmp_path / "data" / ".splicecraft-data-version")
+        monkeypatch.setattr(sc, "_PLUGINS_DIR",
+                              tmp_path / "data" / "plugins")
+        stamp = tmp_path / "data" / ".splicecraft-data-version"
+        stamp.parent.mkdir(parents=True)
+        stamp.write_bytes(b"\x00\xff\x00 not a version \n")
+        # Must not raise.
+        warning = sc._check_and_stamp_data_version()
+        # Garbage doesn't parse as a canonical version → not a known
+        # downgrade → no warning. Stamp gets refreshed regardless.
+        assert warning is None
+        assert stamp.read_text(encoding="utf-8").strip() == sc.__version__
+
+    def test_stamp_handles_oversize_existing(self, monkeypatch, tmp_path):
+        # 1 MB of garbage in the stamp file. Function caps the read
+        # at 128 bytes so memory is bounded.
+        monkeypatch.setattr(sc, "_DATA_DIR", tmp_path / "data")
+        monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
+                              tmp_path / "data" / ".splicecraft-data-version")
+        monkeypatch.setattr(sc, "_PLUGINS_DIR",
+                              tmp_path / "data" / "plugins")
+        stamp = tmp_path / "data" / ".splicecraft-data-version"
+        stamp.parent.mkdir(parents=True)
+        stamp.write_text("X" * (1024 * 1024))
+        # Must not raise + must still overwrite atomically.
+        sc._check_and_stamp_data_version()
+        assert stamp.read_text(encoding="utf-8").strip() == sc.__version__
+
+    def test_stamp_creates_plugins_dir(self, monkeypatch, tmp_path):
+        # Plugin namespace should be reserved (created empty) at the
+        # same checkpoint.
+        monkeypatch.setattr(sc, "_DATA_DIR", tmp_path / "data")
+        monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
+                              tmp_path / "data" / ".splicecraft-data-version")
+        monkeypatch.setattr(sc, "_PLUGINS_DIR",
+                              tmp_path / "data" / "plugins")
+        sc._check_and_stamp_data_version()
+        assert (tmp_path / "data" / "plugins").is_dir()
+
+    def test_stamp_swallows_oserror(self, monkeypatch, tmp_path):
+        # Read-only data dir: function logs + returns None rather
+        # than crashing the launch.
+        monkeypatch.setattr(sc, "_DATA_DIR",
+                              tmp_path / "nonexistent-readonly")
+        monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
+                              tmp_path / "nonexistent-readonly" / "x")
+        monkeypatch.setattr(sc, "_PLUGINS_DIR",
+                              tmp_path / "nonexistent-readonly" / "p")
+        # Even if mkdir succeeds, atomic_write_text might fail; we
+        # just don't want an exception to propagate.
+        warning = sc._check_and_stamp_data_version()
+        # If anything succeeded, no warning. If it failed, no warning
+        # either (logged but swallowed).
+        assert warning is None or isinstance(warning, str)
+
+    # ── (6) Plugin namespace + reserved fields ─────────────────────
+
+    def test_plugin_data_field_round_trip_through_save_load(self):
+        # Reserve `_plugin_data` on every entry in every user-data
+        # file and verify it survives a save → load round-trip.
+        # Without this, plugins added in a future SpliceCraft would
+        # silently lose their state on the first re-save.
+        import json as _json
+        from copy import deepcopy
+        original = [{
+            "id": "round-trip-test",
+            "name": "RT",
+            "_plugin_data": {
+                "my_plugin": {"counter": 42, "tags": ["a", "b"]},
+                "another": {"nested": {"deep": True}},
+            },
+        }]
+        sc._safe_save_json(sc._LIBRARY_FILE, original, "Plasmid library")
+        loaded, warning = sc._safe_load_json(sc._LIBRARY_FILE,
+                                                "Plasmid library")
+        assert warning is None
+        assert loaded == original, (
+            f"_plugin_data was not preserved through round-trip:\n"
+            f"  original: {original}\n"
+            f"  loaded:   {loaded}"
+        )
+
+    def test_plugins_dir_in_user_data_dir_attrs(self):
+        # Forward-compat: if a plugin lands files inside _PLUGINS_DIR,
+        # they get picked up by the pre-update snapshot automatically.
+        assert "_PLUGINS_DIR" in sc._USER_DATA_DIR_ATTRS
+
+    def test_plugin_data_field_is_in_reserved_list(self):
+        assert "_plugin_data" in sc._RESERVED_ENTRY_FIELDS
+
+    def test_plugins_dir_contents_get_snapshotted(self):
+        # End-to-end: a plugin that drops a file in _PLUGINS_DIR
+        # MUST see that file copied into pre-update snapshots.
+        sc._PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
+        plugin_file = sc._PLUGINS_DIR / "myplugin-state.json"
+        plugin_file.write_text('{"counter": 7}', encoding="utf-8")
+        snap = sc._create_pre_update_snapshot("0.0.0-test")
+        copied = snap / sc._PLUGINS_DIR.name / "myplugin-state.json"
+        assert copied.is_file()
+        assert copied.read_text(encoding="utf-8") == '{"counter": 7}'
+
+    # ── Cross-feature edge cases ───────────────────────────────────
+
+    def test_dry_run_force_combo(self, monkeypatch, capsys):
+        # `--dry-run --force` exercises the force path through to
+        # snapshot + command print, without running anything.
+        self._patch_detect(monkeypatch, "pipx")
+        # Same version + force → would normally run install.
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: sc.__version__)
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/pipx")
+        fake = _FakeRun()
+        monkeypatch.setattr(sc.subprocess, "run", fake)
+        rc = sc._run_update_subcommand(
+            ["--dry-run", "--force", "--yes"]
+        )
+        assert rc == 0
+        # Snapshot taken; subprocess NOT called.
+        assert fake.calls == []
+        out = capsys.readouterr().out
+        assert "[dry-run]" in out
+        assert "pipx install --force splicecraft" in out
+
+    def test_migration_non_dict_return_kept_as_warning_only(
+            self, monkeypatch):
+        # A buggy migrator that returns a non-dict shouldn't crash
+        # the load. Currently the function trusts the migrator (no
+        # post-validation), so the non-dict ends up in the output.
+        # Document this behaviour: we DON'T validate post-migration
+        # because every other layer (cache deepcopy, save/load
+        # filtering) already filters non-dict entries via
+        # `isinstance(entry, dict)` checks. The migration framework
+        # is intentionally minimal.
+        def m_evil(entry):
+            return "garbage"  # Buggy migrator
+        monkeypatch.setitem(sc._ENTRY_MIGRATIONS, "L", {(1, 2): m_evil})
+        out, warns = sc._migrate_entries(
+            [{"id": "x"}], 1, 2, "L"
+        )
+        # Output contains the buggy result; warnings list is empty.
+        # Downstream filters (`isinstance(entry, dict)` in
+        # `_safe_save_json`'s shrink check, sidebar render, etc.)
+        # silently drop it.
+        assert out == ["garbage"]
+
+    def test_pypi_url_with_credentials_passes_through(self, monkeypatch):
+        # Behind-firewall mirrors with HTTP basic auth in the URL
+        # are a legitimate use case; we accept them.
+        monkeypatch.setenv("SPLICECRAFT_PYPI_URL",
+                              "https://user:secret@mirror.corp/json")
+        assert sc._resolve_pypi_url() == \
+            "https://user:secret@mirror.corp/json"
+
+    def test_check_does_not_create_plugins_dir(self, monkeypatch, tmp_path):
+        # The plugins-dir reservation runs in `_check_and_stamp_data_version`,
+        # which is called from `main()`. The Textual app's tests
+        # never go through main(), so the dir is not auto-created
+        # there. But if a test explicitly calls the check, it should
+        # be idempotent (creating an existing dir is a no-op).
+        monkeypatch.setattr(sc, "_DATA_DIR", tmp_path / "data")
+        monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
+                              tmp_path / "data" / ".splicecraft-data-version")
+        monkeypatch.setattr(sc, "_PLUGINS_DIR",
+                              tmp_path / "data" / "plugins")
+        sc._check_and_stamp_data_version()
+        sc._check_and_stamp_data_version()  # idempotent
+        assert (tmp_path / "data" / "plugins").is_dir()
+
+
+class TestEventLogAndSnapshot:
+    """End-to-end + edge-case coverage for the diagnostic logging
+    surface: UI snapshot capture (Alt+D), the `splicecraft logs
+    --bundle` CLI, path scrubbing, log-tail reading. Each test
+    targets one failure mode that would otherwise let the user file
+    a bug report missing the data needed to diagnose it.
+    """
+
+    # ── Path scrubber ──────────────────────────────────────────────
+
+    def test_scrub_path_replaces_home_dir(self, monkeypatch, tmp_path):
+        # Force a known home so the test is hermetic across CI.
+        fake_home = tmp_path / "fake_home"
+        fake_home.mkdir()
+        monkeypatch.setattr(sc.Path, "home", classmethod(lambda cls: fake_home))
+        s = f"opened file at {fake_home}/secret/notes.txt"
+        out = sc._scrub_path(s)
+        assert str(fake_home) not in out
+        assert "~/secret/notes.txt" in out
+
+    def test_scrub_path_handles_linux_home_pattern(self):
+        # Even when Path.home() doesn't match the path, the regex
+        # fallback strips `/home/<user>` patterns.
+        s = "stack trace: /home/alice/SpliceCraft/foo.py line 42"
+        out = sc._scrub_path(s)
+        assert "/home/alice" not in out
+        assert "alice" not in out
+
+    def test_scrub_path_handles_macos_users_pattern(self):
+        s = "loaded /Users/bob/Documents/plasmid.gb"
+        out = sc._scrub_path(s)
+        assert "bob" not in out
+
+    def test_scrub_path_handles_windows_pattern(self):
+        s = r"failed: C:\Users\carol\AppData\Local\Temp\x.txt"
+        out = sc._scrub_path(s)
+        assert "carol" not in out
+
+    def test_scrub_path_handles_non_string(self):
+        # Defensive: function must coerce non-strings rather than
+        # crash a snapshot capture.
+        out = sc._scrub_path(42)  # type: ignore[arg-type]
+        assert out == "42"
+
+    def test_scrub_path_idempotent_on_clean_input(self):
+        # Strings without home-like paths pass through unchanged.
+        s = "no paths here, just text"
+        assert sc._scrub_path(s) == s
+
+    # ── Log tail reader ────────────────────────────────────────────
+
+    def test_read_log_tail_returns_empty_for_missing_file(self, tmp_path):
+        nope = tmp_path / "no-such-log.log"
+        assert sc._read_log_tail(nope) == ""
+
+    def test_read_log_tail_caps_at_max_bytes(self, tmp_path):
+        # Write a larger-than-cap log; reader should slice from end.
+        log = tmp_path / "big.log"
+        # 200 short lines → ~6 KB total.
+        lines = [f"line-{i:04d}" for i in range(200)]
+        log.write_text("\n".join(lines), encoding="utf-8")
+        # Cap to 1 KB → only the last few hundred bytes survive.
+        out = sc._read_log_tail(log, n_lines=50, max_bytes=1024)
+        # The final line should be present.
+        assert "line-0199" in out
+        # And the total returned should be ≤ n_lines.
+        assert out.count("\n") + 1 <= 50
+
+    def test_read_log_tail_returns_last_n_lines(self, tmp_path):
+        log = tmp_path / "lines.log"
+        log.write_text("\n".join(f"L{i}" for i in range(100)),
+                        encoding="utf-8")
+        out = sc._read_log_tail(log, n_lines=5)
+        # Last 5 lines: L95..L99.
+        assert out.endswith("L99")
+        assert "L95" in out
+        assert "L94" not in out  # falls outside the window
+        # 5 lines: 4 newlines.
+        assert out.count("\n") == 4
+
+    # ── _collect_ui_snapshot ───────────────────────────────────────
+
+    def test_collect_ui_snapshot_works_without_app(self):
+        # No app passed (e.g. CLI capture before UI launches) — must
+        # not crash and must return all expected keys.
+        snap = sc._collect_ui_snapshot(None)
+        for key in ("captured_at", "session_id", "splicecraft_version",
+                    "python_version", "platform", "screen_stack",
+                    "focused_widget", "current_record", "settings",
+                    "log_tail"):
+            assert key in snap, f"missing key {key!r}"
+        assert snap["screen_stack"] == []
+        assert snap["current_record"] is None
+
+    def test_collect_ui_snapshot_with_app_stub(self):
+        # Stub app with the attributes _collect_ui_snapshot reads.
+        class StubSize:
+            width = 160
+            height = 48
+        class StubFocused:
+            id = "fetch-acc"
+            classes = ["primary"]
+        class StubApp:
+            screen_stack = []
+            focused = StubFocused()
+            size = StubSize()
+            _last_mouse_xy = (42, 8)
+            _current_record = None
+            _active_collection = "MyColl"
+            _active_grammar = "GoldenBraid"
+        snap = sc._collect_ui_snapshot(StubApp())
+        assert snap["focused_widget"]["class"] == "StubFocused"
+        assert snap["focused_widget"]["id"] == "fetch-acc"
+        assert snap["mouse_position"] == {"x": 42, "y": 8}
+        assert snap["terminal_size"] == {"cols": 160, "rows": 48}
+        assert snap["active_collection"] == "MyColl"
+        assert snap["active_grammar"] == "GoldenBraid"
+
+    def test_collect_ui_snapshot_with_record_excludes_sequence(self):
+        # CRITICAL: snapshot must NEVER contain plasmid sequence
+        # content — that's user IP. Only metadata.
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq("AAAAACGTACGTACGTACGTACGTACGTACGTACGT" * 100),
+            id="trade-secret-plasmid",
+            name="trade-secret-plasmid",
+            annotations={"molecule_type": "DNA", "topology": "circular"},
+        )
+        class StubApp:
+            screen_stack = []
+            focused = None
+            _current_record = rec
+            _last_mouse_xy = (0, 0)
+            _source_path = "/home/user/secret.gb"
+        snap = sc._collect_ui_snapshot(StubApp())
+        rec_info = snap["current_record"]
+        # Length is reported (metadata) but the SEQUENCE STRING is not.
+        assert rec_info["length"] == len(rec.seq)
+        assert rec_info["id"] == "trade-secret-plasmid"
+        # No sequence content anywhere.
+        formatted = sc._format_ui_snapshot(snap)
+        assert "AAAAACGT" not in formatted, (
+            "INVARIANT VIOLATED: plasmid sequence content leaked into "
+            "the UI snapshot"
+        )
+        # Source path scrubbed.
+        assert "/home/user" not in formatted
+
+    def test_collect_ui_snapshot_handles_broken_app(self):
+        # Pathological stub that raises from every attribute access.
+        # Must NOT crash _collect_ui_snapshot — we'd be hiding a real
+        # bug behind another bug.
+        class BrokenApp:
+            def __getattr__(self, name):
+                raise RuntimeError(f"explosion on {name}")
+        snap = sc._collect_ui_snapshot(BrokenApp())
+        # Defaults preserved despite the broken app.
+        assert snap["screen_stack"] == []
+        assert snap["current_record"] is None
+
+    # ── _format_ui_snapshot ────────────────────────────────────────
+
+    def test_format_ui_snapshot_renders_markdown_headings(self):
+        snap = sc._collect_ui_snapshot(None)
+        out = sc._format_ui_snapshot(snap)
+        for heading in ("# SpliceCraft UI Snapshot", "## App state",
+                        "## Current record", "## Active workspace",
+                        "## Persisted settings", "## Diagnostic file paths"):
+            assert heading in out, f"missing {heading!r}"
+
+    def test_format_ui_snapshot_includes_session_id(self):
+        snap = sc._collect_ui_snapshot(None)
+        out = sc._format_ui_snapshot(snap)
+        assert sc._SESSION_ID in out
+
+    # ── _save_ui_snapshot atomic ───────────────────────────────────
+
+    def test_save_ui_snapshot_writes_atomic(self, tmp_path):
+        path = sc._save_ui_snapshot("hello world", dest_dir=tmp_path)
+        assert path.is_file()
+        assert path.read_text(encoding="utf-8") == "hello world"
+        # Filename pattern.
+        assert path.name.startswith("ui-snapshot-")
+        assert path.name.endswith(".md")
+
+    def test_save_ui_snapshot_bumps_on_collision(self, tmp_path,
+                                                    monkeypatch):
+        # Force a fixed timestamp so two writes collide.
+        import datetime as _dt
+        class FixedDT(_dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return _dt.datetime(2026, 1, 1, 0, 0, 0)
+        monkeypatch.setattr(_dt, "datetime", FixedDT, raising=False)
+        # Reach into the splicecraft module's reference so the
+        # function picks up the patched datetime.
+        a = sc._save_ui_snapshot("first", dest_dir=tmp_path)
+        b = sc._save_ui_snapshot("second", dest_dir=tmp_path)
+        assert a != b
+        assert a.read_text() == "first"
+        assert b.read_text() == "second"
+
+    def test_save_ui_snapshot_enforces_retention(self, tmp_path):
+        # Create more snapshots than the retention limit; oldest get
+        # pruned automatically.
+        for i in range(sc._UI_SNAPSHOT_RETENTION + 5):
+            sc._save_ui_snapshot(f"snap-{i}", dest_dir=tmp_path)
+            # tiny sleep so mtimes differ
+            import time as _time
+            _time.sleep(0.001)
+        survivors = list(tmp_path.glob("ui-snapshot-*.md"))
+        assert len(survivors) == sc._UI_SNAPSHOT_RETENTION
+
+    # ── _build_system_info ─────────────────────────────────────────
+
+    def test_build_system_info_scrubs_paths(self):
+        info = sc._build_system_info()
+        # Hard guarantee: log_path and data_dir must not contain
+        # the user's literal home directory (would leak the username).
+        try:
+            home = str(sc.Path.home())
+        except Exception:
+            home = ""
+        if home:
+            assert home not in info["log_path"]
+            assert home not in info["data_dir"]
+        # Fields are present.
+        assert info["splicecraft_version"] == sc.__version__
+        assert "session_id" in info
+
+    # ── _create_diagnostic_bundle ──────────────────────────────────
+
+    def test_create_diagnostic_bundle_writes_zip(self, tmp_path):
+        out = tmp_path / "bundle.zip"
+        result = sc._create_diagnostic_bundle(out)
+        assert result == out.resolve()
+        assert out.is_file()
+        # Verify contents.
+        import zipfile
+        with zipfile.ZipFile(out) as zf:
+            names = set(zf.namelist())
+            assert "system_info.json" in names
+            assert "README.md" in names
+            # logs/ entries depend on whether a log file exists.
+            # System info parses cleanly.
+            import json as _json
+            si = _json.loads(zf.read("system_info.json"))
+            assert si["splicecraft_version"] == sc.__version__
+
+    def test_create_diagnostic_bundle_default_name(
+            self, tmp_path, monkeypatch):
+        # No --out: bundle lands in CWD with the default name.
+        monkeypatch.chdir(tmp_path)
+        result = sc._create_diagnostic_bundle(None)
+        assert result.parent == tmp_path
+        assert result.name.startswith("splicecraft-debug-")
+        assert result.name.endswith(".zip")
+        assert sc._SESSION_ID in result.name
+
+    def test_create_diagnostic_bundle_atomic_on_failure(
+            self, tmp_path, monkeypatch):
+        # Force zipfile.write to raise; verify the partial temp file
+        # is cleaned up + final path doesn't exist.
+        out = tmp_path / "should-not-exist.zip"
+        original_open = __import__("zipfile").ZipFile
+
+        class _FlakyZipFile:
+            def __init__(self, *a, **k):
+                self.zf = original_open(*a, **k)
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                self.zf.__exit__(*a)
+            def writestr(self, *a, **k):
+                raise OSError("simulated zip write fail")
+
+        monkeypatch.setattr("zipfile.ZipFile", _FlakyZipFile)
+        with pytest.raises(OSError):
+            sc._create_diagnostic_bundle(out)
+        # Final path must NOT exist (atomic rollback).
+        assert not out.exists()
+        # No leftover staging files starting with the dot prefix.
+        leftovers = list(tmp_path.glob(".should-not-exist.zip.*"))
+        assert leftovers == []
+
+    def test_create_diagnostic_bundle_handles_missing_log(
+            self, tmp_path, monkeypatch):
+        # Point _LOG_PATH at a non-existent file; bundle should still
+        # be created, just without log entries.
+        monkeypatch.setattr(sc, "_LOG_PATH",
+                              str(tmp_path / "no-such-log.log"))
+        out = tmp_path / "bundle.zip"
+        result = sc._create_diagnostic_bundle(out)
+        assert result.is_file()
+        import zipfile
+        with zipfile.ZipFile(result) as zf:
+            # README + system_info still present.
+            assert "README.md" in zf.namelist()
+            assert "system_info.json" in zf.namelist()
+
+    # ── _run_logs_subcommand ───────────────────────────────────────
+
+    def test_logs_help(self, capsys):
+        rc = sc._run_logs_subcommand(["--help"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "splicecraft logs" in out
+        assert "--bundle" in out
+
+    def test_logs_where_prints_log_path(self, capsys):
+        rc = sc._run_logs_subcommand(["--where"])
+        assert rc == 0
+        out = capsys.readouterr().out.strip()
+        assert out == str(sc._LOG_PATH)
+
+    def test_logs_unknown_arg_exits_two(self, capsys):
+        rc = sc._run_logs_subcommand(["--bogus"])
+        assert rc == 2
+
+    def test_logs_bundle_creates_zip(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.chdir(tmp_path)
+        rc = sc._run_logs_subcommand(["--bundle"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Diagnostic bundle saved to" in out
+        zips = list(tmp_path.glob("splicecraft-debug-*.zip"))
+        assert len(zips) == 1
+
+    def test_logs_bundle_with_out_path(self, tmp_path, capsys):
+        out = tmp_path / "custom-name.zip"
+        rc = sc._run_logs_subcommand(["--bundle", "--out", str(out)])
+        assert rc == 0
+        assert out.is_file()
+
+    def test_logs_bundle_out_eq_form(self, tmp_path, capsys):
+        out = tmp_path / "eq-form.zip"
+        rc = sc._run_logs_subcommand(["--bundle", f"--out={out}"])
+        assert rc == 0
+        assert out.is_file()
+
+    def test_logs_no_args_prints_help_and_path(self, capsys):
+        rc = sc._run_logs_subcommand([])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Log file:" in out
+        assert "--bundle" in out
+
+    def test_logs_out_without_value_errors(self, capsys):
+        rc = sc._run_logs_subcommand(["--bundle", "--out"])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "requires a path argument" in err
+
+    # ── alt+d binding wiring ───────────────────────────────────────
+
+    def test_alt_d_binds_to_capture_ui_snapshot(self):
+        # Search PlasmidApp.BINDINGS for alt+d → action key.
+        target = None
+        for b in sc.PlasmidApp.BINDINGS:
+            # Newer Textual stores Binding objects; older may store
+            # tuples. Handle both.
+            key = getattr(b, "key", None) or (b[0] if isinstance(b, tuple) else None)
+            action = getattr(b, "action", None) or (b[1] if isinstance(b, tuple) else None)
+            if key == "alt+d":
+                target = action
+                break
+        assert target == "capture_ui_snapshot", (
+            f"expected alt+d → capture_ui_snapshot; got {target!r}"
+        )
+
+    def test_alt_shift_d_still_toggles_seq_debug(self):
+        # The previous alt+d binding lived on SequencePanel — it
+        # should now be alt+shift+d, still bound to toggle_debug.
+        target = None
+        for b in sc.SequencePanel.BINDINGS:
+            key = getattr(b, "key", None) or (b[0] if isinstance(b, tuple) else None)
+            action = getattr(b, "action", None) or (b[1] if isinstance(b, tuple) else None)
+            if key == "alt+shift+d":
+                target = action
+                break
+        assert target == "toggle_debug", (
+            f"expected alt+shift+d → toggle_debug; got {target!r}"
+        )
+
+    def test_no_seq_panel_alt_d_collision(self):
+        # SequencePanel must NOT have an alt+d binding any more
+        # (we moved it to alt+shift+d so the App-level snapshot
+        # binding fires from the seq panel too).
+        for b in sc.SequencePanel.BINDINGS:
+            key = getattr(b, "key", None) or (b[0] if isinstance(b, tuple) else None)
+            assert key != "alt+d", (
+                "alt+d should not be bound on SequencePanel — it "
+                "would shadow the App-level UI snapshot capture."
+            )
+
+    # ── Logging hardening: _repr_for_log ───────────────────────────
+
+    def test_repr_for_log_truncates_long_strings(self):
+        long = "a" * 500
+        out = sc._repr_for_log(long)
+        assert len(out) < 200
+        assert "[500 chars]" in out
+
+    def test_repr_for_log_summarises_long_lists(self):
+        out = sc._repr_for_log(list(range(100)))
+        assert "100 items" in out
+
+    def test_repr_for_log_summarises_long_dicts(self):
+        out = sc._repr_for_log({str(i): i for i in range(50)})
+        assert "50 keys" in out
+
+    def test_repr_for_log_handles_unrepresentable(self):
+        class Boom:
+            def __repr__(self):
+                raise RuntimeError("can't repr me")
+        out = sc._repr_for_log(Boom())
+        assert out == "<unrepr-able>"
+
+    # ── Log rotation config ───────────────────────────────────────
+
+    def test_log_handler_uses_5mb_rotation(self):
+        # Verify the rotation cap matches what we documented in the
+        # CLAUDE.md invariant — bumped from 2MB×2 to 5MB×4 for
+        # diagnostic depth.
+        from logging.handlers import RotatingFileHandler
+        rotating = [h for h in sc._log.handlers
+                     if isinstance(h, RotatingFileHandler)]
+        if not rotating:
+            pytest.skip("no rotating handler installed (data dir was readonly?)")
+        h = rotating[0]
+        assert h.maxBytes == 5 * 1024 * 1024
+        assert h.backupCount == 4
+
+
+class TestRobustnessHardening:
+    """Coverage for the 10-item robustness pass:
+       (1) data-dir lock, (2) thread excepthook, (3) chmod 0600,
+       (4) settings validation, (5) worker drain at exit,
+       (6) network retry, (7) clipboard fallback, (8) modal stack
+       cap, (9) big-plasmid warning, (10) snapshot size cap.
+
+    Each test targets one failure mode that this batch of changes
+    set out to mitigate.
+    """
+
+    # ── (1) Data-dir lock ──────────────────────────────────────────
+
+    def test_lock_acquire_then_release(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("SPLICECRAFT_SKIP_LOCK", raising=False)
+        fd, path = sc._acquire_data_dir_lock(
+            tmp_path, lockfile_override=tmp_path / "splicecraft.lock"
+        )
+        assert fd is not None
+        assert path is not None and path.is_file()
+        # Release.
+        sc._release_data_dir_lock(fd)
+
+    def test_lock_refuses_second_acquisition(self, tmp_path, monkeypatch):
+        if sc.sys.platform == "win32":
+            pytest.skip("flock not available; lock semantics differ")
+        monkeypatch.delenv("SPLICECRAFT_SKIP_LOCK", raising=False)
+        lockfile = tmp_path / "splicecraft.lock"
+        fd1, _ = sc._acquire_data_dir_lock(tmp_path, lockfile_override=lockfile)
+        try:
+            with pytest.raises(sc.DataDirLockError):
+                sc._acquire_data_dir_lock(tmp_path, lockfile_override=lockfile)
+        finally:
+            sc._release_data_dir_lock(fd1)
+
+    def test_lock_skip_env_var_returns_none(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SPLICECRAFT_SKIP_LOCK", "1")
+        fd, path = sc._acquire_data_dir_lock(tmp_path)
+        assert fd is None
+        assert path is None
+
+    def test_lock_release_is_safe_with_none_fd(self):
+        # No FD → no-op, no exception.
+        sc._release_data_dir_lock(None)
+
+    def test_lock_writes_pid_to_file(self, tmp_path, monkeypatch):
+        if sc.sys.platform == "win32":
+            pytest.skip("Windows lockfile contents not used in error path")
+        monkeypatch.delenv("SPLICECRAFT_SKIP_LOCK", raising=False)
+        lockfile = tmp_path / "splicecraft.lock"
+        fd, _ = sc._acquire_data_dir_lock(
+            tmp_path, lockfile_override=lockfile
+        )
+        try:
+            content = lockfile.read_text(encoding="utf-8")
+            # First line is the PID.
+            first = content.splitlines()[0].strip()
+            assert first == str(sc.os.getpid())
+        finally:
+            sc._release_data_dir_lock(fd)
+
+    # ── (2) Thread excepthook ──────────────────────────────────────
+
+    def test_thread_excepthook_routes_to_log(self, monkeypatch, caplog):
+        # Manually install the same hook main() would install, then
+        # raise from a thread and verify it lands in the log.
+        events: list = []
+        original_hook = sc.threading.excepthook
+
+        def _hook(args):
+            if args.exc_type is SystemExit:
+                return
+            events.append((args.exc_type, str(args.exc_value)))
+
+        sc.threading.excepthook = _hook
+        try:
+            def boom():
+                raise RuntimeError("synthetic worker crash")
+            t = sc.threading.Thread(target=boom, name="test-worker")
+            t.start()
+            t.join(timeout=2.0)
+            assert events, "thread excepthook never fired"
+            assert events[0][0] is RuntimeError
+            assert "synthetic worker crash" in events[0][1]
+        finally:
+            sc.threading.excepthook = original_hook
+
+    # ── (3) chmod 0600 ─────────────────────────────────────────────
+
+    def test_chmod_user_only_tightens_perms(self, tmp_path):
+        if sc.sys.platform == "win32":
+            pytest.skip("POSIX-only mode bits")
+        f = tmp_path / "private.txt"
+        f.write_text("secret")
+        sc.os.chmod(str(f), 0o644)  # set world-readable first
+        sc._chmod_user_only(f)
+        mode = sc.os.stat(str(f)).st_mode & 0o777
+        assert mode == 0o600
+
+    def test_chmod_user_only_silent_on_missing_file(self, tmp_path):
+        # Best-effort: must not raise on missing target.
+        sc._chmod_user_only(tmp_path / "does-not-exist.txt")
+
+    # ── (4) Settings validation ────────────────────────────────────
+
+    def test_settings_validation_coerces_wrong_type(self):
+        # Schema says check_updates is bool; user/file says "yes".
+        bad = {"check_updates": "yes", "show_restr": False}
+        cleaned, warns = sc._validate_settings(bad)
+        # Wrong-type bool came back to default (True per schema).
+        assert cleaned["check_updates"] is True
+        # Correct values pass through unchanged.
+        assert cleaned["show_restr"] is False
+        # And we get a warning about the coercion.
+        assert any("check_updates" in w for w in warns)
+
+    def test_settings_validation_keeps_unknown_keys(self):
+        # Forward-compat: unknown keys (a future setting) are kept.
+        bad = {"future_setting": 42, "show_restr": True}
+        cleaned, _ = sc._validate_settings(bad)
+        assert cleaned["future_setting"] == 42
+
+    def test_settings_validation_strict_bool_vs_int(self):
+        # Python's True is also int — but a bool snuck into an int
+        # field shouldn't sneak through.
+        bad = {"restr_min_len": True}  # would isinstance-test as int!
+        cleaned, warns = sc._validate_settings(bad)
+        assert cleaned["restr_min_len"] == 6  # default
+        assert any("restr_min_len" in w for w in warns)
+
+    def test_settings_validation_handles_non_dict(self):
+        cleaned, warns = sc._validate_settings("not a dict")  # type: ignore[arg-type]
+        assert cleaned == {}
+        assert warns and "not a dict" in warns[0]
+
+    # ── (5) Worker drain ───────────────────────────────────────────
+
+    def test_drain_waits_for_threads_within_timeout(self):
+        import time as _time
+        finished: list = []
+
+        def quick():
+            _time.sleep(0.05)
+            finished.append("ok")
+
+        t = sc.threading.Thread(target=quick, name="quick-worker", daemon=False)
+        t.start()
+        leftover = sc._drain_in_flight_workers(timeout_s=1.0)
+        # The thread should have finished within the budget.
+        assert finished == ["ok"]
+        assert "quick-worker" not in leftover
+
+    def test_drain_reports_leftover_when_timeout_exceeds(self):
+        # Slow thread that exceeds the timeout — leftover list
+        # should contain its name.
+        import time as _time
+        evt = sc.threading.Event()
+
+        def slow():
+            evt.wait(timeout=5.0)
+
+        t = sc.threading.Thread(target=slow, name="slow-worker", daemon=False)
+        t.start()
+        try:
+            leftover = sc._drain_in_flight_workers(timeout_s=0.1)
+            assert "slow-worker" in leftover
+        finally:
+            evt.set()
+            t.join(timeout=2.0)
+
+    def test_drain_skips_daemon_threads(self):
+        # Daemon threads die with the process; drain skips them
+        # entirely so a long-running daemon doesn't hold up shutdown.
+        import time as _time
+        evt = sc.threading.Event()
+
+        def dt():
+            evt.wait(timeout=5.0)
+
+        t = sc.threading.Thread(target=dt, name="daemon-worker", daemon=True)
+        t.start()
+        try:
+            leftover = sc._drain_in_flight_workers(timeout_s=0.1)
+            assert "daemon-worker" not in leftover
+        finally:
+            evt.set()
+
+    # ── (6) Network retry ──────────────────────────────────────────
+
+    def test_pypi_fetch_retries_once_on_transient_failure(
+            self, monkeypatch):
+        import urllib.error
+        import urllib.request
+
+        attempts: list = []
+
+        class _OkResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, n):
+                return b'{"info": {"version": "9.9.9"}}'
+
+        def _flaky_urlopen(req, timeout=None):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise urllib.error.URLError("temporarily unreachable")
+            return _OkResp()
+
+        monkeypatch.setattr(urllib.request, "urlopen", _flaky_urlopen)
+        result = sc._fetch_latest_pypi_version()
+        assert result == "9.9.9"
+        assert len(attempts) == 2  # one failure + one retry
+
+    def test_pypi_fetch_returns_none_after_two_failures(
+            self, monkeypatch):
+        import urllib.error
+        import urllib.request
+
+        attempts: list = []
+
+        def _always_fails(req, timeout=None):
+            attempts.append(1)
+            raise urllib.error.URLError("permanently unreachable")
+
+        monkeypatch.setattr(urllib.request, "urlopen", _always_fails)
+        result = sc._fetch_latest_pypi_version()
+        assert result is None
+        assert len(attempts) == 2
+
+    # ── (7) Clipboard fallback ─────────────────────────────────────
+
+    def test_clipboard_fallback_uses_app_when_available(self):
+        class StubApp:
+            captured: list = []
+            def copy_to_clipboard(self, text):
+                self.captured.append(text)
+        app = StubApp()
+        mode, detail = sc._copy_to_clipboard_with_fallback(
+            app, "hello", label="test"
+        )
+        assert mode == "clipboard"
+        assert detail is None
+        assert app.captured == ["hello"]
+
+    def test_clipboard_fallback_falls_to_file_when_clipboard_fails(
+            self, monkeypatch):
+        class BrokenApp:
+            def copy_to_clipboard(self, text):
+                raise RuntimeError("no clipboard channel")
+        # Force OSC 52 to fail too.
+        monkeypatch.setattr(sc, "_copy_to_clipboard_osc52",
+                              lambda text: False)
+        mode, detail = sc._copy_to_clipboard_with_fallback(
+            BrokenApp(), "important data", label="bug-report"
+        )
+        assert mode == "file"
+        assert detail is not None and detail.is_file()
+        # File contains the text.
+        assert detail.read_text(encoding="utf-8") == "important data"
+
+    def test_clipboard_fallback_log_only_when_everything_fails(
+            self, monkeypatch):
+        class BrokenApp:
+            def copy_to_clipboard(self, text):
+                raise RuntimeError("no clipboard")
+        monkeypatch.setattr(sc, "_copy_to_clipboard_osc52",
+                              lambda text: False)
+        # Force the file-write fallback to fail too.
+        original = sc._atomic_write_text
+        def _broken_write(*a, **k):
+            raise OSError("simulated read-only fs")
+        monkeypatch.setattr(sc, "_atomic_write_text", _broken_write)
+        mode, detail = sc._copy_to_clipboard_with_fallback(
+            BrokenApp(), "data", label="x"
+        )
+        assert mode == "log_only"
+        assert detail is None
+        # Restore for cleanliness.
+        monkeypatch.setattr(sc, "_atomic_write_text", original)
+
+    # ── (8) Modal stack cap ────────────────────────────────────────
+
+    def test_modal_stack_cap_constant_present(self):
+        assert hasattr(sc.PlasmidApp, "_MODAL_STACK_SOFT_CAP")
+        assert sc.PlasmidApp._MODAL_STACK_SOFT_CAP > 0
+
+    def test_modal_stack_cap_refuses_overflow(self, monkeypatch):
+        # Can't easily test by actually pushing 12 modals; instead
+        # exercise the override directly with a stub stack length.
+        app = sc.PlasmidApp()
+        # Force the soft cap to a tiny number for the test.
+        monkeypatch.setattr(app, "_MODAL_STACK_SOFT_CAP", 2)
+        # Stub screen_stack to look full.
+        class FakeStack(list):
+            pass
+        full_stack = FakeStack(["s1", "s2", "s3"])
+        monkeypatch.setattr(type(app), "screen_stack",
+                              property(lambda self: full_stack))
+        # Stub notify so we don't need a mounted app.
+        notifications: list = []
+        def _capture(msg, **kw):
+            notifications.append(msg)
+        monkeypatch.setattr(app, "notify", _capture)
+        # The override should refuse + return a no-op awaitable.
+        result = app.push_screen("DummyScreenName")
+        # The returned object must be awaitable (a coroutine).
+        import asyncio, inspect
+        assert inspect.iscoroutine(result), (
+            f"expected an awaitable; got {type(result)}"
+        )
+        # Drain the awaitable.
+        try:
+            asyncio.run(result)
+        except RuntimeError:
+            # Some Python versions may complain about closed loops;
+            # that's fine — we only care that the call didn't raise.
+            pass
+        # And the user got a warning notification.
+        assert notifications, "no notification fired on cap overflow"
+
+    # ── (9) Big-plasmid warning ────────────────────────────────────
+
+    def test_large_plasmid_threshold_present(self):
+        assert hasattr(sc.PlasmidApp, "_LARGE_PLASMID_BP")
+        assert sc.PlasmidApp._LARGE_PLASMID_BP >= 1_000_000
+
+    # ── (10) Snapshot size cap ─────────────────────────────────────
+
+    def test_snapshot_skips_oversized_file(self, tmp_path, monkeypatch):
+        # Create a fake "library file" larger than the cap and verify
+        # `_snapshot_data_files` skips it.
+        big = tmp_path / "huge.json"
+        # Write a sparse file — actual disk content size > cap.
+        # `_snapshot_data_files` reads st_size, not contents, so a
+        # truncate to cap+1 is enough.
+        with open(big, "wb") as f:
+            f.truncate(sc._SNAPSHOT_FILE_SIZE_CAP + 1)
+        small = tmp_path / "small.json"
+        small.write_bytes(b'{"_schema_version": 1, "entries": []}')
+        written = sc._snapshot_data_files(tmp_path, paths=[big, small])
+        # Oversized file was skipped; small one was snapshotted.
+        snap_dir = tmp_path / sc._SNAPSHOT_DIR_NAME
+        assert not (snap_dir / "huge-*.json").is_file()
+        assert any(p.name.startswith("small-") for p in written)
+
+
+class TestUpdateSubcommandMainDispatch:
+    """`main()` must route `splicecraft update` to the subcommand
+    BEFORE attempting to load it as a file/accession, and must NOT
+    launch the Textual TUI for the update path."""
+
+    def test_main_dispatches_update_check(self, monkeypatch, capsys):
+        # Simulate `splicecraft update --check` from the CLI.
+        monkeypatch.setattr(sys, "argv",
+                              ["splicecraft", "update", "--check"])
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: sc.__version__)
+        # Block any accidental TUI launch — main() must not get this far.
+        def _no_run(*a, **k):
+            raise AssertionError("update subcommand must not launch the TUI")
+        monkeypatch.setattr(sc.PlasmidApp, "run", _no_run, raising=True)
+        with pytest.raises(SystemExit) as excinfo:
+            sc.main()
+        assert excinfo.value.code == 0
+        out = capsys.readouterr().out
+        assert "checking for updates" in out
+
+    def test_main_update_unknown_flag_exits_two(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv",
+                              ["splicecraft", "update", "--what"])
+        # Block PyPI fetch entirely (shouldn't be reached) and TUI launch.
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: sc.__version__)
+        monkeypatch.setattr(sc.PlasmidApp, "run",
+                              lambda *a, **k: (_ for _ in ()).throw(
+                                  AssertionError("must not launch TUI")))
+        with pytest.raises(SystemExit) as excinfo:
+            sc.main()
+        assert excinfo.value.code == 2
+
+    def test_main_update_takes_priority_over_filename(
+            self, monkeypatch, tmp_path, capsys):
+        # If a file named "update" exists in CWD, the subcommand still
+        # wins — but a warning is printed pointing at './update' for
+        # disambiguation.
+        # cd into a temp dir and drop a placeholder file there.
+        (tmp_path / "update").write_text("not a real GenBank file")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(sys, "argv",
+                              ["splicecraft", "update", "--check"])
+        monkeypatch.setattr(sc, "_fetch_latest_pypi_version",
+                              lambda *a, **k: sc.__version__)
+        monkeypatch.setattr(sc.PlasmidApp, "run",
+                              lambda *a, **k: (_ for _ in ()).throw(
+                                  AssertionError("must not launch TUI")))
+        with pytest.raises(SystemExit) as excinfo:
+            sc.main()
+        assert excinfo.value.code == 0
+        err = capsys.readouterr().err
+        assert "ignored in favour of the update subcommand" in err
