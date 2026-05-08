@@ -38,7 +38,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "0.7.4.0"
+__version__ = "0.7.4.2"
 
 # ── Biopython warning filters ─────────────────────────────────────────
 # Some real-world records (notably NCBI Entrez exports that picked up
