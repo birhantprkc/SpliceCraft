@@ -16159,122 +16159,7 @@ def _mut_translate(dna: str) -> str:
 
 
 _MUT_PREVIEW_DNA_COLOR = "color(118)"   # CDS-green, main-app-like
-_MUT_PREVIEW_AA_COLOR  = "color(141)"   # purple
-_MUT_PREVIEW_MUT_COLOR = "color(208)"   # orange (mutated codon + AA)
-
-
-def _mut_build_preview_text(cds_dna: str,
-                            protein_override: str = "",
-                            mutation: "dict | None" = None,
-                            line_width: int = 90,
-                            cursor_aa: int = -1,
-                            dna_color: str = _MUT_PREVIEW_DNA_COLOR,
-                            aa_color:  str = _MUT_PREVIEW_AA_COLOR,
-                            mut_color: str = _MUT_PREVIEW_MUT_COLOR) -> Text:
-    """Build a Rich Text preview of the (optionally mutagenized) CDS.
-
-    Two modes:
-
-    * **DNA + AA**: `cds_dna` is non-empty. DNA is rendered main-app-style
-      (green by default) with line numbers. Beneath each DNA row sits an
-      AA row — one letter per codon, centered under the middle base of
-      that codon, in purple. Stop codons show as `*` (not truncated,
-      unlike `_mut_translate`, so the user can see the end of the CDS).
-    * **AA only**: `cds_dna` is empty but `protein_override` is set. Used
-      while the user is typing a protein in the custom-protein source
-      before optimization produces any DNA.
-
-    `mutation` (dict with `wt_codon` / `mut_codon` / `nt_position` 1-based,
-    as produced by `_mut_design_inner`) substitutes the mutant codon into
-    the displayed DNA and highlights the three mutated bases plus the AA
-    letter below in solid orange.
-
-    `cursor_aa` (>= 0) marks the AA the user is focused on — it gets a
-    reverse-video highlight across both DNA (the whole codon) and AA
-    rows. Reverse style stacks with mutation: cursor-on-mutation ends up
-    as reversed orange, which still reads as "cursor here, mutant here".
-    """
-    t = Text(no_wrap=True, overflow="crop")
-    if not cds_dna:
-        aa = (protein_override or "").upper()
-        if not aa:
-            return t
-        for i in range(0, len(aa), line_width):
-            chunk = aa[i:i + line_width]
-            for j, ch in enumerate(chunk):
-                idx = i + j
-                if idx == cursor_aa:
-                    t.append(ch, style=f"bold reverse {aa_color}")
-                else:
-                    t.append(ch, style=f"bold {aa_color}")
-            t.append("\n")
-        return t
-
-    # Line width must be a multiple of 3 so codons don't straddle lines.
-    lw = max(3, (line_width // 3) * 3)
-
-    dna = cds_dna.upper()
-    mut_lo = mut_hi = -1
-    if mutation:
-        wt_c  = (mutation.get("wt_codon")  or "").upper()
-        mut_c = (mutation.get("mut_codon") or "").upper()
-        try:
-            nt_pos = int(mutation.get("nt_position") or 0)
-        except (TypeError, ValueError):
-            nt_pos = 0
-        if wt_c and mut_c and 1 <= nt_pos <= len(dna) - 2:
-            lo = nt_pos - 1
-            dna = dna[:lo] + mut_c + dna[lo + 3:]
-            mut_lo, mut_hi = lo, lo + 3
-
-    n     = len(dna)
-    num_w = len(str(n)) if n else 1
-    cur_dna_lo = cursor_aa * 3 if cursor_aa >= 0 else -1
-    cur_dna_hi = cur_dna_lo + 3 if cursor_aa >= 0 else -1
-
-    def _base_style(i: int) -> str:
-        is_mut = mut_lo <= i < mut_hi
-        is_cur = cur_dna_lo <= i < cur_dna_hi
-        if is_mut and is_cur:
-            return f"bold reverse {mut_color}"
-        if is_mut:
-            return f"bold {mut_color}"
-        if is_cur:
-            return f"reverse {dna_color}"
-        return dna_color
-
-    def _aa_style(aa_idx: int) -> str:
-        mid_i  = aa_idx * 3 + 1
-        is_mut = mut_lo <= mid_i < mut_hi
-        is_cur = (aa_idx == cursor_aa)
-        if is_mut and is_cur:
-            return f"bold reverse {mut_color}"
-        if is_mut:
-            return f"bold {mut_color}"
-        if is_cur:
-            return f"bold reverse {aa_color}"
-        return f"bold {aa_color}"
-
-    for chunk_start in range(0, n, lw):
-        chunk_end = min(chunk_start + lw, n)
-        t.append(f"{chunk_start + 1:>{num_w}d}  ", style="dim")
-        # DNA row
-        for i in range(chunk_start, chunk_end):
-            t.append(dna[i], style=_base_style(i))
-        t.append("\n")
-        # AA row — one letter centered under each codon's middle base
-        t.append(" " * (num_w + 2))
-        for i in range(chunk_start, chunk_end):
-            if i % 3 == 1:
-                aa_idx = i // 3
-                codon  = dna[aa_idx * 3:aa_idx * 3 + 3]
-                aa_ch  = _MUT_CODON_TO_AA.get(codon, "?")
-                t.append(aa_ch, style=_aa_style(aa_idx))
-            else:
-                t.append(" ")
-        t.append("\n")
-
-    return t
+_MUT_PREVIEW_AA_COLOR  = "color(141)"   # purple (AA-only mode)
 
 
 def _mut_next_cursor(current: int, protein_len: int, line_width: int,
@@ -16300,39 +16185,6 @@ def _mut_next_cursor(current: int, protein_len: int, line_width: int,
     elif direction == "down":  new_idx = current + step
     else:                      return current
     return max(0, min(protein_len - 1, new_idx))
-
-
-def _mut_click_to_aa_index(dna_mode: bool, dna_len: int, protein_len: int,
-                           line_width: int, pad: int,
-                           vp_x: int, content_row: int) -> int:
-    """Translate a click at (vp_x, content_row) inside the preview widget
-    to an amino-acid index, or -1 if the click missed an AA.
-
-    Pure arithmetic — factored out so it can be unit-tested without
-    standing up a Textual event loop. `content_row` is the click's
-    row relative to the *content* (viewport row + scroll offset), not
-    the raw event.y. `vp_x` is the column relative to the widget.
-    """
-    if protein_len <= 0 or line_width <= 0:
-        return -1
-    if dna_mode:
-        # Two rendered rows per logical codon-line (DNA + AA)
-        logical_line = content_row // 2
-        bp_start = logical_line * line_width
-        if bp_start < 0 or bp_start >= dna_len:
-            return -1
-        c_data = vp_x - pad
-        if c_data < 0 or c_data >= line_width:
-            return -1
-        codon_idx_in_line = c_data // 3
-        aa_idx = bp_start // 3 + codon_idx_in_line
-    else:
-        if content_row < 0:
-            return -1
-        aa_idx = content_row * line_width + (vp_x - pad)
-    if aa_idx < 0 or aa_idx >= protein_len:
-        return -1
-    return aa_idx
 
 
 def _mut_tm(seq: str) -> float:
@@ -20647,6 +20499,11 @@ class _FeatureSnippetPanel(Widget):
     the main SequencePanel — dithered ▒ bar + directional arrowhead), and
     a qualifiers list.
 
+    The DNA line width tracks the panel's actual width (minus scrollbar
+    + line-number prefix) on mount and on every resize. Pre-fix used a
+    hardcoded ``line_width=60`` so the lane art never expanded past the
+    leftmost 60 cols of the modal regardless of terminal size.
+
     Not interactive — re-render by calling ``show(entry)``.
     """
 
@@ -20671,11 +20528,44 @@ class _FeatureSnippetPanel(Widget):
     def __init__(self) -> None:
         super().__init__()
         self._entry: "dict | None" = None
+        self._line_width: int = 60
 
     def compose(self) -> ComposeResult:
         yield Static("", id="snippet-header", markup=True)
         yield Static("", id="snippet-dna", markup=False)
         yield Static("", id="snippet-quals", markup=True)
+
+    def on_mount(self) -> None:
+        self._refresh_line_width()
+
+    def on_resize(self, _event) -> None:
+        if self._refresh_line_width():
+            self.show(self._entry)
+
+    def _refresh_line_width(self) -> bool:
+        """Recompute line_width from the current widget width. Returns
+        True if the value actually changed (so callers can re-render).
+
+        Pre-mount / zero-sized: returns False so a cold panel doesn't
+        clobber its constructor default with the floor — the real width
+        gets read once ``on_mount`` fires."""
+        try:
+            w = int(self.size.width or 0)
+        except (AttributeError, TypeError, ValueError):
+            w = 0
+        if w <= 0:
+            return False
+        # padding 1 2 → -4 horizontal; line-number prefix in
+        # _build_seq_text consumes ~num_w + 2 cols (≤8 for 5-digit
+        # entries). Reserve 12 cols of overhead and clamp into a
+        # [20, 500] band so a very narrow terminal still renders
+        # something AND a pathological super-wide widget doesn't blow
+        # up `_build_seq_text`'s per-row arrays.
+        new_lw = max(20, min(500, w - 12))
+        if new_lw != self._line_width:
+            self._line_width = new_lw
+            return True
+        return False
 
     def show(self, entry: "dict | None") -> None:
         self._entry = entry
@@ -20691,7 +20581,7 @@ class _FeatureSnippetPanel(Widget):
             qual.update("")
             return
         hdr.update(self._format_header(entry))
-        dna.update(self._render_dna(entry))
+        dna.update(self._render_dna(entry, self._line_width))
         qual.update(self._format_qualifiers(entry))
 
     @staticmethod
@@ -20717,11 +20607,17 @@ class _FeatureSnippetPanel(Widget):
         return "\n".join(lines)
 
     @staticmethod
-    def _render_dna(entry: "dict") -> "Text":
+    def _render_dna(entry: "dict", line_width: int = 60) -> "Text":
         """Build a full double-stranded DNA visualization by synthesizing a
         single full-span feature and running it through ``_build_seq_text`` —
         the exact same pipeline the main SequencePanel uses. The feature's
-        ``strand`` decides which arrowhead (if any) is drawn."""
+        ``strand`` decides which arrowhead (if any) is drawn.
+
+        ``line_width`` controls how many bp render per line; the panel
+        keeps it in sync with its own width via ``on_resize``. Floored at
+        20 so a very narrow terminal still renders something; capped at
+        500 so a caller passing an unbounded width can't blow up
+        ``_build_seq_text``'s per-row arrays."""
         seq = (entry.get("sequence", "") or "").upper()
         if not seq:
             return Text("(no sequence)", style="dim")
@@ -20737,7 +20633,8 @@ class _FeatureSnippetPanel(Widget):
             "color":  color,
             "label":  name,
         }]
-        return _build_seq_text(seq, synth, line_width=60)
+        return _build_seq_text(seq, synth,
+                               line_width=max(20, min(500, line_width)))
 
     @staticmethod
     def _format_qualifiers(entry: dict) -> str:
@@ -26717,17 +26614,32 @@ class SpeciesPickerModal(ModalScreen):
 # ── Mutagenize helpers (preview widget + AA picker sub-modal) ─────────────────
 
 class _MutPreview(Static):
-    """Focus-and-click-aware Static for the Mutagenize CDS preview.
+    """Focus-and-click-aware preview for the Mutagenize CDS.
+
+    Renders the CDS via ``_build_seq_text`` with a synthesized full-span
+    CDS feature, so the lane art (label + bar + AA letters), the
+    double-stranded DNA pair, and the chunk/stacking layout all come
+    from the same code path as the main SequencePanel
+    (``_chunk_layout`` / ``_paint_feature_label`` / ``_paint_feature_bar``
+    / ``_paint_cds_aa``). Pre-fix used a custom DNA+AA-only renderer that
+    diverged from the SequencePanel pipeline.
+
+    Cursor codon (set on AA click / arrow keys) is highlighted via
+    ``user_sel`` over the codon's 3 bp; a designed mutation is marked
+    via ``sel_range`` (bold + underline) over the mutated 3 bp.
 
     Single click places the cursor on the clicked AA (and takes focus so
     subsequent keys are routed here). Double click OR Enter posts
-    `AARequested(aa_index, aa_letter)`, which the parent handles by
+    ``AARequested(aa_index, aa_letter)``, which the parent handles by
     opening the AA picker. Arrow keys move the cursor — Left/Right step
     by one AA, Up/Down step by one displayed row's worth of AAs.
 
+    Line width tracks the widget's actual width (minus a small overhead
+    for line-number prefix + scrollbar) on mount and on every resize.
+
     Owns its own render state (DNA, mutation, cursor) so it can redraw
     itself after any cursor change without the parent having to re-run
-    its full `_update_preview` pipeline.
+    its full ``_update_preview`` pipeline.
     """
 
     can_focus = True
@@ -26748,70 +26660,241 @@ class _MutPreview(Static):
             self.aa_letter = aa_letter
             super().__init__()
 
+    # Per-chunk row count for the SequencePanel-style render with a
+    # single synthesized CDS feature. Above-DNA stack: label + bar +
+    # AA = 3. DNA pair = 2. Below-DNA stack: 0. Trailing gap = 1.
+    _CDS_ROWS_PER_CHUNK = 6
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # Source content (what parent passes in)
         self._cds_dna_src:      str  = ""
         self._mutation_src:     "dict | None" = None
         self._protein_override: str  = ""
+        self._cds_label:        str  = "CDS"
         self._line_width:       int  = 90
         # Derived, post-mutation display state
         self._eff_dna:     str  = ""
         self._protein:     str  = ""
-        self._pad:         int  = 0
+        self._mut_lo:      int  = -1
+        self._mut_hi:      int  = -1
         self._dna_mode:    bool = False
         # Cursor (-1 = not placed yet)
         self._cursor_aa:   int  = -1
+        # Synth-CDS feature list for `_build_seq_text`. Rebuilt by
+        # ``_recompute_display`` only when content actually changes;
+        # cursor moves reuse the same list identity so the
+        # ``_build_seq_inputs`` / ``_chunk_layout`` caches (keyed on
+        # ``id(feats)``) hit on every keystroke instead of churning
+        # the main SequencePanel's entries out of those LRU caches.
+        self._synth_feats: list[dict] = []
 
     def bind_content(self, *, dna: str = "", mutation: "dict | None" = None,
-                     protein_override: str = "", line_width: int = 90) -> None:
+                     protein_override: str = "", cds_label: str = "CDS",
+                     line_width: "int | None" = None) -> None:
         """Replace the content being previewed. Resets cursor to -1 so it
-        doesn't point into a stale AA when the CDS changes."""
+        doesn't point into a stale AA when the CDS changes.
+
+        ``line_width`` defaults to the widget's own measured width — the
+        parent ``_update_preview`` no longer has to guess. Pass an int
+        only when overriding (e.g. tests).
+
+        ``cds_label`` flows into ``_paint_feature_label`` for the synth
+        CDS bar; we sanitize via ``_sanitize_label`` so a parts-bin /
+        protein-source name with a stray ``\\x1b`` / NUL / newline
+        can't smuggle terminal escape sequences into the lane art."""
         self._cds_dna_src      = dna or ""
         self._mutation_src     = mutation
         self._protein_override = protein_override or ""
-        self._line_width       = max(1, line_width)
-        self._cursor_aa        = -1
+        # Strip control chars + cap length on the label. Empty after
+        # sanitization → fall back to "CDS" (same default as before).
+        self._cds_label        = _sanitize_label(cds_label, max_len=64) or "CDS"
+        if line_width is not None:
+            # Cap the upper end too — a pathological 5000-col line_width
+            # would render each chunk as a 5000-char row and chew memory
+            # for no visual gain (terminals top out around 500 cols).
+            self._line_width = max(20, min(500, line_width))
+        else:
+            self._refresh_line_width()
+        self._cursor_aa = -1
         self._recompute_display()
         self._render_and_update()
 
+    def on_mount(self) -> None:
+        # First measurement of the widget's actual width; before mount
+        # `self.size.width` is 0 so the constructor default applies.
+        if self._refresh_line_width():
+            self._render_and_update()
+
+    def on_resize(self, _event) -> None:
+        if self._refresh_line_width():
+            self._render_and_update()
+
+    def _refresh_line_width(self) -> bool:
+        """Recompute ``_line_width`` from the widget's current size.
+        Returns True if the value changed (so callers can re-render)."""
+        try:
+            w = int(self.size.width or 0)
+        except (AttributeError, TypeError, ValueError):
+            w = 0
+        if w <= 0:
+            # Pre-mount or zero-sized: keep the existing value so the
+            # constructor / explicit-bind default isn't clobbered.
+            return False
+        # Reserve cols for line-number prefix (~6) + padding (~2). Round
+        # down to a multiple of 3 in DNA mode so codons don't straddle
+        # lines (the AA-only mode tolerates any width). Floor at 30 for
+        # very narrow terminals; cap at 500 so a pathological super-wide
+        # widget can't blow up `_build_seq_text`'s per-row arrays.
+        eff = max(30, min(500, w - 8))
+        new_lw = max(30, (eff // 3) * 3)
+        if new_lw != self._line_width:
+            self._line_width = new_lw
+            return True
+        return False
+
     def _recompute_display(self) -> None:
         if self._cds_dna_src:
-            lw  = max(3, (self._line_width // 3) * 3)
             dna = self._cds_dna_src.upper()
+            self._mut_lo = self._mut_hi = -1
             if self._mutation_src:
                 mut_c  = (self._mutation_src.get("mut_codon") or "").upper()
                 try:
                     nt_pos = int(self._mutation_src.get("nt_position") or 0)
                 except (TypeError, ValueError):
                     nt_pos = 0
-                if mut_c and 1 <= nt_pos <= len(dna) - 2:
+                # Strict on length: a 4-nt or 2-nt `mut_codon` would
+                # shift every downstream codon's reading frame after
+                # the splice (`dna[:lo] + mut_c + dna[lo+3:]` extends
+                # / shrinks the CDS by `len(mut_c) - 3`). The legacy
+                # path silently accepted any length; require exactly 3.
+                if mut_c and len(mut_c) == 3 and 1 <= nt_pos <= len(dna) - 2:
                     lo  = nt_pos - 1
                     dna = dna[:lo] + mut_c + dna[lo + 3:]
+                    self._mut_lo, self._mut_hi = lo, lo + 3
             self._eff_dna  = dna
             self._protein  = "".join(
                 _MUT_CODON_TO_AA.get(dna[i:i + 3].upper(), "?")
                 for i in range(0, len(dna) - 2, 3)
             )
-            self._pad      = len(str(len(dna))) + 2
             self._dna_mode = True
         else:
             self._eff_dna  = ""
             self._protein  = (self._protein_override or "").upper()
-            self._pad      = 0
+            self._mut_lo = self._mut_hi = -1
             self._dna_mode = False
         if self._cursor_aa >= len(self._protein):
             self._cursor_aa = -1
+        # Rebuild the synth-CDS feature list whose identity drives the
+        # `_build_seq_inputs` / `_chunk_layout` cache keys. List identity
+        # is preserved across cursor moves — `_render_dna_mode` re-uses
+        # this same list, so cursor scrolls hit cached chunk
+        # decompositions instead of re-running `_pack_features_2d` on
+        # every keystroke and evicting the main SequencePanel's entries
+        # from the size-4 ``_BUILD_SEQ_CACHE`` / ``_CHUNK_LAYOUT_CACHE``.
+        #
+        # When the CDS *content* changes (label, start, end, color), we
+        # mutate the EXISTING dict via ``dict.update`` instead of
+        # replacing list[0] with a fresh dict — the caches store
+        # ``annot_feats`` which references the dict object directly, so
+        # a fresh dict at index 0 leaves the cache with a dangling
+        # reference to the old one (stale label rendered if
+        # ``hash(seq)`` collides on a length-stable content swap). With
+        # in-place key updates the cached references see the new label
+        # automatically. Length / strand / hash changes still flip the
+        # cache key (``len(seq)`` / ``hash(seq)`` are part of it) so
+        # the styles array gets recomputed correctly.
+        n = len(self._eff_dna)
+        if self._dna_mode and n > 0:
+            payload = {
+                "type":   "CDS",
+                "start":  0,
+                "end":    n,
+                "strand": 1,
+                "color":  _MUT_PREVIEW_DNA_COLOR,
+                "label":  self._cds_label or "CDS",
+            }
+            if self._synth_feats:
+                self._synth_feats[0].update(payload)
+            else:
+                # First DNA load (or coming back from AA-only mode):
+                # allocate a fresh dict in the (possibly recycled) list.
+                self._synth_feats.append(payload)
+        elif self._synth_feats:
+            # AA-only mode → no CDS to synthesize. Reassign (don't
+            # in-place clear) so `id(self._synth_feats)` changes — any
+            # stale `_BUILD_SEQ_CACHE` / `_CHUNK_LAYOUT_CACHE` entries
+            # from the prior DNA mode that still hold annot_feats
+            # references to the old dict can't return a stale hit on
+            # the next DNA load if it lands at a `hash(seq)` that
+            # happens to collide. Rare-but-real safety guard;
+            # cursor-move cache hits within a stable DNA mode are
+            # unaffected (those go through `dict.update` above).
+            self._synth_feats = []
 
     def _render_and_update(self) -> None:
-        t = _mut_build_preview_text(
-            self._cds_dna_src,
-            protein_override=self._protein_override,
-            mutation=self._mutation_src,
-            line_width=self._line_width,
-            cursor_aa=self._cursor_aa,
-        )
+        if self._dna_mode:
+            t = self._render_dna_mode()
+        else:
+            t = self._render_aa_mode()
         self.update(t)
+
+    def _render_aa_mode(self) -> "Text":
+        """AA-only render (protein source, no DNA available yet). Plain
+        purple letters with reverse-video on the cursor — kept compact
+        because there's no lane art / DNA to align against."""
+        t = Text(no_wrap=True, overflow="crop")
+        aa = self._protein
+        if not aa:
+            return t
+        lw = max(1, self._line_width)
+        for i in range(0, len(aa), lw):
+            chunk = aa[i:i + lw]
+            for j, ch in enumerate(chunk):
+                idx = i + j
+                sty = (f"bold reverse {_MUT_PREVIEW_AA_COLOR}"
+                       if idx == self._cursor_aa
+                       else f"bold {_MUT_PREVIEW_AA_COLOR}")
+                t.append(ch, style=sty)
+            t.append("\n")
+        return t
+
+    def _render_dna_mode(self) -> "Text":
+        """SequencePanel-style render: hand the cached ``_synth_feats``
+        (one CDS spanning the full preview) to ``_build_seq_text``. That
+        gives label + bar + AA + DNA pair + trailing gap from the shared
+        chunk_layout / paint helpers — same stacking and layout logic
+        the main SequencePanel uses."""
+        n = len(self._eff_dna)
+        if n == 0 or not self._synth_feats:
+            return Text()
+        # `_build_seq_text` accepts any line_width, but we round to a
+        # multiple of 3 so codon midpoints stay column-aligned with
+        # their codon's 3 bp on the DNA row above. The codon AA letter
+        # in `_paint_cds_aa` lands at `aa_bp = orig_s + 3*ci + 1` —
+        # i.e. column 1 of each codon. With `lw % 3 == 0` and
+        # `chunk_start = chunk_idx * lw`, every chunk starts on a
+        # codon boundary so click-column → codon math is exact.
+        lw = max(3, (self._line_width // 3) * 3)
+        # Cursor codon: 3-bp `user_sel` overlay (subtle white bg). The
+        # AA letter above the codon doesn't get a separate cursor mark
+        # — the codon highlight on the DNA conveys the same "you are
+        # here" cue, and the SequencePanel pipeline doesn't have a
+        # single-AA highlight slot.
+        cur_lo = self._cursor_aa * 3 if self._cursor_aa >= 0 else -1
+        cur_hi = cur_lo + 3 if self._cursor_aa >= 0 else -1
+        user_sel = (cur_lo, cur_hi) if cur_lo >= 0 else None
+        # Mutation: 3-bp `sel_range` overlay (bold + underline). Stays
+        # visually distinct from the cursor codon when both land on
+        # different codons; on the same codon, `user_sel` wins (its
+        # palette is checked first in `_render_chunk`) — acceptable
+        # since the user is actively cursor-on-mutation in that case.
+        sel_range = ((self._mut_lo, self._mut_hi)
+                     if self._mut_lo >= 0 else None)
+        return _build_seq_text(
+            self._eff_dna, self._synth_feats, line_width=lw,
+            sel_range=sel_range, user_sel=user_sel,
+        )
 
     # ── Mouse ──────────────────────────────────────────────────────────
 
@@ -26826,14 +26909,15 @@ class _MutPreview(Static):
             if vp_x < 0 or vp_y < 0 or vp_x >= reg.width or vp_y >= reg.height:
                 return
             content_row = vp_y + int(self.scroll_y)
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
+            # AttributeError: widget unmounted (no `region` / `scroll_y`).
+            # TypeError / ValueError: defensive against an event whose
+            # screen_{x,y} is None / non-numeric — Textual normally
+            # wouldn't surface that, but we'd rather drop the click than
+            # raise out of an event handler. Narrow on the actual
+            # arithmetic / attribute failures (avoid bare `except`).
             return
-        lw = (max(3, (self._line_width // 3) * 3) if self._dna_mode
-              else max(1, self._line_width))
-        aa_idx = _mut_click_to_aa_index(
-            self._dna_mode, len(self._eff_dna), len(self._protein),
-            lw, self._pad, vp_x, content_row,
-        )
+        aa_idx = self._click_to_aa(vp_x, content_row)
         if aa_idx < 0:
             return
         aa_letter = self._protein[aa_idx]
@@ -26845,6 +26929,49 @@ class _MutPreview(Static):
         # Double-click commits to mutation
         if event.chain >= 2:
             self.post_message(self.AARequested(aa_idx, aa_letter))
+
+    def _click_to_aa(self, vp_x: int, content_row: int) -> int:
+        """Translate a viewport click to an amino-acid index, or -1.
+
+        DNA mode: per-chunk row count is `_CDS_ROWS_PER_CHUNK = 6`
+        (label + bar + AA + fwd DNA + rev DNA + trailing blank). Click
+        on any of those rows resolves to the codon at column
+        `c_data = vp_x - (num_w + 2)`. Because `lw` is a multiple of 3,
+        every chunk starts on a codon boundary so chunk_idx * lw is the
+        first bp of codon `chunk_idx * (lw // 3)`.
+
+        AA-only mode: one row per `line_width` AAs, no line numbers,
+        so the click column maps directly to an AA index.
+        """
+        if self._dna_mode:
+            n = len(self._eff_dna)
+            if n <= 0 or content_row < 0:
+                return -1
+            lw = max(3, (self._line_width // 3) * 3)
+            chunk_idx = content_row // self._CDS_ROWS_PER_CHUNK
+            chunk_start = chunk_idx * lw
+            if chunk_start >= n:
+                return -1
+            num_w = len(str(n)) if n else 1
+            pad = num_w + 2
+            c_data = vp_x - pad
+            if c_data < 0 or c_data >= lw:
+                return -1
+            bp = chunk_start + c_data
+            if bp >= n:
+                return -1
+            aa_idx = bp // 3
+            if aa_idx < 0 or aa_idx >= len(self._protein):
+                return -1
+            return aa_idx
+        # AA-only mode — no line numbers, no lane art.
+        if content_row < 0 or vp_x < 0:
+            return -1
+        lw = max(1, self._line_width)
+        aa_idx = content_row * lw + vp_x
+        if aa_idx < 0 or aa_idx >= len(self._protein):
+            return -1
+        return aa_idx
 
     # ── Keyboard navigation ────────────────────────────────────────────
 
@@ -27404,17 +27531,23 @@ class MutagenizeModal(ModalScreen):
         Called on every state change that could alter what the user sees:
         source switch, CDS load, optimize, design, or live typing in
         the protein textarea.
+
+        ``_MutPreview`` reads its own width on mount / resize, so we no
+        longer pass an explicit ``line_width`` — pre-fix this defaulted
+        to 90 cols regardless of terminal width.
         """
         try:
             preview = self.query_one("#mut-preview", _MutPreview)
         except Exception:
             return
-        lw = 90
         if self._cds_dna:
+            cds_label = "CDS"
+            if isinstance(self._cds_meta, dict):
+                cds_label = self._cds_meta.get("name") or "CDS"
             preview.bind_content(
                 dna=self._cds_dna,
                 mutation=self._inner or None,
-                line_width=lw,
+                cds_label=cds_label,
             )
         else:
             aa_raw = ""
@@ -27424,7 +27557,7 @@ class MutagenizeModal(ModalScreen):
             except Exception:
                 aa_raw = ""
             aa_clean = re.sub(r"[\s\d>_\-*]", "", aa_raw or "").upper()
-            preview.bind_content(protein_override=aa_clean, line_width=lw)
+            preview.bind_content(protein_override=aa_clean)
 
     @on(TextArea.Changed, "#mut-prot-aa")
     def _on_prot_aa_changed(self, _event) -> None:
@@ -33619,7 +33752,12 @@ MutagenizeModal { align: center middle; }
 #mut-btn-col  { width: 2fr; }
 #btn-mut-design { width: 100%; }
 #mut-preview {
-    height: auto; max-height: 10;
+    /* SequencePanel-style render: each chunk is label + bar + AA + fwd
+       DNA + rev DNA + blank = 6 rows. Pre-fix the preview ran at
+       2 rows per chunk so 10 rows fit 5 chunks; the new render needs
+       roughly 3× that to keep a comparable amount of CDS visible
+       without forcing the user to scroll for every chunk. */
+    height: auto; max-height: 18;
     border: solid $primary-darken-2; padding: 0 1; margin-top: 1;
     overflow-y: auto; overflow-x: auto;
 }

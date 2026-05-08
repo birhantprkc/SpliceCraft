@@ -1734,3 +1734,51 @@ class TestFeatureLibraryExportFasta:
             await pilot.pause()
             await pilot.pause(0.1)
             assert isinstance(app.screen, sc.FeatureLibraryScreen)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Snippet panel — responsive lane art width  (2026-05-07 regression guard)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSnippetPanelResponsiveWidth:
+    """``_FeatureSnippetPanel`` previously hardcoded ``line_width=60`` for
+    ``_build_seq_text``, so the lane art never expanded past the leftmost
+    60 cols of the modal even on wide terminals. The panel now reads its
+    own ``self.size.width`` on mount and on every resize. These tests pin
+    that contract."""
+
+    def test_refresh_line_width_zero_size_keeps_default(self):
+        """Pre-mount / zero-sized: keep the constructor default so a
+        cold panel doesn't clobber its line_width with the floor."""
+        snip = sc._FeatureSnippetPanel()
+        assert snip._line_width == 60
+        # The widget hasn't been mounted yet, so size.width returns 0.
+        # _refresh_line_width should leave _line_width unchanged.
+        assert snip._refresh_line_width() is False
+        assert snip._line_width == 60
+
+    async def test_line_width_picks_up_terminal_width(self, tiny_record):
+        """A wide terminal (180 cols) leaves the FeatureLibraryScreen's
+        right column with much more than 60 cols of room. The snippet
+        panel's ``_line_width`` must adapt — pre-fix it stayed pinned at
+        60 regardless of terminal size."""
+        sc._save_features([{
+            "name": "lacZ", "feature_type": "CDS",
+            "sequence": "ATGAAA" * 50, "strand": 1,
+        }])
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=(180, 50)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            app.push_screen(sc.FeatureLibraryScreen())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            snip = app.screen.query_one(sc._FeatureSnippetPanel)
+            # On a 180-col terminal the right pane is ≥ 60 cols, so the
+            # panel should have read a width > 60 from its actual
+            # ``self.size.width``. The exact value depends on Textual's
+            # layout (``#flib-right`` is ``1fr``), so we just assert
+            # that the default 60 has been replaced with something
+            # larger.
+            assert snip._line_width > 60

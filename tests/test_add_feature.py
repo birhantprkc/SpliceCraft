@@ -509,6 +509,11 @@ class TestGlyphOwnerTracking:
         sp._seq = seq
         sp._feats = feats
         sp._chunks_owners = {}
+        # `_chunk_glyph_owners` keys the per-chunk owner cache on
+        # `_view_origin_bp` so rotated views don't reuse stale lookup
+        # tables. The bare-attribute SequencePanel built here doesn't
+        # run `__init__`, so wire the rotation default in by hand.
+        sp._view_origin_bp = 0
         return sp
 
     def test_owners_fill_full_footprint_for_non_cds(self):

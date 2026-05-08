@@ -2,6 +2,94 @@
 
 ---
 
+## [0.7.4.2] — 2026-05-07
+
+### Changed — Mutagenize preview + Feature Library snippet share SequencePanel pipeline
+
+- **Mutagenize CDS preview now renders via ``_build_seq_text``.** The
+  ``_MutPreview`` widget previously rolled its own DNA + AA renderer
+  (``_mut_build_preview_text``); per user request it now synthesizes a
+  full-span CDS feature and hands the visualization off to the same
+  ``_chunk_layout`` / ``_paint_feature_label`` / ``_paint_feature_bar``
+  / ``_paint_cds_aa`` helpers the main SequencePanel uses. Each chunk
+  now renders as label + bar + AA + fwd DNA + rev DNA + trailing
+  blank — consistent stacking and layout logic across the app.
+  The cursor codon is marked via ``user_sel`` (3-bp subtle white bg);
+  a designed mutation is marked via ``sel_range`` (3-bp bold +
+  underline). AA-only mode (protein source before optimization) keeps
+  its compact one-line-per-row render. Click any cell within a codon's
+  column to place the cursor — the AA-click → codon mapping math is
+  pinned by ``_MutPreview._click_to_aa`` and the row count per chunk
+  is constant (6 rows; lane art always present, no wrap).
+- **Feature Library snippet panel ("``_FeatureSnippetPanel``") line
+  width tracks terminal width.** Pre-fix used a hardcoded
+  ``line_width=60`` so the lane art never expanded past the leftmost
+  60 cols of the modal regardless of terminal size; on wide terminals
+  that left the right half of the preview empty. The panel now reads
+  its own widget width on mount and on every resize and recomputes
+  ``line_width`` accordingly.
+- **Modal preview pane vertical room.** ``#mut-preview`` ``max-height``
+  bumped 10 → 18 so ~3 chunks of the new render fit comfortably; the
+  pane still scrolls for longer CDSes.
+- **Removed dead helpers.** ``_mut_build_preview_text``,
+  ``_mut_click_to_aa_index``, and ``_MUT_PREVIEW_MUT_COLOR`` had no
+  remaining callers after the refactor; deleted along with the old
+  unit tests in ``tests/test_mutagenize.py::TestPreviewText`` /
+  ``::TestClickToAA`` (both classes rewritten to exercise the
+  ``_MutPreview`` render path directly).
+
+### Hardening
+
+- **CDS label sanitized.** ``_MutPreview.bind_content`` now routes the
+  incoming ``cds_label`` through ``_sanitize_label`` (max 64 chars) so
+  a parts-bin / protein-source name with embedded ``\\x1b`` / NUL /
+  newline / BEL bytes can't smuggle terminal escape sequences into the
+  lane art rendered via ``_paint_feature_label``.
+- **Mutation codon length is strict.** ``_recompute_display`` now
+  requires ``len(mut_codon) == 3``; pre-fix a 2-nt or 4-nt mutant
+  codon would shift every downstream codon's reading frame after the
+  splice (``dna[:lo] + mut_c + dna[lo+3:]`` extends / shrinks the
+  CDS), silently corrupting the protein for the rest of the visible
+  preview.
+- **``line_width`` clamped to ``[20, 500]``.** Both ``_MutPreview``
+  and ``_FeatureSnippetPanel`` ``_refresh_line_width`` cap an
+  unrealistic super-wide widget at 500 cols so a pathological resize
+  can't blow up ``_build_seq_text``'s per-row arrays. The ``except
+  Exception`` around the ``self.size.width`` read is also narrowed to
+  the actual failure modes (``AttributeError`` / ``TypeError`` /
+  ``ValueError``).
+- **Synth-feats list + dict identity preserved across cursor moves.**
+  ``_recompute_display`` mutates the existing dict via ``dict.update``
+  instead of reassigning ``list[0]``; both list ID and dict ID stay
+  stable so the size-4 ``_BUILD_SEQ_CACHE`` / ``_CHUNK_LAYOUT_CACHE``
+  hit on every cursor scroll instead of churning the main
+  SequencePanel's entries out of cache. Length / sequence changes
+  still flip the cache key (``len(seq)`` + ``hash(seq)`` are part of
+  it) so styles get recomputed when needed; label-only swaps land on
+  the same dict so cached references see the new value.
+- **AA-only mode reassigns ``_synth_feats`` instead of clearing in
+  place.** The DNA → AA-only transition now does
+  ``self._synth_feats = []`` rather than ``del self._synth_feats[:]``
+  — list ID changes so any stale ``_BUILD_SEQ_CACHE`` /
+  ``_CHUNK_LAYOUT_CACHE`` entries from the prior DNA mode that still
+  hold ``annot_feats`` references to the old dict can't return a
+  stale hit if the next DNA load lands at a colliding ``hash(seq)``.
+- **``_FeatureSnippetPanel._render_dna`` line_width also capped at
+  500.** Defensive even though the panel's own ``_refresh_line_width``
+  already enforces the cap; an external caller passing an unbounded
+  ``line_width`` can't blow up ``_build_seq_text``'s per-row arrays.
+- **Dead ``rerender`` kwarg removed from
+  ``_MutPreview._refresh_line_width``.** The parameter was never
+  inspected; callers always read the bool return and dispatched
+  ``_render_and_update`` themselves.
+- 8 new tests in ``tests/test_mutagenize.py::TestPreviewHardening``
+  pin the sanitization, codon-length strictness, line_width cap,
+  list-identity contracts (across cursor moves AND across DNA
+  ↔ AA-only transitions), and dict-identity stability for label-only
+  swaps within DNA mode.
+
+---
+
 ## [0.7.4.1] — 2026-05-07
 
 ### Fixed
