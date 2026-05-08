@@ -4863,3 +4863,67 @@ class TestDomesticatorUsesActiveGrammar:
             await pilot.pause(0.1)
             title = app.screen.query_one("#dom-title", sc.Static)
             assert "MoClo" in str(title.render())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _classify_part_from_plasmid — auto-detect grammar/position from a plasmid
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_gb_l0_part_seq(oh5: str, oh3: str,
+                          insert: str = "ATGAAACCCGGG" * 5) -> str:
+    """Build a synthetic Golden Braid L0 part vector: insert flanked by
+    inward-facing Esp3I sites with the requested 4-nt overhangs, plus a
+    chunk of inert backbone padding so the digest produces a 2-fragment
+    output (insert vs vector). Treated as circular by callers."""
+    core = "CGTCTCA" + oh5 + insert + oh3 + "AGAGACG"
+    backbone = "AAAAATTTTT" * 50
+    return core + backbone
+
+
+class TestClassifyPartFromPlasmid:
+    """``_classify_part_from_plasmid`` digests a circular plasmid with
+    each grammar's Type IIS enzyme and matches the released fragment's
+    overhangs against the grammar's position table. Powers the Parts
+    Bin "Load Part" button so the user doesn't have to manually pick a
+    grammar / position when registering an externally-domesticated
+    plasmid."""
+
+    def test_detects_gb_l0_promoter(self):
+        seq = _build_gb_l0_part_seq("GGAG", "TGAC")
+        result = sc._classify_part_from_plasmid(seq, circular=True)
+        assert result is not None
+        assert result["grammar_id"] == "gb_l0"
+        assert result["position"]["type"] == "Promoter"
+        assert result["insert"]["left"]["overhang_seq"] == "GGAG"
+        assert result["insert"]["right"]["overhang_seq"] == "TGAC"
+
+    def test_detects_gb_l0_cds(self):
+        seq = _build_gb_l0_part_seq("AATG", "GCTT")
+        result = sc._classify_part_from_plasmid(seq, circular=True)
+        assert result is not None
+        assert result["position"]["type"] == "CDS"
+
+    def test_no_match_returns_none(self):
+        # Overhangs that match no Golden Braid position.
+        seq = _build_gb_l0_part_seq("CCCC", "GGGG")
+        assert sc._classify_part_from_plasmid(seq, circular=True) is None
+
+    def test_linear_skipped(self):
+        seq = _build_gb_l0_part_seq("GGAG", "TGAC")
+        # Linear plasmids can't be cleanly excised so the helper bails.
+        assert sc._classify_part_from_plasmid(seq, circular=False) is None
+
+    def test_empty_seq_safe(self):
+        assert sc._classify_part_from_plasmid("", circular=True) is None
+
+    def test_smaller_fragment_is_insert(self):
+        """The fragment classification picks the smaller fragment as
+        the insert and the larger as the vector — a 60-bp insert in a
+        ~600-bp synthetic backbone must come back labelled correctly."""
+        insert_core = "ATGAAACCCGGG" * 5   # 60 bp
+        seq = _build_gb_l0_part_seq("GGAG", "TGAC", insert_core)
+        result = sc._classify_part_from_plasmid(seq, circular=True)
+        assert result is not None
+        assert (len(result["insert"]["top_seq"])
+                < len(result["vector"]["top_seq"]))
+

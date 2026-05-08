@@ -2,6 +2,117 @@
 
 ---
 
+## [0.7.5.0] — 2026-05-08 — audit + hardening sweep
+
+> Pre-1.0 readiness sweep — bug fixes, cache discipline, worker
+> safety, doc refresh. NOT v1.0.0; the 1.0 tag is gated on the
+> SnapGene round-trip work landing in full and explicit user
+> sign-off, neither of which is in this sweep.
+
+### Bug fixes
+
+- **Traditional cloning: cursor → entry mismatch.** `_record_for_table_row`
+  AND `_current_source_entries` in `TraditionalCloningPane` now apply
+  the same natural sort that `_populate_library_tables` uses for
+  display. Pre-fix the reload was unsorted, so a click on display row
+  N digested whichever plasmid happened to land at on-disk position N
+  — and the construction-history XML recorded the wrong vector as a
+  parent. Sacred invariant: any screen that sorts a `DataTable` for
+  display must resolve every `cursor_row` lookup against the same sort
+  (now codified in CLAUDE.md as invariant #33).
+- **Cache poisoning on save.** `_save_library`, `_save_parts_bin`, and
+  `_save_primers` now `deepcopy(entries)` when re-seating the in-memory
+  cache. Pre-fix the cache shared dict refs with the caller, so a
+  caller that kept editing `entries` after save (e.g. cancelled modal
+  follow-up edits) leaked post-save mutations into the next reader.
+  `_load_library` also now deepcopies on read for symmetry with the
+  other `_load_*` helpers (sacred invariant #17 made stricter).
+- **Library delete / collection switch silently swallowed disk errors.**
+  `LibraryPanel._request_plasmid_delete`'s confirmation callback and
+  `_coll_row_selected`'s collection-load path now wrap `_save_library`
+  in `try / except OSError` and surface the failure with
+  `severity="error"` instead of letting the exception bubble into the
+  Textual event loop. The user now sees a notification on disk-full /
+  RO mount / permission-denied rather than a silent no-op.
+
+### Performance + UX
+
+- **`PartsBinModal._load_part` runs in a worker.** The Type IIS digest
+  loop in `_classify_part_from_plasmid` now executes inside
+  `_load_part_worker` (`@work(thread=True)`) so a multi-grammar digest
+  on a 50 kbp plasmid no longer freezes the modal for 200–500 ms. The
+  pre-flight checks (record present, circular topology) still run on
+  the UI thread so warning toasts are immediate. UI updates inside
+  the worker bounce through `call_from_thread`.
+- **`FeatureLibraryScreen` cursor restore is O(1).** Added
+  `_entry_idx_to_row` reverse dict alongside `_row_to_entry_idx`.
+  Pre-fix `_repopulate_table` did `_row_to_entry_idx.index(...)`
+  (O(N)) on every restore — now O(1) regardless of feature library
+  size. The silent fallback (selected_index outside the row map) now
+  logs a warning so the underlying drift surfaces in dev mode.
+
+### Documentation
+
+- **CLAUDE.md** refreshed:
+  - line count corrected from ~32k to ~39k.
+  - test runtime corrected from ~3 min to ~5–6 min for the full suite.
+  - sacred invariant #17 made stricter: cache helpers now deepcopy on
+    BOTH read and save (not just read).
+  - new invariants #33 (natural-sort row-mapping symmetry across the
+    7 surfaces that now sort), #34 (`_classify_part_from_plasmid`
+    Type IIS digest pattern + worker requirement), #35 (CommercialSaaS
+    `.dna` writer's full default packet inventory).
+- **README.md** refreshed: 1700+ test count, 35 sacred invariants,
+  4-layer data-safety net spelled out, Restore from backup flow
+  surfaced, `.dna` round-trip + construction history mentioned, Load
+  Part button described, pairwise-alignment / Plasmidsaurus ingestion
+  surfaced, cross-collection plasmid search highlighted.
+
+### Tests
+
+- 4 traditional-cloning tests (`test_traditional_pane_pcr_mode_simulate`,
+  `test_traditional_pane_save_forward_to_library`,
+  `test_traditional_pane_save_records_history_xml`,
+  `test_save_buttons_redisable_on_input_change`) updated to match the
+  new sort-aware semantics — pre-fix they computed `target_idx` from
+  disk order and accidentally passed because the underlying bug
+  mirrored the test's own bug.
+- 2 new modal-boundary cases (`DropdownScreen`,
+  `GrammarEditorModal.builtin`) bring the boundary suite to 56
+  modals at 160×48.
+
+### Punch-list follow-ups (audit cleanups)
+
+- **`_search_collections_library` switched to `heapq.nsmallest`** for
+  O(N + limit·log(limit)) search ordering. The pre-fix `out.sort()`
+  was O(N·log(N)) and noticeable on libraries beyond ~1k plasmids;
+  for a 5k catalog the heap form saves ~30 ms per search keystroke.
+  Same returned ordering — only the asymptotic complexity changed.
+- **Defense-in-depth response cap on the agent API.** Added
+  `_AGENT_RESPONSE_MAX_BYTES = 50 MB` (mirrors the read-side
+  `_SAFE_LOAD_JSON_MAX_BYTES` / `_BULK_IMPORT_MAX_BYTES`).
+  `_AgentRequestHandler._send` now refuses to ship any response above
+  the cap — returns a 500 with `{body_too_large: true, body_bytes,
+  cap_bytes}` so the client can branch (re-query with a tighter
+  filter) instead of blocking the worker thread on a multi-MB serialise
+  + loopback write. Catches the unbounded-list class of bugs in any
+  future agent endpoint without rewriting per-handler caps.
+- **`PartsBinModal` design rule documented in code.** Added a paragraph
+  to `_populate` spelling out *why* this modal sorts `_rows` in-place
+  (without a separate `_row_to_part_idx` mapping) and what would have
+  to change before any code path could mutate `self._rows` mid-flight
+  — surfaces sacred invariant #33's reasoning at the call site so a
+  future contributor doesn't accidentally introduce the same class of
+  bug `TraditionalCloningPane` had.
+- **`from copy import deepcopy` hoisted to module level.** Replaced 30
+  function-local imports (and 2 `_shallow_copy` ones) with a single
+  `from copy import copy as _shallow_copy, deepcopy` at the top.
+  Python caches the import either way; the consolidation just makes
+  the deepcopy / shallow-copy contract immediately visible from the
+  imports block instead of scattered through the file.
+
+---
+
 ## [0.7.4.4] — 2026-05-07
 
 ### Hardening — origin rotation clamp on sequence shrink

@@ -577,11 +577,18 @@ class TestSimulateTraditionalCloning:
             modal.query_one("#trad-pcr-name", Input).value = "myInsert"
             ta = modal.query_one("#trad-pcr-seq", TextArea)
             ta.text = "GAGCATGAAACGGCCAAGTAA"
-            # Pick the vector row. Library rows ordered as in
-            # `_load_library()`; find pVec by name.
+            # Pick the vector row. The display sorts entries by
+            # `_natural_sort_key` (`pVec` lands before `TEST001` because
+            # 'pvec' < 'test' lowercased), so compute the target row
+            # against the SORTED list — matching what the user sees and
+            # what `_record_for_table_row` resolves on click.
             vt = modal.query_one("#trad-vector-table", DataTable)
-            entries = [e for e in sc._load_library()
-                         if isinstance(e, dict)]
+            entries = sorted(
+                (e for e in sc._load_library() if isinstance(e, dict)),
+                key=lambda e: sc._natural_sort_key(
+                    e.get("name") or e.get("id") or ""
+                ),
+            )
             target_idx = next(
                 (i for i, e in enumerate(entries) if e.get("name") == "pVec"),
                 -1,
@@ -650,7 +657,15 @@ class TestSimulateTraditionalCloning:
             modal.query_one("#trad-pcr-name", Input).value = "myInsert"
             modal.query_one("#trad-pcr-seq",  TextArea).text = (
                 "GAGCATGAAACGGCCAAGTAA")
-            entries = [e for e in sc._load_library() if isinstance(e, dict)]
+            # Display sorts entries by `_natural_sort_key`; compute
+            # target row against the same order so the cursor lands on
+            # what the user sees as pVec (not the disk-order pVec).
+            entries = sorted(
+                (e for e in sc._load_library() if isinstance(e, dict)),
+                key=lambda e: sc._natural_sort_key(
+                    e.get("name") or e.get("id") or ""
+                ),
+            )
             target = next(i for i, e in enumerate(entries)
                           if e.get("name") == "pVec")
             modal.query_one("#trad-vector-table",
@@ -734,7 +749,15 @@ class TestSimulateTraditionalCloning:
             modal.query_one("#trad-pcr-name", Input).value = "myInsert"
             modal.query_one("#trad-pcr-seq",  TextArea).text = (
                 "GAGCATGAAACGGCCAAGTAA")
-            entries = [e for e in sc._load_library() if isinstance(e, dict)]
+            # Display sorts entries by `_natural_sort_key`; compute
+            # target row against the same order so the cursor lands on
+            # what the user sees as pVec (not the disk-order pVec).
+            entries = sorted(
+                (e for e in sc._load_library() if isinstance(e, dict)),
+                key=lambda e: sc._natural_sort_key(
+                    e.get("name") or e.get("id") or ""
+                ),
+            )
             target = next(i for i, e in enumerate(entries)
                           if e.get("name") == "pVec")
             modal.query_one("#trad-vector-table",
@@ -817,7 +840,15 @@ class TestSimulateTraditionalCloning:
             modal.query_one("#trad-pcr-name", Input).value = "x"
             modal.query_one("#trad-pcr-seq",  TextArea).text = (
                 "GAGCATGAAACGGCCAAGTAA")
-            entries = [e for e in sc._load_library() if isinstance(e, dict)]
+            # Display sorts entries by `_natural_sort_key`; compute
+            # target row against the same order so the cursor lands on
+            # what the user sees as pVec (not the disk-order pVec).
+            entries = sorted(
+                (e for e in sc._load_library() if isinstance(e, dict)),
+                key=lambda e: sc._natural_sort_key(
+                    e.get("name") or e.get("id") or ""
+                ),
+            )
             target = next(i for i, e in enumerate(entries)
                           if e.get("name") == "pVec")
             modal.query_one("#trad-vector-table",

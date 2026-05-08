@@ -34,22 +34,32 @@ A workbench you trust your day to has to behave like one. SpliceCraft
 takes data safety and predictable behaviour as first-class design
 constraints:
 
-- **Atomic writes with on-disk backups.** Every `*.json` library file
-  goes through `tempfile.mkstemp` + `os.fsync` + `os.replace`, with the
-  prior version copied to `*.json.bak` *before* the new write lands.
-  Mid-process crash, full-disk error, or hand-edit gone wrong — the
-  panel re-loads from `.bak` on next launch with a corruption-recovery
-  toast.
+- **Four-layer data-safety net for every JSON write.**
+  - Atomic write via `tempfile.mkstemp` + `os.fsync` + `os.replace`, with
+    the prior version copied to `*.json.bak` first.
+  - Rotating timestamped backups (`*.json.bak.YYYYMMDD-HHMMSS`, last 10
+    retained per file) so an *old* good copy is recoverable, not just
+    the most recent.
+  - Daily per-file snapshots to `<data dir>/snapshots/` (30 days
+    retained) — written once per calendar day at launch.
+  - Suspicious-shrink guard: if a save would discard >50% of entries
+    (with ≥5 prior), the discarded entries are spilled to
+    `<data dir>/lost_entries/` *before* the overwrite proceeds.
+  - **Settings → Restore from backup…** surfaces every recoverable copy
+    across all four tiers; pick a row, get a one-click restore (the
+    pre-restore state goes through the same backup chain, so even an
+    accidental restore is reversible).
 - **Crash-recovery autosave.** Dirty edits debounce a 3-second write
   to a per-record `.gb` snapshot. Power-cut your laptop mid-edit; the
   next launch surfaces the survivors.
-- **1,200+ tests** (`pytest -n auto -q`, ~3 min on 8 cores) anchored on
-  ten **sacred invariants** for biology correctness: palindromic-enzyme
-  scanning, reverse-strand coordinate handling, IUPAC reverse-complement
-  including ambiguity codes, wrap-around feature math, atomic-save
-  contract, undo deepcopy, etc. Property-based fuzzing
-  (`hypothesis`) doubles up on the riskiest ones. Touching the biology
-  primitives trips a test in under two seconds.
+- **1,700+ tests** (`pytest -n auto -q`, ~5–6 min on 8 cores) anchored on
+  35 **sacred invariants** for biology correctness AND data integrity:
+  palindromic-enzyme scanning, reverse-strand coordinate handling,
+  IUPAC reverse-complement including ambiguity codes, wrap-around
+  feature math, atomic-save contract, undo deepcopy, cache-deepcopy on
+  read AND save, natural-sort row-mapping symmetry, etc. Property-based
+  fuzzing (`hypothesis`) doubles up on the riskiest ones. Touching the
+  biology primitives trips a test in under two seconds.
 - **No external BLAST install.** `pyhmmer` ships HMMER 3 source compiled
   in-wheel; BLASTN, BLASTP, and HMMscan all run in-process via
   `nhmmer` / `phmmer` / `hmmscan`, with a pure-Python ungapped fallback
@@ -149,8 +159,20 @@ Press `?` once running for the full keyboard-shortcut reference.
   the active grammar's pad / site / spacer / overhang.
 - **Parts Bin** — domesticated parts catalog with per-grammar filtering;
   legacy parts default to GB L0; "Copy primed sequence" preserves the
-  part's stored grammar.
+  part's stored grammar. **Load Part** auto-classifies the currently-
+  open plasmid by digesting it with each grammar's Type IIS enzyme and
+  matching the released fragment's overhangs against the grammar's
+  position table — register an externally-domesticated part without
+  manually picking grammar / position.
 - **Constructor** — assembly UI for chaining L0 parts into a TU.
+- **Traditional cloning** — restriction-digest + ligation simulator
+  with three insert sources (current plasmid, library entry, free-form
+  PCR product). 2-enzyme directional cuts produce both forward and
+  reverse-orientation products; non-ligatable orientations are flagged
+  rather than silently dropped. Save the simulated product back to the
+  library with full **construction-history XML** (`<HistoryTree>`
+  matching the popular commercial editor's format) so the lineage of
+  multi-step builds is preserved across import/export.
 - **Primer design** — detection / cloning / Golden Braid / generic via
   Primer3; primers can be added to the map as `primer_bind` features
   or saved to the persistent primer library (Designed → Ordered →
@@ -178,6 +200,17 @@ Press `?` once running for the full keyboard-shortcut reference.
     invalidated on `_save_collections`.
 - **Six-frame ORF indexing** (opt-in checkbox) for BLASTP against
   unannotated regions of plasmid backbones.
+- **Cross-collection plasmid search** — Edit → Find plasmid… opens a
+  fuzzy / substring search over every plasmid in every collection,
+  natural-sorted by `(collection, plasmid)` so `pBin2` lands before
+  `pBin10`. One click opens the entry without manually switching
+  collections.
+- **Pairwise alignment of sequencing runs** — File → Align sequencing
+  run loads a Plasmidsaurus `.zip` (or any `.gbk` / `.gb`), pairwise-
+  aligns it against the loaded plasmid, and renders a full-screen
+  alignment viewer with target-feature lane, parallel target/query
+  rows, match track, and mismatch-red highlighting. Length-capped at
+  200 kb per side; cancellable via the standard worker pattern.
 - **New Plasmid modal** (`Ctrl+N`) — paste a sequence, optionally name
   + set topology, then either Create / Annotate-from-library
   (substring match) / Annotate-via-BLAST (≥90% identity → `misc_feature`).
@@ -193,11 +226,23 @@ Press `?` once running for the full keyboard-shortcut reference.
   independently into a new collection; failures are isolated per file
   and surfaced in a notify summary. Designed for migrating a
   popular-commercial-plasmid-editor archive in one shot.
+- **`.dna` round-trip.** SpliceCraft reads the popular commercial
+  plasmid editor's binary format (sequence + features + notes +
+  primers + construction history) and writes it back — including the
+  default `Primers` and `AdditionalSequenceProperties` packets the
+  editor itself emits — so files round-trip through SpliceCraft
+  cleanly into the editor's Viewer / Inspector panels. Construction
+  history XML is preserved on import and synthesised on save for any
+  product built via the Traditional cloning simulator.
 - **Library fuzzy search** — subsequence match (case-insensitive,
-  non-contiguous) against the visible table.
+  non-contiguous) against the visible table; natural-sorted so
+  `pBin2` lands before `pBin10`.
 - **Feature library** — reusable feature snippets (per-entry colour
   and strand) with a centralised browse / edit / rename / recolor /
-  delete workbench.
+  delete workbench. Display rows natural-sort independently of the
+  on-disk order so `pPart-2` sits next to `pPart-10` rather than
+  scattered alphabetically; entry indices remain stable across the
+  re-sort so dirty-edit markers don't desync.
 
 ### Drive it from outside the GUI
 - **Agent API** (`splicecraft --agent-api`) exposes a localhost JSON
@@ -372,7 +417,7 @@ than crashing.
 ## Tests
 
 ```bash
-python3 -m pytest -n auto -q                  # full suite (~3 min on 8 cores)
+python3 -m pytest -n auto -q                  # full suite (1700+ tests, ~5–6 min on 8 cores)
 python3 -m pytest tests/test_dna_sanity.py    # biology correctness only (< 2 s)
 python3 -m pytest tests/test_invariants_hypothesis.py  # property-based fuzzing
 ```
@@ -386,7 +431,7 @@ test can write to real user files.
 ## Codebase tour
 
 SpliceCraft is a single-file Python app (`splicecraft.py`,
-~23,000 lines) on Textual + Biopython. The single-file layout is
+~39,000 lines) on Textual + Biopython. The single-file layout is
 intentional — no import puzzles, everything is greppable from one
 place.
 
@@ -394,9 +439,11 @@ place.
 map. Test files are 1:1 named after the subsystem they cover.
 
 `CLAUDE.md` at the repo root is the **agent + contributor handover
-document**: ten sacred invariants, error-handling convention, known
-pitfalls. Read it before touching the rendering layer, record pipeline,
-or primer design.
+document**: 35 sacred invariants, error-handling convention, known
+pitfalls, persistence + cache discipline, natural-sort row-mapping
+symmetry, the `.dna` writer's expected packet inventory. Read it before
+touching the rendering layer, record pipeline, primer design, or any
+persisted-data save path.
 
 ---
 

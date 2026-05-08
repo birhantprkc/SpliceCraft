@@ -242,6 +242,24 @@ _MODAL_CASES = [
                                                  "history_xml":
                                                      "<HistoryTree/>"},
                                                 default_path="/tmp/ex.dna")),
+    # DropdownScreen is a positioned popup overlay rather than a
+    # centered dialog — its `compose` doesn't anchor to the standard
+    # 160×48 layout box but it still has to render inside the canvas
+    # bounds. Use a 3-item menu (one separator + two actionable rows)
+    # at offset (10, 5) — enough to exercise the layout without
+    # special-casing the boundary check.
+    ("DropdownScreen",             lambda: sc.DropdownScreen(
+                                                items=[("Open…", "app.open_file"),
+                                                       ("---",   None),
+                                                       ("Quit",  "app.quit")],
+                                                x=10, y=5)),
+    # GrammarEditorModal opens a built-in grammar in read-only mode.
+    # Built-ins resolve from `_BUILTIN_GRAMMARS` so the modal builds
+    # without a `cloning_grammars.json` on disk (the autouse
+    # `_protect_user_data` fixture monkeypatches that path away anyway).
+    # `gb_l0` is the default-active grammar so it's the most
+    # representative case to pin.
+    ("GrammarEditorModal.builtin", lambda: sc.GrammarEditorModal("gb_l0")),
 ]
 
 

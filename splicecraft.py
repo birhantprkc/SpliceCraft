@@ -33,6 +33,7 @@ import threading
 import uuid as _uuid
 import warnings as _warnings
 from collections import OrderedDict as _OD
+from copy import copy as _shallow_copy, deepcopy
 from datetime import date as _date, datetime as _datetime
 from io import StringIO
 from logging.handlers import RotatingFileHandler
@@ -1198,8 +1199,13 @@ _library_cache: "list | None" = None
 
 def _load_library() -> list[dict]:
     global _library_cache
+    # Deep-copy on read (sacred invariant #17): library entries carry
+    # nested dicts (qualifiers, history, primer-pair info). Caller-side
+    # mutation of those nested objects would otherwise poison the cache
+    # for every subsequent reader. Mirrors `_load_collections` /
+    # `_load_features` / `_load_parts_bin` / `_load_primers`.
     if _library_cache is not None:
-        return list(_library_cache)
+        return deepcopy(_library_cache)
     entries, warning = _safe_load_json(_LIBRARY_FILE, "Plasmid library")
     if warning:
         _log.warning(warning)
@@ -1207,12 +1213,17 @@ def _load_library() -> list[dict]:
     # .get() calls downstream don't raise AttributeError.
     entries = [e for e in entries if isinstance(e, dict)]
     _library_cache = entries
-    return list(_library_cache)
+    return deepcopy(_library_cache)
 
 def _save_library(entries: list[dict]) -> None:
     global _library_cache
     _safe_save_json(_LIBRARY_FILE, entries, "Plasmid library")
-    _library_cache = list(entries)
+    # Deep-copy the post-save state into the cache so the cache is
+    # independent of the caller's reference. Without this, a caller
+    # that keeps editing `entries` after `_save_library` returns would
+    # poison the in-memory cache with their staged-but-not-yet-saved
+    # mutations — and the next `_load_library` would surface them.
+    _library_cache = deepcopy(entries)
     # Keep the active collection's plasmids in sync with the library — every
     # add / remove / rename on the panel feeds through here, so a single
     # mirror call covers all CRUD without changing call sites.
@@ -1248,13 +1259,11 @@ def _load_collections() -> list[dict]:
         if warning:
             _log.warning(warning)
         _collections_cache = [e for e in entries if isinstance(e, dict)]
-    from copy import deepcopy
     return deepcopy(_collections_cache)
 
 def _save_collections(entries: list[dict]) -> None:
     global _collections_cache
     _safe_save_json(_COLLECTIONS_FILE, entries, "Plasmid collections")
-    from copy import deepcopy
     _collections_cache = deepcopy(entries)
     # Invalidate any cached BLAST databases so a freshly-renamed /
     # deleted / edited collection doesn't keep returning hits from the
@@ -4544,6 +4553,7 @@ def _inject_commercialsaas_history(data: bytes, new_xml: "str | None") -> bytes:
 _COMMERCIALSAAS_PACKET_DNA      = 0x00
 _COMMERCIALSAAS_PACKET_PRIMERS  = 0x05
 _COMMERCIALSAAS_PACKET_NOTES    = 0x06
+_COMMERCIALSAAS_PACKET_ADDPROPS = 0x08
 _COMMERCIALSAAS_PACKET_FEATURES = 0x0A
 
 # Cookie payload: 8-byte format magic + 3 unsigned shorts
@@ -4687,6 +4697,65 @@ def _commercialsaas_feat_name(feat) -> str:
     return _CONTROL_CHARS_RE.sub("", name)[:200] or "feature"
 
 
+def _build_commercialsaas_addprops_packet_default() -> bytes:
+    """Build a default 0x08 AdditionalSequenceProperties packet —
+    Upstream/DownstreamStickiness="0" (= blunt) and Upstream/Downstream
+    Modification=FivePrimePhosphorylated. Real CommercialSaaS files
+    emit this even on circular plasmids where end-stickiness has no
+    biological meaning; it's part of the editor's standard packet
+    inventory and Viewer reads it for the "Sequence Properties"
+    inspector. Pinning the 289-byte default matches all three FFE_*
+    fixtures byte-for-byte.
+
+    SpliceCraft doesn't currently model strand stickiness or end
+    modifications, so a constant default is the right output —
+    extending this when we gain a richer linear-fragment model is a
+    future hardening item."""
+    xml = (
+        "<AdditionalSequenceProperties>"
+        "<UpstreamStickiness>0</UpstreamStickiness>"
+        "<DownstreamStickiness>0</DownstreamStickiness>"
+        "<UpstreamModification>FivePrimePhosphorylated</UpstreamModification>"
+        "<DownstreamModification>FivePrimePhosphorylated</DownstreamModification>"
+        "</AdditionalSequenceProperties>"
+    )
+    return _build_commercialsaas_packet(_COMMERCIALSAAS_PACKET_ADDPROPS,
+                                       xml.encode("utf-8"))
+
+
+def _build_commercialsaas_primers_packet_default() -> bytes:
+    """Build a minimum 0x05 Primers packet — root ``<Primers>`` with a
+    single ``<HybridizationParams>`` child carrying the defaults the
+    commercial editor writes on save (10 bp min continuous match, 1
+    mismatch allowed, 40°C min Tm, 5'-end matching with 15 bp). No
+    actual ``<Primer>`` entries — primer features (``primer_bind``)
+    are still emitted via the 0x0A features packet.
+
+    Real CommercialSaaS files always carry this packet even when no
+    user-tracked primers exist — emitting it lets our from-scratch
+    files mirror the editor's expected packet inventory and stops the
+    Primers panel from defaulting to "(empty)" instead of the user's
+    configured hybridization defaults. Three of the FFE_* test
+    fixtures all carry exactly this 217-byte default; pinning it byte-
+    for-byte gives us a regression target for ``CommercialSaaS Viewer``
+    acceptance.
+    """
+    xml = (
+        '<?xml version="1.0"?>'
+        '<Primers nextValidID="0">'
+        '<HybridizationParams '
+        'minContinuousMatchLen="10" '
+        'allowMismatch="1" '
+        'minMeltingTemperature="40" '
+        'showAdditionalFivePrimeMatches="1" '
+        'minimumFivePrimeAnnealing="15"'
+        '/>'
+        '</Primers>'
+    )
+    return _build_commercialsaas_packet(_COMMERCIALSAAS_PACKET_PRIMERS,
+                                       xml.encode("utf-8"))
+
+
 def _commercialsaas_iter_location_parts(location):
     """Yield `(start, end)` simple parts for a feature location.
     Handles both `SimpleLocation` (single part) and `CompoundLocation`
@@ -4727,6 +4796,19 @@ def _write_commercialsaas_dna_bytes(record, *,
     parts.append(_build_commercialsaas_dna_packet(seq, circular=is_circ))
     parts.append(_build_commercialsaas_features_packet_from_record(record))
     parts.append(_build_commercialsaas_notes_packet(record))
+    # Default 0x08 AdditionalSequenceProperties — strand stickiness +
+    # end modifications. Real files carry this even on circular
+    # plasmids where end-stickiness is meaningless; emitting the same
+    # 289-byte default keeps the Sequence Properties inspector from
+    # falling back to "(empty)" when Viewer reads our output.
+    parts.append(_build_commercialsaas_addprops_packet_default())
+    # Default 0x05 Primers packet — every real CommercialSaaS file
+    # carries this with the same `HybridizationParams` defaults even
+    # when no user primers are tracked. Emitting it ourselves keeps
+    # the from-scratch output's packet inventory aligned with what the
+    # editor produces, so Viewer can render the Primers panel cleanly
+    # and never has to fall back to "(empty)" defaults.
+    parts.append(_build_commercialsaas_primers_packet_default())
     if history_xml:
         payload = _pack_commercialsaas_history_payload(history_xml)
         parts.append(_build_commercialsaas_packet(
@@ -5218,7 +5300,6 @@ def _record_to_gb_text(record) -> str:
     callers that compare records by annotation contents).
     """
     from Bio import SeqIO
-    from copy import copy as _shallow_copy
     anns = dict(getattr(record, "annotations", None) or {})
     anns.setdefault("molecule_type", "DNA")
     rec = _shallow_copy(record)
@@ -5704,7 +5785,6 @@ def _normalize_for_genbank(record):
     Idempotent — existing values are preserved. Only fills gaps. Caller's
     record is never mutated.
     """
-    from copy import copy as _shallow_copy
     from datetime import datetime as _dt
 
     rec = _shallow_copy(record)
@@ -7819,6 +7899,9 @@ def _search_collections_library(query: str, *,
 
     Used by the cross-collection search modal (`LibrarySearchModal`,
     Edit → Find plasmid…) and the `search-library` agent endpoint.
+    Results are natural-sorted by ``(collection_name, plasmid_name)``
+    so ``Backbones 2`` lands before ``Backbones 10`` and within a
+    collection ``pBin2`` lands before ``pBin10``.
     """
     out: list[dict] = []
     q = (query or "").strip()
@@ -7845,9 +7928,22 @@ def _search_collections_library(query: str, *,
                 "status":     _sanitize_plasmid_status(entry.get("status")),
                 "n_feats":    entry.get("n_feats", 0),
             })
-            if len(out) >= limit:
-                return out
-    return out
+    # Natural-sort by (collection, name) — group rows from the same
+    # collection together, with plasmids inside each group in
+    # human-friendly numeric order. `heapq.nsmallest` keeps this O(N
+    # + limit·log(limit)) instead of the full O(N·log(N)) `out.sort`
+    # would cost, which matters once the user crosses ~1k plasmids
+    # (typical limit=200). For small libraries the two paths are
+    # indistinguishable; for a 5k-plasmid catalog the heap form saves
+    # ~30 ms per search keystroke.
+    import heapq as _heapq
+    return _heapq.nsmallest(
+        limit, out,
+        key=lambda r: (
+            _natural_sort_key(r.get("collection") or ""),
+            _natural_sort_key(r.get("name") or ""),
+        ),
+    )
 
 
 _NATURAL_SORT_RE = re.compile(r"(\d+)")
@@ -8457,7 +8553,18 @@ class LibraryPanel(Widget):
             if not yes:
                 return
             entries = [e for e in _load_library() if e.get("id") != entry_id]
-            _save_library(entries)
+            try:
+                _save_library(entries)
+            except OSError as exc:
+                # Disk-full / permission-denied / RO mount: surface to
+                # the user instead of silently swallowing — they need to
+                # know the entry is still on disk and can retry.
+                _log.exception("Plasmid delete: save failed")
+                self.app.notify(
+                    f"Couldn't delete '{name}': {exc}.",
+                    severity="error",
+                )
+                return
             self._repopulate_plasmids()
             # If we just deleted the loaded record's library entry,
             # drop the panel's active-row binding AND clear the
@@ -8546,7 +8653,19 @@ class LibraryPanel(Widget):
         _set_active_collection_name(name)
         plasmids = [dict(p) for p in (coll.get("plasmids") or [])
                     if isinstance(p, dict)]
-        _save_library(plasmids)
+        try:
+            _save_library(plasmids)
+        except OSError as exc:
+            # Disk-full / permission-denied / RO mount: surface so the
+            # user knows the collection switch didn't fully land. The
+            # active-collection pointer was already moved; next launch
+            # will re-resolve via `_restore_library_from_active_collection`.
+            _log.exception("Collection switch: library save failed")
+            self.app.notify(
+                f"Switched to '{name}' but library write failed: {exc}.",
+                severity="error",
+            )
+            return
         self._view_mode = "plasmids"
         self._apply_view_mode()
         self._repopulate_plasmids()
@@ -14082,7 +14201,6 @@ _grammars_cache: "list | None" = None
 
 def _load_custom_grammars() -> list[dict]:
     global _grammars_cache
-    from copy import deepcopy
     if _grammars_cache is not None:
         return deepcopy(_grammars_cache)
     entries, warning = _safe_load_json(_GRAMMARS_FILE, "Cloning grammars")
@@ -14095,7 +14213,6 @@ def _load_custom_grammars() -> list[dict]:
 
 def _save_custom_grammars(entries: list[dict]) -> None:
     global _grammars_cache
-    from copy import deepcopy
     _safe_save_json(_GRAMMARS_FILE, entries, "Cloning grammars")
     _grammars_cache = deepcopy(entries)
 
@@ -14108,7 +14225,6 @@ def _all_grammars() -> dict[str, dict]:
     returned dicts are independent copies, so callers may mutate them
     without poisoning the cache.
     """
-    from copy import deepcopy
     out: dict[str, dict] = {gid: deepcopy(g) for gid, g in _BUILTIN_GRAMMARS.items()}
     for g in _load_custom_grammars():
         gid = g.get("id")
@@ -14161,7 +14277,6 @@ _entry_vectors_cache: "list | None" = None
 
 def _load_entry_vectors() -> list[dict]:
     global _entry_vectors_cache
-    from copy import deepcopy
     if _entry_vectors_cache is not None:
         return deepcopy(_entry_vectors_cache)
     entries, warning = _safe_load_json(_ENTRY_VECTORS_FILE,
@@ -14177,7 +14292,6 @@ def _load_entry_vectors() -> list[dict]:
 
 def _save_entry_vectors(entries: list[dict]) -> None:
     global _entry_vectors_cache
-    from copy import deepcopy
     _safe_save_json(_ENTRY_VECTORS_FILE, entries, "Entry vectors")
     _entry_vectors_cache = deepcopy(entries)
 
@@ -14304,6 +14418,74 @@ def _detect_selection_marker(gb_text: str) -> "str | None":
             for kw, display in _SELECTION_MARKER_KEYWORDS:
                 if kw in low:
                     return display
+    return None
+
+
+def _classify_part_from_plasmid(
+    seq: str,
+    *,
+    circular: bool,
+    features: "list[dict] | None" = None,
+) -> "dict | None":
+    """Identify which cloning grammar + position a circular plasmid
+    holds, by digesting it with each grammar's Type IIS enzyme and
+    matching the released fragment's overhangs against the grammar's
+    position table.
+
+    Returns ``None`` when no grammar gives a clean (exactly 2-fragment)
+    digest where the smaller fragment's ``(left.overhang_seq,
+    right.overhang_seq)`` pair matches one of the grammar's positions.
+    Otherwise returns ``{grammar_id, grammar_name, position, insert,
+    vector}`` where ``insert`` is the smaller fragment dict and
+    ``vector`` the larger one (so the caller can pull the insert
+    sequence + overhangs straight off the dict).
+
+    Built-in grammars are tried in registry order (Golden Braid L0
+    first, then MoClo Plant) followed by user-defined grammars, so a
+    plasmid that's compatible with multiple grammars resolves to the
+    first match — typically what the user expects since L0 / L1 use
+    different enzymes and a real Golden Braid L0 part can only digest
+    cleanly with Esp3I.
+
+    Linear records skip the digest (a linear "part" can't be cleanly
+    excised; the overhangs in the .gb annotation are the source of
+    truth and we don't try to back-derive them here)."""
+    if not seq or not circular:
+        return None
+    grammars = _all_grammars()
+    for gid, grammar in grammars.items():
+        enzyme = grammar.get("enzyme")
+        if not isinstance(enzyme, str) or not enzyme:
+            continue
+        try:
+            frags, err = _excise_fragment_pair(
+                seq, [enzyme], circular=True,
+                features=features,
+                source_label=grammar.get("name", gid),
+            )
+        except Exception:
+            _log.exception("_classify_part_from_plasmid: digest failed for %s", gid)
+            continue
+        if err is not None or len(frags) != 2:
+            continue
+        # Smaller fragment is the insert; larger is the vector.
+        insert = min(frags, key=lambda f: len(f.get("top_seq") or ""))
+        vector = max(frags, key=lambda f: len(f.get("top_seq") or ""))
+        oh5 = (insert.get("left")  or {}).get("overhang_seq", "").upper()
+        oh3 = (insert.get("right") or {}).get("overhang_seq", "").upper()
+        if not oh5 or not oh3:
+            continue
+        for pos in grammar.get("positions") or []:
+            pos_oh5 = str(pos.get("oh5", "")).upper()
+            pos_oh3 = str(pos.get("oh3", "")).upper()
+            if pos_oh5 == oh5 and pos_oh3 == oh3:
+                return {
+                    "grammar_id":   gid,
+                    "grammar_name": grammar.get("name", gid),
+                    "position":     dict(pos),
+                    "insert":       insert,
+                    "vector":       vector,
+                }
     return None
 
 
@@ -14775,20 +14957,22 @@ def _load_parts_bin() -> list[dict]:
         # primer pairs, mutation lists). Caller mutations of those nested
         # objects would otherwise poison the in-memory cache for every
         # subsequent reader (sacred invariant #17).
-        from copy import deepcopy
         return deepcopy(_parts_bin_cache)
     entries, warning = _safe_load_json(_PARTS_BIN_FILE, "Parts bin")
     if warning:
         _log.warning(warning)
     entries = [e for e in entries if isinstance(e, dict)]
     _parts_bin_cache = entries
-    from copy import deepcopy
     return deepcopy(_parts_bin_cache)
 
 def _save_parts_bin(entries: list[dict]) -> None:
     global _parts_bin_cache
     _safe_save_json(_PARTS_BIN_FILE, entries, "Parts bin")
-    _parts_bin_cache = list(entries)
+    # Deep-copy on save so the cache is independent of the caller's
+    # reference — pre-fix `list(entries)` shared dict refs with the
+    # caller, so subsequent caller mutations (e.g. modal Cancel that
+    # didn't actually save) leaked back into the next `_load_parts_bin`.
+    _parts_bin_cache = deepcopy(entries)
 
 
 # ── Primer design (Primer3-backed) ─────────────────────────────────────────────
@@ -14810,20 +14994,22 @@ def _load_primers() -> list[dict]:
         # Deep-copy on read: primer entries carry nested dicts (qualifiers,
         # binding-region info, per-pair attribute dicts). Caller mutations
         # of nested objects would poison the cache (sacred invariant #17).
-        from copy import deepcopy
         return deepcopy(_primers_cache)
     entries, warning = _safe_load_json(_PRIMERS_FILE, "Primer library")
     if warning:
         _log.warning(warning)
     entries = [e for e in entries if isinstance(e, dict)]
     _primers_cache = entries
-    from copy import deepcopy
     return deepcopy(_primers_cache)
 
 def _save_primers(entries: list[dict]) -> None:
     global _primers_cache
     _safe_save_json(_PRIMERS_FILE, entries, "Primer library")
-    _primers_cache = list(entries)
+    # Deep-copy on save so the cache is independent of the caller's
+    # reference — pre-fix `list(entries)` shared dict refs with the
+    # caller, so subsequent caller mutations (e.g. an aborted modal)
+    # leaked back into the next `_load_primers`.
+    _primers_cache = deepcopy(entries)
 
 
 # ── Feature library persistence ───────────────────────────────────────────────
@@ -14938,7 +15124,6 @@ def _load_features() -> list[dict]:
     DomesticatorModal feature picker, etc.) as if it had been saved.
     """
     global _features_cache, _features_generation
-    from copy import deepcopy
     if _features_cache is not None:
         return deepcopy(_features_cache)
     entries, warning = _safe_load_json(_FEATURES_FILE, "Feature library")
@@ -14965,7 +15150,6 @@ def _save_features(entries: list[dict]) -> None:
     the post-save mutations stuck in the cache.
     """
     global _features_cache, _features_generation
-    from copy import deepcopy
     _safe_save_json(_FEATURES_FILE, entries, "Feature library")
     _features_cache = deepcopy(entries)
     _features_generation += 1
@@ -15436,15 +15620,24 @@ def _codon_search(query: str, entries: "list | None" = None) -> list[dict]:
 
     Results are sorted by (rank, name) so same-genus entries cluster and
     the strongest match wins. An empty/whitespace query returns the
-    registry in its persisted order, unchanged, to preserve caller
-    expectations (the filter field shows "all tables" when cleared).
+    registry naturally sorted by display name (`Escherichia coli K12`
+    before `Escherichia coli K-12 MG1655`) so the unfiltered table
+    reads in human-friendly order rather than disk-insertion order.
+    Same-rank ties under a non-empty query also use the natural-sort
+    secondary key (e.g. `E. coli K12` before `K-12 MG1655`).
     """
     if entries is None:
         entries = _codon_tables_load()
     q = (query or "").strip().lower()
     if not q:
-        return list(entries)
-    ranked: list[tuple[int, str, dict]] = []
+        # Empty query → natural-sort the registry by display name so
+        # `Escherichia coli K12` lands near the top in stable order
+        # regardless of the JSON-file insertion order.
+        return sorted(
+            entries,
+            key=lambda e: _natural_sort_key(str(e.get("name") or "")),
+        )
+    ranked: list[tuple[int, tuple, dict]] = []
     for e in entries:
         name_lc  = str(e.get("name", "")).lower()
         taxid_lc = str(e.get("taxid", "")).lower()
@@ -15461,7 +15654,9 @@ def _codon_search(query: str, entries: "list | None" = None) -> list[dict]:
             rank = 4
         else:
             continue
-        ranked.append((rank, name_lc, e))
+        # Secondary key uses natural sort so same-rank matches come
+        # back in human-friendly order (`E. coli K12` before `K-12 MG1655`).
+        ranked.append((rank, _natural_sort_key(name_lc), e))
     ranked.sort(key=lambda t: (t[0], t[1]))
     return [t[2] for t in ranked]
 
@@ -20715,6 +20910,18 @@ class FeatureLibraryScreen(Screen):
         # `action_close` to decide whether to prompt.
         self._dirty_indices: set[int] = set()
         self._has_pending_changes: bool = False
+        # Display-row → entry-index mapping for the natural-sort
+        # rendering. Rebuilt on every ``_repopulate_table``; cursor
+        # events translate visual rows back to entry indices through
+        # this list. ``self._entries`` itself stays in on-disk order
+        # so ``_selected_index`` / ``_dirty_indices`` keep their
+        # entry-index semantics across edits.
+        self._row_to_entry_idx: list[int] = []
+        # Reverse mapping (entry-idx → row) so cursor restoration after
+        # `_repopulate_table` is O(1) instead of O(N) `.index()` lookup.
+        # For libraries with hundreds of entries this avoids per-edit
+        # latency on the cursor-restore path.
+        self._entry_idx_to_row: dict[int, int] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -20756,7 +20963,26 @@ class FeatureLibraryScreen(Screen):
         except NoMatches:
             return
         tbl.clear(columns=False)
-        for i, entry in enumerate(self._entries):
+        # Natural sort by name (``pBin2`` before ``pBin10``). The
+        # backing ``self._entries`` list stays in its on-disk order so
+        # ``_selected_index`` / ``_dirty_indices`` keep their existing
+        # entry-index semantics; we build a row→entry mapping for the
+        # display and translate cursor events through it. Mirrors the
+        # ``FeatureSidebar._row_to_feat_idx`` pattern.
+        self._row_to_entry_idx: list[int] = sorted(
+            range(len(self._entries)),
+            key=lambda i: _natural_sort_key(
+                (self._entries[i].get("name") or "")
+            ),
+        )
+        # Reverse map for O(1) cursor-restore lookup (vs `.index()`
+        # which is O(N) and walked once per repopulate).
+        self._entry_idx_to_row = {
+            entry_idx: row_idx
+            for row_idx, entry_idx in enumerate(self._row_to_entry_idx)
+        }
+        for row_idx, entry_idx in enumerate(self._row_to_entry_idx):
+            entry = self._entries[entry_idx]
             color = _resolve_feature_color(entry)
             strand = entry.get("strand", 1)
             strand_tag = {1: "+", -1: "−", 0: "·", 2: "↔"}.get(strand, "+")
@@ -20765,7 +20991,9 @@ class FeatureLibraryScreen(Screen):
             swatch = Text("███ ", style=color)
             swatch.append(color, style="dim")
             base_name = entry.get("name", "?")
-            name_cell = ("*" + base_name) if i in self._dirty_indices else base_name
+            name_cell = (("*" + base_name)
+                         if entry_idx in self._dirty_indices
+                         else base_name)
             tbl.add_row(
                 name_cell,
                 entry.get("feature_type", "?"),
@@ -20773,11 +21001,25 @@ class FeatureLibraryScreen(Screen):
                 str(bp),
                 swatch,
             )
-        # Keep the selection in range.
+        # Keep the selection in range and place the cursor on the row
+        # whose entry-idx matches `_selected_index`. O(1) via the
+        # reverse map.
         if self._entries:
             if self._selected_index < 0 or self._selected_index >= len(self._entries):
-                self._selected_index = 0
-            tbl.move_cursor(row=self._selected_index)
+                self._selected_index = self._row_to_entry_idx[0]
+            row_idx = self._entry_idx_to_row.get(self._selected_index)
+            if row_idx is None:
+                # Selection drifted outside the current row mapping —
+                # log so the underlying drift surfaces in dev mode
+                # rather than silently snapping to row 0.
+                _log.warning(
+                    "FeatureLibraryScreen: selected_index %d not in "
+                    "row map (n=%d); snapping to row 0",
+                    self._selected_index, len(self._row_to_entry_idx),
+                )
+                row_idx = 0
+                self._selected_index = self._row_to_entry_idx[0]
+            tbl.move_cursor(row=row_idx)
         else:
             self._selected_index = -1
         self._refresh_title()
@@ -20811,7 +21053,17 @@ class FeatureLibraryScreen(Screen):
             tbl = self.query_one("#flib-table", DataTable)
         except NoMatches:
             return
-        self._selected_index = tbl.cursor_row
+        # Translate the visual row index through the natural-sort
+        # row→entry mapping built in `_repopulate_table`. Pre-fix
+        # `cursor_row` was directly used as the entry index — fine when
+        # entries rendered in their on-disk order, broken once the
+        # natural sort started reshuffling rows.
+        row = tbl.cursor_row
+        if (row is None
+                or not getattr(self, "_row_to_entry_idx", None)
+                or row < 0 or row >= len(self._row_to_entry_idx)):
+            return
+        self._selected_index = self._row_to_entry_idx[row]
         self._refresh_preview()
 
     @on(Button.Pressed, "#btn-flib-export-fasta")
@@ -21194,7 +21446,6 @@ class GrammarEditorModal(ModalScreen):
         self._grammar_id = grammar_id
         self._is_builtin = grammar_id in _BUILTIN_GRAMMARS
         # Snapshot the grammar dict so cancel discards in-flight edits.
-        from copy import deepcopy
         grammars = _all_grammars()
         self._grammar = deepcopy(
             grammars.get(grammar_id, _BUILTIN_GRAMMARS["gb_l0"])
@@ -21652,6 +21903,7 @@ class PartsBinModal(Screen):
         "#btn-parts-copy-primed",
         "#btn-parts-copy-cloned",
         "#btn-new-part",
+        "#btn-load-part",
         "#btn-parts-save-as-feature",
         "#btn-parts-export-fasta",
     )
@@ -21733,6 +21985,7 @@ class PartsBinModal(Screen):
                 yield Button("Copy Primed",     id="btn-parts-copy-primed")
                 yield Button("Copy Cloned",     id="btn-parts-copy-cloned")
                 yield Button("New Part",        id="btn-new-part",    variant="primary")
+                yield Button("Load Part",       id="btn-load-part",   variant="primary")
                 yield Button("Save As Feature", id="btn-parts-save-as-feature")
                 yield Button("Save to Collection",
                               id="btn-parts-save-to-coll", variant="primary")
@@ -21821,8 +22074,28 @@ class PartsBinModal(Screen):
         # repopulate may now point at different parts (a New Part
         # save inserts at index 0). Clearing here keeps the bulk-
         # save action from operating on stale targets.
+        #
+        # IMPORTANT (sacred invariant #33 — natural-sort row mapping):
+        # ``self._rows`` IS the display order — we sort it in-place
+        # immediately below, and every cursor / multi-select handler
+        # in this modal indexes ``self._rows[idx]`` directly without a
+        # row→entry mapping. That works ONLY because (a) display order
+        # equals backing-list order (we sort `_rows` itself, not a
+        # separate render list) AND (b) `_selected_rows` is cleared
+        # on every populate. If you ever add a code path that mutates
+        # `self._rows` mid-flight without re-sorting + clearing
+        # selection, you MUST introduce a `_row_to_part_idx` mapping
+        # alongside (mirroring `FeatureLibraryScreen._row_to_entry_idx`
+        # / `PrimerDesignScreen._row_to_primer_idx`) — otherwise
+        # cursor-row lookups will resolve to stale entries.
         self._selected_rows.clear()
         self._rows = self._all_rows()
+        # Natural sort by name (`pBin2` before `pBin10`) — see
+        # `_natural_sort_key`. Parts bin saves preserve insertion
+        # order; sort at populate time so a user adding "BsaI_part_2"
+        # after "BsaI_part_10" doesn't see the lex-sorted "_2 _10"
+        # ordering.
+        self._rows.sort(key=lambda r: _natural_sort_key(r.get("name") or ""))
         # Refresh the feature-library index up-front so every row's
         # cell render is an O(1) dict lookup. Without this each row
         # would call `_feature_library_match`, which itself calls
@@ -22367,6 +22640,159 @@ class PartsBinModal(Screen):
         self.app.push_screen(
             DomesticatorModal(seq, feats, current_plasmid_name=current_name),
             callback=_on_result,
+        )
+
+    @on(Button.Pressed, "#btn-load-part")
+    def _load_part(self, _) -> None:
+        """Take the currently-loaded plasmid, classify it against every
+        cloning grammar via Type IIS digest, and save it as a Parts
+        Bin row tagged with the detected grammar / position / marker.
+
+        For users who already domesticated a part externally and just
+        want to register it in the bin without going through the full
+        Domesticator modal. ``_classify_part_from_plasmid`` does the
+        per-grammar digest; ``_detect_selection_marker`` reads the
+        marker off the plasmid's CDS labels.
+
+        Pre-flight checks (record present, circular topology) run on
+        the UI thread so the user sees the warning toast immediately;
+        the actual digest + serialise + save happens in a worker so a
+        50 kbp plasmid × N grammars doesn't freeze the modal.
+        """
+        rec = getattr(self.app, "_current_record", None)
+        if rec is None:
+            self.app.notify(
+                "Load a plasmid first — Load Part takes the currently-"
+                "open record.",
+                severity="warning",
+            )
+            return
+        circular = (
+            (rec.annotations or {}).get("topology", "").lower() == "circular"
+        )
+        if not circular:
+            self.app.notify(
+                "Load Part needs a circular plasmid (digest into 2 "
+                "fragments). The current record is linear.",
+                severity="warning",
+            )
+            return
+        # Snapshot inputs at click time so a record swap mid-digest
+        # can't cause us to save a part derived from the OLD plasmid
+        # but tagged with the NEW plasmid's name.
+        seq = str(rec.seq).upper()
+        try:
+            pm = self.app.query_one("#plasmid-map", PlasmidMap)
+            feats = list(pm._feats)
+        except NoMatches:
+            feats = []
+        plasmid_name = (getattr(rec, "name", "")
+                        or getattr(rec, "id", "")
+                        or "imported")
+        # Try to serialise on the UI thread — `_record_to_gb_text` is
+        # quick for typical plasmids and surfaces the failure with the
+        # currently-active record, not a stale snapshot.
+        try:
+            gb_text = _record_to_gb_text(rec)
+        except Exception:
+            _log.exception("Load Part: GenBank serialise failed")
+            gb_text = ""
+        self._load_part_worker(seq, feats, plasmid_name, gb_text)
+
+    @work(thread=True)
+    def _load_part_worker(self, seq: str, feats: list,
+                          plasmid_name: str, gb_text: str) -> None:
+        """Worker body for `_load_part`. Classifies the plasmid against
+        every grammar (the slow step — N digests in series), saves to
+        the parts bin, and bounces back to the UI thread for the
+        repopulate + notify."""
+        try:
+            match = _classify_part_from_plasmid(
+                seq, circular=True, features=feats,
+            )
+        except Exception:
+            _log.exception("Load Part: classify failed")
+            self.app.call_from_thread(
+                self.app.notify,
+                "Load Part: digest failed (see log for details).",
+                severity="error",
+            )
+            return
+        if match is None:
+            self.app.call_from_thread(
+                self.app.notify,
+                "Couldn't classify this plasmid against any grammar. "
+                "Either the Type IIS sites don't release a recognised "
+                "fragment, or the overhangs don't match a known position. "
+                "Use New Part to set type / position manually.",
+                severity="warning",
+            )
+            return
+        insert = match["insert"]
+        position = match["position"]
+        grammar_id = match["grammar_id"]
+        marker = _detect_selection_marker(gb_text) or "—"
+        backbone_label = plasmid_name
+        insert_seq = (insert.get("top_seq") or "").upper()
+        oh5 = str((insert.get("left")  or {}).get("overhang_seq", "")).upper()
+        oh3 = str((insert.get("right") or {}).get("overhang_seq", "")).upper()
+        # Strip the leading 5' overhang off the insert top-strand so
+        # the saved ``sequence`` matches the convention used by every
+        # other Parts Bin save path (the New Part / Domesticator flow
+        # stores the designed insert WITHOUT the 4-nt overhangs —
+        # those live in ``oh5`` / ``oh3``).
+        #
+        # For 5' overhang Type IIS enzymes (BsaI / Esp3I / BsmBI / BpiI
+        # — all the cloning grammars currently care about) the LEFT
+        # overhang sits inside ``top_seq`` (first 4 bases) but the
+        # RIGHT overhang lives in the OTHER fragment (between this
+        # cut's top position and its bottom position, both past
+        # top_seq's end). Stripping ``oh3`` from the right via
+        # ``endswith`` would incorrectly trim 4 legitimate bases off a
+        # part whose insert happens to end in the same 4-mer as the
+        # downstream overhang — so we don't try.
+        if oh5 and insert_seq.startswith(oh5):
+            insert_seq = insert_seq[len(oh5):]
+        part = {
+            "name":       plasmid_name,
+            "type":       position.get("type") or "?",
+            "position":   position.get("name") or "?",
+            "oh5":        oh5,
+            "oh3":        oh3,
+            "backbone":   backbone_label,
+            "marker":     marker,
+            "sequence":   insert_seq,
+            "fwd_primer": "",
+            "rev_primer": "",
+            "fwd_tm":     0.0,
+            "rev_tm":     0.0,
+            "grammar":    grammar_id,
+        }
+        try:
+            entries = _load_parts_bin()
+            entries.insert(0, part)
+            _save_parts_bin(entries)
+        except OSError as exc:
+            _log.exception("Load Part: parts bin save failed")
+            self.app.call_from_thread(
+                self.app.notify,
+                f"Load Part: couldn't save parts bin ({exc}).",
+                severity="error",
+            )
+            return
+        try:
+            _set_setting("active_grammar", grammar_id)
+        except OSError:
+            # Settings persist failure isn't fatal — the part already
+            # saved. The user just won't have the active-grammar tab
+            # auto-flip on next launch.
+            _log.exception("Load Part: persist active_grammar failed")
+        self.app.call_from_thread(self._populate)
+        self.app.call_from_thread(
+            self.app.notify,
+            f"Loaded '{plasmid_name}' as {match['grammar_name']} → "
+            f"{position.get('name')} ({position.get('type')}). "
+            f"Marker: {marker}.",
         )
 
     @on(Button.Pressed, "#btn-parts-export-fasta")
@@ -24808,8 +25234,14 @@ class TraditionalCloningPane(Vertical):
         column 0 carries the entry id so we can fetch it back without
         a name-lookup race. Library is loaded fresh each call so a
         plasmid added since the modal opened shows up after a Refresh
-        (no auto-watch — too noisy)."""
-        entries = _load_library()
+        (no auto-watch — too noisy). Sorted by ``_natural_sort_key`` so
+        ``pBin2`` lands before ``pBin10``."""
+        entries = sorted(
+            (e for e in _load_library() if isinstance(e, dict)),
+            key=lambda e: _natural_sort_key(
+                e.get("name") or e.get("id") or ""
+            ),
+        )
         for table_id in ("#trad-source-table", "#trad-vector-table"):
             try:
                 t = self.query_one(table_id, DataTable)
@@ -24818,8 +25250,6 @@ class TraditionalCloningPane(Vertical):
             t.clear(columns=True)
             t.add_columns("Name", "Size (bp)")
             for e in entries:
-                if not isinstance(e, dict):
-                    continue
                 name = str(e.get("name") or e.get("id") or "")[:60]
                 gb_text = e.get("gb_text") or ""
                 size = (e.get("size")
@@ -24931,8 +25361,18 @@ class TraditionalCloningPane(Vertical):
             return None
         if row_idx < 0:
             return None
-        # Re-load library to keep indexing aligned with display order.
-        entries = [e for e in _load_library() if isinstance(e, dict)]
+        # Re-load library and apply the SAME natural sort that
+        # `_populate_library_tables` used so display row N maps back to
+        # the correct entry. Pre-fix this reload was unsorted and
+        # `row_idx` (from the sorted display) indexed into the unsorted
+        # list — a click on the visually-Nth row would return whatever
+        # plasmid happened to land at on-disk position N.
+        entries = sorted(
+            (e for e in _load_library() if isinstance(e, dict)),
+            key=lambda e: _natural_sort_key(
+                e.get("name") or e.get("id") or ""
+            ),
+        )
         if row_idx >= len(entries):
             return None
         entry = entries[row_idx]
@@ -25424,7 +25864,19 @@ class TraditionalCloningPane(Vertical):
             vec_table = self.query_one("#trad-vector-table", DataTable)
         except NoMatches:
             raise LookupError("source/vector tables not available")
-        entries = [e for e in _load_library() if isinstance(e, dict)]
+        # Match `_populate_library_tables` / `_record_for_table_row`'s
+        # natural sort so cursor rows resolve to the same entries the
+        # user sees + the simulator already digested. Pre-fix this
+        # reload was unsorted and the recorded parent in the history
+        # XML pointed to whichever entry happened to land at the
+        # cursor's disk-order index — typically not the one used in the
+        # actual digest.
+        entries = sorted(
+            (e for e in _load_library() if isinstance(e, dict)),
+            key=lambda e: _natural_sort_key(
+                e.get("name") or e.get("id") or ""
+            ),
+        )
         # In PCR mode the source table doesn't drive the lookup —
         # instead the user pasted DNA, so synthesise an insert "entry"
         # with no history.
@@ -25513,7 +25965,8 @@ def _palette_rows_for_grammar(
             if (p.get("grammar") or "gb_l0") == grammar_id
         ]
     user_parts.sort(key=lambda p: (
-        str(p.get("position") or ""), str(p.get("name") or ""),
+        _natural_sort_key(str(p.get("position") or "")),
+        _natural_sort_key(str(p.get("name") or "")),
     ))
     for p in user_parts:
         name = str(p.get("name") or "?")
@@ -27247,6 +27700,11 @@ class MutagenizeModal(ModalScreen):
             if not e.get("gb_text"):
                 continue
             opts.append((nm, str(i)))
+        # Natural sort the display options by name (`pBin2` before
+        # `pBin10`) but keep the value = original disk-order index so
+        # the downstream `_lib_changed` handler can still index into
+        # a freshly-loaded `_load_library()` without remapping.
+        opts.sort(key=lambda o: _natural_sort_key(o[0]))
         if not opts:
             opts = [("(plasmid library is empty)", "_none")]
         return opts
@@ -27255,7 +27713,9 @@ class MutagenizeModal(ModalScreen):
         """Build Select options for the Parts Bin source. Filters to parts
         whose stored insert sequence is a valid CDS shape (≥ 30 bp, length
         a multiple of 3) — same gate the map/library sources apply. The
-        value is the integer index into ``_load_parts_bin()`` (as a str)."""
+        value is the integer index into ``_load_parts_bin()`` (as a str).
+        Sorted naturally by name so ``BsaI_part_2`` lands before
+        ``BsaI_part_10`` in the dropdown."""
         try:
             entries = _load_parts_bin()
         except Exception:
@@ -27269,6 +27729,7 @@ class MutagenizeModal(ModalScreen):
             nm = e.get("name", f"part_{i}")
             ptype = e.get("type", "?")
             opts.append((f"{nm}  [{ptype}, {len(seq)} bp]", str(i)))
+        opts.sort(key=lambda o: _natural_sort_key(o[0]))
         if not opts:
             opts = [("(no eligible parts in bin)", "_none")]
         return opts
@@ -27881,7 +28342,14 @@ class PrimerDesignScreen(Screen):
                 break
         self._det_result:  "dict | None" = None
         self._clo_result:  "dict | None" = None
-        self._lib_selected: set[int] = set()   # multi-selected library rows
+        # Library table: ``_lib_selected`` is a set of *original* primer
+        # indices (the order returned by ``_load_primers()``); the
+        # display sorts naturally by name and keeps the row→primer-idx
+        # mapping in ``_row_to_primer_idx`` so cursor + click handlers
+        # can round-trip through it without ``_lib_selected`` going
+        # stale every time the table re-sorts.
+        self._lib_selected: set[int] = set()
+        self._row_to_primer_idx: list[int] = []
 
     def compose(self) -> ComposeResult:
         # Feature dropdown options
@@ -28320,9 +28788,22 @@ class PrimerDesignScreen(Screen):
         t.clear()
         primers = _load_primers()
         self._lib_selected &= set(range(len(primers)))
-        for i, p in enumerate(primers):
+        # Natural-sort the displayed rows by name (`X-DOM-2-F` lands
+        # before `X-DOM-10-F` instead of the lexicographic order). The
+        # backing primers list is unchanged so ``_lib_selected`` keeps
+        # its primer-index semantics; the row→primer-idx map lets the
+        # mark / status / delete cursor handlers translate a row click
+        # back to the right entry.
+        sorted_pairs = sorted(
+            enumerate(primers),
+            key=lambda pair: _natural_sort_key(
+                pair[1].get("name") or ""
+            ),
+        )
+        self._row_to_primer_idx = [orig_idx for orig_idx, _ in sorted_pairs]
+        for orig_idx, p in sorted_pairs:
             seq    = p.get("sequence", "")
-            marked = i in self._lib_selected
+            marked = orig_idx in self._lib_selected
             mark   = "★ " if marked else "  "
             status = p.get("status", "Designed")
             s_color = self._STATUS_COLORS.get(status, "white")
@@ -28443,13 +28924,25 @@ class PrimerDesignScreen(Screen):
             return
 
         primers = _load_primers()
+
+        def _row_to_primer(row: int) -> int:
+            """Translate the displayed row index to the primer's index
+            in ``_load_primers()`` order. Falls back to identity if
+            the natural-sort map hasn't been built yet (e.g. an early
+            keypress before the first ``_refresh_library_table``)."""
+            mp = self._row_to_primer_idx
+            if 0 <= row < len(mp):
+                return mp[row]
+            return row
+
         if event.key == "m":
             row = t.cursor_row
             if 0 <= row < len(primers):
-                if row in self._lib_selected:
-                    self._lib_selected.discard(row)
+                pidx = _row_to_primer(row)
+                if pidx in self._lib_selected:
+                    self._lib_selected.discard(pidx)
                 else:
-                    self._lib_selected.add(row)
+                    self._lib_selected.add(pidx)
                 self._refresh_library_table()
             event.stop()
         elif event.key in ("M", "shift+m"):
@@ -28466,15 +28959,16 @@ class PrimerDesignScreen(Screen):
             # Shift+S = cycle status: Designed → Ordered → Validated → Designed
             row = t.cursor_row
             if 0 <= row < len(primers):
+                pidx = _row_to_primer(row)
                 _CYCLE = ["Designed", "Ordered", "Validated"]
-                cur = primers[row].get("status", "Designed")
+                cur = primers[pidx].get("status", "Designed")
                 nxt = _CYCLE[(_CYCLE.index(cur) + 1) % 3] if cur in _CYCLE else _CYCLE[0]
                 entries = _load_primers()
-                if row < len(entries):
-                    entries[row]["status"] = nxt
+                if pidx < len(entries):
+                    entries[pidx]["status"] = nxt
                     _save_primers(entries)
                     self._refresh_library_table()
-                    name = primers[row].get("name", "?")
+                    name = primers[pidx].get("name", "?")
                     self.app.notify(f"{name}: {nxt}", markup=False)
             event.stop()
         elif event.key == "delete":
@@ -28803,7 +29297,6 @@ class PrimerDesignScreen(Screen):
         from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
-        from copy import deepcopy
 
         # Build a fresh record rather than mutating self.app._current_record:
         # the undo stack aliases the live record, and appending features in
@@ -28900,12 +29393,19 @@ class PrimerDesignScreen(Screen):
 
     def _selected_primer_name(self) -> "str | None":
         """Return the name of the currently-highlighted primer in the library
-        table, or None if nothing is selected."""
+        table, or None if nothing is selected. Translates the visual
+        cursor row through ``_row_to_primer_idx`` so the natural-sort
+        re-shuffle doesn't desync this lookup from the primer list."""
         t = self.query_one("#pd-lib-table", DataTable)
         primers = _load_primers()
-        if t.row_count == 0 or not (0 <= t.cursor_row < len(primers)):
+        row = t.cursor_row
+        if t.row_count == 0 or not (0 <= row < len(primers)):
             return None
-        return primers[t.cursor_row].get("name")
+        mp = self._row_to_primer_idx
+        pidx = mp[row] if 0 <= row < len(mp) else row
+        if pidx >= len(primers):
+            return None
+        return primers[pidx].get("name")
 
     @on(Button.Pressed, "#btn-pdlib-rename")
     def _rename_primer(self, _) -> None:
@@ -29737,7 +30237,14 @@ class PlasmidPickerModal(ModalScreen):
         t = self.query_one("#pick-table", DataTable)
         t.add_columns("Name", "ID", "Size", "Features")
         cursor = 0
-        entries = _load_library()
+        # Natural-sort by display name so `pBin2` lands before
+        # `pBin10` rather than the lexicographic disk order.
+        entries = sorted(
+            _load_library(),
+            key=lambda e: _natural_sort_key(
+                e.get("name") or e.get("id") or ""
+            ),
+        )
         for i, e in enumerate(entries):
             t.add_row(
                 Text(e.get("name", "?"), style="bold"),
@@ -31245,6 +31752,22 @@ def _agent_endpoint(name: str, *, write: bool = False):
     return deco
 
 
+# Defense-in-depth cap on the size of a single agent-API response. Most
+# endpoints return kilobytes (status, feature dicts, primer designs)
+# and never approach this; the larger ones (`list-library`,
+# `search-library`, `blast`, `hmmscan`, `transfer-annotations`) already
+# truncate at endpoint-specific limits. The cap matters as a backstop
+# when a future handler — or a buggy edit — returns an unbounded list:
+# without it a multi-MB JSON serialise + write to the localhost socket
+# could starve the worker thread or saturate the loopback. Aligned at
+# 50 MB to mirror `_SAFE_LOAD_JSON_MAX_BYTES` and `_BULK_IMPORT_MAX_BYTES`
+# so the read- and write-sides of the agent API have symmetric caps.
+# Exceeding it surfaces a 500 with a `body_too_large` marker so the
+# client can react (re-query with a tighter filter) rather than
+# silently receive a truncated payload.
+_AGENT_RESPONSE_MAX_BYTES = 50 * 1024 * 1024
+
+
 def _agent_dirty_guard(app, payload):
     """Return None if writes may proceed, else (error_dict, 409). The
     `force` field in the payload (or `?force=1` in the query, applied
@@ -31641,7 +32164,6 @@ def _h_delete_feature(app, payload):
         # Several ways to do this; we walk the record features list
         # in order and skip ones we've already matched, mirroring
         # `_parse`'s indexing modulo the `source` filter.
-        from copy import deepcopy
         new_record = deepcopy(app._current_record)
         kept = []
         seen = 0
@@ -31711,7 +32233,6 @@ def _h_update_feature(app, payload):
         if not (0 <= idx < len(pm._feats)):
             return ({"error": f"idx {idx} out of range "
                               f"[0, {len(pm._feats)})"}, 400)
-        from copy import deepcopy
         new_record = deepcopy(app._current_record)
         seen = 0
         target = None
@@ -32865,6 +33386,20 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def _send(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload, default=str).encode("utf-8")
+        # Defense-in-depth: refuse to ship a >50 MB response. Returns a
+        # 500 marker the client can branch on instead of letting the
+        # serialise + socket write block the worker thread for seconds.
+        # See the `_AGENT_RESPONSE_MAX_BYTES` constant docstring for
+        # context. We re-serialise the error so its own size is bounded.
+        if len(body) > _AGENT_RESPONSE_MAX_BYTES:
+            err = {
+                "error":         "response body exceeds agent-API cap",
+                "body_too_large": True,
+                "body_bytes":     len(body),
+                "cap_bytes":      _AGENT_RESPONSE_MAX_BYTES,
+            }
+            body = json.dumps(err).encode("utf-8")
+            status = 500
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -35429,7 +35964,6 @@ SpeciesPickerModal { align: center middle; }
         # current edit paths build a fresh SeqRecord (via _rebuild_*), so
         # the copy is defensive — but cheap (~5 ms on a 50 kb plasmid)
         # and worth the safety margin against future contributors.
-        from copy import deepcopy
         snapshot = (sp._seq, sp._cursor_pos, deepcopy(self._current_record))
         self._undo_stack.append(snapshot)
         if len(self._undo_stack) > self._MAX_UNDO:
@@ -35467,7 +36001,6 @@ SpeciesPickerModal { align: center middle; }
             self.notify("Nothing to undo", severity="information")
             _log_event("undo.empty")
             return
-        from copy import deepcopy
         sp = self.query_one("#seq-panel", SequencePanel)
         # Deep-copy current state to redo stack — same independence guarantee
         # as _push_undo.
@@ -35485,7 +36018,6 @@ SpeciesPickerModal { align: center middle; }
             self.notify("Nothing to redo", severity="information")
             _log_event("redo.empty")
             return
-        from copy import deepcopy
         sp = self.query_one("#seq-panel", SequencePanel)
         self._undo_stack.append(
             (sp._seq, sp._cursor_pos, deepcopy(self._current_record))
@@ -36100,7 +36632,6 @@ SpeciesPickerModal { align: center middle; }
         (target_end < target_start) become a `CompoundLocation` of
         `[start, n) + [0, end)` matching how the rest of the codebase
         represents wrap features."""
-        from copy import deepcopy
         from Bio.SeqFeature import (
             SeqFeature, FeatureLocation, CompoundLocation,
         )
@@ -37230,7 +37761,6 @@ SpeciesPickerModal { align: center middle; }
             return
         if self._current_record is None:
             return
-        from copy import deepcopy
         new_record = deepcopy(self._current_record)
         # Skip the synthetic `source` feature when matching idx — the
         # PlasmidMap's `_feats` list excludes it but `record.features`
@@ -37337,7 +37867,6 @@ SpeciesPickerModal { align: center middle; }
             return
         if self._current_record is None:
             return
-        from copy import deepcopy
         new_record = deepcopy(self._current_record)
         seen = 0
         target = None
@@ -38371,7 +38900,6 @@ SpeciesPickerModal { align: center middle; }
         self, start: int, end: int, entry: dict,
     ) -> None:
         from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
-        from copy import deepcopy
 
         if self._current_record is None:
             raise RuntimeError("Load a plasmid first.")

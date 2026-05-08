@@ -979,6 +979,65 @@ class TestWriteCommercialSaaSDnaBytes:
         with pytest.raises(ValueError):
             sc._write_commercialsaas_dna_bytes(None)
 
+    def test_writer_emits_default_primers_packet(self):
+        """The from-scratch writer now emits a default 0x05 Primers
+        packet (just ``HybridizationParams`` defaults; no ``<Primer>``
+        entries — primer features still ride on the 0x0A features
+        packet) so the output's packet inventory matches what the
+        commercial editor produces. Pinned byte-for-byte against the
+        FFE_* fixtures' default 217-byte payload."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 100), id="t",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        data = sc._write_commercialsaas_dna_bytes(rec)
+        primers_payloads = [
+            payload for type_byte, _length, payload
+            in sc._iter_commercialsaas_packets(data)
+            if type_byte == 0x05
+        ]
+        assert len(primers_payloads) == 1, (
+            "writer must emit exactly one 0x05 Primers packet"
+        )
+        text = primers_payloads[0].decode("utf-8")
+        assert text.startswith('<?xml version="1.0"?>')
+        assert "<Primers nextValidID=\"0\">" in text
+        # HybridizationParams defaults must match what real CommercialSaaS
+        # files carry — these aren't arbitrary: they're the editor's
+        # save-time defaults and Viewer reads them for primer search.
+        assert 'minContinuousMatchLen="10"' in text
+        assert 'allowMismatch="1"' in text
+        assert 'minMeltingTemperature="40"' in text
+        assert 'showAdditionalFivePrimeMatches="1"' in text
+        assert 'minimumFivePrimeAnnealing="15"' in text
+
+    def test_writer_emits_default_addprops_packet(self):
+        """The from-scratch writer also emits a default 0x08
+        AdditionalSequenceProperties packet matching the FFE_* fixtures'
+        289-byte default — Upstream/DownstreamStickiness=0 (blunt) and
+        FivePrimePhosphorylated end modifications. Real CommercialSaaS
+        files emit this even on circular plasmids, so the editor's
+        Sequence Properties inspector renders our output without
+        falling back to (empty) defaults."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("A" * 100), id="t",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        data = sc._write_commercialsaas_dna_bytes(rec)
+        addprops_payloads = [
+            payload for type_byte, _length, payload
+            in sc._iter_commercialsaas_packets(data)
+            if type_byte == 0x08
+        ]
+        assert len(addprops_payloads) == 1
+        text = addprops_payloads[0].decode("utf-8")
+        assert text.startswith("<AdditionalSequenceProperties>")
+        assert "<UpstreamStickiness>0</UpstreamStickiness>" in text
+        assert "<DownstreamStickiness>0</DownstreamStickiness>" in text
+        assert "FivePrimePhosphorylated" in text
+
 
 class TestWriterHardening:
     """Phase 5 — adversarial inputs the writer must handle without
