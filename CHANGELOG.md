@@ -2,6 +2,33 @@
 
 ---
 
+## [0.7.4.4] — 2026-05-07
+
+### Hardening — origin rotation clamp on sequence shrink
+
+- ``SequencePanel.update_seq`` now clamps ``_view_origin_bp`` to
+  ``% len(seq)`` (or 0 for empty seq) at the canonical sequence-change
+  entry point. Pre-fix the only clamp lived in ``set_view_origin``
+  (called on rotation), so an edit-then-shrink path that bypassed the
+  ``pm.load_record`` reset could leave ``_view_origin_bp > len(seq)``,
+  silently degrading ``_get_rotated_state`` (no rotation visible, but
+  feature shifts mis-aligned). The "rotation survives across edits"
+  semantic is preserved — non-shrinking edits still leave the rotation
+  untouched.
+- ``SequencePanel._get_rotated_state`` defensively re-clamps origin
+  via ``% n`` on entry as a belt-and-braces safety net for any future
+  path that might leave the origin stale before render.
+- Cleaned up a multi-paragraph comment in ``_MutPreview.on_click``
+  (landed earlier today for the CSS-gutter off-by-one fix) to a
+  single line per CLAUDE.md style.
+
+### Tests
+
+- 2 new ``test_smoke.py::TestOriginRotationCascade`` cases pin the
+  shrink-clamp + the render-path re-clamp.
+
+---
+
 ## [0.7.4.3] — 2026-05-07
 
 ### Fixed
