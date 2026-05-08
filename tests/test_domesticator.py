@@ -42,14 +42,8 @@ def random_template():
     return seq
 
 
-@pytest.fixture
-def isolated_parts_bin(tmp_path, monkeypatch):
-    """Redirect _PARTS_BIN_FILE to a tmp path so tests don't touch
-    the real parts_bin.json."""
-    tmp_bin = tmp_path / "parts_bin.json"
-    monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_bin)
-    monkeypatch.setattr(sc, "_parts_bin_cache", None)
-    return tmp_bin
+# `isolated_parts_bin` lives in tests/conftest.py — same redirect
+# pattern, shared with test_traditional_cloning.py and others.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2681,12 +2675,18 @@ class TestPartsBinFeatLibColumn:
                 f"Expected empty Feat Lib cell for unmatched part; got {cell!r}"
             )
 
-    async def test_builtin_catalog_row_is_always_empty(
+    async def test_no_builtin_catalog_rows_present(
         self, isolated_parts_bin, isolated_library,
     ):
-        """Built-in catalog parts have no sequence; even if the user
-        coincidentally has a feature with the same name as a catalog
-        entry, the column should render empty (no false positive)."""
+        """The built-in catalog rows were removed in 2026-05-07
+        (see `PartsBinModal._all_rows` docstring) because every Copy /
+        Save / Export / Delete action on them bailed with a "built-in
+        catalog parts have no sequence" notify — clutter without
+        function. Replaces the previous `test_builtin_catalog_row_is_
+        always_empty` test (which fixture-drifted to skip on every
+        run because the catalog rows it expected to find no longer
+        exist). This test asserts the inverse: NO row in the modal
+        is a built-in (every row is a user part)."""
         sc._save_features([{
             "name": "Nos", "feature_type": "promoter",
             "sequence": "ATGCATGCATGC", "strand": 1,
@@ -2698,21 +2698,17 @@ class TestPartsBinFeatLibColumn:
             await pilot.pause()
             await pilot.pause(0.1)
             parts_modal = app.screen
-            t = parts_modal.query_one("#parts-table", sc.DataTable)
-            # First built-in row that's a Promoter named "Nos".
+            # Every row must be a user part (`"user": True`) — built-
+            # ins are gone. Without this assertion, a regression that
+            # re-introduces built-in catalog rows would silently bring
+            # back the action-button-bails-out behaviour the cleanup
+            # eliminated.
             for r in parts_modal._rows:
-                if r["name"] == "Nos" and not r["user"]:
-                    target_row_idx = parts_modal._rows.index(r)
-                    break
-            else:
-                pytest.skip("Catalog has no 'Nos' promoter — fixture drift")
-            row_keys = list(t.rows.keys())
-            col_keys = list(t.columns.keys())
-            cell = t.get_cell(row_keys[target_row_idx], col_keys[-2])  # Feat Lib column
-            assert str(cell) == "", (
-                f"Built-in catalog rows must always render empty in "
-                f"Feat Lib column; got {cell!r}"
-            )
+                assert r["user"] is True, (
+                    f"unexpected built-in catalog row {r['name']!r} — "
+                    "built-in rows were removed in 2026-05-07; only "
+                    "user-saved parts should appear in the modal"
+                )
 
     async def test_column_refreshes_after_save_as_feature(
         self, isolated_parts_bin, isolated_library,

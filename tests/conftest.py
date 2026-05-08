@@ -277,3 +277,27 @@ def isolated_library(tmp_path, monkeypatch):
     monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_lib)
     monkeypatch.setattr(sc, "_library_cache", None)
     return tmp_lib
+
+
+@pytest.fixture
+def isolated_parts_bin(tmp_path, monkeypatch):
+    """Redirect `_PARTS_BIN_FILE` to a tmp path. Same redundant-but-
+    harmless pattern as `isolated_library` — `_protect_user_data` already
+    handles redirect; this fixture exists so tests that want to read /
+    inspect the redirected path can request it explicitly."""
+    import splicecraft as sc
+    tmp_bin = tmp_path / "parts_bin.json"
+    monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_bin)
+    monkeypatch.setattr(sc, "_parts_bin_cache", None)
+    return tmp_bin
+
+
+@pytest.fixture
+def isolated_primers(tmp_path, monkeypatch):
+    """Redirect `_PRIMERS_FILE` to a tmp path. Same redundant-but-harmless
+    pattern as `isolated_library`."""
+    import splicecraft as sc
+    tmp_p = tmp_path / "primers.json"
+    monkeypatch.setattr(sc, "_PRIMERS_FILE", tmp_p)
+    monkeypatch.setattr(sc, "_primers_cache", None)
+    return tmp_p

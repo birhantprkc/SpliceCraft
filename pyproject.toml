@@ -97,3 +97,12 @@ filterwarnings = [
     "ignore::DeprecationWarning:Bio.*",
     "ignore::PendingDeprecationWarning:Bio.*",
 ]
+# Custom test markers. `slow` is for test classes / functions that
+# do heavy I/O (snapshot creation, BLAST DB build, large-plasmid
+# render, full domestication workflow). Default test runs include
+# them; a fast inner-loop CI job can pass `-m "not slow"` to skip
+# them. Registering the marker here silences pytest's "unknown
+# marker" warning.
+markers = [
+    "slow: heavy-I/O or long-running test (use `-m 'not slow'` to skip)",
+]

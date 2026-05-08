@@ -498,6 +498,66 @@ class TestSimulateTraditionalCloning:
         # for diagnostic display (don't break the existing return shape).
         assert isinstance(frags, list)
 
+    @pytest.mark.parametrize("n_sites", [3, 4, 5, 7])
+    def test_excise_fragment_pair_many_cuts_circular_errors(self, n_sites):
+        """Sacred invariant #25 generalised: ANY count >2 must error.
+        Parameterised so a regression that special-cases 3 (e.g.
+        `if n_cuts == 3:`) can't slip through against 4+. Each test
+        builds a circular sequence with `n_sites` EcoRI sites + 10 bp
+        spacers."""
+        seq = "".join("GAATTC" + "A" * 10 for _ in range(n_sites))
+        frags, err = sc._excise_fragment_pair(
+            seq, ["EcoRI"], circular=True,
+        )
+        assert err is not None, (
+            f"{n_sites} cuts on circular should error; got err=None"
+        )
+        assert "exactly 2" in err["error"]
+        assert str(n_sites) in err["error"]
+
+    def test_excise_fragment_pair_two_enzymes_three_total_cuts_errors(self):
+        """Invariant #25: total cut count is what matters, not per-
+        enzyme count. EcoRI×2 + BamHI×1 = 3 total → must error.
+        Catches a hypothetical regression that only checks per-enzyme
+        counts."""
+        # Two EcoRI + one BamHI, all in a circular sequence.
+        seq = (
+            "GAATTC" + "A" * 10 +
+            "GAATTC" + "A" * 10 +
+            "GGATCC" + "A" * 10
+        )
+        frags, err = sc._excise_fragment_pair(
+            seq, ["EcoRI", "BamHI"], circular=True,
+        )
+        assert err is not None
+        assert "exactly 2" in err["error"]
+        # Per-enzyme breakdown is in the message.
+        assert "EcoRI" in err["error"]
+        assert "BamHI" in err["error"]
+
+    def test_excise_fragment_pair_linear_three_cuts_does_not_error(self):
+        """Invariant #25's strict 2-cut requirement applies only to
+        CIRCULAR plasmids. Linear sequences with N cuts produce N+1
+        fragments naturally, no ambiguity in selecting "the insert"
+        because the caller knows linear has ends. The check must NOT
+        false-positive on the linear path."""
+        seq = (
+            "GAATTC" + "A" * 10 +
+            "GAATTC" + "A" * 10 +
+            "GAATTC" + "A" * 10
+        )
+        frags, err = sc._excise_fragment_pair(
+            seq, ["EcoRI"], circular=False,
+        )
+        # Linear is allowed any cut count without the >2 hard-stop.
+        # (`err` may still be set for OTHER reasons — e.g. zero cuts —
+        # but should NOT be the "exactly 2" message.)
+        if err is not None:
+            assert "exactly 2" not in err["error"], (
+                f"linear path should NOT trigger exactly-2 hard-stop; "
+                f"got err={err['error']!r}"
+            )
+
     # ──────────────────────────────────────────────────────────────────
     # End-to-end UI tests — open the modal, switch tabs, simulate.
     # ──────────────────────────────────────────────────────────────────

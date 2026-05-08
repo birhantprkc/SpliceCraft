@@ -15,6 +15,8 @@ backends produce valid but different numeric ranges.
 """
 from __future__ import annotations
 
+import pytest
+
 import splicecraft as sc
 
 
@@ -72,6 +74,7 @@ class TestRealisticLoad:
 # BLAST modal — realistic-plasmid query
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.slow
 class TestBlastModalRealistic:
     """Drive the BLAST modal against a collection containing the
     realistic plasmid; verify a known feature's sequence finds itself
@@ -112,9 +115,12 @@ class TestBlastModalRealistic:
             modal.query_one("#blast-source", sc.Select).value = "RealTest"
             await pilot.pause()
             modal.query_one("#btn-blast-run", sc.Button).press()
-            # The worker is threaded; let it finish.
-            await pilot.pause(0.5)
-            await pilot.pause(0.5)
+            # Wait for the threaded BLAST worker to hand its result
+            # back to the event loop, then for one more frame so the
+            # `#blast-results` Static has rendered the hits.
+            from tests._pilot_helpers import wait_for_no_workers
+            await wait_for_no_workers(pilot, timeout=5.0)
+            await pilot.pause()
             results = modal.query_one("#blast-results", sc.Static)
             txt = str(results.render())
             # Hit must reference SYNREAL.
@@ -258,6 +264,7 @@ class TestKeybindingsUnderModal:
 # Performance: realistic plasmid render budget
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.slow
 class TestRealisticPerf:
     """Loose budgets — catch architectural regressions, not micro drift."""
 

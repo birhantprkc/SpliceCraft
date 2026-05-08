@@ -7681,6 +7681,7 @@ class TestUpdateSubcommandFlow:
         assert "exited with status 2" in err
 
 
+@pytest.mark.slow
 class TestUpdateDataSafety:
     """SACRED INVARIANT: every running upgrade path takes a complete,
     atomic snapshot of user data BEFORE the install subprocess runs.
@@ -8191,6 +8192,7 @@ class TestUpdateDataSafety:
         assert rc == 130
 
 
+@pytest.mark.slow
 class TestUpdateDataSafetyHardening:
     """Hardening tests for the pre-update snapshot system. Each test
     targets a specific attack surface or correctness gap caught by
@@ -8607,6 +8609,7 @@ class TestUpdateDataSafetyHardening:
         assert data["schema_version"] == sc._PRE_UPDATE_SCHEMA_VERSION
 
 
+@pytest.mark.slow
 class TestUpdateRegistryFutureProofing:
     """Future-proofing audits that fire when a contributor adds a new
     install method, a new persisted-file constant, or otherwise

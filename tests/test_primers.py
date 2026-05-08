@@ -25,12 +25,8 @@ def random_seq_3k():
     return "".join(rng.choice("ACGT") for _ in range(3000))
 
 
-@pytest.fixture
-def isolated_primers(tmp_path, monkeypatch):
-    tmp_p = tmp_path / "primers.json"
-    monkeypatch.setattr(sc, "_PRIMERS_FILE", tmp_p)
-    monkeypatch.setattr(sc, "_primers_cache", None)
-    return tmp_p
+# `isolated_primers` lives in tests/conftest.py — same redirect
+# pattern, shared with test_smoke.py and others.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
