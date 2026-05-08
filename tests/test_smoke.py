@@ -2908,6 +2908,46 @@ class TestOriginRotationCascade:
         assert sp._abs_to_disp(500) == 500
         assert sp._disp_to_abs(500) == 500
 
+    def test_update_seq_clamps_view_origin_on_shrink(self):
+        """``update_seq`` must clamp ``_view_origin_bp`` to the new
+        sequence length — pre-fix a sequence shrink that dropped below
+        the current rotation origin would leave the seq panel pointing
+        past the end, silently degrading ``_get_rotated_state`` (no
+        rotation visible, but feature shifts mis-aligned). In practice
+        the edit path resets origin via ``pm.load_record`` so this
+        couldn't happen via the UI; the clamp is defensive depth for
+        any future code path that bypasses the load_record reset."""
+        sp = sc.SequencePanel()
+        # `update_seq` ends with a `_refresh_view` that needs a
+        # mounted widget tree (queries `#seq-view`). The clamp is
+        # what we're testing — neutralise the trailing render so the
+        # test stays out of the Textual mount path.
+        sp._refresh_view = lambda: None   # type: ignore[assignment]
+        sp._seq = "A" * 1000
+        sp._view_origin_bp = 700
+        # Shrink the sequence to 500 bp via update_seq directly.
+        sp.update_seq("A" * 500, [])
+        # _view_origin_bp must now be < 500 (clamped via % 500).
+        assert sp._view_origin_bp == 200
+        # Empty sequence collapses origin to 0.
+        sp.update_seq("", [])
+        assert sp._view_origin_bp == 0
+
+    def test_get_rotated_state_handles_stale_origin(self):
+        """``_get_rotated_state`` defensively re-clamps origin to
+        ``% n`` so even if some path leaves ``_view_origin_bp`` past
+        the current sequence length, the rotation math still produces
+        a valid display state instead of silently degrading."""
+        sp = sc.SequencePanel()
+        sp._seq = "A" * 100
+        sp._feats = []
+        # Inject an out-of-bounds origin BYPASSING update_seq's clamp.
+        sp._view_origin_bp = 250
+        rot_seq, rot_feats = sp._get_rotated_state()
+        # Effective origin = 250 % 100 = 50. Display starts at abs bp 50.
+        assert len(rot_seq) == 100
+        assert rot_feats == []
+
 
 class TestSidebarClickCentersSeqPanel:
     """Regression guard for the 2026-04-25 sidebar-click centering fix.

@@ -9312,14 +9312,22 @@ class SequencePanel(Widget):
     def update_seq(self, seq: str, feats: list[dict]) -> None:
         """Called after loading a record or committing an edit.
 
-        Does NOT reset `_view_origin_bp` — the plasmid map owns the
-        origin and posts `OriginChanged` whenever it changes. New
+        Does NOT reset `_view_origin_bp` to 0 — the plasmid map owns
+        the origin and posts `OriginChanged` whenever it changes. New
         record loads cascade through the watcher (the map's
         `load_record` resets `origin_bp` to 0); in-place edits leave
         the rotation untouched so the view doesn't snap back to bp 0
         every time the user types Ctrl+E. The rotated cache is
         invalidated unconditionally because `seq` and `feats`
         identities changed.
+
+        DOES clamp `_view_origin_bp` to `% len(seq)` so a sequence
+        shrink that drops below the current origin can't leave the
+        seq panel pointing past the end — `_get_rotated_state` would
+        silently degrade (no rotation visible, but feature shifts
+        mis-aligned). Pre-fix the clamp lived only in
+        `set_view_origin` (called on rotation), so an edit-then-shrink
+        path could bypass it.
         """
         self._seq          = seq
         self._feats        = feats
@@ -9334,6 +9342,9 @@ class SequencePanel(Widget):
         self._rotated_cache_key = None
         self._rotated_seq = None
         self._rotated_feats = None
+        # Clamp the rotation origin to the new sequence length. See
+        # docstring; bounded between [0, len(seq)).
+        self._view_origin_bp = (self._view_origin_bp % len(seq)) if seq else 0
         self._refresh_view()
 
     def set_view_origin(self, origin_bp: int) -> None:
@@ -9414,7 +9425,16 @@ class SequencePanel(Widget):
         extra allocation cost.
         """
         n = len(self._seq)
-        o = int(self._view_origin_bp) if n > 0 else 0
+        # Defensive `% n` clamp: `set_view_origin` already mods on
+        # entry, and `pm.load_record` resets `origin_bp = 0` after
+        # every sequence edit so origin can never legitimately exceed
+        # the new length. But if some future code path calls
+        # `update_seq` with a shorter sequence WITHOUT going through
+        # `load_record`, `_view_origin_bp` could outlive the seq it
+        # was set against — without the clamp the rotated state would
+        # silently degrade (no visible rotation, but feature shifts
+        # mis-aligned). Cheap insurance.
+        o = (int(self._view_origin_bp) % n) if n > 0 else 0
         if o <= 0 or n == 0:
             return self._seq, self._feats
         key = (id(self._seq), id(self._feats), o)
@@ -26903,23 +26923,18 @@ class _MutPreview(Static):
             return
         self.focus()
         try:
-            # ``event.x`` / ``event.y`` are widget-relative AND already
-            # account for our CSS ``border: solid`` + ``padding: 0 1``
-            # — using ``event.screen_x - self.region.x`` would include
-            # the 2-col border+padding overhead and shift every click
-            # right by 2 cols, resolving to the codon ~one AA to the
-            # left of the click target (2026-05-07 user report:
-            # "amino acid click is off by exactly one amino acid").
-            vp_x = int(event.x)
-            vp_y = int(event.y)
+            # `event.x` / `event.y` are measured from the widget's OUTER
+            # edge (border + padding included — see screen.py:1974,
+            # `event._apply_offset(-region.x, -region.y)`). Subtract
+            # `content_offset` to land in the content area where
+            # `_paint_cds_aa` paints. Regression guard for the
+            # 2026-05-07 "AA click off by one" report.
+            offset = self.content_offset
+            vp_x = int(event.x) - int(offset.x)
+            vp_y = int(event.y) - int(offset.y)
             content_row = vp_y + int(self.scroll_y)
             content_col = vp_x + int(self.scroll_x)
         except (AttributeError, TypeError, ValueError):
-            # AttributeError: widget unmounted (no `scroll_y`).
-            # TypeError / ValueError: defensive against an event whose
-            # ``x`` / ``y`` is None / non-numeric — Textual normally
-            # wouldn't surface that, but we'd rather drop the click
-            # than raise out of an event handler.
             return
         aa_idx = self._click_to_aa(content_col, content_row)
         if aa_idx < 0:

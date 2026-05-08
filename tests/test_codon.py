@@ -908,9 +908,8 @@ class TestMutagenizeClickAlignment:
 
     async def test_aa_click_lands_on_clicked_codon(self):
         # 33-bp CDS = 11 aa. The CDS feature filter requires >= 30 bp
-        # and len % 3 == 0; 33 satisfies both. AA letters at content
-        # cols 1 / 4 / 7 / 10 / ... within the data area.
-        cds = "ATGGCCAGCAAATTCCATTGGGCAGAAGCCTAA"   # 33 bp → M A S K F H W A E A *
+        # and len % 3 == 0; 33 satisfies both.
+        cds = "ATGGCCAGCAAATTCCATTGGGCAGAAGCCTAA"   # M A S K F H W A E A *
         assert len(cds) == 33 and len(cds) % 3 == 0
         feats = [{"type": "CDS", "label": "testCDS",
                   "start": 0, "end": len(cds), "strand": 1}]
@@ -926,43 +925,49 @@ class TestMutagenizeClickAlignment:
             preview = modal.query_one("#mut-preview", sc._MutPreview)
             assert preview._dna_mode is True
             assert preview._protein.startswith("MASKFHW")
-            # Drive a synthetic Click at ``event.x = pad+4, event.y = 2``
-            # (the codon-1 AA-row column of chunk 0). With the CSS-aware
-            # fix ``on_click`` reads ``event.x`` directly, so this
-            # resolves to aa_idx=1 ('A'). Pre-fix the same click landed
-            # on aa_idx=0 ('M') because ``event.screen_x - region.x``
-            # included the 2-col CSS border + padding overhead.
+            # Drive synthetic Click events whose ``event.x`` matches
+            # what real Textual delivers: ``screen_x - widget.region.x``,
+            # i.e. measured from the widget's OUTER edge (gutter
+            # included). The handler then subtracts ``content_offset``
+            # to reach the content-area col. Reading the live
+            # ``content_offset.x`` from the mounted widget keeps the
+            # test honest under whatever border / padding the modal
+            # CSS applies.
             from types import SimpleNamespace
             n = len(cds)
             num_w = len(str(n))
             pad = num_w + 2
-            preview._cursor_aa = -1
-            click_evt = SimpleNamespace(
-                x=pad + 4, y=2, screen_x=pad + 4, screen_y=2,
-                chain=1, button=1,
+            gutter_x = int(preview.content_offset.x)
+            assert gutter_x > 0, (
+                "test only meaningful when the widget actually has a "
+                f"non-zero gutter; got content_offset.x={gutter_x}"
             )
-            preview.on_click(click_evt)
+
+            def _click_at_content_col(c: int) -> None:
+                """Simulate a real Textual click at content col `c`,
+                AA row of chunk 0 (= row 2). ``event.x`` includes the
+                gutter offset because Textual delivers it that way."""
+                preview._cursor_aa = -1
+                evt = SimpleNamespace(
+                    x=gutter_x + c, y=2,
+                    screen_x=gutter_x + c, screen_y=2,
+                    chain=1, button=1,
+                )
+                preview.on_click(evt)
+
+            # AA letters land at content cols pad+1, pad+4, pad+7, …
+            # corresponding to codons 0, 1, 2, …
+            _click_at_content_col(pad + 1)
             await pilot.pause(0.05)
-            assert preview._cursor_aa == 1, (
-                f"expected cursor on AA 1 ('A'), got {preview._cursor_aa} "
+            assert preview._cursor_aa == 0, (
+                f"clicked 'M' (codon 0); got cursor on "
+                f"{preview._cursor_aa} "
                 f"('{preview._protein[preview._cursor_aa] if preview._cursor_aa >= 0 else 'NONE'}')"
             )
-            # Click the codon-2 column ('S' at content col pad+7).
-            preview._cursor_aa = -1
-            click_evt2 = SimpleNamespace(
-                x=pad + 7, y=2, screen_x=pad + 7, screen_y=2,
-                chain=1, button=1,
-            )
-            preview.on_click(click_evt2)
+            _click_at_content_col(pad + 4)
             await pilot.pause(0.05)
-            assert preview._cursor_aa == 2
-            # Click codon 0 ('M' at content col pad+1).
-            preview._cursor_aa = -1
-            click_evt3 = SimpleNamespace(
-                x=pad + 1, y=2, screen_x=pad + 1, screen_y=2,
-                chain=1, button=1,
-            )
-            preview.on_click(click_evt3)
+            assert preview._cursor_aa == 1   # 'A'
+            _click_at_content_col(pad + 7)
             await pilot.pause(0.05)
-            assert preview._cursor_aa == 0
+            assert preview._cursor_aa == 2   # 'S'
             app.exit()
