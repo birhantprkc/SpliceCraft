@@ -348,6 +348,116 @@ class TestBlastDbCache:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Pre-flight size cap (regression guard for 2026-05-10 OOM-on-large-collection)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBlastDbSizeCap:
+    """`_blast_filter_oversized` skips per-plasmid rows over
+    `_BLAST_DB_BUILD_MAX_PER_PLASMID_BP` and raises
+    `_BlastDbTooLargeError` when the post-skip total exceeds
+    `_BLAST_DB_BUILD_MAX_TOTAL_BP`. Without this guard the kernel
+    OOM-killed the worker mid-build on chromosome-scale collections —
+    `_do_build`'s `except Exception` never fired and the user just
+    saw the app vanish.
+    """
+
+    def test_normal_collection_passes_through_unfiltered(self):
+        rec = _make_record("S01", "AAAA" + "ACGT" * 30)
+        _seed_collection("Normal", [rec])
+        cols = [c for c in sc._load_collections()
+                if c.get("name") == "Normal"]
+        kept, skipped, total_bp = sc._blast_filter_oversized(cols)
+        assert skipped == []
+        assert total_bp == len(rec.seq)
+        assert len(kept) == 1
+        assert len(kept[0]["plasmids"]) == 1
+
+    def test_oversized_per_plasmid_skipped_with_reason(self):
+        # Build a collection whose ONLY plasmid is over the per-plasmid
+        # cap. We don't actually allocate 10 Mbp — we lie about `size`
+        # in the entry dict, since the filter reads that field directly
+        # (avoiding a 10 Mbp gb_text on every test run).
+        sc._save_collections([{
+            "name": "Big", "description": "test",
+            "plasmids": [{
+                "name":    "huge_plasmid",
+                "id":      "HUGE",
+                "size":    sc._BLAST_DB_BUILD_MAX_PER_PLASMID_BP + 1,
+                "n_feats": 0,
+                "gb_text": "stub",
+            }],
+            "saved": "2026-05-10",
+        }])
+        cols = sc._load_collections()
+        kept, skipped, total_bp = sc._blast_filter_oversized(cols)
+        assert total_bp == 0
+        assert kept == []          # collection was emptied + dropped
+        assert len(skipped) == 1
+        assert skipped[0]["name"] == "huge_plasmid"
+        assert skipped[0]["collection"] == "Big"
+        assert "exceeds per-plasmid cap" in skipped[0]["reason"]
+
+    def test_total_cap_raises_with_helpful_message(self):
+        # Several plasmids each just under the per-plasmid cap, but
+        # whose sum exceeds the total cap. Triggers the refusal path
+        # without skipping any individual entry.
+        per_size = sc._BLAST_DB_BUILD_MAX_PER_PLASMID_BP
+        n_plasmids = (sc._BLAST_DB_BUILD_MAX_TOTAL_BP // per_size) + 1
+        sc._save_collections([{
+            "name": "TotalOverflow", "description": "test",
+            "plasmids": [{
+                "name":    f"p{i}",
+                "id":      f"P{i}",
+                "size":    per_size,
+                "n_feats": 0,
+                "gb_text": "stub",
+            } for i in range(n_plasmids)],
+            "saved": "2026-05-10",
+        }])
+        cols = sc._load_collections()
+        import pytest
+        with pytest.raises(sc._BlastDbTooLargeError) as exc:
+            sc._blast_filter_oversized(cols)
+        msg = str(exc.value)
+        assert "exceeds the BLAST DB build cap" in msg
+        assert "Filter" in msg
+
+    def test_blast_too_large_subclasses_memory_error(self):
+        """Worker's `except Exception` catches MemoryError subclasses,
+        so the refusal flow lands in the user-facing status bar
+        rather than leaking the traceback."""
+        assert issubclass(sc._BlastDbTooLargeError, MemoryError)
+        assert issubclass(sc._BlastDbTooLargeError, Exception)
+
+    def test_build_db_attaches_skipped_and_total_bp(self):
+        """`_blast_build_db` must surface the filter's skip list +
+        total bp on the returned db so `_build_done` can render them."""
+        rec = _make_record("S01", "AAAA" + "ACGT" * 30)
+        _seed_collection("WithSkip", [rec])
+        # Add an oversized sibling that the filter will drop.
+        existing = sc._load_collections()
+        for c in existing:
+            if c.get("name") == "WithSkip":
+                c["plasmids"].append({
+                    "name":    "huge",
+                    "id":      "HUGE",
+                    "size":    sc._BLAST_DB_BUILD_MAX_PER_PLASMID_BP + 1,
+                    "n_feats": 0,
+                    "gb_text": "stub",
+                })
+        sc._save_collections(existing)
+        sc._blast_clear_cache()
+        db = sc._blast_get_db("blastn", ["WithSkip"])
+        # Normal-sized plasmid still indexed.
+        assert len(db["subjects"]) == 1
+        # Skip metadata propagated.
+        assert "skipped" in db
+        assert len(db["skipped"]) == 1
+        assert db["skipped"][0]["name"] == "huge"
+        assert db["total_bp"] == len(rec.seq)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Modal integration (engine wired correctly)
 # ═══════════════════════════════════════════════════════════════════════════════
 

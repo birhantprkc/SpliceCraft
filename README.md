@@ -52,14 +52,34 @@ constraints:
 - **Crash-recovery autosave.** Dirty edits debounce a 3-second write
   to a per-record `.gb` snapshot. Power-cut your laptop mid-edit; the
   next launch surfaces the survivors.
-- **1,700+ tests** (`pytest -n auto -q`, ~5–6 min on 8 cores) anchored on
-  35 **sacred invariants** for biology correctness AND data integrity:
+- **2,100+ tests** (`pytest -n auto -q`, ~5 min on 8 cores) anchored on
+  41 **sacred invariants** for biology correctness AND data integrity:
   palindromic-enzyme scanning, reverse-strand coordinate handling,
   IUPAC reverse-complement including ambiguity codes, wrap-around
   feature math, atomic-save contract, undo deepcopy, cache-deepcopy on
   read AND save, natural-sort row-mapping symmetry, etc. Property-based
   fuzzing (`hypothesis`) doubles up on the riskiest ones. Touching the
   biology primitives trips a test in under two seconds.
+- **Wrap-feature correctness.** Origin-spanning features (CDSes /
+  ori / regulatory elements that cross bp 0) are first-class
+  citizens. `_feat_bounds` normalises every `CompoundLocation` to
+  the dict-feature convention (`end < start` signals wrap), and
+  every cloning / primer-design / annotation-transfer path routes
+  through it — so a wrap CDS in pACYC184 designs the right primers,
+  digests the right region, and transfers cleanly to a target.
+- **Restriction scan off the UI thread.** Every keystroke, every
+  settings toggle, every sequence replacement now dispatches the
+  scan through a worker (`_dispatch_restr_scan`) instead of blocking
+  the UI for 50–200 ms on big plasmids. Inputs (topology, min-length,
+  unique-only filter) are captured at dispatch time so a record swap
+  mid-scan can't poison the result.
+- **Lock + concurrency hardening.** Lockfile PID is `fsync`-ed before
+  acquire returns; stale-PID detection (`os.kill(pid, 0)`) lets a
+  splicecraft killed on a shared filesystem release its lock on the
+  next launch. Modal cap dispatches `callback(None)` on overflow so
+  parent flows don't deadlock waiting for a result that never comes.
+  Save / autosave workers deep-copy the record at entry so a
+  concurrent feature-add can't leak partial state into a saved file.
 - **No external BLAST install.** `pyhmmer` ships HMMER 3 source compiled
   in-wheel; BLASTN, BLASTP, and HMMscan all run in-process via
   `nhmmer` / `phmmer` / `hmmscan`, with a pure-Python ungapped fallback

@@ -180,6 +180,10 @@ _MODAL_CASES = [
                                                "ATGGCCGCCGCCGCCTAA" * 5,
                                                circular=True)),
     ("LibrarySearchModal",         lambda: sc.LibrarySearchModal()),
+    ("LoadPartSourceModal",        lambda: sc.LoadPartSourceModal()),
+    ("NamePlasmidModal",           lambda: sc.NamePlasmidModal(
+                                               "test_plasmid",
+                                               target_label="TU")),
     ("AnnotationTransferModal",    lambda: sc.AnnotationTransferModal(
                                                source_label="src",
                                                target_label="tgt",
@@ -275,6 +279,19 @@ _MODAL_CASES = [
     # `gb_l0` is the default-active grammar so it's the most
     # representative case to pin.
     ("GrammarEditorModal.builtin", lambda: sc.GrammarEditorModal("gb_l0")),
+    # Create-mode editor: empty grammar_id flips the modal into the
+    # blank-fields path. Important to pin separately because the
+    # compose branch differs (no entry-vector pickers, "New Grammar"
+    # title, mandatory level-up enzyme input).
+    ("GrammarEditorModal.new",     lambda: sc.GrammarEditorModal("")),
+    ("GrammarManagerModal",        lambda: sc.GrammarManagerModal()),
+    ("EditGrammarConfirmModal",    lambda: sc.EditGrammarConfirmModal(
+                                                "MyCustomGrammar",
+                                                n_dependents=3)),
+    ("_ConfirmDeleteGrammarModal", lambda: sc._ConfirmDeleteGrammarModal(
+                                                "MyCustomGrammar",
+                                                "  Test body markup line.\n"
+                                                "  3 dependents.")),
 ]
 
 

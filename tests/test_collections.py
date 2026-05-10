@@ -364,6 +364,88 @@ class TestLibraryPanelModes:
             assert lib.query_one("#lib-table").display is False
             app.exit()
 
+    async def test_back_clears_search_filter_so_collections_visible(self):
+        """Regression guard for 2026-05-10 fix: typing a query in the
+        plasmid-view search bar then pressing the back button used to
+        carry the filter into the collections view via the shared
+        ``_filter_text`` field — `_repopulate_collections` would then
+        hide every collection that didn't fuzzy-match the leftover
+        plasmid query, leaving the user staring at an empty collections
+        panel."""
+        sc._save_collections([
+            {"name": "Project Alpha", "plasmids": []},
+            {"name": "Project Beta",  "plasmids": []},
+            {"name": "Backbones",     "plasmids": []},
+        ])
+        sc._set_active_collection_name("Project Alpha")
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            # In plasmids view, simulate the user submitting a search
+            # for a query that doesn't match any collection name.
+            assert lib._view_mode == "plasmids"
+            lib._filter_text = "thisQueryMatchesNoCollection"
+            search = lib.query_one("#lib-search", sc.Input)
+            search.value = "thisQueryMatchesNoCollection"
+            await pilot.pause()
+            # Press back.
+            lib.query_one("#btn-lib-back").action_press()
+            await pilot.pause(0.1)
+            assert lib._view_mode == "collections"
+            # The fix: filter is cleared on view-mode switch, so every
+            # collection appears.
+            assert lib._filter_text == ""
+            assert search.value == sc._SearchInput.PREFILL
+            t = lib.query_one("#lib-coll-table", sc.DataTable)
+            assert t.row_count == 3, (
+                f"expected 3 collections, got {t.row_count} — search "
+                f"filter leaked across the view-mode switch"
+            )
+            app.exit()
+
+    async def test_collection_pick_clears_search_filter_to_plasmids(self):
+        """Symmetric to the back-clears-filter case: a query typed in
+        the collections-view search bar must NOT carry into the plasmid
+        view when the user activates a collection. Same root cause
+        (shared `_filter_text` field), so the fix in `_apply_view_mode`
+        covers both directions."""
+        sc._save_collections([
+            {"name": "OnlyOne", "plasmids": [
+                {"id": "p1", "name": "p1", "size": 100,
+                 "gb_text": "GB"},
+                {"id": "p2", "name": "p2", "size": 200,
+                 "gb_text": "GB"},
+            ]},
+        ])
+        sc._set_active_collection_name("OnlyOne")
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            # Force collections view + stale filter, then drive the
+            # collections → plasmids transition that the view-mode
+            # switch fix should sanitise.
+            lib._view_mode = "collections"
+            lib._apply_view_mode()
+            await pilot.pause()
+            lib._filter_text = "Backbones"
+            search = lib.query_one("#lib-search", sc.Input)
+            search.value = "Backbones"
+            await pilot.pause()
+            lib._view_mode = "plasmids"
+            lib._apply_view_mode()
+            lib._repopulate_plasmids()
+            await pilot.pause(0.1)
+            assert lib._filter_text == ""
+            assert search.value == sc._SearchInput.PREFILL
+            t = lib.query_one("#lib-table", sc.DataTable)
+            # Both plasmids visible — filter didn't leak in.
+            assert t.row_count == 2
+            app.exit()
+
     async def test_clicking_collection_requires_double_activation(self):
         """Loading a collection swaps the entire library, so a stray
         RowSelected must NOT fire the load. The first activation arms

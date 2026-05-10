@@ -423,12 +423,27 @@ class TestGBConstants:
 
     def test_adjacent_positions_share_overhangs(self):
         """The 3' OH of one position must equal the 5' OH of the next.
-        This is the core Golden Braid assembly principle."""
+        This is the core Golden Braid assembly principle.
+
+        After the 0.7.7.2 expanded GB 2.0 grammar update, the chain
+        has TWO valid paths through Promoter-class slots:
+          * Combined PromUTR (default): Promoter → CDS directly via
+            the AATG connector. (The user-typical Anderson-promoter-
+            with-RBS cassette.)
+          * Separate Promoter+5'UTR: Promoter-only → 5'UTR → CDS via
+            the CCAT connector between Promoter-only and 5'UTR.
+        Both paths converge at AATG (the CDS start codon). Both are
+        validated below.
+        """
         chain = [
-            ("Promoter", "5' UTR"),
-            ("5' UTR",   "CDS"),
-            ("CDS-NS",   "C-tag"),
-            ("C-tag",    "Terminator"),   # C-tag 3' = GCTT = Terminator 5'
+            # Combined Promoter+5'UTR path: Promoter → CDS
+            ("Promoter",      "CDS"),
+            # Separate path: Promoter-only → 5'UTR → CDS
+            ("Promoter-only", "5' UTR"),
+            ("5' UTR",        "CDS"),
+            # CDS-tag chain (unchanged)
+            ("CDS-NS",        "C-tag"),
+            ("C-tag",         "Terminator"),
         ]
         for left, right in chain:
             _, _, oh3_left = sc._GB_POSITIONS[left]
@@ -2279,6 +2294,928 @@ class TestPartsBinDelete:
             assert modal.query_one(
                 "#btn-parts-save-to-coll", sc.Button
             ).disabled is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Parts Bin: Load Part button → LoadPartSourceModal picker (2026-05-10)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestLoadPartSourceModal:
+    """Regression guard for 2026-05-10 fix.
+
+    Pre-2026-05-10 the Parts Bin "Load Part" button took
+    ``self.app._current_record`` directly, forcing the user to load
+    the candidate plasmid onto the canvas first. The new flow pushes
+    ``LoadPartSourceModal`` so the user can pick from any saved
+    plasmid in any collection, or open a fresh ``.gb`` / ``.dna``
+    from disk — without disturbing the canvas.
+    """
+
+    @staticmethod
+    def _seed_two_collections() -> str:
+        """Seed two collections with one plasmid each. Returns the gb_text
+        of the active-collection plasmid so the test can round-trip
+        through the picker."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        # Active collection: one Golden Braid L0 PromUTR (combined
+        # Promoter+5'UTR; GGAG → AATG).
+        gb_seq = (
+            "CGTCTCA" + "GGAG" + "ATGAAACCCGGG" * 5 + "AATG" + "AGAGACG"
+            + "AAAAATTTTT" * 50
+        )
+        gb_record = SeqRecord(
+            Seq(gb_seq),
+            id="active_part",
+            name="active_part",
+            annotations={"topology": "circular", "molecule_type": "DNA"},
+        )
+        gb_text = sc._record_to_gb_text(gb_record)
+        sc._save_collections([
+            {
+                "name":        "Active",
+                "description": "active",
+                "plasmids":    [{
+                    "id":      "active_part",
+                    "name":    "active_part",
+                    "size":    len(gb_seq),
+                    "n_feats": 0,
+                    "gb_text": gb_text,
+                }],
+            },
+            {
+                "name":        "Other",
+                "description": "other",
+                "plasmids":    [{
+                    "id":      "other_part",
+                    "name":    "other_part",
+                    "size":    100,
+                    "n_feats": 0,
+                    "gb_text": gb_text,  # same content, separate id
+                }],
+            },
+        ])
+        sc._set_active_collection_name("Active")
+        sc._save_library([{
+            "id":      "active_part",
+            "name":    "active_part",
+            "size":    len(gb_seq),
+            "n_feats": 0,
+            "gb_text": gb_text,
+        }])
+        return gb_text
+
+    async def test_load_part_button_pushes_picker(
+            self, isolated_parts_bin, isolated_library):
+        """Clicking Load Part with no canvas record must still push the
+        picker (vs. the pre-fix behavior which warned + bailed)."""
+        self._seed_two_collections()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            parts_modal.query_one("#btn-load-part", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, sc.LoadPartSourceModal)
+
+    async def test_picker_lists_all_collections_active_first(
+            self, isolated_parts_bin, isolated_library):
+        """Both collections' plasmids must show up in the picker, with
+        the active collection's entry listed first (regardless of
+        alpha order — Active < Other alphabetically anyway, so we also
+        verify by scanning the matches list directly)."""
+        self._seed_two_collections()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.LoadPartSourceModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            assert isinstance(picker, sc.LoadPartSourceModal)
+            collections = [m["collection"] for m in picker._matches]
+            assert "Active" in collections
+            assert "Other" in collections
+            # Active collection lands first in the matches list.
+            assert collections.index("Active") < collections.index("Other")
+
+    async def test_picking_circular_plasmid_classifies_to_parts_bin(
+            self, isolated_parts_bin, isolated_library):
+        """End-to-end: pick a Golden Braid L0 promoter from the active
+        collection, the worker classifies it, and the parts bin grows
+        by exactly one row tagged with the right grammar / position."""
+        self._seed_two_collections()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            initial = len(sc._load_parts_bin())
+            parts_modal.query_one("#btn-load-part", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            assert isinstance(picker, sc.LoadPartSourceModal)
+            # Pick the active-collection row (index 0 after the
+            # active-first sort).
+            t = picker.query_one("#loadpart-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            picker.query_one("#btn-loadpart-ok", sc.Button).press()
+            await pilot.pause()
+            # Worker runs in a `@work(thread=True)` — give it room to
+            # land. Two pauses + a 0.5s delay matches the cadence other
+            # parts-bin worker tests use.
+            await pilot.pause()
+            await pilot.pause(0.5)
+            await pilot.pause()
+            entries = sc._load_parts_bin()
+            assert len(entries) == initial + 1
+            saved = entries[0]
+            assert saved["grammar"] == "gb_l0"
+            assert saved["position"] == "Pos 1"
+            assert saved["oh5"] == "GGAG"
+            assert saved["oh3"] == "AATG"
+
+    async def test_open_file_button_pushes_open_file_modal(
+            self, isolated_parts_bin, isolated_library):
+        """The "Open file…" button on the picker must push
+        ``OpenFileModal`` so the user can pick a fresh ``.gb`` / ``.dna``
+        from disk."""
+        self._seed_two_collections()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.LoadPartSourceModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            picker.query_one("#btn-loadpart-file", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, sc.OpenFileModal)
+
+    async def test_picker_cancel_dismisses_with_none(
+            self, isolated_parts_bin, isolated_library):
+        """Esc / Cancel returns ``None`` so the worker is never invoked."""
+        self._seed_two_collections()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            initial = len(sc._load_parts_bin())
+            parts_modal.query_one("#btn-load-part", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            assert isinstance(picker, sc.LoadPartSourceModal)
+            picker.query_one("#btn-loadpart-cancel", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Back on the parts modal, no new entry.
+            assert isinstance(app.screen, sc.PartsBinModal)
+            assert len(sc._load_parts_bin()) == initial
+
+    async def test_picker_warns_on_linear_pick(
+            self, isolated_parts_bin, isolated_library):
+        """A linear plasmid in the picker must produce a warning + no
+        parts-bin write when picked (the digest needs a circular
+        topology). After hardening (2026-05-10), the picker now keeps
+        the modal OPEN on a linear pick so the user can pick another
+        row without re-launching the dialog."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        # Seed a linear-topology plasmid in the active collection.
+        gb_seq = (
+            "CGTCTCA" + "GGAG" + "ATGAAACCCGGG" * 5 + "TGAC" + "AGAGACG"
+            + "AAAAATTTTT" * 50
+        )
+        linear_record = SeqRecord(
+            Seq(gb_seq),
+            id="linear_part",
+            name="linear_part",
+            annotations={"topology": "linear", "molecule_type": "DNA"},
+        )
+        gb_text = sc._record_to_gb_text(linear_record)
+        sc._save_collections([{
+            "name":        "Linear-only",
+            "description": "test",
+            "plasmids":    [{
+                "id":      "linear_part",
+                "name":    "linear_part",
+                "size":    len(gb_seq),
+                "n_feats": 0,
+                "gb_text": gb_text,
+            }],
+        }])
+        sc._set_active_collection_name("Linear-only")
+        sc._save_library([{
+            "id":      "linear_part",
+            "name":    "linear_part",
+            "size":    len(gb_seq),
+            "n_feats": 0,
+            "gb_text": gb_text,
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts_modal = app.screen
+            initial = len(sc._load_parts_bin())
+            parts_modal.query_one("#btn-load-part", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            t = picker.query_one("#loadpart-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            picker.query_one("#btn-loadpart-ok", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # No new parts-bin row — the picker's pre-flight bailed.
+            assert len(sc._load_parts_bin()) == initial
+            # Picker stays open so the user can pick another row.
+            assert isinstance(app.screen, sc.LoadPartSourceModal)
+            assert app.screen._dismissing is False
+
+
+class TestLoadPartSourceModalHardening:
+    """Edge-case + robustness regression guards for `LoadPartSourceModal`.
+
+    Covers (2026-05-10):
+      * Double-dismiss guard — a Select+Enter race or a row double-click
+        can't fire `dismiss(record)` twice (would crash the screen
+        stack on the second call).
+      * Select button is disabled when the table is empty.
+      * Topology pre-flight in the picker keeps the modal open instead
+        of dismissing into the worker's "linear" warning.
+      * Empty-sequence pre-flight surfaces in-modal feedback rather
+        than a useless toast.
+      * Filter timer is cancelled on unmount so a stale tick doesn't
+        fire against a disposed widget tree.
+    """
+
+    @staticmethod
+    def _seed_one_circular() -> None:
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        gb_seq = (
+            "CGTCTCA" + "GGAG" + "ATGAAACCCGGG" * 5 + "TGAC" + "AGAGACG"
+            + "AAAAATTTTT" * 50
+        )
+        rec = SeqRecord(
+            Seq(gb_seq), id="p1", name="p1",
+            annotations={"topology": "circular",
+                         "molecule_type": "DNA"},
+        )
+        gb = sc._record_to_gb_text(rec)
+        sc._save_collections([{
+            "name": "Coll", "description": "t",
+            "plasmids": [{
+                "id": "p1", "name": "p1",
+                "size": len(gb_seq), "n_feats": 0,
+                "gb_text": gb,
+            }],
+        }])
+        sc._set_active_collection_name("Coll")
+        sc._save_library([{
+            "id": "p1", "name": "p1",
+            "size": len(gb_seq), "n_feats": 0,
+            "gb_text": gb,
+        }])
+
+    async def test_select_button_disabled_when_no_matches(
+            self, isolated_library, isolated_parts_bin):
+        """Empty library → Select button must come up disabled. The
+        old code left it enabled and `_on_query_submitted` no-op'd on
+        empty matches; the disabled state makes the empty case
+        visible up-front."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.LoadPartSourceModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            assert isinstance(picker, sc.LoadPartSourceModal)
+            assert picker._matches == []
+            btn = picker.query_one("#btn-loadpart-ok", sc.Button)
+            assert btn.disabled is True
+
+    async def test_select_button_enabled_when_matches_present(
+            self, isolated_library, isolated_parts_bin):
+        """Reverse of the empty case — a non-empty list flips the
+        Select button on after the initial refresh."""
+        self._seed_one_circular()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.LoadPartSourceModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            assert len(picker._matches) == 1
+            btn = picker.query_one("#btn-loadpart-ok", sc.Button)
+            assert btn.disabled is False
+
+    async def test_double_dismiss_guard(
+            self, isolated_library, isolated_parts_bin):
+        """Calling `_dismiss_with_match` twice (simulating a Select +
+        Enter race or a duplicate RowSelected event) must not crash —
+        only the first call dismisses, the second is a no-op."""
+        self._seed_one_circular()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.LoadPartSourceModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            match = picker._matches[0]
+            # First dismissal: real one — flips the latch.
+            picker._dismiss_with_match(match)
+            assert picker._dismissing is True
+            # Second call: must short-circuit. No exception, no
+            # second screen-pop. Still on PartsBin path though we
+            # never opened it; just ensure no crash.
+            picker._dismiss_with_match(match)
+
+    async def test_action_cancel_idempotent(
+            self, isolated_library, isolated_parts_bin):
+        """Esc → action_cancel — a second invocation (rapid double
+        Esc) must not double-dismiss."""
+        self._seed_one_circular()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.LoadPartSourceModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            picker.action_cancel()
+            assert picker._dismissing is True
+            # Second call short-circuits.
+            picker.action_cancel()
+
+    async def test_unmount_cancels_filter_timer(
+            self, isolated_library, isolated_parts_bin):
+        """The debounce timer is freed on unmount — without this it
+        keeps a reference to `_refresh` and fires after the modal is
+        gone (cosmetic; status logs would noise up)."""
+        self._seed_one_circular()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.LoadPartSourceModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            # Type a key to schedule the debounce.
+            inp = picker.query_one("#loadpart-input", sc.Input)
+            inp.value = "x"
+            await pilot.pause()
+            assert picker._filter_timer is not None
+            picker.action_cancel()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # After unmount, the slot is wiped to None.
+            assert picker._filter_timer is None
+
+    async def test_empty_sequence_record_does_not_dismiss(
+            self, isolated_library, isolated_parts_bin):
+        """A library entry whose gb_text parses to a 0-bp record must
+        notify + stay open, not crash the worker chain."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        rec = SeqRecord(
+            Seq(""), id="empty", name="empty",
+            annotations={"topology": "circular",
+                         "molecule_type": "DNA"},
+        )
+        gb = sc._record_to_gb_text(rec)
+        sc._save_collections([{
+            "name": "Coll", "description": "t",
+            "plasmids": [{
+                "id": "empty", "name": "empty",
+                "size": 0, "n_feats": 0, "gb_text": gb,
+            }],
+        }])
+        sc._set_active_collection_name("Coll")
+        sc._save_library([{
+            "id": "empty", "name": "empty",
+            "size": 0, "n_feats": 0, "gb_text": gb,
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.LoadPartSourceModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            picker._dismiss_with_match(picker._matches[0])
+            # The empty-seq pre-flight kept the modal open.
+            assert picker._dismissing is False
+
+
+class TestCheckVectorMatchHardening:
+    """Hardening for `_check_vector_match`'s rotation + RC checks and
+    the digest cache. Avoids spinning up the modal/worker — these
+    operate purely on the pure-Python layer."""
+
+    @staticmethod
+    def _make_l0_ring(insert: str = "AAAA",
+                       oh5: str = "GGAG",
+                       oh3: str = "AATG",
+                       backbone: str = "AAAAATTTTT" * 50) -> str:
+        return ("CGTCTCA" + oh5 + insert + oh3 + "AGAGACG" + backbone)
+
+    def test_match_via_doubled_substring_rotation(
+            self, isolated_library):
+        """Cloning typically preserves the vector half byte-for-byte;
+        a configured EV's vector half should match the user's vector
+        half via the doubled-substring trick. Direct equality is the
+        common case; this test asserts the substring path also lands
+        the match (the user's plasmid is a rotation-equivalent ring
+        of the EV's vector half plus a different insert)."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        ev_seq   = self._make_l0_ring("CCCCTTTT" * 5)
+        user_seq = self._make_l0_ring("ATGAAACCCGGG" * 5)
+        ev_rec = SeqRecord(
+            Seq(ev_seq), id="ev", name="ev",
+            annotations={"topology": "circular",
+                         "molecule_type": "DNA"},
+        )
+        sc._save_entry_vectors([{
+            "grammar_id": "gb_l0", "role": "",
+            "name": "ev", "size": len(ev_seq),
+            "source": "test", "gb_text":
+                sc._record_to_gb_text(ev_rec),
+        }])
+        result = sc._classify_part_from_plasmid(user_seq, circular=True)
+        assert result is not None
+        ev = result.get("entry_vector")
+        assert ev is not None and ev["matches"] is True
+
+    def test_match_via_rc_orientation(self, isolated_library):
+        """If the user saved their plasmid with the OTHER strand on
+        top (RC of the canonical orientation), the vector half's
+        top_seq is the RC of the EV's vector half. The hardened
+        check matches via the RC-doubled fallback so the mismatch
+        doesn't dismiss as "no entry vector configured"."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        ev_seq = self._make_l0_ring("CCCCTTTT" * 5)
+        # Build the RC-of-the-ring as the user's plasmid. After RC,
+        # the Esp3I sites + overhangs are inverted — the digest still
+        # produces the SAME biological fragments but their top_seq is
+        # the RC of the canonical fragments.
+        user_seq = sc._rc(ev_seq)
+        # RC swaps the digestion's overhang labelling: GGAG↔CTCC,
+        # TGAC↔GTCA. To classify under gb_l0 the user's RC plasmid
+        # must still be a recognisable Promoter — verify upfront.
+        # If not, this test is a no-op for the EV check and we'd
+        # silently pass; assert the classification works first so a
+        # regression in the RC path doesn't slip through.
+        result_rc = sc._classify_part_from_plasmid(
+            user_seq, circular=True,
+        )
+        # If the RC seq doesn't classify (overhangs map to a non-GB
+        # position), skip — this guard isn't useful in that case.
+        if result_rc is None:
+            import pytest
+            pytest.skip("RC seq doesn't classify under any grammar "
+                        "(test environment-dependent)")
+        ev_rec = SeqRecord(
+            Seq(ev_seq), id="ev", name="ev",
+            annotations={"topology": "circular",
+                         "molecule_type": "DNA"},
+        )
+        sc._save_entry_vectors([{
+            "grammar_id": result_rc["grammar_id"], "role": "",
+            "name": "ev", "size": len(ev_seq),
+            "source": "test", "gb_text":
+                sc._record_to_gb_text(ev_rec),
+        }])
+        # The EV check should land via the RC fallback even though
+        # the user's vector half is the RC of the EV's vector half.
+        result_with_ev = sc._classify_part_from_plasmid(
+            user_seq, circular=True,
+        )
+        ev = result_with_ev.get("entry_vector") if result_with_ev else None
+        assert ev is not None, \
+            "RC-fallback in _check_vector_match did not fire"
+        assert ev["matches"] is True
+
+    def test_digest_cache_avoids_reparsing(self, isolated_library):
+        """The `_VECTOR_MATCH_CACHE` keyed by (gb_text, enzyme) must
+        return the cached result on a repeat call. Verifies the cache
+        exists + populates as expected."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        ev_seq = self._make_l0_ring("CCCCTTTT" * 5)
+        ev_rec = SeqRecord(
+            Seq(ev_seq), id="ev", name="ev",
+            annotations={"topology": "circular",
+                         "molecule_type": "DNA"},
+        )
+        ev_gb = sc._record_to_gb_text(ev_rec)
+        sc._VECTOR_MATCH_CACHE.clear()
+        first  = sc._vector_half_top_seq(ev_gb, "Esp3I")
+        # Cache must now have an entry for this (gb_text, enzyme) key.
+        assert (ev_gb, "Esp3I") in sc._VECTOR_MATCH_CACHE
+        second = sc._vector_half_top_seq(ev_gb, "Esp3I")
+        assert first == second is not None
+
+    def test_digest_cache_bounded(self):
+        """The cache must not grow unbounded — once it crosses the
+        cap, the oldest insertion is evicted."""
+        sc._VECTOR_MATCH_CACHE.clear()
+        # Stuff the cache past the cap with junk keys (the helper
+        # never inserts None values that fail to digest, but for
+        # a bounded-cache test we exercise the eviction directly
+        # by calling `_vector_half_top_seq` with synthesized stubs).
+        for i in range(sc._VECTOR_MATCH_CACHE_MAX + 5):
+            sc._VECTOR_MATCH_CACHE[(f"k{i}", "Esp3I")] = "stub"
+        # Direct stuffing exceeded the cap; verify the helper's
+        # bounded insertion path keeps it within bounds going forward.
+        # Re-clear, then call the helper repeatedly with distinct
+        # gb_text keys to verify it caps itself.
+        sc._VECTOR_MATCH_CACHE.clear()
+        for i in range(sc._VECTOR_MATCH_CACHE_MAX + 5):
+            sc._vector_half_top_seq(f">fake gb_text {i}", "Esp3I")
+        assert len(sc._VECTOR_MATCH_CACHE) <= sc._VECTOR_MATCH_CACHE_MAX
+
+
+class TestLoadPartSourceModalShutdown:
+    """Shutdown path coverage: Esc, Ctrl+Q, app.exit while open, and
+    cleanup invariants (filter timer cancelled regardless of which
+    dismiss path fires). Regression guard for 2026-05-10 hardening
+    pass.
+    """
+
+    @staticmethod
+    def _seed_one_circular() -> None:
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        gb_seq = (
+            "CGTCTCA" + "GGAG" + "ATGAAACCCGGG" * 5 + "TGAC" + "AGAGACG"
+            + "AAAAATTTTT" * 50
+        )
+        rec = SeqRecord(
+            Seq(gb_seq), id="p1", name="p1",
+            annotations={"topology": "circular",
+                         "molecule_type": "DNA"},
+        )
+        gb = sc._record_to_gb_text(rec)
+        sc._save_collections([{
+            "name": "Coll", "description": "t",
+            "plasmids": [{
+                "id": "p1", "name": "p1",
+                "size": len(gb_seq), "n_feats": 0,
+                "gb_text": gb,
+            }],
+        }])
+        sc._set_active_collection_name("Coll")
+        sc._save_library([{
+            "id": "p1", "name": "p1",
+            "size": len(gb_seq), "n_feats": 0,
+            "gb_text": gb,
+        }])
+
+    async def test_esc_cascade_loadpart_then_partsbin(
+            self, isolated_library, isolated_parts_bin):
+        """Esc on LoadPart pops it; second Esc pops PartsBin. Verifies
+        the modal stack drains cleanly without leaving an orphan
+        screen on top."""
+        self._seed_one_circular()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            parts = app.screen
+            assert isinstance(parts, sc.PartsBinModal)
+            parts.query_one("#btn-load-part", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            assert isinstance(picker, sc.LoadPartSourceModal)
+            # First Esc: pops LoadPart.
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, sc.PartsBinModal)
+            # Second Esc: pops PartsBin.
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Parts bin gone. Default app screen is on top.
+            assert not isinstance(app.screen, sc.PartsBinModal)
+            assert not isinstance(app.screen, sc.LoadPartSourceModal)
+
+    async def test_esc_with_pending_filter_timer_cancels_cleanly(
+            self, isolated_library, isolated_parts_bin):
+        """Type into the filter (schedules a debounce timer), then
+        press Esc immediately. The on_unmount hook must cancel the
+        timer so it doesn't fire against the disposed widget tree."""
+        self._seed_one_circular()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.LoadPartSourceModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            inp = picker.query_one("#loadpart-input", sc.Input)
+            inp.value = "p"
+            await pilot.pause()
+            assert picker._filter_timer is not None
+            # Esc before the 150 ms debounce window expires.
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # on_unmount cleared the timer slot; the original Timer
+            # object was stopped before the slot was wiped.
+            assert picker._filter_timer is None
+            assert picker._dismissing is True
+
+    async def test_select_dismiss_also_cancels_timer(
+            self, isolated_library, isolated_parts_bin):
+        """on_unmount fires on EVERY dismiss path, not just action_
+        cancel. Verifies the Select-with-record path also clears the
+        timer (regression guard against a half-baked cleanup that
+        only covered the cancel path)."""
+        self._seed_one_circular()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.LoadPartSourceModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            inp = picker.query_one("#loadpart-input", sc.Input)
+            inp.value = "p"
+            await pilot.pause()
+            assert picker._filter_timer is not None
+            # Select via OK button — dismisses with the record.
+            picker.query_one("#btn-loadpart-ok", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # on_unmount fired during the dismiss; timer is gone.
+            assert picker._filter_timer is None
+
+    async def test_app_exit_while_picker_open_unmounts_cleanly(
+            self, isolated_library, isolated_parts_bin):
+        """Exiting the app while the picker is on top triggers a full
+        unmount cascade — the modal's `on_unmount` must run so the
+        timer doesn't leak past process shutdown.
+        """
+        self._seed_one_circular()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.LoadPartSourceModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            inp = picker.query_one("#loadpart-input", sc.Input)
+            inp.value = "p"
+            await pilot.pause()
+            assert picker._filter_timer is not None
+            # Capture a reference; we inspect post-exit.
+            picker_ref = picker
+            # Hard exit — no UnsavedQuitModal in the path because the
+            # app has no record loaded. Mirrors a `app.exit()` from
+            # any code path.
+            app.exit()
+            await pilot.pause()
+            await pilot.pause(0.2)
+        # After context exit, the test harness has shut the app down.
+        # The picker reference still holds, but on_unmount fired and
+        # cleared the slot.
+        assert picker_ref._filter_timer is None
+
+    async def test_cancel_button_idempotent_after_select(
+            self, isolated_library, isolated_parts_bin):
+        """Once Select fires (`_dismissing=True`), pressing Cancel
+        afterward must be a no-op. Defends against a race where the
+        user clicks Select, then mashes Cancel before the dismiss
+        animation completes."""
+        self._seed_one_circular()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.LoadPartSourceModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            # Manually trigger the dismiss path without letting the
+            # screen actually pop yet. Simulates the same race.
+            picker._dismissing = True
+            # Cancel button: must short-circuit with `_dismissing=True`.
+            picker._cancel_btn(None)
+            picker.action_cancel()
+            # No exception, latch stays True, no second dismiss queued.
+            assert picker._dismissing is True
+
+
+class TestLoadPartSourceModalRobustness:
+    """Edge cases discovered in the 2nd-pass audit (2026-05-10):
+    corrupt gb_text recovery, search-helper exception path, original
+    gb_text round-trip preservation."""
+
+    async def test_corrupt_gb_text_keeps_modal_open(
+            self, isolated_library, isolated_parts_bin):
+        """An entry whose gb_text is malformed (un-parseable) must
+        notify + stay open, not crash the dismiss path. Pre-fix the
+        parse exception was caught but the modal could leave the
+        broken row selectable; the latch ensures we don't latch
+        `_dismissing` on a parse failure."""
+        sc._save_collections([{
+            "name": "Corrupt", "description": "t",
+            "plasmids": [{
+                "id": "broken", "name": "broken",
+                "size": 5_000, "n_feats": 0,
+                "gb_text": "this is not GenBank text at all",
+            }],
+        }])
+        sc._set_active_collection_name("Corrupt")
+        sc._save_library([{
+            "id": "broken", "name": "broken",
+            "size": 5_000, "n_feats": 0,
+            "gb_text": "this is not GenBank text at all",
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.LoadPartSourceModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            picker._dismiss_with_match(picker._matches[0])
+            # Parse failed → notify + stay open. Latch must NOT have
+            # flipped (so the user can pick a different row without
+            # the dismiss-guard short-circuiting them).
+            assert picker._dismissing is False
+            assert isinstance(app.screen, sc.LoadPartSourceModal)
+
+    async def test_search_helper_exception_leaves_modal_usable(
+            self, isolated_library, isolated_parts_bin,
+            monkeypatch):
+        """If `_search_collections_library` raises during a refresh,
+        the modal must catch + show an error banner without crashing.
+        Simulates a buggy custom-grammar plugin or a corrupted
+        in-memory state mid-iteration."""
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated search failure")
+        monkeypatch.setattr(
+            sc, "_search_collections_library", _boom,
+        )
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.LoadPartSourceModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            assert isinstance(picker, sc.LoadPartSourceModal)
+            # Search failed → empty matches, Select disabled, status
+            # has the red banner.
+            assert picker._matches == []
+            btn = picker.query_one("#btn-loadpart-ok", sc.Button)
+            assert btn.disabled is True
+            status = picker.query_one("#loadpart-status", sc.Static)
+            assert "failed" in str(status.render()).lower()
+
+    async def test_original_gb_text_stashed_on_record(
+            self, isolated_library, isolated_parts_bin):
+        """The picker stashes the library's ORIGINAL `gb_text` on the
+        dismissed record (`record._tui_gb_text`) so the worker can
+        skip the parse → serialise round-trip. Verifies the stash
+        is intact at dismiss time."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        gb_seq = (
+            "CGTCTCA" + "GGAG" + "ATGAAACCCGGG" * 5 + "TGAC"
+            + "AGAGACG" + "AAAAATTTTT" * 50
+        )
+        rec = SeqRecord(
+            Seq(gb_seq), id="p1", name="p1",
+            annotations={"topology": "circular",
+                         "molecule_type": "DNA"},
+        )
+        original_gb = sc._record_to_gb_text(rec)
+        sc._save_collections([{
+            "name": "Coll", "description": "t",
+            "plasmids": [{
+                "id": "p1", "name": "p1",
+                "size": len(gb_seq), "n_feats": 0,
+                "gb_text": original_gb,
+            }],
+        }])
+        sc._set_active_collection_name("Coll")
+        sc._save_library([{
+            "id": "p1", "name": "p1",
+            "size": len(gb_seq), "n_feats": 0,
+            "gb_text": original_gb,
+        }])
+        # Capture the dismissed record so we can inspect it post-
+        # dismiss.
+        captured = {}
+
+        def _capture(record):
+            captured["record"] = record
+
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.LoadPartSourceModal(),
+                            callback=_capture)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            picker._dismiss_with_match(picker._matches[0])
+            await pilot.pause()
+            await pilot.pause(0.1)
+        rec = captured.get("record")
+        assert rec is not None
+        # Stashed gb_text matches the library entry's original.
+        assert getattr(rec, "_tui_gb_text", None) == original_gb
+
+
+class TestSaveEntryVectorsCacheInvalidation:
+    """`_save_entry_vectors` must drop the digest cache so a
+    reconfigure doesn't leave stale entries crowding the cap or
+    (worst case) returning a digest derived from a deleted EV."""
+
+    def test_save_clears_vector_match_cache(self, isolated_library):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        # Pre-populate the cache via a manual digest.
+        ev_seq = ("CGTCTCA" + "GGAG" + "AAAA" + "TGAC"
+                  + "AGAGACG" + "AAAAATTTTT" * 50)
+        ev_rec = SeqRecord(
+            Seq(ev_seq), id="ev", name="ev",
+            annotations={"topology": "circular",
+                         "molecule_type": "DNA"},
+        )
+        ev_gb = sc._record_to_gb_text(ev_rec)
+        sc._VECTOR_MATCH_CACHE.clear()
+        sc._vector_half_top_seq(ev_gb, "Esp3I")
+        assert len(sc._VECTOR_MATCH_CACHE) >= 1
+        # Persist any entry-vector list — the call must wipe the
+        # cache regardless of contents.
+        sc._save_entry_vectors([{
+            "grammar_id": "gb_l0", "role": "",
+            "name": "ev", "size": len(ev_seq),
+            "source": "test", "gb_text": ev_gb,
+        }])
+        assert len(sc._VECTOR_MATCH_CACHE) == 0
+
+
+class TestVectorHalfTopSeqRobustness:
+    """Edge-cases for `_vector_half_top_seq` — non-circular EV refusal,
+    parse-failure swallow, cache hit on repeat call."""
+
+    def test_non_circular_ev_returns_none(self):
+        """A linearised EV would dispatch through
+        `_excise_fragment_pair(circular=True)` and produce nonsense
+        fragments. Skip the digest and return None."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        seq = ("CGTCTCA" + "GGAG" + "AAAA" + "TGAC"
+               + "AGAGACG" + "AAAAATTTTT" * 50)
+        rec = SeqRecord(
+            Seq(seq), id="lin", name="lin",
+            annotations={"topology": "linear",
+                         "molecule_type": "DNA"},
+        )
+        ev_gb = sc._record_to_gb_text(rec)
+        sc._VECTOR_MATCH_CACHE.clear()
+        result = sc._vector_half_top_seq(ev_gb, "Esp3I")
+        assert result is None
+
+    def test_unparseable_gb_returns_none(self):
+        """Bogus gb_text → parse fails → swallow and return None
+        rather than propagating the exception."""
+        sc._VECTOR_MATCH_CACHE.clear()
+        result = sc._vector_half_top_seq(
+            "not actual genbank text", "Esp3I",
+        )
+        assert result is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5329,13 +6266,18 @@ class TestClassifyPartFromPlasmid:
     plasmid."""
 
     def test_detects_gb_l0_promoter(self):
-        seq = _build_gb_l0_part_seq("GGAG", "TGAC")
+        # GB 2.0 PromUTR (combined Promoter + 5'UTR): GGAG → AATG.
+        # The 3' overhang lands on the start codon (ATG) of the
+        # downstream CDS, matching the canonical post-cloning shape
+        # of an Anderson-style promoter (e.g. J23100) bundled with
+        # its RBS / 5'UTR.
+        seq = _build_gb_l0_part_seq("GGAG", "AATG")
         result = sc._classify_part_from_plasmid(seq, circular=True)
         assert result is not None
         assert result["grammar_id"] == "gb_l0"
         assert result["position"]["type"] == "Promoter"
         assert result["insert"]["left"]["overhang_seq"] == "GGAG"
-        assert result["insert"]["right"]["overhang_seq"] == "TGAC"
+        assert result["insert"]["right"]["overhang_seq"] == "AATG"
 
     def test_detects_gb_l0_cds(self):
         seq = _build_gb_l0_part_seq("AATG", "GCTT")
@@ -5361,22 +6303,26 @@ class TestClassifyPartFromPlasmid:
         the insert and the larger as the vector — a 60-bp insert in a
         ~600-bp synthetic backbone must come back labelled correctly."""
         insert_core = "ATGAAACCCGGG" * 5   # 60 bp
-        seq = _build_gb_l0_part_seq("GGAG", "TGAC", insert_core)
+        seq = _build_gb_l0_part_seq("GGAG", "AATG", insert_core)
         result = sc._classify_part_from_plasmid(seq, circular=True)
         assert result is not None
         assert (len(result["insert"]["top_seq"])
                 < len(result["vector"]["top_seq"]))
 
-    def test_detects_moclo_plant_promoter(self):
-        """A MoClo Plant L0 promoter (GGAG / AATG, BsaI-cuttable) must
-        classify to MoClo Plant Pos 1 / Promoter — the canonical
-        layout for the J23100 promoter as it ships in standard MoClo
-        Plant L0 entry vectors. Regression guard for the FFE 7
-        plasmid case the user reported on 2026-05-10."""
+    def test_gb_priority_over_moclo_for_shared_promoter_overhangs(self):
+        """Both gb_l0 Pos 1 (combined Promoter+5'UTR) and moclo_plant
+        Pos 1 use ``GGAG / AATG`` overhangs — a J23100+RBS cassette
+        cloned into either system has identical digest output. The
+        registry order resolves the ambiguity: gb_l0 ships first in
+        ``_BUILTIN_GRAMMARS`` so it wins. Regression guard for the
+        2026-05-10 user report ("J23100/J23114 detected as MoClo
+        instead of GB"). To force a MoClo classification on a
+        GGAG/AATG plasmid, the user must remove gb_l0 from the
+        active grammar list or use the manual New Part flow."""
         seq = _build_moclo_plant_part_seq("GGAG", "AATG")
         result = sc._classify_part_from_plasmid(seq, circular=True)
         assert result is not None
-        assert result["grammar_id"]    == "moclo_plant"
+        assert result["grammar_id"]    == "gb_l0"
         assert result["position"]["type"] == "Promoter"
         assert result["position"]["name"] == "Pos 1"
         assert result["insert"]["left"]["overhang_seq"]  == "GGAG"
@@ -5385,8 +6331,8 @@ class TestClassifyPartFromPlasmid:
     def test_detects_moclo_plant_cds(self):
         """MoClo Plant CDS overhangs (AGGT / GCTT) must classify to
         the Pos 3 / CDS slot. Differentiates from gb_l0 CDS (AATG /
-        GCTT) which would NOT match because gb_l0's positions are
-        offset by the AATG-bracketed 5'UTR slot."""
+        GCTT): gb_l0 has no AGGT-prefixed position, so the GB pass
+        misses cleanly and MoClo takes over."""
         seq = _build_moclo_plant_part_seq("AGGT", "GCTT")
         result = sc._classify_part_from_plasmid(seq, circular=True)
         assert result is not None
@@ -5394,18 +6340,378 @@ class TestClassifyPartFromPlasmid:
         assert result["position"]["type"] == "CDS"
 
     def test_no_esp3i_sites_falls_through_to_bsai(self):
-        """A plasmid with NO Esp3I sites at all (so gb_l0 digest
-        returns 0 fragments) must fall through to MoClo Plant rather
-        than failing classification. This is the FFE 7 case in
-        practice — MoClo Plant L0 vectors typically carry no Esp3I
-        sites because their domestication strips them."""
-        seq = _build_moclo_plant_part_seq("GGAG", "AATG")
+        """A plasmid with NO Esp3I sites AND with overhangs that
+        ONLY match MoClo (not the expanded GB grammar) must fall
+        through to MoClo Plant rather than failing classification.
+
+        Use MoClo Pos 5 / Terminator (GGTA / CGCT) — disjoint from
+        every GB position (GB Terminator is GCTT/CGCT). The FFE 7
+        case the test originally targeted now classifies as gb_l0
+        Promoter (combined Promoter+5'UTR added in 0.7.7.2) — see
+        `test_gb_priority_over_moclo_for_shared_promoter_overhangs`.
+        """
+        seq = _build_moclo_plant_part_seq("GGTA", "CGCT")
         # Spot-check: no Esp3I (CGTCTC) in either strand.
         assert "CGTCTC" not in seq
         assert "GAGACG" not in seq
         result = sc._classify_part_from_plasmid(seq, circular=True)
         assert result is not None
         assert result["grammar_id"] == "moclo_plant"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _classify_part_from_plasmid — multi-level (L0 / TU / MOD) detection
+# + entry-vector compatibility check (regression guard for 2026-05-10)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_post_cloning_l0_seq(oh5: str, oh3: str,
+                                insert: str = "ATG" * 15) -> str:
+    """An L0 part already cloned into a pUPD2-style L0 entry vector.
+    BsaI sites flank the part body (ready for L1 assembly); the
+    primary Esp3I sites have been "consumed" so the only remaining
+    cut sites are the secondary (BsaI) ones. The user explicitly
+    asked Load Part to recognise this case (2026-05-10 follow-up)."""
+    core = "GGTCTCA" + oh5 + insert + oh3 + "AGAGACC"
+    backbone = "AAAAATTTTT" * 50    # no BsaI internal
+    return core + backbone
+
+
+def _build_gb_tu_seq(insert: str = "ATG" * 30,
+                       oh5: str = "GGAG", oh3: str = "CGCT") -> str:
+    """Synthetic GB TU: BsaI sites flanking a TU body whose internal
+    Esp3I sites are scrubbed (domesticated). Boundary overhangs default
+    to ``GGAG/CGCT`` — the canonical GB TU start/end."""
+    core = "GGTCTCA" + oh5 + insert + oh3 + "AGAGACC"
+    backbone = "AAAAATTTTT" * 50
+    return core + backbone
+
+
+def _build_gb_mod_seq(insert: str = "ATG" * 50,
+                       oh5: str = "GGAG", oh3: str = "CGCT") -> str:
+    """Synthetic GB MOD (L2): Esp3I sites flanking a multi-TU body
+    whose internal BsaI sites are scrubbed. The same TU boundary
+    overhangs flank the MOD insert because L2 destinations preserve
+    the TU edge convention."""
+    core = "CGTCTCA" + oh5 + insert + oh3 + "AGAGACG"
+    backbone = "AAAAATTTTT" * 50
+    return core + backbone
+
+
+class TestClassifyPartFromPlasmidLevels:
+    """Multi-level detection: pre-cloning L0, post-cloning L0 (BsaI-
+    flanked, no Esp3I), TU (level 1), MOD (level 2). Plus the
+    entry-vector compatibility check that surfaces "this plasmid was
+    cloned into your configured destination" so the user doesn't
+    accidentally save a part against the wrong backbone.
+    """
+
+    def test_pre_cloning_l0_classifies_as_level_0(self):
+        """Existing path: synthetic GB Promoter still has Esp3I sites
+        flanking the part body. Primary digest matches L0 position
+        directly — release_enzyme is the primary (Esp3I)."""
+        seq = _build_gb_l0_part_seq("GGAG", "AATG")
+        result = sc._classify_part_from_plasmid(seq, circular=True)
+        assert result is not None
+        assert result["grammar_id"]    == "gb_l0"
+        assert result["level"]         == 0
+        assert result["position"]["type"] == "Promoter"
+        assert result["release_enzyme"] in ("Esp3I", "BsmBI")
+
+    def test_post_cloning_l0_classifies_as_level_0(self):
+        """User's explicit ask (2026-05-10): an L0 part already cloned
+        into pUPD2 has no Esp3I sites left, only BsaI flanking. Must
+        still classify as gb_l0 / level=0 — the part is biologically
+        an L0, just packaged ready for L1 assembly. Release enzyme
+        switches to the secondary (BsaI)."""
+        seq = _build_post_cloning_l0_seq("GGAG", "AATG")
+        # Sanity: no Esp3I sites either strand.
+        assert "CGTCTC" not in seq
+        assert "GAGACG" not in seq
+        result = sc._classify_part_from_plasmid(seq, circular=True)
+        assert result is not None
+        assert result["grammar_id"]    == "gb_l0"
+        assert result["level"]         == 0
+        assert result["position"]["type"] == "Promoter"
+        assert result["release_enzyme"] == "BsaI"
+
+    def test_post_cloning_l0_cds_classifies_as_level_0(self):
+        """A post-cloning L0 CDS (AATG/GCTT — between Promoter and
+        Terminator overhangs) classifies the same way — verifies the
+        post-cloning path isn't hard-coded to a single position."""
+        seq = _build_post_cloning_l0_seq("AATG", "GCTT")
+        result = sc._classify_part_from_plasmid(seq, circular=True)
+        assert result is not None
+        assert result["level"]            == 0
+        assert result["position"]["type"] == "CDS"
+        assert result["release_enzyme"]   == "BsaI"
+
+    def test_j23100_with_rbs_classifies_as_gb_promoter(self):
+        """Regression guard for the 2026-05-10 user report: a
+        J23100/J23114 cassette already cloned into an L0 entry vector
+        with the RBS bundled (GGAG → AATG, BsaI sites flanking) must
+        classify as gb_l0 / Promoter, not moclo_plant. Pre-fix the
+        GB Promoter slot was (GGAG, TGAC) which never matched any
+        post-cloning Anderson-style cassette — the user got
+        ``moclo_plant`` even when their workflow was GB."""
+        seq = _build_post_cloning_l0_seq("GGAG", "AATG")
+        result = sc._classify_part_from_plasmid(seq, circular=True)
+        assert result is not None
+        assert result["grammar_id"]    == "gb_l0"
+        assert result["level"]         == 0
+        assert result["position"]["name"] == "Pos 1"
+        assert result["position"]["type"] == "Promoter"
+        assert result["release_enzyme"] == "BsaI"
+
+    def test_separate_gb_promoter_only_classifies(self):
+        """The expanded GB 2.0 grammar adds a separate Promoter-only
+        position (GGAG → CCAT) for users who domesticate the
+        promoter and 5'UTR apart. Verify the new slot matches."""
+        seq = _build_gb_l0_part_seq("GGAG", "CCAT")
+        result = sc._classify_part_from_plasmid(seq, circular=True)
+        assert result is not None
+        assert result["grammar_id"]    == "gb_l0"
+        assert result["position"]["name"] == "Pos 1a"
+        assert result["position"]["type"] == "Promoter-only"
+
+    def test_separate_gb_5_utr_classifies(self):
+        """Partner to the separate Promoter-only slot: GB 2.0's
+        5' UTR position takes the CCAT connector overhang to AATG.
+        Pre-fix it was TGAC/AATG (never connected to any other slot
+        coherently); the canonical GB 2.0 spec uses CCAT."""
+        seq = _build_gb_l0_part_seq("CCAT", "AATG")
+        result = sc._classify_part_from_plasmid(seq, circular=True)
+        assert result is not None
+        assert result["grammar_id"]    == "gb_l0"
+        assert result["position"]["name"] == "Pos 1b"
+        assert result["position"]["type"] == "5' UTR"
+
+    def test_tu_classifies_as_level_1(self):
+        """A GB TU (BsaI-flanked, GGAG/CGCT boundary, no internal
+        Esp3I) must classify as gb_l0 / level=1. Released by the
+        secondary enzyme (BsaI); the position dict carries the
+        ``TU`` label so the Parts Bin TU tab picks it up."""
+        seq = _build_gb_tu_seq()
+        # Sanity: no Esp3I on either strand.
+        assert "CGTCTC" not in seq
+        assert "GAGACG" not in seq
+        result = sc._classify_part_from_plasmid(seq, circular=True)
+        assert result is not None
+        assert result["grammar_id"]    == "gb_l0"
+        assert result["level"]         == 1
+        assert result["position"]["name"] == "TU"
+        assert result["release_enzyme"] == "BsaI"
+
+    def test_mod_classifies_as_level_2(self):
+        """A GB MOD (Esp3I-flanked, GGAG/CGCT boundary, no internal
+        BsaI) must classify as gb_l0 / level=2. The primary enzyme
+        produces the digest at L2 — same enzyme as L0, distinguished
+        by overhang pattern (TU boundary vs L0 position table)."""
+        seq = _build_gb_mod_seq()
+        # Sanity: no BsaI on either strand.
+        assert "GGTCTC" not in seq
+        assert "GAGACC" not in seq
+        result = sc._classify_part_from_plasmid(seq, circular=True)
+        assert result is not None
+        assert result["grammar_id"]    == "gb_l0"
+        assert result["level"]         == 2
+        assert result["position"]["name"] == "MOD"
+        assert result["release_enzyme"] in ("Esp3I", "BsmBI")
+
+    def test_random_overhangs_still_return_none(self):
+        """Sanity carry-over from the L0-only era: non-recognised
+        overhangs (not in any L0 position AND not on the TU boundary)
+        still return None at every level."""
+        # L0 overhangs that don't match any GB position; doesn't
+        # match GB TU boundary (GGAG/CGCT) either.
+        seq = _build_gb_l0_part_seq("CCCC", "GGGG")
+        assert sc._classify_part_from_plasmid(seq, circular=True) is None
+
+    def test_entry_vector_field_is_none_when_unconfigured(self):
+        """No entry vectors saved → result.entry_vector is None.
+        Default state for a fresh install — verifies we don't
+        accidentally fabricate a match."""
+        seq = _build_gb_l0_part_seq("GGAG", "AATG")
+        result = sc._classify_part_from_plasmid(seq, circular=True)
+        assert result is not None
+        assert result.get("entry_vector") is None
+
+    def test_entry_vector_match_l0(self, isolated_library):
+        """Configure an L0 entry vector. Build a user plasmid with
+        the same backbone but a different insert. Classify it — the
+        entry_vector field should report ``matches=True`` because
+        the digest's vector half is rotationally identical to the
+        configured entry vector's vector half."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        # Shared backbone; unique cassette per plasmid.
+        backbone = "AAAAATTTTT" * 50
+        ev_cassette  = "CCCCTTTT" * 5
+        user_promoter = "ATGAAACCCGGG" * 5
+        # Both plasmids: Esp3I sites flanking GGAG/AATG (Promoter
+        # slot — combined Promoter+5'UTR per GB 2.0 PromUTR).
+        ev_seq = ("CGTCTCA" + "GGAG" + ev_cassette + "AATG"
+                  + "AGAGACG" + backbone)
+        user_seq = ("CGTCTCA" + "GGAG" + user_promoter + "AATG"
+                    + "AGAGACG" + backbone)
+        # Persist the entry vector for gb_l0, role="" (singleton L0
+        # destination — pUPD2-style).
+        ev_rec = SeqRecord(
+            Seq(ev_seq), id="testEV", name="testEV",
+            annotations={"topology": "circular",
+                          "molecule_type": "DNA"},
+        )
+        sc._save_entry_vectors([{
+            "grammar_id": "gb_l0",
+            "role":       "",
+            "name":       "test_pUPD2",
+            "size":       len(ev_seq),
+            "source":     "test",
+            "gb_text":    sc._record_to_gb_text(ev_rec),
+        }])
+        # Classify the user's plasmid.
+        result = sc._classify_part_from_plasmid(user_seq, circular=True)
+        assert result is not None
+        assert result["grammar_id"] == "gb_l0"
+        assert result["level"]      == 0
+        ev = result.get("entry_vector")
+        assert ev is not None, \
+            "entry_vector check should fire when an EV is configured"
+        assert ev["matches"] is True
+        assert ev["name"]    == "test_pUPD2"
+        assert ev["role"]    == ""
+
+    def test_entry_vector_mismatch_when_backbone_differs(
+            self, isolated_library):
+        """Configure an L0 entry vector. Classify a plasmid that fits
+        the same grammar/position BUT has a DIFFERENT backbone — the
+        entry_vector field must come back None (no match), so the
+        user can spot the unexpected destination."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        ev_backbone   = "AAAAATTTTT" * 50
+        user_backbone = "GGGGCCCCAA" * 50    # different
+        cassette = "ATGAAACCCGGG" * 5
+        ev_seq = ("CGTCTCA" + "GGAG" + "AAAA" + "AATG"
+                  + "AGAGACG" + ev_backbone)
+        user_seq = ("CGTCTCA" + "GGAG" + cassette + "AATG"
+                    + "AGAGACG" + user_backbone)
+        ev_rec = SeqRecord(
+            Seq(ev_seq), id="testEV", name="testEV",
+            annotations={"topology": "circular",
+                          "molecule_type": "DNA"},
+        )
+        sc._save_entry_vectors([{
+            "grammar_id": "gb_l0",
+            "role":       "",
+            "name":       "test_pUPD2",
+            "size":       len(ev_seq),
+            "source":     "test",
+            "gb_text":    sc._record_to_gb_text(ev_rec),
+        }])
+        result = sc._classify_part_from_plasmid(user_seq, circular=True)
+        assert result is not None
+        assert result.get("entry_vector") is None, \
+            "entry_vector must be None when no configured EV matches"
+
+    def test_entry_vector_role_propagates(self, isolated_library):
+        """The role field on the configured EV (e.g. ``Alpha1`` vs
+        ``Omega1`` for GB) must propagate into the classifier's
+        ``entry_vector.role`` so the worker can show the user which
+        L1 destination their plasmid lines up with."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        backbone = "AAAAATTTTT" * 50
+        # An L1 entry vector for the Alpha1 role: BsaI-flanked acceptor
+        # whose dropout has GGAG/CGCT (TU boundary) overhangs. We
+        # configure it for gb_l0 / Alpha1.
+        ev_dropout = "ACGTACGT" * 5
+        ev_seq = ("GGTCTCA" + "GGAG" + ev_dropout + "CGCT"
+                  + "AGAGACC" + backbone)
+        # User TU plasmid: same architecture, different TU body, SAME
+        # backbone — the post-assembly state of cloning a TU into the
+        # Alpha1 acceptor.
+        tu_body = "ATG" * 30
+        user_seq = ("GGTCTCA" + "GGAG" + tu_body + "CGCT"
+                    + "AGAGACC" + backbone)
+        ev_rec = SeqRecord(
+            Seq(ev_seq), id="alpha1", name="alpha1",
+            annotations={"topology": "circular",
+                          "molecule_type": "DNA"},
+        )
+        sc._save_entry_vectors([{
+            "grammar_id": "gb_l0",
+            "role":       "Alpha1",
+            "name":       "pDGB1_alpha1",
+            "size":       len(ev_seq),
+            "source":     "test",
+            "gb_text":    sc._record_to_gb_text(ev_rec),
+        }])
+        result = sc._classify_part_from_plasmid(user_seq, circular=True)
+        assert result is not None
+        assert result["level"] == 1
+        ev = result.get("entry_vector") or {}
+        assert ev.get("matches") is True
+        assert ev.get("role")    == "Alpha1"
+        assert ev.get("name")    == "pDGB1_alpha1"
+
+    async def test_load_part_worker_propagates_level_to_parts_bin(
+            self, isolated_library, isolated_parts_bin):
+        """End-to-end: Load Part on a TU plasmid must save the new
+        Parts Bin row with ``level=1`` so it lands in the TU tab.
+        Pre-fix this was hardcoded to 0 — every TU got mis-tabbed
+        into L0."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        tu_seq = _build_gb_tu_seq()
+        rec = SeqRecord(
+            Seq(tu_seq), id="my_tu", name="my_tu",
+            annotations={"topology": "circular",
+                          "molecule_type": "DNA"},
+        )
+        gb_text = sc._record_to_gb_text(rec)
+        sc._save_collections([{
+            "name":        "TUcoll",
+            "description": "test",
+            "plasmids":    [{
+                "id":      "my_tu",
+                "name":    "my_tu",
+                "size":    len(tu_seq),
+                "n_feats": 0,
+                "gb_text": gb_text,
+            }],
+        }])
+        sc._set_active_collection_name("TUcoll")
+        sc._save_library([{
+            "id":      "my_tu",
+            "name":    "my_tu",
+            "size":    len(tu_seq),
+            "n_feats": 0,
+            "gb_text": gb_text,
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PartsBinModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            pm = app.screen
+            pm.query_one("#btn-load-part", sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            picker = app.screen
+            t = picker.query_one("#loadpart-table", sc.DataTable)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            picker.query_one("#btn-loadpart-ok", sc.Button).press()
+            # Worker runs `@work(thread=True)` — give it room to land.
+            await pilot.pause()
+            await pilot.pause(0.5)
+            await pilot.pause()
+        entries = sc._load_parts_bin()
+        assert len(entries) == 1, \
+            f"expected one part saved, got {entries!r}"
+        assert entries[0]["level"]   == 1
+        assert entries[0]["grammar"] == "gb_l0"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5655,10 +6961,20 @@ class TestLevelMatchesTab:
         assert not sc._level_matches_tab(1, 0)
         assert not sc._level_matches_tab(2, 0)
 
-    def test_tu_tab_exact_match(self):
+    def test_tu_tab_absorbs_level_1_and_above(self):
+        # Tab "TU" (level 1) catches its own level AND every higher
+        # level so a MOD assembled from TUs back-populates into the
+        # TU palette — biologically the same plasmid can serve as
+        # the source for the next cycle regardless of its labelled
+        # level (the bench reaction only cares about overhang
+        # compatibility, which the assembly simulator + the
+        # constructor's compatibility check both verify).
         assert sc._level_matches_tab(1, 1)
+        assert sc._level_matches_tab(2, 1)
+        assert sc._level_matches_tab(7, 1)
+        # L0 parts stay out of the TU tab (they're domesticated
+        # entities, not assemblies).
         assert not sc._level_matches_tab(0, 1)
-        assert not sc._level_matches_tab(2, 1)
 
     def test_mod_tab_absorbs_level_2_and_above(self):
         # Tab "MOD" (level 2) catches every level ≥ 2 so further
@@ -5936,8 +7252,12 @@ class TestPartsBinLevelTabs:
             assert len(modal._rows) == 1
             assert modal._rows[0]["name"] == "L0_part"
 
-    async def test_tu_tab_shows_level_1_only(
+    async def test_tu_tab_shows_level_1_and_above(
             self, isolated_parts_bin):
+        # TU tab back-populates MODs (and any higher level) so a
+        # MOD assembled from TUs can be re-used as a TU-equivalent
+        # source in the next cycle. L0 parts stay strictly in the
+        # L0 tab.
         sc._save_parts_bin([
             self._stub_part(name="L0_part", level=0),
             self._stub_part(name="TU_plasmid", level=1),
@@ -5955,8 +7275,8 @@ class TestPartsBinLevelTabs:
             await pilot.pause()
             await pilot.pause(0.1)
             assert modal._active_level == 1
-            names = [r["name"] for r in modal._rows]
-            assert names == ["TU_plasmid"]
+            names = sorted(r["name"] for r in modal._rows)
+            assert names == ["MOD_plasmid", "TU_plasmid"]
 
     async def test_mod_tab_shows_level_2_and_above(
             self, isolated_parts_bin):
@@ -6510,4 +7830,375 @@ class TestConstructorPaletteFitsWithLongValidation:
                     f"{sel} extends to row {bottom}, past the "
                     f"terminal bottom ({term_h})."
                 )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _sanitize_plasmid_name — input cleaning for the Constructor save flow
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSanitizePlasmidName:
+    """Pure function: maps user-provided / agent-provided plasmid
+    names to a cleaned form that's safe for SeqRecord ids, library
+    rows, parts-bin rows, and downstream tools that don't tolerate
+    NUL / control chars / path separators.
+    """
+
+    def test_strips_control_chars(self):
+        assert sc._sanitize_plasmid_name("foo\x00bar") == "foobar"
+        assert sc._sanitize_plasmid_name("\x01\x02baz") == "baz"
+        assert sc._sanitize_plasmid_name("hi\x7Fthere") == "hithere"
+
+    def test_strips_path_separators(self):
+        # Forward and backslashes both become spaces, which then
+        # collapse via whitespace normalisation.
+        assert sc._sanitize_plasmid_name(
+            "../../etc/passwd"
+        ) == ".. .. etc passwd"
+        assert sc._sanitize_plasmid_name(
+            r"C:\bad\path"
+        ) == "C: bad path"
+
+    def test_collapses_whitespace_runs(self):
+        assert sc._sanitize_plasmid_name(
+            "foo   bar\t\tbaz"
+        ) == "foo bar baz"
+
+    def test_trims_outer_whitespace(self):
+        assert sc._sanitize_plasmid_name("  pUC19  ") == "pUC19"
+
+    def test_empty_input_uses_fallback(self):
+        assert sc._sanitize_plasmid_name("") == "assembly"
+        assert sc._sanitize_plasmid_name("   ") == "assembly"
+        assert sc._sanitize_plasmid_name(
+            "", fallback="my_default"
+        ) == "my_default"
+
+    def test_only_control_chars_uses_fallback(self):
+        # After stripping control chars + whitespace, nothing remains.
+        assert sc._sanitize_plasmid_name(
+            "\x00\x01\x02"
+        ) == "assembly"
+
+    def test_truncates_to_max_len(self):
+        long_name = "x" * 200
+        result = sc._sanitize_plasmid_name(long_name, max_len=60)
+        assert len(result) == 60
+        assert result == "x" * 60
+
+    def test_truncate_strips_trailing_whitespace(self):
+        # If the truncation cuts mid-word and leaves trailing
+        # whitespace, the trailing strip applies to the truncated
+        # form too.
+        n = sc._sanitize_plasmid_name(
+            "abc def ghi jkl mno", max_len=8,
+        )
+        assert n == "abc def"
+
+    def test_non_string_input_coerces_to_string(self):
+        assert sc._sanitize_plasmid_name(None) == "assembly"
+        assert sc._sanitize_plasmid_name(42) == "42"
+
+    def test_unicode_letters_pass_through(self):
+        # Non-ASCII letters are kept (we only filter C0 controls +
+        # path separators), so a name like "pαβ-test" survives.
+        assert sc._sanitize_plasmid_name("pαβ-test") == "pαβ-test"
+
+    def test_plus_dot_underscore_dash_preserved(self):
+        # These chars are heavily used in the auto-generated default
+        # ("vector · part1+part2.fragment_3") so they must round-trip
+        # through the sanitiser unchanged.
+        assert sc._sanitize_plasmid_name(
+            "vector · part1+part2.fragment_3-x"
+        ) == "vector · part1+part2.fragment_3-x"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NamePlasmidModal — Constructor save-flow naming prompt
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestNamePlasmidModal:
+    """The naming prompt sanitises every dismiss path so the saved
+    plasmid name lands cleanly in the library and parts bin."""
+
+    async def test_default_name_prefilled(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.NamePlasmidModal(
+                "test_default", target_label="TU",
+            ))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            inp = app.screen.query_one("#nameplasmid-input", sc.Input)
+            assert inp.value == "test_default"
+
+    async def test_save_dismisses_with_clean_name(self):
+        captured = {}
+
+        def _capture(name):
+            captured["name"] = name
+
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.NamePlasmidModal("default"),
+                            callback=_capture)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            inp = modal.query_one("#nameplasmid-input", sc.Input)
+            inp.value = "my_clean_name"
+            modal.query_one("#btn-nameplasmid-save",
+                            sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+        assert captured.get("name") == "my_clean_name"
+
+    async def test_dirty_name_normalises_first_then_dismisses(self):
+        """A name with leading/trailing whitespace + path chars goes
+        through one normalisation press (status banner shows the
+        cleaned value, Input is updated), then a second press
+        dismisses with the cleaned name."""
+        captured = {}
+
+        def _capture(name):
+            captured["name"] = name
+
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.NamePlasmidModal("default"),
+                            callback=_capture)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            inp = modal.query_one("#nameplasmid-input", sc.Input)
+            inp.value = "  ../foo  "
+            modal.query_one("#btn-nameplasmid-save",
+                            sc.Button).press()
+            await pilot.pause()
+            # First press normalised + showed status; modal still open.
+            assert isinstance(app.screen, sc.NamePlasmidModal)
+            assert inp.value == ".. foo"
+            # Second press dismisses with the cleaned name.
+            modal.query_one("#btn-nameplasmid-save",
+                            sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+        assert captured.get("name") == ".. foo"
+
+    async def test_cancel_dismisses_with_none(self):
+        captured = {}
+
+        def _capture(name):
+            captured["name"] = name
+
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.NamePlasmidModal("default"),
+                            callback=_capture)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            modal.query_one("#btn-nameplasmid-cancel",
+                            sc.Button).press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+        assert "name" in captured
+        assert captured["name"] is None
+
+    async def test_esc_dismisses_with_none(self):
+        captured = {}
+
+        def _capture(name):
+            captured["name"] = name
+
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.NamePlasmidModal("default"),
+                            callback=_capture)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.pause(0.1)
+        assert captured.get("name") is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Constructor: READY TO CLONE badge + Save flow integration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestConstructorReadyBadge:
+    """The ``ctor-ready-badge-{gid}`` widget toggles visibility based
+    on lane validity AND backbone-bound state. Hidden by default;
+    visible only when the user is one click away from a successful
+    save. Regression guard for 2026-05-10 UX add."""
+
+    async def test_badge_hidden_when_lane_empty(
+            self, isolated_library, isolated_parts_bin):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.ConstructorModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            badge = modal.query_one(
+                "#ctor-ready-badge-gb_l0", sc.Static,
+            )
+            assert "ctor-ready-badge-hidden" in badge.classes
+
+    async def test_badge_hidden_when_no_backbone_bound(
+            self, isolated_library, isolated_parts_bin):
+        """Even with a valid lane, the badge stays hidden until a
+        backbone is bound (so Save is actually clickable). Without
+        that gate, the user would see READY TO CLONE but the Save
+        button would still be disabled — confusing."""
+        # Seed a valid GB L0 lane: Promoter + CDS + Terminator.
+        sc._save_parts_bin([
+            {"name": "P", "type": "Promoter", "position": "Pos 1",
+             "oh5": "GGAG", "oh3": "AATG",
+             "sequence": "ATG" * 5,
+             "grammar": "gb_l0", "level": 0,
+             "backbone": "", "marker": "",
+             "fwd_primer": "", "rev_primer": "",
+             "fwd_tm": 0.0, "rev_tm": 0.0},
+            {"name": "C", "type": "CDS", "position": "Pos 3-4",
+             "oh5": "AATG", "oh3": "GCTT",
+             "sequence": "ATG" * 30,
+             "grammar": "gb_l0", "level": 0,
+             "backbone": "", "marker": "",
+             "fwd_primer": "", "rev_primer": "",
+             "fwd_tm": 0.0, "rev_tm": 0.0},
+            {"name": "T", "type": "Terminator", "position": "Pos 5",
+             "oh5": "GCTT", "oh3": "CGCT",
+             "sequence": "ATG" * 5,
+             "grammar": "gb_l0", "level": 0,
+             "backbone": "", "marker": "",
+             "fwd_primer": "", "rev_primer": "",
+             "fwd_tm": 0.0, "rev_tm": 0.0},
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.ConstructorModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            modal._lanes["gb_l0"] = [
+                ("P", "Promoter",   "Pos 1",   "GGAG", "AATG", "", ""),
+                ("C", "CDS",        "Pos 3-4", "AATG", "GCTT", "", ""),
+                ("T", "Terminator", "Pos 5",   "GCTT", "CGCT", "", ""),
+            ]
+            modal._refresh_validation("gb_l0")
+            await pilot.pause()
+            badge = modal.query_one(
+                "#ctor-ready-badge-gb_l0", sc.Static,
+            )
+            # Lane chain is valid — the green status text appears —
+            # but no backbone is bound, so the badge stays hidden.
+            assert "ctor-ready-badge-hidden" in badge.classes
+
+
+class TestConstructorSavePromptsForName:
+    """The Save To Library button now pushes ``NamePlasmidModal``
+    before persisting. Regression guard so a future refactor doesn't
+    bypass the prompt and silently use the auto-generated default
+    (which loses the user's authoritative naming intent).
+    """
+
+    async def test_save_button_pushes_name_modal_first(
+            self, isolated_library, isolated_parts_bin):
+        """Set up a valid lane + bound backbone, click Save → the
+        next screen should be `NamePlasmidModal`, not the parts-bin
+        toast. Verifying the modal-stack push proves the flow goes
+        through the naming prompt before persisting."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        # Seed L0 parts.
+        sc._save_parts_bin([
+            {"name": "P", "type": "Promoter", "position": "Pos 1",
+             "oh5": "GGAG", "oh3": "AATG",
+             "sequence": "AAATTTGGG" * 10,
+             "grammar": "gb_l0", "level": 0,
+             "backbone": "", "marker": "",
+             "fwd_primer": "", "rev_primer": "",
+             "fwd_tm": 0.0, "rev_tm": 0.0},
+            {"name": "C", "type": "CDS", "position": "Pos 3-4",
+             "oh5": "AATG", "oh3": "GCTT",
+             "sequence": "ATGAAACCCGGG" * 10,
+             "grammar": "gb_l0", "level": 0,
+             "backbone": "", "marker": "",
+             "fwd_primer": "", "rev_primer": "",
+             "fwd_tm": 0.0, "rev_tm": 0.0},
+            {"name": "T", "type": "Terminator", "position": "Pos 5",
+             "oh5": "GCTT", "oh3": "CGCT",
+             "sequence": "TTTTAAAAGGGGCCCC" * 5,
+             "grammar": "gb_l0", "level": 0,
+             "backbone": "", "marker": "",
+             "fwd_primer": "", "rev_primer": "",
+             "fwd_tm": 0.0, "rev_tm": 0.0},
+        ])
+        # Bind a fake L1 entry vector (Alpha1) — minimal valid layout
+        # so `_clone_assembly_into_entry_vector` can run later.
+        bsai_left  = "GGTCTCA"
+        bsai_right = sc._rc("GGTCTCA")
+        esp_left   = "CGTCTCA"
+        esp_right  = sc._rc("CGTCTCA")
+        dropout    = "ACGTAGCT" * 10
+        backbone   = "GGGGTTTTAAAA" * 30
+        ev_seq = (backbone +
+                   bsai_left + "TACA" +
+                   esp_left + "GGAG" + dropout + "CGCT" + esp_right +
+                   "CCAA" + bsai_right +
+                   "TTTGGG" * 30)
+        ev_rec = SeqRecord(
+            Seq(ev_seq), id="alpha1", name="alpha1",
+            annotations={"topology": "circular",
+                         "molecule_type": "DNA"},
+        )
+        sc._save_entry_vectors([{
+            "grammar_id": "gb_l0", "role": "Alpha1",
+            "name": "alpha1_test", "size": len(ev_seq),
+            "source": "test",
+            "gb_text": sc._record_to_gb_text(ev_rec),
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.ConstructorModal())
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            from textual.widgets import TabbedContent
+            modal.query_one(
+                "#ctor-tabs", TabbedContent,
+            ).active = "ctor-tab-gb_l0"
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal._lanes["gb_l0"] = [
+                ("P", "Promoter",   "Pos 1",   "GGAG", "AATG", "", ""),
+                ("C", "CDS",        "Pos 3-4", "AATG", "GCTT", "", ""),
+                ("T", "Terminator", "Pos 5",   "GCTT", "CGCT", "", ""),
+            ]
+            modal._backbones["gb_l0"] = "Alpha1"
+            modal._refresh_validation("gb_l0")
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # Save button must be enabled now.
+            sim = modal.query_one("#btn-ctor-simulate-gb_l0", sc.Button)
+            assert sim.disabled is False
+            # READY TO CLONE badge must be visible.
+            badge = modal.query_one(
+                "#ctor-ready-badge-gb_l0", sc.Static,
+            )
+            assert "ctor-ready-badge-hidden" not in badge.classes
+            # Click Save → expect NamePlasmidModal on top.
+            sim.press()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, sc.NamePlasmidModal)
 

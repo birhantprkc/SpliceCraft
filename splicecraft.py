@@ -581,6 +581,22 @@ def _migrate_entries(entries: list,
     return out, warnings
 
 
+# Per-path observed schema versions. When `_safe_load_json` reads a
+# file written by a newer SpliceCraft (schema_version > current), we
+# stash the observed version here keyed by the file path so the next
+# `_safe_save_json` for the same path preserves it on disk rather than
+# demoting the stamp. Without this, the save path would unconditionally
+# write `_CURRENT_SCHEMA_VERSION`, demoting a v2 file to v1 stamp the
+# moment the user makes any edit — a future v2 splicecraft would then
+# run the v1→v2 migrator over fields that were already v2, double-
+# migrating.
+#
+# Keyed by absolute path string (not label) so two files sharing a
+# label in a test still get independent stamps — and so the same
+# load-then-save cycle naturally targets the same key.
+_OBSERVED_SCHEMA_VERSIONS: "dict[str, int]" = {}
+
+
 def _extract_entries(raw, label: str) -> "tuple[list | None, str | None]":
     """Return (entries, warning) from a parsed-JSON payload.
 
@@ -590,7 +606,8 @@ def _extract_entries(raw, label: str) -> "tuple[list | None, str | None]":
 
     Forward-compat: a higher schema_version loads with a warning (entries
     flow through unchanged; deepcopy preserves unknown fields across a
-    save round-trip).
+    save round-trip). The observed version is recorded so the next save
+    for the same label preserves it on disk.
     Backward-compat: a lower schema_version is funnelled through the
     `_migrate_entries` registry so every consumer sees the current shape.
     """
@@ -607,8 +624,11 @@ def _extract_entries(raw, label: str) -> "tuple[list | None, str | None]":
         entries_raw = list(raw["entries"])
         if version is not None and isinstance(version, int) and \
                 version > _CURRENT_SCHEMA_VERSION:
-            # Written by a newer SpliceCraft. Load the entries but warn so
-            # the user knows fields may be silently dropped on re-save.
+            # Written by a newer SpliceCraft. Load the entries but warn
+            # so the user knows fields may be silently dropped on
+            # re-save. The version recording happens in
+            # `_safe_load_json` where the path is available — keying
+            # the registry by path is more accurate than by label.
             return entries_raw, (
                 f"{label} was written by a newer SpliceCraft "
                 f"(schema v{version} > v{_CURRENT_SCHEMA_VERSION}) — some "
@@ -628,11 +648,106 @@ def _extract_entries(raw, label: str) -> "tuple[list | None, str | None]":
     return None, f"{label}: unexpected JSON shape ({type(raw).__name__})"
 
 
+def _safe_file_size_check(path: Path, max_bytes: int, label: str
+                            ) -> "tuple[bool, str | None]":
+    """Verify that `path` is a regular file (not symlink / FIFO /
+    device) AND that its size is ≤ `max_bytes`. Returns
+    `(ok, reason_if_not)`.
+
+    `path.stat()` follows symlinks; a symlink → `/dev/zero` reports
+    `st_size=0`, passes the byte cap, then a subsequent read consumes
+    RAM until the OS kills the worker. `lstat` + `S_ISREG` rejects
+    those up front. FIFOs / character devices / sockets also report
+    `st_size=0` and are similarly hostile; the same `S_ISREG` check
+    catches them.
+
+    Returns `(False, reason)` on any of:
+      * path doesn't exist
+      * path is a symlink (regardless of target)
+      * path is not a regular file (FIFO / device / socket / dir)
+      * file size > max_bytes
+    """
+    import os, stat
+    try:
+        st = os.lstat(str(path))
+    except OSError as exc:
+        return False, f"{label} could not stat: {exc}"
+    mode = st.st_mode
+    if stat.S_ISLNK(mode):
+        return False, (
+            f"{label} is a symlink — refusing for safety "
+            f"(symlinks to character devices report 0 bytes and OOM "
+            f"on read)"
+        )
+    if not stat.S_ISREG(mode):
+        return False, f"{label} is not a regular file (mode {oct(mode)})"
+    if st.st_size > max_bytes:
+        return False, (
+            f"{label} file is {st.st_size:,} bytes (cap "
+            f"{max_bytes:,}); refusing to load"
+        )
+    return True, None
+
+
+def _notify_save_failure(app, label: str, exc: BaseException,
+                          *, severity: str = "error") -> None:
+    """Surface a save failure to the user via the app's notify channel.
+    Wraps every `_save_*` call site that needs to recover gracefully
+    when disk-full / RO-mount / EACCES bubbles out of `_safe_save_json`.
+
+    Per sacred invariant #7, `_safe_save_json` re-raises on failure so
+    callers can notify; this helper makes the notify pattern uniform
+    rather than each call site composing its own message.
+
+    `app` may be `None` (test contexts that don't run an App). Falls
+    back to logging only.
+    """
+    _log.exception("Save failed for %s", label)
+    msg = f"{label} save failed: {exc}"
+    if app is None:
+        return
+    try:
+        app.notify(msg, severity=severity, timeout=12)
+    except Exception:
+        # If notify itself fails (no app, no screen mounted yet) we've
+        # already logged via _log.exception — that's enough.
+        pass
+
+
+def _fsync_parent_dir(path: Path) -> None:
+    """Fsync `path.parent` so the rename's directory entry update is
+    journalled. `os.replace` is atomic for the *inode* on POSIX, but
+    the directory entry change is journalled separately — a power loss
+    between the rename and the parent-dir flush can leave the inode
+    containing the new data while the directory entry still points at
+    the OLD inode after fsck. Linux-only (Windows doesn't expose
+    directory fsync; opening a directory for fsync fails). Best-effort:
+    failures are silently swallowed because they're informational —
+    the rename has already succeeded."""
+    import os
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+
+
 def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
     """Atomically write *text* to *path* via ``tempfile`` + ``os.replace``.
 
     Guarantees: a concurrent crash leaves either the previous file intact
-    or the new file in place — never a partial write. Callers that need
+    or the new file in place — never a partial write. The parent
+    directory is also fsynced after the rename so the directory entry
+    change is journalled (see `_fsync_parent_dir`). Callers that need
     a ``.bak`` should use :func:`_safe_save_json` instead (it layers the
     envelope, shrink-guard, and schema handling on top of this).
     """
@@ -651,6 +766,7 @@ def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
             except OSError:
                 pass
         os.replace(tmp, str(path))
+        _fsync_parent_dir(path)
     except Exception:
         try:
             os.unlink(tmp)
@@ -768,7 +884,7 @@ def _diff_lost_entries(prev_entries: list, new_entries: list) -> list:
 
 
 def _safe_save_json(path: Path, entries: list, label: str,
-                    schema_version: int = _CURRENT_SCHEMA_VERSION) -> None:
+                    schema_version: "int | None" = None) -> None:
     """Atomically write `entries` as JSON to `path`, backing up first.
 
     Writes the envelope format `{"_schema_version": N, "entries": [...]}`.
@@ -795,6 +911,16 @@ def _safe_save_json(path: Path, entries: list, label: str,
     """
     import os
     import tempfile
+
+    # Schema-version stamp: preserve the highest observed version for
+    # this file. A file written by a newer SpliceCraft (recorded via
+    # `_OBSERVED_SCHEMA_VERSIONS` from `_safe_load_json`) must stamp
+    # back with that higher version so a v2 file edited under a v1
+    # binary doesn't demote to v1 on save (which would re-trigger the
+    # v1→v2 migrator next time a v2 binary opens it, double-migrating).
+    if schema_version is None:
+        observed = _OBSERVED_SCHEMA_VERSIONS.get(str(path), 0)
+        schema_version = max(_CURRENT_SCHEMA_VERSION, observed)
 
     # OVERSIZE GUARD (sacred invariant — DO NOT BYPASS).
     #
@@ -910,6 +1036,13 @@ def _safe_save_json(path: Path, entries: list, label: str,
                 except OSError:
                     pass
             os.replace(tmp_name, str(path))
+            # Fsync the parent directory so the rename's directory entry
+            # update is journalled — see `_fsync_parent_dir`. Pre-fix
+            # `_safe_save_json` skipped this, leaving the
+            # rename-then-power-loss window where the inode held the new
+            # data but the directory entry still pointed at the OLD inode
+            # after fsck.
+            _fsync_parent_dir(path)
             _log.info("Saved %s: %d entries to %s (schema v%d)",
                       label, len(entries), path, schema_version)
         except Exception:
@@ -952,6 +1085,15 @@ _SNAPSHOT_RETENTION_DAYS = 30
 # available via `_safe_save_json`'s .bak rotation (last 10 generations)
 # and the pre-update snapshot system (last 5 update points).
 _SNAPSHOT_FILE_SIZE_CAP  = 50 * 1024 * 1024  # 50 MB
+# Aggregate cap across the entire snapshots directory. Per-file cap
+# alone allows 4 files × 49 MB × 30 days = ~5.9 GB of accumulated
+# snapshots. The aggregate cap drops the oldest snapshots until total
+# usage falls below this ceiling; nothing structural is lost because
+# the `.bak` rotation (per-file, 10 generations) covers recent rollback
+# and the pre-update snapshots cover upgrade rollback. Date-based
+# retention runs first; the aggregate cap is the last-line defense
+# for genuinely-heavy users.
+_SNAPSHOT_TOTAL_SIZE_CAP = 500 * 1024 * 1024  # 500 MB
 
 
 def _snapshot_data_files(data_dir: Path,
@@ -1053,6 +1195,56 @@ def _prune_old_snapshots(snap_dir: Path,
                 snap.unlink()
             except OSError:
                 _log.debug("Could not prune old snapshot %s", snap)
+
+    # Aggregate-size cap: after date-based pruning, if the directory
+    # still exceeds `_SNAPSHOT_TOTAL_SIZE_CAP`, drop the oldest
+    # remaining snapshots until usage falls below the cap. Files are
+    # ranked by their embedded date (oldest first); a file with an
+    # unparseable date is treated as oldest and is removed before any
+    # dated file. Pre-fix the snapshot dir had no aggregate ceiling —
+    # 4 files × 49 MB × 30 days could grow to ~5.9 GB.
+    try:
+        survivors = [s for s in snap_dir.iterdir() if s.is_file()]
+    except OSError:
+        return
+    total = 0
+    sized: list[tuple[int, "_date | None", Path]] = []
+    for s in survivors:
+        try:
+            sz = s.stat().st_size
+        except OSError:
+            continue
+        total += sz
+        m = date_re.search(s.stem)
+        if m is None:
+            sized.append((sz, None, s))
+        else:
+            try:
+                sized.append(
+                    (sz,
+                     _date(int(m.group(1)), int(m.group(2)),
+                            int(m.group(3))),
+                     s),
+                )
+            except ValueError:
+                sized.append((sz, None, s))
+    if total <= _SNAPSHOT_TOTAL_SIZE_CAP:
+        return
+    # Oldest-first sort: undated files first, then ascending by date.
+    sized.sort(key=lambda t: (t[1] is not None,
+                                t[1] or _date.min))
+    for sz, _d, snap in sized:
+        if total <= _SNAPSHOT_TOTAL_SIZE_CAP:
+            break
+        try:
+            snap.unlink()
+            total -= sz
+            _log.info(
+                "Pruned snapshot %s (%d bytes) — aggregate cap",
+                snap.name, sz,
+            )
+        except OSError:
+            _log.debug("Could not prune snapshot %s", snap)
 
 
 # ── Backup discovery + restore ──────────────────────────────────────────────
@@ -1201,17 +1393,16 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
     if not path.exists():
         return [], None
 
-    # Size cap — refuse to even read a multi-GB file. Stat is cheap.
-    try:
-        size = path.stat().st_size
-    except OSError as exc:
-        _log.warning("Could not stat %s for %s: %s", path, label, exc)
-        size = 0
-    if size > _SAFE_LOAD_JSON_MAX_BYTES:
-        warn = (f"{label} file is {size:,} bytes "
-                f"(cap {_SAFE_LOAD_JSON_MAX_BYTES:,}); refusing to load")
-        _log.warning(warn)
-        return [], warn
+    # Size cap + symlink rejection — refuse to read multi-GB files
+    # and refuse to follow symlinks (a symlink → /dev/zero reports
+    # 0 bytes through `path.stat()` and a subsequent read would
+    # consume RAM until the kernel OOM-killed us).
+    ok, reason = _safe_file_size_check(
+        path, _SAFE_LOAD_JSON_MAX_BYTES, label,
+    )
+    if not ok:
+        _log.warning("%s: %s", path, reason)
+        return [], reason
 
     # Try the main file
     main_warning: "str | None" = None
@@ -1219,6 +1410,15 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
         raw = json.loads(path.read_text(encoding="utf-8"))
         entries, shape_warn = _extract_entries(raw, label)
         if entries is not None:
+            # If this file was written by a newer SpliceCraft, stash
+            # the observed schema version keyed by absolute path so
+            # the next save preserves it (no schema-stamp demotion on
+            # downgrade-then-edit round trips). The version is on the
+            # envelope; pull it out here so we don't need to re-parse.
+            if isinstance(raw, dict):
+                v = raw.get("_schema_version")
+                if isinstance(v, int) and v > _CURRENT_SCHEMA_VERSION:
+                    _OBSERVED_SCHEMA_VERSIONS[str(path)] = v
             return entries, shape_warn
         _log.warning("%s: %s", path, shape_warn)
         main_warning = shape_warn
@@ -1369,6 +1569,29 @@ class DataDirLockError(RuntimeError):
     message verbatim."""
 
 
+def _pid_alive(pid: int) -> bool:
+    """Best-effort liveness check for `pid`. POSIX: `kill(pid, 0)`
+    returns silently if the pid is live, raises ProcessLookupError if
+    not, raises PermissionError if alive-but-foreign-user (which counts
+    as live for our purposes). Windows: assume live (the staleness
+    retry on Windows is a no-op anyway, msvcrt.locking releases on
+    process death). Returns True on any uncertainty so a false-positive
+    "stale" never causes us to forcibly take a live lock."""
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+
+
 def _acquire_data_dir_lock(
     data_dir: "Path | None" = None,
     lockfile_override: "Path | None" = None,
@@ -1388,6 +1611,15 @@ def _acquire_data_dir_lock(
     if os.environ.get("SPLICECRAFT_SKIP_LOCK", "").strip().lower() in (
         "1", "true", "yes"
     ):
+        # Warn loudly so the bypass surfaces in the diagnostic bundle —
+        # a user who set this for a one-off troubleshooting session
+        # months ago and forgot would otherwise be silently running
+        # concurrent splicecrafts, each clobbering the other's caches.
+        _log.warning(
+            "SPLICECRAFT_SKIP_LOCK enabled — concurrent splicecraft "
+            "instances may corrupt the library cache. Unset the env "
+            "var if you didn't set it on purpose."
+        )
         return None, None
 
     target_dir = data_dir if data_dir is not None else _DATA_DIR
@@ -1401,6 +1633,7 @@ def _acquire_data_dir_lock(
     fd = os.open(str(lockfile), os.O_CREAT | os.O_RDWR, 0o600)
 
     held_by: "str | None" = None
+    held_by_pid: "int | None" = None
     locked = False
     try:
         if sys.platform == "win32":
@@ -1433,34 +1666,69 @@ def _acquire_data_dir_lock(
                 pass
 
         if not locked:
-            # Best-effort PID readout from the holder.
+            # Best-effort PID readout from the holder + staleness probe.
+            # If the recorded PID no longer corresponds to a live process
+            # AND the kernel still gave us back the (held) flock state
+            # (rare on POSIX — fcntl.flock releases on process death —
+            # but possible on weaker NFS / Docker overlay filesystems),
+            # treat the lock as stale and retry once. Without this an
+            # unclean kill on a shared FS could lock the user out of
+            # their own data dir indefinitely.
             try:
                 os.lseek(fd, 0, 0)
                 payload = os.read(fd, 256).decode("utf-8", errors="replace").strip()
                 if payload:
-                    held_by = payload.splitlines()[0]
+                    first = payload.splitlines()[0]
+                    held_by = first
+                    try:
+                        held_by_pid = int(first)
+                    except ValueError:
+                        held_by_pid = None
             except OSError:
                 pass
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            hint = f" (held by PID {held_by})" if held_by else ""
-            raise DataDirLockError(
-                f"Another splicecraft instance is already running"
-                f"{hint}. Data is at {target_dir}. Quit the other "
-                "instance or set SPLICECRAFT_SKIP_LOCK=1 to override "
-                "(NOT RECOMMENDED — concurrent instances can corrupt "
-                "the library cache)."
-            )
+            if (held_by_pid is not None
+                    and sys.platform != "win32"
+                    and not _pid_alive(held_by_pid)):
+                _log.warning(
+                    "Lockfile %s holds stale PID %d (no live process); "
+                    "retaking the lock.",
+                    lockfile, held_by_pid,
+                )
+                try:
+                    if sys.platform != "win32":
+                        import fcntl  # type: ignore[import-not-found]
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        locked = True
+                except (ImportError, BlockingIOError, OSError):
+                    pass
+            if not locked:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                hint = f" (held by PID {held_by})" if held_by else ""
+                raise DataDirLockError(
+                    f"Another splicecraft instance is already running"
+                    f"{hint}. Data is at {target_dir}. Quit the other "
+                    "instance or set SPLICECRAFT_SKIP_LOCK=1 to override "
+                    "(NOT RECOMMENDED — concurrent instances can corrupt "
+                    "the library cache)."
+                )
 
         # Write our PID + version + start-time to the file so a
-        # second-instance error message has something useful.
+        # second-instance error message has something useful. Fsync the
+        # write so a power-loss between acquire and the next operation
+        # doesn't leave a zero-byte lockfile (which would defeat the
+        # PID-readout path on the next contention).
         try:
             os.lseek(fd, 0, 0)
             os.ftruncate(fd, 0)
             stamp = f"{os.getpid()}\n{__version__}\n".encode("utf-8")
             os.write(fd, stamp)
+            try:
+                os.fsync(fd)
+            except OSError:
+                pass
         except OSError as exc:
             _log.warning("Could not write lockfile metadata: %s", exc)
         return fd, lockfile
@@ -2342,7 +2610,14 @@ def _load_library() -> list[dict]:
     _library_cache = entries
     return deepcopy(_library_cache)
 
-def _save_library(entries: list[dict]) -> None:
+def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
+    """Persist the live library and mirror it into the active
+    collection. ``async_sync=True`` (used by the LibraryPanel's delete
+    path) defers the collection mirror to a background worker so a
+    user with a 100+ MB collections.json doesn't see a 6-10 s UI hang
+    on every delete. Default is synchronous so callers that need to
+    read back collection state right after save (Constructor's
+    cascade-into-active-collection, tests) keep working unchanged."""
     global _library_cache
     _safe_save_json(_LIBRARY_FILE, entries, "Plasmid library")
     # Deep-copy the post-save state into the cache so the cache is
@@ -2354,7 +2629,7 @@ def _save_library(entries: list[dict]) -> None:
     # Keep the active collection's plasmids in sync with the library — every
     # add / remove / rename on the panel feeds through here, so a single
     # mirror call covers all CRUD without changing call sites.
-    _sync_active_collection_plasmids(entries)
+    _sync_active_collection_plasmids(entries, async_write=async_sync)
 
 
 # ── Plasmid collections ────────────────────────────────────────────────────────
@@ -2457,23 +2732,153 @@ def _ensure_default_collection() -> None:
     _set_active_collection_name(_DEFAULT_COLLECTION_NAME)
 
 
-def _sync_active_collection_plasmids(entries: list[dict]) -> None:
+_collection_sync_lock = threading.Lock()
+# Shutdown signal: set by `_flush_pending_collection_sync` so the
+# drain worker doesn't START a new save cycle after shutdown begins.
+# An in-flight `_save_collections` is allowed to complete because it
+# routes through `_safe_save_json` (atomic os.replace); only NEW work
+# is refused. Without this flag a daemon worker could pick up a fresh
+# pending sync mid-shutdown and get killed mid-write.
+_collection_sync_shutdown = threading.Event()
+_collection_sync_pending: "tuple[str, list[dict]] | None" = None
+_collection_sync_thread: "threading.Thread | None" = None
+_collection_sync_event = threading.Event()
+
+
+def _drain_collection_sync_loop() -> None:
+    """Background worker that drains pending collection-sync requests.
+    Multiple rapid mutations coalesce: the worker grabs the LATEST
+    pending state, runs `_save_collections` once, and loops if a
+    newer state arrived during the save. Big libraries with 100+ MB
+    collection files benefit massively — a delete/save burst that
+    used to block the UI for 6-10 s now returns immediately and the
+    sync runs out-of-band."""
+    global _collection_sync_pending
+    while True:
+        # Wake-up gate: block here until something is pending OR a
+        # spurious wake from a prior loop arrives. Spurious wakes
+        # exit cleanly via the empty-pending guard below.
+        _collection_sync_event.wait()
+        _collection_sync_event.clear()
+        with _collection_sync_lock:
+            payload = _collection_sync_pending
+            _collection_sync_pending = None
+        if payload is None:
+            return
+        # Shutdown gate: if `_flush_pending_collection_sync` set the
+        # shutdown event before we picked up this payload, drain it
+        # to disk synchronously here on this thread (we're already
+        # holding the wake-up cycle). After draining, exit so process
+        # shutdown can complete without leaving a daemon mid-write.
+        name, snapshot = payload
+        try:
+            colls = _load_collections()
+            for c in colls:
+                if c.get("name") == name:
+                    c["plasmids"] = snapshot
+                    _save_collections(colls)
+                    break
+        except Exception:
+            _log.exception(
+                "collection sync worker: save failed for %r", name,
+            )
+        if _collection_sync_shutdown.is_set():
+            # Refuse NEW work; any pending mutations queued during
+            # this save are deliberately dropped at shutdown — the
+            # snapshot we just wrote is "good enough" for recovery
+            # and the user is exiting.
+            return
+        # Loop: another mutation may have arrived while we were
+        # writing — drain that next iteration before exiting.
+
+
+def _sync_active_collection_plasmids(
+    entries: list[dict], *, async_write: bool = False,
+) -> None:
     """Mirror the live library's contents into the active collection so the
     on-disk collection record never drifts from the panel's view.
 
     Silent no-op if no collection is active, or if the active name has
     been deleted (e.g. user removed it via the manager) — the next
     explicit Load/Save will re-establish a target.
+
+    Default is synchronous so existing callers (Constructor save,
+    rename flows, tests that assert post-save state immediately) see
+    the mirror on disk by the time the call returns. Pass
+    ``async_write=True`` from the LibraryPanel's delete path: a
+    100+ MB collection file there used to block the UI for 6-10 s on
+    every delete, and the user doesn't typically read collections.json
+    again before the worker finishes anyway. The async path uses a
+    single coalescing background thread — repeated rapid mutations
+    overwrite the queued state so only the LATEST snapshot ever
+    lands. App exit calls `_flush_pending_collection_sync` so a
+    deferred sync still completes before the process goes away.
     """
     name = _get_active_collection_name()
     if not name:
         return
-    colls = _load_collections()
-    for c in colls:
-        if c.get("name") == name:
-            c["plasmids"] = [dict(e) for e in entries if isinstance(e, dict)]
-            _save_collections(colls)
-            return
+    snapshot = [dict(e) for e in entries if isinstance(e, dict)]
+    if not async_write:
+        colls = _load_collections()
+        for c in colls:
+            if c.get("name") == name:
+                c["plasmids"] = snapshot
+                _save_collections(colls)
+                return
+        return
+    global _collection_sync_thread, _collection_sync_pending
+    with _collection_sync_lock:
+        _collection_sync_pending = (name, snapshot)
+        if (_collection_sync_thread is None
+                or not _collection_sync_thread.is_alive()):
+            _collection_sync_thread = threading.Thread(
+                target=_drain_collection_sync_loop,
+                name="collection-sync",
+                daemon=True,
+            )
+            _collection_sync_thread.start()
+    # Signal AFTER releasing the lock so the worker can grab it.
+    _collection_sync_event.set()
+
+
+def _flush_pending_collection_sync(timeout_s: float = 5.0) -> None:
+    """Block until any in-flight async collection sync completes.
+    Called from the app exit path so a sync that was deferred during
+    the user's last delete actually lands on disk before the process
+    goes away. Bounded wait — the user shouldn't see an extra
+    multi-second hang on quit just because a giant collection file
+    was queued.
+
+    Sets `_collection_sync_shutdown` so the worker refuses to start a
+    NEW save cycle after the first drain completes — daemon threads
+    are kept (so a wedged worker can never block process exit) but the
+    flag minimises the kill-mid-write window. If the in-flight save
+    doesn't complete within `timeout_s` we log a warning rather than
+    risk corrupting state by killing it; the next launch will pick up
+    whatever state landed."""
+    _collection_sync_shutdown.set()
+    with _collection_sync_lock:
+        thread = _collection_sync_thread
+        pending = _collection_sync_pending
+    if pending is None and (thread is None or not thread.is_alive()):
+        return
+    # Wake the worker (in case it hasn't yet) and wait for it to
+    # drain the queue. The worker exits when pending is None after a
+    # cycle, so the join with timeout is the right "wait until
+    # quiescent" primitive.
+    _collection_sync_event.set()
+    if thread is not None:
+        try:
+            thread.join(timeout=timeout_s)
+            if thread.is_alive():
+                _log.warning(
+                    "Collection-sync worker still active after %.1fs "
+                    "drain; process will exit and may leave a stale "
+                    "tempfile in the data dir (next launch will clean).",
+                    timeout_s,
+                )
+        except RuntimeError:
+            pass
 
 
 def _restore_library_from_active_collection() -> None:
@@ -2495,7 +2900,12 @@ def _restore_library_from_active_collection() -> None:
     plasmids = [dict(p) for p in (coll.get("plasmids") or [])
                 if isinstance(p, dict)]
     _safe_save_json(_LIBRARY_FILE, plasmids, "Plasmid library")
-    _library_cache = list(plasmids)
+    # Deep-copy on cache re-seat per invariant #17 — pre-fix this used
+    # `list(plasmids)` which only copies the outer list; nested-dict
+    # mutations on the collection's `plasmids` list (a separate code
+    # path) would leak into the cache and the next reader would see
+    # stale-but-different-from-disk library entries.
+    _library_cache = deepcopy(plasmids)
 
 
 # ── Restriction sites ──────────────────────────────────────────────────────────
@@ -2807,6 +3217,67 @@ def _slice_circular(seq: str, start: int, end: int) -> str:
     if end >= start:
         return seq[start:end]
     return seq[start:] + seq[:end]
+
+
+def _feat_bounds(feat, total: int) -> "tuple[int, int, int] | None":
+    """Wrap-aware extraction of `(start, end, strand)` from a Biopython
+    `SeqFeature`. The returned `(start, end)` follows the dict-feature
+    convention: `end < start` signals an origin-spanning wrap; otherwise
+    `end > start`. Returns `None` if the location has non-integer coords
+    (UnknownPosition / BetweenPosition).
+
+    For a `CompoundLocation` of exactly two parts whose outer bounds are
+    `[0, ..)` and `[.., total)`, re-encodes as `(tail_start, head_end)`
+    so callers can slice with `_slice_circular` and length with `_feat_len`.
+    Other compound shapes flatten to outer bounds.
+
+    Callers that read `int(feat.location.start)` / `int(feat.location.end)`
+    directly silently flatten wrap features (Biopython returns `min(part.start)`
+    for a CompoundLocation), so any code that later does `seq[s:e]` returns
+    the BACKBONE GAP rather than the feature. Always route through this
+    helper instead. See sacred invariant #9.
+    """
+    loc = getattr(feat, "location", None)
+    if loc is None:
+        return None
+    try:
+        strand = int(getattr(loc, "strand", 1) or 1)
+    except (TypeError, ValueError):
+        strand = 1
+    try:
+        from Bio.SeqFeature import CompoundLocation
+    except ImportError:
+        CompoundLocation = None
+    if CompoundLocation is not None and isinstance(loc, CompoundLocation):
+        try:
+            parts = sorted(loc.parts, key=lambda p: int(p.start))
+            if (
+                total > 0 and len(parts) == 2
+                and int(parts[0].start) == 0
+                and int(parts[-1].end) == total
+                and int(parts[0].end) < int(parts[-1].start)
+            ):
+                # Origin wrap → (tail_start, head_end) so end < start.
+                return int(parts[-1].start), int(parts[0].end), strand
+            # Other compound shapes: outer bounds, lossy but oriented.
+            return int(parts[0].start), int(parts[-1].end), strand
+        except (TypeError, ValueError):
+            return None
+    try:
+        return int(loc.start), int(loc.end), strand
+    except (TypeError, ValueError):
+        return None
+
+
+def _feat_span_label(start: int, end: int, total: int) -> str:
+    """Human-readable span for a feature dict's (start, end). Wrap
+    features render as ``"start..0..end"`` so the picker dropdown reflects
+    the actual biology rather than printing a misleading linear span
+    that looks like the backbone gap. Coords are kept 0-based (matches
+    every other in-app display)."""
+    if end < start:
+        return f"{start}..0..{end}"
+    return f"{start}..{end}"
 
 
 # Pre-built per-enzyme scan records: immutable derived values (compiled pattern,
@@ -5541,12 +6012,23 @@ def load_genbank(path: str):
     from the file stem so the library and map title show something
     human-readable instead of `<unknown name>`.
 
+    Size + symlink check via `_safe_file_size_check`: pre-fix a CLI
+    invocation `splicecraft /path/to/huge.gb` (e.g. a 1 GB chromosome
+    dump) reached `SeqIO.parse` directly and SeqIO eagerly parsed it
+    into RAM. The cap matches the modal-flow cap.
+
     Raises ValueError with a user-friendly message if the file has no
-    records or multiple records.
+    records, multiple records, is oversized, or is a symlink to a
+    character device.
     """
     import struct
     from Bio import SeqIO
     from pathlib import Path as _P
+    ok, reason = _safe_file_size_check(
+        _P(path), _SAFE_LOAD_JSON_MAX_BYTES, "Plasmid",
+    )
+    if not ok:
+        raise ValueError(reason or "Plasmid file is unsafe to load")
     fmt = _detect_plasmid_format(path)
     try:
         records = list(SeqIO.parse(path, fmt))
@@ -6550,6 +7032,38 @@ _PLASMIDSAURUS_MAX_MEMBERS      = 2000                # listing cap
 _GBK_EXTS = (".gbk", ".gb", ".genbank")
 
 
+def _is_safe_zip_member_name(name: str) -> bool:
+    """Return True if `name` is safe to surface in the picker AND safe
+    to feed back into `zf.getinfo(name)`. Rejects:
+
+      * absolute paths (`/etc/passwd.gbk`, `C:\\Users\\…`)
+      * `..` segments (`../../escape.gbk`)
+      * NUL bytes (terminal-display ANSI smuggling)
+      * embedded ANSI escape codes (likewise)
+
+    Stdlib `zipfile.open(info)` doesn't extract to a path, so a hostile
+    name is currently bounded — but a future `extract()` / `extractall()`
+    switch would silently flow into path traversal. This rejection
+    fences off the whole class of bugs at the listing stage.
+    """
+    if not name or "\x00" in name:
+        return False
+    # ANSI escape (\x1b) — used in terminal-injection attacks
+    if "\x1b" in name:
+        return False
+    # Windows absolute (C:, D:, etc.)
+    if len(name) >= 2 and name[1] == ":" and name[0].isalpha():
+        return False
+    # Backslash separator (Windows paths in malicious zips)
+    norm = name.replace("\\", "/")
+    if norm.startswith("/"):
+        return False
+    parts = norm.split("/")
+    if any(p in ("..", ".") for p in parts):
+        return False
+    return True
+
+
 def _list_gbk_members_in_zip(zip_path: Path) -> "list[dict]":
     """Walk a .zip and return a list of dicts describing every .gbk /
     .gb / .genbank member. Each dict carries:
@@ -6593,6 +7107,12 @@ def _list_gbk_members_in_zip(zip_path: Path) -> "list[dict]":
             if info.is_dir():
                 continue
             name = info.filename
+            if not _is_safe_zip_member_name(name):
+                _log.warning(
+                    "plasmidsaurus: skipping unsafe zip member name %r",
+                    name,
+                )
+                continue
             base = name.rsplit("/", 1)[-1]
             if not base or base.startswith("."):
                 continue
@@ -6623,8 +7143,11 @@ def _extract_gbk_member(zip_path: Path, member_name: str) -> str:
     """Read a single .gbk member out of a zip and return its decoded
     text. Caller passes the result through `_gb_text_to_record` to get
     a SeqRecord. Raises ValueError on missing / oversized / unreadable
-    member, or on UTF-8 / latin-1 decode failure."""
+    member, on UTF-8 / latin-1 decode failure, or on an unsafe member
+    name (path traversal / NUL / ANSI smuggling)."""
     import zipfile
+    if not _is_safe_zip_member_name(member_name):
+        raise ValueError(f"unsafe zip member name: {member_name!r}")
     try:
         with zipfile.ZipFile(str(zip_path), "r") as zf:
             try:
@@ -6638,8 +7161,21 @@ def _extract_gbk_member(zip_path: Path, member_name: str) -> str:
                     f"member too large ({info.file_size:,} bytes; cap "
                     f"{_PLASMIDSAURUS_MEMBER_MAX_BYTES:,})"
                 )
+            # Bounded streaming read: the central-directory `file_size`
+            # is attacker-controlled. A malicious zip can claim 1 KB
+            # but stream 5 GB of compressed-to-zero data and OOM the
+            # process. Cap the actual read at MAX+1 and abort if we
+            # exceeded — pre-fix `fh.read()` was unbounded and only
+            # the (untrusted) header was checked.
+            cap = _PLASMIDSAURUS_MEMBER_MAX_BYTES
             with zf.open(info, "r") as fh:
-                raw = fh.read()
+                raw = fh.read(cap + 1)
+            if len(raw) > cap:
+                raise ValueError(
+                    f"member exceeded cap during decompression "
+                    f"(claimed {info.file_size:,} bytes; cap {cap:,}) "
+                    f"— possible zip-bomb"
+                )
     except (zipfile.BadZipFile, OSError) as exc:
         raise ValueError(f"could not read zip: {exc}") from exc
     # GenBank is ASCII per the spec; fall back to latin-1 only if a
@@ -6758,13 +7294,15 @@ def _find_annotation_transfers(source_rec, target_rec, *,
         if ftype == "source":
             continue
         # Lift the feature into the dict shape `_feature_bases` expects.
-        try:
-            loc = feat.location
-            f_start = int(loc.start)
-            f_end   = int(loc.end)
-            f_strand = int(loc.strand or 1)
-        except (AttributeError, TypeError, ValueError):
+        # `_feat_bounds` is wrap-aware so an origin-spanning source feature
+        # transfers correctly; pre-fix this used `int(loc.start)` /
+        # `int(loc.end)` which silently flattened wrap CDSes and left
+        # them undiscoverable on the target (the search would slice the
+        # backbone gap and find nothing).
+        bounds = _feat_bounds(feat, n_src)
+        if bounds is None:
             continue
+        f_start, f_end, f_strand = bounds
         feat_bases = _feature_bases(
             src_seq,
             {"start": f_start, "end": f_end, "strand": f_strand},
@@ -9081,9 +9619,27 @@ class FeatureSidebar(Widget):
 def _fuzzy_match(query: str, name: str) -> bool:
     """Case-insensitive subsequence match: True if every char of `query`
     appears in `name` in order (not necessarily contiguous). Empty query
-    matches everything. Used by LibraryPanel's search filter."""
+    matches everything. Used by LibraryPanel's search filter and by
+    `_search_collections_library` (cross-collection search).
+
+    Performance: O(len(query) * len(name)) worst case via repeated
+    `str.find`. Early-rejects when ``len(query) > len(name)`` (no
+    subsequence can be longer than its container) — saves the
+    full lower() + scan on huge libraries where most names are
+    shorter than a typical fuzzy query. The lower() call is the hot
+    spot for very long names; the early reject runs on the original
+    strings before any allocation.
+    """
     if not query:
         return True
+    if not name:
+        return False
+    # Subsequence membership requires `len(query) <= len(name)`. Skip
+    # the lower() + scan entirely when impossible. This is the hot
+    # exit on huge libraries where typical names are short and the
+    # user's filter has 5+ chars.
+    if len(query) > len(name):
+        return False
     q, n = query.lower(), name.lower()
     i = 0
     for ch in q:
@@ -9156,6 +9712,16 @@ def _search_collections_library(query: str, *,
 
 _NATURAL_SORT_RE = re.compile(r"(\d+)")
 
+# LRU-style cache for `_natural_sort_key`. Library / collections /
+# parts-bin repopulate paths fire on every Filter-Input keystroke and
+# each one re-sorts the entire list; for a 1000-entry library that's
+# 1000 regex.split + lower calls × every keystroke. The keys are tiny
+# strings (plasmid / collection / part names) so the cache footprint
+# is bounded, and we cap to `_NATURAL_SORT_CACHE_CAP` entries to keep
+# the cache from growing unboundedly under arbitrarily large libraries.
+_NATURAL_SORT_KEY_CACHE: "dict[str, tuple]" = {}
+_NATURAL_SORT_CACHE_CAP: int = 4096
+
 
 def _natural_sort_key(s: str) -> tuple:
     """Return a tuple suitable for natural / human-friendly sorting.
@@ -9168,7 +9734,14 @@ def _natural_sort_key(s: str) -> tuple:
     raises in Py3) — that mixed comparison is the gotcha that bites
     the naïve `(int_or_str, ...)` formulation when a name starts
     with a digit (like `"5kb_backbone"` vs `"pBin1"`).
+
+    Cached: identical input strings (the common case across re-sort
+    calls when filter keystrokes only change the predicate, not the
+    underlying library) reuse the previously computed tuple.
     """
+    cached = _NATURAL_SORT_KEY_CACHE.get(s)
+    if cached is not None:
+        return cached
     out: list[tuple[int, "int | str"]] = []
     for part in _NATURAL_SORT_RE.split(s.lower()):
         if not part:
@@ -9177,21 +9750,190 @@ def _natural_sort_key(s: str) -> tuple:
             out.append((1, int(part)))
         else:
             out.append((0, part))
-    return tuple(out)
+    result = tuple(out)
+    if len(_NATURAL_SORT_KEY_CACHE) >= _NATURAL_SORT_CACHE_CAP:
+        # Bounded cache: drop oldest insertion when at cap. dict
+        # preserves insertion order, so popping the first key is the
+        # cheapest FIFO eviction we can do without a full LRU dance.
+        try:
+            first = next(iter(_NATURAL_SORT_KEY_CACHE))
+            del _NATURAL_SORT_KEY_CACHE[first]
+        except StopIteration:
+            pass
+    _NATURAL_SORT_KEY_CACHE[s] = result
+    return result
 
 
 class _SearchInput(Input):
-    """Input that clears its display when focus is gained, so the user
-    sees a fresh cursor regardless of whether the field had the
-    'Search' prefill or an active filter shown. The parent panel
-    (LibraryPanel) handles Submitted to apply / clear the filter and
-    restores PREFILL on submit-empty."""
+    """Reusable search-bar Input.
+
+    Three reusable behaviours that every search bar in the app wants
+    consistently:
+
+    1. **Prefill / placeholder hybrid.** ``PREFILL`` is shown when the
+       field is unfocused + empty; clicking into the field clears it
+       so the user types into a fresh cursor. Blurring an empty field
+       restores the prefill. The PREFILL string also counts as
+       "empty" in `query()` so a user mashing Enter without focusing
+       first doesn't search for the literal word "Search".
+
+    2. **Optional live-filter debouncing.** When the parent passes
+       ``debounce_s=<seconds>`` + ``on_filter=<callable>``, every
+       keystroke schedules a single timer; rapid typing coalesces
+       into one call. With ``debounce_s=None`` (default) the widget
+       behaves identically to plain ``Input`` and the parent listens
+       to ``Input.Submitted`` for Enter-to-apply UX. The debounce
+       timer is cancelled on unmount so a queued tick can't fire
+       against a disposed widget tree.
+
+    3. **Length cap.** Defaults to ``DEFAULT_MAX_LEN = 200``. Longer
+       pastes (e.g. an accidental clipboard dump) are silently
+       truncated. The fuzzy matcher is O(query × name); without a
+       cap a 100k-char paste against a 5k-plasmid library would lock
+       the UI for seconds before any debounce fires.
+
+    Pre-2026-05-10 this class had only the focus-clear behaviour and
+    every site that wanted debounce / cleanup / cap rolled its own.
+    The four search bars in the app (LibraryPanel, LibrarySearchModal,
+    LoadPartSourceModal, SpeciesPickerModal) used 4 slightly-different
+    patterns; the consolidated widget is the one place to fix
+    behaviour bugs going forward.
+    """
     PREFILL = "Search"
+    DEFAULT_MAX_LEN = 200
+
+    def __init__(
+        self,
+        *args,
+        prefill: "str | None" = None,
+        debounce_s: "float | None" = None,
+        max_len: int = DEFAULT_MAX_LEN,
+        on_filter=None,
+        **kwargs,
+    ):
+        # Default prefill to the class constant; allow opt-out by
+        # passing ``prefill=""`` so a caller that wants placeholder-
+        # only behaviour gets a plain Input visually.
+        if prefill is None:
+            prefill = self.PREFILL
+        # Use the prefill as the initial value if the caller didn't
+        # pass one explicitly. ``None`` is the sentinel for "use the
+        # prefill"; ``""`` is the sentinel for "start empty".
+        if "value" not in kwargs:
+            kwargs["value"] = prefill
+        super().__init__(*args, **kwargs)
+        self._prefill = prefill
+        self._debounce_s = debounce_s
+        self._max_len = max(1, int(max_len))
+        self._on_filter = on_filter
+        self._filter_timer = None
 
     def on_focus(self, _event) -> None:
         # Always blank the field on focus gain — matches the spec
         # "clicking into … the textbox clears and a cursor appears".
-        self.value = ""
+        if self.value == self._prefill:
+            self.value = ""
+
+    def on_blur(self, _event) -> None:
+        # Restoring the prefill on blur (empty field only) keeps the
+        # idle UI readable — without this, a user who clicked away
+        # without typing would see an empty field with no affordance
+        # cue. Whitespace-only counts as empty.
+        if not self.value.strip():
+            try:
+                self.value = self._prefill
+            except Exception:
+                # Defensive — Input.value setter could fail mid-
+                # teardown; the next on_focus / clear() will recover.
+                pass
+
+    def on_input_changed(self, event) -> None:
+        # Length cap is a hard truncate. Setting `self.value` here
+        # re-triggers Input.Changed; the second pass reads the
+        # truncated value, hits the equality check, and skips the
+        # truncate path. So we don't need an explicit re-entrancy
+        # guard — but we DO need to bail before scheduling a debounce
+        # for the truncate-pass, since we'll be back here in 1 µs.
+        if len(self.value) > self._max_len:
+            self.value = self.value[: self._max_len]
+            return
+        # No callback / no debounce → behave like a plain Input.
+        if self._on_filter is None or self._debounce_s is None:
+            return
+        # Cancel any pending tick before scheduling a fresh one;
+        # without this a burst of N keystrokes spawns N timers and
+        # the filter callback fires N times after debounce_s.
+        if self._filter_timer is not None:
+            try:
+                self._filter_timer.stop()
+            except Exception:
+                pass
+        try:
+            self._filter_timer = self.set_timer(
+                self._debounce_s, self._fire_filter,
+            )
+        except Exception:
+            # Timer setup can race with unmount; fall back to a
+            # synchronous fire so the user's keystroke isn't lost.
+            self._filter_timer = None
+            self._fire_filter()
+
+    def _fire_filter(self) -> None:
+        """Invoke the ``on_filter`` callback with the sanitised query.
+        Wrapped in try/except so a callback that raises (e.g. a stale
+        widget query during unmount) doesn't poison the timer."""
+        if self._on_filter is None:
+            return
+        try:
+            self._on_filter(self.current_query())
+        except Exception:
+            _log.exception(
+                "_SearchInput: on_filter callback raised on query %r",
+                self.value,
+            )
+
+    def current_query(self) -> str:
+        """Return the sanitised query string. Strips outer whitespace
+        and treats the prefill as empty so a user who didn't focus
+        the field doesn't search for the placeholder text.
+
+        Named ``current_query`` (not ``query``) to avoid colliding
+        with ``Widget.query(selector)`` from Textual's DOMNode API,
+        which would otherwise be shadowed by the same-name override.
+        """
+        v = (self.value or "").strip()
+        if v == self._prefill:
+            return ""
+        return v
+
+    def clear(self) -> None:
+        """Reset the input to prefill state and cancel any pending
+        debounce. Idempotent — safe to call from a parent's
+        view-mode-switch path that also fires `on_unmount` shortly
+        afterward."""
+        try:
+            self.value = self._prefill
+        except Exception:
+            pass
+        if self._filter_timer is not None:
+            try:
+                self._filter_timer.stop()
+            except Exception:
+                pass
+            self._filter_timer = None
+
+    def on_unmount(self) -> None:
+        # Cancel the pending debounce so a queued tick doesn't fire
+        # against a disposed widget tree — the callback typically
+        # `query_one`s into the parent's table, which would raise
+        # NoMatches (caught) but log a noisy warning. Wiping the
+        # slot keeps the tear-down clean.
+        if self._filter_timer is not None:
+            try:
+                self._filter_timer.stop()
+            except Exception:
+                pass
+            self._filter_timer = None
 
 
 class LibraryPanel(Widget):
@@ -9427,7 +10169,29 @@ class LibraryPanel(Widget):
             self.query_one("#lib-btns").display       = not is_coll
         except NoMatches:
             return
+        # Switching views invalidates the search query — both
+        # `_repopulate_collections` and `_repopulate_plasmids` filter
+        # against `_filter_text`, so a stale plasmid query carrying
+        # over to collections (or vice versa) silently hides the
+        # entire next-view list. Pre-2026-05-10 a user typing in the
+        # search bar then pressing the back button saw an empty
+        # collections panel because the leftover plasmid query
+        # filtered every collection out.
+        self._reset_search()
         self._update_header()
+
+    def _reset_search(self) -> None:
+        """Clear the search filter + reset the Input to its prefill
+        text. Called from `_apply_view_mode` on every view-mode
+        switch so a query from one view doesn't leak into the other.
+        Best-effort — falls through quietly if the search Input
+        isn't mounted (compose hasn't run yet)."""
+        self._filter_text = ""
+        try:
+            inp = self.query_one("#lib-search", _SearchInput)
+            inp.clear()
+        except NoMatches:
+            pass
 
     def _update_header(self) -> None:
         try:
@@ -9611,10 +10375,63 @@ class LibraryPanel(Widget):
             "gb_text": gb_text,
             "status":  prev_status,
         })
-        _save_library(entries)
+        try:
+            _save_library(entries)
+        except (OSError, RuntimeError) as exc:
+            # Disk-full / RO-mount / EACCES bubbles from `_save_library`
+            # per invariant #7. Surface to the user rather than letting
+            # a raw stacktrace exit the key-press handler.
+            _notify_save_failure(self.app, "Plasmid library", exc)
+            return
         if self._view_mode == "plasmids":
             self._apply_panel_width()
             self._repopulate_plasmids()
+
+    def reveal_entry_id(self, entry_id: str) -> None:
+        """Switch to the plasmids view, repopulate, and move the
+        cursor to the row whose key matches ``entry_id``. Used by
+        flows that just persisted a library entry (Constructor save,
+        external imports) so the user sees their new plasmid land
+        in-list and focused without scrolling.
+
+        Clears any active search filter so a typed query left from
+        an earlier session doesn't hide the just-saved entry. Without
+        this, a user who searched for "pUC" then saved a TU named
+        "TU_J23100_cscA" would see the constructor "succeed" but the
+        library table would render empty — the row was added but the
+        filter passed nothing.
+
+        Best-effort: silently no-ops when the panel isn't fully
+        composed yet, when the id isn't found post-refresh, or when
+        Textual's row-iteration shape changes underneath us. Falls
+        back to a plain repop in those cases — the new entry is
+        still visible at the top of the natural-sort order."""
+        if not entry_id:
+            return
+        # Clear filter (both in-memory + the search Input's value) so
+        # the new row is visible regardless of what the user had
+        # typed. `_reset_search` is the canonical helper — it handles
+        # the not-yet-mounted case and restores the prefill text.
+        try:
+            self._reset_search()
+        except (NoMatches, AttributeError):
+            pass
+        if getattr(self, "_view_mode", "plasmids") != "plasmids":
+            self._view_mode = "plasmids"
+            try:
+                self._apply_view_mode()
+            except (NoMatches, AttributeError):
+                pass
+        self._apply_panel_width()
+        self._repopulate_plasmids()
+        try:
+            t = self.query_one("#lib-table", DataTable)
+            for i, row_key in enumerate(t.rows.keys()):
+                if getattr(row_key, "value", None) == entry_id:
+                    t.move_cursor(row=i)
+                    break
+        except (NoMatches, AttributeError):
+            pass
 
     @on(DataTable.RowSelected, "#lib-table")
     def _row_selected(self, event: DataTable.RowSelected):
@@ -9762,7 +10579,14 @@ class LibraryPanel(Widget):
                 return
             entries = [e for e in _load_library() if e.get("id") != entry_id]
             try:
-                _save_library(entries)
+                # async_sync=True: defer the active-collection mirror
+                # to a background worker. On a 100+ MB collections.json
+                # the synchronous path took 5-8 s per delete, blocking
+                # the UI; the async path returns as soon as the
+                # library file is on disk, and the mirror catches up
+                # out-of-band (worker drained at app exit so the
+                # mirror always lands eventually).
+                _save_library(entries, async_sync=True)
             except OSError as exc:
                 # Disk-full / permission-denied / RO mount: surface to
                 # the user instead of silently swallowing — they need to
@@ -9773,6 +10597,59 @@ class LibraryPanel(Widget):
                     severity="error",
                 )
                 return
+            # Cascade: remove any parts-bin entries that mirror the
+            # deleted library plasmid. Match on (name, grammar) — a
+            # name-only match would over-delete when two grammars
+            # carry a TU with the same name (legal: parts are
+            # name-unique PER GRAMMAR, see `_palette_rows_for_grammar`
+            # dedupe). The library entry's grammar lives on its
+            # `source` field as `constructor:{gid}:{role}` (set by
+            # `_persist_assembly`); legacy entries without that
+            # encoding fall back to name-only matching. Best-effort:
+            # failures are logged + a soft notify, but they don't
+            # block the library delete that already succeeded.
+            try:
+                src_field = str(entry.get("source") or "")
+                lib_grammar = ""
+                if src_field.startswith("constructor:"):
+                    parts_src = src_field.split(":", 2)
+                    if len(parts_src) >= 2:
+                        lib_grammar = parts_src[1]
+                bin_entries = _load_parts_bin()
+                if lib_grammar:
+                    kept = [
+                        b for b in bin_entries
+                        if not (
+                            (b.get("name") or "") == name
+                            and (b.get("grammar") or "gb_l0")
+                                == lib_grammar
+                        )
+                    ]
+                else:
+                    # Legacy entry: no grammar info on the library
+                    # row. Fall back to name-only — same behaviour as
+                    # before, accepts the over-delete risk for
+                    # entries that pre-date the constructor source
+                    # tag.
+                    kept = [
+                        b for b in bin_entries
+                        if (b.get("name") or "") != name
+                    ]
+                n_dropped = len(bin_entries) - len(kept)
+                if n_dropped > 0:
+                    _save_parts_bin(kept)
+                    _log.info(
+                        "Plasmid delete: cascaded %d parts-bin row(s) "
+                        "for %r (grammar %r)", n_dropped, name,
+                        lib_grammar or "<any>",
+                    )
+            except (OSError, ValueError) as exc:
+                _log.exception("Plasmid delete: parts-bin cascade failed")
+                self.app.notify(
+                    f"Library entry deleted, but parts-bin cleanup "
+                    f"failed: {exc}",
+                    severity="warning",
+                )
             self._repopulate_plasmids()
             # If we just deleted the loaded record's library entry,
             # drop the panel's active-row binding AND clear the
@@ -16034,17 +16911,19 @@ class MenuBar(Widget):
 # ── Golden Braid L0 part catalog (shared by Parts Bin and Constructor) ─────────
 
 # (Name, Type, Position, 5' OH, 3' OH, Backbone, Selection Marker)
+#
+# Position-1 promoters in the catalog are "PromUTR" combined parts
+# (Promoter + 5'UTR domesticated as one) — the most common shape in
+# practice (e.g., a J23100+B0030 cassette ending at AATG). The GB 2.0
+# expanded grammar also allows them as separate parts (`Promoter-only`
+# Pos 1a / `5' UTR` Pos 1b); see `_GB_POSITIONS`.
 _GB_L0_PARTS: list[tuple] = [
-    # ── Promoters (Position 1: GGAG → TGAC) ────────────────────────────
-    ("CaMV 35S",          "Promoter",   "Pos 1",   "GGAG", "TGAC", "pUPD2", "Spectinomycin"),
-    ("Nos",               "Promoter",   "Pos 1",   "GGAG", "TGAC", "pUPD2", "Spectinomycin"),
-    ("AtUBQ10",           "Promoter",   "Pos 1",   "GGAG", "TGAC", "pUPD2", "Spectinomycin"),
-    ("ZmUBI1",            "Promoter",   "Pos 1",   "GGAG", "TGAC", "pUPD2", "Spectinomycin"),
-    ("AtRPS5a",           "Promoter",   "Pos 1",   "GGAG", "TGAC", "pUPD2", "Spectinomycin"),
-    # ── 5′ UTRs (Position 2: TGAC → AATG) ─────────────────────────────
-    ("TMV Omega",         "5' UTR",     "Pos 2",   "TGAC", "AATG", "pUPD2", "Spectinomycin"),
-    ("Nos 5'UTR",         "5' UTR",     "Pos 2",   "TGAC", "AATG", "pUPD2", "Spectinomycin"),
-    ("ADH1 5'UTR",        "5' UTR",     "Pos 2",   "TGAC", "AATG", "pUPD2", "Spectinomycin"),
+    # ── Promoters (Pos 1, combined Promoter+5'UTR: GGAG → AATG) ───────
+    ("CaMV 35S",          "Promoter",   "Pos 1",   "GGAG", "AATG", "pUPD2", "Spectinomycin"),
+    ("Nos",               "Promoter",   "Pos 1",   "GGAG", "AATG", "pUPD2", "Spectinomycin"),
+    ("AtUBQ10",           "Promoter",   "Pos 1",   "GGAG", "AATG", "pUPD2", "Spectinomycin"),
+    ("ZmUBI1",            "Promoter",   "Pos 1",   "GGAG", "AATG", "pUPD2", "Spectinomycin"),
+    ("AtRPS5a",           "Promoter",   "Pos 1",   "GGAG", "AATG", "pUPD2", "Spectinomycin"),
     # ── CDS with stop (Positions 3-4: AATG → GCTT) ─────────────────────
     ("eGFP",              "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
     ("mCherry",           "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
@@ -16072,24 +16951,48 @@ _GB_L0_PARTS: list[tuple] = [
 ]
 
 _GB_TYPE_COLORS: dict[str, str] = {
-    "Promoter":   "green",
-    "5' UTR":     "cyan",
-    "CDS":        "yellow",
-    "CDS-NS":     "dark_orange",
-    "C-tag":      "magenta",
-    "Terminator": "blue",
+    "Promoter":      "green",
+    "Promoter-only": "green",
+    "5' UTR":        "cyan",
+    "CDS":           "yellow",
+    "CDS-NS":        "dark_orange",
+    "C-tag":         "magenta",
+    "Terminator":    "blue",
 }
 
-# Canonical Golden Braid L0 part positions.
-# Each maps a part-type name → (position label, 5' overhang, 3' overhang).
-# Overhangs follow the published GB2.0 standard (Sarrion-Perdigones et al. 2013).
+# Golden Braid L0 part positions — expanded GB 2.0 grammar.
+# Each entry maps a part-type name → (position label, 5' overhang,
+# 3' overhang).
+#
+# Promoter-class parts come in two interchangeable flavours:
+#   * `Promoter` (Pos 1) — combined Promoter+5'UTR ("PromUTR" in GB
+#     2.0). Cassettes that bundle a promoter with its RBS / 5'UTR end
+#     at AATG (the start codon of the downstream CDS). This is the
+#     default shape for both the user catalog and most commercial L0
+#     plasmid distributions (Anderson promoters with built-in RBS,
+#     pICH-family vectors, etc.).
+#   * `Promoter-only` (Pos 1a) + `5' UTR` (Pos 1b) — when the promoter
+#     and 5'UTR are domesticated as separate parts and ligated together
+#     in the L1 reaction. Connector overhang `CCAT` between them
+#     follows the canonical GB 2.0 fusion-site table.
+#
+# Both shapes share the same TU boundary (positions[0].oh5 = GGAG;
+# positions[-1].oh3 = CGCT), so `_grammar_tu_overhangs` keeps working.
+# Pre-2026-05-10 the Promoter slot was (GGAG, TGAC) with `TGAC` as the
+# Promoter→5'UTR connector — that doesn't match any documented GB 2.0
+# variant or the typical post-cloning J23100/J23114 cassette and was
+# replaced when the user reported MoClo mis-classification.
 _GB_POSITIONS: dict[str, tuple[str, str, str]] = {
-    "Promoter":    ("Pos 1",   "GGAG", "TGAC"),
-    "5' UTR":      ("Pos 2",   "TGAC", "AATG"),
-    "CDS":         ("Pos 3-4", "AATG", "GCTT"),
-    "CDS-NS":      ("Pos 3",   "AATG", "TTCG"),
-    "C-tag":       ("Pos 4",   "TTCG", "GCTT"),
-    "Terminator":  ("Pos 5",   "GCTT", "CGCT"),
+    # Combined Promoter+5'UTR (GB 2.0 PromUTR; the common form).
+    "Promoter":      ("Pos 1",   "GGAG", "AATG"),
+    # Separate Promoter (no 5'UTR) — for the split workflow.
+    "Promoter-only": ("Pos 1a",  "GGAG", "CCAT"),
+    # Separate 5'UTR — partner to Promoter-only via CCAT connector.
+    "5' UTR":        ("Pos 1b",  "CCAT", "AATG"),
+    "CDS":           ("Pos 3-4", "AATG", "GCTT"),
+    "CDS-NS":        ("Pos 3",   "AATG", "TTCG"),
+    "C-tag":         ("Pos 4",   "TTCG", "GCTT"),
+    "Terminator":    ("Pos 5",   "GCTT", "CGCT"),
 }
 
 # Coding-DNA part types: these are the only types where silent (synonymous)
@@ -16106,12 +17009,13 @@ _GB_CODING_PART_TYPES: frozenset[str] = frozenset({"CDS", "CDS-NS", "C-tag"})
 # coding-DNA shapes — so they collapse to plain CDS; the GB position
 # survives in the feature's description string instead.
 _GB_PART_TYPE_TO_INSDC: dict[str, str] = {
-    "Promoter":   "promoter",
-    "5' UTR":     "5'UTR",
-    "CDS":        "CDS",
-    "CDS-NS":     "CDS",
-    "C-tag":      "CDS",
-    "Terminator": "terminator",
+    "Promoter":      "promoter",
+    "Promoter-only": "promoter",
+    "5' UTR":        "5'UTR",
+    "CDS":           "CDS",
+    "CDS-NS":        "CDS",
+    "C-tag":         "CDS",
+    "Terminator":    "terminator",
 }
 
 # Type IIS recognition + tail used for all Golden Braid L0 domestication
@@ -16281,14 +17185,17 @@ def _clone_part_into_entry_vector(
     vec_topology = (vec_rec.annotations.get("topology", "") or "").lower()
     vec_circular = vec_topology != "linear"
     vec_features: list[dict] = []
+    total_vec = len(vec_rec.seq) if getattr(vec_rec, "seq", None) is not None else 0
     for f in (vec_rec.features or []):
         if f.type == "source":
             continue
-        try:
-            fs = int(f.location.start)
-            fe = int(f.location.end)
-        except Exception:
+        # Wrap-aware via `_feat_bounds`; pre-fix `int(loc.start)`
+        # flattened wrap features to outer bounds and the carry-over
+        # logic dropped them as "fully inside the dropout".
+        bounds = _feat_bounds(f, total_vec)
+        if bounds is None:
             continue
+        fs, fe, _fs_strand = bounds
         label = ""
         for k in ("label", "gene", "product", "note"):
             vals = f.qualifiers.get(k, [])
@@ -16391,23 +17298,54 @@ def _clone_part_into_entry_vector(
         if dropout_idx >= 0:
             insert_frag = dict(candidate)
             insert_frag["features"] = list(insert_frag.get("features", []))
-            f = dict(part_feature)
-            f["end"] = len(insert_frag["top_seq"])
-            insert_frag["features"].append(f)
+            # Pre-built features path (multi-source assembly): the
+            # caller chained per-source features into `part["features"]`
+            # with coords relative to the body insert. The candidate
+            # fragment's top_seq is roughly `oh5 + insert + oh3`, so
+            # shift each feature by `len(oh5)` to land in candidate
+            # coords. Skip the single whole-insert part_feature so
+            # the resulting MOD shows individual TU annotations
+            # (Promoter, CDS, Terminator, …) instead of one collapsed
+            # block named after the entry vector.
+            prebuilt = part.get("features")
+            if isinstance(prebuilt, list) and prebuilt:
+                shift = len(oh5)
+                top_len = len(insert_frag["top_seq"])
+                for fr in prebuilt:
+                    try:
+                        fs = int(fr.get("start", 0))
+                        fe = int(fr.get("end", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    new_s = max(0, min(top_len, fs + shift))
+                    new_e = max(0, min(top_len, fe + shift))
+                    if new_e <= new_s:
+                        continue
+                    insert_frag["features"].append({
+                        **fr,
+                        "start": new_s,
+                        "end":   new_e,
+                    })
+            else:
+                f = dict(part_feature)
+                f["end"] = len(insert_frag["top_seq"])
+                insert_frag["features"].append(f)
 
     # Second try (fallback): synthesise the insert fragment
-    # directly. Dropout = the smallest vector fragment (the
-    # conventional pUPD2-style dropout cassette). Insert top_seq
-    # carries the dropout's left overhang + the part's BsaI
-    # junction overhangs + insert + right BsaI overhang. Sticky
-    # ends are stamped from the dropout's edges so ligation is
-    # always compatible.
+    # directly. Dropout = the vector fragment WITHOUT a backbone
+    # marker (rep_origin, antibiotic resistance) — falls back to
+    # the smallest fragment when feature detection is ambiguous,
+    # which is the conventional pUPD2-style assumption. Insert
+    # top_seq carries the dropout's left overhang + the part's
+    # IIS junction overhangs + insert + right IIS overhang.
+    # Sticky ends are stamped from the dropout's edges so
+    # ligation is always compatible. Feature-aware selection
+    # protects against the "stacked-TU MOD where insert >
+    # backbone" case that would have made min-size pick the
+    # backbone instead of the dropout cassette.
     if insert_frag is None:
-        dropout_idx = min(
-            range(len(all_frags)),
-            key=lambda i: len(all_frags[i]["top_seq"]),
-        )
-        dropout = all_frags[dropout_idx]
+        dropout = _pick_insert_fragment(all_frags) or all_frags[0]
+        dropout_idx = all_frags.index(dropout)
         left_end  = dict(dropout["left"])
         right_end = dict(dropout["right"])
         left_oh   = left_end.get("overhang_seq", "")
@@ -16419,18 +17357,47 @@ def _clone_part_into_entry_vector(
         # with the part's 3' BsaI overhang — the matching right
         # overhang region is already inside the backbone chain.
         synth_top = left_oh + oh5 + insert + oh3
-        f = dict(part_feature)
-        # Place the part feature so that the BsaI overhangs flank
-        # it: the insert annotation covers exactly the user's
-        # designed sequence (between oh5 and oh3). The L1-junction
-        # overhangs themselves stay untagged.
-        f["start"] = len(left_oh) + len(oh5)
-        f["end"]   = f["start"] + len(insert)
+        # Pre-built features path (multi-source assembly): chain
+        # the caller's per-source features with the same offset as
+        # the synthetic insert (left_oh + oh5 prefix). Drops anything
+        # whose body landed wholly inside the overhang regions
+        # (zero-length after shift). For a single-name part (the
+        # historical L0 / single-source case) fall back to the
+        # whole-insert part_feature.
+        prebuilt = part.get("features")
+        if isinstance(prebuilt, list) and prebuilt:
+            shift = len(left_oh) + len(oh5)
+            top_len = len(synth_top)
+            built_features: list[dict] = []
+            for fr in prebuilt:
+                try:
+                    fs = int(fr.get("start", 0))
+                    fe = int(fr.get("end", 0))
+                except (TypeError, ValueError):
+                    continue
+                new_s = max(0, min(top_len, fs + shift))
+                new_e = max(0, min(top_len, fe + shift))
+                if new_e <= new_s:
+                    continue
+                built_features.append({
+                    **fr,
+                    "start": new_s,
+                    "end":   new_e,
+                })
+        else:
+            f = dict(part_feature)
+            # Place the part feature so that the BsaI overhangs flank
+            # it: the insert annotation covers exactly the user's
+            # designed sequence (between oh5 and oh3). The L1-junction
+            # overhangs themselves stay untagged.
+            f["start"] = len(left_oh) + len(oh5)
+            f["end"]   = f["start"] + len(insert)
+            built_features = [f]
         insert_frag = {
             "top_seq":      synth_top,
             "left":         left_end,
             "right":        right_end,
-            "features":     [f],
+            "features":     built_features,
             "source_label": str(raw_name),
         }
         _log.info(
@@ -16496,7 +17463,15 @@ def _clone_part_into_entry_vector(
                 type=str(f.get("type", "misc_feature")),
                 qualifiers=quals,
             ))
-        except Exception:
+        except (TypeError, ValueError) as exc:
+            # FeatureLocation rejects negative / non-int coords; log so a
+            # silently-dropped annotation surfaces in the diagnostic
+            # bundle. Pre-fix this swallowed every exception including
+            # programmer bugs (AttributeError etc.).
+            _log.warning(
+                "clone_sim: dropped feature %r (coords %d..%d): %s",
+                f.get("label") or f.get("type"), s, e, exc,
+            )
             continue
     _log.info(
         "clone_sim: real-cloned %r into %r (%d bp → %d bp; %d cuts)",
@@ -16515,18 +17490,235 @@ def _site_for_enzyme(enzyme: str) -> str:
     return ""
 
 
+# Backbone-marker keywords used by `_pick_insert_fragment` to tell the
+# bacterial / replication-machinery half of a digested plasmid apart
+# from the cloned insert. Match is case-insensitive substring on
+# feature labels + types — covers the common annotation styles
+# (`rep_origin`, `Ori*`, `AmpR`, `KanR`, `cat`, `Spec`, etc.) without
+# trying to be exhaustive: false negatives just trigger the size
+# fallback, which is fine.
+_BACKBONE_FEATURE_TYPES: frozenset[str] = frozenset({
+    "rep_origin", "oriT",
+})
+_BACKBONE_LABEL_KEYWORDS: tuple[str, ...] = (
+    "ori", "rep_origin",
+    "ampr", "kanr", "specr", "specinomycin", "spectinomycin",
+    "cmr", "chloramphenicol", "tetr", "tetracyclin",
+    "carbr", "carbenicillin",
+    "selection", "antibiotic",
+)
+
+
+def _reconstruct_l0_features_in_seq(
+    insert_seq: str,
+    source_parts: "list[str] | tuple[str, ...]",
+    grammar_id: str,
+) -> list[dict]:
+    """Re-derive L0-part features inside ``insert_seq`` by string-
+    searching for each named source part's body sequence.
+
+    Used by `_assembly_fragment_from_source` to ensure every cycle
+    surfaces the individual promoter / CDS / terminator annotations
+    each TU was BUILT FROM, even when the saved TU plasmid only
+    carries a single collapsed feature (legacy data, manually-
+    annotated runs that pre-date multi-feature persist). Pure
+    sequence match — no coordinate-arithmetic assumptions about
+    how the alpha vector internally lays out the L0 region — so
+    it works for reversed-design vectors and any custom grammar.
+
+    Returns a list of feature dicts in the standard
+    `_fragments_from_cuts` shape: ``{start, end, strand, type,
+    label, color}``. Misses (L0 part deleted from bin, sequence not
+    found verbatim, RC-only on linear; we try both) are silently
+    skipped — better to surface fewer features than fabricated ones.
+    """
+    out: list[dict] = []
+    if not insert_seq or not source_parts:
+        return out
+    insert_seq = insert_seq.upper()
+    bin_index: dict[str, dict] = {}
+    for p in _load_parts_bin():
+        nm = p.get("name") or ""
+        if (nm
+                and nm not in bin_index
+                and (p.get("grammar") or "gb_l0") == grammar_id
+                and _part_level(p) == 0):
+            bin_index[nm] = p
+    for raw_name in source_parts:
+        name = str(raw_name or "")
+        if not name:
+            continue
+        p = bin_index.get(name)
+        if p is None:
+            continue
+        body = str(p.get("sequence") or "").upper()
+        if not body:
+            continue
+        pos = insert_seq.find(body)
+        strand = 1
+        if pos < 0:
+            rc_body = _rc(body)
+            pos = insert_seq.find(rc_body)
+            if pos < 0:
+                continue
+            strand = -1
+        ptype = str(p.get("type") or "misc_feature")
+        out.append({
+            "start":  pos,
+            "end":    pos + len(body),
+            "strand": strand,
+            "type":   _GB_PART_TYPE_TO_INSDC.get(
+                ptype, "misc_feature",
+            ),
+            "label":  name,
+            "color":  _GB_TYPE_COLORS.get(ptype, "white"),
+        })
+    return out
+
+
+def _fragment_has_backbone_marker(frag: dict) -> bool:
+    """Return True iff ``frag``'s features include a typical
+    bacterial-backbone marker (origin of replication or antibiotic
+    resistance). Case-insensitive substring match on the feature's
+    label / qualifier.
+
+    Used by `_pick_insert_fragment` to avoid the "smallest fragment
+    is the dropout" heuristic — that rule breaks the moment a
+    stacked-TU/MOD insert outgrows its carrier vector. Looking for
+    the ORIGIN/SELECTION markers is reliable because real Golden
+    Braid / MoClo entry vectors annotate them, and the L0 parts
+    chained INTO an insert never do."""
+    for f in (frag.get("features") or []):
+        if not isinstance(f, dict):
+            continue
+        ftype = str(f.get("type") or "").lower()
+        if ftype in _BACKBONE_FEATURE_TYPES:
+            return True
+        label = str(f.get("label") or "").lower()
+        if not label:
+            continue
+        for kw in _BACKBONE_LABEL_KEYWORDS:
+            if kw in label:
+                return True
+    return False
+
+
+def _pick_insert_fragment(
+    fragments: list[dict],
+    expected_oh5: str = "",
+    expected_oh3: str = "",
+) -> "dict | None":
+    """Pick the "released insert" fragment from a multi-fragment
+    digest. Strategy, in priority order:
+
+    1. **Backbone-marker exclusion** — if exactly one fragment lacks
+       any origin/resistance feature, that's the insert. Reliable
+       across stacked-TU/MOD plasmids where the insert can be much
+       larger than the carrier backbone (the "min size" heuristic
+       would otherwise mis-select once N-TUs grow past the backbone).
+    2. **Overhang match** — when an expected ``(oh5, oh3)`` pair is
+       supplied, prefer a fragment whose left/right overhangs match
+       (in either orientation; reverse-complement of the swap is
+       allowed for backbone-direction agnosticism).
+    3. **Smallest fragment** — legacy fallback. Works for typical
+       single-TU / first-cycle plasmids where backbone > insert.
+
+    Returns the picked fragment dict, or ``None`` when ``fragments``
+    is empty."""
+    if not fragments:
+        return None
+    # Strategy 1 — exclude backbone-marker fragments.
+    insert_candidates = [
+        f for f in fragments
+        if not _fragment_has_backbone_marker(f)
+    ]
+    if len(insert_candidates) == 1:
+        return insert_candidates[0]
+    # Strategy 2 — overhang match (when caller knows what to expect).
+    if expected_oh5 and expected_oh3:
+        e5 = expected_oh5.upper()
+        e3 = expected_oh3.upper()
+        e5_rc = _rc(e5)
+        e3_rc = _rc(e3)
+        for f in fragments:
+            left  = str((f.get("left")  or {}).get("overhang_seq", "")).upper()
+            right = str((f.get("right") or {}).get("overhang_seq", "")).upper()
+            if (left == e5 and right == e3):
+                return f
+            if (left == e3_rc and right == e5_rc):
+                return f
+    # Strategy 3 — smallest fragment (legacy, robust for ≤1-cycle).
+    return min(fragments, key=lambda f: len(f.get("top_seq") or ""))
+
+
+def _pick_backbone_fragment(fragments: list[dict]) -> "dict | None":
+    """Complement of `_pick_insert_fragment` — picks the bacterial
+    backbone half (rep_origin + selection-marker carrier). Strategy:
+
+    1. **Backbone-marker presence** — if exactly one fragment has
+       a backbone marker, that's the backbone. Works whether or not
+       the backbone is the larger fragment (matters when an insert
+       outgrows its carrier in deep cycles, where max-size flips
+       which fragment gets picked).
+    2. **Largest fragment** — legacy fallback. Works for the
+       typical entry-vector + small insert case.
+
+    Used by traditional cloning to keep the user's intended
+    backbone choice stable as inserts grow over multiple cloning
+    cycles. Returns ``None`` when ``fragments`` is empty."""
+    if not fragments:
+        return None
+    backbone_candidates = [
+        f for f in fragments
+        if _fragment_has_backbone_marker(f)
+    ]
+    if len(backbone_candidates) == 1:
+        return backbone_candidates[0]
+    return max(fragments, key=lambda f: len(f.get("top_seq") or ""))
+
+
+# LRU cache for `_assembly_fragment_from_source` digests on L1+ TUs/MODs.
+# Keyed by (gb_text_hash, grammar_id, source_level, primary_enzyme,
+# level_up_enzyme). Without this, `_palette_rows_for_grammar` redigests
+# every saved part on every refresh — a 50-TU bin used to cost 0.25-2.5 s
+# per palette rebuild (palette tab switch, source-level radio, filter
+# toggle). Cap matches `_VECTOR_MATCH_CACHE` rationale: well above the
+# steady-state working set for a single user, small enough that stale
+# entries from a different in-memory grammar don't accumulate. Cleared
+# explicitly by `_save_parts_bin` and `_save_custom_grammars` so a part
+# edit / grammar enzyme change isn't masked by a stale digest.
+_ASSEMBLY_FRAGMENT_CACHE: "_OD[tuple, dict | None]" = _OD()
+_ASSEMBLY_FRAGMENT_CACHE_MAX = 128
+
+
+def _clear_assembly_fragment_cache() -> None:
+    """Drop every cached digest so the next palette refresh / save
+    re-derives overhangs from the current parts bin + grammar
+    state. Called from `_save_parts_bin` and `_save_custom_grammars`."""
+    _ASSEMBLY_FRAGMENT_CACHE.clear()
+
+
 def _assembly_fragment_from_source(
     source: dict, grammar: dict, source_level: int,
 ) -> "dict | None":
-    """Extract a uniform ``{name, sequence, oh5, oh3}`` fragment dict
-    from an L0 part OR an L1+ assembled plasmid, suitable for chaining
-    in a multi-part Golden Braid assembly.
+    """Extract a uniform ``{name, sequence, oh5, oh3, features}``
+    fragment dict from an L0 part OR an L1+ assembled plasmid,
+    suitable for chaining in a multi-part Golden Braid (or any other
+    modular) assembly.
 
     L0 sources read fields directly. L1+ sources are digested with the
-    level-up enzyme (which alternates by level — see
-    ``_enzyme_for_level_up``); the smaller of the two released
-    fragments becomes the carried "insert". Returns ``None`` on any
-    extraction failure so the caller can surface a clean error."""
+    grammar's level-up enzyme; if that yields no clean 2-fragment
+    circular digest the helper falls back to grammar.enzyme (and
+    grammar.level_up_enzyme), so reversed-design vectors keep
+    cycling without a custom grammar. The smaller of the two released
+    fragments becomes the carried "insert", with its features
+    shifted into oh-stripped local coords. Returns ``None`` on any
+    extraction failure so the caller can surface a clean error.
+
+    L1+ digests are LRU-cached by (gb_text_hash, grammar_id,
+    source_level, primary_enzyme, level_up_enzyme); the cache is
+    cleared on parts-bin or grammar saves so a re-domesticated part
+    or a level_up_enzyme tweak takes effect on the next refresh."""
     if source_level <= 0:
         seq = (source.get("sequence") or "").upper()
         oh5 = (source.get("oh5") or "").upper()
@@ -16540,52 +17732,284 @@ def _assembly_fragment_from_source(
             "oh3":      oh3,
             "level":    int(source_level),
         }
-    enzyme = _enzyme_for_level_up(grammar, source_level)
-    if not enzyme:
+    primary_enzyme = _enzyme_for_level_up(grammar, source_level)
+    if not primary_enzyme:
         return None
     gb_text = source.get("gb_text") or ""
     if not gb_text:
         return None
+    # Cache key: gb_text length + a sha-derived hash + grammar id +
+    # source_level + both enzyme candidates. We don't use the raw
+    # gb_text as a key because it can be hundreds of KB and Python
+    # dict hashing would copy the string bytes on every lookup.
+    # `len(gb_text)` first lets the dict bucket on a cheap int while
+    # hash(gb_text) ties the slot to the actual content. False
+    # positives are impossible (Python str hashing is content-based)
+    # and the (gb_text, grammar, level, enzymes) tuple uniquely
+    # identifies the digest result modulo enzyme catalog changes.
+    grammar_secondary_for_key = str(grammar.get("level_up_enzyme") or "")
+    grammar_primary_for_key   = str(grammar.get("enzyme") or "")
+    cache_key = (
+        hash(gb_text), len(gb_text),
+        grammar.get("id") or "",
+        int(source_level),
+        primary_enzyme,
+        grammar_primary_for_key,
+        grammar_secondary_for_key,
+    )
+    cached = _ASSEMBLY_FRAGMENT_CACHE.get(cache_key, _ASSEMBLY_FRAGMENT_CACHE)
+    if cached is not _ASSEMBLY_FRAGMENT_CACHE:
+        # LRU: bump key to most-recent so steady-state queries don't
+        # evict each other.
+        _ASSEMBLY_FRAGMENT_CACHE.move_to_end(cache_key)
+        # Cached value can legitimately be None (digest failed once,
+        # will fail the same way again until parts/grammar change).
+        # Return a deep copy so callers can mutate the dict (e.g.
+        # palette code rewrites name) without poisoning the cache.
+        if cached is None:
+            return None
+        return deepcopy(cached)
     try:
         rec = _gb_text_to_record(gb_text)
     except Exception:
         _log.exception("assembly_fragment: gb_text parse failed for %r",
                         source.get("name"))
+        _ASSEMBLY_FRAGMENT_CACHE[cache_key] = None
         return None
     plasmid_seq = str(rec.seq).upper()
     if not plasmid_seq:
         return None
     topology = (rec.annotations.get("topology", "") or "").lower()
     circular = topology != "linear"
-    try:
-        frags, err = _excise_fragment_pair(
-            plasmid_seq, [enzyme], circular=circular,
-            source_label=source.get("name") or "src",
+    # Marshal source features into the dict shape `_fragments_from_cuts`
+    # expects. Without this, the released fragment carries no
+    # features and downstream MOD assemblies render as a single
+    # collapsed feature named after the entry vector. Skips `source`
+    # rows (whole-record metadata, not biology) and tolerates
+    # whatever qualifier the original GenBank carried for the label.
+    src_features: list[dict] = []
+    total_src = len(rec.seq) if getattr(rec, "seq", None) is not None else 0
+    for f in (rec.features or []):
+        if f.type == "source":
+            continue
+        bounds = _feat_bounds(f, total_src)
+        if bounds is None:
+            continue
+        fs, fe, fstrand = bounds
+        label = ""
+        for k in ("label", "gene", "product", "note"):
+            vals = f.qualifiers.get(k, [])
+            if vals:
+                label = str(vals[0])
+                break
+        # Try to extract a colour qualifier so the assembled MOD
+        # keeps the same chrome the user picked at L0 / TU time.
+        color = ""
+        for k in ("ApEinfo_fwdcolor", "ApEinfo_revcolor", "color"):
+            vals = f.qualifiers.get(k, [])
+            if vals:
+                color = str(vals[0])
+                break
+        src_features.append({
+            "start":  fs, "end":   fe,
+            "strand": fstrand,
+            "type":   f.type,
+            "label":  label or f.type,
+            "color":  color or "white",
+        })
+    # Auto-detect: try the grammar's declared level-up enzyme first,
+    # then fall back to the primary enzyme. Reversed-design vectors
+    # (BsaI INSIDE Esp3I in the alpha cassette) lose the level-up
+    # enzyme's sites during the L0→TU clone — but the OTHER enzyme
+    # (the one used as primary) survives in the assembled TU and IS
+    # the right cutter for that user's TU→MOD step. The fallback
+    # picks whichever enzyme yields a clean 2-fragment circular
+    # digest, so a single grammar can handle both standard and
+    # reversed designs without forcing the user to define a custom
+    # one. For properly-designed standard GB vectors the primary
+    # candidate (level_up_enzyme) succeeds first and the fallback
+    # never triggers — no behavior change.
+    grammar_primary = str(grammar.get("enzyme") or "")
+    grammar_secondary = str(grammar.get("level_up_enzyme") or "")
+    candidates: list[str] = [primary_enzyme]
+    # Both `grammar.enzyme` and `grammar.level_up_enzyme` are
+    # candidates, in that order, after the primary. Dedupe so we
+    # don't re-run the same enzyme. Without this, an even-source-
+    # level (L2, L4 …) digest where `_enzyme_for_level_up` already
+    # returned `grammar.enzyme` would have NO fallback, and a
+    # reversed-design L2+ MOD silently fails the way the user's
+    # ALPHA_TEST_1/2 used to fail at L1 → L2.
+    for cand in (grammar_primary, grammar_secondary):
+        if cand and cand not in candidates:
+            candidates.append(cand)
+    last_err: object = None
+    insert_frag: "dict | None" = None
+    chosen_enzyme: str = ""
+    for enz in candidates:
+        try:
+            frags, err = _excise_fragment_pair(
+                plasmid_seq, [enz], circular=circular,
+                features=src_features,
+                source_label=source.get("name") or "src",
+            )
+        except Exception:
+            _log.exception("assembly_fragment: digest failed for %r",
+                            source.get("name"))
+            continue
+        if err is not None or len(frags) != 2:
+            last_err = err
+            continue
+        # Pick the released-insert fragment via feature-aware
+        # selection (rep_origin / antibiotic-resistance absent).
+        # Falls through to overhang match (if the source's stored
+        # oh5/oh3 are present) and finally to min-size for a
+        # robust legacy default. The min-size rule alone breaks
+        # the moment a multi-TU MOD's insert outgrows the carrier
+        # backbone — a fully-stacked level-up cycle is the
+        # archetype of "insert > backbone".
+        insert_frag = _pick_insert_fragment(
+            frags,
+            expected_oh5=str(source.get("oh5") or ""),
+            expected_oh3=str(source.get("oh3") or ""),
         )
-    except Exception:
-        _log.exception("assembly_fragment: digest failed for %r",
-                        source.get("name"))
+        if insert_frag is None:
+            continue
+        chosen_enzyme = enz
+        if enz != primary_enzyme:
+            _log.info(
+                "assembly_fragment: %r — level_up enzyme %r had no "
+                "clean digest, fell back to %r",
+                source.get("name"), primary_enzyme, enz,
+            )
+        break
+    if insert_frag is None:
+        _log.info(
+            "assembly_fragment: %r — no clean digest under any enzyme "
+            "(%s); last err: %r",
+            source.get("name"), candidates, last_err,
+        )
+        _ASSEMBLY_FRAGMENT_CACHE[cache_key] = None
         return None
-    if err is not None or len(frags) != 2:
-        return None
-    insert_frag = min(frags, key=lambda f: len(f.get("top_seq") or ""))
     top_seq = (insert_frag.get("top_seq") or "").upper()
     oh5 = (insert_frag.get("left")  or {}).get("overhang_seq", "").upper()
     oh3 = (insert_frag.get("right") or {}).get("overhang_seq", "").upper()
     if not top_seq or not oh5 or not oh3:
+        _ASSEMBLY_FRAGMENT_CACHE[cache_key] = None
         return None
     # Strip the leading 4-bp 5' overhang to match the L0 storage
     # convention (sequence WITHOUT the overhang; oh5/oh3 held
     # separately). The right overhang lives between this fragment's
     # cut and the next fragment, so it doesn't appear inside top_seq.
     seq_no_oh = top_seq[len(oh5):] if top_seq.startswith(oh5) else top_seq
-    return {
+    # Shift the fragment-local features to oh-stripped coords. The
+    # released fragment's top_seq starts with the oh5 region; once
+    # we strip it for storage convention, every feature must shift
+    # back by `len(oh5)`. Features whose entire span sat inside
+    # the stripped overhang region collapse to zero-length and are
+    # dropped — an oh5-only feature has no biological meaning in
+    # the chained sequence anyway.
+    frag_features: list[dict] = []
+    for f in (insert_frag.get("features") or []):
+        try:
+            fs = int(f.get("start", 0))
+            fe = int(f.get("end",   0))
+        except (TypeError, ValueError):
+            continue
+        new_s = max(0, fs - len(oh5))
+        new_e = max(0, fe - len(oh5))
+        if new_e <= new_s:
+            continue
+        if new_s >= len(seq_no_oh):
+            continue
+        frag_features.append({
+            **f,
+            "start": new_s,
+            "end":   min(new_e, len(seq_no_oh)),
+        })
+    # Augment with reconstructed L0-part features so every cycle
+    # propagates the full provenance (J23100, cscA, Lambda T0 …)
+    # even when the saved TU/MOD plasmid only carries a single
+    # collapsed feature for the insert region (legacy data, manual
+    # annotations, or sources persisted before multi-feature
+    # support landed). Pure substring search on each `source_parts`
+    # body — works regardless of how the carrier vector lays out
+    # its dropout. Skips features that already exist (same label +
+    # same span) so a fresh multi-feature TU isn't duplicated.
+    src_parts = source.get("source_parts") or []
+    if isinstance(src_parts, (list, tuple)) and src_parts:
+        try:
+            recon = _reconstruct_l0_features_in_seq(
+                seq_no_oh,
+                src_parts,
+                str(grammar.get("id") or ""),
+            )
+        except Exception:
+            _log.exception(
+                "assembly_fragment: L0 feature reconstruction "
+                "raised for %r", source.get("name"),
+            )
+            recon = []
+        if recon:
+            existing_keys = {
+                (str(f.get("label") or ""),
+                 int(f.get("start", -1)),
+                 int(f.get("end",   -1)))
+                for f in frag_features
+            }
+            # Drop features that span ≥2 reconstructed L0 sub-parts:
+            # those are the "ALPHA TEST 1"-style collapsed
+            # annotations that united every L0 position into one
+            # whole-insert block at TU build time. Once we've
+            # surfaced the individual L0 features, the wrapping
+            # block is redundant — keeping it would clutter the
+            # plasmid map with a feature that contains nothing the
+            # smaller features don't already show. Vector backbone
+            # features (HindIII, Ori, AmpR …) sit outside the L0
+            # region so they fail the containment check and stay.
+            kept_features: list[dict] = []
+            for f in frag_features:
+                try:
+                    fs = int(f.get("start", 0))
+                    fe = int(f.get("end",   0))
+                except (TypeError, ValueError):
+                    kept_features.append(f)
+                    continue
+                contained = sum(
+                    1 for r in recon
+                    if int(r.get("start", 0)) >= fs
+                    and int(r.get("end",   0)) <= fe
+                )
+                if contained >= 2:
+                    continue
+                kept_features.append(f)
+            frag_features = kept_features
+            for r in recon:
+                key = (
+                    str(r.get("label") or ""),
+                    int(r.get("start", -1)),
+                    int(r.get("end",   -1)),
+                )
+                if key not in existing_keys:
+                    frag_features.append(r)
+    result = {
         "name":     source.get("name") or "src",
         "sequence": seq_no_oh,
         "oh5":      oh5,
         "oh3":      oh3,
         "level":    int(source_level),
+        "enzyme":   chosen_enzyme,
+        "features": frag_features,
     }
+    # Cache result. Bound the cache to `_ASSEMBLY_FRAGMENT_CACHE_MAX`
+    # via FIFO eviction (the LRU semantics — `move_to_end` on hit —
+    # already keeps the working set warm). Stores a deepcopy so a
+    # caller mutating the returned dict can't poison subsequent
+    # readers; a separate deepcopy is returned so the cached version
+    # stays canonical.
+    _ASSEMBLY_FRAGMENT_CACHE[cache_key] = deepcopy(result)
+    while len(_ASSEMBLY_FRAGMENT_CACHE) > _ASSEMBLY_FRAGMENT_CACHE_MAX:
+        _ASSEMBLY_FRAGMENT_CACHE.popitem(last=False)
+    return result
 
 
 def _clone_assembly_into_entry_vector(
@@ -16652,17 +18076,78 @@ def _clone_assembly_into_entry_vector(
                 i, fragments[i]["oh3"], fragments[i + 1]["oh5"],
             )
             return None
-    # Concatenate top strands. Adjacent overhangs collapse: each
+    # Concatenate top strands AND chain features so the assembled
+    # MOD inherits every promoter / CDS / terminator / colour the
+    # source TUs carried, instead of collapsing into a single
+    # whole-insert feature named after the entry vector. Each
     # fragment contributes its 5'OH (except the first, whose oh5 is
-    # the chain's terminal sticky end) + its body sequence.
+    # the chain's terminal sticky end) + its body sequence; feature
+    # coords shift by the cumulative offset of preceding fragments.
     seq_parts: list[str] = []
+    chained_features: list[dict] = []
+    cursor = 0
+    grammar_id_for_color = grammar.get("id") or ""
     for i, f in enumerate(fragments):
         if i > 0:
+            cursor += len(f["oh5"])
             seq_parts.append(f["oh5"])
-        seq_parts.append(f["sequence"])
+        body = f["sequence"]
+        seq_parts.append(body)
+        # Pull features off the fragment when `_assembly_fragment_from_source`
+        # extracted them (L1+ sources). For L0 sources the helper
+        # returns no features; synthesise one feature per L0 part so
+        # the assembled TU shows the user's promoter / CDS /
+        # terminator names instead of a single "TU1" blob. Type is
+        # taken from the source's `type` field (Promoter, CDS,
+        # Terminator, etc.); colour from the grammar's per-type
+        # colour table when available, else falls back to "white".
+        frag_feats = list(f.get("features") or [])
+        if not frag_feats and body:
+            ptype = ""
+            for s in sources:
+                if (s.get("name") or "") == f["name"]:
+                    ptype = str(s.get("type") or "")
+                    break
+            color = _GB_TYPE_COLORS.get(ptype, "white")
+            frag_feats = [{
+                "start":  0,
+                "end":    len(body),
+                "strand": 1,
+                "type":   _GB_PART_TYPE_TO_INSDC.get(ptype, "misc_feature"),
+                "label":  f["name"],
+                "color":  color,
+            }]
+        for fr in frag_feats:
+            try:
+                fs = int(fr.get("start", 0))
+                fe = int(fr.get("end",   0))
+            except (TypeError, ValueError):
+                continue
+            if fe <= fs:
+                continue
+            chained_features.append({
+                **fr,
+                "start": cursor + fs,
+                "end":   cursor + fe,
+            })
+        cursor += len(body)
     combined_seq = "".join(seq_parts)
-    # Pick the enzyme + site for the level-up step.
-    target_enzyme = _enzyme_for_level_up(grammar, source_level)
+    # Pick the enzyme + site for the level-up step. Prefer whatever
+    # enzyme `_assembly_fragment_from_source` actually used to release
+    # the source fragments — its auto-detect already picked the
+    # enzyme that survives in the user's TU/MOD plasmids, so
+    # cutting the entry vector with the SAME enzyme keeps the
+    # extraction + ligation sides consistent. Falls back to the
+    # grammar-level pick when no fragment carried an explicit
+    # `enzyme` (legacy callers, source_level=0).
+    target_enzyme = ""
+    for f in fragments:
+        cand = str(f.get("enzyme") or "")
+        if cand:
+            target_enzyme = cand
+            break
+    if not target_enzyme:
+        target_enzyme = _enzyme_for_level_up(grammar, source_level)
     if not target_enzyme:
         return None
     target_site = _site_for_enzyme(target_enzyme)
@@ -16679,6 +18164,12 @@ def _clone_assembly_into_entry_vector(
         "type":     ("TU" if source_level == 0 else "MOD"),
         "position": ("TU" if source_level == 0 else "MOD"),
         "grammar":  grammar.get("id"),
+        # Pre-built features signal `_clone_part_into_entry_vector`
+        # to skip the single-name part_feature and use these instead.
+        # Generic across grammars: GB, MoClo, custom — anything that
+        # routes through `_clone_assembly_into_entry_vector` gets the
+        # multi-feature insert by virtue of this key.
+        "features": chained_features,
     }
     return _clone_part_into_entry_vector(
         synthetic, entry_vector, grammar_for_step,
@@ -16866,10 +18357,23 @@ def _splice_part_into_vector_by_overhang(
         for f in (vec_rec.features or []):
             if f.type == "source":
                 continue
-            try:
-                fs = int(f.location.start)
-                fe = int(f.location.end)
-            except Exception:
+            bounds = _feat_bounds(f, n)
+            if bounds is None:
+                continue
+            fs, fe, _f_strand = bounds
+            # Wrap vector features (end < start) can't be shifted by a
+            # linear delta — the new plasmid has a different length and
+            # the origin sits at a different offset. Pre-fix this path
+            # ran `int(loc.start)` which flattened wrap features to
+            # outer bounds and then dropped them as "fully inside the
+            # dropout"; skipping explicitly with a log surfaces the
+            # data loss in the diagnostic bundle instead.
+            if fe < fs:
+                _log.info(
+                    "_assemble_construct: skipping wrap feature %s "
+                    "(%d..%d) — linear-clone shift math can't carry it",
+                    _feat_label(f), fs, fe,
+                )
                 continue
             # Drop features fully inside the dropout
             if fs >= overhang5_end and fe <= overhang3_start:
@@ -17281,6 +18785,11 @@ def _save_custom_grammars(entries: list[dict]) -> None:
     global _grammars_cache
     _safe_save_json(_GRAMMARS_FILE, entries, "Cloning grammars")
     _grammars_cache = deepcopy(entries)
+    # Invalidate the assembly-fragment digest cache: a grammar enzyme
+    # / level_up_enzyme change shifts which fragment a TU/MOD
+    # releases, so the cached overhangs from the previous grammar
+    # must not survive into the next palette refresh.
+    _clear_assembly_fragment_cache()
 
 
 def _all_grammars() -> dict[str, dict]:
@@ -17360,6 +18869,15 @@ def _save_entry_vectors(entries: list[dict]) -> None:
     global _entry_vectors_cache
     _safe_save_json(_ENTRY_VECTORS_FILE, entries, "Entry vectors")
     _entry_vectors_cache = deepcopy(entries)
+    # Drop the digest cache built around the previous EV list — old
+    # entries hanging on after a reconfigure waste cache slots and,
+    # for users who rotate vectors often (testing custom grammars),
+    # would push valid hits out via the FIFO eviction. The cache is
+    # defined later in the file; resolve via `globals()` so this
+    # cross-reference doesn't depend on declaration order.
+    cache = globals().get("_VECTOR_MATCH_CACHE")
+    if isinstance(cache, dict):
+        cache.clear()
 
 
 def _get_entry_vector(
@@ -17411,6 +18929,26 @@ def _set_entry_vector(
         v["role"]       = role
         entries.append(v)
     _save_entry_vectors(entries)
+
+
+def _clear_entry_vectors_for_grammar(grammar_id: str) -> int:
+    """Drop every entry-vector binding for ``grammar_id``, regardless
+    of role. Used by grammar-delete flows so a grammar with multiple
+    role bindings (Constructor's Alpha1/Alpha2/Omega1/Omega2) doesn't
+    leave orphan rows in entry_vectors.json that would silently come
+    back to life if a future custom grammar slugs to the same id.
+
+    Returns the number of bindings removed; 0 when nothing matched.
+    No-op for empty grammar_id (defensive — callers can pass a
+    user-typed value without pre-checking)."""
+    if not isinstance(grammar_id, str) or not grammar_id:
+        return 0
+    entries = _load_entry_vectors()
+    kept = [e for e in entries if e.get("grammar_id") != grammar_id]
+    n_dropped = len(entries) - len(kept)
+    if n_dropped > 0:
+        _save_entry_vectors(kept)
+    return n_dropped
 
 
 # Lowercase keyword → display name. Used by `_detect_selection_marker`
@@ -17487,70 +19025,301 @@ def _detect_selection_marker(gb_text: str) -> "str | None":
     return None
 
 
+# Per-call cache for entry-vector vector-half top_seqs, keyed by
+# (gb_text, enzyme). Re-using the same `_check_vector_match` helper
+# from a single classification call typically hits N entry vectors;
+# without the cache, each call to the helper re-parses + re-digests
+# every EV from scratch. The cache is a free-floating module-level
+# dict (not a method-level @lru_cache because the EV gb_text isn't
+# hashable) and is bounded by `_VECTOR_MATCH_CACHE_MAX` to absorb
+# pathological cases without memory growth. `_save_entry_vectors`
+# clears the cache so a reconfigure doesn't leave stale entries
+# crowding the cap.
+#
+# Cap = 64: covers a typical 2-grammar × 4-role × 2-enzyme footprint
+# (gb_l0 Alpha1/Alpha2/Omega1/Omega2 + moclo_plant Acceptor1/Acceptor2
+# = 12 base entries; with custom grammars + repeated enzyme passes the
+# active set is well under 32, with margin for FIFO churn). Bumped
+# from 32 in 0.7.7.2 after a user with many custom grammars hit
+# steady-state thrashing.
+_VECTOR_MATCH_CACHE: "dict[tuple, str | None]" = {}
+_VECTOR_MATCH_CACHE_MAX = 64
+
+
+def _vector_half_top_seq(ev_gb: str, enzyme: str) -> "str | None":
+    """Cached helper: return the entry vector's vector-half top_seq
+    after digesting with ``enzyme``. Returns None on parse / digest
+    failure or when the EV is non-circular (digest needs a ring).
+    Cache is keyed by ``(ev_gb, enzyme)`` so a saved EV's digest is
+    re-used across `_check_vector_match` calls within a classification
+    run.
+
+    Non-circular EVs are explicitly skipped (returns None) — without
+    the topology check, a linearised EV file would dispatch through
+    `_excise_fragment_pair(circular=True)` and produce nonsense
+    fragments. Better to fail closed than report a phantom match.
+    """
+    key = (ev_gb, enzyme)
+    if key in _VECTOR_MATCH_CACHE:
+        return _VECTOR_MATCH_CACHE[key]
+    result: "str | None" = None
+    try:
+        ev_rec = _gb_text_to_record(ev_gb)
+        topology = (
+            getattr(ev_rec, "annotations", {}) or {}
+        ).get("topology", "")
+        if str(topology).lower() != "circular":
+            # Refuse linearised entry vectors — `_excise_fragment_pair`
+            # with `circular=True` on a linear sequence misreports
+            # cuts at the joined ends.
+            _log.debug(
+                "_vector_half_top_seq: skipping non-circular EV "
+                "(topology=%r)", topology,
+            )
+        else:
+            ev_seq = str(ev_rec.seq).upper()
+            ev_frags, ev_err = _excise_fragment_pair(
+                ev_seq, [enzyme], circular=True,
+            )
+            if ev_err is None and len(ev_frags) == 2:
+                ev_vector_half = max(
+                    ev_frags,
+                    key=lambda f: len(f.get("top_seq") or ""),
+                )
+                result = (
+                    ev_vector_half.get("top_seq") or ""
+                ).upper() or None
+    except Exception:
+        _log.debug(
+            "_vector_half_top_seq: digest failed for enzyme %r", enzyme,
+        )
+    # Bounded LRU-ish: drop one arbitrary entry when over cap. Insertion
+    # order eviction (Python 3.7+ dict preserves insertion order) gives
+    # us FIFO behaviour without an OrderedDict import.
+    if len(_VECTOR_MATCH_CACHE) >= _VECTOR_MATCH_CACHE_MAX:
+        try:
+            _VECTOR_MATCH_CACHE.pop(next(iter(_VECTOR_MATCH_CACHE)))
+        except StopIteration:
+            pass
+    _VECTOR_MATCH_CACHE[key] = result
+    return result
+
+
+def _check_vector_match(
+    gid: str, enzyme: str, user_vector_frag: dict,
+) -> "dict | None":
+    """Compare the user's vector half (the larger digest fragment)
+    against every entry vector configured for grammar ``gid``. Returns
+    ``{role, name, matches: True}`` for the first vector half that's
+    rotationally identical (in either orientation), or ``None`` when
+    no entry vector is configured for ``gid`` / no match is found.
+
+    The comparison uses the same ``enzyme`` that produced the user's
+    digest so the two vector halves are directly comparable. Rotation-
+    invariance is handled by checking whether the user's top_seq is a
+    substring of the entry vector's doubled top_seq — fragments from
+    rotationally equivalent rings have the same content but may start
+    at different positions in the linearised representation. The same
+    test is run against the EV's reverse-complement-doubled seq so an
+    RC-saved user plasmid (the same biological ring written with the
+    other strand on top) still matches.
+
+    Used by `_classify_part_from_plasmid` to surface "this plasmid was
+    cloned into your configured Alpha1 entry vector" so Load Part can
+    confirm the user's expected destination matches before saving.
+    """
+    user_vec_seq = (user_vector_frag.get("top_seq") or "").upper()
+    if not user_vec_seq:
+        return None
+    for ev in _load_entry_vectors():
+        if ev.get("grammar_id") != gid:
+            continue
+        ev_gb = ev.get("gb_text") or ""
+        if not ev_gb:
+            continue
+        ev_vec_seq = _vector_half_top_seq(ev_gb, enzyme)
+        if not ev_vec_seq or len(user_vec_seq) != len(ev_vec_seq):
+            continue
+        if user_vec_seq in (ev_vec_seq + ev_vec_seq):
+            return {
+                "role":    ev.get("role") or "",
+                "name":    ev.get("name", "?"),
+                "matches": True,
+            }
+        # Reverse-strand orientation: the user may have saved the
+        # plasmid with the other strand on top, which makes the
+        # digest's top_seq the RC of the canonical vector half. Try
+        # the RC-doubled form too — same rotation-invariant check.
+        try:
+            rc_doubled = _rc(ev_vec_seq)
+            if rc_doubled and user_vec_seq in (rc_doubled + rc_doubled):
+                return {
+                    "role":    ev.get("role") or "",
+                    "name":    ev.get("name", "?"),
+                    "matches": True,
+                }
+        except Exception:
+            _log.debug(
+                "_check_vector_match: RC fallback failed for ev %r",
+                ev.get("name"),
+            )
+            continue
+    return None
+
+
 def _classify_part_from_plasmid(
     seq: str,
     *,
     circular: bool,
     features: "list[dict] | None" = None,
 ) -> "dict | None":
-    """Identify which cloning grammar + position a circular plasmid
-    holds, by digesting it with each grammar's Type IIS enzyme and
-    matching the released fragment's overhangs against the grammar's
-    position table.
+    """Identify which cloning grammar + position + level a circular
+    plasmid holds, by trying each grammar's primary and secondary
+    Type IIS enzymes and matching the released fragment's overhangs
+    against either the grammar's L0 position table or its TU boundary
+    overhangs (`_grammar_tu_overhangs`).
+
+    SACRED INVARIANT: the (oh5, oh3) overhang pair released by the
+    digest is the **only** input used to determine position type.
+    The classifier never overrides this from feature labels, plasmid
+    name, source filename, or any other heuristic — the user's
+    biological molecule has ONE legal position per overhang pair, so
+    the lookup is unambiguous and the code path must reflect that.
+    Callers can re-tag manually via the Parts Bin Edit modal if they
+    really need to, but the classifier itself stays mechanical.
+
+    Detection cases (per grammar, in registry order):
+      * Primary enzyme cuts → 2 fragments → overhangs match an L0
+        position → returns ``level=0`` (pre-cloning L0 part: native
+        primary cut sites still flank the part body).
+      * Primary enzyme cuts → overhangs match TU boundary → returns
+        ``level=2`` (MOD: parity flips back to primary at L2, so a
+        multi-TU module assembled into an L2 acceptor releases its
+        insert via primary).
+      * Secondary (level-up) enzyme cuts → 2 fragments → overhangs
+        match an L0 position → returns ``level=0`` (post-cloning L0
+        part: the L0 part has already been ligated into its L0 entry
+        vector — pUPD2 et al. — so the primary sites have been
+        consumed and the secondary sites flank the part body, ready
+        for L1 assembly).
+      * Secondary enzyme cuts → overhangs match TU boundary →
+        returns ``level=1`` (TU: a complete L0-ligated transcription
+        unit assembled into an L1 α/Ω acceptor).
 
     Returns ``None`` when no grammar gives a clean (exactly 2-fragment)
-    digest where the smaller fragment's ``(left.overhang_seq,
-    right.overhang_seq)`` pair matches one of the grammar's positions.
-    Otherwise returns ``{grammar_id, grammar_name, position, insert,
-    vector}`` where ``insert`` is the smaller fragment dict and
-    ``vector`` the larger one (so the caller can pull the insert
-    sequence + overhangs straight off the dict).
+    digest with recognised overhangs. Otherwise returns
+    ``{grammar_id, grammar_name, level, position, insert, vector,
+       release_enzyme, entry_vector}`` where:
+      * ``level`` is 0 / 1 / 2 — what the user-facing Parts Bin tab
+        should land it under (mapped by `_part_level_label`).
+      * ``release_enzyme`` is the enzyme that produced the digest,
+        so the caller knows which one will release the insert in
+        downstream assembly.
+      * ``entry_vector`` is None or a `_check_vector_match` result —
+        flags which configured entry vector (if any) the user's
+        vector half matches.
 
     Built-in grammars are tried in registry order (Golden Braid L0
-    first, then MoClo Plant) followed by user-defined grammars, so a
-    plasmid that's compatible with multiple grammars resolves to the
-    first match — typically what the user expects since L0 / L1 use
-    different enzymes and a real Golden Braid L0 part can only digest
-    cleanly with Esp3I.
+    first, then MoClo Plant) followed by user-defined grammars. Per-
+    grammar enzyme order is primary → secondary so a pre-cloning L0
+    plasmid (cuts on primary) classifies before falling through to
+    the secondary check; for a post-cloning L0 plasmid (no primary
+    sites) the primary digest yields 0 fragments and the secondary
+    pass picks it up.
 
-    Linear records skip the digest (a linear "part" can't be cleanly
-    excised; the overhangs in the .gb annotation are the source of
-    truth and we don't try to back-derive them here)."""
+    Linear records skip the digest — a linear "part" can't be cleanly
+    excised, and the overhangs in the .gb annotation are the source
+    of truth in that case.
+    """
     if not seq or not circular:
         return None
     grammars = _all_grammars()
     for gid, grammar in grammars.items():
-        enzyme = grammar.get("enzyme")
-        if not isinstance(enzyme, str) or not enzyme:
-            continue
-        try:
-            frags, err = _excise_fragment_pair(
-                seq, [enzyme], circular=True,
-                features=features,
-                source_label=grammar.get("name", gid),
-            )
-        except Exception:
-            _log.exception("_classify_part_from_plasmid: digest failed for %s", gid)
-            continue
-        if err is not None or len(frags) != 2:
-            continue
-        # Smaller fragment is the insert; larger is the vector.
-        insert = min(frags, key=lambda f: len(f.get("top_seq") or ""))
-        vector = max(frags, key=lambda f: len(f.get("top_seq") or ""))
-        oh5 = (insert.get("left")  or {}).get("overhang_seq", "").upper()
-        oh3 = (insert.get("right") or {}).get("overhang_seq", "").upper()
-        if not oh5 or not oh3:
-            continue
-        for pos in grammar.get("positions") or []:
-            pos_oh5 = str(pos.get("oh5", "")).upper()
-            pos_oh3 = str(pos.get("oh3", "")).upper()
-            if pos_oh5 == oh5 and pos_oh3 == oh3:
+        primary   = grammar.get("enzyme")
+        secondary = (grammar.get("level_up_enzyme")
+                     or grammar.get("enzyme"))
+        for enzyme_role, enzyme in (
+            ("primary",   primary),
+            ("secondary", secondary),
+        ):
+            if not isinstance(enzyme, str) or not enzyme:
+                continue
+            # Skip the secondary pass entirely when it's the same as
+            # the primary (custom grammar that omits `level_up_enzyme`)
+            # — we'd just re-run the same digest with the same outcome.
+            if enzyme_role == "secondary" and enzyme == primary:
+                continue
+            try:
+                frags, err = _excise_fragment_pair(
+                    seq, [enzyme], circular=True,
+                    features=features,
+                    source_label=grammar.get("name", gid),
+                )
+            except Exception:
+                _log.exception(
+                    "_classify_part_from_plasmid: %s digest failed for %s",
+                    enzyme_role, gid,
+                )
+                continue
+            if err is not None or len(frags) != 2:
+                continue
+            # Feature-aware pick: insert = no rep_origin / selection
+            # marker, vector = the carrier with those markers.
+            # Falls back to size when the feature signal is
+            # ambiguous, so a properly-annotated plasmid is
+            # classified correctly even when its insert outgrew
+            # the backbone in deep cycles.
+            insert = _pick_insert_fragment(frags) or frags[0]
+            vector = _pick_backbone_fragment(frags) or frags[1 if frags[0] is insert else 0]
+            oh5 = (insert.get("left")  or {}).get("overhang_seq", "").upper()
+            oh3 = (insert.get("right") or {}).get("overhang_seq", "").upper()
+            if not oh5 or not oh3:
+                continue
+            # First check: the L0 position table. Both pre- and post-
+            # cloning L0 parts land here — only the enzyme differs
+            # (primary for pre-cloning, secondary for post-cloning).
+            for pos in (grammar.get("positions") or []):
+                pos_oh5 = str(pos.get("oh5", "")).upper()
+                pos_oh3 = str(pos.get("oh3", "")).upper()
+                if pos_oh5 == oh5 and pos_oh3 == oh3:
+                    return {
+                        "grammar_id":     gid,
+                        "grammar_name":   grammar.get("name", gid),
+                        "level":          0,
+                        "position":       dict(pos),
+                        "insert":         insert,
+                        "vector":         vector,
+                        "release_enzyme": enzyme,
+                        "entry_vector":   _check_vector_match(
+                            gid, enzyme, vector,
+                        ),
+                    }
+            # Second check: TU boundary overhangs. The level depends
+            # on enzyme parity — secondary release ⇒ TU (L1), primary
+            # release ⇒ MOD (L2).
+            tu_start, tu_end = _grammar_tu_overhangs(grammar)
+            if (tu_start and tu_end
+                    and tu_start.upper() == oh5
+                    and tu_end.upper()   == oh3):
+                level = 1 if enzyme_role == "secondary" else 2
+                position = {
+                    "name":  _part_level_label(level),
+                    "type":  _part_level_label(level),
+                    "oh5":   tu_start,
+                    "oh3":   tu_end,
+                    "color": "white",
+                }
                 return {
-                    "grammar_id":   gid,
-                    "grammar_name": grammar.get("name", gid),
-                    "position":     dict(pos),
-                    "insert":       insert,
-                    "vector":       vector,
+                    "grammar_id":     gid,
+                    "grammar_name":   grammar.get("name", gid),
+                    "level":          level,
+                    "position":       position,
+                    "insert":         insert,
+                    "vector":         vector,
+                    "release_enzyme": enzyme,
+                    "entry_vector":   _check_vector_match(
+                        gid, enzyme, vector,
+                    ),
                 }
     return None
 
@@ -17614,14 +19383,29 @@ def _level_matches_tab(part_level: int, tab_level: int) -> bool:
     """True iff a part with ``part_level`` belongs in the ``tab_level``
     Parts Bin tab / Constructor palette filter.
 
-    Tabs L0 (0) and TU (1) exact-match their level; the MOD tab
-    (2) absorbs every level ≥ 2 (L2 / L3 / L4 / …). Used by the
-    parts-bin row filter, the constructor's palette refresh, and
-    the lane-resolver's identity match — extracted so the rule
-    change in one place propagates everywhere."""
-    if tab_level < 2:
-        return part_level == tab_level
-    return part_level >= 2
+    Tab L0 (0) is the only strict-match level — L0 parts are
+    domesticated entities, biologically distinct from any
+    assembled plasmid. Every higher-level tab absorbs its own
+    level AND everything above:
+
+      * TU tab (1) → level ≥ 1 (TUs + MODs + L3 + …)
+      * MOD tab (2) → level ≥ 2 (MODs + L3 + …)
+
+    Rationale: a MOD plasmid carries a chain that, after the
+    correct level-up digest, can ligate into a "TU → MOD"
+    assembly alongside a real TU — same enzyme, same overhang
+    shape. Hiding the MOD from the TU palette would force users
+    to re-do their library tagging just to chain plasmids the
+    bench reaction handles fine. The compatibility check at
+    save-time still flags overhang mismatches, so the user can
+    SEE every candidate without losing the safety net.
+
+    Used by the parts-bin row filter, the constructor's palette
+    refresh, and the lane-resolver's identity match — extracted
+    so the rule change in one place propagates everywhere."""
+    if tab_level <= 0:
+        return part_level == 0
+    return part_level >= tab_level
 
 
 def _enzyme_for_level_up(grammar: dict, source_level: int) -> str:
@@ -18210,6 +19994,11 @@ def _save_parts_bin(entries: list[dict]) -> None:
     # caller, so subsequent caller mutations (e.g. modal Cancel that
     # didn't actually save) leaked back into the next `_load_parts_bin`.
     _parts_bin_cache = deepcopy(entries)
+    # Invalidate the assembly-fragment digest cache: a part edit
+    # (re-domestication, gb_text rewrite, deleted entry) shifts what
+    # `_assembly_fragment_from_source` yields, so stale digests
+    # would surface old overhangs in the constructor palette.
+    _clear_assembly_fragment_cache()
 
 
 # ── Primer design (Primer3-backed) ─────────────────────────────────────────────
@@ -18739,12 +20528,13 @@ def _codon_raw_from_json(blob: dict) -> dict:
 
 
 def _codon_tables_load() -> list[dict]:
-    """Load codon-table registry. Returns a list of dicts; each entry has
-    an extra 'raw' in-memory form with tuples. Seeds built-in E. coli K12
-    on first run so the library is never empty."""
+    """Load codon-table registry. Returns a deep copy so caller-side
+    mutation of the `raw` dict (e.g. an in-progress Kazusa import edit)
+    can't poison the cache — matches invariant #17. Seeds built-in
+    E. coli K12 on first run so the library is never empty."""
     global _codon_tables_cache
     if _codon_tables_cache is not None:
-        return list(_codon_tables_cache)
+        return deepcopy(_codon_tables_cache)
     entries, warning = _safe_load_json(_CODON_TABLES_FILE, "Codon table library")
     if warning:
         _log.warning("Codon table library: %s", warning)
@@ -18775,11 +20565,14 @@ def _codon_tables_load() -> list[dict]:
         _codon_tables_save(fixed)
     else:
         _codon_tables_cache = fixed
-    return list(_codon_tables_cache)
+    return deepcopy(_codon_tables_cache)
 
 
 def _codon_tables_save(entries: list[dict]) -> None:
-    """Persist registry to disk via _safe_save_json (atomic, .bak)."""
+    """Persist registry to disk via _safe_save_json (atomic, .bak).
+    Re-seats the cache with a deep copy so callers that retain a reference
+    to the input list (and continue mutating it) can't leak post-save
+    edits into the next reader. Matches invariant #17."""
     global _codon_tables_cache
     serializable = [{
         "name":   e.get("name", "?"),
@@ -18789,7 +20582,7 @@ def _codon_tables_save(entries: list[dict]) -> None:
         "raw":    _codon_raw_to_json(e.get("raw", {})),
     } for e in entries]
     _safe_save_json(_CODON_TABLES_FILE, serializable, "Codon table library")
-    _codon_tables_cache = list(entries)
+    _codon_tables_cache = deepcopy(entries)
 
 
 def _codon_tables_add(name: str, taxid: str, raw: dict,
@@ -18921,18 +20714,56 @@ def _codon_parse_kazusa_html(html: str) -> "dict | None":
 
 
 def _safe_xml_parse(xml_data: str):
-    """Parse XML with basic defense against billion-laughs / XXE tricks.
+    """Parse XML with defense against billion-laughs / XXE tricks.
 
     Python's stdlib ET (expat) already refuses to fetch external entities
     since 3.7.1, so the remaining attack surface is DTD-declared entity
-    expansion. Rejecting any DOCTYPE/ENTITY up front is a dep-free guard
-    against a compromised NCBI mirror or MITM. NCBI's real responses
-    have no DTD, so this never false-positives.
+    expansion. Pre-fix we substring-matched `<!doctype` / `<!entity` only
+    in the FIRST 4096 chars — exploitable with a long whitespace /
+    comment prefix that pushes the DOCTYPE past the window.
+
+    Replaced with a streaming prologue scan: skip leading whitespace +
+    comments + processing instructions and inspect the first non-trivial
+    declaration. If it's a DOCTYPE / ENTITY, refuse before handing to
+    expat. NCBI / Kazusa / .dna history XML have no legitimate DTD, so
+    this never false-positives.
     """
     import xml.etree.ElementTree as ET
-    head = xml_data[:4096].lower()
-    if "<!doctype" in head or "<!entity" in head:
-        raise ET.ParseError("XML contains DTD/ENTITY — refusing to parse")
+    # Streaming prologue scan: advance past whitespace, comments, and
+    # processing instructions to find the first non-trivial declaration.
+    i = 0
+    n = len(xml_data)
+    while i < n:
+        c = xml_data[i]
+        if c in " \t\r\n":
+            i += 1
+            continue
+        # Comment: <!-- ... -->
+        if xml_data.startswith("<!--", i):
+            end = xml_data.find("-->", i + 4)
+            if end == -1:
+                # Unterminated comment — defer to expat for the parse
+                # error so the user sees the proper diagnostic.
+                break
+            i = end + 3
+            continue
+        # Processing instruction: <?xml version="1.0"?> etc.
+        if xml_data.startswith("<?", i):
+            end = xml_data.find("?>", i + 2)
+            if end == -1:
+                break
+            i = end + 2
+            continue
+        # DOCTYPE / ENTITY declaration — refuse.
+        # Case-insensitive check on the next ~16 chars (case-folding
+        # the WHOLE document is expensive on multi-MB inputs).
+        head = xml_data[i:i + 16].lower()
+        if head.startswith("<!doctype") or head.startswith("<!entity"):
+            raise ET.ParseError(
+                "XML contains DTD/ENTITY — refusing to parse"
+            )
+        # Reached a normal start tag — safe to hand off to expat.
+        break
     return ET.fromstring(xml_data)
 
 
@@ -22182,6 +24013,89 @@ def _ungapped_extend(
             total_score, total_matches)
 
 
+# Per-plasmid size cap for the BLAST DB index. Plasmids exceeding this
+# get skipped with a notify rather than blowing up the worker. 10 Mbp
+# is 2× the soft "large plasmid" threshold (`_LARGE_PLASMID_BP`); a
+# typical Mbp-scale chromosome dump still indexes, but a full mammalian
+# chromosome (250 Mbp) would be refused. The k-mer index for a single
+# plasmid costs ~150 B per base on both strands — 10 Mbp ≈ 3 GB index.
+_BLAST_DB_BUILD_MAX_PER_PLASMID_BP = 10_000_000
+
+# Total-collection size cap. Sum of every included plasmid's length
+# (after per-plasmid skips); refuse the build outright if it crosses
+# this. 25 Mbp ≈ 7-8 GB of index in the worst case (BLASTN, both
+# strands), at the upper edge of what a typical 16 GB host absorbs
+# without paging. Exceeding the cap raises `_BlastDbTooLargeError`
+# which the worker surfaces as a clear status-bar message rather
+# than the kernel SIGKILLing the process mid-build.
+_BLAST_DB_BUILD_MAX_TOTAL_BP = 25_000_000
+
+
+class _BlastDbTooLargeError(MemoryError):
+    """Raised by `_blast_filter_oversized` when the post-skip total bp
+    across the selected collections exceeds `_BLAST_DB_BUILD_MAX_TOTAL_BP`.
+    Subclasses `MemoryError` so the existing worker `except Exception`
+    path catches it; the dedicated type lets tests assert on the
+    refusal flow specifically."""
+
+
+def _blast_filter_oversized(
+    cols: "list[dict]",
+) -> "tuple[list[dict], list[dict], int]":
+    """Pre-flight pass for `_blast_build_db`. Skips plasmids exceeding
+    the per-plasmid bp cap and raises if the post-skip total still
+    exceeds the collection cap. Returns
+    ``(filtered_cols, skipped_entries, total_bp)``.
+
+    Each ``skipped_entries`` element carries ``{collection, name,
+    size, reason}`` so the caller can surface a clear summary to the
+    user. ``total_bp`` is the sum of every kept plasmid's reported
+    size — used by the caller for status / telemetry.
+
+    The size lookup falls back to ``len(gb_text)`` when the entry's
+    cached ``size`` is missing or zero (legacy collection rows). It's
+    a rough proxy — gb_text includes header bytes — but it's a safe
+    over-estimate, which is the right side to err on for a cap.
+    """
+    filtered: list[dict] = []
+    skipped:  list[dict] = []
+    total_bp = 0
+    for c in cols:
+        kept_plasmids: list[dict] = []
+        for entry in (c.get("plasmids") or []):
+            if not isinstance(entry, dict):
+                continue
+            sz = int(entry.get("size", 0) or 0)
+            if not sz:
+                gb = entry.get("gb_text") or ""
+                sz = len(gb)
+            if sz > _BLAST_DB_BUILD_MAX_PER_PLASMID_BP:
+                skipped.append({
+                    "collection": c.get("name", "?"),
+                    "name":       (entry.get("name")
+                                   or entry.get("id")
+                                   or "?"),
+                    "size":       sz,
+                    "reason":     (
+                        f"exceeds per-plasmid cap "
+                        f"({_BLAST_DB_BUILD_MAX_PER_PLASMID_BP:,} bp)"
+                    ),
+                })
+                continue
+            kept_plasmids.append(entry)
+            total_bp += sz
+        if kept_plasmids:
+            filtered.append({**c, "plasmids": kept_plasmids})
+    if total_bp > _BLAST_DB_BUILD_MAX_TOTAL_BP:
+        raise _BlastDbTooLargeError(
+            f"Total sequence ({total_bp:,} bp) exceeds the BLAST DB "
+            f"build cap ({_BLAST_DB_BUILD_MAX_TOTAL_BP:,} bp). Filter "
+            f"to a smaller subset of collections in the picker, or "
+            f"split a large plasmid into its own collection."
+        )
+    return filtered, skipped, total_bp
+
+
 def _blast_build_db(program: str,
                     collection_names: "list[str] | None" = None,
                     *, six_frame: bool = False) -> dict:
@@ -22198,10 +24112,20 @@ def _blast_build_db(program: str,
     regions; off by default because the noise floor is much higher
     than the curated CDS-only path.
 
+    A pre-flight pass (`_blast_filter_oversized`) skips per-plasmid
+    rows over `_BLAST_DB_BUILD_MAX_PER_PLASMID_BP` (default 10 Mbp)
+    and raises `_BlastDbTooLargeError` when the post-skip total
+    exceeds `_BLAST_DB_BUILD_MAX_TOTAL_BP` (default 25 Mbp). Without
+    this guard the kernel OOM-kills the worker mid-build on chromosome
+    -scale collections — the `except Exception` in `_do_build` never
+    fires and the user just sees the app vanish.
+
     Returned db schema:
       ``{"program": str, "k": int, "subjects":
          [{"id", "name", "seq_fwd", "seq_rev"?, "kind"}],
-         "kmer_index": {kmer: [(subject_idx, position, strand)]}
+         "kmer_index": {kmer: [(subject_idx, position, strand)]},
+         "skipped":    [{"collection", "name", "size", "reason"}, ...],
+         "total_bp":   int  # post-skip total, for the status line
         }``
 
     For BLASTN, ``subjects`` are full plasmid sequences; the index covers
@@ -22214,11 +24138,18 @@ def _blast_build_db(program: str,
         wanted = set(collection_names)
         cols = [c for c in cols if c.get("name") in wanted]
 
+    cols, skipped, total_bp = _blast_filter_oversized(cols)
+
     if program == "blastn":
-        return _blast_build_db_blastn(cols)
-    if program == "blastp":
-        return _blast_build_db_blastp(cols, six_frame=six_frame)
-    return {"program": program, "k": 0, "subjects": [], "kmer_index": {}}
+        db = _blast_build_db_blastn(cols)
+    elif program == "blastp":
+        db = _blast_build_db_blastp(cols, six_frame=six_frame)
+    else:
+        db = {"program": program, "k": 0,
+              "subjects": [], "kmer_index": {}}
+    db["skipped"]  = skipped
+    db["total_bp"] = total_bp
+    return db
 
 
 def _blast_build_db_blastn(cols: "list[dict]") -> dict:
@@ -23232,7 +25163,7 @@ class BlastModal(ModalScreen):
             return ""
         return (inp.value or "").strip()
 
-    @work(thread=True)
+    @work(thread=True, exclusive=True, group="blast_run")
     def _do_run_hmmscan(self, query: str, hmm_path: str,
                         truncated: bool) -> None:
         try:
@@ -23291,7 +25222,7 @@ class BlastModal(ModalScreen):
         except NoMatches:
             return False
 
-    @work(thread=True)
+    @work(thread=True, exclusive=True, group="blast_run")
     def _do_run(self, prog: str, query: str,
                 col_filter: "list[str] | None",
                 src_label: str, truncated: bool) -> None:
@@ -23445,7 +25376,22 @@ class BlastModal(ModalScreen):
         if err_msg or db is None:
             self._safe_status(f"[red]{err_msg or 'unknown failure'}[/red]")
             return
-        self._safe_status(f"[green]{_blast_db_summary(db)}[/green]")
+        summary = _blast_db_summary(db)
+        # Surface the skipped-plasmid count + first few names so the
+        # user knows why a plasmid they expected to find isn't in the
+        # index. Show up to 3 names, then "+N more" — keeps the
+        # status line readable even with a huge skip set.
+        skipped = db.get("skipped") or []
+        if skipped:
+            n = len(skipped)
+            preview = ", ".join(s.get("name") or "?" for s in skipped[:3])
+            if n > 3:
+                preview += f", +{n - 3} more"
+            summary += (
+                f" [yellow](skipped {n} oversized "
+                f"plasmid{'' if n == 1 else 's'}: {preview})[/yellow]"
+            )
+        self._safe_status(f"[green]{summary}[/green]")
 
     def _format_hits(self, program: str, query: str,
                      hits: "list[dict]", db: dict) -> str:
@@ -24678,26 +26624,62 @@ class GrammarEditorModal(ModalScreen):
         Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
-    def __init__(self, grammar_id: str) -> None:
+    def __init__(self, grammar_id: str = "") -> None:
         super().__init__()
+        # `grammar_id == ""` is the sentinel for "create new". The
+        # actual id gets slugged from the user-typed name on Save —
+        # see `_save`. Empty-id mode is fully editable, has no entry
+        # vector pre-bound, and never touches `_BUILTIN_GRAMMARS`.
         self._grammar_id = grammar_id
-        self._is_builtin = grammar_id in _BUILTIN_GRAMMARS
-        # Snapshot the grammar dict so cancel discards in-flight edits.
-        grammars = _all_grammars()
-        self._grammar = deepcopy(
-            grammars.get(grammar_id, _BUILTIN_GRAMMARS["gb_l0"])
+        self._create_mode = (grammar_id == "")
+        self._is_builtin = (
+            (not self._create_mode) and grammar_id in _BUILTIN_GRAMMARS
         )
+        if self._create_mode:
+            # Blank-but-typed scaffold so the form's IUPAC validators
+            # have something concrete to push back on. Saner defaults
+            # than empty strings — the user gets a structured starting
+            # point even for a brand-new grammar.
+            self._grammar = {
+                "id":              "",
+                "name":            "",
+                "enzyme":          "",
+                "level_up_enzyme": "",
+                "site":            "",
+                "spacer":          "",
+                "pad":             "",
+                "forbidden_sites": {},
+                "positions":       [],
+                "coding_types":    [],
+                "type_to_insdc":   {},
+                "catalog":         [],
+                "editable":        True,
+            }
+        else:
+            # Snapshot the grammar dict so cancel discards in-flight edits.
+            grammars = _all_grammars()
+            self._grammar = deepcopy(
+                grammars.get(grammar_id, _BUILTIN_GRAMMARS["gb_l0"])
+            )
         # Entry vector is editable for ALL grammars (built-in or
         # custom). Stored separately from the grammar dict in
         # `entry_vectors.json` so the canonical built-in grammar
-        # definitions stay immutable.
-        self._entry_vector = _get_entry_vector(grammar_id)
+        # definitions stay immutable. Create-mode starts with no bound
+        # vector — the user binds one after the grammar exists on disk
+        # (entry_vectors.json keys by grammar_id, so the binding only
+        # makes sense post-Save).
+        self._entry_vector = (
+            None if self._create_mode else _get_entry_vector(grammar_id)
+        )
 
     def compose(self) -> ComposeResult:
         g = self._grammar
         editable = not self._is_builtin
         with Vertical(id="ged-dlg"):
-            title = f" Grammar: {g.get('name', '?')}"
+            if self._create_mode:
+                title = " New Grammar"
+            else:
+                title = f" Grammar: {g.get('name', '?')}"
             if self._is_builtin:
                 title += "   [built-in, read-only]"
             yield Static(title, id="ged-title")
@@ -24708,28 +26690,47 @@ class GrammarEditorModal(ModalScreen):
                     "Duplicate from the Parts Bin to fork an editable copy.",
                     id="ged-builtin-banner",
                 )
+            elif self._create_mode:
+                yield Static(
+                    "  Pick a unique name, an enzyme + recognition site, "
+                    "and at least one position. The grammar's id is "
+                    "slugged from the name on Save.",
+                    id="ged-builtin-banner",
+                )
 
             with ScrollableContainer(id="ged-body"):
                 # ── Entry vector ─────────────────────────────────────
-                # Always editable (even on built-in grammars) — the
-                # entry vector is grammar-scoped meta, not part of
-                # the canonical grammar definition. Stored in
-                # `entry_vectors.json` and persisted *immediately*
+                # Always editable for existing grammars (built-in or
+                # custom) — the entry vector is grammar-scoped meta,
+                # not part of the canonical grammar definition. Stored
+                # in `entry_vectors.json` and persisted *immediately*
                 # on pick (no need to hit Save), so users can
-                # configure even read-only built-ins.
+                # configure even read-only built-ins. Disabled in
+                # create-mode because entry_vectors.json keys by
+                # grammar_id, which doesn't exist until first Save.
                 yield Label("Entry vector  (the destination plasmid for assemblies):")
                 with Horizontal(id="ged-entry-row"):
-                    yield Static(self._entry_vector_summary(),
-                                 id="ged-entry-info", markup=True)
+                    if self._create_mode:
+                        yield Static(
+                            "[dim](bind a vector after Save — "
+                            "the grammar id is needed to key the binding)[/dim]",
+                            id="ged-entry-info", markup=True,
+                        )
+                    else:
+                        yield Static(self._entry_vector_summary(),
+                                     id="ged-entry-info", markup=True)
                 with Horizontal(id="ged-entry-btns"):
                     yield Button("Pick from library…",
-                                 id="btn-ged-entry-lib")
+                                 id="btn-ged-entry-lib",
+                                 disabled=self._create_mode)
                     yield Button("Open file…",
-                                 id="btn-ged-entry-file")
+                                 id="btn-ged-entry-file",
+                                 disabled=self._create_mode)
                     yield Button("Clear",
                                  id="btn-ged-entry-clear",
                                  variant="error",
-                                 disabled=self._entry_vector is None)
+                                 disabled=(self._create_mode
+                                            or self._entry_vector is None))
 
                 yield Label("Name:")
                 yield Input(value=g.get("name", ""),
@@ -24742,6 +26743,20 @@ class GrammarEditorModal(ModalScreen):
                     yield Label("Recognition:", classes="ged-inline-label")
                     yield Input(value=g.get("site", ""),
                                 id="ged-site", disabled=not editable)
+
+                # Level-up enzyme is the Type IIS used at the NEXT
+                # cycle step (TU→MOD, MOD→next). Empty / blank →
+                # `_enzyme_for_level_up` falls back to the primary
+                # enzyme so single-level grammars still work. For
+                # iterative cycles (Golden Braid, MoClo) the user
+                # picks a second enzyme that survives the L0 dropout
+                # so the assembled plasmid can be re-digested.
+                with Horizontal(id="ged-lvlup-row"):
+                    yield Label("Level-up enzyme:", classes="ged-inline-label")
+                    yield Input(value=g.get("level_up_enzyme", ""),
+                                id="ged-level-up-enzyme",
+                                placeholder="(optional — for iterative cycles)",
+                                disabled=not editable)
 
                 with Horizontal(id="ged-tail-row"):
                     yield Label("Spacer:", classes="ged-inline-label")
@@ -24901,21 +26916,60 @@ class GrammarEditorModal(ModalScreen):
         if parsed is None:
             return
         entries = _load_custom_grammars()
-        for i, e in enumerate(entries):
-            if e.get("id") == self._grammar_id:
-                entries[i] = parsed
-                break
-        else:
+        new_id_for_create: str = ""
+        if self._create_mode:
+            # Slug a unique grammar id from the user-typed name. Avoid
+            # collisions against both built-in IDs and any existing
+            # custom grammar so the new entry gets its own row in
+            # `cloning_grammars.json` (rather than overwriting an
+            # unrelated grammar that happens to share a slug).
+            base = re.sub(
+                r"[^A-Za-z0-9_]+", "_",
+                parsed.get("name", "") or "custom_grammar",
+            ).strip("_") or "custom_grammar"
+            taken = {gid for gid in _BUILTIN_GRAMMARS}
+            taken.update(e.get("id") or "" for e in entries)
+            new_id_for_create = base
+            suffix = 2
+            while new_id_for_create in taken:
+                new_id_for_create = f"{base}_{suffix}"
+                suffix += 1
+            parsed["id"] = new_id_for_create
             entries.append(parsed)
+        else:
+            for i, e in enumerate(entries):
+                if e.get("id") == self._grammar_id:
+                    entries[i] = parsed
+                    break
+            else:
+                entries.append(parsed)
         try:
             _save_custom_grammars(entries)
         except (OSError, ValueError) as exc:
+            # Defer the in-memory id flip until AFTER the save
+            # commits — a disk-full / RO-mount failure shouldn't
+            # leave the modal half-committed (its `_grammar_id` set
+            # to a slug that doesn't exist on disk; a retry would
+            # re-slug from scratch and pick a different id, leaving
+            # both the orphan slug AND the new attempt visible to
+            # the user).
             _log.exception("Grammar save failed")
             self.app.notify(f"Save failed: {exc}", severity="error")
             return
+        # Save committed — now safe to flip the modal's view of the
+        # grammar id. Done here, post-save, so the failure path
+        # above leaves `_grammar_id` and `_create_mode` exactly as
+        # they were on entry to the modal session.
+        if self._create_mode:
+            self._grammar_id = new_id_for_create
+            self._create_mode = False
+        # Dismiss with the new (or existing) id so the caller's
+        # callback (e.g. `GrammarManagerModal._refresh_table`) can
+        # focus the just-saved row instead of resetting the cursor
+        # to the top of the table.
         self.app.notify(f"Saved grammar '{parsed.get('name')}'.",
                         severity="success", markup=False)
-        self.dismiss("saved")
+        self.dismiss(self._grammar_id)
 
     @on(Button.Pressed, "#btn-ged-delete")
     def _delete(self, _) -> None:
@@ -24935,6 +26989,22 @@ class GrammarEditorModal(ModalScreen):
             _log.exception("Grammar delete failed")
             self.app.notify(f"Delete failed: {exc}", severity="error")
             return
+        # Clear EVERY entry-vector binding for the deleted grammar
+        # (Constructor's Alpha1/Alpha2/Omega1/Omega2 + the default
+        # role) so a future custom grammar that slugs to the same
+        # id doesn't inherit ghost bindings. The legacy
+        # `_set_entry_vector(gid, None)` only cleared the default
+        # role and left every Constructor binding orphan.
+        try:
+            _clear_entry_vectors_for_grammar(self._grammar_id)
+        except Exception:
+            _log.exception(
+                "Grammar delete: entry-vector cleanup failed",
+            )
+        # Drop the deleted grammar from active_grammar so the rest
+        # of the app keeps a valid handle.
+        if _get_setting("active_grammar") == self._grammar_id:
+            _set_setting("active_grammar", "gb_l0")
         self.app.notify(
             f"Deleted grammar '{self._grammar.get('name', self._grammar_id)}'."
         )
@@ -24948,6 +27018,7 @@ class GrammarEditorModal(ModalScreen):
         try:
             name      = self.query_one("#ged-name",      Input).value.strip()
             enzyme    = self.query_one("#ged-enzyme",    Input).value.strip()
+            level_up  = self.query_one("#ged-level-up-enzyme", Input).value.strip()
             site      = self.query_one("#ged-site",      Input).value.strip().upper()
             spacer    = self.query_one("#ged-spacer",    Input).value.strip().upper()
             pad       = self.query_one("#ged-pad",       Input).value.strip().upper()
@@ -24962,10 +27033,33 @@ class GrammarEditorModal(ModalScreen):
         if not name:
             status.update("[red]Name cannot be empty.[/red]")
             return None
-        for label, val in (("Enzyme", enzyme),):
-            if not val:
-                status.update(f"[red]{label} cannot be empty.[/red]")
-                return None
+        if not enzyme:
+            status.update("[red]Enzyme cannot be empty.[/red]")
+            return None
+        if enzyme not in _NEB_ENZYMES:
+            # Casing matters in `_NEB_ENZYMES` (`BsaI`, not `bsai`),
+            # so we don't auto-coerce — surface the error so the
+            # user fixes the casing themselves rather than saving a
+            # silently-broken grammar that fails every digest at
+            # runtime with cryptic "no clean digest" messages.
+            status.update(
+                f"[red]Enzyme {enzyme!r} not in NEB catalog. "
+                f"Examples: BsaI, Esp3I, BpiI, BbsI.[/red]"
+            )
+            return None
+        # `level_up` is optional (single-step grammars leave it
+        # blank) but if provided it MUST resolve to a real enzyme,
+        # otherwise iterative cycles silently degrade — the user
+        # would build a TU thinking it can chain into a MOD, hit
+        # Save To Library, and get an opaque "no clean digest"
+        # error from the assembly simulator.
+        if level_up and level_up not in _NEB_ENZYMES:
+            status.update(
+                f"[red]Level-up enzyme {level_up!r} not in NEB "
+                f"catalog. Leave blank for single-step grammars, or "
+                f"pick from NEB names (Esp3I, BsaI, BpiI, …).[/red]"
+            )
+            return None
         for label, val in (
             ("Recognition site", site),
             ("Spacer", spacer),
@@ -25074,6 +27168,7 @@ class GrammarEditorModal(ModalScreen):
             "id":              self._grammar_id,
             "name":            name,
             "enzyme":          enzyme,
+            "level_up_enzyme": level_up,
             "site":            site,
             "spacer":          spacer,
             "pad":             pad,
@@ -25084,6 +27179,412 @@ class GrammarEditorModal(ModalScreen):
             "catalog":         self._grammar.get("catalog", []) or [],
             "editable":        True,
         }
+
+
+class EditGrammarConfirmModal(ModalScreen):
+    """Warning before opening `GrammarEditorModal` on a custom
+    grammar. Surfaces the fact that edits propagate to every
+    TU/MOD already saved under this grammar — overhang positions
+    can shift, enzyme assignments change which fragments digest
+    cleanly, and the persisted parts may stop chaining at the
+    next cycle. Default focus on `Cancel`."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, grammar_name: str, n_dependents: int = 0) -> None:
+        super().__init__()
+        self._grammar_name = grammar_name
+        self._n_dependents = n_dependents
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="gec-dlg"):
+            yield Static(" Edit Grammar? ", id="gec-title")
+            from rich.markup import escape as _esc
+            nm = _esc(self._grammar_name)
+            if self._n_dependents > 0:
+                msg = (
+                    f"  You're about to edit grammar [bold]{nm}[/bold].\n"
+                    f"  [yellow]{self._n_dependents}[/yellow] saved "
+                    f"part{'s' if self._n_dependents != 1 else ''} "
+                    f"reference{'' if self._n_dependents != 1 else 's'} "
+                    f"this grammar.\n"
+                    f"  Changes to enzyme, recognition, or overhang "
+                    f"positions can break those parts' chaining."
+                )
+            else:
+                msg = (
+                    f"  You're about to edit grammar [bold]{nm}[/bold].\n"
+                    f"  Changes to enzyme, recognition site, or overhang "
+                    f"positions can\n"
+                    f"  invalidate any TUs / MODs you save under this "
+                    f"grammar later."
+                )
+            yield Static(msg, id="gec-msg", markup=True)
+            with Horizontal(id="gec-btns"):
+                yield Button("Cancel", id="btn-gec-no", variant="default")
+                yield Button("Edit",   id="btn-gec-yes", variant="warning")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#btn-gec-no", Button).focus()
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-gec-no")
+    def _no(self, _): self.dismiss(False)
+
+    @on(Button.Pressed, "#btn-gec-yes")
+    def _yes(self, _): self.dismiss(True)
+
+    def action_cancel(self): self.dismiss(False)
+
+
+class _ConfirmDeleteGrammarModal(ModalScreen):
+    """Confirmation prompt before `GrammarManagerModal._delete`
+    actually wipes a custom grammar + its entry-vector bindings.
+    Same shape as `EditGrammarConfirmModal` but with a red Delete
+    button and a body that quantifies the blast radius (how many
+    parts reference this grammar, what cleanup will run). Default
+    focus on Cancel — protects against an accidental Enter on the
+    bare Delete button in the manager."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, grammar_name: str, body_markup: str) -> None:
+        super().__init__()
+        self._grammar_name = grammar_name
+        self._body = body_markup
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="gec-dlg"):
+            yield Static(" Delete Grammar? ", id="gec-title")
+            yield Static(self._body, id="gec-msg", markup=True)
+            with Horizontal(id="gec-btns"):
+                yield Button("Cancel", id="btn-gec-no",
+                             variant="default")
+                yield Button("Delete", id="btn-gec-yes",
+                             variant="error")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#btn-gec-no", Button).focus()
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-gec-no")
+    def _no(self, _): self.dismiss(False)
+
+    @on(Button.Pressed, "#btn-gec-yes")
+    def _yes(self, _): self.dismiss(True)
+
+    def action_cancel(self): self.dismiss(False)
+
+
+
+class GrammarManagerModal(ModalScreen):
+    """List all cloning grammars and let the user create / edit /
+    delete custom ones. Built-in grammars (gb_l0, moclo_plant) appear
+    in the list as read-only — Edit opens them in `GrammarEditorModal`
+    in built-in / read-only mode, Delete is disabled.
+
+    Custom grammars get the full lifecycle:
+
+      * **+ New** — opens `GrammarEditorModal` in create-mode
+        (``grammar_id=""``); on Save the editor slugs the user-typed
+        name into a unique id and persists to ``cloning_grammars.json``.
+      * **Edit** — wraps the editor launch with
+        `EditGrammarConfirmModal` so the user knows the edit can
+        cascade into already-saved TUs/MODs.
+      * **Delete** — confirmation through a small inline notify; the
+        actual remove goes through the editor's existing Delete path
+        for symmetry.
+
+    Dismisses with ``None`` (caller doesn't need a return value — the
+    modal mutates the underlying ``cloning_grammars.json`` directly).
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="gmgr-dlg"):
+            yield Static(" Cloning grammars ", id="gmgr-title")
+            yield DataTable(id="gmgr-table",
+                              cursor_type="row",
+                              zebra_stripes=True)
+            with Horizontal(id="gmgr-btns"):
+                yield Button("+ New",  id="btn-gmgr-new",  variant="primary")
+                yield Button("Edit",   id="btn-gmgr-edit", variant="default")
+                yield Button("Delete", id="btn-gmgr-del",  variant="error")
+                yield Button("Close",  id="btn-gmgr-close")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#gmgr-table", DataTable)
+        t.add_columns("Name", "Type", "Enzyme", "Level-up", "Positions")
+        self._refresh_table()
+
+    def _refresh_table(self) -> None:
+        try:
+            t = self.query_one("#gmgr-table", DataTable)
+        except NoMatches:
+            return
+        t.clear()
+        # Built-ins first (canonical reference order), then custom
+        # grammars sorted alphanumerically by display name so the
+        # user's custom set scans naturally.
+        rows: list[tuple[str, str, dict]] = []
+        for gid in _BUILTIN_GRAMMARS:
+            g = _BUILTIN_GRAMMARS[gid]
+            rows.append((gid, "built-in", g))
+        custom = [(g.get("id") or "", "custom", g)
+                   for g in _load_custom_grammars()
+                   if g.get("id")]
+        custom.sort(key=lambda r: _natural_sort_key(
+            str(r[2].get("name") or "")))
+        rows.extend(custom)
+        for gid, kind, g in rows:
+            level_up = g.get("level_up_enzyme") or g.get("enzyme") or ""
+            t.add_row(
+                str(g.get("name") or "?"),
+                kind,
+                str(g.get("enzyme") or "?"),
+                str(level_up),
+                str(len(g.get("positions") or [])),
+                key=gid,
+            )
+
+    def _selected_gid(self) -> str:
+        try:
+            t = self.query_one("#gmgr-table", DataTable)
+        except NoMatches:
+            return ""
+        return _cursor_row_key(t) or ""
+
+    def _focus_gid(self, gid: str) -> None:
+        """Move the manager's table cursor to the row whose key
+        matches ``gid``. Used after Save / Delete / New so the user
+        doesn't lose their place. Best-effort: no-ops if the table
+        isn't mounted or the gid isn't in the current rows."""
+        if not gid:
+            return
+        try:
+            t = self.query_one("#gmgr-table", DataTable)
+        except NoMatches:
+            return
+        for i, row_key in enumerate(t.rows.keys()):
+            if getattr(row_key, "value", None) == gid:
+                try:
+                    t.move_cursor(row=i)
+                except Exception:
+                    pass
+                return
+
+    @on(Button.Pressed, "#btn-gmgr-new")
+    def _new(self, _) -> None:
+        def _on_done(result):
+            self._refresh_table()
+            # `GrammarEditorModal._save` dismisses with the new id
+            # (or the existing id for an in-place edit). Focus the
+            # row so the user lands on their freshly-created grammar
+            # instead of bouncing back to row 0 (the gb_l0 built-in).
+            if isinstance(result, str) and result:
+                self._focus_gid(result)
+        self.app.push_screen(GrammarEditorModal(""), _on_done)
+
+    @on(Button.Pressed, "#btn-gmgr-edit")
+    def _edit(self, _) -> None:
+        gid = self._selected_gid()
+        if not gid:
+            self.app.notify("Select a grammar first.", severity="warning")
+            return
+        # Built-ins skip the warning — they're read-only anyway, so
+        # the editor just shows the canonical fields and the user can
+        # bind / clear an entry vector. Custom grammars get the
+        # cascade-warning so the user knows mid-flight edits can
+        # invalidate already-saved TUs.
+        if gid in _BUILTIN_GRAMMARS:
+            def _on_done_builtin(result):
+                self._refresh_table()
+                if isinstance(result, str) and result:
+                    self._focus_gid(result)
+                else:
+                    self._focus_gid(gid)
+            self.app.push_screen(GrammarEditorModal(gid), _on_done_builtin)
+            return
+        all_grammars = _all_grammars()
+        g = all_grammars.get(gid, {})
+        nm = str(g.get("name") or gid)
+        # Count parts that reference this grammar so the warning can
+        # mention concrete impact ("3 saved TUs use this grammar").
+        n_dependents = 0
+        try:
+            for p in _load_parts_bin():
+                if (p.get("grammar") or "gb_l0") == gid:
+                    n_dependents += 1
+        except Exception:
+            n_dependents = 0
+
+        def _open_editor() -> None:
+            def _on_done(result):
+                self._refresh_table()
+                if isinstance(result, str) and result:
+                    self._focus_gid(result)
+                else:
+                    # Fall back to the original gid when the editor
+                    # dismisses with None (cancel) or "deleted".
+                    self._focus_gid(gid)
+            self.app.push_screen(GrammarEditorModal(gid), _on_done)
+
+        # Skip the warning when there's nothing to warn about: a
+        # grammar with zero saved dependents can't break anything
+        # downstream, so the friction-vs-safety trade falls on the
+        # friction side. The user still sees the editor's own
+        # built-in/read-only banner if applicable.
+        if n_dependents == 0:
+            _open_editor()
+            return
+
+        def _confirmed(go: "bool | None") -> None:
+            if go:
+                _open_editor()
+
+        self.app.push_screen(
+            EditGrammarConfirmModal(nm, n_dependents),
+            _confirmed,
+        )
+
+    @on(Button.Pressed, "#btn-gmgr-del")
+    def _delete(self, _) -> None:
+        gid = self._selected_gid()
+        if not gid:
+            self.app.notify("Select a grammar first.", severity="warning")
+            return
+        if gid in _BUILTIN_GRAMMARS:
+            self.app.notify(
+                "Built-in grammars can't be deleted.",
+                severity="warning",
+            )
+            return
+        entries = _load_custom_grammars()
+        target = next((e for e in entries if e.get("id") == gid), None)
+        if target is None:
+            self.app.notify("Grammar not found.", severity="warning")
+            return
+        nm = str(target.get("name") or gid)
+        # Count dependent parts so the confirmation surfaces the
+        # actual blast radius. Cheap O(n_parts); the bin is small.
+        n_dependents = 0
+        try:
+            for p in _load_parts_bin():
+                if (p.get("grammar") or "gb_l0") == gid:
+                    n_dependents += 1
+        except Exception:
+            n_dependents = 0
+        # Capture cursor position now so we can restore focus near
+        # the deleted row after the table rebuild — without this,
+        # the cursor jumps back to row 0 (the gb_l0 built-in) on
+        # every delete, forcing the user to re-scroll for their
+        # next custom grammar.
+        try:
+            t = self.query_one("#gmgr-table", DataTable)
+            cursor_idx = t.cursor_row
+        except (NoMatches, AttributeError):
+            cursor_idx = -1
+
+        def _confirmed(go: "bool | None") -> None:
+            if not go:
+                return
+            entries_now = _load_custom_grammars()
+            target_now = next(
+                (e for e in entries_now if e.get("id") == gid), None,
+            )
+            if target_now is None:
+                # Got deleted underneath us (parallel session, manual
+                # edit). Surface so the user knows the action no-op'd
+                # but isn't a bug.
+                self.app.notify(
+                    f"Grammar '{nm}' was already removed.",
+                    severity="warning",
+                )
+                self._refresh_table()
+                return
+            new_entries = [e for e in entries_now if e.get("id") != gid]
+            try:
+                _save_custom_grammars(new_entries)
+            except (OSError, ValueError) as exc:
+                _log.exception("Grammar delete failed")
+                self.app.notify(
+                    f"Delete failed: {exc}", severity="error",
+                )
+                return
+            # Clear EVERY entry-vector binding (Alpha1/Alpha2/Omega1/
+            # Omega2 / etc.) keyed to this grammar id so a stale
+            # binding doesn't ghost back when a future grammar
+            # slugs to the same id. The default-role path on the old
+            # `_set_entry_vector(gid, None)` only cleared one of N.
+            try:
+                _clear_entry_vectors_for_grammar(gid)
+            except Exception:
+                _log.exception(
+                    "Grammar delete: entry-vector cleanup failed",
+                )
+            # If the just-deleted grammar was the active one, fall
+            # back to gb_l0 so the rest of the app keeps a valid
+            # handle.
+            if _get_setting("active_grammar") == gid:
+                _set_setting("active_grammar", "gb_l0")
+            self.app.notify(f"Deleted grammar '{nm}'.")
+            self._refresh_table()
+            # Restore cursor to whichever row now sits where the
+            # deleted one used to be (or the previous row if we
+            # nuked the last one). Built-ins occupy the head of the
+            # table; custom grammars start after them, so we never
+            # let the cursor land on a built-in by accident.
+            try:
+                t2 = self.query_one("#gmgr-table", DataTable)
+                row_count = t2.row_count
+                if row_count > 0 and cursor_idx >= 0:
+                    new_idx = min(cursor_idx, row_count - 1)
+                    t2.move_cursor(row=new_idx)
+            except (NoMatches, AttributeError):
+                pass
+
+        # Confirmation modal — built on the same shape as
+        # `EditGrammarConfirmModal` but framed for delete (red
+        # button, blast-radius copy). One mis-click on the bare
+        # Delete button used to wipe the grammar plus all of its
+        # entry-vector bindings without any prompt.
+        msg = (
+            f"  About to delete custom grammar [bold]{nm}[/bold].\n"
+        )
+        if n_dependents > 0:
+            msg += (
+                f"  [yellow]{n_dependents}[/yellow] saved "
+                f"part{'s' if n_dependents != 1 else ''} "
+                f"reference{'' if n_dependents != 1 else 's'} "
+                f"this grammar — they'll keep their gb_text but "
+                f"may stop chaining at the next cycle.\n"
+            )
+        msg += "  Entry-vector bindings for this grammar will also be removed."
+        self.app.push_screen(
+            _ConfirmDeleteGrammarModal(nm, msg),
+            _confirmed,
+        )
+
+    @on(Button.Pressed, "#btn-gmgr-close")
+    def _close(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 # ── Parts bin modal ────────────────────────────────────────────────────────────
@@ -25779,10 +28280,17 @@ class PartsBinModal(Screen):
         L0 (the only level that existed pre-2026-05-10) so they show
         up under the L0 tab without a migration step.
 
-        Level filter:
-          * tab L0  → ``_part_level(p) == 0``
-          * tab TU  → ``_part_level(p) == 1``
-          * tab MOD → ``_part_level(p) >= 2``
+        Level filter (per `_level_matches_tab`):
+          * tab L0  → ``_part_level(p) == 0`` (strict)
+          * tab TU  → ``_part_level(p) >= 1`` (TUs + MODs + L3 + …)
+          * tab MOD → ``_part_level(p) >= 2`` (MODs + L3 + …)
+
+        Higher-level entries appear in lower-level tabs because
+        the same plasmid can serve as a source for the next cycle
+        regardless of its labelled level — the bench reaction
+        only cares that the released overhangs match the
+        destination dropout, which the assembly simulator + the
+        constructor's compatibility check both verify.
         """
         rows: list[dict] = []
         active = self._active_level
@@ -26505,60 +29013,80 @@ class PartsBinModal(Screen):
 
     @on(Button.Pressed, "#btn-load-part")
     def _load_part(self, _) -> None:
-        """Take the currently-loaded plasmid, classify it against every
-        cloning grammar via Type IIS digest, and save it as a Parts
-        Bin row tagged with the detected grammar / position / marker.
+        """Open the source picker; on dismiss with a SeqRecord, classify
+        it against every cloning grammar via Type IIS digest, and save
+        the matched insert as a Parts Bin row tagged with the detected
+        grammar / position / marker.
 
-        For users who already domesticated a part externally and just
-        want to register it in the bin without going through the full
-        Domesticator modal. ``_classify_part_from_plasmid`` does the
-        per-grammar digest; ``_detect_selection_marker`` reads the
-        marker off the plasmid's CDS labels.
+        Pre-2026-05-10 this took ``self.app._current_record`` directly,
+        forcing the user to load the candidate plasmid onto the main
+        canvas first. The picker covers the common cases (any saved
+        plasmid in any collection, or a fresh ``.gb`` / ``.dna`` from
+        disk) without disturbing whatever the user already has open.
 
-        Pre-flight checks (record present, circular topology) run on
-        the UI thread so the user sees the warning toast immediately;
-        the actual digest + serialise + save happens in a worker so a
+        Pre-flight (circular topology) runs on the picker's callback
+        so the user sees the warning toast immediately; the digest +
+        serialise + save still happens in a ``@work`` thread so a
         50 kbp plasmid × N grammars doesn't freeze the modal.
         """
-        rec = getattr(self.app, "_current_record", None)
-        if rec is None:
-            self.app.notify(
-                "Load a plasmid first — Load Part takes the currently-"
-                "open record.",
-                severity="warning",
+        def _on_picked(record) -> None:
+            if record is None:
+                return
+            # Defensive: PartsBin may have unmounted between the
+            # picker's dismiss and this callback firing (rare, but
+            # possible if app.exit() interleaves). Bail without
+            # spawning a worker against a dead screen.
+            if not self.is_mounted:
+                return
+            # Empty / missing seq → classifier returns None → useless
+            # toast. Catch here so the warning is specific (the
+            # picker pre-flights the same case but defensive layering
+            # is cheap).
+            seq_len = len(getattr(record, "seq", "") or "")
+            if seq_len == 0:
+                self.app.notify(
+                    "Picked record has no sequence content.",
+                    severity="warning",
+                )
+                return
+            circular = (
+                (record.annotations or {}).get("topology", "").lower()
+                == "circular"
             )
-            return
-        circular = (
-            (rec.annotations or {}).get("topology", "").lower() == "circular"
-        )
-        if not circular:
-            self.app.notify(
-                "Load Part needs a circular plasmid (digest into 2 "
-                "fragments). The current record is linear.",
-                severity="warning",
-            )
-            return
-        # Snapshot inputs at click time so a record swap mid-digest
-        # can't cause us to save a part derived from the OLD plasmid
-        # but tagged with the NEW plasmid's name.
-        seq = str(rec.seq).upper()
-        try:
-            pm = self.app.query_one("#plasmid-map", PlasmidMap)
-            feats = list(pm._feats)
-        except NoMatches:
-            feats = []
-        plasmid_name = (getattr(rec, "name", "")
-                        or getattr(rec, "id", "")
-                        or "imported")
-        # Try to serialise on the UI thread — `_record_to_gb_text` is
-        # quick for typical plasmids and surfaces the failure with the
-        # currently-active record, not a stale snapshot.
-        try:
-            gb_text = _record_to_gb_text(rec)
-        except Exception:
-            _log.exception("Load Part: GenBank serialise failed")
-            gb_text = ""
-        self._load_part_worker(seq, feats, plasmid_name, gb_text)
+            if not circular:
+                self.app.notify(
+                    "Load Part needs a circular plasmid (digest into "
+                    "2 fragments). The picked record is linear.",
+                    severity="warning",
+                )
+                return
+            seq = str(record.seq).upper()
+            plasmid_name = (getattr(record, "name", "")
+                            or getattr(record, "id", "")
+                            or "imported")
+            # Reuse the original library `gb_text` if the picker
+            # stashed it (`record._tui_gb_text`) — saves a parse →
+            # serialise round-trip and preserves the exact qualifier
+            # formatting `_detect_selection_marker` regex-matches
+            # against. Falls back to a fresh serialise for the
+            # OpenFile path (where only the parsed record is
+            # available).
+            gb_text = getattr(record, "_tui_gb_text", None)
+            if not gb_text:
+                try:
+                    gb_text = _record_to_gb_text(record)
+                except Exception:
+                    _log.exception(
+                        "Load Part: GenBank serialise failed",
+                    )
+                    gb_text = ""
+            # The classifier reads only `top_seq` + overhangs off the
+            # post-digest fragments, so feature plumbing is unnecessary
+            # here (was previously sourced from the canvas's PlasmidMap;
+            # the picker no longer touches the canvas).
+            self._load_part_worker(seq, [], plasmid_name, gb_text)
+
+        self.app.push_screen(LoadPartSourceModal(), callback=_on_picked)
 
     @work(thread=True)
     def _load_part_worker(self, seq: str, feats: list,
@@ -26614,6 +29142,11 @@ class PartsBinModal(Screen):
         # downstream overhang — so we don't try.
         if oh5 and insert_seq.startswith(oh5):
             insert_seq = insert_seq[len(oh5):]
+        # `level` comes from the classifier — a TU plasmid (BsaI-flanked
+        # body with TU boundary overhangs) lands at level=1, a MOD at
+        # level=2, and an L0 part (with either primary or secondary
+        # release enzyme) at level=0. Pre-2026-05-10 this was hardcoded
+        # 0, which mis-tabbed every TU/MOD plasmid into the L0 tab.
         part = {
             "name":       plasmid_name,
             "type":       position.get("type") or "?",
@@ -26628,7 +29161,7 @@ class PartsBinModal(Screen):
             "fwd_tm":     0.0,
             "rev_tm":     0.0,
             "grammar":    grammar_id,
-            "level":      0,
+            "level":      int(match.get("level", 0) or 0),
         }
         try:
             entries = _load_parts_bin()
@@ -26649,12 +29182,23 @@ class PartsBinModal(Screen):
             # saved. The user just won't have the active-grammar tab
             # auto-flip on next launch.
             _log.exception("Load Part: persist active_grammar failed")
+        # Surface the entry-vector match in the toast so the user sees
+        # whether their plasmid actually fits a configured destination.
+        # Stays silent when no entry vector is configured for the
+        # grammar — most users haven't bound one yet.
+        ev = match.get("entry_vector") or {}
+        ev_msg = ""
+        if ev.get("matches"):
+            role = ev.get("role") or ""
+            role_str = f" / {role}" if role else ""
+            ev_msg = f" Vector: {ev.get('name', '?')}{role_str}."
+        level_label = _part_level_label(int(match.get("level", 0) or 0))
         self.app.call_from_thread(self._populate)
         self.app.call_from_thread(
             self.app.notify,
             f"Loaded '{plasmid_name}' as {match['grammar_name']} → "
             f"{position.get('name')} ({position.get('type')}). "
-            f"Marker: {marker}.",
+            f"Level: {level_label}. Marker: {marker}.{ev_msg}",
         )
 
     @on(Button.Pressed, "#btn-parts-export-fasta")
@@ -27839,7 +30383,7 @@ class PlasmidsaurusAlignModal(ModalScreen):
             gbk_text = _extract_gbk_member(self._zip_path,
                                               self._selected_member)
             query_rec = _gb_text_to_record(gbk_text)
-        except (ValueError, Exception) as exc:
+        except (ValueError, OSError, RuntimeError) as exc:
             _log.exception("PlasmidsaurusAlignModal: extract / parse failed")
             self.query_one("#align-status", Static).update(
                 f"[red]{_esc_md(str(exc))}[/red]"
@@ -27857,34 +30401,82 @@ class PlasmidsaurusAlignModal(ModalScreen):
             return
         try:
             target_rec = _gb_text_to_record(target_entry.get("gb_text", ""))
-        except Exception as exc:
+        except (ValueError, RuntimeError) as exc:
             _log.exception("PlasmidsaurusAlignModal: target parse failed")
             self.query_one("#align-status", Static).update(
                 f"[red]Target parse failed: {_esc_md(str(exc))}[/red]"
             )
             return
-        # Run the alignment.
+        # Dispatch alignment to a worker — the C-loop dominates for
+        # 100+ kbp sequences (1–2 s frozen UI on a 200 kbp x 200 kbp
+        # pair, uncancellable per CLAUDE.md invariant 28). Pre-fix the
+        # synchronous call here hitched the modal while the load
+        # counter ticked; the worker captures it at entry so a later
+        # plasmid swap discards the result rather than painting an
+        # alignment for a record the canvas no longer shows.
+        self.query_one("#align-status", Static).update(
+            "[dim]Aligning… (may take a few seconds for big plasmids)[/dim]"
+        )
+        target_label = target_entry.get("name") or target_id
+        self._align_worker(
+            query_seq=str(query_rec.seq),
+            target_seq=str(target_rec.seq),
+            query_label=self._selected_member,
+            target_label=target_label,
+            target_record=target_rec,
+            entry_counter=getattr(self.app, "_record_load_counter", 0),
+        )
+
+    @work(thread=True, exclusive=True, group="plasmidsaurus_align")
+    def _align_worker(self, *, query_seq: str, target_seq: str,
+                       query_label: str, target_label: str,
+                       target_record, entry_counter: int) -> None:
+        """Worker: run `_pairwise_align` off the UI thread, then push
+        the visualisation screen. Inputs captured at entry; stale-load
+        guard on the load counter (mirrors `_restr_scan_worker`)."""
         try:
             result = _pairwise_align(
-                str(query_rec.seq),
-                str(target_rec.seq),
-                mode="global",
+                query_seq, target_seq, mode="global",
             )
         except ValueError as exc:
-            self.query_one("#align-status", Static).update(
-                f"[red]Alignment failed: {_esc_md(str(exc))}[/red]"
-            )
+            def _err():
+                try:
+                    self.query_one("#align-status", Static).update(
+                        f"[red]Alignment failed: {_esc_md(str(exc))}[/red]"
+                    )
+                except NoMatches:
+                    pass
+            self.app.call_from_thread(_err)
             return
-        # Push the visualisation screen, then dismiss this modal.
-        self.app.push_screen(
-            AlignmentScreen(
-                query_label=self._selected_member,
-                target_label=target_entry.get("name") or target_id,
-                target_record=target_rec,
-                result=result,
+        except Exception as exc:
+            _log.exception("PlasmidsaurusAlignModal worker failed")
+            def _err():
+                try:
+                    self.query_one("#align-status", Static).update(
+                        f"[red]Alignment failed: {_esc_md(str(exc))}[/red]"
+                    )
+                except NoMatches:
+                    pass
+            self.app.call_from_thread(_err)
+            return
+
+        def _show():
+            # Stale-load guard: discard if user swapped plasmids while
+            # the C-loop ran. Pre-fix the worker's push_screen happily
+            # painted an alignment for the OLD record.
+            if (getattr(self.app, "_record_load_counter", 0)
+                    != entry_counter):
+                return
+            self.app.push_screen(
+                AlignmentScreen(
+                    query_label=query_label,
+                    target_label=target_label,
+                    target_record=target_record,
+                    result=result,
+                )
             )
-        )
-        self.dismiss(result)
+            self.dismiss(result)
+        self.app.call_from_thread(_show)
 
     @on(Button.Pressed, "#btn-align-cancel")
     def _cancel_btn(self, _) -> None:
@@ -28116,22 +30708,28 @@ def _feats_for_domesticator(record) -> list[dict]:
     """Parse a SeqRecord into the shape the DomesticatorModal feature picker
     expects: ``{label, type, start, end, strand}`` per non-source feature.
 
-    Kept deliberately simpler than ``PlasmidMap._parse`` — compound/wrap
-    features are flattened to their outer bounds (the domesticator only
-    needs slice coordinates, not rendering geometry), and restriction-site
-    overlays are skipped. Features with non-integer coords or zero width
-    are dropped rather than raising."""
+    Wrap-aware via ``_feat_bounds`` — an origin-spanning feature is encoded
+    as ``end < start`` so downstream ``_design_gb_primers`` rotates around
+    the wrap (pitfall #6). Pre-fix this flattened wrap features to outer
+    bounds, then the picker showed ``5800..50`` as a 5750 bp linear span
+    and the domesticator designed primers against the inverted backbone
+    region rather than the user's feature.
+
+    Restriction-site overlays are skipped; features with non-integer coords
+    or zero width are dropped rather than raising."""
     out: list[dict] = []
     total = len(getattr(record, "seq", "") or "")
     for feat in getattr(record, "features", []) or []:
         if feat.type in ("source", "resite", "recut"):
             continue
-        try:
-            start = int(feat.location.start)
-            end   = int(feat.location.end)
-        except (TypeError, ValueError):
+        bounds = _feat_bounds(feat, total)
+        if bounds is None:
             continue
+        start, end, strand = bounds
         if total > 0:
+            # Clamp coords that exceed sequence length; wrap features
+            # already have both bounds inside [0, total] by construction
+            # so clamping is a no-op for them.
             start = max(0, min(start, total))
             end   = max(0, min(end,   total))
         if start == end:
@@ -28141,7 +30739,7 @@ def _feats_for_domesticator(record) -> list[dict]:
             "type":   feat.type,
             "start":  start,
             "end":    end,
-            "strand": getattr(feat.location, "strand", 1) or 1,
+            "strand": strand,
         })
     return out
 
@@ -28247,12 +30845,19 @@ class DomesticatorModal(ModalScreen):
 
     def _plasmid_feat_options(self) -> list[tuple[str, str]]:
         """Build Select options for the currently-picked plasmid's features.
-        Value is the index (as str) into ``self._plasmid_pick_feats``."""
+        Value is the index (as str) into ``self._plasmid_pick_feats``.
+        Wrap features render as ``S+1..0..E`` via `_feat_span_label` so the
+        user can spot origin-spanning features in the dropdown."""
         opts: list[tuple[str, str]] = []
+        total = len(self._plasmid_pick_seq)
         for i, f in enumerate(self._plasmid_pick_feats):
             label = f.get("label") or f.get("type", "?")
             s, e  = f.get("start", 0), f.get("end", 0)
-            opts.append((f"{label}  ({s+1}‥{e})", str(i)))
+            if e < s:
+                span = f"{s+1}..0..{e}"
+            else:
+                span = f"{s+1}‥{e}"
+            opts.append((f"{label}  ({span})", str(i)))
         return opts
 
     def compose(self) -> ComposeResult:
@@ -29219,17 +31824,25 @@ class TraditionalCloningPane(Vertical):
         feat_select = self.query_one("#trad-feature-select", Select)
         opts: list[tuple[str, str]] = []
         idx = 0
+        total = len(rec.seq) if getattr(rec, "seq", None) is not None else 0
         for f in rec.features:
             if f.type == "source":
                 continue
             label = ((f.qualifiers.get("label") or [""])[0]
                        or f.type or "(unnamed)")
-            try:
-                s = int(f.location.start)
-                e = int(f.location.end)
-            except (TypeError, ValueError):
+            bounds = _feat_bounds(f, total)
+            if bounds is None:
                 continue
-            opts.append((f"{label}  ({f.type}, {s}..{e})", str(idx)))
+            s, e, _strand = bounds
+            # `_feat_span_label` renders a wrap feature as ``S..0..E`` so
+            # the user can tell at a glance that this feature crosses
+            # the origin; the original ``f"{s}..{e}"`` made wrap features
+            # look like very long linear spans (the backbone gap), which
+            # downstream sliced wrong sequence on Build.
+            opts.append((
+                f"{label}  ({f.type}, {_feat_span_label(s, e, total)})",
+                str(idx),
+            ))
             idx += 1
         if not opts:
             opts = [("(no annotated features)", "")]
@@ -29365,9 +31978,13 @@ class TraditionalCloningPane(Vertical):
                 f"(got {len(frags)}). Pick different enzymes.[/]"
             )
             return None
-        # Default: smaller fragment is the insert.
-        insert = min(frags, key=lambda f: len(f["top_seq"]))
-        return insert
+        # Pick the released-insert fragment via feature-aware
+        # selection (rep_origin / antibiotic-resistance absent).
+        # Falls back to smallest-fragment when feature detection
+        # is ambiguous — same shared helper the modular path uses,
+        # so traditional cloning behaves the same way when an
+        # insert outgrows its carrier across deep cycles.
+        return _pick_insert_fragment(frags) or frags[0]
 
     def _build_insert_from_feature(self, enzymes: list[str],
                                       results: "Static") -> "dict | None":
@@ -29396,14 +32013,20 @@ class TraditionalCloningPane(Vertical):
             results.update("[red]Selected feature out of range.[/]")
             return None
         feat = feats_iter[feat_idx]
-        try:
-            s = int(feat.location.start)
-            e = int(feat.location.end)
-        except (TypeError, ValueError):
+        seq = str(rec.seq)
+        total = len(seq)
+        bounds = _feat_bounds(feat, total)
+        if bounds is None:
             results.update("[red]Feature has unparseable coordinates.[/]")
             return None
-        seq = str(rec.seq)
-        feat_seq = seq[s:e] if e > s else (seq[s:] + seq[:e])
+        s, e, _strand = bounds
+        # `_slice_circular` is wrap-aware: an origin-spanning feature
+        # encoded as `end < start` correctly returns `seq[s:] + seq[:e]`.
+        # Pre-fix `int(loc.start)/int(loc.end)` flattened the wrap and the
+        # `if e > s` branch always wrongly hit `seq[s:e]` — the BACKBONE
+        # GAP. Silent biological corruption (wrong restriction sites,
+        # wrong cloning recommendation).
+        feat_seq = _slice_circular(seq, s, e)
         if not feat_seq:
             results.update("[red]Feature has zero length.[/]")
             return None
@@ -29476,29 +32099,34 @@ class TraditionalCloningPane(Vertical):
                 f"need exactly 2.[/]"
             )
             return None
-        # Default: vector is the LARGER fragment (the backbone with
-        # selection markers). User can override post-hoc.
-        return max(frags, key=lambda f: len(f["top_seq"]))
+        # Pick the bacterial-backbone fragment — feature-aware
+        # (rep_origin / antibiotic-resistance present) with a
+        # max-size legacy fallback. Without the feature pass, a
+        # large insert dropped from a small carrier would have
+        # the user's vector flip-flop with each cloning round.
+        return _pick_backbone_fragment(frags) or frags[0]
 
     def _record_features(self, rec) -> list[dict]:
         """Convert a SeqRecord's features to the simple-dict shape the
-        engine consumes. Skips `source`."""
+        engine consumes. Skips `source`. Wrap-aware via `_feat_bounds`
+        so an origin-spanning vector feature carries through
+        `_excise_fragment_pair` with the correct dropout coords."""
         out: list[dict] = []
+        total = len(rec.seq) if getattr(rec, "seq", None) is not None else 0
         for f in rec.features:
             if f.type == "source":
                 continue
-            try:
-                s = int(f.location.start)
-                e = int(f.location.end)
-            except (TypeError, ValueError):
+            bounds = _feat_bounds(f, total)
+            if bounds is None:
                 continue
+            s, e, strand = bounds
             label = (f.qualifiers.get("label")
                       or f.qualifiers.get("product")
                       or [f.type])[0]
             out.append({
                 "start":  s,
                 "end":    e,
-                "strand": f.location.strand or 1,
+                "strand": strand,
                 "type":   f.type,
                 "label":  str(label)[:200],
             })
@@ -29868,17 +32496,52 @@ def _palette_rows_for_grammar(
         _natural_sort_key(str(p.get("position") or "")),
         _natural_sort_key(str(p.get("name") or "")),
     ))
+    # For L1+ rows, the stored oh5/oh3 reflects the boundaries of
+    # whatever was chained INTO the source assembly (L0 boundaries
+    # for a TU, lower-MOD boundaries for a higher MOD). Those are
+    # NOT what the level-up enzyme cuts when this part is used as a
+    # source for the next cycle — the constructor's lane validator
+    # needs the digest-derived overhangs, otherwise legacy entries
+    # saved before the persist-side digest fix surface a bogus
+    # "junction mismatch" against parts whose actual cuts would
+    # ligate cleanly. So at palette-build time we re-resolve oh5/oh3
+    # from each part's gb_text via `_assembly_fragment_from_source`,
+    # which auto-detects whichever enzyme produces a clean 2-fragment
+    # circular digest. Fall back to the stored values when the
+    # digest can't extract a fragment (no gb_text, no clean cuts in
+    # ANY candidate enzyme — the row still appears so the user can
+    # inspect it, just flagged with whatever it carried on disk).
+    grammar_for_digest: dict = {}
+    if source_level >= 1:
+        grammar_for_digest = (
+            _all_grammars().get(grammar_id) or {}
+        )
     for p in user_parts:
         name = str(p.get("name") or "?")
         if name in seen_names:
             continue
         seen_names.add(name)
+        oh5 = str(p.get("oh5") or "")
+        oh3 = str(p.get("oh3") or "")
+        if source_level >= 1 and grammar_for_digest:
+            try:
+                frag = _assembly_fragment_from_source(
+                    p, grammar_for_digest, source_level=source_level,
+                )
+            except Exception:
+                _log.exception(
+                    "palette: digest probe raised for %r", name,
+                )
+                frag = None
+            if isinstance(frag, dict):
+                oh5 = str(frag.get("oh5") or oh5)
+                oh3 = str(frag.get("oh3") or oh3)
         rows.append((
             name,
             str(p.get("type") or "?"),
             str(p.get("position") or ""),
-            str(p.get("oh5") or ""),
-            str(p.get("oh3") or ""),
+            oh5,
+            oh3,
             str(p.get("backbone") or ""),
             str(p.get("marker") or ""),
         ))
@@ -29923,12 +32586,15 @@ def _grammar_pos_slots(grammar: dict) -> dict[str, int]:
     grammar. Used by `ConstructorModal._validate` to detect a
     duplicate slot occupancy (e.g. two Promoters in one TU).
 
-    CDS-NS always shares the CDS slot — they're alternative ways
-    to fill the same biological position (no-stop variant intended
-    for C-tag fusion). gb_l0's positions list happens to contain
-    both as separate entries, but they MUST collide on the slot
-    number for the duplicate-occupancy check to flag a lane that
-    pairs both with no C-tag.
+    Some types share a logical slot:
+      * ``CDS-NS`` shares the ``CDS`` slot — alternative ways to fill
+        the same biological position (no-stop CDS for C-tag fusion).
+      * ``Promoter-only`` shares the ``Promoter`` slot — a separate
+        Promoter (no built-in 5'UTR) occupies the same Pos 1 as a
+        combined Promoter+5'UTR. Without this alias the duplicate-
+        occupancy check would NOT flag a lane carrying both shapes,
+        which is biologically nonsense (you can't ligate a combined
+        PromUTR alongside a separate Promoter into one TU).
     """
     slots: dict[str, int] = {}
     for i, p in enumerate(grammar.get("positions", []) or []):
@@ -29937,6 +32603,8 @@ def _grammar_pos_slots(grammar: dict) -> dict[str, int]:
             slots[ptype] = i + 1
     if "CDS" in slots:
         slots["CDS-NS"] = slots["CDS"]
+    if "Promoter" in slots:
+        slots["Promoter-only"] = slots["Promoter"]
     return slots
 
 
@@ -30141,6 +32809,17 @@ class ConstructorModal(ModalScreen):
                            variant="primary", disabled=True)
             yield Button("Clear Lane", id=f"btn-ctor-clear-{gid}",
                            variant="default")
+            # READY TO CLONE badge — shown when the lane is valid AND
+            # a backbone is bound, hidden otherwise. The status text in
+            # `ctor-validation-{gid}` already conveys the same info but
+            # this is a high-contrast affordance so the user sees at a
+            # glance "the assembly is good to ship."
+            yield Static(
+                "",
+                id=f"ctor-ready-badge-{gid}",
+                classes="ctor-ready-badge ctor-ready-badge-hidden",
+                markup=True,
+            )
 
     def on_mount(self) -> None:
         for gid, _ in _CONSTRUCTOR_GRAMMARS_FOR_TABS:
@@ -30340,6 +33019,225 @@ class ConstructorModal(ModalScreen):
 
         return len(errors) == 0, errors
 
+    def _check_lane_vector_compatibility(
+        self, gid: str,
+    ) -> "tuple[bool, str]":
+        """Test whether the active lane's terminal overhangs fit the
+        bound entry vector's dropout. Returns ``(compatible, reason)``
+        where ``reason`` is empty on the happy path and an explanatory
+        string when the lane can't ligate into the chosen vector.
+
+        Compatibility test: digest the entry vector with the level-up
+        enzyme (auto-detect: try grammar.level_up_enzyme first, fall
+        back to grammar.enzyme — same logic as
+        `_assembly_fragment_from_source`), find the dropout fragment
+        with the smallest body, and require the lane's leading oh5 +
+        trailing oh3 to match its overhangs (in either orientation —
+        the user can hand-flip the lane at save time).
+
+        Returns ``(True, "")`` (no-op) when:
+          * the lane is empty (validator already complained)
+          * no backbone is bound
+          * the bound vector has no gb_text on disk
+
+        — i.e. the check only fires when there's something concrete
+        to compare. Failures from the digest pipeline (vector with no
+        cuts, malformed gb_text) return ``(True, "")`` as well: the
+        cloning simulator will surface a real error at Save time, and
+        showing INCOMPATIBLE for a transient digest hiccup would be
+        worse UX than letting Save fail loudly with the actual reason.
+        """
+        lane = self._lanes.get(gid, [])
+        if not lane:
+            return True, ""
+        bb_key = self._backbones.get(gid, "")
+        if not bb_key:
+            return True, ""
+        vec = _get_entry_vector(gid, bb_key)
+        if not (isinstance(vec, dict) and vec.get("gb_text")):
+            return True, ""
+        grammar = (
+            _all_grammars().get(gid)
+            or _BUILTIN_GRAMMARS.get("gb_l0", {})
+        )
+        source_level = self._source_levels.get(gid, 0)
+        target_level = source_level + 1
+        primary = _enzyme_for_level_up(grammar, target_level - 1)
+        # Auto-detect the level-up enzyme that actually cuts THIS
+        # vector — same fallback the assembly extractor uses, so a
+        # reversed-design vector (Esp3I outer + BsaI inner instead
+        # of the gb_l0 default) gets compatibility-checked under
+        # the cutter that survived its dropout, not the canonical
+        # GB level pick.
+        try:
+            vec_rec = _gb_text_to_record(str(vec.get("gb_text") or ""))
+        except Exception:
+            return True, ""
+        vec_seq = str(vec_rec.seq).upper()
+        if not vec_seq:
+            return True, ""
+        topology = (
+            vec_rec.annotations.get("topology", "") or ""
+        ).lower()
+        circular = topology != "linear"
+        lane_oh5 = str(lane[0][3] or "").upper()
+        lane_oh3 = str(lane[-1][4] or "").upper()
+        if not lane_oh5 or not lane_oh3:
+            return True, ""
+        # For source_level >= 1 lanes the relevant cutter is whichever
+        # enzyme `_assembly_fragment_from_source` actually used to
+        # release the source TUs / MODs (it tries level_up_enzyme
+        # first, falls back to enzyme — handles reversed-design
+        # vectors). Look it up from the cached digest so the
+        # vector's compatibility is tested against the SAME enzyme,
+        # not just any candidate that happens to produce a matching
+        # overhang pair (which would falsely accept e.g. an Alpha
+        # vector for a TU→MOD step because Alpha's BsaI inner cuts
+        # match L0 boundaries even though no BsaI sites survive in
+        # the actual TU plasmid). Falls back to the grammar's level
+        # candidates when source enzyme can't be determined (L0→TU,
+        # legacy parts without gb_text).
+        required_enzyme = ""
+        if source_level >= 1:
+            try:
+                bin_index: dict[str, dict] = {}
+                for p in _load_parts_bin():
+                    nm = p.get("name") or ""
+                    if (nm
+                            and nm not in bin_index
+                            and (p.get("grammar") or "gb_l0") == gid
+                            and _level_matches_tab(
+                                _part_level(p), source_level)):
+                        bin_index[nm] = p
+                for row in lane:
+                    p = bin_index.get(str(row[0] or ""))
+                    if p is None:
+                        continue
+                    frag = _assembly_fragment_from_source(
+                        p, grammar, source_level=source_level,
+                    )
+                    if isinstance(frag, dict):
+                        cand = str(frag.get("enzyme") or "")
+                        if cand:
+                            required_enzyme = cand
+                            break
+            except Exception:
+                _log.exception(
+                    "compat: source-enzyme probe raised",
+                )
+                required_enzyme = ""
+        if required_enzyme:
+            candidates: list[str] = [required_enzyme]
+        else:
+            candidates = []
+            for cand in (
+                primary,
+                str(grammar.get("enzyme") or ""),
+                str(grammar.get("level_up_enzyme") or ""),
+            ):
+                if cand and cand not in candidates:
+                    candidates.append(cand)
+        # Try the candidate(s); accept the first whose dropout
+        # matches the lane ends. Records the last observed dropout
+        # pair so the failure message can name a concrete one.
+        # Mirrors `_clone_part_into_entry_vector`'s permissive
+        # multi-cut handling: a vector with 3+ cuts under one
+        # enzyme isn't a deal-breaker — the cloning simulator picks
+        # whichever fragment fits, so the compatibility check has
+        # to scan ALL fragments (not just the smallest of a 2-cut
+        # digest) before it can claim "no match". Vector features
+        # are handed to `_fragments_from_cuts` so the dropout
+        # heuristic in `_pick_insert_fragment` can rank fragments
+        # by backbone-marker absence (works for stacked-MOD
+        # vectors where dropout > backbone).
+        vec_features: list[dict] = []
+        total_vec = len(vec_seq) if vec_seq else 0
+        for f in (vec_rec.features or []):
+            if f.type == "source":
+                continue
+            bounds = _feat_bounds(f, total_vec)
+            if bounds is None:
+                continue
+            fs, fe, fstrand = bounds
+            label = ""
+            for k in ("label", "gene", "product", "note"):
+                vals = f.qualifiers.get(k, [])
+                if vals:
+                    label = str(vals[0]); break
+            vec_features.append({
+                "start": fs, "end": fe,
+                "strand": fstrand,
+                "type": f.type, "label": label or f.type,
+            })
+        last_pair: "tuple[str, str] | None" = None
+        for enz in candidates:
+            try:
+                cuts = _enzyme_cuts(vec_seq, [enz], circular=circular)
+            except Exception:
+                continue
+            if len(cuts) < 2:
+                continue
+            try:
+                all_frags = _fragments_from_cuts(
+                    vec_seq, cuts, circular=circular,
+                    features=vec_features,
+                    source_label=str(vec.get("name") or "vector"),
+                )
+            except Exception:
+                continue
+            if not all_frags:
+                continue
+            # Try fragments in dropout-likelihood order: first the
+            # feature-aware pick (the fragment WITHOUT backbone
+            # markers), then the rest in original order. This
+            # protects the failure-message fallback `last_pair` from
+            # always reporting the wrong (backbone) fragment when
+            # the vector has more than 2 cuts.
+            preferred = _pick_insert_fragment(all_frags)
+            ordered_frags: list[dict] = []
+            if preferred is not None:
+                ordered_frags.append(preferred)
+                ordered_frags.extend(
+                    f for f in all_frags if f is not preferred
+                )
+            else:
+                ordered_frags = list(all_frags)
+            for frag in ordered_frags:
+                left  = (frag.get("left")  or {}).get("overhang_seq", "")
+                right = (frag.get("right") or {}).get("overhang_seq", "")
+                if not (left and right):
+                    continue
+                v_left  = left.upper()
+                v_right = right.upper()
+                last_pair = (v_left, v_right)
+                # Forward orientation: lane oh5 ↔ v_left,
+                # lane oh3 ↔ v_right.
+                # Reverse: lane chain reads on the opposite strand,
+                # so match is lane.oh5 ↔ rc(v_right),
+                # lane.oh3 ↔ rc(v_left). Either orientation is
+                # biologically achievable; the constructor doesn't
+                # constrain orientation explicitly.
+                if (lane_oh5 == v_left and lane_oh3 == v_right):
+                    return True, ""
+                if (lane_oh5 == _rc(v_right)
+                        and lane_oh3 == _rc(v_left)):
+                    return True, ""
+        if last_pair is None:
+            # No candidate enzyme could even cut the vector. The
+            # cloning simulator will surface a real error at Save
+            # time; surfacing INCOMPATIBLE here would block the
+            # user from getting that more-precise error.
+            return True, ""
+        target_label = _part_level_label(target_level)
+        vec_name = str(vec.get("name") or bb_key)
+        v_left, v_right = last_pair
+        return False, (
+            f"Lane ends ({lane_oh5}/{lane_oh3}) don't fit {vec_name}'s "
+            f"{target_label} dropout ({v_left}/{v_right}). Pick a "
+            f"different acceptor or rebuild the lane with matching "
+            f"overhangs."
+        )
+
     def _build_chain(self, gid: str) -> Text:
         """Render the overhang chain for grammar ``gid``'s lane with
         colour-coded junctions (green = matches expected, red =
@@ -30400,12 +33298,59 @@ class ConstructorModal(ModalScreen):
         bb       = _CONSTRUCTOR_BACKBONES.get(gid, {}).get(bb_key, {})
         bound = _get_entry_vector(gid, bb_key) if bb_key else None
         has_vector = (isinstance(bound, dict) and bool(bound.get("gb_text")))
+        # Compatibility test runs ONLY when the chain is internally
+        # consistent AND a vector is bound — there's nothing to test
+        # against otherwise, and surfacing INCOMPATIBLE on top of an
+        # already-broken chain would just clutter the message. The
+        # check returns (True, "") for the can't-determine case so a
+        # transient digest hiccup doesn't spook the user.
+        compatible = True
+        compat_reason = ""
+        if is_valid and has_vector:
+            try:
+                compatible, compat_reason = (
+                    self._check_lane_vector_compatibility(gid)
+                )
+            except Exception:
+                _log.exception(
+                    "constructor: compatibility probe raised for %r",
+                    gid,
+                )
+                compatible, compat_reason = True, ""
+        ready_to_clone = bool(is_valid and has_vector and compatible)
         # Save is only useful when chain is valid AND a backbone is bound
-        # (so the cloning simulator has a target to ligate into). Chain-
-        # validity drives the green status text; backbone-not-set surfaces
-        # as a separate yellow hint per the 2026-05-10 UX spec ("words
-        # green as soon as parts fit").
-        sim.disabled = not (is_valid and has_vector)
+        # (so the cloning simulator has a target to ligate into) AND the
+        # lane's terminal overhangs actually fit the chosen vector's
+        # dropout. Chain-validity drives the green status text;
+        # backbone-not-set surfaces as a separate yellow hint per the
+        # 2026-05-10 UX spec ("words green as soon as parts fit").
+        sim.disabled = not ready_to_clone
+        # Toggle the high-contrast badge — green READY TO CLONE when
+        # everything aligns; red INCOMPATIBLE when the chain is valid
+        # and a vector is bound but the overhangs don't fit. Hidden
+        # via a CSS class so the layout doesn't reflow on toggle.
+        # Best-effort query: an in-flight compose during a rapid lane
+        # edit could miss the badge widget, in which case we silently
+        # skip the update — the validation status text already has the
+        # same info as a fallback.
+        try:
+            badge = self.query_one(
+                f"#ctor-ready-badge-{gid}", Static,
+            )
+            if ready_to_clone:
+                badge.update(" READY TO CLONE ")
+                badge.remove_class("ctor-ready-badge-hidden")
+                badge.remove_class("ctor-ready-badge-incompatible")
+            elif is_valid and has_vector and not compatible:
+                badge.update(" INCOMPATIBLE ")
+                badge.remove_class("ctor-ready-badge-hidden")
+                badge.add_class("ctor-ready-badge-incompatible")
+            else:
+                badge.update("")
+                badge.add_class("ctor-ready-badge-hidden")
+                badge.remove_class("ctor-ready-badge-incompatible")
+        except NoMatches:
+            pass
 
         source_level = self._source_levels.get(gid, 0)
         target_level = source_level + 1
@@ -30434,6 +33379,12 @@ class ConstructorModal(ModalScreen):
                     f"↓  {bb_key} role isn't bound to a library plasmid "
                     "yet — click the role button below to pick one.",
                     style="yellow",
+                )
+            elif not compatible:
+                t.append("\n")
+                t.append(
+                    f"✗  INCOMPATIBLE — {compat_reason}",
+                    style="bold red",
                 )
             else:
                 bb_sel  = bb.get("selection", "")
@@ -30623,9 +33574,52 @@ class ConstructorModal(ModalScreen):
         default_name = self._compose_assembly_name(
             entry_vector.get("name") or bb_key, parts,
         )
+        target_level_for_label = source_level + 1
+        target_label_for_modal = _part_level_label(target_level_for_label)
+
+        def _on_named(user_name: "str | None") -> None:
+            if user_name is None:
+                # User cancelled the naming prompt — abort the whole
+                # save flow so we don't write a half-named assembly
+                # under the auto-generated default.
+                return
+            # `NamePlasmidModal` already sanitises, but re-run the
+            # filter defensively in case a future code path bypasses
+            # the modal (e.g. an agent endpoint).
+            chosen = _sanitize_plasmid_name(
+                user_name, fallback=default_name,
+            )
+            self._do_save_with_name(
+                gid=gid,
+                grammar=grammar,
+                entry_vector=entry_vector,
+                parts=parts,
+                source_level=source_level,
+                bb_key=bb_key,
+                name=chosen,
+            )
+
+        self.app.push_screen(
+            NamePlasmidModal(
+                default_name,
+                target_label=target_label_for_modal,
+            ),
+            callback=_on_named,
+        )
+
+    def _do_save_with_name(self, *, gid: str, grammar: dict,
+                           entry_vector: dict, parts: list[dict],
+                           source_level: int, bb_key: str,
+                           name: str) -> None:
+        """Run the assembly simulation + library / parts-bin persist
+        with a user-provided name. Split out from `_save_to_library`
+        so the naming prompt callback can dispatch cleanly without
+        re-entering the validation pre-flight (which already passed
+        before the modal was pushed).
+        """
         new_rec = _clone_assembly_into_entry_vector(
             parts, entry_vector, grammar,
-            source_level=source_level, name=default_name,
+            source_level=source_level, name=name,
         )
         if new_rec is None:
             self.app.notify(
@@ -30637,7 +33631,7 @@ class ConstructorModal(ModalScreen):
             )
             return
         try:
-            self._persist_assembly(
+            new_id = self._persist_assembly(
                 new_rec, gid, source_level=source_level,
                 entry_vector=entry_vector, parts=parts,
                 backbone_role=bb_key,
@@ -30649,6 +33643,19 @@ class ConstructorModal(ModalScreen):
                 severity="error", markup=False,
             )
             return
+        # Repopulate the LibraryPanel + focus the new row so the user
+        # sees the assembly land in-list. Best-effort — the panel
+        # might not be mounted (some test paths drive _do_save_with_name
+        # without a full app), in which case the persist still
+        # succeeded and the next interactive launch will pick it up
+        # via _load_library.
+        if new_id:
+            try:
+                lib = self.app.query_one("#library", LibraryPanel)
+            except (NoMatches, AttributeError):
+                lib = None
+            if lib is not None:
+                lib.reveal_entry_id(new_id)
         target_level = source_level + 1
         level_label = _part_level_label(target_level)
         # Mention the active collection in the notify so the user
@@ -30662,7 +33669,7 @@ class ConstructorModal(ModalScreen):
             if active_coll else "library"
         )
         self.app.notify(
-            f"Saved '{default_name}' to {coll_part} "
+            f"Saved '{name}' to {coll_part} "
             f"({len(new_rec.seq):,} bp, level {level_label}). "
             f"Also added to Parts Bin under {level_label}.",
             severity="success", markup=False,
@@ -30686,12 +33693,15 @@ class ConstructorModal(ModalScreen):
                             source_level: int,
                             entry_vector: dict,
                             parts: list[dict],
-                            backbone_role: str) -> None:
+                            backbone_role: str) -> str:
         """Add the newly-cloned plasmid to plasmid_library.json AND
         mirror a parts-bin entry so the result can be picked from the
         L1+ assembly palette in subsequent cycles. Both go through
         their respective `_save_*` helpers (sacred invariant #7 — no
-        bypassing `_safe_save_json`)."""
+        bypassing `_safe_save_json`).
+
+        Returns the disambiguated library id of the new plasmid so
+        the caller can focus it in the LibraryPanel after save."""
         from copy import deepcopy
         gb_text = _record_to_gb_text(new_rec)
         # Library entry — same shape as the main library schema.
@@ -30733,15 +33743,53 @@ class ConstructorModal(ModalScreen):
             .get(backbone_role, {})
             .get("selection", "")
         )
-        # Boundary overhangs of the assembled plasmid become the
-        # next-level oh5/oh3. Read them off the first/last source
-        # fragment we just chained.
+        # Compute the level-up overhangs by digesting the assembled
+        # plasmid with the next-cycle's enzyme. These are the
+        # overhangs the constructor's TU→MOD (etc.) palette + lane
+        # validator should display, NOT the inner-source boundaries
+        # — those are inherited from L0 / lower-level parts and only
+        # describe the chain-internal junctions, which the level-up
+        # cut never sees. Falls back to the inner boundaries when the
+        # digest can't release a clean fragment (vector design that
+        # doesn't carry the level-up enzyme outside its dropout, fake
+        # records in unit tests with no IIS sites, etc.) so legacy
+        # assertions and oddly-designed vectors still get a value.
+        grammar_for_digest = (
+            _all_grammars().get(gid)
+            or _BUILTIN_GRAMMARS.get("gb_l0", {})
+        )
+        next_oh5 = str(parts[0].get("oh5") or "")
+        next_oh3 = str(parts[-1].get("oh3") or "")
+        try:
+            level_up_frag = _assembly_fragment_from_source(
+                {"gb_text": gb_text, "name": new_rec.id or new_rec.name},
+                grammar_for_digest, source_level=target_level,
+            )
+        except Exception:
+            _log.exception(
+                "constructor: level-up digest probe raised for %r",
+                new_rec.id or new_rec.name,
+            )
+            level_up_frag = None
+        if isinstance(level_up_frag, dict):
+            next_oh5 = str(level_up_frag.get("oh5") or next_oh5)
+            next_oh3 = str(level_up_frag.get("oh3") or next_oh3)
+        else:
+            _log.warning(
+                "constructor: %r at level %d has no clean %s release "
+                "— storing inner-source boundaries (%s/%s); this "
+                "assembly may not chain at the next cycle",
+                new_rec.id or new_rec.name, target_level,
+                _enzyme_for_level_up(grammar_for_digest, target_level)
+                or "?",
+                next_oh5, next_oh3,
+            )
         bin_entry = {
             "name":     new_rec.id or new_rec.name or unique_id,
             "type":     target_label,
             "position": target_label,
-            "oh5":      str(parts[0].get("oh5") or ""),
-            "oh3":      str(parts[-1].get("oh3") or ""),
+            "oh5":      next_oh5,
+            "oh3":      next_oh3,
             "backbone": str(entry_vector.get("name") or backbone_role),
             "marker":   selection,
             "sequence": "",  # the gb_text below is the source of truth for L1+
@@ -30768,6 +33816,7 @@ class ConstructorModal(ModalScreen):
             len(new_rec.seq), len(parts),
             entry_vector.get("name"),
         )
+        return unique_id
 
     def _backbone_name_label(self, gid: str, role: str) -> str:
         """Static text rendered ABOVE the role's button. Shows the
@@ -32950,14 +35999,21 @@ class PrimerDesignScreen(Screen):
 
     def _parse_features_from_record(self, record) -> list[dict]:
         """Minimal feature parse from a SeqRecord — matches the keys used
-        by the compose-time feat_opts list."""
+        by the compose-time feat_opts list. Wrap-aware via `_feat_bounds`:
+        an origin-spanning CDS is encoded as `end < start` so the
+        downstream primer-design machinery (which rotates around the
+        wrap per pitfall #6) sees the right region. Pre-fix `int(loc.start)`
+        flattened wrap CDSes and Primer3 designed against the inverted
+        backbone span."""
         feats = []
+        total = len(record.seq) if getattr(record, "seq", None) is not None else 0
         for feat in record.features:
             if feat.type == "source":
                 continue
-            s = int(feat.location.start)
-            e = int(feat.location.end)
-            strand = getattr(feat.location, "strand", 1) or 1
+            bounds = _feat_bounds(feat, total)
+            if bounds is None:
+                continue
+            s, e, strand = bounds
             feats.append({
                 "type":   feat.type,
                 "start":  s,
@@ -34164,20 +37220,31 @@ class SplashScreen(ModalScreen):
         self._safe_dismiss()
 
     def _safe_dismiss(self) -> None:
-        """Dismiss only if the splash is still on the screen stack.
-        Without this guard, a second key/click event arriving after
-        the first dismiss has already popped the screen would call
-        `pop_screen` on a stack that only has the default screen,
-        raising ScreenStackError."""
+        """Dismiss only if the splash is still on the screen stack AND
+        no concurrent dismiss is mid-flight. Without these guards a
+        trackpad user who taps + presses Enter near-simultaneously can
+        get two _safe_dismiss calls; the second arrives while the
+        first's `dismiss` is mid-pop and races against the next-modal
+        push. The `_dismissing` flag is set BEFORE the dismiss call so
+        the second call short-circuits even if `self` still appears in
+        the screen stack."""
+        if getattr(self, "_dismissing", False):
+            _log_event("splash.dismiss_skipped", reason="already_dismissing")
+            return
         try:
             stack = self.app._screen_stack
         except AttributeError:
             stack = []
         if self in stack:
+            self._dismissing = True
             try:
                 self.dismiss(None)
             except Exception:
                 _log.exception("splash dismiss failed")
+                # Reset flag on failure so the user can retry. The
+                # dismiss is the only thing protected; if it raised
+                # we're still on the stack.
+                self._dismissing = False
         else:
             # Silent no-op left a paper trail nowhere — log so a user
             # complaining "the splash sometimes ignores my Enter"
@@ -34469,6 +37536,356 @@ class LibrarySearchModal(ModalScreen):
         self.dismiss(None)
 
     def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class LoadPartSourceModal(ModalScreen):
+    """Pick a plasmid to classify as a Parts Bin part.
+
+    Lists every plasmid across every collection with the active
+    collection grouped at the top, plus an *Open file…* button that
+    pushes ``OpenFileModal`` for a fresh disk import. Replaces the
+    pre-2026-05-10 "Load Part takes the currently-loaded record"
+    flow which forced the user to first load the candidate plasmid
+    onto the canvas. Dismiss payload is a ``SeqRecord`` (the picked
+    plasmid) or ``None`` on cancel; the caller funnels the record
+    into ``_load_part_worker`` for the per-grammar Type IIS digest.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next",   show=False),
+    ]
+
+    # Same debounce window as `LibrarySearchModal` — coalesces a burst
+    # of keystrokes into a single `_search_collections_library` call so
+    # the modal stays snappy on multi-thousand-plasmid libraries.
+    _LIVE_FILTER_DEBOUNCE_S = 0.15
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._matches: list[dict] = []
+        self._filter_timer = None
+        # Latch flipped on the first dismiss so a Select+Enter race or
+        # a double-click on a row can't fire `dismiss(record)` twice
+        # (the second call lands on an already-popped screen and
+        # crashes Textual's screen stack).
+        self._dismissing: bool = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="loadpart-box"):
+            yield Static(" Pick plasmid to classify as a part ",
+                         id="loadpart-title")
+            yield Static(
+                "[dim]Pick a saved plasmid from any collection — or "
+                "[b]Open file…[/b] to import one from disk. The "
+                "plasmid is digested with each grammar's Type IIS "
+                "enzyme; the matched insert lands in the Parts Bin."
+                "[/dim]",
+                id="loadpart-hint", markup=True,
+            )
+            yield Input(
+                placeholder="filter by name…",
+                id="loadpart-input",
+            )
+            yield DataTable(id="loadpart-table",
+                            cursor_type="row",
+                            zebra_stripes=True)
+            yield Static("", id="loadpart-status", markup=True)
+            with Horizontal(id="loadpart-btns"):
+                yield Button("Open file…", id="btn-loadpart-file")
+                yield Button("Select",     id="btn-loadpart-ok",
+                             variant="primary",
+                             # Disabled until the first refresh confirms
+                             # there's at least one row to select; the
+                             # debounced `_refresh` flips this back on.
+                             disabled=True)
+                yield Button("Cancel",     id="btn-loadpart-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            t = self.query_one("#loadpart-table", DataTable)
+        except NoMatches:
+            return
+        t.add_columns("Plasmid", "Collection", "Status", "bp")
+        self._refresh()
+        try:
+            self.query_one("#loadpart-input", Input).focus()
+        except NoMatches:
+            pass
+
+    def on_unmount(self) -> None:
+        """Cancel the debounce timer if it's still pending. Without
+        this the timer keeps a reference to `_refresh`, which keeps
+        the modal alive until the timer fires (small leak; the timer
+        body's NoMatches catch absorbs the eventual error but logs
+        warnings)."""
+        if self._filter_timer is not None:
+            try:
+                self._filter_timer.stop()
+            except Exception:
+                pass
+            self._filter_timer = None
+
+    def _refresh(self) -> None:
+        try:
+            inp = self.query_one("#loadpart-input", Input)
+            t   = self.query_one("#loadpart-table", DataTable)
+        except NoMatches:
+            return
+        query = (inp.value or "").strip()
+        # `_search_collections_library` already natural-sorts by
+        # (collection, name); we re-bucket so the active collection
+        # lands at the top while preserving in-collection ordering.
+        # Limit is pumped (vs. the search modal's 300) because Load
+        # Part is a one-shot picker — paging by typing a query is
+        # the user's affordance for narrowing.
+        #
+        # `_load_collections` already absorbs corrupted-JSON failures
+        # into an empty list (via `_safe_load_json`), so the search
+        # helper itself is well-behaved on bad data. Catch any
+        # remaining surprises (e.g. a buggy custom grammar mutating
+        # the cache mid-iteration) so a single bad keystroke can't
+        # tear the modal down — fall back to an empty match list and
+        # surface a status-bar error.
+        search_failed = False
+        try:
+            all_matches = _search_collections_library(query, limit=2000)
+        except Exception:
+            _log.exception(
+                "LoadPartSourceModal: search_collections_library "
+                "raised on query %r", query,
+            )
+            all_matches = []
+            search_failed = True
+        active = _get_active_collection_name() or ""
+        self._matches = (
+            [m for m in all_matches if m.get("collection") == active]
+            + [m for m in all_matches if m.get("collection") != active]
+        )
+        t.clear()
+        for m in self._matches:
+            status = m.get("status") or ""
+            color  = _PLASMID_STATUS_COLORS.get(status)
+            status_cell = (Text(status, style=f"{color} bold")
+                           if status and color is not None
+                           else Text("—", style="dim"))
+            t.add_row(
+                Text(m["name"], no_wrap=True, overflow="ellipsis"),
+                Text(m["collection"], no_wrap=True, overflow="ellipsis"),
+                status_cell,
+                f"{m.get('size', 0):,}",
+                key=f"{m['collection']}\x00{m['id']}",
+            )
+        # Toggle Select disabled state with the match count so the
+        # button can't fire on an empty table; mirrors the empty-
+        # collection / no-results UX in LibrarySearchModal.
+        try:
+            self.query_one("#btn-loadpart-ok", Button).disabled = (
+                not self._matches
+            )
+        except NoMatches:
+            pass
+        try:
+            if search_failed:
+                self.query_one("#loadpart-status", Static).update(
+                    "[red]Library load failed — see log. Esc to "
+                    "cancel.[/red]"
+                )
+            else:
+                n = len(self._matches)
+                label = "plasmid" if n == 1 else "plasmids"
+                self.query_one("#loadpart-status", Static).update(
+                    f"[dim]{n} {label} — Esc to cancel, "
+                    f"[b]Open file…[/b] for a fresh import.[/dim]"
+                )
+        except NoMatches:
+            pass
+
+    @on(Input.Changed, "#loadpart-input")
+    def _on_query_changed(self, _event: Input.Changed) -> None:
+        if self._filter_timer is not None:
+            try:
+                self._filter_timer.stop()
+            except Exception:
+                pass
+        self._filter_timer = self.set_timer(
+            self._LIVE_FILTER_DEBOUNCE_S, self._refresh,
+        )
+
+    @on(Input.Submitted, "#loadpart-input")
+    def _on_query_submitted(self, _event) -> None:
+        # Enter in the input == press Select if there's a match.
+        if not self._matches or self._dismissing:
+            return
+        try:
+            t = self.query_one("#loadpart-table", DataTable)
+        except NoMatches:
+            return
+        idx = t.cursor_row if t.cursor_row is not None else 0
+        if 0 <= idx < len(self._matches):
+            self._dismiss_with_match(self._matches[idx])
+
+    @on(Button.Pressed, "#btn-loadpart-ok")
+    def _ok_btn(self, _) -> None:
+        self._on_query_submitted(None)  # type: ignore[arg-type]
+
+    @on(DataTable.RowSelected, "#loadpart-table")
+    def _row_selected(self, event: DataTable.RowSelected) -> None:
+        if self._dismissing:
+            return
+        idx = event.cursor_row
+        if 0 <= idx < len(self._matches):
+            self._dismiss_with_match(self._matches[idx])
+
+    def _dismiss_with_match(self, match: dict) -> None:
+        """Resolve the picked (collection, id) pair to a parsed
+        ``SeqRecord`` and dismiss with it. Looks up the gb_text in
+        ``collections.json`` (cross-collection — we deliberately do
+        NOT switch active collection; the classifier doesn't need
+        the canvas, it just needs the sequence).
+
+        Pre-dismiss validation runs here so the picker (not the
+        downstream worker) is the place a user sees "this plasmid
+        won't classify" feedback. Failures notify + stay open so the
+        user can pick another row without re-launching the modal.
+        """
+        if self._dismissing:
+            return
+        coll_name = match.get("collection") or ""
+        entry_id  = match.get("id") or ""
+        coll = _find_collection(coll_name)
+        if coll is None:
+            self.app.notify(
+                f"Collection '{coll_name}' is no longer present.",
+                severity="warning",
+            )
+            return
+        entry = next(
+            (e for e in (coll.get("plasmids") or [])
+             if isinstance(e, dict) and e.get("id") == entry_id),
+            None,
+        )
+        if entry is None:
+            self.app.notify(
+                "Plasmid not found — it may have been deleted.",
+                severity="warning",
+            )
+            return
+        gb_text = entry.get("gb_text") or ""
+        if not gb_text:
+            self.app.notify(
+                "Library entry has no embedded sequence.",
+                severity="warning",
+            )
+            return
+        try:
+            record = _gb_text_to_record(gb_text)
+        except Exception as exc:
+            _log.exception(
+                "LoadPartSourceModal: parse failed for %r", entry_id,
+            )
+            self.app.notify(
+                f"Could not parse plasmid: {exc}",
+                severity="error",
+            )
+            return
+        # Sequence-level pre-flight: zero-length and linear records
+        # can't classify (digest needs a circular ring). Catch them
+        # here so the user gets feedback in-modal rather than seeing
+        # the picker close + a useless toast appear.
+        seq_len = len(getattr(record, "seq", "") or "")
+        if seq_len == 0:
+            self.app.notify(
+                "Plasmid has no sequence content — pick another.",
+                severity="warning",
+            )
+            return
+        topology = (record.annotations or {}).get("topology", "")
+        if str(topology).lower() != "circular":
+            self.app.notify(
+                "Load Part needs a circular plasmid (digest into 2 "
+                "fragments). Pick a circular record.",
+                severity="warning",
+            )
+            return
+        # Stash the ORIGINAL gb_text on the record so the caller can
+        # forward it to the worker without paying for a parse →
+        # serialise round-trip. The original is also what
+        # `_detect_selection_marker` should see — re-serialised text
+        # might lose qualifier formatting that the marker matcher
+        # relies on. Mirrors `OpenFileModal`'s `_tui_source`
+        # convention.
+        try:
+            record._tui_gb_text = gb_text
+        except Exception:
+            # SeqRecord allows attribute assignment, but in case a
+            # subclass forbids it (defensive — unlikely), fall back
+            # to the worker-side serialise.
+            _log.debug(
+                "LoadPartSourceModal: couldn't stash gb_text on record",
+            )
+        self._dismissing = True
+        self.dismiss(record)
+
+    @on(Button.Pressed, "#btn-loadpart-file")
+    def _file_btn(self, _) -> None:
+        """Push ``OpenFileModal``; on dismiss with a SeqRecord, re-
+        dismiss ourselves with the same record so the caller's
+        callback receives a uniform payload regardless of source.
+        Multi-record FASTA imports (which dismiss with a dict, not
+        a record) aren't classifiable as a single part — surface a
+        notify and stay open so the user can pick again.
+        """
+        def _on_file(result):
+            if result is None:
+                return
+            # Modal could have been dismissed (Esc / Cancel) between
+            # the file-modal pop and this callback firing. Calling
+            # `dismiss` on an unmounted modal raises in Textual; bail
+            # quietly instead.
+            if not self.is_mounted or self._dismissing:
+                return
+            if isinstance(result, dict):
+                self.app.notify(
+                    "Multi-record FASTA can't be classified as a "
+                    "single part. Pick a single-record file.",
+                    severity="warning",
+                )
+                return
+            # Same circular pre-flight as the library path — catches
+            # users who picked a `.gb` containing a linear chromosome.
+            seq_len = len(getattr(result, "seq", "") or "")
+            if seq_len == 0:
+                self.app.notify(
+                    "Loaded file has no sequence content.",
+                    severity="warning",
+                )
+                return
+            topology = (result.annotations or {}).get("topology", "")
+            if str(topology).lower() != "circular":
+                self.app.notify(
+                    "Load Part needs a circular plasmid. The opened "
+                    "file is linear — pick a circular record.",
+                    severity="warning",
+                )
+                return
+            self._dismissing = True
+            self.dismiss(result)
+
+        self.app.push_screen(OpenFileModal(), callback=_on_file)
+
+    @on(Button.Pressed, "#btn-loadpart-cancel")
+    def _cancel_btn(self, _) -> None:
+        if self._dismissing:
+            return
+        self._dismissing = True
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        if self._dismissing:
+            return
+        self._dismissing = True
         self.dismiss(None)
 
 
@@ -35348,6 +38765,159 @@ class ScaryDeleteConfirmModal(ModalScreen):
         self.dismiss(False)
 
 
+def _sanitize_plasmid_name(raw: str, *,
+                            fallback: str = "assembly",
+                            max_len: int = 60) -> str:
+    """Clean a user-entered plasmid name for safe storage in the
+    library / parts bin and for use as a SeqRecord ``id`` / ``name``.
+
+    Strips control chars (including NUL — would break C-string-style
+    handling in downstream tools), trims whitespace, and truncates
+    to ``max_len`` chars to keep DataTable rows from blowing the
+    row width. Empty / whitespace-only input falls back to
+    ``fallback`` so the caller never gets a zero-length string.
+
+    Forbidden character set is conservative: only printable ASCII +
+    Unicode letters / digits / a small punctuation set (``_-+. ·:``).
+    Colons are kept because the constructor uses them in source
+    annotations (``constructor:gid:role``); slashes and backslashes
+    are dropped because they look like paths and tools commonly
+    interpret them as such.
+    """
+    if not isinstance(raw, str):
+        raw = str(raw or "")
+    # Whitespace control chars (\t \n \r \v \f) become spaces FIRST so
+    # they don't silently fuse adjacent words after the control-strip
+    # pass. e.g. ``"foo\tbar"`` becomes ``"foo bar"``, not ``"foobar"``.
+    for ch in "\t\n\r\v\f":
+        raw = raw.replace(ch, " ")
+    # Drop NUL + remaining C0 control chars (\x00–\x1F + \x7F) — these
+    # never belong in a user-facing identifier and break naive
+    # C-string handling in some downstream tools.
+    cleaned = "".join(
+        ch for ch in raw
+        if (ord(ch) >= 0x20 and ord(ch) != 0x7F)
+    )
+    # Drop path-like separators outright — a name like
+    # ``../../etc/passwd`` becomes ``etc passwd`` after this filter,
+    # so even a malicious agent prompt can't escape into a file path
+    # via the library-save flow downstream.
+    for ch in "/\\":
+        cleaned = cleaned.replace(ch, " ")
+    # Normalise whitespace runs to single spaces; lots of tools
+    # render multiple spaces awkwardly in TUI tables.
+    cleaned = " ".join(cleaned.split())
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return fallback
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip()
+    return cleaned or fallback
+
+
+class NamePlasmidModal(ModalScreen):
+    """Prompt the user to name a freshly-assembled plasmid before
+    it lands in the library.
+
+    Default value is the auto-generated ``vector · part1+part2…``
+    string from `ConstructorModal._compose_assembly_name`. The user
+    can edit it freely; the dismiss flow re-runs
+    ``_sanitize_plasmid_name`` so even a hand-pasted weird character
+    can't reach the library.
+
+    Dismiss payload:
+      ``str``  — the sanitised name (always non-empty).
+      ``None`` — user cancelled; caller should NOT save.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, default_name: str,
+                 *, target_label: str = "plasmid") -> None:
+        super().__init__()
+        self._default_name = _sanitize_plasmid_name(
+            default_name or "", fallback="assembly",
+        )
+        # ``target_label`` ("TU", "MOD", or just "plasmid") shows up
+        # in the title so the user knows which level they're naming.
+        self._target_label = target_label or "plasmid"
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="nameplasmid-dlg"):
+            yield Static(
+                f" Name your {self._target_label} ",
+                id="nameplasmid-title",
+            )
+            yield Label(
+                "This name lands on the SeqRecord, the library row, "
+                "and the Parts Bin entry. You can rename later.",
+            )
+            yield Input(
+                value=self._default_name,
+                placeholder="enter a name (default shown)",
+                id="nameplasmid-input",
+            )
+            yield Static("", id="nameplasmid-status", markup=True)
+            with Horizontal(id="nameplasmid-btns"):
+                yield Button("Save",   id="btn-nameplasmid-save",
+                             variant="primary")
+                yield Button("Cancel", id="btn-nameplasmid-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            inp = self.query_one("#nameplasmid-input", Input)
+        except NoMatches:
+            return
+        inp.focus()
+
+    @on(Button.Pressed, "#btn-nameplasmid-save")
+    def _save(self, _) -> None:
+        self._try_submit()
+
+    @on(Input.Submitted, "#nameplasmid-input")
+    def _submitted(self, _) -> None:
+        self._try_submit()
+
+    def _try_submit(self) -> None:
+        try:
+            inp = self.query_one("#nameplasmid-input", Input)
+            status = self.query_one("#nameplasmid-status", Static)
+        except NoMatches:
+            return
+        cleaned = _sanitize_plasmid_name(
+            inp.value, fallback=self._default_name,
+        )
+        if not cleaned:
+            status.update("[red]Name cannot be empty.[/red]")
+            return
+        # If sanitisation changed the user's input materially (more
+        # than just trimming trailing whitespace), surface a hint.
+        # The sanitised version is what gets dismissed regardless;
+        # the hint just lets the user know.
+        if cleaned != inp.value.strip():
+            status.update(
+                f"[yellow]Cleaned to:[/yellow] [b]{cleaned}[/b]"
+            )
+            # Don't auto-dismiss yet — let the user confirm by
+            # pressing Save / Enter again, OR edit further.
+            try:
+                inp.value = cleaned
+            except Exception:
+                pass
+            return
+        self.dismiss(cleaned)
+
+    @on(Button.Pressed, "#btn-nameplasmid-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class RenamePlasmidModal(ModalScreen):
     """Prompt for a new name for a library entry.
 
@@ -36160,17 +39730,27 @@ def _h_load_file(app, payload):
         return ({"error": "missing 'path'"}, 400)
     if not path.exists():
         return ({"error": f"file not found: {path}"}, 404)
-    if not path.is_file():
-        return ({"error": f"not a regular file: {path}"}, 400)
-    try:
-        size = path.stat().st_size
-    except OSError as exc:
-        return ({"error": f"stat failed: {exc}"}, 400)
-    if size > _BULK_IMPORT_MAX_BYTES and not bool(payload.get("force")):
-        return ({"error": (
-            f"file is {size:,} bytes (cap {_BULK_IMPORT_MAX_BYTES:,}). "
-            f"Pass force=true to override."
-        ), "size_bytes": size, "cap_bytes": _BULK_IMPORT_MAX_BYTES}, 413)
+    # Regular-file + symlink check via `_safe_file_size_check`. Pre-fix
+    # `path.is_file()` followed symlinks; a symlink → /dev/zero
+    # reported `st_size=0` and the subsequent `load_genbank` parse
+    # consumed RAM until the kernel OOM-killed the worker. With
+    # `lstat` + `S_ISREG` a symlink is now refused outright.
+    cap = (10 * 1024 * 1024 * 1024 if bool(payload.get("force"))
+            else _BULK_IMPORT_MAX_BYTES)
+    ok, reason = _safe_file_size_check(path, cap, "plasmid")
+    if not ok:
+        # Distinguish "too big" (413) from "not a regular file" (400)
+        # so the agent client can react with the right error code.
+        if "bytes" in (reason or "") and "cap" in (reason or ""):
+            try:
+                size = path.lstat().st_size
+            except OSError:
+                size = 0
+            return ({"error": (
+                f"file is {size:,} bytes (cap {_BULK_IMPORT_MAX_BYTES:,}). "
+                f"Pass force=true to override."
+            ), "size_bytes": size, "cap_bytes": _BULK_IMPORT_MAX_BYTES}, 413)
+        return ({"error": reason or "unsafe file"}, 400)
     try:
         record = load_genbank(str(path))
     except (ValueError, OSError) as exc:
@@ -36376,16 +39956,15 @@ def _h_replace_sequence(app, payload):
             app._current_record = new_record
             pm.load_record(new_record)
             app.query_one("#sidebar", FeatureSidebar).populate(pm._feats)
-            app._restr_cache = _scan_restriction_sites(
-                new_seq,
-                min_recognition_len=app._restr_min_len,
-                unique_only=app._restr_unique_only,
-                circular=app._current_record_is_circular(),
-            )
-            displayed = app._restr_cache if app._show_restr else []
-            pm._restr_feats = displayed
+            # Restriction scan dispatched async — paints overlays as
+            # soon as the worker reports back. Pre-fix this synchronous
+            # call blocked the agent's `call_from_thread` for the full
+            # scan duration on big plasmids, holding the UI thread.
+            app._restr_cache = []
+            pm._restr_feats = []
             pm.refresh()
-            sp.update_seq(new_seq, pm._feats + displayed)
+            sp.update_seq(new_seq, pm._feats)
+            app._dispatch_restr_scan(new_seq)
             app._mark_dirty()
             return new_record.id
         except (ValueError, RuntimeError) as exc:
@@ -38062,6 +41641,20 @@ LibrarySearchModal { align: center middle; }
 #libsearch-btns   { height: 3; margin-top: 1; }
 #libsearch-btns Button { margin-right: 1; }
 
+/* ── Parts Bin "Load Part" source picker ─────────────────── */
+LoadPartSourceModal { align: center middle; }
+#loadpart-box {
+    width: 110; height: 38;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#loadpart-title  { background: $primary; padding: 0 1; margin-bottom: 1; }
+#loadpart-hint   { color: $text-muted; margin-bottom: 1; }
+#loadpart-input  { height: 3; }
+#loadpart-table  { height: 1fr; margin-top: 1; }
+#loadpart-status { height: 1; margin-top: 1; }
+#loadpart-btns   { height: 3; margin-top: 1; }
+#loadpart-btns Button { margin-right: 1; }
+
 /* ── ORF finder modal ────────────────────────────────────── */
 ORFFinderModal { align: center middle; }
 #orf-box {
@@ -38375,6 +41968,18 @@ RenamePlasmidModal { align: center middle; }
 #rename-btns   { height: 3; margin-top: 1; }
 #rename-btns Button { margin-right: 1; }
 
+/* ── Name new plasmid (Constructor → Save To Library) ─────── */
+NamePlasmidModal { align: center middle; }
+#nameplasmid-dlg {
+    width: 70; height: auto;
+    background: $surface; border: solid $primary; padding: 1 2;
+}
+#nameplasmid-title  { background: $primary-darken-2; color: $text; padding: 0 1; margin-bottom: 1; }
+#nameplasmid-input  { margin-top: 1; margin-bottom: 1; }
+#nameplasmid-status { height: 2; color: $text-muted; }
+#nameplasmid-btns   { height: 3; margin-top: 1; }
+#nameplasmid-btns Button { margin-right: 1; }
+
 /* ── Constructor modal ───────────────────────────────────── */
 ConstructorModal { align: center middle; }
 #ctor-box {
@@ -38411,6 +42016,28 @@ ConstructorModal { align: center middle; }
 .ctor-filter-row  { height: 3; }
 .ctor-btns        { height: 3; margin-top: 1; }
 .ctor-btns Button { margin-right: 1; }
+/* READY TO CLONE badge — shown next to the Save button when the
+   lane validates AND a backbone is bound. Green background + bold
+   text + a bit of horizontal padding so it reads as a chip. The
+   `-hidden` class collapses width to 0 so the layout doesn't
+   reflow when the badge appears / disappears. */
+.ctor-ready-badge {
+    height: 3; padding: 1 2; margin-left: 1;
+    background: $success; color: $text;
+    text-style: bold;
+    width: auto; content-align: center middle;
+}
+.ctor-ready-badge-hidden {
+    width: 0; padding: 0; margin-left: 0; background: $surface;
+}
+/* Red INCOMPATIBLE state — surfaced when the chain is internally
+   consistent and a vector is bound but the lane's terminal overhangs
+   don't match the bound vector's dropout. Same chip geometry as the
+   green READY TO CLONE state so toggling between them doesn't
+   reflow the row. */
+.ctor-ready-badge-incompatible {
+    background: $error;
+}
 /* Backbone row: each role is a column (bb-col) holding a name
    label above the role button. The Horizontal row sits below a
    section header (no leading inline label — Textual's Static
@@ -38501,8 +42128,9 @@ GrammarEditorModal { align: center middle; }
     padding: 0 1; margin-top: 1;
 }
 #ged-body { height: 1fr; padding: 0 1; }
-#ged-enzyme-row, #ged-tail-row { height: 3; margin-top: 1; }
+#ged-enzyme-row, #ged-tail-row, #ged-lvlup-row { height: 3; margin-top: 1; }
 #ged-enzyme-row Input, #ged-tail-row Input { width: 22; margin-right: 2; }
+#ged-lvlup-row Input { width: 1fr; }
 .ged-inline-label { padding: 1 1 0 0; width: 14; }
 #ged-forbidden { height: 5; border: solid $primary-darken-2; }
 #ged-positions { height: 9; border: solid $primary-darken-2; }
@@ -38513,6 +42141,29 @@ GrammarEditorModal { align: center middle; }
 #ged-entry-btns Button { margin-right: 1; }
 #ged-btns { height: 3; margin-top: 1; }
 #ged-btns Button { margin-right: 1; }
+
+/* ── Grammar manager + edit-confirm modals ───────────────── */
+GrammarManagerModal { align: center middle; }
+#gmgr-dlg {
+    width: 90; max-width: 95%; min-width: 60;
+    height: 70%; max-height: 30;
+    background: $surface; border: solid $accent; padding: 1 2;
+}
+#gmgr-title { background: $primary-darken-1; color: $text; padding: 0 1; margin-bottom: 1; }
+#gmgr-table { height: 1fr; }
+#gmgr-btns  { height: 3; margin-top: 1; }
+#gmgr-btns Button { margin-right: 1; }
+
+EditGrammarConfirmModal { align: center middle; }
+#gec-dlg {
+    width: 70; max-width: 95%; min-width: 50;
+    height: auto; max-height: 14;
+    background: $surface; border: solid $warning; padding: 1 2;
+}
+#gec-title { background: $warning-darken-1; color: $text; padding: 0 1; }
+#gec-msg   { height: auto; padding: 1 1; }
+#gec-btns  { height: 3; margin-top: 1; align: right middle; }
+#gec-btns Button { margin-left: 1; }
 
 /* ── Parts bin (full-screen) ─────────────────────────────── */
 #parts-box {
@@ -39172,7 +42823,7 @@ SpeciesPickerModal { align: center middle; }
             pm._restr_feats = []
             pm.refresh()
             sp.update_seq(new_seq, pm._feats)
-        self._restr_scan_worker(new_seq, self._record_load_counter)
+        self._dispatch_restr_scan(new_seq)
 
         self._mark_dirty()
 
@@ -39511,7 +43162,11 @@ SpeciesPickerModal { align: center middle; }
         global _collections_cache, _settings_cache
         # Force a cold read on every JSON registry so a corrupt file is
         # detected NOW (with .bak recovery + a user notify) rather than at
-        # the first lazy-load when something breaks downstream.
+        # the first lazy-load when something breaks downstream. The
+        # cache reset is the mechanism that lets a .bak restore land in
+        # the next typed-loader call. Caches WITHOUT their own
+        # generation counter (library, parts_bin, primers, collections,
+        # entry_vectors, settings) need the reset.
         for path, label, cache_attr in [
             (_LIBRARY_FILE,        "Plasmid library",     "_library_cache"),
             (_PARTS_BIN_FILE,      "Parts bin",           "_parts_bin_cache"),
@@ -39521,6 +43176,22 @@ SpeciesPickerModal { align: center middle; }
             (_SETTINGS_FILE,       "Settings",            "_settings_cache"),
         ]:
             globals()[cache_attr] = None
+            _, warning = _safe_load_json(path, label)
+            if warning:
+                self.notify(warning, severity="warning", timeout=12)
+        # Generation-tracked caches (features / feature_colors / grammars
+        # / codon_tables) DON'T need a cache reset — their typed loaders
+        # bump a global generation counter on every cold read, so the
+        # downstream generation-keyed consumers (Parts-Bin feat-lib
+        # index, FeatureLibraryScreen) would see a phantom invalidation
+        # if we forced a cold reread here. Just validate on-disk
+        # corruption + surface the warning; cache state is untouched.
+        for path, label in [
+            (_FEATURES_FILE,       "Feature library"),
+            (_FEATURE_COLORS_FILE, "Feature colours"),
+            (_GRAMMARS_FILE,       "Cloning grammars"),
+            (_CODON_TABLES_FILE,   "Codon tables"),
+        ]:
             _, warning = _safe_load_json(path, label)
             if warning:
                 self.notify(warning, severity="warning", timeout=12)
@@ -39571,14 +43242,17 @@ SpeciesPickerModal { align: center middle; }
         for ~1–2 s on a 5 Mb plasmid (the `_record_to_gb_text` +
         atomic write dominates). Off the UI thread the user keeps
         typing while disk I/O happens in the background.
-        Captures `_current_record` at entry so a record-swap mid-flight
-        can't make us write the wrong record under the old autosave
-        path; the `exclusive=True` + group ensures only the freshest
+        Deep-copies `_current_record` at entry so any concurrent
+        in-place mutation (e.g. a primer-add path that appends to
+        `record.features` between the autosave fire and serialisation
+        completing) can't leak partial state into the autosave file.
+        The `exclusive=True` + group ensures only the freshest
         autosave attempt runs.
         """
-        record = self._current_record
-        if record is None or not self._unsaved:
+        live = self._current_record
+        if live is None or not self._unsaved:
             return
+        record = deepcopy(live)
         path = self._autosave_path(record)
         if path is None:
             return
@@ -39766,12 +43440,24 @@ SpeciesPickerModal { align: center middle; }
         try:
             record = fetch_genbank("MW463917.1")
             def _add():
-                # Library add always fires (the seed is useful as a
-                # picker entry even if the user has loaded something
-                # else). Apply only if no record load has happened
+                # Library add fires only if MW463917.1 isn't already in
+                # the library — otherwise a user who pasted a plasmid
+                # named MW463917.1 between launch and seed-fetch
+                # completing would have their entry silently overwritten.
+                # Apply the record only if no record load has happened
                 # since we entered.
                 lib = self.query_one("#library", LibraryPanel)
-                lib.add_entry(record)
+                existing_ids = {
+                    e.get("id") for e in _load_library()
+                    if isinstance(e, dict)
+                }
+                if record.id not in existing_ids:
+                    lib.add_entry(record)
+                else:
+                    _log.info(
+                        "Default library seed MW463917.1 already "
+                        "present — skipping (user added it first)"
+                    )
                 if (self._current_record is None
                         and self._record_load_counter == entry_counter):
                     self._apply_record(record)
@@ -39781,7 +43467,11 @@ SpeciesPickerModal { align: center middle; }
             _log.exception("Default library seed (MW463917.1) failed")
 
     @work(thread=True, exclusive=True, group="restr_scan")
-    def _restr_scan_worker(self, seq: str, entry_counter: int) -> None:
+    def _restr_scan_worker(self, seq: str, *,
+                            min_len: int,
+                            unique_only: bool,
+                            circular: bool,
+                            entry_counter: int) -> None:
         """Worker: scan `seq` for restriction sites and apply the
         result if no record load has happened since entry. The scan
         itself is pure CPU and dominates `_apply_record` for big
@@ -39795,13 +43485,21 @@ SpeciesPickerModal { align: center middle; }
         recent scan request lives — if the user pages quickly through
         five plasmids, the four mid-flight scans get cancelled instead
         of all racing to apply.
+
+        All inputs (`min_len`, `unique_only`, `circular`) are captured
+        at the caller's entry rather than read off-thread. A linear→
+        circular swap during a 3 s scan on a 5 Mb plasmid was emitting
+        phantom wrap-spanning resites until the stale-counter discard
+        kicked in — the C-loop still ran on poisoned input the whole
+        time. Capture-at-entry locks the scan's view of the world to
+        the moment the user triggered it.
         """
         try:
             result = _scan_restriction_sites(
                 seq,
-                min_recognition_len=self._restr_min_len,
-                unique_only=self._restr_unique_only,
-                circular=self._current_record_is_circular(),
+                min_recognition_len=min_len,
+                unique_only=unique_only,
+                circular=circular,
             )
         except Exception:
             _log.exception("Restriction scan worker failed")
@@ -39830,6 +43528,23 @@ SpeciesPickerModal { align: center middle; }
 
         self.call_from_thread(_apply)
 
+    def _dispatch_restr_scan(self, seq: str) -> None:
+        """Capture current scan-relevant settings + topology on the UI
+        thread and dispatch `_restr_scan_worker` to do the CPU work
+        off-thread. Replaces a half-dozen sites that used to call
+        `_scan_restriction_sites` synchronously from the UI thread —
+        each was a 50-200 ms hitch on a 200 kb plasmid (worse on
+        bigger ones). Capture is on the UI thread so the worker never
+        reads instance state across threads (finding #13)."""
+        circular = self._current_record_is_circular()
+        self._restr_scan_worker(
+            seq,
+            min_len=self._restr_min_len,
+            unique_only=self._restr_unique_only,
+            circular=circular,
+            entry_counter=self._record_load_counter,
+        )
+
     # ── Keyboard: cursor movement, copy, undo/redo ─────────────────────────────
 
     def action_copy_selection(self) -> None:
@@ -39857,20 +43572,17 @@ SpeciesPickerModal { align: center middle; }
             f_s, f_e = aa_feat["start"], aa_feat["end"]
             strand = aa_feat.get("strand", 1)
             aa_str = _translate_cds(seq, f_s, f_e, strand).rstrip("*")
-            try:
-                self.copy_to_clipboard(aa_str)
-                self._notify_success(
-                    f"Copied {len(aa_str)} aa ({aa_feat.get('label', 'CDS')}) "
-                    f"to clipboard"
-                )
-            except Exception:
-                if _copy_to_clipboard_osc52(aa_str):
-                    self._notify_success(
-                        f"Copied {len(aa_str)} aa "
-                        f"({aa_feat.get('label', 'CDS')}) to clipboard"
-                    )
-                else:
-                    self.notify("Clipboard unavailable", severity="warning")
+            # Route through the 4-tier helper so a clipboard-broken
+            # SSH session still gets the AA string via the disk-fallback
+            # tier (hardening item 37). Pre-fix this fell through to
+            # "Clipboard unavailable" notify, defeating the hardening.
+            mode, detail = _copy_to_clipboard_with_fallback(
+                self, aa_str, label=f"aa-{aa_feat.get('label', 'CDS')}",
+            )
+            self._notify_copy_outcome(
+                len(aa_str), f"aa ({aa_feat.get('label', 'CDS')})",
+                mode, detail,
+            )
             return
         sel = sp._user_sel or sp._sel_range
         if not sel:
@@ -39885,14 +43597,33 @@ SpeciesPickerModal { align: center middle; }
         else:
             text = top
             label = "top strand"
-        try:
-            self.copy_to_clipboard(text)
-            self._notify_success(f"Copied {len(text)} bp ({label}) to clipboard")
-        except Exception:
-            if _copy_to_clipboard_osc52(text):
-                self._notify_success(f"Copied {len(text)} bp ({label}) to clipboard")
-            else:
-                self.notify("Clipboard unavailable", severity="warning")
+        mode, detail = _copy_to_clipboard_with_fallback(
+            self, text, label=label.replace(" ", "_"),
+        )
+        self._notify_copy_outcome(len(text), f"bp ({label})", mode, detail)
+
+    def _notify_copy_outcome(self, n: int, what: str,
+                                mode: str, detail) -> None:
+        """Surface the right toast for whichever tier of
+        `_copy_to_clipboard_with_fallback` succeeded. Pre-fix every
+        copy path composed its own message and several missed the
+        file-tier success case where the text landed in
+        ``<DATA_DIR>/clipboard/...`` — the user got "Clipboard
+        unavailable" instead of being told where to find their copy."""
+        if mode == "clipboard" or mode == "osc52":
+            self._notify_success(f"Copied {n} {what} to clipboard")
+        elif mode == "file" and detail is not None:
+            self.notify(
+                f"Clipboard unavailable. {n} {what} written to "
+                f"{detail}",
+                severity="warning", timeout=15,
+            )
+        else:
+            self.notify(
+                f"Clipboard unavailable. {n} {what} logged to the "
+                f"diagnostic file only.",
+                severity="warning", timeout=12,
+            )
 
     def _clear_all_highlights(self) -> None:
         """Comprehensive 'fresh state' reset — clears every panel's
@@ -40298,7 +44029,7 @@ SpeciesPickerModal { align: center middle; }
             pm._restr_feats   = []
             pm.refresh()
             sp.update_seq(seq, pm._feats)
-            self._restr_scan_worker(seq, self._record_load_counter)
+            self._dispatch_restr_scan(seq)
         else:
             sp.update_seq(seq, [])
         sp._cursor_pos = cursor_pos
@@ -40507,18 +44238,26 @@ SpeciesPickerModal { align: center middle; }
         library when running synchronously; threading keeps the cursor
         responsive while I/O happens in the background.
 
-        Captures record reference + source path at entry so a
-        record-swap mid-write can't leave the wrong content on disk.
-        `exclusive=True` + `group="save"` collapse rapid Ctrl+S spam
-        into a single in-flight save.
+        Captures a deep-copied record snapshot + source path at entry
+        so a record-swap OR in-place feature mutation mid-write can't
+        leave the wrong content on disk. Pre-fix the worker captured a
+        bare reference and iterated `record.features` from a non-UI
+        thread; in the (theoretical) case of a concurrent in-place
+        `record.features.append(...)` from a primer-add path the
+        serialisation would crash or pick up half-mutated state.
+        Deepcopy on a 5 Mb plasmid costs ~50 ms — cheap vs. the
+        atomic-write cost that dominates the worker. `exclusive=True`
+        + `group="save"` collapse rapid Ctrl+S spam into a single
+        in-flight save.
         """
-        record = self._current_record
-        if record is None:
+        live_record = self._current_record
+        if live_record is None:
             self.call_from_thread(
                 self.notify, "Nothing to save.", severity="warning",
             )
             _log_event("save.no_record")
             return
+        record = deepcopy(live_record)
         source_path = self._source_path
         record_name = record.name
         record_id   = record.id
@@ -41391,10 +45130,10 @@ SpeciesPickerModal { align: center middle; }
         )
 
         # Kick off the deferred scan. `_record_load_counter` was
-        # already incremented above; pass it as the stale-load token
-        # so the worker discards its result if the user loads something
-        # else before the scan finishes.
-        self._restr_scan_worker(seq_str, self._record_load_counter)
+        # already incremented above; the dispatcher captures it as the
+        # stale-load token so the worker discards its result if the
+        # user loads something else before the scan finishes.
+        self._dispatch_restr_scan(seq_str)
 
         # Heads-up for non-fatal import oddities that the user should know
         # about: skipped features (UnknownPosition), compound locations
@@ -42551,36 +46290,43 @@ SpeciesPickerModal { align: center middle; }
         return str(topology).lower() != "linear"
 
     def _rescan_restrictions(self) -> None:
-        """Re-scan restriction sites with current settings and update UI."""
+        """Re-scan restriction sites with current settings and update UI.
+        Dispatches through `_restr_scan_worker` rather than running the
+        scan synchronously — the toggle bindings (Show/Hide RE, 4 bp /
+        6 bp threshold, Unique-only) used to block the UI for 1–2 s on a
+        200 kb plasmid (worse on multi-Mb). The worker paints overlays
+        when ready; the current cache (possibly empty) is shown in the
+        interim."""
         sp = self.query_one("#seq-panel", SequencePanel)
         pm = self.query_one("#plasmid-map", PlasmidMap)
         if not sp._seq:
             return
-        self._restr_cache = _scan_restriction_sites(
-            sp._seq,
-            min_recognition_len=self._restr_min_len,
-            unique_only=self._restr_unique_only,
-            circular=self._current_record_is_circular(),
-        )
-        displayed = self._restr_cache if self._show_restr else []
-        pm._restr_feats = displayed
+        # Clear the existing cache so the user gets immediate visual
+        # feedback that the scan parameters changed (overlays drop while
+        # the worker recomputes). Without this the previous cache stays
+        # painted until the worker reports back — the user thinks the
+        # toggle did nothing.
+        self._restr_cache = []
+        pm._restr_feats = [] if self._show_restr else pm._restr_feats
         pm.refresh()
-        sp.update_seq(sp._seq, pm._feats + displayed)
+        sp.update_seq(sp._seq, pm._feats)
+        self._dispatch_restr_scan(sp._seq)
 
     def _apply_restr_visibility(self) -> None:
-        """Push current cache to map/sequence panel respecting _show_restr flag."""
+        """Push current cache to map/sequence panel respecting _show_restr flag.
+        If the cache is empty and overlays are wanted, dispatch a worker
+        scan rather than blocking the UI."""
         sp = self.query_one("#seq-panel", SequencePanel)
         pm = self.query_one("#plasmid-map", PlasmidMap)
         if not sp._seq:
             return
-        # Rescan if cache is stale or empty (e.g. loaded before cache was wired up)
         if self._show_restr and not self._restr_cache:
-            self._restr_cache = _scan_restriction_sites(
-                sp._seq,
-                min_recognition_len=self._restr_min_len,
-                unique_only=self._restr_unique_only,
-                circular=self._current_record_is_circular(),
-            )
+            # Dispatch async; paint the (empty) state immediately.
+            pm._restr_feats = []
+            pm.refresh()
+            sp.update_seq(sp._seq, pm._feats)
+            self._dispatch_restr_scan(sp._seq)
+            return
         displayed = self._restr_cache if self._show_restr else []
         pm._restr_feats = displayed
         pm.refresh()
@@ -42656,6 +46402,8 @@ SpeciesPickerModal { align: center middle; }
                                                           "toggle_constructor_filter"),
                 (f"Min primer binding: {self._min_primer_binding} bp → set…",
                                                           "set_min_primer_binding"),
+                ("---",                                   None),
+                ("Cloning grammars…",                     "open_grammars"),
                 ("---",                                   None),
                 ("Restore library / collections from backup…",
                                                           "restore_from_backup"),
@@ -43309,17 +47057,15 @@ SpeciesPickerModal { align: center middle; }
         sp      = self.query_one("#seq-panel",   SequencePanel)
         pm.load_record(new_record)
         seq_str = str(new_record.seq)
-        self._restr_cache = _scan_restriction_sites(
-            seq_str,
-            min_recognition_len=self._restr_min_len,
-            unique_only=self._restr_unique_only,
-            circular=self._current_record_is_circular(),
-        )
-        displayed = self._restr_cache if self._show_restr else []
-        pm._restr_feats = displayed
+        # Restriction scan dispatched async — `_dispatch_restr_scan` paints
+        # overlays when the worker reports. Pre-fix the synchronous call
+        # here hitched the Add-Feature modal close on big plasmids.
+        self._restr_cache = []
+        pm._restr_feats = []
         pm.refresh()
         sidebar.populate(pm._feats)
-        sp.update_seq(seq_str, pm._feats + displayed)
+        sp.update_seq(seq_str, pm._feats)
+        self._dispatch_restr_scan(seq_str)
         # Auto-highlight the freshly-annotated bp range. `update_seq`
         # cleared `_user_sel`; setting it now to the new feature's
         # span paints the white-on-black overlay on those bases the
@@ -43385,6 +47131,14 @@ SpeciesPickerModal { align: center middle; }
 
     def action_open_constructor(self) -> None:
         self.push_screen(ConstructorModal())
+
+    def action_open_grammars(self) -> None:
+        """Settings → Cloning grammars… opens the grammar manager so
+        the user can create / edit / delete custom grammars without
+        touching `cloning_grammars.json` by hand. Custom grammars
+        appear automatically in every grammar dropdown
+        (`_grammar_dropdown_options`) once saved."""
+        self.push_screen(GrammarManagerModal())
 
     def action_open_primer_design(self) -> None:
         """Open the full-screen Primer Design workbench. Passes the current
@@ -43452,6 +47206,22 @@ SpeciesPickerModal { align: center middle; }
                 )
             except Exception:
                 pass
+            # Cap-fallback must STILL dispatch the caller's `callback`
+            # with `None` so parent flows that wait on it (modal save
+            # buttons, picker dismiss handlers) don't deadlock waiting
+            # for a result that will never arrive. Pre-fix we returned
+            # a no-op awaitable and dropped the kwargs — buttons would
+            # stay disabled, focus parked in a half-state.
+            callback = kwargs.get("callback")
+            if callable(callback):
+                try:
+                    callback(None)
+                except Exception:
+                    # Caller's callback is their problem; we did our
+                    # part by invoking it. Log so it's not silent.
+                    _log.exception(
+                        "Cap-fallback callback raised for %s", screen_name,
+                    )
             # Return a completed awaitable so `await` works.
             async def _noop():
                 return None
@@ -43503,9 +47273,45 @@ SpeciesPickerModal { align: center middle; }
             except Exception:
                 pass
 
+    def _undo_blocked_by_modal(self) -> bool:
+        """Return True if a modal on the screen stack opts into
+        blocking app-level undo/redo. Modals that synchronously mutate
+        `_current_record` (Constructor save, Domesticator save-as,
+        Mutagenize commit) should set `_blocks_undo = True` so a
+        mid-save Ctrl+Z can't reassign the record under them.
+
+        Default policy: undo/redo stay global — most modals are read-
+        only and the user expects Ctrl+Z to "always work" — but a
+        modal can OPT IN by carrying the class attribute. This keeps
+        invariants #13 / #15 honest (undo is above the screen-stack
+        guard for global semantics) while plugging the specific bug
+        class where a modal's continued reference to the record gets
+        orphaned mid-action."""
+        try:
+            stack = self.screen_stack
+        except Exception:
+            return False
+        if len(stack) <= 1:
+            return False
+        try:
+            top = stack[-1]
+        except (IndexError, AttributeError):
+            return False
+        return bool(getattr(top, "_blocks_undo", False))
+
     def action_undo(self) -> None:
         # Log every undo so a diagnostic bundle can replay the user's
         # sequence of edits. Cheap (one line per keystroke).
+        if self._undo_blocked_by_modal():
+            try:
+                self.notify(
+                    "Undo blocked: a save / commit is in progress.",
+                    severity="warning",
+                )
+            except Exception:
+                pass
+            _log.info("user action: undo refused — modal blocks_undo")
+            return
         try:
             n = len(self._undo_stack) if hasattr(self, "_undo_stack") else 0
         except Exception:
@@ -43514,6 +47320,16 @@ SpeciesPickerModal { align: center middle; }
         self._action_undo()
 
     def action_redo(self) -> None:
+        if self._undo_blocked_by_modal():
+            try:
+                self.notify(
+                    "Redo blocked: a save / commit is in progress.",
+                    severity="warning",
+                )
+            except Exception:
+                pass
+            _log.info("user action: redo refused — modal blocks_undo")
+            return
         try:
             n = len(self._redo_stack) if hasattr(self, "_redo_stack") else 0
         except Exception:
@@ -43525,17 +47341,16 @@ SpeciesPickerModal { align: center middle; }
 
     @on(SequencePanel.SequenceChanged)
     def _seq_changed(self, event: SequencePanel.SequenceChanged):
-        # Update restriction site overlay whenever sequence changes
+        # Update restriction site overlay whenever sequence changes —
+        # dispatch through the worker so per-keystroke edits don't
+        # block the UI for 50–200 ms on big plasmids. Empty the cache
+        # so the overlay drops while the worker recomputes (otherwise
+        # the user types and sees stale resites linger).
         pm = self.query_one("#plasmid-map", PlasmidMap)
-        self._restr_cache = _scan_restriction_sites(
-            event.seq,
-            min_recognition_len=self._restr_min_len,
-            unique_only=self._restr_unique_only,
-            circular=self._current_record_is_circular(),
-        )
-        displayed = self._restr_cache if self._show_restr else []
-        pm._restr_feats = displayed
+        self._restr_cache = []
+        pm._restr_feats = [] if self._show_restr else pm._restr_feats
         pm.refresh()
+        self._dispatch_restr_scan(event.seq)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -43792,6 +47607,16 @@ def main():
             _settings_flush_sync()
         except Exception:
             _log.exception("Settings flush-on-exit failed")
+        # Flush any pending async collection-sync. The worker is
+        # daemon so it would die with the process, but a delete /
+        # save the user did right before quitting needs to actually
+        # land on disk. 6 s is generous — `_save_collections` on a
+        # 150 MB file finishes in ~2 s on WSL2 and we'd rather wait
+        # than lose the mirror.
+        try:
+            _flush_pending_collection_sync(timeout_s=6.0)
+        except Exception:
+            _log.exception("Collection sync flush-on-exit failed")
         # Drain non-daemon worker threads with a 2 s budget. Most
         # `@work(thread=True)` tasks finish well within this; if a
         # BLAST run is still in flight, log which threads are pending

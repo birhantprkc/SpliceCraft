@@ -406,3 +406,225 @@ class TestFeatLen:
         ]
         by_len_desc = sorted(feats, key=lambda f: -sc._feat_len(f["start"], f["end"], 1000))
         assert [f["name"] for f in by_len_desc] == ["big_linear", "wrap_150", "small_linear"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# _feat_bounds — sacred invariant #9 (wrap-feature CompoundLocation extraction)
+# Regression guard for 2026-05-10 fix: routing five call sites through this
+# helper instead of raw `int(loc.start)`/`int(loc.end)` which silently flattened
+# origin-spanning features to the BACKBONE GAP and produced biologically wrong
+# downstream behavior (wrong primers, wrong restriction analysis, dropped
+# annotations).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _make_wrap_compound_feat(tail_start: int, head_end: int, total: int,
+                               *, strand: int = 1, ftype: str = "CDS",
+                               label: str = "wrap_cds"):
+    """Build a Biopython SeqFeature whose CompoundLocation has the canonical
+    origin-wrap shape: ``join(0..head_end, tail_start..total)``."""
+    from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+    parts = [
+        FeatureLocation(0, head_end, strand=strand),
+        FeatureLocation(tail_start, total, strand=strand),
+    ]
+    feat = SeqFeature(
+        CompoundLocation(parts), type=ftype,
+        qualifiers={"label": [label]},
+    )
+    return feat
+
+
+def _make_simple_feat(start: int, end: int, *, strand: int = 1,
+                        ftype: str = "CDS", label: str = "linear_cds"):
+    from Bio.SeqFeature import SeqFeature, FeatureLocation
+    return SeqFeature(
+        FeatureLocation(start, end, strand=strand), type=ftype,
+        qualifiers={"label": [label]},
+    )
+
+
+class TestFeatBounds:
+    def test_linear_feature_unchanged(self):
+        feat = _make_simple_feat(100, 200, strand=1)
+        bounds = sc._feat_bounds(feat, total=1000)
+        assert bounds == (100, 200, 1)
+
+    def test_linear_reverse_strand_carries(self):
+        feat = _make_simple_feat(100, 200, strand=-1)
+        bounds = sc._feat_bounds(feat, total=1000)
+        assert bounds == (100, 200, -1)
+
+    def test_origin_wrap_returns_tail_start_head_end(self):
+        """The canonical join(0..50, 5800..6000) shape on a 6000 bp plasmid
+        re-encodes as (5800, 50) so end < start signals wrap."""
+        feat = _make_wrap_compound_feat(
+            tail_start=5800, head_end=50, total=6000,
+        )
+        bounds = sc._feat_bounds(feat, total=6000)
+        assert bounds == (5800, 50, 1)
+
+    def test_origin_wrap_reverse_strand(self):
+        feat = _make_wrap_compound_feat(
+            tail_start=4500, head_end=200, total=5000, strand=-1,
+        )
+        bounds = sc._feat_bounds(feat, total=5000)
+        assert bounds == (4500, 200, -1)
+
+    def test_non_origin_compound_flattens_to_outer_bounds(self):
+        """A compound like exon-1 + exon-2 (NOT touching 0 or total) is
+        flattened to outer bounds — lossy, but oriented correctly."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+        feat = SeqFeature(
+            CompoundLocation([
+                FeatureLocation(100, 200, strand=1),
+                FeatureLocation(400, 500, strand=1),
+            ]),
+            type="mRNA", qualifiers={"label": ["mrna"]},
+        )
+        bounds = sc._feat_bounds(feat, total=1000)
+        assert bounds == (100, 500, 1)
+
+    def test_unknown_position_returns_none(self):
+        from Bio.SeqFeature import SeqFeature
+        try:
+            from Bio.SeqFeature import UnknownPosition, FeatureLocation
+        except ImportError:
+            pytest.skip("UnknownPosition unavailable in this Biopython")
+        try:
+            loc = FeatureLocation(UnknownPosition(), UnknownPosition())
+        except Exception:
+            pytest.skip("UnknownPosition couldn't build a FeatureLocation")
+        feat = SeqFeature(loc, type="misc_feature")
+        bounds = sc._feat_bounds(feat, total=1000)
+        assert bounds is None
+
+    def test_missing_location_returns_none(self):
+        class _Fake:
+            location = None
+        assert sc._feat_bounds(_Fake(), total=1000) is None
+
+
+class TestWrapFeatureSliceContract:
+    """The whole point of `_feat_bounds` is that downstream `_slice_circular`
+    + `_feat_len` produce the right biology for a wrap feature."""
+
+    def test_slice_picks_correct_bases(self):
+        # 60 bp plasmid; wrap CDS at join(0..10, 50..60) = 20 bp total
+        # encoded as (50, 10). Sequence: 0-9 are "A"s (head), 10-49 are
+        # "C"s (gap), 50-59 are "T"s (tail). Wrap feature should return
+        # TTTTTTTTTTAAAAAAAAAA.
+        seq = "A"*10 + "C"*40 + "T"*10
+        feat = _make_wrap_compound_feat(50, 10, 60)
+        s, e, _strand = sc._feat_bounds(feat, total=60)
+        assert (s, e) == (50, 10)
+        feat_seq = sc._slice_circular(seq, s, e)
+        assert feat_seq == "T"*10 + "A"*10
+        # Confirm the OLD (broken) path returned the gap:
+        broken = seq[int(feat.location.start):int(feat.location.end)]
+        assert broken == "A"*10 + "C"*40 + "T"*10  # Biopython flattens to full span
+        # so OLD slice would have been the WRONG 60-bp full-record span.
+
+    def test_length_routes_through_feat_len(self):
+        feat = _make_wrap_compound_feat(5800, 50, 6000)
+        s, e, _strand = sc._feat_bounds(feat, total=6000)
+        assert sc._feat_len(s, e, 6000) == 250
+
+
+class TestWrapFeatureAnnotationTransfer:
+    """Regression guard: `_find_annotation_transfers` must propagate origin-
+    spanning source features. Pre-fix it called `int(loc.start)`/`int(loc.end)`
+    which flattened wrap CDSes and they vanished from the result list."""
+
+    def test_wrap_cds_transfers(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        # Source: 100 bp circular, wrap feature at join(0..20, 80..100).
+        # Use a non-palindromic 40-bp wrap region so the test only matches
+        # the forward strand (palindromic regions would match RC too and
+        # produce two transfers).
+        src_seq = ("ACGAGTACGAGTACGAGTAC"      # 0..20: head of wrap CDS
+                   + "C"*60                    # 20..80: gap (backbone)
+                   + "GATTCAGATTCAGATTCAGT")   # 80..100: tail of wrap CDS
+        assert len(src_seq) == 100
+        src_rec = SeqRecord(Seq(src_seq), id="src", name="src")
+        src_rec.annotations["topology"] = "circular"
+        src_rec.features.append(_make_wrap_compound_feat(80, 20, 100))
+        # Target: linearised version of the wrap region (tail+head).
+        tgt_bases = src_seq[80:] + src_seq[:20]
+        tgt_seq = "G"*30 + tgt_bases + "G"*30
+        tgt_rec = SeqRecord(Seq(tgt_seq), id="tgt", name="tgt")
+        tgt_rec.annotations["topology"] = "linear"
+
+        transfers = sc._find_annotation_transfers(src_rec, tgt_rec, min_len=20)
+        assert len(transfers) == 1, (
+            "Wrap CDS must transfer exactly once; pre-fix it was silently "
+            "dropped because `int(loc.start)`/`int(loc.end)` returned (0, 100) "
+            "and the slice produced the whole sequence rather than the "
+            "40-bp wrap region."
+        )
+        t = transfers[0]
+        assert t["target_start"] == 30
+        assert t["target_end"]   == 70
+
+
+class TestWrapFeatureRecordFeatures:
+    """`TraditionalCloningPane._record_features` must emit wrap-encoded dicts
+    so `_excise_fragment_pair` sees `end < start` for origin-spanning vector
+    features and routes the dropout correctly."""
+
+    def test_wrap_vector_feature_encoded_as_wrap(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("N"*1000), id="r", name="r")
+        rec.annotations["topology"] = "circular"
+        rec.features.append(_make_wrap_compound_feat(950, 50, 1000))
+
+        # Build a TraditionalCloningPane bound just enough to call the
+        # method (it's instance-level but doesn't touch self state in the
+        # body).
+        pane = sc.TraditionalCloningPane.__new__(sc.TraditionalCloningPane)
+        feats = pane._record_features(rec)
+        assert len(feats) == 1
+        f = feats[0]
+        assert (f["start"], f["end"]) == (950, 50), (
+            "Wrap feature must encode as (tail_start, head_end). Pre-fix "
+            "this returned (0, 1000) — the WHOLE plasmid, which would slice "
+            "every base of the vector as 'feature'."
+        )
+
+
+class TestWrapFeatureFeatsForDomesticator:
+    def test_wrap_feature_encoded_correctly(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ACGT"*250), id="r", name="r")  # 1000 bp
+        rec.annotations["topology"] = "circular"
+        rec.features.append(_make_wrap_compound_feat(900, 100, 1000))
+
+        feats = sc._feats_for_domesticator(rec)
+        assert len(feats) == 1
+        f = feats[0]
+        assert (f["start"], f["end"]) == (900, 100), (
+            "Pre-fix this returned (0, 1000) which the domesticator then "
+            "treated as 'design primers for the entire plasmid' — wrong "
+            "biology and wrong primer Tm budget."
+        )
+
+
+class TestWrapFeaturePrimerDesignScreen:
+    def test_wrap_cds_encoded_correctly(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ACGT"*500), id="r", name="r")  # 2000 bp
+        rec.annotations["topology"] = "circular"
+        rec.features.append(_make_wrap_compound_feat(1900, 100, 2000))
+
+        scr = sc.PrimerDesignScreen.__new__(sc.PrimerDesignScreen)
+        feats = scr._parse_features_from_record(rec)
+        assert len(feats) == 1
+        assert (feats[0]["start"], feats[0]["end"]) == (1900, 100), (
+            "Pre-fix the wrap CDS came in as (0, 2000) and Primer3 designed "
+            "against the inverted backbone region rather than the user's "
+            "feature."
+        )

@@ -1101,10 +1101,12 @@ class TestConstructorMultiGrammarTabs:
     def test_grammar_pos_slots_includes_cds_ns_alias(self):
         gb_l0 = sc._BUILTIN_GRAMMARS["gb_l0"]
         slots = sc._grammar_pos_slots(gb_l0)
-        # CDS at pos 3 (gb_l0 has Promoter, 5' UTR, CDS, ...).
-        assert slots["CDS"] == 3
+        # GB 2.0 expanded grammar: Promoter(1), Promoter-only(2),
+        # 5' UTR(3), CDS(4), ...  — CDS is at pos 4 not 3 since the
+        # expansion split Promoter into combined + separate variants.
+        assert slots["CDS"] == 4
         # CDS-NS shares the CDS slot via alias-fallback.
-        assert slots["CDS-NS"] == 3
+        assert slots["CDS-NS"] == 4
 
     async def test_constructor_modal_has_three_tabs(
             self, tiny_record, isolated_library):

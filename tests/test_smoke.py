@@ -2266,6 +2266,250 @@ class TestLibrarySearch:
         # 'zlc' fails because no 'c' after the 'z' in "LacZ alpha".
         assert not sc._fuzzy_match("zlc", "LacZ alpha")
 
+    def test_fuzzy_match_empty_name_with_query_returns_false(self):
+        """Edge case: a non-empty query against an empty name can
+        never match. The early-exit avoids the lower() + scan path
+        which would also return False, just cheaper."""
+        assert sc._fuzzy_match("x", "") is False
+
+    def test_fuzzy_match_query_longer_than_name_short_circuits(self):
+        """Subsequence requires len(query) <= len(name). When the
+        user types more chars than the longest plasmid name, every
+        match early-rejects without lowercasing or scanning.
+
+        Performance proxy: the early-reject path skips `str.lower()`
+        which is the hot loop on big libraries with long descriptive
+        names. We just assert the boolean result here; the perf win
+        is exercised by `test_fuzzy_match_huge_query_doesnt_hang`."""
+        assert sc._fuzzy_match("abcdef", "abc") is False
+        assert sc._fuzzy_match("aaaa", "aaa") is False
+        # Equal length still goes through the scan path.
+        assert sc._fuzzy_match("abc", "abc") is True
+
+    def test_fuzzy_match_huge_query_doesnt_hang(self):
+        """A 100k-char paste shouldn't lock the search bar — fuzzy
+        matching against typical plasmid names (10-30 chars) early-
+        rejects via the length pre-check. Run 1000 iterations as a
+        perf smoke test; on a slow CI host the bound is 0.5s.
+        """
+        import time
+        big_query = "x" * 100_000
+        names = [
+            "pUC19", "pBR322", "pET28a", "pUPD2", "pAGM4673",
+        ]
+        t0 = time.perf_counter()
+        for _ in range(1000):
+            for n in names:
+                assert sc._fuzzy_match(big_query, n) is False
+        elapsed = time.perf_counter() - t0
+        # 5000 calls × early-reject = should be < 50 ms on any
+        # reasonable host. 0.5s is a generous CI-friendly bound.
+        assert elapsed < 0.5, (
+            f"fuzzy match too slow on huge query: {elapsed:.3f}s "
+            "for 5000 calls — early-reject regressed?"
+        )
+
+    def test_fuzzy_match_unicode_lowercases(self):
+        """The lower() call is unicode-aware, so a Greek prefix
+        matches its own lowercase form."""
+        assert sc._fuzzy_match("αβ", "ΑΒgene") is True
+        assert sc._fuzzy_match("ΑΒ", "αβgene") is True
+
+
+class TestSearchInputWidget:
+    """`_SearchInput` is the reusable search-bar widget — prefill,
+    focus-clear, blur-restore, optional debounce, length cap, timer
+    cleanup. Regression guards for 2026-05-10 hardening."""
+
+    async def test_prefill_default_and_current_query_empty(self):
+        """The widget initialises with PREFILL as its display value;
+        `current_query()` returns "" because the prefill counts as
+        empty. Mirrors the library-panel idle state where the user
+        hasn't typed anything yet.
+
+        The harness uses a second widget to ensure the search bar
+        does NOT auto-focus on mount — `on_focus` clears the prefill
+        (per the documented "click into to clear" UX), and we want
+        to assert the idle-state value here.
+        """
+        from textual.app import App
+        from textual.widgets import Static
+
+        class _Harness(App):
+            def compose(self):
+                yield Static("anchor", id="anchor")
+                yield sc._SearchInput(id="harness-search")
+
+        app = _Harness()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            inp = app.query_one("#harness-search", sc._SearchInput)
+            # The anchor widget takes focus first; the search bar
+            # holds its prefill until the user clicks into it.
+            if inp.has_focus:
+                # Some Textual versions still auto-focus the only
+                # focusable widget. Defocus + restore prefill so the
+                # assertion below tests the idle-state contract.
+                inp.on_blur(None)
+            assert inp.value == sc._SearchInput.PREFILL
+            assert inp.current_query() == ""
+
+    async def test_current_query_strips_whitespace(self):
+        """A user-typed query with surrounding whitespace surfaces
+        as the trimmed form. Defends downstream filters from having
+        to strip themselves."""
+        from textual.app import App
+
+        class _Harness(App):
+            def compose(self):
+                yield sc._SearchInput(id="harness-search")
+
+        app = _Harness()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            inp = app.query_one("#harness-search", sc._SearchInput)
+            inp.value = "   pUC19   "
+            assert inp.current_query() == "pUC19"
+
+    async def test_length_cap_truncates_huge_paste(self):
+        """A clipboard dump way past the cap is silently truncated.
+        Without this the fuzzy matcher's O(query × name) loop would
+        stall the UI before the debounce had a chance to fire."""
+        from textual.app import App
+
+        class _Harness(App):
+            def compose(self):
+                yield sc._SearchInput(id="harness-search", max_len=50)
+
+        app = _Harness()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            inp = app.query_one("#harness-search", sc._SearchInput)
+            inp.value = "x" * 5000
+            await pilot.pause()
+            assert len(inp.value) <= 50
+
+    async def test_clear_resets_to_prefill(self):
+        from textual.app import App
+
+        class _Harness(App):
+            def compose(self):
+                yield sc._SearchInput(id="harness-search")
+
+        app = _Harness()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            inp = app.query_one("#harness-search", sc._SearchInput)
+            inp.value = "user typed"
+            inp.clear()
+            assert inp.value == sc._SearchInput.PREFILL
+            assert inp.current_query() == ""
+
+    async def test_debounce_fires_filter_callback_once(self):
+        """A burst of three keystrokes within the debounce window
+        fires the on_filter callback exactly once after the window
+        expires. Without the cancel-and-reschedule it would fire
+        three times."""
+        import asyncio
+        from textual.app import App
+        calls = []
+
+        class _Harness(App):
+            def compose(self):
+                yield sc._SearchInput(
+                    id="harness-search",
+                    debounce_s=0.05,
+                    on_filter=lambda q: calls.append(q),
+                )
+
+        app = _Harness()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            inp = app.query_one("#harness-search", sc._SearchInput)
+            # Type three chars in rapid succession.
+            inp.value = "p"
+            inp.value = "pU"
+            inp.value = "pUC"
+            # Wait past the debounce window.
+            await asyncio.sleep(0.15)
+            await pilot.pause()
+        assert len(calls) == 1, (
+            f"expected 1 debounced call, got {len(calls)}: {calls}"
+        )
+        # The callback receives the SANITISED query — last value
+        # only, with prefill/whitespace stripped.
+        assert calls[0] == "pUC"
+
+    async def test_unmount_cancels_pending_debounce(self):
+        """The debounce timer is freed on unmount so a queued tick
+        doesn't fire against a disposed widget tree. Mirrors the
+        same guarantee in `LoadPartSourceModal`."""
+        import asyncio
+        from textual.app import App
+        calls = []
+
+        class _Harness(App):
+            def compose(self):
+                yield sc._SearchInput(
+                    id="harness-search",
+                    debounce_s=0.20,
+                    on_filter=lambda q: calls.append(q),
+                )
+
+        app = _Harness()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            inp = app.query_one("#harness-search", sc._SearchInput)
+            inp.value = "queued"
+            assert inp._filter_timer is not None
+        # `app.run_test` exits → on_unmount fires → timer cancelled.
+        # Extra wait past the original 0.20 s window — if the
+        # cancel didn't fire, the callback would land here.
+        await asyncio.sleep(0.30)
+        assert calls == [], (
+            f"timer fired post-unmount: {calls}"
+        )
+
+    async def test_blur_restores_prefill_when_empty(self):
+        """An empty + unfocused field shows the prefill again so the
+        idle UI keeps its 'Search' affordance. Whitespace-only
+        counts as empty for this restore."""
+        from textual.app import App
+
+        class _Harness(App):
+            def compose(self):
+                yield sc._SearchInput(id="harness-search")
+
+        app = _Harness()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            inp = app.query_one("#harness-search", sc._SearchInput)
+            inp.value = "   "
+            # Manually fire on_blur (Textual's harness doesn't
+            # always dispatch focus events deterministically; the
+            # method is a pure value-mutator anyway).
+            inp.on_blur(None)
+            assert inp.value == sc._SearchInput.PREFILL
+
+    async def test_prefill_is_treated_as_empty_in_current_query(self):
+        """Typing the literal prefill string and checking
+        `current_query()` returns "" — defends against a user who
+        hasn't focused the field but whose Submitted event still
+        fires (some terminals dispatch Enter on a freshly-mounted
+        Input that still shows the prefill)."""
+        from textual.app import App
+
+        class _Harness(App):
+            def compose(self):
+                yield sc._SearchInput(id="harness-search")
+
+        app = _Harness()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            inp = app.query_one("#harness-search", sc._SearchInput)
+            inp.value = sc._SearchInput.PREFILL
+            assert inp.current_query() == ""
+
     def test_natural_sort_key_orders_numbers_by_value(self):
         """`pBin2` must sort before `pBin10` — lexicographic sort would
         put `pBin10` first because '1' < '2' as a character. Natural
