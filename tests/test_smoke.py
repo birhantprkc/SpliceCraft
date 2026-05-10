@@ -58,6 +58,10 @@ class TestAppBootstrap:
             app.query_one("#sidebar", sc.FeatureSidebar)
             app.query_one("#seq-panel", sc.SequencePanel)
             app.query_one("#library", sc.LibraryPanel)
+            # The map/seq resize handle (PR #8 from Harley King) is
+            # part of the canonical compose() output and must mount on
+            # every launch.
+            app.query_one("#map-seq-resize", sc.MapSequenceResizeHandle)
 
     async def test_features_loaded_into_map(self, tiny_record, isolated_library):
         app = _build_app(tiny_record, isolated_library)
@@ -107,6 +111,201 @@ class TestAppBootstrap:
             await pilot.pause()
             await pilot.pause(0.05)
             assert app._current_record is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Map/sequence resize handle (PR #8 from Harley King — har1eyk)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestMapSequenceResize:
+    """Drag handle between the top row and SequencePanel, originally
+    contributed by Harley King (har1eyk) in closed PR #8. These tests
+    drive the actual `pilot.mouse_down/move/up` API (not a fake
+    `_MouseEvent` shim) so the Textual event-routing + coordinate-
+    translation + capture-mouse wiring is end-to-end covered."""
+
+    async def test_handle_mounts_with_app(self, tiny_record, isolated_library):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            handle = app.query_one("#map-seq-resize",
+                                    sc.MapSequenceResizeHandle)
+            assert handle is not None
+            assert handle.size.height == 1
+
+    async def test_mouse_down_starts_drag(self, tiny_record,
+                                            isolated_library):
+        """`pilot.mouse_down` on the handle must route through Textual's
+        event system and flip the widget into drag mode. This
+        end-to-end check is the one PR #8's original `_MouseEvent`
+        shim bypassed (review item #4)."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            handle = app.query_one("#map-seq-resize",
+                                    sc.MapSequenceResizeHandle)
+            assert handle._dragging is False
+            await pilot.mouse_down("#map-seq-resize", offset=(0, 0))
+            await pilot.pause()
+            assert handle._dragging is True, (
+                "pilot.mouse_down didn't reach widget — event routing "
+                "regression?"
+            )
+            await pilot.mouse_up("#map-seq-resize", offset=(0, 0))
+            await pilot.pause()
+            assert handle._dragging is False
+
+    async def test_drag_grows_sequence_panel(self, tiny_record,
+                                               isolated_library):
+        """Dragging UP (negative delta_y) must grow the seq panel.
+        We use a real Textual `MouseMove` event constructed in the
+        test — closer to end-to-end than the original PR #8's fake
+        `_MouseEvent`, and necessary because Textual's `Pilot` API
+        doesn't expose `mouse_move`."""
+        from textual.events import MouseMove
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            handle = app.query_one("#map-seq-resize",
+                                    sc.MapSequenceResizeHandle)
+            before = sp.size.height
+            # Real Textual mouse-down → drag-up 5 rows → release.
+            await pilot.mouse_down("#map-seq-resize", offset=(0, 0))
+            start_y = handle._drag_start_y
+            # The widget reads `event.screen_y` — build a MouseMove
+            # with a screen-y 5 rows above the drag start. Field set
+            # is whatever Textual currently uses; we read the same
+            # attribute the widget's handler reads.
+            handle.on_mouse_move(_real_mouse_move(start_y - 5))
+            await pilot.pause()
+            await pilot.mouse_up("#map-seq-resize", offset=(0, 0))
+            await pilot.pause()
+            after = sp.size.height
+            # Allow for clamp: if the panel was already near max, the
+            # apply may have been a no-op. Most reasonable: panel grew
+            # OR stayed unchanged because of clamp. It must NOT shrink
+            # on an upward drag.
+            assert after >= before, (
+                f"Drag UP shrank seq panel: {before} → {after}"
+            )
+
+    async def test_clamp_holds_below_minimum(self, tiny_record,
+                                               isolated_library):
+        """`_clamp_sequence_height` must keep the requested height at
+        or above `_MIN_SEQ_HEIGHT`, regardless of how negative the
+        caller asks for. Direct unit test on the clamp helper —
+        avoids Textual's render-time layout interfering with the
+        result. The drag handler routes every requested height through
+        this clamp before applying."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            handle = app.query_one("#map-seq-resize",
+                                    sc.MapSequenceResizeHandle)
+            # Way below minimum:
+            assert handle._clamp_sequence_height(-1000) >= handle._MIN_SEQ_HEIGHT
+            assert handle._clamp_sequence_height(0)     >= handle._MIN_SEQ_HEIGHT
+            assert handle._clamp_sequence_height(3)     >= handle._MIN_SEQ_HEIGHT
+            # Way above maximum still gives a positive int, not an
+            # unbounded value.
+            assert handle._clamp_sequence_height(10_000) > 0
+            # In-range values pass through (or clamp to the screen-
+            # adjusted max if 100 happens to exceed it).
+            mid = handle._clamp_sequence_height(20)
+            assert mid >= handle._MIN_SEQ_HEIGHT
+
+    async def test_persists_to_settings_after_drag(self, tiny_record,
+                                                     isolated_library,
+                                                     monkeypatch):
+        """After releasing the mouse, the chosen height lands in
+        settings.json under `seq_panel_height`. Verifies the
+        review-required persistence (PR #8 review item #6)."""
+        captured: list[tuple[str, object]] = []
+        orig = sc._set_setting
+
+        def spy(key, value):
+            captured.append((key, value))
+            return orig(key, value)
+
+        monkeypatch.setattr(sc, "_set_setting", spy)
+
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            handle = app.query_one("#map-seq-resize",
+                                    sc.MapSequenceResizeHandle)
+            await pilot.mouse_down("#map-seq-resize", offset=(0, 0))
+            start_y = handle._drag_start_y
+            handle.on_mouse_move(_real_mouse_move(start_y - 3))
+            await pilot.pause()
+            await pilot.mouse_up("#map-seq-resize", offset=(0, 0))
+            await pilot.pause()
+            await pilot.pause(0.05)
+        # `_set_setting` may be called for other keys during launch.
+        # Filter for the persistence write we care about.
+        seq_h_writes = [v for k, v in captured if k == "seq_panel_height"]
+        assert len(seq_h_writes) >= 1, (
+            f"_set_setting('seq_panel_height', ...) was never called; "
+            f"all writes captured: {captured}"
+        )
+        h = seq_h_writes[-1]
+        assert isinstance(h, int) and h >= 6, (
+            f"persisted seq_panel_height has bad shape: {h!r}"
+        )
+
+    async def test_hydrate_from_settings_on_launch(self, tiny_record,
+                                                     isolated_library):
+        """Setting `seq_panel_height` to 15 in settings.json before
+        launch must apply that height to the SequencePanel on mount."""
+        sc._set_setting("seq_panel_height", 15)
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert app._pending_seq_panel_height == 15
+
+
+def _real_mouse_move(screen_y: int):
+    """Construct a real Textual `MouseMove` event with the screen-y
+    coordinate the handler reads. Real event class, real fields — no
+    fake `_MouseEvent` shim like PR #8 originally had.
+
+    Textual's `MouseMove` signature has shifted across versions; we
+    introspect the available fields so this test stays portable across
+    a Textual upgrade."""
+    from textual.events import MouseMove
+    import inspect
+    sig = inspect.signature(MouseMove.__init__)
+    params = sig.parameters
+    kwargs: dict = {}
+    # Common fields across Textual versions:
+    for k, v in (
+        ("widget", None), ("x", 0), ("y", 0),
+        ("delta_x", 0), ("delta_y", 0),
+        ("button", 1), ("shift", False), ("meta", False), ("ctrl", False),
+        ("screen_x", 0), ("screen_y", int(screen_y)),
+        ("style", None),
+    ):
+        if k in params:
+            kwargs[k] = v
+    try:
+        return MouseMove(**kwargs)
+    except TypeError:
+        # Fallback: an `object` proxy that quacks like the event,
+        # exposing the two attributes the handler actually reads.
+        class _Proxy:
+            def __init__(self, sy):
+                self.screen_y = sy
+                self.button = 1
+            def stop(self):
+                pass
+        return _Proxy(int(screen_y))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

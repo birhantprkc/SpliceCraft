@@ -2,6 +2,78 @@
 
 ---
 
+## [0.7.8.0] — 2026-05-10 — community contributions: map/seq resize + crash fix
+
+> **Thank you, Harley King ([@har1eyk](https://github.com/har1eyk)),
+> for both of these.** The closed PRs #7 and #8 sat in the repo for
+> nearly two weeks because the branches were on v0.3.3 and the
+> intervening rewrites made a literal merge impossible. The work was
+> still real — this release lands the useful pieces of both, with
+> credit going to the human who did the thinking.
+
+### New: drag handle to resize the map/sequence split (PR #8)
+
+- New `MapSequenceResizeHandle` widget sits as a 1-row strip between
+  the top row (Library / Map / Sidebar) and the SequencePanel.
+  Click + drag vertically to rebalance the split:
+  - **Drag UP** grows the SequencePanel, shrinks the top row.
+  - **Drag DOWN** shrinks the SequencePanel, grows the top row.
+- Clamped on both ends — the seq panel can't go below 6 rows, and
+  the top row can't shrink below 14 rows. No matter how aggressively
+  you drag, the layout stays usable.
+- **Persisted** across sessions: the final height after each drag
+  lands in `settings.json` under `seq_panel_height`, hydrated back
+  on the next launch. Same pattern as `show_restr` / `restr_unique_only`
+  / etc.
+- Drag handle's render-cost was the maintainer's biggest concern in
+  the review of the original PR — every mouse-move tick was firing
+  `app.refresh(layout=True)` which invalidated `PlasmidMap._draw_cache`
+  (keyed on viewport height) and triggered a full braille re-render
+  ~10×/sec. This implementation refreshes only the SequencePanel; the
+  map's draw cache survives the drag and the resize stays smooth on
+  50 kb plasmids.
+
+### Fixed: `FetchModal` crash on NCBI fetch failure (PR #7)
+
+- **Real bug that's been live since the modal was written**: when
+  NCBI returns an error (timeout, 503, malformed payload, etc.), the
+  error-rendering closure inside `_do_fetch` referenced `exc` directly.
+  Python 3 deletes the `except` binding at scope exit, so by the time
+  the closure ran later via `call_from_thread` it crashed with
+  `NameError: cannot access free variable 'exc'`. Caught by Harley
+  King in PR #7 with assist from ChatGPT-5.5 — fix captures
+  `err_msg = str(exc)` before the closure is built. Thank you, Harley.
+
+### Other cleanups (PR #7)
+
+- `uv.lock` added to `.gitignore` — pure local artifact, shouldn't
+  ship.
+- `# noqa: E402` annotations on the Textual / Rich imports below
+  `_log_startup_banner()`. The placement is intentional (banner
+  setup runs before importing the heavy Textual stack so the cold-
+  launch path is leaner), but lint tools rightly flag the order; the
+  noqa makes the intent explicit.
+- Multi-line `import fcntl, os, struct, termios` → one-per-line
+  split (in `_detect_char_aspect`). Same for `urllib.request,
+  urllib.parse` in `_ncbi_taxid_search`.
+- Unused-import / unused-local cleanups: `AddFeatureModal._gather`
+  no longer queries `#addfeat-strand-fwd` (the forward state is the
+  fall-through default); `_rebuild_record_without_feature` no longer
+  imports `FeatureLocation` (it reuses each feature's existing
+  `feat.location` directly).
+
+### Tests
+
+- 5 new tests in `test_smoke.py::TestMapSequenceResize` covering:
+  handle mount, mouse-down begins drag (end-to-end pilot routing),
+  drag-up grows the seq panel, clamp holds below minimum,
+  persistence to settings.json, hydration from settings on launch.
+- Updated `TestAppBootstrap::test_all_panels_present` to assert the
+  resize handle is part of the canonical widget set.
+- Full suite: 2,140+ tests passing in ~5 min.
+
+---
+
 ## [0.7.6.0] — 2026-05-08 — self-update + diagnostics + robustness pass
 
 > Pre-1.0 sweep adding three connected operational surfaces — a

@@ -32,3 +32,7 @@ primers.json
 
 # Claude Code local settings / cache
 .claude/
+
+# uv resolver lock — generated locally, not committed
+# (contributed by Harley King in closed PR #7)
+uv.lock

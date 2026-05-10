@@ -386,19 +386,23 @@ def _log_timing(path: str, threshold_ms: float = _SLOW_THRESHOLD_MS):
             _log_event("slow", path=path, elapsed_ms=round(dt_ms, 1))
 
 
-from textual import on, work
-from textual.app import App, ComposeResult
-from textual.binding import Binding
-from textual.containers import (
+# `noqa: E402` on every Textual / Rich import below — these are after
+# the early `_log_startup_banner()` setup so the lint warning is correct
+# (module-level code precedes import) but the placement is intentional.
+# Annotation contributed by Harley King in closed PR #7.
+from textual import on, work  # noqa: E402
+from textual.app import App, ComposeResult  # noqa: E402
+from textual.binding import Binding  # noqa: E402
+from textual.containers import (  # noqa: E402
     Horizontal, Vertical, ScrollableContainer, VerticalScroll,
 )
-from textual.css.query import NoMatches
-from textual.events import Click, MouseDown, MouseMove, MouseUp, MouseScrollDown, MouseScrollUp
-from textual.message import Message
-from textual.reactive import reactive
-from textual.screen import ModalScreen, Screen
-from textual.theme import Theme
-from textual.widget import Widget
+from textual.css.query import NoMatches  # noqa: E402
+from textual.events import Click, MouseDown, MouseMove, MouseUp, MouseScrollDown, MouseScrollUp  # noqa: E402
+from textual.message import Message  # noqa: E402
+from textual.reactive import reactive  # noqa: E402
+from textual.screen import ModalScreen, Screen  # noqa: E402
+from textual.theme import Theme  # noqa: E402
+from textual.widget import Widget  # noqa: E402
 
 # ── Hot-path optimization: memoize `Style.from_rich_style` ─────────────────
 # Profiling on a 5 kb plasmid in fullscreen seq-panel mode showed 87 % of
@@ -440,7 +444,7 @@ def _from_rich_style_cached(cls, rich_style, console=None):
 
 _tstyle_mod.Style.from_rich_style = classmethod(_from_rich_style_cached)
 
-from textual.widgets import (
+from textual.widgets import (  # noqa: E402
     Button, Checkbox, DataTable, DirectoryTree, Footer, Header, Input, Label,
     ListItem, ListView, ProgressBar, RadioButton, RadioSet, Select,
     Static, Tab, TabbedContent, TabPane, Tabs, TextArea, Tree,
@@ -449,7 +453,7 @@ from textual.widgets import (
 # (~50 ms) + pygments (~50 ms) + rich.markdown (~30 ms) at import
 # time, all only needed by the `?` Help modal. Imported lazily inside
 # `HelpModal.compose` instead so the cold-launch path stays lean.
-from rich.text import Text
+from rich.text import Text  # noqa: E402
 
 # ── Feature appearance ─────────────────────────────────────────────────────────
 
@@ -5721,7 +5725,12 @@ def _detect_char_aspect() -> float:
     pixel dimensions via TIOCGWINSZ.  Falls back to 2.0 if unavailable.
     """
     try:
-        import fcntl, os, struct, termios
+        # Multi-line for lint compliance — caught by Harley King in
+        # closed PR #7.
+        import fcntl
+        import os
+        import struct
+        import termios
         fds: list[tuple[int, bool]] = []
         try:
             fds.append((os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY), True))
@@ -10953,6 +10962,170 @@ class LibraryPanel(Widget):
         )
 
 
+# ── Map / sequence split resize handle ─────────────────────────────────────────
+#
+# Drag-handle widget that sits between the top row (LibraryPanel +
+# PlasmidMap + FeatureSidebar) and the SequencePanel. Click and drag
+# vertically to rebalance the split — drag UP shrinks the map and
+# grows the sequence panel; drag DOWN does the reverse. The chosen
+# height persists to settings.json (`seq_panel_height`) so it survives
+# restart, the same pattern as `show_restr` / `restr_unique_only` /
+# etc.
+#
+# Originally contributed by Harley King (har1eyk) in closed PR #8 with
+# a video demo. The maintainer's review listed six required changes
+# before merge — those are applied in this implementation:
+#
+#   1. `except NoMatches` (not bare `except Exception`) — only failure
+#      mode of `query_one` is "not on screen yet" / "unmounted", which
+#      is exactly what NoMatches signals (CLAUDE.md pitfall #1).
+#   2. No `self.app.refresh(layout=True)` per move — would invalidate
+#      `PlasmidMap._draw_cache` (keyed on viewport height) and trigger
+#      a full braille re-render every mouse-move tick. The per-widget
+#      `refresh(layout=True)` on `seq_panel` is enough.
+#   3. Short-circuit when the clamped height equals the currently-
+#      applied height — keeps the refresh-and-persist path idle on
+#      micro-movements that don't actually change anything.
+#   4. Real `pilot.mouse_*` test coverage in `tests/test_smoke.py`
+#      (not the fake `_MouseEvent` shim from the original PR which
+#      bypassed Textual's event routing).
+#   5. Rebased onto current master — the original branch was on v0.3.3
+#      and the LibraryPanel / compose() layout has been heavily
+#      rewritten since.
+#   6. Persist `seq_panel_height` to settings.json so the user's
+#      chosen split survives a restart.
+
+class MapSequenceResizeHandle(Widget):
+    """One-row drag handle between the top row and the sequence panel."""
+
+    DEFAULT_CSS = """
+    MapSequenceResizeHandle {
+        height: 1;
+        background: $primary-darken-2;
+        color: $text-muted;
+        content-align: center middle;
+    }
+    MapSequenceResizeHandle.dragging {
+        background: $accent;
+        color: $text;
+    }
+    """
+
+    can_focus = False
+
+    # Minimum heights to keep the layout functional. The seq panel
+    # needs at least a header + a couple of data rows to be useful;
+    # the top row needs the library / map / sidebar to not be
+    # squashed to nothing.
+    _MIN_SEQ_HEIGHT = 6
+    _MIN_TOP_HEIGHT = 14
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._dragging = False
+        self._drag_start_y = 0
+        self._drag_start_seq_height = 0
+
+    def render(self) -> Text:
+        width = max(1, self.size.width)
+        return Text("─" * width, style="dim")
+
+    def _clamp_sequence_height(self, height: int) -> int:
+        """Clamp the requested seq-panel height to [MIN_SEQ, max_available].
+
+        The upper bound is the app's screen height minus the handle's
+        own row minus `_MIN_TOP_HEIGHT` (so the top row never shrinks
+        below usable). Falls back to a permissive clamp if the screen
+        size isn't yet known (test harness pre-mount, etc.)."""
+        try:
+            screen_h = self.app.size.height
+        except NoMatches:
+            return max(self._MIN_SEQ_HEIGHT, height)
+        handle_h = max(1, self.size.height)
+        max_seq_h = max(
+            self._MIN_SEQ_HEIGHT,
+            screen_h - handle_h - self._MIN_TOP_HEIGHT,
+        )
+        return max(self._MIN_SEQ_HEIGHT, min(max_seq_h, height))
+
+    def _apply_sequence_height(self, height: int) -> bool:
+        """Set the seq panel's height and refresh layout. Returns True
+        if the height actually changed (callers persist to settings
+        only on real changes — see review item #3 / #6)."""
+        try:
+            seq_panel = self.app.query_one("#seq-panel", SequencePanel)
+        except NoMatches:
+            return False
+        clamped = self._clamp_sequence_height(height)
+        # Short-circuit no-op resize: avoid per-tick refresh + persist
+        # spam on micro-movements that don't actually change the
+        # rendered layout.
+        try:
+            current_h = int(seq_panel.size.height)
+        except (TypeError, ValueError):
+            current_h = -1
+        if clamped == current_h:
+            return False
+        seq_panel.styles.height = clamped
+        seq_panel.refresh(layout=True)
+        # Per the review: no `self.app.refresh(layout=True)` here. The
+        # per-widget refresh already cascades to descendants and the
+        # PlasmidMap's draw cache (keyed on viewport height) would
+        # otherwise re-render the braille map every mouse-move tick.
+        return True
+
+    def on_mouse_down(self, event: MouseDown) -> None:
+        if event.button != 1:
+            return
+        try:
+            seq_panel = self.app.query_one("#seq-panel", SequencePanel)
+        except NoMatches:
+            return
+        self._dragging = True
+        self._drag_start_y = int(event.screen_y or 0)
+        self._drag_start_seq_height = int(seq_panel.size.height)
+        self.add_class("dragging")
+        self.capture_mouse()
+        event.stop()
+
+    def on_mouse_move(self, event: MouseMove) -> None:
+        if not self._dragging:
+            return
+        # Drag UP (negative delta_y) GROWS the seq panel; drag DOWN
+        # shrinks it. So the new height is `start_height - delta_y`.
+        delta_y = int(event.screen_y or 0) - self._drag_start_y
+        self._apply_sequence_height(self._drag_start_seq_height - delta_y)
+        event.stop()
+
+    def on_mouse_up(self, event: MouseUp) -> None:
+        if event.button != 1 or not self._dragging:
+            return
+        self._dragging = False
+        self.remove_class("dragging")
+        self.release_mouse()
+        # Persist the final height to settings.json so the user's
+        # chosen split survives a restart (review item #6). Read the
+        # current seq panel height after release — the last
+        # `_apply_sequence_height` call during the drag would have
+        # already clamped + assigned it.
+        try:
+            seq_panel = self.app.query_one("#seq-panel", SequencePanel)
+            final_h = int(seq_panel.size.height)
+        except (NoMatches, TypeError, ValueError):
+            final_h = -1
+        if final_h >= self._MIN_SEQ_HEIGHT:
+            try:
+                _set_setting("seq_panel_height", final_h)
+            except Exception:
+                # Disk-full / RO-mount: don't break the resize UX
+                # just because the persistence call failed. The log
+                # records the issue for diagnostic-bundle triage.
+                _log.exception(
+                    "seq_panel_height persist failed (height=%d)", final_h,
+                )
+        event.stop()
+
+
 # ── Sequence panel ─────────────────────────────────────────────────────────────
 
 class SequencePanel(Widget):
@@ -15614,23 +15787,30 @@ class FetchModal(ModalScreen):
             record = fetch_genbank(acc, email)
         except Exception as exc:
             _log.exception("NCBI fetch failed for %s", acc)
+            # Capture the message BEFORE building the closure. Python 3
+            # deletes the `except` binding (`exc`) at scope exit, so the
+            # closure that runs later via `call_from_thread` would crash
+            # with `NameError: cannot access free variable 'exc'` every
+            # time NCBI errors out. Caught by Harley King (har1eyk) in
+            # the closed PR #7 — thank you, Harley.
+            err_msg = str(exc)
             def _err():
                 # Modal may have been dismissed while the fetch was in flight;
                 # query_one would then raise NoMatches. Fall back to a toast.
                 if not self.is_mounted:
                     try:
-                        self.app.notify(f"NCBI fetch failed: {exc}",
+                        self.app.notify(f"NCBI fetch failed: {err_msg}",
                                         severity="error", timeout=8)
                     except Exception:
                         _log.exception("notify fallback for fetch error failed")
                     return
                 try:
                     self.query_one("#fetch-status", Static).update(
-                        f"[red]Error: {exc}[/red]"
+                        f"[red]Error: {err_msg}[/red]"
                     )
                 except NoMatches:
                     try:
-                        self.app.notify(f"NCBI fetch failed: {exc}",
+                        self.app.notify(f"NCBI fetch failed: {err_msg}",
                                         severity="error", timeout=8)
                     except Exception:
                         _log.exception("notify fallback for fetch error failed")
@@ -19488,6 +19668,10 @@ _SETTINGS_SCHEMA: "dict[str, tuple[tuple, object]]" = {
     "last_known_latest":       ((str,),                ""),
     "last_update_check_ts":    ((int, float),          0),
     "hmm_db_path":             ((str,),                ""),
+    # Persisted seq-panel height from the map/seq resize handle (PR #8
+    # from Harley King). `None`-default is encoded as 0 so the schema
+    # validator passes; hydrate logic treats <6 as "unset".
+    "seq_panel_height":        ((int,),                0),
 }
 
 
@@ -20804,7 +20988,8 @@ def _ncbi_taxid_search(query: str, retmax: int = 200,
     {'taxid': str, 'name': str}. Names come from a batched esummary call
     (one round-trip for up to `retmax` ids). Partial queries are auto-
     wildcarded via `_ncbi_prep_term`. Pure network — run from a worker."""
-    import urllib.request, urllib.parse
+    import urllib.parse
+    import urllib.request
     import xml.etree.ElementTree as ET
     q = (query or "").strip()
     if not q:
@@ -21985,7 +22170,9 @@ class AddFeatureModal(ModalScreen):
             seqraw = self.query_one("#addfeat-seq",   TextArea).text
             quals  = self.query_one("#addfeat-quals", Input).value
             desc   = self.query_one("#addfeat-desc",  Input).value.strip()
-            fwd_rb  = self.query_one("#addfeat-strand-fwd",  RadioButton)
+            # `fwd_rb` is implicit — its `True` state is the fall-through
+            # default in the strand resolution below, so we don't need to
+            # query it. Caught by Harley King in closed PR #7.
             rev_rb  = self.query_one("#addfeat-strand-rev",  RadioButton)
             none_rb = self.query_one("#addfeat-strand-none", RadioButton)
             both_rb = self.query_one("#addfeat-strand-both", RadioButton)
@@ -42637,6 +42824,19 @@ SpeciesPickerModal { align: center middle; }
         self._pending_show_connectors = bool(
             _get_setting("show_connectors", False)
         )
+        # `seq_panel_height` (PR #8 from Harley King): user's chosen
+        # map/seq split, applied to the SequencePanel once it mounts
+        # (same deferred-apply pattern as `show_connectors`). Defaults
+        # to None → use the Textual layout default. Range-checked so
+        # a hand-edited settings entry can't push the panel below
+        # MIN_SEQ_HEIGHT or above a 4-decimal-digit value (which
+        # would point at corrupted state, not a real terminal).
+        raw_seq_h = _get_setting("seq_panel_height", None)
+        self._pending_seq_panel_height: "int | None" = (
+            int(raw_seq_h)
+            if isinstance(raw_seq_h, int) and 6 <= raw_seq_h <= 9999
+            else None
+        )
         # `map_mode` is deliberately NOT hydrated from settings:
         # circular is the canonical default for every plasmid load,
         # and `PlasmidMap.load_record` resets the mode on every
@@ -42653,6 +42853,11 @@ SpeciesPickerModal { align: center middle; }
             yield LibraryPanel(id="library")
             yield PlasmidMap(id="plasmid-map")
             yield FeatureSidebar(id="sidebar")
+        # Drag handle for rebalancing the map/seq split (PR #8 from
+        # Harley King). Default 1-row strip; click + drag vertically
+        # to resize. Chosen height persists via `seq_panel_height` in
+        # settings.json.
+        yield MapSequenceResizeHandle(id="map-seq-resize")
         yield SequencePanel(id="seq-panel")
         # Removed the secondary `#status-bar` shortcut hint row
         # (2026-05-01) — Footer alone covers binding hints, and the
@@ -42930,7 +43135,10 @@ SpeciesPickerModal { align: center middle; }
         """Create a new SeqRecord with the feat_idx-th non-source feature removed."""
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
-        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        # `FeatureLocation` was imported but never used — the rebuild
+        # reuses each feature's existing `feat.location` directly. Caught
+        # by Harley King in closed PR #7.
+        from Bio.SeqFeature import SeqFeature
 
         new_record = SeqRecord(
             Seq(str(self._current_record.seq)),
@@ -43037,6 +43245,12 @@ SpeciesPickerModal { align: center middle; }
             if getattr(self, "_pending_show_connectors", False):
                 sp._show_connectors = True
                 pm._show_connectors = True
+            # `seq_panel_height` (PR #8 from Harley King): apply the
+            # persisted split now that the SequencePanel widget exists.
+            pending_h = getattr(self, "_pending_seq_panel_height", None)
+            if pending_h is not None:
+                sp.styles.height = pending_h
+                sp.refresh(layout=True)
             # map_mode intentionally NOT hydrated — circular is the
             # canonical default and `PlasmidMap.load_record` resets
             # it on every plasmid load. linear_layout removed
