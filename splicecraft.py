@@ -1112,14 +1112,20 @@ def _snapshot_data_files(data_dir: Path,
     locked / read-only data dir never crashes the launch path. The
     user's worst-case is a missed snapshot day, not an aborted app.
 
-    `paths` defaults to the four user-data files
-    (`plasmid_library`, `collections`, `parts_bin`, `primers`). Passing
-    a custom list keeps the helper test-friendly without exposing
-    fragile module globals to the test.
+    `paths` defaults to every persisted user-data file (the resolved
+    contents of `_USER_DATA_FILE_ATTRS` — kept in sync with the same
+    table the pre-update snapshot consults, so the daily snapshot net
+    can't drift behind the user's actual data footprint). Passing a
+    custom list keeps the helper test-friendly without exposing fragile
+    module globals to the test.
     """
     if paths is None:
-        paths = [_LIBRARY_FILE, _COLLECTIONS_FILE,
-                 _PARTS_BIN_FILE, _PRIMERS_FILE]
+        paths = []
+        g = globals()
+        for attr in g.get("_USER_DATA_FILE_ATTRS", ()):
+            p = g.get(attr)
+            if isinstance(p, Path):
+                paths.append(p)
     snap_dir = data_dir / _SNAPSHOT_DIR_NAME
     today = _date.today().isoformat()  # YYYY-MM-DD
     written: list[Path] = []
@@ -1354,6 +1360,19 @@ def _restore_from_backup(target_path: Path, source_path: Path,
         raw = json.loads(source_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"unreadable backup: {exc}") from exc
+    # If the source backup carries a higher-than-current schema version,
+    # stamp it under the *target* path so the subsequent `_safe_save_json`
+    # write preserves the v stamp instead of demoting it to
+    # `_CURRENT_SCHEMA_VERSION`. Mirrors `_safe_load_json`'s observation
+    # logic — restoring a v2 backup onto a v1 SpliceCraft no longer
+    # silently downgrades the user's data on the next save.
+    if isinstance(raw, dict):
+        try:
+            observed_v = int(raw.get("_schema_version", 0))
+        except (TypeError, ValueError):
+            observed_v = 0
+        if observed_v > _CURRENT_SCHEMA_VERSION:
+            _OBSERVED_SCHEMA_VERSIONS[str(target_path)] = observed_v
     entries, _shape_warn = _extract_entries(raw, label)
     if entries is None:
         raise ValueError(
@@ -6211,7 +6230,7 @@ def load_genbank(path: str):
 
     # `.dna` augmentation: re-read the file bytes to recover per-feature
     # colours + primer-bind sequence stamps + 0x05 primer-DB entries that
-    # BioPython's `snapgene` parser silently drops. Stashed on the record
+    # BioPython's `.dna` parser silently drops. Stashed on the record
     # as a transient attribute so `_apply_record` can flush the primer
     # entries into `primers.json` after the load completes. Failures here
     # are non-fatal — the record loads with palette colours and bare
@@ -6894,7 +6913,7 @@ def _coerce_int_or_zero(s) -> int:
 def _augment_dna_record_from_packets(
     rec, data: bytes,
 ) -> list[dict]:
-    """Recover info BioPython's ``snapgene`` parser drops:
+    """Recover info BioPython's ``.dna`` parser drops:
       * **per-feature colours** from the 0x0A Features packet
         (``<Segment color="#RRGGBB"/>`` attributes). BioPython parses
         ``<Feature>`` name/type/location but throws the colour away —
@@ -7041,22 +7060,36 @@ def _augment_dna_record_from_packets(
         if f.type != "primer_bind":
             continue
         try:
-            start = int(f.location.start)
-            end   = int(f.location.end)
+            bounds = _feat_bounds(f, n)
         except (TypeError, ValueError, AttributeError):
+            bounds = None
+        if bounds is None:
             continue
-        strand = getattr(f.location, "strand", 1) or 1
-        if not (0 <= start < end <= n):
-            continue
+        start, end, strand = bounds
+        strand = strand or 1
+        # Wrap-aware slice: origin-spanning primer_bind features have
+        # `end < start` after `_feat_bounds` normalisation. Pre-fix the
+        # raw `int(f.location.start)/.end` flattened the `CompoundLocation`
+        # to (min, max) and `seq_str[0:n]` stamped the WHOLE plasmid as
+        # primer_seq. Rare in practice (most primers don't cross the
+        # origin) but biologically wrong when it happens.
+        if end < start:
+            if not (0 <= start < n and 0 <= end <= n):
+                continue
+            sliced_top = seq_str[start:] + seq_str[:end]
+        else:
+            if not (0 <= start < end <= n):
+                continue
+            sliced_top = seq_str[start:end]
         existing_pseq = f.qualifiers.get("primer_seq", [])
         if existing_pseq and isinstance(existing_pseq, list):
             bound_seq = str(existing_pseq[0]).strip().upper()
             if not bound_seq:
-                bound_seq = seq_str[start:end]
+                bound_seq = sliced_top
                 if strand < 0:
                     bound_seq = _rc(bound_seq)
         else:
-            bound_seq = seq_str[start:end]
+            bound_seq = sliced_top
             if strand < 0:
                 bound_seq = _rc(bound_seq)
             f.qualifiers["primer_seq"] = [bound_seq]
@@ -8156,6 +8189,19 @@ def _record_to_gff3(record) -> str:
                 continue
             if p_e <= p_s:
                 continue
+            # Per-part strand: a mixed-strand `CompoundLocation` has
+            # `feat.location.strand == None` (Biopython returns None when
+            # parts disagree), so the feature-level `gff_strand`
+            # computation above flattened to "." and lost the per-part
+            # info. Probe each `part.strand` so mixed-strand joins
+            # (rare but legal in biology) emit the right +/- per arc.
+            # Falls back to the feature-level strand when the part
+            # itself has no strand attribute.
+            part_strand = getattr(part, "strand", None)
+            if part_strand is None:
+                part_strand = strand_int or 0
+            part_gff_strand = ("+" if part_strand == 1
+                                else "-" if part_strand == -1 else ".")
             out.append("\t".join((
                 safe_seqid,
                 "SpliceCraft",
@@ -8164,7 +8210,7 @@ def _record_to_gff3(record) -> str:
                 str(p_s + 1),
                 str(p_e),
                 ".",
-                gff_strand,
+                part_gff_strand,
                 phase,
                 ";".join(attr_parts),
             )))
@@ -8977,8 +9023,9 @@ class PlasmidMap(Widget):
     def on_mouse_scroll_up(self, event: MouseScrollUp):
         """Mouse-wheel up. Default = rotate clockwise (circular view).
         In linear mode, Ctrl+scroll zooms in and Shift+scroll pans
-        left — both flagged by Koeng101 in issue #5 as SnapGene
-        muscle memory. Plain scroll in linear mode falls through to
+        left — both flagged by Koeng101 in issue #5 as muscle memory
+        from the popular commercial plasmid editor. Plain scroll in
+        linear mode falls through to
         the rotate action (which is a no-op for linear records, so
         the default is harmless)."""
         if self._map_mode == "linear":
@@ -16578,7 +16625,7 @@ class FetchModal(ModalScreen):
         )
         self._do_fetch(acc, email)
 
-    @work(thread=True)
+    @work(thread=True, exclusive=True, group="ncbi_fetch")
     def _do_fetch(self, acc: str, email: str):
         try:
             record = fetch_genbank(acc, email)
@@ -16735,8 +16782,28 @@ class OpenFileModal(ModalScreen):
             return
         # Probe size BEFORE invoking the parser — avoids a 30 s
         # parse on a 50 MB file the user clicked by accident.
+        # lstat (not stat) so a symlink reports the symlink itself rather
+        # than its target — defends against the "symlink to /dev/zero
+        # reports st_size = 0, bypassing the large-file confirm" pathology.
+        # The actual load path (`load_genbank`) goes through
+        # `_safe_file_size_check` which rejects symlinks outright; we
+        # refuse here at the confirm-probe step to match that policy
+        # (and to avoid the confusing UX of "confirm a huge file" then
+        # "load failed: refused symlink").
         try:
-            size_bytes = Path(path).expanduser().stat().st_size
+            import stat as _stat_mod
+            p_resolved = Path(path).expanduser()
+            p_stat = p_resolved.lstat()
+            if _stat_mod.S_ISLNK(p_stat.st_mode):
+                try:
+                    self.query_one("#open-status", Static).update(
+                        "[red]Refusing to open a symlink. Open the "
+                        "real file directly.[/red]"
+                    )
+                except NoMatches:
+                    pass
+                return
+            size_bytes = p_stat.st_size
         except OSError:
             size_bytes = 0
         if size_bytes > _LARGE_LOAD_DISK_BYTES:
@@ -16896,46 +16963,14 @@ class OpenFileModal(ModalScreen):
                 # file. No-op cleanup here; buttons are already
                 # re-enabled above.
                 return
-            # Build SeqRecords with topology detection + ID dedupe.
-            records = _fasta_records_to_seqrecords(parsed_records, path)
-            if not records:
-                try:
-                    self.query_one("#open-status", Static).update(
-                        "[red]No valid records in FASTA — every "
-                        "record was empty or had non-IUPAC "
-                        "characters.[/red]"
-                    )
-                except NoMatches:
-                    pass
-                return
             try:
-                _create_fasta_collection(name, records, path)
-            except (OSError, ValueError) as exc:
-                _log.exception(
-                    "Failed to create FASTA collection %r", name,
+                self.query_one("#open-status", Static).update(
+                    f"[dim]Creating collection '{name}'…[/dim]"
                 )
-                try:
-                    self.query_one("#open-status", Static).update(
-                        f"[red]Could not create collection: "
-                        f"{exc}[/red]"
-                    )
-                except NoMatches:
-                    pass
-                return
-            # Hand the import payload to the app handler. We dismiss
-            # with a dict (vs. the SeqRecord the single-record path
-            # uses) so the `_on_open_file_done` dispatch can tell
-            # the two cases apart.
-            n_dropped = len(parsed_records) - len(records)
-            if not self.is_mounted:
-                return
-            self.dismiss({
-                "kind":            "fasta_collection",
-                "collection_name": name,
-                "records":         records,
-                "n_dropped":       n_dropped,
-                "source_path":     path,
-            })
+                self.query_one("#btn-open", Button).disabled = True
+            except NoMatches:
+                pass
+            self._fasta_collection_worker(name, parsed_records, path)
 
         self.app.push_screen(
             MultiRecordFastaModal(
@@ -16943,6 +16978,61 @@ class OpenFileModal(ModalScreen):
             ),
             callback=_on_picked,
         )
+
+    @work(thread=True, exclusive=True, group="fasta_collection_import")
+    def _fasta_collection_worker(self, name: str, parsed_records: list,
+                                    path: str) -> None:
+        """Off-thread FASTA → SeqRecords + collection write. Pre-fix
+        this ran sync on the name-modal callback — a thousand-record
+        FASTA could freeze the UI for a few seconds (per-record IUPAC
+        validation + ID dedupe + `_save_collections` disk write of the
+        full collection payload)."""
+        records = _fasta_records_to_seqrecords(parsed_records, path)
+        if not records:
+            self.app.call_from_thread(
+                self._on_fasta_import_failed,
+                "[red]No valid records in FASTA — every record was "
+                "empty or had non-IUPAC characters.[/red]",
+            )
+            return
+        try:
+            _create_fasta_collection(name, records, path)
+        except (OSError, ValueError) as exc:
+            _log.exception(
+                "Failed to create FASTA collection %r", name,
+            )
+            self.app.call_from_thread(
+                self._on_fasta_import_failed,
+                f"[red]Could not create collection: {exc}[/red]",
+            )
+            return
+        n_dropped = len(parsed_records) - len(records)
+        self.app.call_from_thread(
+            self._on_fasta_import_success,
+            name, records, n_dropped, path,
+        )
+
+    def _on_fasta_import_failed(self, msg: str) -> None:
+        try:
+            self.query_one("#open-status", Static).update(msg)
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#btn-open", Button).disabled = False
+        except NoMatches:
+            pass
+
+    def _on_fasta_import_success(self, name: str, records: list,
+                                    n_dropped: int, path: str) -> None:
+        if not self.is_mounted:
+            return
+        self.dismiss({
+            "kind":            "fasta_collection",
+            "collection_name": name,
+            "records":         records,
+            "n_dropped":       n_dropped,
+            "source_path":     path,
+        })
 
     @on(Button.Pressed, "#btn-cancel-open")
     def _cancel_btn(self):
@@ -17320,25 +17410,58 @@ class ExportGenBankModal(ModalScreen):
             status.update("[red]Enter a filename.[/red]")
             return
         path = str(Path(self._selected_dir).expanduser() / filename)
+        status.update(f"[dim]Exporting to {path}…[/dim]")
+        # Disable the Export button so the user can't double-click
+        # while the worker is in flight. Cancel stays enabled so the
+        # user can bail mid-export (a 5 MB plasmid GenBank serialise +
+        # atomic write can take ~1–2 s and we want to keep the cancel
+        # path responsive). Re-enabled by `_on_export_failed`.
+        try:
+            self.query_one("#btn-export", Button).disabled = True
+        except NoMatches:
+            pass
+        self._do_export_worker(path)
+
+    @work(thread=True, exclusive=True, group="genbank_export")
+    def _do_export_worker(self, path: str) -> None:
         try:
             summary = _export_genbank_to_path(self._record, path)
         except OSError as exc:
             _log.exception("GenBank export to %s failed", path)
-            status.update(
+            msg = (
                 f"[red]Could not write to {path!r}: {exc.strerror or exc}. "
                 f"Check the directory exists and you have write permission."
                 f"[/red]"
             )
+            self.app.call_from_thread(self._on_export_failed, msg)
             return
         except ValueError as exc:
             _log.exception("GenBank export to %s rejected", path)
-            status.update(
+            msg = (
                 f"[red]Export rejected: {exc}. The path needs to end in "
                 f".gb / .gbk and the record must be GenBank-compliant."
                 f"[/red]"
             )
+            self.app.call_from_thread(self._on_export_failed, msg)
             return
-        self.dismiss(summary)
+        # Worker may complete after the user dismissed the modal via
+        # Cancel; guard the dismiss so a successful-export call into a
+        # stale modal can't trip Textual's dismiss handler. Matches the
+        # `FetchModal._do_fetch` is_mounted pattern.
+        def _dismiss_if_mounted() -> None:
+            if self.is_mounted:
+                self.dismiss(summary)
+        self.app.call_from_thread(_dismiss_if_mounted)
+
+    def _on_export_failed(self, msg: str) -> None:
+        try:
+            self.query_one("#export-status", Static).update(msg)
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#btn-export", Button).disabled = False
+        except NoMatches:
+            pass
 
     @on(Input.Submitted, "#export-filename")
     def _submitted(self) -> None:
@@ -17455,17 +17578,41 @@ class GffExportModal(ModalScreen):
             status.update("[red]Enter a filename.[/red]")
             return
         path = str(Path(self._selected_dir).expanduser() / filename)
+        status.update(f"[dim]Exporting to {path}…[/dim]")
+        try:
+            self.query_one("#btn-gff-export-ok", Button).disabled = True
+        except NoMatches:
+            pass
+        self._do_export_worker(path)
+
+    @work(thread=True, exclusive=True, group="gff_export")
+    def _do_export_worker(self, path: str) -> None:
         try:
             summary = _export_gff_to_path(self._record, path)
         except OSError as exc:
             _log.exception("GFF export to %s failed", path)
-            status.update(
+            msg = (
                 f"[red]Could not write to {path!r}: "
                 f"{exc.strerror or exc}.  Check the directory exists "
                 f"and you have write permission.[/red]"
             )
+            self.app.call_from_thread(self._on_export_failed, msg)
             return
-        self.dismiss(summary)
+        # Guard dismiss for the same reason as `GenBankExportModal`.
+        def _dismiss_if_mounted() -> None:
+            if self.is_mounted:
+                self.dismiss(summary)
+        self.app.call_from_thread(_dismiss_if_mounted)
+
+    def _on_export_failed(self, msg: str) -> None:
+        try:
+            self.query_one("#gff-export-status", Static).update(msg)
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#btn-gff-export-ok", Button).disabled = False
+        except NoMatches:
+            pass
 
     @on(Input.Submitted, "#gff-export-filename")
     def _submitted(self) -> None:
@@ -17575,25 +17722,50 @@ class FastaExportModal(ModalScreen):
             status.update("[red]Enter a filename.[/red]")
             return
         path = str(Path(self._selected_dir).expanduser() / filename)
+        status.update(f"[dim]Exporting to {path}…[/dim]")
+        try:
+            self.query_one("#btn-fasta-export-ok", Button).disabled = True
+        except NoMatches:
+            pass
+        self._do_export_worker(path)
+
+    @work(thread=True, exclusive=True, group="fasta_export")
+    def _do_export_worker(self, path: str) -> None:
         try:
             summary = _export_fasta_to_path(self._name, self._sequence, path)
         except OSError as exc:
             _log.exception("FASTA export to %s failed", path)
-            status.update(
+            msg = (
                 f"[red]Could not write to {path!r}: {exc.strerror or exc}. "
                 f"Check the directory exists and you have write permission."
                 f"[/red]"
             )
+            self.app.call_from_thread(self._on_export_failed, msg)
             return
         except ValueError as exc:
             _log.exception("FASTA export to %s rejected", path)
-            status.update(
+            msg = (
                 f"[red]Export rejected: {exc}. Path should end in "
                 f".fa / .fasta and the sequence must be non-empty."
                 f"[/red]"
             )
+            self.app.call_from_thread(self._on_export_failed, msg)
             return
-        self.dismiss(summary)
+        # Guard dismiss for the same reason as `GenBankExportModal`.
+        def _dismiss_if_mounted() -> None:
+            if self.is_mounted:
+                self.dismiss(summary)
+        self.app.call_from_thread(_dismiss_if_mounted)
+
+    def _on_export_failed(self, msg: str) -> None:
+        try:
+            self.query_one("#fasta-export-status", Static).update(msg)
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#btn-fasta-export-ok", Button).disabled = False
+        except NoMatches:
+            pass
 
     @on(Input.Submitted, "#fasta-export-filename")
     def _submitted(self) -> None:
@@ -20716,7 +20888,7 @@ def _load_settings() -> dict:
     """
     global _settings_cache
     if _settings_cache is not None:
-        return dict(_settings_cache)
+        return deepcopy(_settings_cache)
     entries, warning = _safe_load_json(_SETTINGS_FILE, "Settings")
     if warning:
         _log.warning(warning)
@@ -20731,7 +20903,7 @@ def _load_settings() -> dict:
     for w in warns:
         _log.warning(w)
     _settings_cache = cleaned
-    return dict(_settings_cache)
+    return deepcopy(_settings_cache)
 
 
 def _save_settings(settings: dict) -> None:
@@ -20742,7 +20914,7 @@ def _save_settings(settings: dict) -> None:
     global _settings_cache
     entries = [{"key": k, "value": v} for k, v in settings.items()]
     _safe_save_json(_SETTINGS_FILE, entries, "Settings")
-    _settings_cache = dict(settings)
+    _settings_cache = deepcopy(settings)
 
 
 def _get_setting(key: str, default=None):
@@ -21227,10 +21399,74 @@ def _dedupe_primers_by_sequence(entries: list[dict]) -> list[dict]:
     return out
 
 
+def _dedupe_primers_by_name_longest_seq(entries: list[dict]) -> list[dict]:
+    """Collapse primer entries that share a ``name`` field, keeping the
+    one with the longest sequence — typically the variant carrying the
+    full cloning tail rather than a truncated binding region.
+
+    Why a separate pass from `_dedupe_primers_by_sequence`:
+      * `_dedupe_primers_by_sequence` is the sacred-invariant default
+        on every save: same DNA sequence ⇒ one entry, no ambiguity.
+      * Name collisions are a different problem class — `.dna` imports
+        often replay the same primer-name with different binding /
+        tail variants (truncated annotation vs full cloned primer),
+        so the on-disk schema legitimately carries N entries with the
+        same name and N different sequences. Dropping them on save
+        would lose data.
+
+    This helper is therefore opt-in: it's run at startup by
+    `_check_primer_duplicates` (with user confirmation via
+    `PrimerDuplicatesModal`), not by `_save_primers`. The user signs
+    off on the "longest wins" policy before any data leaves disk.
+
+    Ties on length: the entry earlier in the input order wins.
+    Non-dict / no-name / non-string-sequence entries are kept verbatim.
+    """
+    best_idx: dict[str, int] = {}
+    best_len: dict[str, int] = {}
+    for i, e in enumerate(entries):
+        if not isinstance(e, dict):
+            continue
+        name = e.get("name")
+        if not isinstance(name, str):
+            continue
+        key = name.strip()
+        if not key:
+            continue
+        seq = e.get("sequence")
+        if not isinstance(seq, str):
+            continue
+        this_len = len(seq.strip())
+        if key not in best_idx or this_len > best_len[key]:
+            best_idx[key] = i
+            best_len[key] = this_len
+    kept = set(best_idx.values())
+    out: list[dict] = []
+    for i, e in enumerate(entries):
+        if not isinstance(e, dict):
+            out.append(e)
+            continue
+        name = e.get("name")
+        seq = e.get("sequence")
+        # Entries without a usable name OR a string sequence aren't
+        # candidates for name-collision collapse — keep them through.
+        if (not isinstance(name, str) or not name.strip()
+                or not isinstance(seq, str)):
+            out.append(e)
+            continue
+        if i in kept:
+            out.append(e)
+    return out
+
+
 def _save_primers(entries: list[dict]) -> None:
     global _primers_cache
     # Dedupe by sequence on every save (sacred policy: one entry per
-    # unique sequence). See `_dedupe_primers_by_sequence`.
+    # unique sequence). See `_dedupe_primers_by_sequence`. Note that
+    # NAME collisions are NOT auto-collapsed here — `.dna` imports
+    # legitimately stash same-name different-sequence variants, and
+    # silently dropping any would lose primer data. Name-collision
+    # cleanup is opt-in via `PrimerDuplicatesModal` at startup.
     deduped = _dedupe_primers_by_sequence(entries)
     _safe_save_json(_PRIMERS_FILE, deduped, "Primer library")
     # Deep-copy on save so the cache is independent of the caller's
@@ -24593,6 +24829,127 @@ class PrimerEditModal(ModalScreen):
         self.dismiss(None)
 
 
+class PrimerDuplicatesModal(ModalScreen):
+    """Surfaced at startup when `primers.json` carries duplicate-
+    sequence entries OR name-collision groups (same name, different
+    sequences — common in `.dna` imports that replay primer entries
+    across multiple plasmids with different binding-region / tail
+    variants).
+
+    Defaults to KEEP — user must explicitly click Delete to remove
+    duplicates. The Keep button has initial focus so a stray Enter on
+    splash dismiss doesn't silently delete primer data.
+
+    Two cleanup passes on confirm:
+      * Sequence collisions: first occurrence wins (sacred policy).
+      * Name collisions: longest sequence wins (typically the variant
+        carrying the full cloning tail, not a truncated binding only).
+
+    Dismiss payload:
+      True  — user confirmed deletion
+      False / None — user kept everything (cancel / Escape / Keep)
+    """
+
+    _blocks_undo: bool = True   # primer-library write, no Ctrl+Z race
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    PrimerDuplicatesModal { align: center middle; }
+    #pdup-dlg {
+        width: 70;
+        height: auto;
+        background: $surface;
+        border: heavy $warning;
+        padding: 1 2;
+    }
+    #pdup-title {
+        text-align: center;
+        background: $warning-darken-2;
+        color: $text;
+        padding: 0 1;
+    }
+    #pdup-body {
+        margin: 1 0;
+        padding: 0 1;
+    }
+    #pdup-btns {
+        height: 3;
+        align: right middle;
+        padding-top: 1;
+    }
+    #pdup-btns Button { margin-left: 1; }
+    """
+
+    def __init__(self, total: int, seq_duplicates: int,
+                 name_collisions: int, final_kept: int):
+        super().__init__()
+        self._total = total
+        self._seq_duplicates = seq_duplicates
+        self._name_collisions = name_collisions
+        self._final_kept = final_kept
+
+    def compose(self) -> ComposeResult:
+        to_remove = self._seq_duplicates + self._name_collisions
+        lines: list[str] = []
+        if self._seq_duplicates:
+            lines.append(
+                f"• {self._seq_duplicates} entr"
+                f"{'ies' if self._seq_duplicates != 1 else 'y'} "
+                f"share a DNA sequence with another entry"
+            )
+        if self._name_collisions:
+            lines.append(
+                f"• {self._name_collisions} entr"
+                f"{'ies' if self._name_collisions != 1 else 'y'} "
+                f"share a name with another entry (longest sequence "
+                f"per name will be kept)"
+            )
+        breakdown = "\n".join(lines)
+        with Vertical(id="pdup-dlg"):
+            yield Static(" Duplicate primers detected ", id="pdup-title")
+            yield Static(
+                f"Your primer library has {self._total} entries.\n"
+                f"{breakdown}\n\n"
+                f"Delete duplicates? Sequence collisions keep the "
+                f"first occurrence; name collisions keep the entry "
+                f"with the longest sequence (typically the full "
+                f"primer including its cloning tail). Library would "
+                f"end up with {self._final_kept} entries.",
+                id="pdup-body",
+            )
+            with Horizontal(id="pdup-btns"):
+                yield Button("Keep all", id="btn-pdup-keep",
+                              variant="default")
+                yield Button(
+                    f"Delete {to_remove} entr"
+                    f"{'ies' if to_remove != 1 else 'y'}",
+                    id="btn-pdup-delete", variant="warning",
+                )
+
+    def on_mount(self) -> None:
+        # Default focus on Keep so a stray Enter on splash dismiss
+        # doesn't trigger a delete.
+        try:
+            self.query_one("#btn-pdup-keep", Button).focus()
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-pdup-keep")
+    def _keep(self, _) -> None:
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#btn-pdup-delete")
+    def _delete(self, _) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class NewPlasmidModal(ModalScreen):
     """Build a brand-new plasmid record from pasted DNA.
 
@@ -27541,8 +27898,7 @@ class FeatureLibraryScreen(Screen):
         try:
             _save_features(self._entries)
         except (OSError, ValueError) as exc:
-            _log.exception("Feature library save failed")
-            self.app.notify(f"Save failed: {exc}", severity="error")
+            _notify_save_failure(self.app, "Feature library", exc)
             return False
         self._dirty_indices.clear()
         self._has_pending_changes = False
@@ -28158,8 +28514,7 @@ class GrammarEditorModal(ModalScreen):
             # re-slug from scratch and pick a different id, leaving
             # both the orphan slug AND the new attempt visible to
             # the user).
-            _log.exception("Grammar save failed")
-            self.app.notify(f"Save failed: {exc}", severity="error")
+            _notify_save_failure(self.app, "Cloning grammar", exc)
             return
         # Save committed — now safe to flip the modal's view of the
         # grammar id. Done here, post-save, so the failure path
@@ -30398,7 +30753,12 @@ class PartsBinModal(Screen):
             role_str = f" / {role}" if role else ""
             ev_msg = f" Vector: {ev.get('name', '?')}{role_str}."
         level_label = _part_level_label(int(match.get("level", 0) or 0))
-        self.app.call_from_thread(self._populate)
+        # Skip the modal-side repopulate if the user closed the Parts Bin
+        # while the digest was running — the part is already on disk, so a
+        # future open will see it. Notify still fires (app-level, safe even
+        # after dismissal).
+        if self.is_mounted:
+            self.app.call_from_thread(self._populate)
         self.app.call_from_thread(
             self.app.notify,
             f"Loaded '{plasmid_name}' as {match['grammar_name']} → "
@@ -31966,6 +32326,12 @@ class DomesticatorModal(ModalScreen):
     without re-cutting.
     """
 
+    # Block Ctrl+Z/Y while this modal is mounted — `_do_save` (and
+    # the Save flow generally) mutates `_current_record` synchronously
+    # so an undo firing underneath would race the in-flight commit
+    # (see sweep #41 / `PlasmidApp._undo_blocked_by_modal`).
+    _blocks_undo: bool = True
+
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("tab",    "app.focus_next", "Next", show=False),
@@ -33135,38 +33501,148 @@ class TraditionalCloningPane(Vertical):
         if not enzymes:
             results.update("[red]Pick at least one enzyme.[/]")
             return
-        insert_frag = self._build_insert_fragment(enzymes, results)
-        if insert_frag is None:
-            return  # error already surfaced
-        vector_frag = self._build_vector_fragment(enzymes, results)
-        if vector_frag is None:
+        # Capture all UI state on the UI thread so the worker can run
+        # as a pure function of its inputs — no `query_one` /
+        # `widget.update` calls racing UI mutations from inside the
+        # worker.
+        inputs, err = self._collect_simulate_inputs(enzymes)
+        if err is not None:
+            results.update(f"[red]{err}[/]")
             return
-        outcome = _simulate_traditional_cloning(insert_frag, vector_frag)
+        results.update("[dim]Simulating digest + ligation…[/dim]")
+        self._trad_simulate_worker(inputs)
+
+    def _collect_simulate_inputs(self, enzymes: list[str]) -> tuple:
+        """Read every UI field the simulate flow needs into a plain
+        dict; the worker then runs off the UI thread on that
+        snapshot. Returns ``(inputs_or_None, err_msg_or_None)``."""
+        inputs: dict = {"enzymes": enzymes, "mode": self._mode}
+        if self._mode == "plasmid":
+            try:
+                t = self.query_one("#trad-source-table", DataTable)
+            except NoMatches:
+                return None, "Insert source table not found."
+            rec = self._record_for_table_row(t.cursor_row,
+                                               "#trad-source-table")
+            if rec is None:
+                return None, "Pick an insert plasmid first."
+            inputs["insert_rec"] = rec
+        elif self._mode == "feature":
+            try:
+                t = self.query_one("#trad-source-table", DataTable)
+                sel = self.query_one("#trad-feature-select", Select)
+            except NoMatches:
+                return None, "Feature picker not found."
+            rec = self._record_for_table_row(t.cursor_row,
+                                               "#trad-source-table")
+            if rec is None:
+                return None, "Pick a plasmid first."
+            if sel.value is Select.BLANK or not sel.value:
+                return None, "Pick a feature."
+            try:
+                feat_idx = int(str(sel.value))
+            except ValueError:
+                return None, "Bad feature selection."
+            inputs["insert_rec"] = rec
+            inputs["feat_idx"] = feat_idx
+        elif self._mode == "pcr":
+            try:
+                name_in = self.query_one("#trad-pcr-name", Input).value.strip()
+                seq_ta = self.query_one("#trad-pcr-seq", TextArea)
+            except NoMatches:
+                return None, "PCR fields not found."
+            inputs["pcr_name"] = name_in or "PCR-product"
+            inputs["pcr_seq"] = seq_ta.text or ""
+        else:
+            return None, f"Unknown insert mode: {self._mode!r}"
+        # Vector source (shared across modes).
+        try:
+            t = self.query_one("#trad-vector-table", DataTable)
+        except NoMatches:
+            return None, "Vector source table not found."
+        rec = self._record_for_table_row(t.cursor_row, "#trad-vector-table")
+        if rec is None:
+            return None, "Pick a destination vector."
+        inputs["vector_rec"] = rec
+        return inputs, None
+
+    @work(thread=True, exclusive=True, group="trad_simulate")
+    def _trad_simulate_worker(self, inputs: dict) -> None:
+        """Off-thread digest + ligation. `_build_*_fragment` helpers
+        now take pre-captured records and return ``(frag, err_msg)``
+        tuples, so the whole flow runs pure of widget access here.
+        Pre-fix `_excise_fragment_pair` (Mb-scale IUPAC scan) ran on
+        the UI thread; this worker moves it off-thread alongside the
+        ligation. Stale-record guard (invariant #28) drops results if
+        the canvas reloaded mid-simulate."""
+        entry_counter = getattr(self.app, "_record_load_counter", 0)
+        insert_frag, err = self._build_insert_fragment(inputs)
+        if err is not None:
+            self.app.call_from_thread(self._on_trad_simulate_failed, err)
+            return
+        vector_frag, err = self._build_vector_fragment(inputs)
+        if err is not None:
+            self.app.call_from_thread(self._on_trad_simulate_failed, err)
+            return
+        try:
+            outcome = _simulate_traditional_cloning(
+                insert_frag, vector_frag
+            )
+        except Exception as exc:
+            _log.exception("trad-cloning: simulate failed")
+            self.app.call_from_thread(
+                self._on_trad_simulate_failed, str(exc)
+            )
+            return
+        if entry_counter != getattr(self.app, "_record_load_counter", 0):
+            return  # canvas moved on — drop the result
+        self.app.call_from_thread(
+            self._apply_trad_simulate_result, outcome
+        )
+
+    def _on_trad_simulate_failed(self, msg: str) -> None:
+        try:
+            results = self.query_one("#trad-results-text", Static)
+        except NoMatches:
+            return
+        results.update(f"[red]{msg}[/]")
+
+    def _apply_trad_simulate_result(self, outcome: dict) -> None:
         self._fwd_product = outcome["forward"]
         self._rev_product = outcome["reverse"]
+        try:
+            results = self.query_one("#trad-results-text", Static)
+        except NoMatches:
+            return
         self._render_results(outcome, results)
 
-    def _build_insert_fragment(self, enzymes: list[str],
-                                results: "Static") -> "dict | None":
-        if self._mode == "plasmid":
-            return self._build_insert_from_plasmid(enzymes, results)
-        if self._mode == "feature":
-            return self._build_insert_from_feature(enzymes, results)
-        if self._mode == "pcr":
-            return self._build_insert_from_pcr(enzymes, results)
-        results.update(f"[red]Unknown insert mode: {self._mode!r}[/]")
-        return None
+    def _build_insert_fragment(self, inputs: dict) -> tuple:
+        """Dispatch to the per-mode helper. Returns
+        ``(frag_or_None, err_msg_or_None)``. Pre-fix each helper
+        called ``results.update(...)`` directly, which precluded
+        running the flow off the UI thread; now errors surface as
+        strings the caller renders."""
+        mode = inputs["mode"]
+        enzymes = inputs["enzymes"]
+        if mode == "plasmid":
+            return self._build_insert_from_plasmid(
+                inputs["insert_rec"], enzymes
+            )
+        if mode == "feature":
+            return self._build_insert_from_feature(
+                inputs["insert_rec"], inputs["feat_idx"], enzymes
+            )
+        if mode == "pcr":
+            return self._build_insert_from_pcr(
+                inputs["pcr_name"], inputs["pcr_seq"], enzymes
+            )
+        return None, f"Unknown insert mode: {mode!r}"
 
-    def _build_insert_from_plasmid(self, enzymes: list[str],
-                                      results: "Static") -> "dict | None":
-        try:
-            t = self.query_one("#trad-source-table", DataTable)
-        except NoMatches:
-            return None
-        rec = self._record_for_table_row(t.cursor_row, "#trad-source-table")
+    def _build_insert_from_plasmid(self, rec,
+                                      enzymes: list[str]) -> tuple:
+        """Returns ``(frag_or_None, err_msg_or_None)``."""
         if rec is None:
-            results.update("[red]Pick an insert plasmid first.[/]")
-            return None
+            return None, "Pick an insert plasmid first."
         seq = str(rec.seq).upper()
         circular = (rec.annotations or {}).get("topology", "") == "circular"
         feats = self._record_features(rec)
@@ -33175,55 +33651,34 @@ class TraditionalCloningPane(Vertical):
             source_label=str(rec.name or rec.id or "insert"),
         )
         if err is not None:
-            results.update(f"[red]{err['error']}[/]")
-            return None
+            return None, err["error"]
         if len(frags) != 2:
-            results.update(
-                f"[red]Need exactly 2 fragments after digest "
-                f"(got {len(frags)}). Pick different enzymes.[/]"
-            )
-            return None
+            return None, (f"Need exactly 2 fragments after digest "
+                            f"(got {len(frags)}). Pick different enzymes.")
         # Pick the released-insert fragment via feature-aware
         # selection (rep_origin / antibiotic-resistance absent).
         # Falls back to smallest-fragment when feature detection
         # is ambiguous — same shared helper the modular path uses,
         # so traditional cloning behaves the same way when an
         # insert outgrows its carrier across deep cycles.
-        return _pick_insert_fragment(frags) or frags[0]
+        return (_pick_insert_fragment(frags) or frags[0]), None
 
-    def _build_insert_from_feature(self, enzymes: list[str],
-                                      results: "Static") -> "dict | None":
-        if len(enzymes) < 1:
-            results.update("[red]Need at least one enzyme.[/]")
-            return None
-        try:
-            t = self.query_one("#trad-source-table", DataTable)
-            sel = self.query_one("#trad-feature-select", Select)
-        except NoMatches:
-            return None
-        rec = self._record_for_table_row(t.cursor_row, "#trad-source-table")
+    def _build_insert_from_feature(self, rec, feat_idx: int,
+                                      enzymes: list[str]) -> tuple:
+        """Returns ``(frag_or_None, err_msg_or_None)``."""
         if rec is None:
-            results.update("[red]Pick a plasmid first.[/]")
-            return None
-        if sel.value is Select.BLANK or not sel.value:
-            results.update("[red]Pick a feature.[/]")
-            return None
-        try:
-            feat_idx = int(str(sel.value))
-        except ValueError:
-            results.update("[red]Bad feature selection.[/]")
-            return None
+            return None, "Pick a plasmid first."
+        if len(enzymes) < 1:
+            return None, "Need at least one enzyme."
         feats_iter = [f for f in rec.features if f.type != "source"]
         if not (0 <= feat_idx < len(feats_iter)):
-            results.update("[red]Selected feature out of range.[/]")
-            return None
+            return None, "Selected feature out of range."
         feat = feats_iter[feat_idx]
         seq = str(rec.seq)
         total = len(seq)
         bounds = _feat_bounds(feat, total)
         if bounds is None:
-            results.update("[red]Feature has unparseable coordinates.[/]")
-            return None
+            return None, "Feature has unparseable coordinates."
         s, e, _strand = bounds
         # `_slice_circular` is wrap-aware: an origin-spanning feature
         # encoded as `end < start` correctly returns `seq[s:] + seq[:e]`.
@@ -33233,38 +33688,27 @@ class TraditionalCloningPane(Vertical):
         # wrong cloning recommendation).
         feat_seq = _slice_circular(seq, s, e)
         if not feat_seq:
-            results.update("[red]Feature has zero length.[/]")
-            return None
+            return None, "Feature has zero length."
         enz_left  = enzymes[0]
         enz_right = enzymes[1] if len(enzymes) > 1 else enzymes[0]
         try:
             return _make_synthetic_fragment(
                 feat_seq, enz_left=enz_left, enz_right=enz_right,
                 source_label=(feat.qualifiers.get("label") or ["feature"])[0],
-            )
+            ), None
         except ValueError as exc:
-            results.update(f"[red]{exc}[/]")
-            return None
+            return None, str(exc)
 
-    def _build_insert_from_pcr(self, enzymes: list[str],
-                                 results: "Static") -> "dict | None":
+    def _build_insert_from_pcr(self, name_in: str, raw_seq: str,
+                                 enzymes: list[str]) -> tuple:
+        """Returns ``(frag_or_None, err_msg_or_None)``."""
         if len(enzymes) < 1:
-            results.update("[red]Need at least one enzyme.[/]")
-            return None
-        try:
-            name_in = self.query_one("#trad-pcr-name", Input).value.strip()
-            seq_ta = self.query_one("#trad-pcr-seq", TextArea)
-        except NoMatches:
-            return None
-        raw = (seq_ta.text or "").strip()
-        # Strip whitespace + non-DNA chars; uppercase.
-        cleaned = "".join(ch for ch in raw.upper()
+            return None, "Need at least one enzyme."
+        cleaned = "".join(ch for ch in (raw_seq or "").upper()
                             if ch in "ACGTRYWSMKBDHVN")
         if not cleaned:
-            results.update(
-                "[red]Paste DNA bases (ACGT/IUPAC) into the sequence box.[/]"
-            )
-            return None
+            return None, ("Paste DNA bases (ACGT/IUPAC) into the "
+                            "sequence box.")
         if not name_in:
             name_in = "PCR-product"
         enz_left  = enzymes[0]
@@ -33273,21 +33717,16 @@ class TraditionalCloningPane(Vertical):
             return _make_synthetic_fragment(
                 cleaned, enz_left=enz_left, enz_right=enz_right,
                 source_label=name_in,
-            )
+            ), None
         except ValueError as exc:
-            results.update(f"[red]{exc}[/]")
-            return None
+            return None, str(exc)
 
-    def _build_vector_fragment(self, enzymes: list[str],
-                                  results: "Static") -> "dict | None":
-        try:
-            t = self.query_one("#trad-vector-table", DataTable)
-        except NoMatches:
-            return None
-        rec = self._record_for_table_row(t.cursor_row, "#trad-vector-table")
+    def _build_vector_fragment(self, inputs: dict) -> tuple:
+        """Returns ``(frag_or_None, err_msg_or_None)``."""
+        rec = inputs.get("vector_rec")
+        enzymes = inputs["enzymes"]
         if rec is None:
-            results.update("[red]Pick a destination vector.[/]")
-            return None
+            return None, "Pick a destination vector."
         seq = str(rec.seq).upper()
         circular = (rec.annotations or {}).get("topology", "") == "circular"
         feats = self._record_features(rec)
@@ -33296,20 +33735,16 @@ class TraditionalCloningPane(Vertical):
             source_label=str(rec.name or rec.id or "vector"),
         )
         if err is not None:
-            results.update(f"[red]{err['error']} (vector)[/]")
-            return None
+            return None, f"{err['error']} (vector)"
         if len(frags) != 2:
-            results.update(
-                f"[red]Vector digest produced {len(frags)} fragments — "
-                f"need exactly 2.[/]"
-            )
-            return None
+            return None, (f"Vector digest produced {len(frags)} "
+                            f"fragments — need exactly 2.")
         # Pick the bacterial-backbone fragment — feature-aware
         # (rep_origin / antibiotic-resistance present) with a
         # max-size legacy fallback. Without the feature pass, a
         # large insert dropped from a small carrier would have
         # the user's vector flip-flop with each cloning round.
-        return _pick_backbone_fragment(frags) or frags[0]
+        return (_pick_backbone_fragment(frags) or frags[0]), None
 
     def _record_features(self, rec) -> list[dict]:
         """Convert a SeqRecord's features to the simple-dict shape the
@@ -33502,7 +33937,11 @@ class TraditionalCloningPane(Vertical):
                               "for %s", name)
         entries = _load_library()
         entries.append(entry)
-        _save_library(entries)
+        try:
+            _save_library(entries)
+        except (OSError, ValueError) as exc:
+            _notify_save_failure(self.app, "Plasmid library", exc)
+            return
         self.app.notify(
             f"Saved {name} ({len(rec.seq):,} bp) to library.",
             timeout=6,
@@ -33845,6 +34284,11 @@ class ConstructorModal(ModalScreen):
     (default). The built-in grammar catalog sits below user parts
     as a reference set.
     """
+
+    # Save-To-Library mutates the active record + library synchronously
+    # via `_do_save_with_name` → `_persist_assembly`, so Ctrl+Z/Y firing
+    # underneath would race that flow (sweep #41).
+    _blocks_undo: bool = True
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
@@ -34816,23 +35260,40 @@ class ConstructorModal(ModalScreen):
                            entry_vector: dict, parts: list[dict],
                            source_level: int, bb_key: str,
                            name: str) -> None:
-        """Run the assembly simulation + library / parts-bin persist
-        with a user-provided name. Split out from `_save_to_library`
-        so the naming prompt callback can dispatch cleanly without
-        re-entering the validation pre-flight (which already passed
-        before the modal was pushed).
+        """Dispatch the assembly simulation + library / parts-bin
+        persist to a worker so the UI stays responsive during a
+        multi-second flow on heavy libraries. Pre-fix the whole flow
+        ran sync on the name-modal callback — a 10-part L2 MOD
+        assembly into a 100 MB library could freeze for 5–15 s.
         """
+        self.app.notify("Assembling and saving…", timeout=4, markup=False)
+        self._save_to_library_worker(
+            gid=gid, grammar=grammar, entry_vector=entry_vector,
+            parts=parts, source_level=source_level,
+            bb_key=bb_key, name=name,
+        )
+
+    @work(thread=True, exclusive=True, group="constructor_save")
+    def _save_to_library_worker(self, *, gid: str, grammar: dict,
+                                  entry_vector: dict,
+                                  parts: list[dict],
+                                  source_level: int, bb_key: str,
+                                  name: str) -> None:
+        """Worker body for `_do_save_with_name`. Runs
+        `_clone_assembly_into_entry_vector` (heavy assembly simulation)
+        and `_persist_assembly` (library + parts-bin write + history
+        XML) off the UI thread."""
         new_rec = _clone_assembly_into_entry_vector(
             parts, entry_vector, grammar,
             source_level=source_level, name=name,
         )
         if new_rec is None:
-            self.app.notify(
+            self.app.call_from_thread(
+                self._on_constructor_save_failed,
                 "Assembly simulation failed — log has details. "
                 "Common causes: extra IIS sites in the entry vector, "
                 "or the lane's terminal overhangs don't match the "
                 "vector's dropout overhangs.",
-                severity="error", markup=False,
             )
             return
         try:
@@ -34843,17 +35304,28 @@ class ConstructorModal(ModalScreen):
             )
         except Exception as exc:
             _log.exception("Save To Library: persist failed")
-            self.app.notify(
+            self.app.call_from_thread(
+                self._on_constructor_save_failed,
                 f"Save failed: {exc}",
-                severity="error", markup=False,
             )
             return
+        self.app.call_from_thread(
+            self._on_constructor_save_success,
+            new_id, len(new_rec.seq), source_level, name,
+        )
+
+    def _on_constructor_save_failed(self, msg: str) -> None:
+        self.app.notify(msg, severity="error", markup=False)
+
+    def _on_constructor_save_success(self, new_id: str, seq_len: int,
+                                       source_level: int,
+                                       name: str) -> None:
         # Repopulate the LibraryPanel + focus the new row so the user
         # sees the assembly land in-list. Best-effort — the panel
-        # might not be mounted (some test paths drive _do_save_with_name
-        # without a full app), in which case the persist still
-        # succeeded and the next interactive launch will pick it up
-        # via _load_library.
+        # might not be mounted (some test paths drive
+        # `_do_save_with_name` without a full app), in which case the
+        # persist still succeeded and the next interactive launch
+        # will pick it up via `_load_library`.
         if new_id:
             try:
                 lib = self.app.query_one("#library", LibraryPanel)
@@ -34866,8 +35338,8 @@ class ConstructorModal(ModalScreen):
         # Mention the active collection in the notify so the user
         # knows the assembly automatically mirrored there (via
         # `_save_library` → `_sync_active_collection_plasmids`).
-        # Falls back to the "main" library wording when no
-        # collection is active.
+        # Falls back to the "main" library wording when no collection
+        # is active.
         active_coll = _get_active_collection_name()
         coll_part = (
             f"collection '{active_coll}'"
@@ -34875,7 +35347,7 @@ class ConstructorModal(ModalScreen):
         )
         self.app.notify(
             f"Saved '{name}' to {coll_part} "
-            f"({len(new_rec.seq):,} bp, level {level_label}). "
+            f"({seq_len:,} bp, level {level_label}). "
             f"Also added to Parts Bin under {level_label}.",
             severity="success", markup=False,
         )
@@ -36180,6 +36652,11 @@ class MutagenizeModal(ModalScreen):
     .bak, sacred invariant #7).
     """
 
+    # Save-To-Primers + Apply-Mutation mutate persistent state and the
+    # active record, so Ctrl+Z/Y firing underneath would race the commit
+    # (sweep #41).
+    _blocks_undo: bool = True
+
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("tab",    "app.focus_next", "Next", show=False),
@@ -36586,22 +37063,49 @@ class MutagenizeModal(ModalScreen):
         if bad:
             info.update(f"[red]Invalid amino-acid letters: {''.join(bad)}[/red]")
             return
+        name = self.query_one("#mut-prot-name", Input).value.strip() or "protein"
+        info.update("[dim]Optimizing codons…[/dim]")
+        self._optimize_worker(aa, self._codon_entry["raw"], name)
+
+    @work(thread=True, exclusive=True, group="mutagenize_optimize")
+    def _optimize_worker(self, aa: str, codon_raw: dict,
+                           name: str) -> None:
+        """Off-thread codon optimisation + IIS-site scrub. Pre-fix this
+        ran sync on the button-press handler — a 1 kb CDS hit ~200–400 ms
+        in `_codon_optimize` alone, plus the site-scrub pass. Stale-
+        record guard (invariant #28) drops the result if the canvas
+        reloaded mid-optimize."""
+        entry_counter = getattr(self.app, "_record_load_counter", 0)
         try:
-            cds = _codon_optimize(aa, self._codon_entry["raw"])
+            cds = _codon_optimize(aa, codon_raw)
             cds, fixes = _codon_fix_sites(
-                cds, aa, self._codon_entry["raw"],
+                cds, aa, codon_raw,
                 sites={"BsaI": "GGTCTC"},  # only guard the tail enzyme
             )
         except Exception as exc:
             _log.exception("Mutagenize: optimize failed")
-            info.update(
-                f"[red]Codon optimization failed: {exc}. "
-                f"The selected codon table may be missing entries for this "
-                f"protein's residues — try a different organism or "
-                f"add codon-table entries via File > Codon tables.[/red]"
-            )
+            self.app.call_from_thread(self._on_optimize_failed, str(exc))
             return
-        name = self.query_one("#mut-prot-name", Input).value.strip() or "protein"
+        if entry_counter != getattr(self.app, "_record_load_counter", 0):
+            return  # canvas moved on — drop the result
+        self.app.call_from_thread(
+            self._apply_optimized_cds, aa, cds, fixes, codon_raw, name
+        )
+
+    def _on_optimize_failed(self, msg: str) -> None:
+        try:
+            info = self.query_one("#mut-cds-info", Static)
+        except NoMatches:
+            return
+        info.update(
+            f"[red]Codon optimization failed: {msg}. "
+            f"The selected codon table may be missing entries for this "
+            f"protein's residues — try a different organism or "
+            f"add codon-table entries via File > Codon tables.[/red]"
+        )
+
+    def _apply_optimized_cds(self, aa: str, cds: str, fixes,
+                               codon_raw: dict, name: str) -> None:
         self._cds_dna  = cds
         self._cds_meta = {"start": 0, "end": len(cds), "strand": 1,
                           "name": name, "origin": "prot"}
@@ -36615,9 +37119,13 @@ class MutagenizeModal(ModalScreen):
         stop_s = (f"[green]{stop_tag}[/green]" if stop_tag in _MUT_STOPS
                   else f"[yellow]{stop_tag}[/yellow]")
         fix_note = f" · {len(fixes)} BsaI fix(es)" if fixes else ""
+        try:
+            info = self.query_one("#mut-cds-info", Static)
+        except NoMatches:
+            return
         info.update(
             f"  [dim]{len(cds)} nt · {len(protein)} aa · optimized · "
-            f"CAI {_codon_cai(cds, self._codon_entry['raw']):.2f} · "
+            f"CAI {_codon_cai(cds, codon_raw):.2f} · "
             f"GC {_codon_gc(cds):.1f}%{fix_note}[/dim]   "
             f"start {atg}   stop {stop_s}"
         )
@@ -36738,19 +37246,49 @@ class MutagenizeModal(ModalScreen):
             status.update(f"[red]Position {pos} is '{actual}', not '{wt_aa}'.[/red]")
             return
         codon_raw = (self._codon_entry or {}).get("raw")
+        status.update("[dim]Designing SOE primers…[/dim]")
+        self._design_mut_worker(self._cds_dna, pos, mut_aa, wt_aa, codon_raw)
+
+    @work(thread=True, exclusive=True, group="mutagenize_design")
+    def _design_mut_worker(self, cds_dna: str, pos: int, mut_aa: str,
+                             wt_aa: str, codon_raw) -> None:
+        """Off-thread SOE-PCR primer design. Pre-fix `_mut_design_outer`
+        + `_mut_design_inner` ran sync on the button-press handler —
+        primer3 + Tm scan on a 3 kb CDS hit ~500 ms. Stale-record
+        guard (invariant #28) drops the result if the canvas reloaded
+        mid-design."""
+        entry_counter = getattr(self.app, "_record_load_counter", 0)
         try:
-            outer = _mut_design_outer(self._cds_dna)
-            inner = _mut_design_inner(self._cds_dna, pos, mut_aa, wt_aa,
-                                      codon_table=codon_raw)
+            outer = _mut_design_outer(cds_dna)
+            inner = _mut_design_inner(cds_dna, pos, mut_aa, wt_aa,
+                                       codon_table=codon_raw)
         except Exception as exc:
             _log.exception("Mutagenesis primer design failed")
-            status.update(f"[red]Primer design failed: {exc}[/red]")
+            self.app.call_from_thread(self._on_mut_design_failed, str(exc))
             return
+        if entry_counter != getattr(self.app, "_record_load_counter", 0):
+            return  # canvas moved on — drop the result
+        self.app.call_from_thread(self._apply_design_mut_result, outer, inner)
 
+    def _on_mut_design_failed(self, msg: str) -> None:
+        try:
+            status = self.query_one("#mut-results", Static)
+        except NoMatches:
+            return
+        status.update(f"[red]Primer design failed: {msg}[/red]")
+
+    def _apply_design_mut_result(self, outer: dict, inner: dict) -> None:
         self._outer = outer
         self._inner = inner
+        try:
+            status = self.query_one("#mut-results", Static)
+        except NoMatches:
+            return
         status.update(self._render_results())
-        self.query_one("#btn-mut-save", Button).disabled = False
+        try:
+            self.query_one("#btn-mut-save", Button).disabled = False
+        except NoMatches:
+            pass
         self._update_preview()
 
     def _render_results(self) -> Text:
@@ -37677,6 +38215,34 @@ class PrimerDesignScreen(Screen):
                 f"3' RE: {design['re_3prime']} ({design['site_3']})\n",
                 style="cyan",
             )
+        # Design-time duplicate hint: surface the conflict BEFORE the user
+        # bothers naming and clicking Save. The library-policy is one
+        # entry per unique sequence (`_dedupe_primers_by_sequence`), so
+        # a matching sequence here means Save will be refused.
+        existing_by_seq = {
+            (e.get("sequence") or "").upper(): e for e in _load_primers()
+            if isinstance(e, dict) and isinstance(e.get("sequence"), str)
+        }
+        fwd_match = existing_by_seq.get(design[fwd_key].upper())
+        rev_match = existing_by_seq.get(design[rev_key].upper())
+        if fwd_match or rev_match:
+            t.append("\n⚠ ", style="bold yellow")
+            t.append("Already in primer library — Save will be refused:\n",
+                       style="yellow")
+            if fwd_match:
+                t.append(f"  FWD matches '{fwd_match.get('name', '?')}'",
+                           style="yellow")
+                d = fwd_match.get("date")
+                if d:
+                    t.append(f" (saved {d})", style="dim yellow")
+                t.append("\n", style="yellow")
+            if rev_match:
+                t.append(f"  REV matches '{rev_match.get('name', '?')}'",
+                           style="yellow")
+                d = rev_match.get("date")
+                if d:
+                    t.append(f" (saved {d})", style="dim yellow")
+                t.append("\n", style="yellow")
         status.update(t)
 
         name = self.query_one("#pd-part-name", Input).value.strip() or "primer"
@@ -37772,16 +38338,14 @@ class PrimerDesignScreen(Screen):
         except ValueError:
             self.app.notify("Invalid detection parameters.", severity="error")
             return
-        result = _design_detection_primers(
-            template, start, end, product_min=p_min, product_max=p_max,
-            target_tm=tm, primer_len=plen,
+        self.query_one("#pd-results", Static).update(
+            "[dim]Designing detection primers…[/dim]"
         )
-        if "error" in result:
-            self.query_one("#pd-results", Static).update(f"[red]{result['error']}[/red]")
-            return
-        self._det_result = result
-        self._det_result["_type"] = "detection"
-        self._show_result(result, "detection", "fwd_seq", "rev_seq")
+        self._design_worker(
+            "detection", template, start, end,
+            {"product_min": p_min, "product_max": p_max,
+              "target_tm": tm, "primer_len": plen},
+        )
 
     def _run_cloning(self, template: str, start: int, end: int) -> None:
         cust5 = self.query_one("#pd-cust5", Input).value.strip().upper()
@@ -37806,41 +38370,103 @@ class PrimerDesignScreen(Screen):
             tm = float(self.query_one("#pd-clo-tm", Input).value)
         except ValueError:
             tm = 60.0
-        result = _design_cloning_primers_raw(
-            template, start, end, site_5, site_3, name_5, name_3, target_tm=tm,
+        self.query_one("#pd-results", Static).update(
+            "[dim]Designing cloning primers…[/dim]"
         )
-        if "error" in result:
-            self.query_one("#pd-results", Static).update(f"[red]{result['error']}[/red]")
-            return
-        self._clo_result = result
-        self._clo_result["_type"] = "cloning"
-        self._show_result(result, "cloning", "fwd_full", "rev_full")
+        self._design_worker(
+            "cloning", template, start, end,
+            {"site_5": site_5, "site_3": site_3,
+              "name_5": name_5, "name_3": name_3, "target_tm": tm},
+        )
 
     def _run_goldenbraid(self, template: str, start: int, end: int) -> None:
         pt = self.query_one("#pd-gb-type", Select).value
         if not isinstance(pt, str) or pt not in _GB_POSITIONS:
             self.app.notify("Select a GB part type.", severity="error")
             return
-        result = _design_gb_primers(template, start, end, pt)
-        if "error" in result:
-            self.query_one("#pd-results", Static).update(f"[red]{result['error']}[/red]")
-            return
-        self._clo_result = result
-        self._clo_result["_type"] = "goldenbraid"
-        self._show_result(result, "goldenbraid", "fwd_full", "rev_full")
+        self.query_one("#pd-results", Static).update(
+            "[dim]Designing Golden Braid primers…[/dim]"
+        )
+        self._design_worker(
+            "goldenbraid", template, start, end, {"pt": pt}
+        )
 
     def _run_generic(self, template: str, start: int, end: int) -> None:
         try:
             tm = float(self.query_one("#pd-gen-tm", Input).value)
         except ValueError:
             tm = 60.0
-        result = _design_generic_primers(template, start, end, target_tm=tm)
-        if "error" in result:
-            self.query_one("#pd-results", Static).update(f"[red]{result['error']}[/red]")
+        self.query_one("#pd-results", Static).update(
+            "[dim]Designing generic primers…[/dim]"
+        )
+        self._design_worker(
+            "generic", template, start, end, {"target_tm": tm}
+        )
+
+    @work(thread=True, exclusive=True, group="primer3_design")
+    def _design_worker(self, kind: str, template: str, start: int,
+                         end: int, kwargs: dict) -> None:
+        """Off-thread Primer3 dispatch. Each `_run_*` packs its kwargs
+        into the dict; this worker fans out to the right `_design_*`
+        function and hands the result back via `_apply_design_result`.
+        Pre-fix Primer3 ran sync on the button-press handler — a 200 kb
+        template with product_max ≥ 2 kb took ~1–2 s and froze the
+        modal. `exclusive=True, group=` drops superseded clicks. Stale-
+        record guard (invariant #28) drops the result if the canvas
+        reloaded mid-design — relevant when the user backs out of the
+        screen mid-flight and re-enters on a different plasmid.
+        """
+        entry_counter = getattr(self.app, "_record_load_counter", 0)
+        try:
+            if kind == "detection":
+                result = _design_detection_primers(
+                    template, start, end, **kwargs
+                )
+            elif kind == "cloning":
+                result = _design_cloning_primers_raw(
+                    template, start, end,
+                    kwargs["site_5"], kwargs["site_3"],
+                    kwargs["name_5"], kwargs["name_3"],
+                    target_tm=kwargs["target_tm"],
+                )
+            elif kind == "goldenbraid":
+                result = _design_gb_primers(
+                    template, start, end, kwargs["pt"]
+                )
+            elif kind == "generic":
+                result = _design_generic_primers(
+                    template, start, end, target_tm=kwargs["target_tm"]
+                )
+            else:
+                result = {"error": f"unknown design kind: {kind!r}"}
+        except Exception as exc:
+            _log.exception("Primer design failed (%s)", kind)
+            result = {"error": str(exc)}
+        if entry_counter != getattr(self.app, "_record_load_counter", 0):
+            return  # canvas moved on — drop the result
+        self.app.call_from_thread(
+            self._apply_design_result, kind, result
+        )
+
+    def _apply_design_result(self, kind: str, result: dict) -> None:
+        """UI-thread callback for `_design_worker`. Routes the result
+        into the correct result slot + invokes `_show_result` with the
+        per-kind fwd/rev qualifier names."""
+        try:
+            results_widget = self.query_one("#pd-results", Static)
+        except NoMatches:
             return
-        self._det_result = result
-        self._det_result["_type"] = "generic"
-        self._show_result(result, "generic", "fwd_seq", "rev_seq")
+        if "error" in result:
+            results_widget.update(f"[red]{result['error']}[/red]")
+            return
+        if kind in ("detection", "generic"):
+            self._det_result = result
+            self._det_result["_type"] = kind
+            self._show_result(result, kind, "fwd_seq", "rev_seq")
+        elif kind in ("cloning", "goldenbraid"):
+            self._clo_result = result
+            self._clo_result["_type"] = kind
+            self._show_result(result, kind, "fwd_full", "rev_full")
 
     # ── Save to primer library ─────────────────────────────────────────────
 
@@ -37869,21 +38495,34 @@ class PrimerDesignScreen(Screen):
         else:
             source = self._plasmid_name or "custom"
 
-        # Check for duplicate SEQUENCES (not names) already in the library
+        # Check for duplicate SEQUENCES (not names) already in the library.
+        # Surface WHICH existing primer the designed sequence collides with
+        # so the user knows what to rename / discard — a bare "duplicate"
+        # warning forced them to scroll through the library table to find
+        # the offending row.
         entries = _load_primers()
         fwd_seq = result[fwd_key]
         rev_seq = result[rev_key]
-        existing_seqs = {e.get("sequence", "").upper() for e in entries}
-        dupes = []
-        if fwd_seq.upper() in existing_seqs:
-            dupes.append(fwd_name)
-        if rev_seq.upper() in existing_seqs:
-            dupes.append(rev_name)
+        existing_by_seq = {
+            (e.get("sequence") or "").upper(): e for e in entries
+            if isinstance(e, dict) and isinstance(e.get("sequence"), str)
+        }
+        dupes: list[tuple[str, dict]] = []
+        if fwd_seq.upper() in existing_by_seq:
+            dupes.append((fwd_name, existing_by_seq[fwd_seq.upper()]))
+        if rev_seq.upper() in existing_by_seq:
+            dupes.append((rev_name, existing_by_seq[rev_seq.upper()]))
         if dupes:
+            def _fmt(new_name: str, old: dict) -> str:
+                old_name = old.get("name", "?")
+                date = old.get("date")
+                date_part = f", saved {date}" if date else ""
+                return f"'{new_name}' matches existing '{old_name}'{date_part}"
             self.app.notify(
-                f"Duplicate sequence already in library: {', '.join(dupes)}. "
-                f"Primer not saved — rename or modify the design.",
-                severity="warning", timeout=8,
+                "Duplicate sequence already in library: "
+                + "; ".join(_fmt(n, o) for n, o in dupes)
+                + ". Primer not saved — rename or modify the design.",
+                severity="warning", timeout=10, markup=False,
             )
             return
 
@@ -41453,19 +42092,56 @@ def _h_replace_sequence(app, payload):
                   f"need 0 <= start <= end <= {n} (linear replace)"},
                 400)
 
+    # Atomic dirty check + record snapshot on the UI thread. The
+    # deepcopy here is the price of a clean rebuild: the agent thread
+    # gets a frozen view of `_current_record` to rebuild from, immune
+    # to concurrent user feature edits. For typical <100 kb plasmids
+    # the deepcopy is <10 ms; for multi-Mb plasmids ~100–200 ms —
+    # still much cheaper than running the full rebuild on the UI
+    # thread (the pre-fix freeze).
+    def _check_dirty_and_snapshot():
+        g = _agent_dirty_guard(app, payload)
+        if g is not None:
+            return g
+        return deepcopy(app._current_record)
+
+    snapshot_or_guard = app.call_from_thread(_check_dirty_and_snapshot)
+    if isinstance(snapshot_or_guard, tuple):
+        return snapshot_or_guard
+    snapshot = snapshot_or_guard
+
+    # Capture the canvas-load counter for stale-record protection
+    # (invariant #28). If the user paged to a different plasmid
+    # mid-rebuild, the `_apply` callback drops the edit rather than
+    # clobbering the new canvas record.
+    entry_counter = getattr(app, "_record_load_counter", 0)
+
+    # Build the new record on the agent thread (off the UI thread).
+    # Pre-fix the rebuild ran inside the `_apply` closure dispatched
+    # via `call_from_thread`, holding the UI thread for 100–500 ms on
+    # multi-Mb wrap-feature-heavy records. The snapshot above makes
+    # this rebuild read-only on a frozen view — no race with UI edits.
+    old_seq = str(snapshot.seq)
+    new_seq = old_seq[:start] + bases + old_seq[end:]
+    try:
+        new_record = app._rebuild_record_with_edit(
+            new_seq, "replace", start, end, bases,
+            source_record=snapshot,
+        )
+    except (ValueError, RuntimeError) as exc:
+        return ({"error": str(exc)}, 400)
+
     def _apply():
-        guard = _agent_dirty_guard(app, payload)
-        if guard is not None:
-            return guard
+        # Stale-record guard: drop the agent edit if the canvas paged
+        # to a different plasmid during the rebuild (invariant #28).
+        if entry_counter != getattr(app, "_record_load_counter", 0):
+            return ({"error":
+                      "canvas reloaded mid-edit — agent edit dropped"},
+                    409)
         try:
-            old_seq = str(app._current_record.seq)
-            new_seq = old_seq[:start] + bases + old_seq[end:]
             sp = app.query_one("#seq-panel", SequencePanel)
             pm = app.query_one("#plasmid-map", PlasmidMap)
             app._push_undo()
-            new_record = app._rebuild_record_with_edit(
-                new_seq, "replace", start, end, bases,
-            )
             app._current_record = new_record
             pm.load_record(new_record)
             app.query_one("#sidebar", FeatureSidebar).populate(pm._feats)
@@ -42990,6 +43666,12 @@ class PlasmidApp(App):
     # async test. Production launch flips this to False so users
     # always have a 30-day rolling window of recoverable snapshots.
     _skip_snapshot: bool          = True
+    # Startup primer-library duplicate check. Default-True for tests
+    # so `PrimerDuplicatesModal` doesn't pop during async pilots.
+    # Production launch flips this to False so legacy duplicates
+    # (from .dna imports before `_dedupe_primers_by_sequence` ran on
+    # every save) surface a one-time cleanup prompt.
+    _skip_primer_dedupe_check: bool = True
     # Hydrated from the persisted `check_updates` setting in compose();
     # the in-memory mirror is read by the worker and the menu toggle.
     _check_updates: bool          = True
@@ -44036,8 +44718,9 @@ SpeciesPickerModal { align: center middle; }
         Binding("f5",          "show_history",         "History",      show=False, priority=True),
         Binding("ctrl+h",      "show_history",         "History",      show=False, priority=True),
         Binding("f6",          "focus_panel_all",      "All panels",   show=False, priority=True),
-        # Ctrl+# aliases for the F-key fullscreen views — SnapGene
-        # muscle memory (Koeng101 + Cory Tobin in issue #1). Ctrl+1
+        # Ctrl+# aliases for the F-key fullscreen views — popular
+        # plasmid editor muscle memory (Koeng101 + Cory Tobin in issue
+        # #1). Ctrl+1
         # is Library (=F1), Ctrl+2 is Sequence (=F4 because that's the
         # one Cory specifically called out), Ctrl+3 is Features (=F3).
         # Ctrl+0 returns to all-panels view.
@@ -44391,7 +45074,8 @@ SpeciesPickerModal { align: center middle; }
         sp._refresh_view()
 
     def _rebuild_record_with_edit(self, new_seq: str, mode: str,
-                                   s: int, e: int, new_bases: str):
+                                   s: int, e: int, new_bases: str,
+                                   *, source_record=None):
         """Rebuild SeqRecord after an insert/replace, shifting feature coords precisely.
 
         Wrap features (origin-spanning CompoundLocations of the canonical
@@ -44399,10 +45083,20 @@ SpeciesPickerModal { align: center middle; }
         are shifted per-part so the wrap structure survives the edit.
         Features consumed entirely by a replace are dropped — we never
         leave 1-bp ghost stubs behind.
+
+        ``source_record`` lets a caller pass a snapshot to rebuild
+        from instead of ``self._current_record``. Used by the
+        agent-API ``replace-sequence`` worker so the heavy rebuild
+        can run off the UI thread against a pre-captured deepcopy —
+        the feature-read loop is read-only on the snapshot, so a
+        concurrent UI-thread feature edit can't corrupt the result.
         """
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
         from Bio.SeqFeature import SeqFeature, FeatureLocation, CompoundLocation
+
+        src = (source_record if source_record is not None
+                else self._current_record)
 
         ins_len  = len(new_bases)
         del_len  = 0 if mode == "insert" else (e - s)
@@ -44438,13 +45132,13 @@ SpeciesPickerModal { align: center middle; }
 
         new_record = SeqRecord(
             Seq(new_seq),
-            id=self._current_record.id,
-            name=self._current_record.name,
-            description=self._current_record.description,
-            annotations=dict(self._current_record.annotations),
+            id=src.id,
+            name=src.name,
+            description=src.description,
+            annotations=dict(src.annotations),
         )
 
-        for feat in self._current_record.features:
+        for feat in src.features:
             loc = feat.location
             if isinstance(loc, CompoundLocation):
                 new_parts = []
@@ -45733,10 +46427,21 @@ SpeciesPickerModal { align: center middle; }
         `__version__`, push the dialog. The setting bumps to the
         current version on the modal's dismiss so the user only
         sees it once per upgrade.
+
+        Also runs the primer-library duplicate scan: legacy `.dna`
+        imports (before `_dedupe_primers_by_sequence` ran on every
+        save) could leave duplicate-sequence rows in `primers.json`
+        that never self-cleaned. If any are found, a confirmation
+        modal is pushed (defaulted to KEEP so a stray Enter on splash
+        dismiss can't silently delete user data). Pushed before
+        `WhatsNewModal` so the WhatsNew screen ends up on top of the
+        screen stack — user sees WhatsNew first, then the prompt.
         """
         queue, self._splash_notify_queue = self._splash_notify_queue, []
         for msg, kwargs in queue:
             super().notify(msg, **kwargs)
+        if not getattr(self, "_skip_primer_dedupe_check", True):
+            self._check_primer_duplicates()
         try:
             seen = str(_get_setting("last_seen_version", "") or "")
         except Exception:
@@ -45745,6 +46450,66 @@ SpeciesPickerModal { align: center middle; }
             def _on_seen(_dismiss_result) -> None:
                 _set_setting("last_seen_version", __version__)
             self.push_screen(WhatsNewModal(__version__), _on_seen)
+
+    def _check_primer_duplicates(self) -> None:
+        """Scan `primers.json` for duplicate-sequence entries AND for
+        name-collision groups (same name, different sequences — a
+        common `.dna` import artefact). If anything would be removed
+        by either pass, push a confirmation modal defaulted to KEEP.
+
+        Two cleanup passes run on confirm:
+          1. **Sequence dedupe** — `_dedupe_primers_by_sequence`:
+             same DNA sequence ⇒ first occurrence wins. Sacred policy
+             also enforced on every save.
+          2. **Name collapse** — `_dedupe_primers_by_name_longest_seq`:
+             same name, different sequences ⇒ keep the longest
+             sequence (the variant with the full cloning tail).
+
+        The scan computes both passes once and threads the final list
+        through the callback so a confirm doesn't re-walk on `_save_primers`.
+        """
+        try:
+            entries = _load_primers()
+        except Exception:
+            _log.exception("primer-duplicate scan: load failed")
+            return
+        total = sum(1 for e in entries if isinstance(e, dict))
+        # Pass 1: sequence dedupe (same as `_save_primers`).
+        seq_deduped = _dedupe_primers_by_sequence(entries)
+        seq_kept = sum(1 for e in seq_deduped if isinstance(e, dict))
+        seq_removed = total - seq_kept
+        # Pass 2: name-collision collapse (longest sequence wins).
+        final = _dedupe_primers_by_name_longest_seq(seq_deduped)
+        final_kept = sum(1 for e in final if isinstance(e, dict))
+        name_removed = seq_kept - final_kept
+        if seq_removed == 0 and name_removed == 0:
+            return
+
+        def _on_choice(delete: "bool | None") -> None:
+            if not delete:
+                return
+            try:
+                _save_primers(final)
+            except (OSError, ValueError) as exc:
+                _notify_save_failure(self, "Primer library", exc)
+                return
+            removed = seq_removed + name_removed
+            self.notify(
+                f"Deleted {removed} duplicate primer "
+                f"entr{'ies' if removed != 1 else 'y'}. "
+                f"Library now has {final_kept} entries.",
+                severity="information",
+            )
+
+        self.push_screen(
+            PrimerDuplicatesModal(
+                total=total,
+                seq_duplicates=seq_removed,
+                name_collisions=name_removed,
+                final_kept=final_kept,
+            ),
+            callback=_on_choice,
+        )
 
     def action_show_whats_new(self) -> None:
         """File → What's New… — manual reopen of the per-version
@@ -46486,7 +47251,11 @@ SpeciesPickerModal { align: center middle; }
                 plasmids = [dict(p)
                             for p in (coll.get("plasmids") or [])
                             if isinstance(p, dict)]
-                _save_library(plasmids)
+                try:
+                    _save_library(plasmids)
+                except (OSError, ValueError) as exc:
+                    _notify_save_failure(self, "Plasmid library", exc)
+                    return
                 # Tell the LibraryPanel so it repopulates against the
                 # newly-active collection (mirrors the click-twice flow).
                 try:
@@ -47763,7 +48532,11 @@ SpeciesPickerModal { align: center middle; }
                 self.notify("Library entry vanished.",
                              severity="warning")
                 return
-            _save_library(entries)
+            try:
+                _save_library(entries)
+            except (OSError, ValueError) as exc:
+                _notify_save_failure(self, "Plasmid library", exc)
+                return
             try:
                 lib = self.query_one("#library", LibraryPanel)
                 lib._repopulate()
@@ -48801,8 +49574,8 @@ SpeciesPickerModal { align: center middle; }
     def action_find_annotation(self) -> None:
         """Open the feature-search modal (issue #6 from Anirudh). On
         dismiss, jump the seq-panel cursor and select the chosen
-        feature in the map — the SnapGene / Geneious "find
-        annotation" reflex. No-op when no record is loaded."""
+        feature in the map — the popular plasmid editor / Geneious
+        "find annotation" reflex. No-op when no record is loaded."""
         if self._current_record is None:
             self.notify(
                 "Load a plasmid before searching annotations.",
@@ -49268,6 +50041,10 @@ def main():
     # inside every async run; production users always have a 30-day
     # rolling snapshot window.
     app._skip_snapshot = False
+    # Production launch also opts in to the startup primer-library
+    # duplicate scan. Tests leave this True (class default) so
+    # `PrimerDuplicatesModal` doesn't pop during async pilots.
+    app._skip_primer_dedupe_check = False
     if enable_agent_api:
         app._agent_api_port = agent_port
 

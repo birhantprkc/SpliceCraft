@@ -52,8 +52,8 @@ constraints:
 - **Crash-recovery autosave.** Dirty edits debounce a 3-second write
   to a per-record `.gb` snapshot. Power-cut your laptop mid-edit; the
   next launch surfaces the survivors.
-- **2,100+ tests** (`pytest -n auto -q`, ~5 min on 8 cores) anchored on
-  41 **sacred invariants** for biology correctness AND data integrity:
+- **2,250+ tests** (`pytest -n auto -q`, ~5 min on 8 cores) anchored on
+  42 **sacred invariants** for biology correctness AND data integrity:
   palindromic-enzyme scanning, reverse-strand coordinate handling,
   IUPAC reverse-complement including ambiguity codes, wrap-around
   feature math, atomic-save contract, undo deepcopy, cache-deepcopy on
@@ -251,9 +251,15 @@ Press `?` once running for the full keyboard-shortcut reference.
   primers + construction history) and writes it back — including the
   default `Primers` and `AdditionalSequenceProperties` packets the
   editor itself emits — so files round-trip through SpliceCraft
-  cleanly into the editor's Viewer / Inspector panels. Construction
-  history XML is preserved on import and synthesised on save for any
-  product built via the Traditional cloning simulator.
+  cleanly into the editor's Viewer / Inspector panels. Imported
+  primers feed into the persistent primer library (de-duplicated by
+  sequence), and per-feature colours are recovered alongside.
+  Construction history XML is preserved on import and synthesised on
+  save for any product built via the Traditional cloning simulator.
+- **Construction history viewer.** `File → View construction history`
+  renders any record's `<HistoryTree>` lineage — fragments, enzymes,
+  parent products — as a navigable tree so the provenance of a
+  multi-step build is auditable at a glance.
 - **Library fuzzy search** — subsequence match (case-insensitive,
   non-contiguous) against the visible table; natural-sorted so
   `pBin2` lands before `pBin10`.
@@ -437,7 +443,7 @@ than crashing.
 ## Tests
 
 ```bash
-python3 -m pytest -n auto -q                  # full suite (1700+ tests, ~5–6 min on 8 cores)
+python3 -m pytest -n auto -q                  # full suite (2,250+ tests, ~5–6 min on 8 cores)
 python3 -m pytest tests/test_dna_sanity.py    # biology correctness only (< 2 s)
 python3 -m pytest tests/test_invariants_hypothesis.py  # property-based fuzzing
 ```
@@ -459,7 +465,7 @@ place.
 map. Test files are 1:1 named after the subsystem they cover.
 
 `CLAUDE.md` at the repo root is the **agent + contributor handover
-document**: 35 sacred invariants, error-handling convention, known
+document**: 42 sacred invariants, error-handling convention, known
 pitfalls, persistence + cache discipline, natural-sort row-mapping
 symmetry, the `.dna` writer's expected packet inventory. Read it before
 touching the rendering layer, record pipeline, primer design, or any

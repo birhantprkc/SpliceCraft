@@ -180,6 +180,8 @@ _MODAL_CASES = [
                                                "ATGGCCGCCGCCGCCTAA" * 5,
                                                circular=True)),
     ("LibrarySearchModal",         lambda: sc.LibrarySearchModal()),
+    ("FeatureSearchModal",         lambda: sc.FeatureSearchModal(
+                                               _make_feats(), total=3000)),
     ("LoadPartSourceModal",        lambda: sc.LoadPartSourceModal()),
     ("NamePlasmidModal",           lambda: sc.NamePlasmidModal(
                                                "test_plasmid",
@@ -190,6 +192,10 @@ _MODAL_CASES = [
                                                transfers=[])),
     ("CollectionsModal",           lambda: sc.CollectionsModal()),
     ("RestoreFromBackupModal",     lambda: sc.RestoreFromBackupModal()),
+    ("PrimerDuplicatesModal",      lambda: sc.PrimerDuplicatesModal(
+                                               total=671, seq_duplicates=0,
+                                               name_collisions=156,
+                                               final_kept=515)),
     ("CollectionNameModal",        lambda: sc.CollectionNameModal(
                                                "New collection", "")),
     ("NewCollectionModal",         lambda: sc.NewCollectionModal()),
