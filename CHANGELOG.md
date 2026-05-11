@@ -2,6 +2,112 @@
 
 ---
 
+## [0.7.10.1] — 2026-05-11 — `.dna` import recovers colours, primers, and feeds the primer library
+
+The 0.7.10.0 release shipped the `.dna` augmentation path that recovers
+per-feature colours and primer information BioPython's `snapgene` parser
+silently drops, but two follow-up issues surfaced once it landed in real
+use: bulk-folder imports never reached the primer library, and legacy
+duplicate sequences accumulated in `primers.json` without a cleanup path.
+
+### Fixed: bulk-folder `.dna` imports now seed the primer library
+
+- `_bulk_import_folder` (used by **New Collection → Bulk import from
+  folder…** and any other folder-walk import) called `load_genbank` on
+  every file — which DID run the augment helper and stash
+  `_dna_primer_entries` on each SeqRecord — but the rec was discarded
+  after being converted to a library entry, so the primer entries
+  never reached `primers.json`. The user saw imported plasmids in the
+  library but no primers in the Primers tab.
+- Now `_bulk_import_folder` accumulates `_dna_primer_entries` across
+  the batch and merges them into `primers.json` at the end of the
+  walk. Dedupe by sequence (case-insensitive) so re-importing the
+  same folder doesn't pile up duplicates, and cross-file dedupe so a
+  M13 fwd/rev appearing in every plasmid of a 5-plasmid pUC-derived
+  collection only lands once.
+- Save failures are logged but don't abort the import — the library
+  entries themselves are still built and the caller persists them;
+  the primer DB sync is a side-effect convenience.
+
+### Fixed: pre-stamped `primer_seq` qualifier no longer skips the DB append
+
+- `_augment_dna_record_from_packets` early-`continue`d when a
+  `primer_bind` feature already carried a `primer_seq` qualifier.
+  That skipped both the sequence-derivation AND the primer-DB entry
+  append — so any `.dna` file round-tripped through splicecraft (or
+  exported from ApE / any tool that stamps `primer_seq`) silently
+  lost its primers from the imported DB.
+- The audit caught it: of 6 `.dna` fixtures, AB303066 (a splicecraft
+  round-tripped file) reported `0/2` primer entries queued while the
+  5 FFE fixtures reported `2/2`. Fixed by restructuring the
+  primer_bind loop: when `primer_seq` is pre-stamped, use it verbatim
+  (preserves any 5' flap longer than the bound region — deriving
+  from the bound region would drop the flap); when absent, derive
+  from the bound region. Either way, queue the DB entry.
+
+### Fixed: `tm=None` no longer crashes the primer library table
+
+- The `_refresh_library_table` row builder formatted Tm as
+  `f"{p.get('tm', 0):.1f}°C"`, which crashed with
+  `unsupported format string passed to NoneType.__format__` if any
+  primer carried `tm=None` (legacy hand-edited entries, imports from
+  before this release). Now non-numeric Tm renders as `—` instead.
+- Also: every `.dna`-imported primer now gets a computed Tm at
+  augment time (`primer3-py` if available, 2+4 rule fallback) — same
+  shape as designed primers, no more `None` to defend against.
+
+### Fixed: legacy duplicate primers in `primers.json` finally clean up
+
+- The 0.7.10.0 dedupe paths (`_apply_record`, `_bulk_import_folder`)
+  only filtered NEW additions — they didn't remove duplicates that
+  already existed in `primers.json` from earlier sessions (manual
+  JSON edits, pre-dedupe imports, etc.). The user accumulated "many
+  copies of the same primer with identical sequence" over time
+  without any way to clean them up short of editing the JSON.
+- Now `_save_primers` itself dedupes by sequence (case-insensitive)
+  on every write. First-by-position wins so callers that prepend MRU
+  at index 0 keep their newest copy. Sacred policy now enforced
+  end-to-end: **one entry per unique sequence** across every save
+  path. Existing duplicates collapse on the next save (any import,
+  design, status cycle, rename, or delete triggers cleanup).
+- Defensive: entries without a usable `sequence` (string-typed and
+  non-empty) are kept verbatim — losing them silently would be
+  worse than leaving the user a one-off oddity to investigate.
+
+### New: `PlasmidMap._parse` honours `ApEinfo_*color` qualifiers
+
+- Pre-fix, every feature got a deterministic-but-unrelated colour
+  from `_FEATURE_PALETTE` rotation regardless of what the source
+  file said. Now the parse path reads `ApEinfo_fwdcolor`,
+  `ApEinfo_revcolor`, or `color` qualifiers first (validated as
+  CSS-hex shape) and falls back to the palette only when none is
+  present. Helps `.gb` files from ApE and Geneious too, not just
+  `.dna` imports.
+
+### Tests
+
+- **`test_commercialsaas_io.py`** — 13 new tests in
+  `TestDnaImportAugmentation` / `TestAugmentHelperUnit` /
+  `TestColorQualifierReadInPlasmidMap` pin every fix above:
+  per-feature colour recovery from real FFE fixtures, primer_seq
+  derivation from bound region, RC for reverse-strand primers,
+  primer DB stash, palette overridden by qualifier, pre-stamped
+  `primer_seq` still appending DB entry, flap-preservation when a
+  longer `primer_seq` is present, bulk-import flush to `primers.json`,
+  cross-file dedupe in the bulk path, malformed colour rejected,
+  colour qualifier wins in `PlasmidMap._parse`, palette fallback
+  when no qualifier.
+- **`test_primers.py`** — 6 new tests in
+  `TestPrimerLibraryShowsImported` / `TestPrimerLibraryScrollable`:
+  imported primer appears in the library DataTable on screen open,
+  `tm=None` legacy entry renders without crash, library scrolls past
+  viewport (60 unique primers, cursor navigates to row 59), dedupe
+  on save collapses 5 entries → 2 by sequence, and a missing-sequence
+  entry survives the dedupe.
+- Net: 2208 → 2229 passing (+21 from this release).
+
+---
+
 ## [0.7.10.0] — 2026-05-10 — full GB 2.0 grammar + performance sweep + CDS start-codon fix
 
 ### New: full Golden Braid 2.0 grammar (`_GB_POSITIONS` expanded 7 → 17 slots)

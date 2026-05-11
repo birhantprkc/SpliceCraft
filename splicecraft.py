@@ -6208,6 +6208,27 @@ def load_genbank(path: str):
         rec.id = safe_stem
     if not rec.name or rec.name.startswith("<unknown"):
         rec.name = safe_stem
+
+    # `.dna` augmentation: re-read the file bytes to recover per-feature
+    # colours + primer-bind sequence stamps + 0x05 primer-DB entries that
+    # BioPython's `snapgene` parser silently drops. Stashed on the record
+    # as a transient attribute so `_apply_record` can flush the primer
+    # entries into `primers.json` after the load completes. Failures here
+    # are non-fatal — the record loads with palette colours and bare
+    # primer features (the historical behaviour).
+    if fmt == _BIOPYTHON_DNA_FMT:
+        try:
+            with open(path, "rb") as fh:
+                _dna_bytes = fh.read()
+            extra_primers = _augment_dna_record_from_packets(rec, _dna_bytes)
+            if extra_primers:
+                rec._dna_primer_entries = extra_primers
+        except (OSError, ValueError) as exc:
+            _log.warning(
+                "dna augment failed for %s (%s); record loads with "
+                "palette colours instead of source colours",
+                path, exc,
+            )
     return rec
 
 
@@ -6870,6 +6891,205 @@ def _coerce_int_or_zero(s) -> int:
         return 0
 
 
+def _augment_dna_record_from_packets(
+    rec, data: bytes,
+) -> list[dict]:
+    """Recover info BioPython's ``snapgene`` parser drops:
+      * **per-feature colours** from the 0x0A Features packet
+        (``<Segment color="#RRGGBB"/>`` attributes). BioPython parses
+        ``<Feature>`` name/type/location but throws the colour away —
+        SpliceCraft then falls back to its rotating ``_FEATURE_PALETTE``,
+        which gives correct-but-unfamiliar colours that don't match
+        what the user saw in the original editor. This helper stamps
+        ``ApEinfo_revcolor`` + ``ApEinfo_fwdcolor`` qualifiers on every
+        non-source feature so the colour-read path in
+        ``PlasmidMap._parse`` picks them up.
+      * **primer sequence stamps** on every ``primer_bind`` feature so
+        the seq panel renders them with the full primer machinery
+        (flap detection, weak-primer arrow, partial-binding tooltip).
+        Derived from the bound region's bases — forward primers take
+        the top-strand sequence directly; reverse primers take the
+        reverse-complement. Skipped if BioPython already provided a
+        ``primer_seq`` (defensive — future BioPython versions may
+        decode the 0x05 packet themselves).
+      * **standalone <Primer> entries** from the 0x05 Primers packet,
+        when present. Most user-saved ``.dna`` files keep the 0x05
+        packet at its empty default (just ``HybridizationParams``), but
+        files that the user has run primer-design on inside the editor
+        carry real entries here; we surface them into ``primers.json``
+        so the user's primer library mirrors what they had in the
+        source file.
+
+    Mutates ``rec`` in place. Returns a list of primer dicts (the
+    ``primers.json`` shape) — one per primer_bind feature plus one per
+    standalone 0x05 ``<Primer>`` entry, with duplicates by sequence
+    already collapsed within this call. The caller (``_apply_record``)
+    dedupes against the existing primer DB before persisting.
+    """
+    import xml.etree.ElementTree as _ET
+
+    # Local Tm calculator — primer3 if available, 2+4 fallback otherwise.
+    # Captured once at the top of the augment so we don't pay the import
+    # cost for every primer entry we build below. Imported primers get a
+    # computed Tm so the Primer Library table renders the same way it
+    # does for designed primers (it does `f"{tm:.1f}°C"` on the value).
+    try:
+        import primer3 as _primer3
+        def _calc_tm(s: str) -> float:
+            try:
+                return float(_primer3.calc_tm(s))
+            except Exception:
+                # primer3 occasionally barfs on weird sequences (very
+                # short, contains N, etc.); fall back to the 2+4 rule.
+                gc = sum(1 for c in s.upper() if c in "GC")
+                at = sum(1 for c in s.upper() if c in "AT")
+                return float(2 * at + 4 * gc)
+    except ImportError:
+        def _calc_tm(s: str) -> float:
+            gc = sum(1 for c in s.upper() if c in "GC")
+            at = sum(1 for c in s.upper() if c in "AT")
+            return float(2 * at + 4 * gc)
+
+    feature_colors: list[str] = []
+    standalone_primers: list[dict] = []
+
+    for type_byte, _length, payload in _iter_commercialsaas_packets(data):
+        if type_byte == _COMMERCIALSAAS_PACKET_FEATURES:
+            try:
+                root = _safe_xml_parse(payload.decode("utf-8"))
+            except (_ET.ParseError, UnicodeDecodeError, ValueError):
+                _log.warning("dna augment: 0x0A features packet parse failed")
+                continue
+            if root is None:
+                continue
+            for feat_el in root.findall(".//Feature"):
+                seg = feat_el.find("Segment")
+                feature_colors.append(
+                    seg.get("color", "") if seg is not None else ""
+                )
+        elif type_byte == _COMMERCIALSAAS_PACKET_PRIMERS:
+            try:
+                root = _safe_xml_parse(payload.decode("utf-8"))
+            except (_ET.ParseError, UnicodeDecodeError, ValueError):
+                _log.warning("dna augment: 0x05 primers packet parse failed")
+                continue
+            if root is None:
+                continue
+            today = _date.today().isoformat()
+            for prim_el in root.findall(".//Primer"):
+                pseq = (prim_el.get("sequence") or "").upper().replace("U", "T")
+                if not pseq:
+                    continue
+                pname = (prim_el.get("name") or "").strip()
+                if not pname:
+                    pname = f"primer_{len(standalone_primers) + 1}"
+                standalone_primers.append({
+                    "name":        pname,
+                    "sequence":    pseq,
+                    "tm":          round(_calc_tm(pseq), 1),
+                    "primer_type": "imported",
+                    "source":      ".dna import",
+                    "pos_start":   None,
+                    "pos_end":     None,
+                    "strand":      None,
+                    "date":        today,
+                    "status":      "Imported",
+                })
+
+    # Stamp colour qualifiers on features by enumeration order. The
+    # 0x0A packet only carries the features the editor itself created;
+    # any `source` row in the SeqRecord comes from BioPython's LOCUS
+    # parsing (not the 0x0A packet) so it doesn't consume a colour
+    # slot. Out-of-order or extra features are tolerated — we just
+    # stop when we run off the end of the colour list.
+    color_idx = 0
+    for f in rec.features:
+        if f.type == "source":
+            continue
+        if color_idx >= len(feature_colors):
+            break
+        c = feature_colors[color_idx]
+        color_idx += 1
+        if not c or not isinstance(c, str):
+            continue
+        # Defensive: only accept plausible CSS hex colours so a malformed
+        # packet can't sneak arbitrary strings into our qualifiers.
+        c = c.strip()
+        if not (c.startswith("#") and len(c) in (4, 7)):
+            continue
+        f.qualifiers["ApEinfo_revcolor"] = [c]
+        f.qualifiers["ApEinfo_fwdcolor"] = [c]
+
+    # Build primer DB entries from the primer_bind features. Two
+    # sources for the primer sequence:
+    #   * `primer_seq` qualifier already on the feature (the round-trip
+    #     case — splicecraft stamps this when it writes a .dna, and ApE
+    #     uses the same convention). USE this verbatim so a primer
+    #     carrying a 5' flap keeps its full length in the DB; deriving
+    #     from the bound region would drop the flap.
+    #   * Otherwise derive from the bound region (forward primers take
+    #     the top strand directly; reverse primers take the RC).
+    # Pre-2026-05-10 the code `continue`d on the qualifier-present
+    # branch, which skipped the DB-entry append — so any .dna file
+    # round-tripped through splicecraft (or exported from a tool that
+    # stamps primer_seq) lost its primers from the imported DB.
+    seq_str = str(rec.seq).upper() if getattr(rec, "seq", None) else ""
+    n = len(seq_str)
+    today = _date.today().isoformat()
+    primer_bind_entries: list[dict] = []
+    for f in rec.features:
+        if f.type != "primer_bind":
+            continue
+        try:
+            start = int(f.location.start)
+            end   = int(f.location.end)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        strand = getattr(f.location, "strand", 1) or 1
+        if not (0 <= start < end <= n):
+            continue
+        existing_pseq = f.qualifiers.get("primer_seq", [])
+        if existing_pseq and isinstance(existing_pseq, list):
+            bound_seq = str(existing_pseq[0]).strip().upper()
+            if not bound_seq:
+                bound_seq = seq_str[start:end]
+                if strand < 0:
+                    bound_seq = _rc(bound_seq)
+        else:
+            bound_seq = seq_str[start:end]
+            if strand < 0:
+                bound_seq = _rc(bound_seq)
+            f.qualifiers["primer_seq"] = [bound_seq]
+        labels = f.qualifiers.get("label", [])
+        pname = str(labels[0]).strip() if labels else f"primer_{start}_{end}"
+        primer_bind_entries.append({
+            "name":        pname,
+            "sequence":    bound_seq,
+            "tm":          round(_calc_tm(bound_seq), 1),
+            "primer_type": "imported",
+            "source":      ".dna import",
+            "pos_start":   start,
+            "pos_end":     end,
+            "strand":      strand,
+            "date":        today,
+            "status":      "Imported",
+        })
+
+    # Merge + dedupe by sequence (case-insensitive). Standalone 0x05
+    # entries come first so their explicit ``<Primer name="...">`` wins
+    # over an auto-generated ``primer_<start>_<end>`` name when the
+    # same sequence appears in both places.
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for entry in standalone_primers + primer_bind_entries:
+        key = (entry["sequence"] or "").upper()
+        if not key or key in seen:
+            continue
+        merged.append(entry)
+        seen.add(key)
+    return merged
+
+
 def _parse_commercialsaas_history(xml_text: str) -> "_CommercialSaaSHistoryNode | None":
     """Parse `<HistoryTree>` XML into a node tree. Returns the root
     `<Node>` (the result plasmid) or ``None`` if the XML is empty /
@@ -7040,6 +7260,15 @@ def _bulk_import_folder(
     entries: list[dict] = []
     failures: list[tuple[Path, str]] = []
     seen_ids: set[str] = set()
+    # Accumulator for primer DB entries surfaced by
+    # `_augment_dna_record_from_packets` on each .dna. Bulk imports
+    # discard the SeqRecord after converting it to a library entry, so
+    # `_apply_record`'s primer-flush path never fires for these — we
+    # have to merge them into `primers.json` ourselves at the end of
+    # the batch. Regression guard for 2026-05-10: user reported
+    # imported primers missing from the Primer Library after a folder
+    # import.
+    all_dna_primer_entries: list[dict] = []
 
     # Read the directory once. Permission / not-found / disappeared-during-
     # selection: surface as one folder-level failure rather than crash.
@@ -7100,6 +7329,15 @@ def _bulk_import_folder(
                     entry["id"] = f"{base_id}_{n}"
                 seen_ids.add(entry["id"])
                 entries.append(entry)
+                # Harvest primer DB entries the augment helper stashed
+                # on the SeqRecord — bulk imports never hit
+                # `_apply_record`, so without this the user's primer
+                # library wouldn't pick up primers from imported .dna
+                # files. We accumulate across the batch and write once
+                # at the end of `_bulk_import_folder`.
+                dna_pe = getattr(rec, "_dna_primer_entries", None)
+                if isinstance(dna_pe, list) and dna_pe:
+                    all_dna_primer_entries.extend(dna_pe)
                 # Sidecar copy of the original .dna bytes (Phase 4d):
                 # lets us round-trip back to .dna later by splicing
                 # fresh history into the original byte stream. Only
@@ -7125,6 +7363,42 @@ def _bulk_import_folder(
                     progress_cb(i, total, path.name, ok)
                 except Exception:
                     _log.exception("bulk_import: progress_cb raised")
+
+    # Flush accumulated primer entries to `primers.json`. Dedupes
+    # against the existing primer library by sequence (case-insensitive)
+    # so re-importing the same folder doesn't pile up duplicates. Save
+    # failures are logged but don't abort the import — the library
+    # entries themselves have already been built and the caller will
+    # persist them; the primer DB sync is a side-effect convenience.
+    if all_dna_primer_entries:
+        try:
+            existing = _load_primers()
+            existing_seqs = {
+                (e.get("sequence") or "").upper() for e in existing
+            }
+            n_added = 0
+            for pe in all_dna_primer_entries:
+                pseq = (pe.get("sequence") or "").upper()
+                if not pseq or pseq in existing_seqs:
+                    continue
+                existing.insert(0, pe)
+                existing_seqs.add(pseq)
+                n_added += 1
+            if n_added:
+                _save_primers(existing)
+                _log.info(
+                    "bulk_import: added %d primer(s) to primer library "
+                    "from %d .dna file(s)",
+                    n_added, len(all_dna_primer_entries),
+                )
+        except (OSError, RuntimeError) as exc:
+            _log.warning(
+                "bulk_import: failed to write imported primers to "
+                "primer library (%s); .dna primer features were "
+                "preserved on the library entries but not aggregated "
+                "into primers.json",
+                exc,
+            )
     return entries, failures
 
 
@@ -8405,12 +8679,31 @@ class PlasmidMap(Widget):
                     start, end = clamped_start, clamped_end
 
             idx    = len(feats)
+            # Colour resolution order:
+            #   1. Explicit qualifier (`ApEinfo_fwdcolor` /
+            #      `ApEinfo_revcolor` / `color`) — the cross-tool
+            #      convention written by ApE, Geneious, and the
+            #      CommercialSaaS .dna augment path
+            #      (`_augment_dna_record_from_packets`). Preserves the
+            #      colour the user set in the source editor.
+            #   2. Deterministic fallback from `_FEATURE_PALETTE`
+            #      indexed by feature position — only used for records
+            #      that ship no colour info at all (legacy GenBank
+            #      fetches, freshly-typed plasmids).
+            qual_color = ""
+            for k in ("ApEinfo_fwdcolor", "ApEinfo_revcolor", "color"):
+                vals = feat.qualifiers.get(k, [])
+                if vals:
+                    c = str(vals[0]).strip()
+                    if c.startswith("#") and len(c) in (4, 7):
+                        qual_color = c
+                        break
             new_feat: dict = {
                 "type":   feat.type,
                 "start":  start,
                 "end":    end,
                 "strand": strand,
-                "color":  _FEATURE_PALETTE[idx % len(_FEATURE_PALETTE)],
+                "color":  qual_color or _FEATURE_PALETTE[idx % len(_FEATURE_PALETTE)],
                 "label":  _feat_label(feat),
             }
             if feat_exons is not None:
@@ -20584,14 +20877,65 @@ def _load_primers() -> list[dict]:
     _primers_cache = entries
     return _typed_clone(_primers_cache)
 
+def _dedupe_primers_by_sequence(entries: list[dict]) -> list[dict]:
+    """Collapse primer entries whose ``sequence`` field duplicates an
+    earlier entry's sequence (case-insensitive). The first entry of
+    each unique sequence wins — callers that prepend MRU at index 0
+    therefore keep their newest copy, while older duplicates are
+    silently dropped.
+
+    The primer-library policy across the app has always been "one entry
+    per unique sequence":
+
+      * ``PrimerDesignScreen._save_primers_btn`` rejects a designed
+        primer when its sequence already exists.
+      * ``_apply_record`` and ``_bulk_import_folder`` dedupe
+        .dna-imported primers against the existing library before
+        appending.
+
+    Pre-2026-05-10 those dedupe paths only filtered NEW additions —
+    duplicates that snuck into ``primers.json`` from earlier sessions
+    (manual edits, imports before the dedupe landed, etc.) stayed
+    forever. Calling this helper on every save means the next write
+    of ``primers.json`` cleans up legacy duplicates without the user
+    having to do anything.
+
+    Entries lacking a usable ``sequence`` (None / empty / non-string)
+    are kept verbatim — losing them silently would be worse than
+    leaving the user with a one-off "unknown" row to investigate.
+    """
+    seen: set[str] = set()
+    out: list[dict] = []
+    for e in entries:
+        if not isinstance(e, dict):
+            out.append(e)
+            continue
+        raw_seq = e.get("sequence")
+        if not isinstance(raw_seq, str):
+            out.append(e)
+            continue
+        key = raw_seq.strip().upper()
+        if not key:
+            out.append(e)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(e)
+    return out
+
+
 def _save_primers(entries: list[dict]) -> None:
     global _primers_cache
-    _safe_save_json(_PRIMERS_FILE, entries, "Primer library")
+    # Dedupe by sequence on every save (sacred policy: one entry per
+    # unique sequence). See `_dedupe_primers_by_sequence`.
+    deduped = _dedupe_primers_by_sequence(entries)
+    _safe_save_json(_PRIMERS_FILE, deduped, "Primer library")
     # Deep-copy on save so the cache is independent of the caller's
     # reference — pre-fix `list(entries)` shared dict refs with the
     # caller, so subsequent caller mutations (e.g. an aborted modal)
     # leaked back into the next `_load_primers`.
-    _primers_cache = _typed_clone(entries)
+    _primers_cache = _typed_clone(deduped)
 
 
 # ── Feature library persistence ───────────────────────────────────────────────
@@ -36684,11 +37028,20 @@ class PrimerDesignScreen(Screen):
             mark   = "★ " if marked else "  "
             status = p.get("status", "Designed")
             s_color = self._STATUS_COLORS.get(status, "white")
+            # `tm` defensive: `.dna` imports from < 0.7.10.1 (and any
+            # hand-edited primer entry) can carry `tm=None`. Render as
+            # `—` rather than crashing the table on `f"{None:.1f}"`.
+            tm_raw = p.get("tm")
+            tm_cell = (
+                f"{float(tm_raw):.1f}°C"
+                if isinstance(tm_raw, (int, float))
+                else "—"
+            )
             t.add_row(
                 Text(mark + p.get("name", "?"), style="bold"),
                 Text(seq[:30], style="dim color(252)"),
                 f"{len(seq)} nt",
-                f"{p.get('tm', 0):.1f}°C",
+                tm_cell,
                 p.get("primer_type", "?"),
                 p.get("source", ""),
                 p.get("date", ""),
@@ -45943,6 +46296,45 @@ SpeciesPickerModal { align: center middle; }
         # stale-load token so the worker discards its result if the
         # user loads something else before the scan finishes.
         self._dispatch_restr_scan(seq_str)
+
+        # `.dna` import: flush stashed primer entries into the primer
+        # library so the user's primers.json mirrors what they saw in
+        # the source editor. Stamped by `_augment_dna_record_from_packets`
+        # on the SeqRecord as a transient `_dna_primer_entries` attribute.
+        # Dedupe against existing entries by sequence (case-insensitive)
+        # so re-loading the same .dna file doesn't pile up duplicates.
+        extra_primers = getattr(record, "_dna_primer_entries", None)
+        if isinstance(extra_primers, list) and extra_primers:
+            try:
+                existing = _load_primers()
+                existing_seqs = {
+                    (e.get("sequence") or "").upper() for e in existing
+                }
+                added: list[dict] = []
+                for pe in extra_primers:
+                    pseq = (pe.get("sequence") or "").upper()
+                    if not pseq or pseq in existing_seqs:
+                        continue
+                    existing.insert(0, pe)
+                    existing_seqs.add(pseq)
+                    added.append(pe)
+                if added:
+                    _save_primers(existing)
+                    self.notify(
+                        f"Added {len(added)} primer"
+                        f"{'s' if len(added) != 1 else ''} from .dna "
+                        f"import to primer library.",
+                        severity="information",
+                        timeout=6,
+                    )
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Primer library", exc)
+            # Clear the transient so a re-`_apply_record` (e.g. after
+            # undo) doesn't try to re-flush.
+            try:
+                delattr(record, "_dna_primer_entries")
+            except AttributeError:
+                pass
 
         # Heads-up for non-fatal import oddities that the user should know
         # about: skipped features (UnknownPosition), compound locations

@@ -717,3 +717,194 @@ class TestWrapRegionUI:
             assert screen.query_one("#pd-end", Input).value == "200"
             # No crash — in buggy version feat_len=-2700 caused
             # detection product range to go negative.
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Primer library — `.dna` imports show up + scroll-through behaviour.
+# Regression guards for 2026-05-10 user report: "make sure primers
+# added from snapgene collection import shows up in the primer library
+# section of the Primers tab, and that the primer library is scrollable"
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestPrimerLibraryShowsImported:
+    """Primers landed in `primers.json` by `.dna` import (or any other
+    code path) must show up in the PrimerDesignScreen's library table."""
+
+    async def test_imported_primer_appears_in_library_table(
+            self, isolated_library
+    ):
+        from textual.widgets import DataTable
+        # Pre-populate primers.json with an "imported" entry the same
+        # shape `_augment_dna_record_from_packets` produces.
+        sc._save_primers([{
+            "name":        "M13 fwd",
+            "sequence":    "GTAAAACGACGGCCAGT",
+            "tm":          54.7,
+            "primer_type": "imported",
+            "source":      ".dna import",
+            "pos_start":   0,
+            "pos_end":     17,
+            "strand":      1,
+            "date":        "2026-05-10",
+            "status":      "Imported",
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            screen = sc.PrimerDesignScreen("ACGT" * 200, [], "test")
+            app.push_screen(screen)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            t = screen.query_one("#pd-lib-table", DataTable)
+            assert t.row_count == 1, (
+                f"Expected 1 row from the imported primer, got {t.row_count}"
+            )
+
+    async def test_table_renders_with_tm_none_legacy_entry(
+            self, isolated_library
+    ):
+        """Hand-edited entries (or imports from < 0.7.10.1 before the
+        Tm calculation landed) can have `tm=None`. The table must
+        render without crashing — defensive coding pinned by this test."""
+        from textual.widgets import DataTable
+        sc._save_primers([{
+            "name":        "legacy",
+            "sequence":    "ACGTACGT",
+            "tm":          None,    # <-- the regression target
+            "primer_type": "imported",
+            "source":      ".dna import",
+            "status":      "Imported",
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            screen = sc.PrimerDesignScreen("ACGT" * 200, [], "test")
+            app.push_screen(screen)
+            await pilot.pause()
+            t = screen.query_one("#pd-lib-table", DataTable)
+            assert t.row_count == 1
+
+
+class TestPrimerLibraryScrollable:
+    """A library with more primers than fit in the viewport must
+    remain navigable — DataTable supports keyboard + mouse scroll
+    natively, but the regression target is making sure no CSS or
+    container constraint clips off-screen rows."""
+
+    async def test_all_rows_in_table_when_library_exceeds_viewport(
+            self, isolated_library
+    ):
+        from textual.widgets import DataTable
+        # 60 entries — far more than fits in a 42-row terminal once
+        # all the wizard sections + results section are stacked above.
+        # Each primer needs a unique sequence so the dedupe-on-save in
+        # `_save_primers` doesn't collapse them. Encode the index into
+        # the bases so 60 unique sequences are generated cheaply.
+        def _unique_seq(i: int) -> str:
+            # 18-mer with a deterministic prefix per index — gives 60
+            # distinct sequences while keeping length realistic.
+            return f"AC{i:04d}".ljust(18, "T")
+        entries = [{
+            "name":        f"primer_{i:02d}",
+            "sequence":    _unique_seq(i),
+            "tm":          float(58 + (i % 5)),
+            "primer_type": "imported",
+            "source":      ".dna import",
+            "pos_start":   i * 10,
+            "pos_end":     i * 10 + 20,
+            "strand":      1,
+            "date":        "2026-05-10",
+            "status":      "Imported",
+        } for i in range(60)]
+        sc._save_primers(entries)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            screen = sc.PrimerDesignScreen("ACGT" * 200, [], "test")
+            app.push_screen(screen)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            t = screen.query_one("#pd-lib-table", DataTable)
+            # Every entry must be present in the data model — if rows
+            # were truncated, the user couldn't reach them by any
+            # navigation. DataTable's internal scrolling handles
+            # viewport mapping at paint time.
+            assert t.row_count == 60
+
+    async def test_save_dedupes_legacy_duplicates(self, isolated_library):
+        """Regression for 2026-05-10: pre-fix, primers.json could
+        accumulate duplicates by sequence — from manual JSON edits,
+        from imports before the dedupe paths landed, or from any path
+        that bypassed the in-memory dedupe. The save path now collapses
+        duplicates by sequence (case-insensitive) so any write cleans
+        up the file. First-by-position wins."""
+        sc._save_primers([
+            {"name": "M13fwd_v1", "sequence": "GTAAAACGACGGCCAGT",
+             "tm": 54.7, "status": "Imported"},
+            {"name": "M13fwd_v2", "sequence": "GTAAAACGACGGCCAGT",
+             "tm": 54.7, "status": "Imported"},
+            {"name": "M13fwd_lower", "sequence": "gtaaaacgacggccagt",
+             "tm": 54.7, "status": "Imported"},
+            {"name": "Other", "sequence": "TTTTTTTTTT",
+             "tm": 50.0, "status": "Designed"},
+        ])
+        primers = sc._load_primers()
+        # 4 → 2: M13fwd_v1 wins (first by position), the lowercase
+        # variant and v2 are dropped. Other stays (unique sequence).
+        names = [p["name"] for p in primers]
+        assert names == ["M13fwd_v1", "Other"], (
+            f"Expected dedupe to [M13fwd_v1, Other], got {names}"
+        )
+
+    async def test_dedupe_preserves_entries_with_missing_sequence(
+            self, isolated_library
+    ):
+        """Defensive: an entry without a usable `sequence` field must
+        survive the dedupe. Losing it silently would be worse than
+        leaving the user with a one-off oddity to investigate."""
+        sc._save_primers([
+            {"name": "no_seq", "tm": 60.0},   # missing sequence
+            {"name": "empty_seq", "sequence": ""},
+            {"name": "ok", "sequence": "ACGT" * 5},
+        ])
+        primers = sc._load_primers()
+        # All three preserved — only sequence-shared dupes collapse.
+        assert len(primers) == 3
+
+    async def test_cursor_moves_past_initial_viewport(
+            self, isolated_library
+    ):
+        """Move the cursor down past the visible rows. The cursor
+        should reach the last row without erroring — Textual's
+        DataTable auto-scrolls its viewport to follow the cursor."""
+        from textual.widgets import DataTable
+        # Same uniqueness-per-index trick as the test above so the
+        # dedupe-on-save in `_save_primers` doesn't collapse the 50
+        # entries down to one.
+        def _unique_seq(i: int) -> str:
+            return f"GT{i:04d}".ljust(18, "A")
+        entries = [{
+            "name":        f"primer_{i:02d}",
+            "sequence":    _unique_seq(i),
+            "tm":          60.0,
+            "primer_type": "imported",
+            "source":      ".dna import",
+            "status":      "Imported",
+        } for i in range(50)]
+        sc._save_primers(entries)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            screen = sc.PrimerDesignScreen("ACGT" * 200, [], "test")
+            app.push_screen(screen)
+            await pilot.pause()
+            t = screen.query_one("#pd-lib-table", DataTable)
+            assert t.row_count == 50
+            # Move cursor to the last row programmatically — proves the
+            # DataTable accepts navigation past the viewport. If the
+            # container clipped the table, this would either error or
+            # silently fail to scroll.
+            t.move_cursor(row=49)
+            await pilot.pause()
+            assert t.cursor_row == 49

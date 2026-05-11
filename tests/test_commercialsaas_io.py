@@ -1372,3 +1372,468 @@ class TestRealCommercialSaaSFiles:
         after  = [(t, p) for t, _l, p in sc._iter_commercialsaas_packets(out)
                   if t != 0x07]
         assert before == after
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# `.dna` import augmentation (regression guard for 2026-05-10 user report).
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# `_augment_dna_record_from_packets` recovers info BioPython's snapgene
+# parser drops:
+#   1. per-feature colours from the 0x0A features packet — without
+#      this, every imported .dna feature gets a deterministic-but-
+#      unrelated colour from `_FEATURE_PALETTE` rotation.
+#   2. primer_seq stamps on every `primer_bind` feature — without
+#      this, primers visualise as plain bars instead of through the
+#      seq-panel primer machinery (flap, weak-primer arrow, tooltip).
+#   3. primer entries for `primers.json` — both standalone 0x05
+#      `<Primer>` entries AND primer_bind features get added to the
+#      persistent primer library so the user's primer DB mirrors what
+#      they had in the source editor.
+
+_FFE_FIXTURE = Path(__file__).resolve().parent / "FFE 1 ENTRY UPD.dna"
+
+
+def _fixture_available() -> bool:
+    return _FFE_FIXTURE.exists()
+
+
+@pytest.mark.skipif(not _fixture_available(), reason="FFE fixture not present")
+class TestDnaImportAugmentation:
+    """End-to-end via `load_genbank` against the real FFE_1 fixture.
+    Verifies the augmentation actually fires on the snapgene parse
+    path and stamps the qualifiers / primer entries we expect."""
+
+    def test_per_feature_colors_recovered(self):
+        rec = sc.load_genbank(str(_FFE_FIXTURE))
+        non_source = [f for f in rec.features if f.type != "source"]
+        # Every non-source feature in the FFE fixture has a Segment
+        # colour in the 0x0A XML, so every one should now have the
+        # qualifier stamped.
+        for f in non_source:
+            assert "ApEinfo_revcolor" in f.qualifiers, (
+                f"feature {f.qualifiers.get('label', ['?'])[0]} "
+                f"({f.type}) missing colour qualifier"
+            )
+            assert "ApEinfo_fwdcolor" in f.qualifiers
+            c = f.qualifiers["ApEinfo_revcolor"][0]
+            # Hex CSS colour shape — 3 or 6 nibbles after #.
+            assert c.startswith("#")
+            assert len(c) in (4, 7)
+
+    def test_primer_bind_features_carry_primer_seq(self):
+        rec = sc.load_genbank(str(_FFE_FIXTURE))
+        primers = [f for f in rec.features if f.type == "primer_bind"]
+        assert len(primers) >= 1
+        for p in primers:
+            assert "primer_seq" in p.qualifiers, (
+                f"primer_bind {p.qualifiers.get('label', ['?'])[0]} "
+                f"missing primer_seq stamp"
+            )
+            ps = p.qualifiers["primer_seq"][0]
+            # Sanity: pure ACGT, length matches the bound region.
+            assert set(ps) <= set("ACGTN")
+            start = int(p.location.start)
+            end   = int(p.location.end)
+            assert len(ps) == end - start
+
+    def test_reverse_strand_primer_gets_rc_of_bound_region(self):
+        """For a `(-)`-strand primer, the stamped `primer_seq` should
+        read 5'→3' on the bottom strand — i.e., the RC of the top
+        strand bases at the bound region."""
+        rec = sc.load_genbank(str(_FFE_FIXTURE))
+        seq_str = str(rec.seq).upper()
+        for p in rec.features:
+            if p.type != "primer_bind":
+                continue
+            strand = p.location.strand
+            if strand != -1:
+                continue
+            start = int(p.location.start)
+            end   = int(p.location.end)
+            ps = p.qualifiers["primer_seq"][0]
+            assert ps == sc._rc(seq_str[start:end]), (
+                f"reverse primer at {start}..{end} primer_seq doesn't "
+                f"match RC of bound region"
+            )
+
+    def test_primer_db_entries_stashed_on_record(self):
+        """The augment helper stashes a list of primer DB dicts on
+        `_dna_primer_entries`. `_apply_record` (App-level) is what
+        actually flushes them to `primers.json`; here we just verify
+        the stash."""
+        rec = sc.load_genbank(str(_FFE_FIXTURE))
+        entries = getattr(rec, "_dna_primer_entries", None)
+        assert isinstance(entries, list)
+        assert len(entries) >= 1
+        for e in entries:
+            assert e["primer_type"] == "imported"
+            assert e["source"] == ".dna import"
+            assert e["status"] == "Imported"
+            assert e["sequence"]
+            assert e["name"]
+
+    def test_palette_color_overridden_by_qualifier(self):
+        """Regression: pre-fix, `PlasmidMap._parse` unconditionally
+        assigned a palette colour, throwing away the user's colours.
+        After the fix, the qualifier value wins."""
+        rec = sc.load_genbank(str(_FFE_FIXTURE))
+        # Pick a feature whose colour we KNOW from inspecting the
+        # 0x0A packet: M13 fwd is purple (#a020f0).
+        m13 = next(
+            (f for f in rec.features
+             if f.qualifiers.get("label", [""])[0] == "M13 fwd"),
+            None,
+        )
+        assert m13 is not None
+        assert m13.qualifiers["ApEinfo_revcolor"][0].lower() == "#a020f0"
+
+    def test_pre_stamped_primer_seq_still_appends_db_entry(self):
+        """Regression for 2026-05-10: pre-fix, `_augment_dna_record_from_packets`
+        early-continued when a `primer_bind` feature already carried a
+        `primer_seq` qualifier. That `continue` skipped both the
+        sequence-derivation AND the primer-DB entry append, so any
+        ``.dna`` file round-tripped through splicecraft (or exported
+        from ApE / a tool that stamps `primer_seq`) lost its primers
+        from the imported DB.
+
+        AB303066.dna is the round-trip case in our fixture set: 2
+        `primer_bind` features, both already carrying `primer_seq` from
+        the splicecraft writer. Without the fix, `_dna_primer_entries`
+        would be empty; with the fix, both primers land in the queue."""
+        ab_fixture = Path(__file__).resolve().parent.parent / "AB303066.dna"
+        if not ab_fixture.exists():
+            pytest.skip("AB303066.dna fixture not present")
+        rec = sc.load_genbank(str(ab_fixture))
+        n_pb = len([f for f in rec.features if f.type == "primer_bind"])
+        entries = getattr(rec, "_dna_primer_entries", [])
+        assert n_pb >= 1, "AB303066 should have at least one primer_bind"
+        assert len(entries) == n_pb, (
+            f"Expected {n_pb} primer DB entries (one per primer_bind), "
+            f"got {len(entries)} — the pre-stamped-primer_seq case "
+            f"used to skip the append"
+        )
+
+    def test_bulk_import_folder_flushes_primers_to_db(
+            self, tmp_path, monkeypatch,
+    ):
+        """Regression for 2026-05-10: pre-fix, `_bulk_import_folder`
+        called `load_genbank` on every .dna in the folder (which DID
+        run the augment helper and stash `_dna_primer_entries` on each
+        SeqRecord), then converted each record to a library entry —
+        but the rec was discarded after that and the primer entries
+        with it. Bulk-imported primers never reached `primers.json`,
+        and the user didn't see them in the Primer Library.
+
+        After the fix, `_bulk_import_folder` itself accumulates the
+        primer entries across the batch and writes them to the primer
+        DB at the end (dedupe by sequence)."""
+        import shutil
+        # Build a folder containing both an FFE-style .dna (primer_bind
+        # WITHOUT primer_seq qualifier) and the AB303066 case
+        # (primer_bind WITH primer_seq) so we cover both code paths
+        # the augment helper takes.
+        src_folder = tmp_path / "src"
+        src_folder.mkdir()
+        ffe = Path(__file__).resolve().parent / "FFE 1 ENTRY UPD.dna"
+        ab  = Path(__file__).resolve().parent.parent / "AB303066.dna"
+        if not (ffe.exists() and ab.exists()):
+            pytest.skip(".dna fixtures not present")
+        shutil.copy(ffe, src_folder / ffe.name)
+        shutil.copy(ab,  src_folder / ab.name)
+        # `_protect_user_data` (autouse) already redirected
+        # `_PRIMERS_FILE`. Start from an empty primer library so the
+        # assertions check the bulk-import path's contribution alone.
+        sc._save_primers([])
+        entries, failures = sc._bulk_import_folder(src_folder)
+        assert failures == []
+        assert len(entries) == 2
+        primers = sc._load_primers()
+        # FFE_1 contributes M13 fwd + M13 rev. AB303066 contributes
+        # KanR Promoter-DET-F + KanR Promoter-DET-R. Total 4 unique
+        # sequences, none colliding → all 4 land in primers.json.
+        seqs = {p["sequence"] for p in primers}
+        assert "GTAAAACGACGGCCAGT" in seqs   # M13 fwd
+        assert "CAGGAAACAGCTATGAC" in seqs   # M13 rev
+        assert "CGTTGTGTCTCAAAATCTCTGATGT" in seqs  # KanR-F (pre-stamped)
+        assert "ACACCCCTTGTATTACTGTTTATGT" in seqs  # KanR-R (pre-stamped)
+        # Numeric Tm on all four — no `tm=None` legacy crashes.
+        for p in primers:
+            assert isinstance(p["tm"], (int, float))
+
+    def test_bulk_import_dedupes_primers_across_files(
+            self, tmp_path, monkeypatch,
+    ):
+        """Multiple .dna files in the same folder often share primers
+        (e.g. M13 fwd/rev appearing in every pUC-derived plasmid).
+        The bulk-import flush must dedupe by sequence so the user
+        doesn't end up with 5× M13 fwd entries from a 5-plasmid folder."""
+        import shutil
+        src_folder = tmp_path / "src"
+        src_folder.mkdir()
+        # Copy all five FFE fixtures — each has M13 fwd + M13 rev.
+        test_dir = Path(__file__).resolve().parent
+        names = [
+            "FFE 1 ENTRY UPD.dna",
+            "FFE 2 ENTRY A1.dna",
+            "FFE 3 ENTRY A2.dna",
+            "FFE 4 ENTRY O1.dna",
+            "FFE 5 ENTRY O2.dna",
+        ]
+        present = [n for n in names if (test_dir / n).exists()]
+        if len(present) < 2:
+            pytest.skip("Need ≥2 FFE fixtures for dedupe test")
+        for n in present:
+            shutil.copy(test_dir / n, src_folder / n)
+        sc._save_primers([])
+        entries, failures = sc._bulk_import_folder(src_folder)
+        assert failures == []
+        primers = sc._load_primers()
+        # M13 fwd + M13 rev are the only two unique sequences across
+        # all FFE fixtures. The dedupe must collapse them to exactly 2.
+        seqs = {p["sequence"] for p in primers}
+        assert seqs == {"GTAAAACGACGGCCAGT", "CAGGAAACAGCTATGAC"}, (
+            f"Expected dedupe to 2 unique primers, got {len(seqs)}: {seqs}"
+        )
+
+    def test_pre_stamped_primer_seq_preserved_verbatim(self):
+        """When a primer_bind has a pre-existing `primer_seq` qualifier
+        (e.g. with a 5' flap, longer than the bound region), the augment
+        helper must use THAT sequence verbatim in the DB entry — NOT
+        re-derive from the bound region and drop the flap."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.Seq import Seq
+        seq = "ACGTACGT" * 10  # 80 bp
+        # A primer with a 5' flap: bound region is seq[0:20] (20 bp);
+        # the full primer (with flap) is 5 bp longer.
+        bound = seq[0:20]
+        full_primer_with_flap = "GGGGG" + bound  # 25 bp
+        prim = SeqFeature(
+            location=FeatureLocation(0, 20, strand=1),
+            type="primer_bind",
+            qualifiers={
+                "label": ["test_with_flap"],
+                "primer_seq": [full_primer_with_flap],
+            },
+        )
+        rec = SeqRecord(Seq(seq), id="syn", name="syn", features=[prim])
+        # Empty .dna byte stream (no 0x0A / 0x05) — we're testing the
+        # primer_bind branch only.
+        from tests.test_commercialsaas_io import _make_minimal_dna
+        data = _make_minimal_dna()
+        entries = sc._augment_dna_record_from_packets(rec, data)
+        assert len(entries) == 1
+        assert entries[0]["sequence"] == full_primer_with_flap, (
+            "should preserve the flap-bearing primer_seq verbatim"
+        )
+
+
+class TestAugmentHelperUnit:
+    """Direct unit tests on `_augment_dna_record_from_packets` using
+    a synthesised .dna byte stream — runs even without fixture files."""
+
+    def _build_dna_with_one_primer(self):
+        """Synthesize a minimal .dna with: cookie + DNA seq + 0x0A
+        features (one CDS, one primer_bind) + 0x05 with one standalone
+        Primer entry."""
+        seq = "ATGAAACGCGGGAAATAACCC" * 5  # 105 bp
+        # 0x00 DNA packet: 1-byte topology + seq bytes (lowercase is
+        # the editor's convention; the BioPython parser tolerates both).
+        dna_payload = b"\x01" + seq.encode("ascii")
+        # 0x0A features XML — two segments with distinct colours.
+        features_xml = (
+            '<?xml version="1.0"?>'
+            '<Features nextValidID="2">'
+            '<Feature recentID="0" name="test_cds" type="CDS" '
+            'directionality="1" allowSegmentOverlaps="0" '
+            'consecutiveTranslationNumbering="1">'
+            '<Segment range="1-21" color="#33ccff" type="standard"/>'
+            '</Feature>'
+            '<Feature recentID="1" name="test_primer" type="primer_bind" '
+            'directionality="1" allowSegmentOverlaps="0" '
+            'consecutiveTranslationNumbering="1">'
+            '<Segment range="22-42" color="#ff9966" type="standard"/>'
+            '</Feature>'
+            '</Features>'
+        ).encode("utf-8")
+        # 0x05 primers XML with one standalone <Primer>.
+        primers_xml = (
+            '<?xml version="1.0"?>'
+            '<Primers nextValidID="1">'
+            '<HybridizationParams minContinuousMatchLen="10" '
+            'allowMismatch="1" minMeltingTemperature="40" '
+            'showAdditionalFivePrimeMatches="1" '
+            'minimumFivePrimeAnnealing="15"/>'
+            '<Primer name="standalone_X" sequence="GATTACAGATTACA"/>'
+            '</Primers>'
+        ).encode("utf-8")
+        return _make_minimal_dna(
+            (0x00, dna_payload),
+            (0x0A, features_xml),
+            (0x05, primers_xml),
+        )
+
+    def _make_synthetic_rec(self, seq_str: str):
+        """Build a minimal SeqRecord that mirrors what BioPython would
+        produce after parsing our synthetic .dna bytes — one CDS + one
+        primer_bind, both forward strand, no colour qualifiers yet."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.Seq import Seq
+        cds = SeqFeature(
+            location=FeatureLocation(0, 21, strand=1),
+            type="CDS",
+            qualifiers={"label": ["test_cds"]},
+        )
+        prim = SeqFeature(
+            location=FeatureLocation(21, 42, strand=1),
+            type="primer_bind",
+            qualifiers={"label": ["test_primer"]},
+        )
+        return SeqRecord(Seq(seq_str), id="syn", name="syn",
+                         features=[cds, prim])
+
+    def test_color_stamped_from_synthesized_packet(self):
+        data = self._build_dna_with_one_primer()
+        rec = self._make_synthetic_rec("ATGAAACGCGGGAAATAACCC" * 5)
+        extras = sc._augment_dna_record_from_packets(rec, data)
+        # CDS picked up the first <Segment> colour.
+        cds = rec.features[0]
+        assert cds.qualifiers["ApEinfo_revcolor"][0].lower() == "#33ccff"
+        # primer_bind picked up the second.
+        prim = rec.features[1]
+        assert prim.qualifiers["ApEinfo_revcolor"][0].lower() == "#ff9966"
+        # primer_seq stamped from the bound region.
+        assert "primer_seq" in prim.qualifiers
+
+    def test_standalone_primer_entry_returned(self):
+        """A 0x05 `<Primer name="standalone_X" sequence="GATTACA..."/>`
+        must surface as a primer DB entry in the returned list."""
+        data = self._build_dna_with_one_primer()
+        rec = self._make_synthetic_rec("ATGAAACGCGGGAAATAACCC" * 5)
+        extras = sc._augment_dna_record_from_packets(rec, data)
+        names = {e["name"] for e in extras}
+        seqs  = {e["sequence"] for e in extras}
+        assert "standalone_X" in names
+        assert "GATTACAGATTACA" in seqs
+
+    def test_dedupe_by_sequence(self):
+        """If the same sequence appears in both 0x05 and as a
+        primer_bind, the merge step must dedupe."""
+        # Forge a 0x05 entry whose sequence happens to match the
+        # primer_bind's bound region.
+        seq = "ATGAAACGCGGGAAATAACCC" * 5
+        # primer_bind is at [21, 42); the bound bases on the top
+        # strand are seq[21:42].
+        bound = seq[21:42]
+        primers_xml = (
+            '<?xml version="1.0"?>'
+            '<Primers>'
+            f'<Primer name="dup" sequence="{bound}"/>'
+            '</Primers>'
+        ).encode("utf-8")
+        features_xml = (
+            '<?xml version="1.0"?>'
+            '<Features>'
+            '<Feature name="test_primer" type="primer_bind" '
+            'directionality="1">'
+            '<Segment range="22-42" color="#ff9966" type="standard"/>'
+            '</Feature>'
+            '</Features>'
+        ).encode("utf-8")
+        data = _make_minimal_dna(
+            (0x00, b"\x01" + seq.encode("ascii")),
+            (0x0A, features_xml),
+            (0x05, primers_xml),
+        )
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.Seq import Seq
+        prim = SeqFeature(
+            location=FeatureLocation(21, 42, strand=1),
+            type="primer_bind",
+            qualifiers={"label": ["test_primer"]},
+        )
+        rec = SeqRecord(Seq(seq), id="syn", name="syn", features=[prim])
+        extras = sc._augment_dna_record_from_packets(rec, data)
+        # Same sequence → one entry only. Standalone (`name="dup"`)
+        # comes first in the merge order so it wins the name.
+        assert len(extras) == 1
+        assert extras[0]["name"] == "dup"
+
+    def test_malformed_color_rejected(self):
+        """Defensive: a malformed colour string (no #, wrong length)
+        must NOT land in the qualifier — we don't want arbitrary
+        strings leaking into our colour-rendering paths."""
+        seq = "ATGCCC" * 10
+        bad_features_xml = (
+            '<?xml version="1.0"?>'
+            '<Features>'
+            '<Feature name="bad" type="misc_feature">'
+            '<Segment range="1-6" color="javascript:alert(1)" '
+            'type="standard"/>'
+            '</Feature>'
+            '</Features>'
+        ).encode("utf-8")
+        data = _make_minimal_dna(
+            (0x00, b"\x01" + seq.encode("ascii")),
+            (0x0A, bad_features_xml),
+        )
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.Seq import Seq
+        f = SeqFeature(
+            location=FeatureLocation(0, 6, strand=1),
+            type="misc_feature",
+            qualifiers={"label": ["bad"]},
+        )
+        rec = SeqRecord(Seq(seq), id="syn", name="syn", features=[f])
+        sc._augment_dna_record_from_packets(rec, data)
+        # The malformed colour should NOT be in the qualifier.
+        assert "ApEinfo_revcolor" not in rec.features[0].qualifiers
+
+
+class TestColorQualifierReadInPlasmidMap:
+    """`PlasmidMap._parse` must read the ApEinfo colour qualifiers
+    before falling back to `_FEATURE_PALETTE`. Applies to all imports
+    (not just .dna) — ApE / Geneious .gb files use the same convention."""
+
+    def test_qualifier_overrides_palette(self):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.Seq import Seq
+        f1 = SeqFeature(
+            location=FeatureLocation(0, 100, strand=1),
+            type="CDS",
+            qualifiers={
+                "label": ["test"],
+                "ApEinfo_revcolor": ["#abcdef"],
+                "ApEinfo_fwdcolor": ["#abcdef"],
+            },
+        )
+        rec = SeqRecord(Seq("A" * 500), id="syn", name="syn",
+                        features=[f1])
+        pm = sc.PlasmidMap.__new__(sc.PlasmidMap)
+        feats = pm._parse(rec)
+        assert len(feats) == 1
+        assert feats[0]["color"].lower() == "#abcdef"
+
+    def test_palette_fallback_when_no_qualifier(self):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from Bio.Seq import Seq
+        f1 = SeqFeature(
+            location=FeatureLocation(0, 100, strand=1),
+            type="CDS",
+            qualifiers={"label": ["test"]},
+        )
+        rec = SeqRecord(Seq("A" * 500), id="syn", name="syn",
+                        features=[f1])
+        pm = sc.PlasmidMap.__new__(sc.PlasmidMap)
+        feats = pm._parse(rec)
+        assert len(feats) == 1
+        # Must come from the palette — non-empty, not the dummy
+        # malformed string.
+        assert feats[0]["color"]
+        assert feats[0]["color"] in sc._FEATURE_PALETTE
