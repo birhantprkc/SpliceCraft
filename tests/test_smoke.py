@@ -2285,9 +2285,13 @@ class TestTypeIISCutRegionHighlight:
             s for s in sites
             if s.get("type") == "resite" and s.get("label") == "MmeI"
         )
-        # MmeI(20/18): site at 0..6, top cut at 20, bot cut at 18.
-        assert mmei["top_cut_bp"]    == 20
-        assert mmei["bottom_cut_bp"] == 18
+        # MmeI = TCCRAC(20/18): recognition 6 bp at 0..6, top cut at
+        # recog_end + 20 = 26, bot cut at recog_end + 18 = 24.
+        # (Pre-2026-05-11 the catalog stored the raw downstream offsets
+        # 20/18 instead of `size + offset` 26/24 — corrected in the
+        # catalog audit; this test was updated alongside.)
+        assert mmei["top_cut_bp"]    == 26
+        assert mmei["bottom_cut_bp"] == 24
         assert mmei["top_cut_bp"] > mmei["bottom_cut_bp"], (
             "MmeI is a 3' overhang enzyme — top_cut should exceed bot_cut"
         )

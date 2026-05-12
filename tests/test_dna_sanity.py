@@ -234,6 +234,164 @@ class TestNEBEnzymesCatalog:
         )
 
 
+class TestNEBEnzymesAgreeWithBioPython:
+    """Cross-validate `_NEB_ENZYMES` tuples against `Bio.Restriction` for every
+    enzyme name shared between the two catalogs. Regression guard added
+    2026-05-11 after an audit caught ~25 wrong tuples (wrong overhang length
+    on BsmI/BstEII/SfiI/Eco53kI/BmtI/BstAPI/BseYI/BsrI/BtsCI/EarI/BssSI; wrong
+    cut location on Type IIS far-cutters HphI/MboII/MmeI/NmeAIII/BceAI/BmrI/
+    BsbI/BseMII/BseRI). Convention is `(fst5, size + fst3)` where `fst5` /
+    `fst3` are BioPython's cut offsets — fst5 = top-strand cut from 5' of
+    recognition, fst3 = bottom-strand cut from 3' end of recognition. This
+    test would have caught every entry the audit found.
+
+    HF / v2 variants are validated separately (they share a recognition and
+    cut pattern with their parent, but BioPython doesn't always carry them)."""
+
+    @pytest.fixture(scope="class")
+    def biopy(self):
+        import Bio.Restriction as R
+        return R
+
+    def test_every_overlapping_enzyme_matches_biopython(self, biopy):
+        """For every name in BOTH catalogs, the SpliceCraft tuple's top and
+        bottom cut positions must equal `(fst5, size + fst3)` from BioPython."""
+        mismatches = []
+        for name, (_site, sc_top, sc_bot) in sc._NEB_ENZYMES.items():
+            if not hasattr(biopy, name):
+                continue
+            enz = getattr(biopy, name)
+            expected = (enz.fst5, enz.size + enz.fst3)
+            if (sc_top, sc_bot) != expected:
+                mismatches.append((name, (sc_top, sc_bot), expected,
+                                   enz.elucidate()))
+        if mismatches:
+            lines = [f"  {n:<12} SC={sc} BioPy={exp}  {elu}"
+                     for n, sc, exp, elu in mismatches]
+            pytest.fail(
+                f"{len(mismatches)} enzymes disagree with BioPython:\n"
+                + "\n".join(lines)
+            )
+
+    def test_every_enzyme_exists_in_rebase(self):
+        """Regression guard for issue #14 (cory-mozza, 2026-05-11):
+        SpliceCraft was listing enzymes that don't exist (BspLU11III) or
+        have no commercial supplier (BsbI). The first crashes any wet-lab
+        attempt; the second silently suggests a digest the user can never
+        order. Every catalog entry must either appear in REBASE under
+        that exact name, or be an HF/v2 variant of a REBASE-listed parent
+        — with at least one supplier."""
+        import Bio.Restriction.Restriction_Dictionary as RD
+        rd = RD.rest_dict
+        hallucinated = []
+        no_supplier  = []
+        for name in sc._NEB_ENZYMES:
+            base = name
+            for suffix in ("-HF", "-v2"):
+                if name.endswith(suffix):
+                    base = name[: -len(suffix)]
+                    break
+            if base not in rd:
+                hallucinated.append(name)
+                continue
+            if not rd[base].get("suppl"):
+                no_supplier.append(name)
+        assert not hallucinated, (
+            f"{len(hallucinated)} hallucinated / non-REBASE enzymes "
+            f"in catalog: {hallucinated}"
+        )
+        assert not no_supplier, (
+            f"{len(no_supplier)} enzymes with no commercial supplier "
+            f"(user can't buy them) in catalog: {no_supplier}"
+        )
+
+    def test_recognition_sites_match_rebase(self):
+        """Catalog recognition sequence must match REBASE for every
+        non-variant enzyme. Caught AccI (was GTYRAC, real is GTMKAC —
+        different IUPAC codes match different sequence sets) and BstXI
+        (was 5 Ns between CCA/TGG, real is 6 Ns) on 2026-05-11."""
+        import Bio.Restriction.Restriction_Dictionary as RD
+        rd = RD.rest_dict
+        mismatches = []
+        for name, (sc_site, _, _) in sc._NEB_ENZYMES.items():
+            if name.endswith("-HF") or name.endswith("-v2"):
+                continue  # commercial variant; recognition equals parent
+            if name not in rd:
+                continue  # caught by `test_every_enzyme_exists_in_rebase`
+            rb_site = rd[name]["site"]
+            if sc_site.upper() != rb_site.upper():
+                mismatches.append((name, sc_site, rb_site))
+        if mismatches:
+            lines = [f"  {n}: SC={s!r} REBASE={r!r}"
+                     for n, s, r in mismatches]
+            pytest.fail(
+                f"{len(mismatches)} recognition sites disagree with REBASE:\n"
+                + "\n".join(lines)
+            )
+
+    def test_hf_and_v2_variants_match_parent(self):
+        """`*-HF` and `*-v2` variants are enzyme-prep improvements (better
+        buffer compatibility, faster cleavage) — they share recognition and
+        cleavage with their parent. Diverging values silently break cloning
+        sims using the variant name."""
+        for name, (site, top, bot) in sc._NEB_ENZYMES.items():
+            for suffix in ("-HF", "-v2"):
+                if not name.endswith(suffix):
+                    continue
+                parent = name[: -len(suffix)]
+                if parent not in sc._NEB_ENZYMES:
+                    continue
+                p_site, p_top, p_bot = sc._NEB_ENZYMES[parent]
+                assert (site, top, bot) == (p_site, p_top, p_bot), (
+                    f"{name} {(site, top, bot)} disagrees with parent "
+                    f"{parent} {(p_site, p_top, p_bot)}"
+                )
+
+    @pytest.mark.parametrize("name,padding", [
+        ("EcoRI",   "AAAAA"),
+        ("BamHI",   "AAAAA"),
+        ("BsaI",    "AAAAAAAAAA"),
+        ("BsmBI",   "AAAAAAAAAA"),
+        ("BbsI",    "AAAAAAAAAA"),
+        ("SapI",    "AAAAAAAAAA"),
+        ("BsmI",    "AAAAAAAAAA"),
+        ("BsrI",    "AAAAAAAAAA"),
+        ("SfiI",    "AAAAAAAAAA"),
+        ("HphI",    "AAAAAAAAAAAAAAAAAA"),
+        ("MmeI",    "AAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        ("BssSI",   "AAAAAAAAAA"),
+        ("Eco53kI", "AAAAAAAAAA"),
+        ("BmtI",    "AAAAAAAAAA"),
+        ("BstEII",  "AAAAAAAAAA"),
+        ("BseYI",   "AAAAAAAAAA"),
+    ])
+    def test_synthetic_template_top_cut_matches_biopython(self, biopy, name, padding):
+        """End-to-end: run `_enzyme_cuts` on a synthetic `pad + site + pad`
+        template and confirm the top-strand cut position equals BioPython's
+        cut for the same enzyme on the same template."""
+        from Bio.Seq import Seq
+        enz = getattr(biopy, name)
+        # Resolve any IUPAC bases in the recognition site to a single
+        # canonical match so BioPython's strict-match search will hit.
+        site = (enz.site.replace("N", "A").replace("R", "A")
+                          .replace("Y", "C").replace("W", "A")
+                          .replace("S", "C").replace("M", "A")
+                          .replace("K", "G").replace("B", "C")
+                          .replace("D", "A").replace("H", "A")
+                          .replace("V", "A"))
+        seq = padding + site + padding
+        bp_cut_1based = enz.search(Seq(seq), linear=True)
+        assert bp_cut_1based, f"BioPython didn't find {name} site in synthetic template"
+        bp_cut_0based = bp_cut_1based[0] - 1
+        sc_hits = sc._enzyme_cuts(seq, [name], circular=False)
+        sc_top_cuts = [h["top"] for h in sc_hits if h.get("top") is not None]
+        assert sc_top_cuts, f"SpliceCraft didn't return a cut for {name}"
+        assert bp_cut_0based in sc_top_cuts, (
+            f"{name}: BioPython top cut at {bp_cut_0based} (0-based) "
+            f"not in SpliceCraft top cuts {sc_top_cuts}"
+        )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Restriction site scanning — sacred invariants #1 and #2
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -661,6 +819,87 @@ class TestResiteLabelWidth:
         assert "MyLongNm" in rendered, rendered
 
 
+class TestResiteHighlightWrap:
+    """Regression guards for the 2026-05-11 wrap-cut highlight fix.
+
+    A Type IIS forward-strand cut whose recognition sits at the end of
+    a circular sequence (raw `p + offset` exceeds `n`) lands at a small
+    bp value post-modulo. The old `_resite_highlight_dict` then dragged
+    `hi_start` down to the wrapped cut, producing a highlight that spanned
+    most of the plasmid the wrong way. The new code wrap-encodes the
+    highlight (`hi_end < hi_start` signals origin-wrap) and the renderer
+    `_render_chunk` tests `i >= reh_s or i < reh_e` in that case.
+    """
+
+    @staticmethod
+    def _highlight(seq, resite):
+        class _MockMap:
+            pass
+        m = _MockMap()
+        m._seq = seq
+        return sc.SequencePanel._resite_highlight_dict(m, resite)
+
+    def test_forward_type_iis_at_origin_wraps(self):
+        """BsaI forward at p=24 on n=30 (cut wraps origin). The highlight
+        must encode the wrap as hi_end < hi_start, NOT drag hi_start back."""
+        resite = {
+            "start": 24, "end": 30, "strand": 1, "color": "red",
+            "label": "BsaI",
+            "top_cut_bp": 1, "bottom_cut_bp": 5, "ext_cut_bp": 1,
+        }
+        hi = self._highlight("X" * 30, resite)
+        assert hi["start"] == 24, (
+            f"hi_start dragged to wrapped cut: got {hi['start']} "
+            "(should stay at recognition start 24)"
+        )
+        # Wrap-encoded: hi_end < hi_start. Furthest-forward wrapped cut is
+        # bot=5, so hi_end = max(wrap_cuts) = 5.
+        assert hi["end"] == 5, f"expected wrap-encoded hi_end=5, got {hi['end']}"
+        assert hi["end"] < hi["start"], "highlight must be wrap-encoded"
+
+    def test_linear_type_iis_in_middle_extends_normally(self):
+        """BsaI forward at p=10 on n=50 (cuts in middle, no wrap). The
+        highlight must extend hi_end past the recognition to enclose
+        the Type IIS cuts as before — wrap detection should NOT fire."""
+        resite = {
+            "start": 10, "end": 16, "strand": 1, "color": "red",
+            "label": "BsaI",
+            "top_cut_bp": 17, "bottom_cut_bp": 21, "ext_cut_bp": 17,
+        }
+        hi = self._highlight("X" * 50, resite)
+        assert hi["start"] == 10
+        assert hi["end"] == 21
+        assert hi["end"] >= hi["start"], "must NOT wrap-encode normal case"
+
+    def test_reverse_type_iis_genuine_upstream_extends_hi_start(self):
+        """Reverse-strand Type IIS (BsaI bound on the bottom strand) cuts
+        upstream of recognition in forward coords. With recognition in the
+        middle of a linear seq, the cut is genuinely upstream (cut <
+        hi_start) — hi_start must extend back, NOT wrap-encode."""
+        resite = {
+            "start": 20, "end": 26, "strand": -1, "color": "red",
+            "label": "BsaI",
+            "top_cut_bp": 15, "bottom_cut_bp": 19, "ext_cut_bp": 15,
+        }
+        hi = self._highlight("X" * 50, resite)
+        assert hi["start"] == 15
+        assert hi["end"] == 26
+        assert hi["end"] >= hi["start"]
+
+    def test_palindromic_cut_inside_recognition_unchanged(self):
+        """EcoRI palindrome cuts inside recognition. Both cuts at bp 5
+        for a site at [4, 10) — inside hi_start/hi_end so neither
+        ext_cuts nor wrap_cuts gets populated. Highlight matches recog."""
+        resite = {
+            "start": 4, "end": 10, "strand": 1, "color": "red",
+            "label": "EcoRI",
+            "top_cut_bp": 5, "bottom_cut_bp": 9,
+        }
+        hi = self._highlight("X" * 30, resite)
+        assert hi["start"] == 4
+        assert hi["end"] == 10
+
+
 class TestRestrictionScanLinearVsCircular:
     """Linear records must NOT scan past their end. Pre-2026-05-08
     every caller of `_scan_restriction_sites` defaulted to
@@ -763,6 +1002,53 @@ class TestTranslateCds:
         aa = sc._translate_cds(seq, 0, 7, strand=1)
         # Exactly 2 amino acids should translate; trailing stop appended.
         assert aa.replace("*", "") == "MK"
+
+    def test_codon_start_2_skips_first_base(self):
+        """Regression guard for 2026-05-11. `/codon_start=2` means the first
+        base of the CDS is the last base of an incomplete leading codon —
+        the real reading frame starts at offset 1. Pre-fix the qualifier
+        was silently ignored, frame-shifting every AA past position 0."""
+        # First base 'X' is the partial leading codon; real CDS is ATGGCATAG → M A *
+        seq = "X" + "ATGGCATAG"
+        aa = sc._translate_cds(seq, 0, len(seq), strand=1, codon_start=2)
+        # First complete codon = ATG (M), then GCA (A), then TAG (*).
+        # Note `?` may appear from the leading partial codon's bases
+        # depending on the slice; check the in-frame portion is right.
+        assert "MA*" in aa, f"expected MA* in {aa!r}"
+
+    def test_codon_start_3_skips_first_two_bases(self):
+        seq = "XX" + "ATGGCATAG"     # /codon_start=3
+        aa = sc._translate_cds(seq, 0, len(seq), strand=1, codon_start=3)
+        assert "MA*" in aa, f"expected MA* in {aa!r}"
+
+    def test_codon_start_matches_biopython(self):
+        """Cross-check against Biopython's feature.extract().translate(cds=False)
+        which DOES honour /codon_start when reading from a SeqRecord. We
+        replicate via Seq.translate on a manually-offset slice."""
+        from Bio.Seq import Seq
+        for cs in (1, 2, 3):
+            seq = "X" * (cs - 1) + "ATGAAATTTGGGCCCTAG"
+            sc_aa = sc._translate_cds(seq, 0, len(seq), strand=1, codon_start=cs)
+            bp_aa = str(Seq(seq[cs - 1:]).translate())
+            assert sc_aa.rstrip("*") == bp_aa.rstrip("*"), (
+                f"codon_start={cs}: SC={sc_aa!r} vs BioPython={bp_aa!r}"
+            )
+
+    def test_codon_start_reverse_strand(self):
+        """Reverse-strand CDS with /codon_start=2: the offset is applied
+        after RC, so the trailing base of the RC'd sequence is the partial
+        leading codon and the in-frame translation starts one base in."""
+        from Bio.Seq import Seq
+        fwd = "ATGAAATAG"    # M K *
+        rc = str(Seq(fwd).reverse_complement())
+        # Reverse-strand CDS spanning the RC'd region + 1 leading 'X' base on
+        # the forward template (which becomes a TRAILING base after RC) —
+        # codon_start=1 sees a frame-shifted CDS, codon_start=2 corrects it.
+        full = rc + "X"
+        # With codon_start=1 the trailing X drops into the frame and breaks
+        # the protein; with codon_start=2 the X is skipped and we get back MK*.
+        cs2 = sc._translate_cds(full, 0, len(full), strand=-1, codon_start=2)
+        assert "MK*" in cs2, f"expected MK* in {cs2!r}"
 
     def test_unknown_codon_becomes_question_mark(self):
         # Inserting 'N' creates a codon not in the table

@@ -196,6 +196,24 @@ _MODAL_CASES = [
                                                total=671, seq_duplicates=0,
                                                name_collisions=156,
                                                final_kept=515)),
+    ("PrimerPlasmidsModal",        lambda: sc.PrimerPlasmidsModal(
+                                               primer_entry={
+                                                   "name": "P-test-F",
+                                                   "sequence": "GATC" * 5,
+                                                   "tm": 60.0,
+                                               },
+                                               usages=[
+                                                   {"collection": "TestColl",
+                                                    "plasmid_id": "test1",
+                                                    "plasmid_name": "pTest1",
+                                                    "start": 100, "end": 120,
+                                                    "strand": 1},
+                                                   {"collection": "TestColl",
+                                                    "plasmid_id": "test2",
+                                                    "plasmid_name": "pTest2",
+                                                    "start": 200, "end": 220,
+                                                    "strand": -1},
+                                               ])),
     ("CollectionNameModal",        lambda: sc.CollectionNameModal(
                                                "New collection", "")),
     ("NewCollectionModal",         lambda: sc.NewCollectionModal()),

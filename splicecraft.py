@@ -2678,6 +2678,15 @@ def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
     # poison the in-memory cache with their staged-but-not-yet-saved
     # mutations — and the next `_load_library` would surface them.
     _library_cache = _typed_clone(entries)
+    # Invalidate the primer-usage cache: every library write potentially
+    # changes the set of plasmids whose `primer_bind` features are
+    # counted by `_index_primer_usage_in_collections`. The cache is
+    # rebuilt lazily on the next PrimerDesignScreen open. Guarded
+    # because the helper is defined later in this file (module import
+    # order).
+    _clear_primer_cache = globals().get("_primer_usage_clear_cache")
+    if _clear_primer_cache is not None:
+        _clear_primer_cache()
     # Keep the active collection's plasmids in sync with the library — every
     # add / remove / rename on the panel feeds through here, so a single
     # mirror call covers all CRUD without changing call sites.
@@ -2727,6 +2736,12 @@ def _save_collections(entries: list[dict]) -> None:
     _clear = globals().get("_blast_clear_cache")
     if _clear is not None:
         _clear()
+    # Same lazy-import guard for the primer-usage cache: every
+    # collections write potentially changes the plasmid set, so the
+    # next PrimerDesignScreen open should re-scan.
+    _clear_primer_cache = globals().get("_primer_usage_clear_cache")
+    if _clear_primer_cache is not None:
+        _clear_primer_cache()
 
 
 # Active collection — which named collection is the panel currently showing.
@@ -3012,15 +3027,15 @@ _NEB_ENZYMES: dict[str, tuple[str, int, int]] = {
     "BsrGI":     ("TGTACA",       1,  5),  # T^GTACA   / ACATG^T     5' overhang
     "BssHII":    ("GCGCGC",       1,  5),  # G^CGCGC   / CGCGC^G     5' overhang
     "BstBI":     ("TTCGAA",       2,  4),  # TT^CGAA   / AAGC^TT     5' overhang
-    "BstEII":    ("GGTNACC",      1,  5),  # G^GTNACC  / CCANT^GG    5' overhang
-    "BstXI":     ("CCANNNNNTGG",  8,  4),  # CCANN4^TGG/ CCA^N5TGG   3' overhang
+    "BstEII":    ("GGTNACC",      1,  6),  # G^GTNACC / CCANTG^G  5-nt 5' overhang GTNAC
+    "BstXI":     ("CCANNNNNNTGG", 8,  4),  # CCANNNNN^NTGG  4-nt 3' overhang (12-bp recog)
     "BstYI":     ("RGATCY",       1,  5),  # R^GATCY   / YCTAG^R     5' overhang
     "CpoI":      ("CGGWCCG",      2,  5),  # CG^GWCCG  / CGCC^WGG    5' overhang
     "DraI":      ("TTTAAA",       3,  3),  # TTT^AAA   / TTT^AAA     blunt
     "DraIII":    ("CACNNNGTG",    6,  3),  # CACNNN^GTG/ GTG^NNNGTG  3' overhang
     "EagI":      ("CGGCCG",       1,  5),  # C^GGCCG   / GCCGG^C     5' overhang (NotI subset)
     "Eco47III":  ("AGCGCT",       3,  3),  # AGC^GCT                 blunt
-    "Eco53kI":   ("GAGCTC",       5,  1),  # GAGCT^C                 3' overhang (SacI isoschizomer)
+    "Eco53kI":   ("GAGCTC",       3,  3),  # GAG^CTC                 blunt (SacI neoschizomer)
     "EcoNI":     ("CCTNNNNNAGG",  5,  6),  # CCTNN^NNNAGG            5' overhang
     "FseI":      ("GGCCGGCC",     6,  2),  # GGCCGG^CC / CC^GGCCGG   3' overhang (8-cutter)
     "FspI":      ("TGCGCA",       3,  3),  # TGC^GCA                 blunt
@@ -3050,7 +3065,7 @@ _NEB_ENZYMES: dict[str, tuple[str, int, int]] = {
     "RsrII":     ("CGGWCCG",      2,  5),  # CG^GWCCG                CpoI isoschizomer
     "SbfI":      ("CCTGCAGG",     6,  2),  # CCTGCA^GG / CC^TGCAGG   PstI-compatible (8-cutter)
     "ScaI":      ("AGTACT",       3,  3),  # AGT^ACT                 blunt
-    "SfiI":      ("GGCCNNNNNGGCC",8,  4),  # GGCCN4^NGGCC            3' overhang (13-bp)
+    "SfiI":      ("GGCCNNNNNGGCC",8,  5),  # GGCCN^NNN^NGGCC         3-nt 3' overhang (13-bp)
     "SgrAI":     ("CRCCGGYG",     2,  6),  # CR^CCGGYG / GCCGGR^C    5' overhang
     "SmaI":      ("CCCGGG",       3,  3),  # CCC^GGG                 blunt
     "SnaBI":     ("TACGTA",       3,  3),  # TAC^GTA                 blunt
@@ -3066,7 +3081,7 @@ _NEB_ENZYMES: dict[str, tuple[str, int, int]] = {
     "AsiSI":     ("GCGATCGC",     5,  3),  # GCGAT^CGC / GCG^ATCGC   3' overhang
 
     # ── Degenerate / IUPAC recognition sequences ───────────────────────────────
-    "AccI":      ("GTYRAC",       2,  4),  # GT^YRAC                 3' overhang
+    "AccI":      ("GTMKAC",       2,  4),  # GT^MKAC / CAKM^TG       2-nt 5' overhang
     "AclI":      ("AACGTT",       2,  4),  # AA^CGTT                 3' overhang
     "AfeI":      ("AGCGCT",       3,  3),  # AGC^GCT                 blunt (Eco47III isoschizomer)
     "AflII":     ("CTTAAG",       1,  5),  # C^TTAAG                 MfeI-compatible ends
@@ -3085,14 +3100,14 @@ _NEB_ENZYMES: dict[str, tuple[str, int, int]] = {
     "BsaBI":     ("GATNNNNATC",   5,  5),  # GATN4^ATC               blunt
     "BsaHI":     ("GRCGYC",       2,  4),  # GR^CGYC                 3' overhang
     "BsaWI":     ("WCCGGW",       1,  5),  # W^CCGGW                 5' overhang
-    "BseYI":     ("CCCAGC",       5,  1),  # CCCAG^C   / C^CCAGC     3' overhang
+    "BseYI":     ("CCCAGC",       1,  5),  # C^CCAGC   / GCTGG^G     5' overhang
     "BsiEI":     ("CGRYCG",       4,  2),  # CGRY^CG                 3' overhang
     "BsiHKAI":   ("GWGCWC",       5,  1),  # GWGCW^C                 3' overhang
     "BsrFI":     ("RCCGGY",       1,  5),  # R^CCGGY                 5' overhang
     "Bsp1286I":  ("GDGCHC",       5,  1),  # GDGCH^C                 3' overhang
     "BspHI":     ("TCATGA",       1,  5),  # T^CATGA                 NcoI-compatible ends
-    "BsrI":      ("ACTGG",        1,  1),  # ACT^GG                  degenerate Type IIS-like
-    "BstAPI":    ("GCANNNNNTGC",  7,  5),  # GCANNNN^NTGC            3' overhang
+    "BsrI":      ("ACTGG",        6,  4),  # ACTGGN^/^NCCAGT 2-nt 3' overhang Type IIS
+    "BstAPI":    ("GCANNNNNTGC",  7,  4),  # GCAN^NNN^NTGC           3-nt 3' overhang
     "BstNI":     ("CCWGG",        2,  3),  # CC^WGG    / WGG^CC      3' overhang
     "BstUI":     ("CGCG",         2,  2),  # CG^CG                   blunt (4-cutter; methylation-sensitive)
     "BstZ17I":   ("GTATAC",       3,  3),  # GTA^TAC                 blunt
@@ -3104,15 +3119,15 @@ _NEB_ENZYMES: dict[str, tuple[str, int, int]] = {
     "DpnII":     ("GATC",         0,  4),  # ^GATC     / GATC^       5' overhang (4-cutter)
     "DrdI":      ("GACNNNNNNGTC", 7,  5),  # GACNNNNN^NGTC           3' overhang
     "EcoO109I":  ("RGGNCCY",      2,  5),  # RG^GNCCY                5' overhang
-    "HphI":      ("GGTGA",        8, 12),  # GGTGA(8/7) downstream   Type IIS
+    "HphI":      ("GGTGA",       13, 12),  # GGTGA(8/7) downstream   Type IIS
     "KasI":      ("GGCGCC",       1,  5),  # G^GCGCC                 5' overhang (NarI isoschizomer)
     "MboI":      ("GATC",         0,  4),  # ^GATC                   DpnII isoschizomer
-    "MboII":     ("GAAGA",        8, 12),  # GAAGA(8/7) downstream   Type IIS
+    "MboII":     ("GAAGA",       13, 12),  # GAAGA(8/7) downstream   Type IIS
     "MlyI":      ("GAGTC",       10, 10),  # GAGTC(5/5) downstream   blunt, Type IIS
-    "MmeI":      ("TCCRAC",      20, 18),  # TCCRAC(20/18)           Type IIS far-cutter
+    "MmeI":      ("TCCRAC",      26, 24),  # TCCRAC(20/18)           Type IIS far-cutter
     "MspA1I":    ("CMGCKG",       3,  3),  # CMG^CKG                 blunt
     "NgoMIV":    ("GCCGGC",       1,  5),  # G^CCGGC                 5' overhang (EagI-compatible)
-    "NmeAIII":   ("GCCGAG",      21, 19),  # GCCGAG(15/13)           Type IIS far-cutter
+    "NmeAIII":   ("GCCGAG",      27, 25),  # GCCGAG(21/19)           Type IIS far-cutter
     "PflMI":     ("CCANNNNNTGG",  7,  4),  # CCANN4^NTGG             3' overhang (BstXI isoschizomer)
     "PspOMI":    ("GGGCCC",       1,  5),  # G^GGCCC                 ApaI isoschizomer (5' overhang)
     "Sau3AI":    ("GATC",         0,  4),  # ^GATC                   BamHI-compatible ends (4-cutter)
@@ -3126,39 +3141,50 @@ _NEB_ENZYMES: dict[str, tuple[str, int, int]] = {
     # fwd/rev positions are still offsets from start of recognition seq.
     # For an n-bp recognition sequence cutting d1/d2 downstream:
     #   fwd = n + d1,  rev = n + d2
-    "BaeI":      ("ACNNNNGTAYYC",-10, -7), # cuts 10/15 upstream (negative = upstream)
+    "BaeI":      ("ACNNNNGTAYC", -10,-15), # (10/15)…(12/7): upstream pair only — downstream cut not represented (11-bp recog)
     "BbsI":      ("GAAGAC",       8, 12),  # GAAGAC(2/6)  BpiI isoschizomer
     "BcoDI":     ("GTCTC",        6, 10),  # GTCTC(1/5)   BsaI 5-bp variant
-    "BceAI":     ("ACGGC",        9, 11),  # ACGGC(4/6)
-    "BciVI":     ("GTATCC",      12,  6),  # GTATCC(6/5)  asymmetric
+    "BceAI":     ("ACGGC",       17, 19),  # ACGGC(12/14)            Type IIS far-cutter
+    "BciVI":     ("GTATCC",      12, 11),  # GTATCC(6/5)             1-nt 3' overhang
     "BfuAI":     ("ACCTGC",      10, 14),  # ACCTGC(4/8)  BspMI isoschizomer
-    "BmrI":      ("ACTGGN",       6,  5),  # cuts 1 past end of recog
+    "BmrI":      ("ACTGGG",      11, 10),  # ACTGGG(5/4)             1-nt 3' overhang Type IIS
     "BpiI":      ("GAAGAC",       8, 12),  # BbsI isoschizomer
     "BsaI":      ("GGTCTC",       7, 11),  # GGTCTC(1/5)  Golden Gate workhorse
-    "BsaXI":     ("ACNNNNNCTCC",  3, 12),  # cuts upstream and downstream (unusual)
-    "BsbI":      ("CAACAC",      17, 15),  # far-cutter
-    "BseJI":     ("GAAGAC",       8, 12),  # BbsI isoschizomer
+    "BsaXI":     ("ACNNNNNCTCC", -9,-12),  # (9/12)…(10/7): upstream pair only — downstream cut not represented
+    # BsbI removed 2026-05-11 (issue #14, cory-mozza): real REBASE id 329
+    # but no commercial supplier — users can't actually buy or order this
+    # enzyme. Showing it on the map suggests a digest option that doesn't
+    # exist in any wet lab. Keep removed unless a vendor starts producing.
+    # BseJI removed 2026-05-11: previous entry claimed BbsI-isoschizomer
+    # behaviour with site GAAGAC, but real BseJI recognises GATNNNNATC
+    # (blunt) per REBASE/NEB. Users who want BbsI behaviour should use
+    # `BbsI` / `BpiI` (already in this catalog). If a real BseJI entry
+    # is requested, add it back as: ("GATNNNNATC", 5, 5) — blunt 5-bp
+    # 5'-OH cut after the 5th base of recognition.
     "BseLI":     ("CCNNNNNNNGG",  7,  4),  # 3' overhang
-    "BseMII":    ("CTCAG",       10,  8),  # CTCAG(5/3)
-    "BseRI":     ("GAGGAG",      10, 14),  # GAGGAG(10/8)
+    "BseMII":    ("CTCAG",       15, 13),  # CTCAG(10/8)             Type IIS far-cutter
+    "BseRI":     ("GAGGAG",      16, 14),  # GAGGAG(10/8)            2-nt 3' overhang
     "BsgI":      ("GTGCAG",      22, 20),  # GTGCAG(16/14) far-cutter
     "BslI":      ("CCNNNNNNNGG",  7,  4),  # 3' overhang (BseLI variant)
     "BsmAI":     ("GTCTC",        6, 10),  # GTCTC(1/5)   BsaI isoschizomer (5-bp)
     "BsmBI":     ("CGTCTC",       7, 11),  # CGTCTC(1/5)  Esp3I isoschizomer
     "BsmFI":     ("GGGAC",       15, 19),  # GGGAC(10/14)
-    "BsmI":      ("GAATGC",       7,  1),  # GAATGC(1/-1) asymmetric Type IIS
-    "BspLU11III":("ACATGT",       1,  5),  # PciI isoschizomer (not strictly IIS)
+    "BsmI":      ("GAATGC",       7,  5),  # GAATGC(1/-1)            2-nt 3' overhang Type IIS
+    # BspLU11III removed 2026-05-11: not a real enzyme. Closest REBASE
+    # match is BspLU11I (site ACATGT) — PciI isoschizomer — but BspLU11I
+    # also has no commercial supplier, and PciI itself is already in this
+    # catalog with the correct (1, 5) tuple.
     "BspMI":     ("ACCTGC",      10, 14),  # ACCTGC(4/8)
     "BspQI":     ("GCTCTTC",      8, 11),  # SapI isoschizomer
     "BspTNI":    ("GGTCTC",       7, 11),  # BsaI isoschizomer
     "BsrBI":     ("CCGCTC",       3,  3),  # cuts within recog (special case)
     "BsrDI":     ("GCAATG",       8,  6),  # GCAATG(2/0)
-    "BssSI":     ("CACGAG",      -5, -1),  # cuts upstream of recognition
+    "BssSI":     ("CACGAG",       1,  5),  # C^ACGAG / GTGCT^C       4-nt 5' overhang
     "BtgZI":     ("GCGATG",      16, 20),  # GCGATG(10/14)
-    "BtsCI":     ("GGATG",        5,  3),  # GGATG(2/0)
+    "BtsCI":     ("GGATG",        7,  5),  # GGATG(2/0)              2-nt 3' overhang
     "BtsI":      ("GCAGTG",       8,  6),  # GCAGTG(2/0)
-    "BtsImutI":  ("CAGTG",        5,  3),  # BtsCI variant
-    "EarI":      ("CTCTTC",      10,  6),  # CTCTTC(4/1)  SapI-related
+    "BtsIMutI":  ("CAGTG",        7,  5),  # CAGTG(2/0)              2-nt 3' overhang (canonical REBASE/NEB capitalisation)
+    "EarI":      ("CTCTTC",       7, 10),  # CTCTTC(1/4)  SapI-related 3-nt 5' overhang
     "Esp3I":     ("CGTCTC",       7, 11),  # BsmBI isoschizomer
     "PaqCI":     ("CACCTGC",     11, 15),  # CACCTGC(4/8)
     "SapI":      ("GCTCTTC",      8, 11),  # GCTCTTC(1/4)
@@ -3168,12 +3194,12 @@ _NEB_ENZYMES: dict[str, tuple[str, int, int]] = {
     "AgeI-HF":   ("ACCGGT",       1,  5),
     "BamHI-HF":  ("GGATCC",       1,  5),
     "BclI-HF":   ("TGATCA",       1,  5),
-    "BmtI":      ("GCTAGC",       1,  5),  # NheI isoschizomer / HF variant
+    "BmtI":      ("GCTAGC",       5,  1),  # GCTAG^C / G^CTAGC       3' overhang CTAG (NheI neoschizomer)
     "BsiWI-HF":  ("CGTACG",       1,  5),
     "BsrFI-v2":  ("RCCGGY",       1,  5),
     "BsrGI-HF":  ("TGTACA",       1,  5),
-    "BssSI-v2":  ("CACGAG",      -5, -1),
-    "BstEII-HF": ("GGTNACC",      1,  5),
+    "BssSI-v2":  ("CACGAG",       1,  5),
+    "BstEII-HF": ("GGTNACC",      1,  6),
     "BstZ17I-HF":("GTATAC",       3,  3),
     "DraIII-HF": ("CACNNNGTG",    6,  3),
     "EcoRI-HF":  ("GAATTC",       1,  5),
@@ -4701,14 +4727,19 @@ def _paint_cds_aa(arr: list[tuple[str, str]], f: dict,
     sty = (f"reverse bold {color}" if is_aa_active
            else f"bold {color}")
     content_w = chunk_end - chunk_start
+    # /codon_start offset (1/2/3 → 0/1/2 leading bases skipped). Applied
+    # in CDS-5'-end direction so it shifts forward-strand AA letters
+    # right by `cs_off` bp and reverse-strand AA letters left by `cs_off`.
+    cs_off = max(0, min(2, int(f.get("codon_start", 1)) - 1))
     if exons:
         # Intron-aware: every codon's middle base is at spliced index
-        # 3*ci + 1. Walk via the helper. The painter doesn't try to
-        # narrow `i_range` because the codon→bp map isn't monotonic
-        # across intron junctions; full-scan with per-bp filter is the
-        # correct (and bounded) approach.
+        # 3*ci + 1 (+ cs_off for partial leading codons). Walk via the
+        # helper. The painter doesn't try to narrow `i_range` because
+        # the codon→bp map isn't monotonic across intron junctions;
+        # full-scan with per-bp filter is the correct (and bounded)
+        # approach.
         for ci in range(n_codons):
-            aa_bp = _spliced_idx_to_genomic_bp(3*ci + 1, exons, strand)
+            aa_bp = _spliced_idx_to_genomic_bp(cs_off + 3*ci + 1, exons, strand)
             if aa_bp < 0:
                 continue
             if chunk_start <= aa_bp < chunk_end:
@@ -4721,11 +4752,11 @@ def _paint_cds_aa(arr: list[tuple[str, str]], f: dict,
         # this chunk so a 10 kb CDS doesn't iterate every codon per
         # chunk it spans.
         if strand == -1:
-            lo = (orig_e - 2 - chunk_end) // 3 + 1
-            hi = (orig_e - 2 - chunk_start) // 3 + 1
+            lo = (virt_e - cs_off - 2 - chunk_end) // 3 + 1
+            hi = (virt_e - cs_off - 2 - chunk_start) // 3 + 1
         else:
-            lo = (chunk_start - orig_s - 1 + 2) // 3
-            hi = (chunk_end - orig_s - 1 + 2) // 3
+            lo = (chunk_start - orig_s - cs_off - 1 + 2) // 3
+            hi = (chunk_end - orig_s - cs_off - 1 + 2) // 3
         lo = max(0, lo)
         hi = min(n_codons, hi + 1)
         i_range = range(lo, hi) if lo < hi else range(0)
@@ -4737,9 +4768,9 @@ def _paint_cds_aa(arr: list[tuple[str, str]], f: dict,
         i_range = range(n_codons)
     for ci in i_range:
         if strand == -1:
-            aa_bp = (virt_e - 3*ci - 2) % n if n else 0
+            aa_bp = (virt_e - cs_off - 3*ci - 2) % n if n else 0
         else:
-            aa_bp = (orig_s + 3*ci + 1) % n if n else 0
+            aa_bp = (orig_s + cs_off + 3*ci + 1) % n if n else 0
         if chunk_start <= aa_bp < chunk_end:
             col = aa_bp - chunk_start
             if 0 <= col < content_w:
@@ -5384,6 +5415,20 @@ def _render_chunk(result: "Text", chunk_start: int, chunk_end: int,
     """
     above_p, below_p, above_rows, below_rows = groups
     re_se = (reh_s, reh_e) if reh_s >= 0 and reh_e > reh_s else None
+    n = len(seq_upper)
+
+    # Wrap-aware upstream/downstream test for a clicked Type IIS cut that
+    # wraps origin (raw `p + offset > n`, post-modulo small). Defined here
+    # so the per-base loop doesn't redefine it for every base. Hoisted
+    # 2026-05-11 alongside the wrap-highlight fix.
+    def _cut_is_upstream(i_: int, cut: int) -> bool:
+        if cut < 0:
+            return False
+        if reh_rec_s >= 0 and cut < reh_rec_s and n:
+            return i_ < cut + n
+        if reh_rec_s >= 0 and i_ < reh_rec_s and cut >= reh_rec_e and n:
+            return i_ + n < cut
+        return i_ < cut
 
     # Rows ABOVE DNA — render top (far) → bottom (close to DNA).
     # Per-feature 2D packing: each feature's bar is at row 0
@@ -5454,7 +5499,15 @@ def _render_chunk(result: "Text", chunk_start: int, chunk_end: int,
             base   = styles[i]
             in_usr = (usr_s <= i < usr_e)
             in_sel = (sel_s <= i < sel_e)
-            in_re  = (reh_s <= i < reh_e)
+            # RE highlight membership: linear when reh_e >= reh_s, wrap
+            # when reh_e < reh_s (cut wraps origin for a near-origin Type
+            # IIS site — encoded by `_resite_highlight_dict` since 2026-05-11).
+            if reh_s < 0:
+                in_re = False
+            elif reh_e >= reh_s:
+                in_re = (reh_s <= i < reh_e)
+            else:
+                in_re = (i >= reh_s or i < reh_e)
             is_cur = (cursor_pos == i)
 
             if is_cur:
@@ -5498,17 +5551,19 @@ def _render_chunk(result: "Text", chunk_start: int, chunk_end: int,
                 else:
                     in_overhang = False
                 if in_recognition:
-                    # Per-strand upstream/downstream split based
-                    # on each strand's cut position.
+                    # Per-strand upstream/downstream split based on each
+                    # strand's cut position. Wrap-aware via `_cut_is_upstream`
+                    # so a Type IIS cut that wraps origin still paints the
+                    # recognition bases correctly (blue = upstream of cut).
                     if reh_top_cut >= 0:
                         fwd_sty = ("black on blue bold"
-                                   if i < reh_top_cut
+                                   if _cut_is_upstream(i, reh_top_cut)
                                    else "black on red bold")
                     else:
                         fwd_sty = "black on white bold"
                     if reh_bot_cut >= 0:
                         rev_sty = ("black on blue bold"
-                                   if i < reh_bot_cut
+                                   if _cut_is_upstream(i, reh_bot_cut)
                                    else "black on red bold")
                     else:
                         rev_sty = "black on white bold"
@@ -5693,9 +5748,13 @@ def _cds_aa_list(seq: str, f: dict) -> tuple[list[str], int, int]:
     e = f.get("_orig_end",   f["end"])
     strand = f.get("strand", 1)
     exons = f.get("_exons")
+    # GenBank /codon_start qualifier (1/2/3, default 1). Stamped on the
+    # feature dict by the GenBank parser. Off-by-one would frame-shift
+    # every AA past the leading partial codon.
+    cs_offset = max(0, min(2, int(f.get("codon_start", 1)) - 1))
     exon_key = tuple(exons) if exons else None
     # hash(seq) instead of id(seq) — see `_build_seq_inputs`.
-    key = (hash(seq), s, e, strand, exon_key)
+    key = (hash(seq), s, e, strand, exon_key, cs_offset)
     cached = _CDS_AA_CACHE.get(key)
     if cached is not None:
         return cached
@@ -5718,7 +5777,10 @@ def _cds_aa_list(seq: str, f: dict) -> tuple[list[str], int, int]:
         virt_e  = e
     if strand == -1:
         cds_seq = cds_seq.translate(_IUPAC_COMP)[::-1]
-    n_codons = cds_len // 3
+    # Apply codon_start AFTER strand correction: the offset is measured
+    # from the CDS's own 5' end (= virt_e on - strand, = orig_s on +).
+    cds_seq = cds_seq[cs_offset:]
+    n_codons = (cds_len - cs_offset) // 3
     aa_letters = [
         _CODON_TABLE.get(cds_seq[3*i:3*i+3], "?")
         for i in range(n_codons)
@@ -5731,7 +5793,8 @@ def _cds_aa_list(seq: str, f: dict) -> tuple[list[str], int, int]:
 
 
 def _translate_cds(full_seq: str, start: int, end: int, strand: int,
-                    exons: "list[tuple[int, int]] | None" = None) -> str:
+                    exons: "list[tuple[int, int]] | None" = None,
+                    codon_start: int = 1) -> str:
     """Translate a CDS region to single-letter AA string (stop codon → *).
 
     Uses _IUPAC_COMP for the reverse-complement step so IUPAC ambiguity codes
@@ -5750,6 +5813,12 @@ def _translate_cds(full_seq: str, start: int, end: int, strand: int,
     shifts every AA past the splice. Wrap-CDS isn't intron-aware (the
     wrap encoding overloads `end < start`); callers that combine wrap +
     introns should handle it themselves.
+
+    `codon_start` is the GenBank /codon_start qualifier (1/2/3, default 1).
+    A value of 2 or 3 means the first 1 or 2 bases of the CDS span an
+    incomplete leading codon and the reading frame starts at offset
+    `codon_start - 1`. Common on NCBI-fetched partial CDSes; was silently
+    ignored before 2026-05-11, frame-shifting every AA.
     """
     if exons:
         sub = "".join(full_seq[xs:xe].upper() for xs, xe in exons)
@@ -5759,6 +5828,8 @@ def _translate_cds(full_seq: str, start: int, end: int, strand: int,
         sub = full_seq[start:end].upper()
     if strand == -1:
         sub = sub.translate(_IUPAC_COMP)[::-1]
+    offset = max(0, min(2, int(codon_start) - 1))
+    sub = sub[offset:]
     aa = [_CODON_TABLE.get(sub[i:i+3], "?") for i in range(0, len(sub) - 2, 3)]
     result = "".join(aa)
     if result and not result.endswith("*"):
@@ -8174,13 +8245,44 @@ def _record_to_gff3(record) -> str:
             except (TypeError, ValueError, IndexError):
                 cs = 1
             phase = str(max(0, min(2, cs - 1)))
-        # Iterate location parts so wrap features get one row per
-        # arc, sharing the same ID — the GFF3 split-feature convention.
+        # Iterate location parts so wrap features get one row per arc,
+        # sharing the same ID — the GFF3 split-feature convention.
+        # Order parts in biological 5'→3' direction so the split-feature
+        # rows read in the order the ribosome (or polymerase) traverses
+        # them. For forward-strand: ascending genomic start. For
+        # reverse-strand: descending. A canonical-wrap forward feature
+        # (`join(tail..total, 1..head)`) is already declared in 5'→3'
+        # order (tail first), so sorting by start would REVERSE it; we
+        # detect canonical wrap and keep it in declared order. Same for
+        # reverse-strand wrap (head first, descending). Pre-2026-05-11
+        # the loop iterated `parts` in declared order — fine for
+        # GenBank-parsed wraps (which declare in biological order) but
+        # wrong for programmatically constructed CompoundLocations.
         try:
-            parts = (getattr(feat.location, "parts", None)
-                     or [feat.location])
+            parts_seq = list(getattr(feat.location, "parts", None)
+                              or [feat.location])
         except AttributeError:
-            parts = []
+            parts_seq = []
+        try:
+            is_wrap_canonical = (
+                len(parts_seq) == 2
+                and int(parts_seq[0].start) == 0
+                and int(parts_seq[-1].end) == len(record.seq)
+                and int(parts_seq[0].end) < int(parts_seq[-1].start)
+            )
+        except (AttributeError, TypeError, ValueError):
+            is_wrap_canonical = False
+        if is_wrap_canonical:
+            # Tail first for + strand (biological 5'→3'); head first for - strand.
+            parts = ([parts_seq[-1], parts_seq[0]] if strand_int != -1
+                     else [parts_seq[0], parts_seq[-1]])
+        else:
+            try:
+                parts_sorted = sorted(parts_seq, key=lambda p: int(p.start))
+            except (AttributeError, TypeError, ValueError):
+                parts_sorted = parts_seq
+            parts = (parts_sorted if strand_int != -1
+                     else list(reversed(parts_sorted)))
         for part in parts:
             try:
                 p_s = int(part.start)
@@ -8754,6 +8856,21 @@ class PlasmidMap(Widget):
             }
             if feat_exons is not None:
                 new_feat["_exons"] = feat_exons
+            # GenBank /codon_start qualifier (1/2/3, default 1). Stamped on
+            # CDS features so `_translate_cds` / `_cds_aa_list` / the AA-
+            # click handler / Ctrl+C protein copy honour the reading frame
+            # of partial CDSes (common on NCBI fetches). Pre-2026-05-11
+            # this was silently ignored everywhere except GFF3 export,
+            # frame-shifting every AA past the leading partial codon.
+            if feat.type.upper() == "CDS":
+                try:
+                    cs_raw = int(
+                        (feat.qualifiers.get("codon_start", ["1"]) or ["1"])[0]
+                    )
+                except (TypeError, ValueError, IndexError):
+                    cs_raw = 1
+                if cs_raw in (2, 3):
+                    new_feat["codon_start"] = cs_raw
             # ── Partial-binding primer detection ────────────────────
             # When a `primer_bind` feature carries a `/primer_seq`
             # qualifier (set by `_add_selected_to_map` since 0.5.9),
@@ -13077,23 +13194,47 @@ class SequencePanel(Widget):
         top_cut  = resite.get("top_cut_bp", -1)
         bot_cut  = resite.get("bottom_cut_bp", -1)
         ext_cut  = resite.get("ext_cut_bp")
+        strand   = resite.get("strand", 1)
+        # Classify each external cut as "natural extension" (genuinely
+        # upstream/downstream of the recognition for this strand) vs.
+        # "wrap" (cut wrapped past the origin to land on the wrong side
+        # of the recognition in linear coordinates). For forward-strand
+        # binding (strand >= 0), cuts are expected downstream — a cut
+        # numerically smaller than `hi_start` means the raw `p + offset`
+        # exceeded `n` and wrapped. For reverse-strand binding the
+        # mirror applies. Pre-2026-05-11 the loop unconditionally
+        # dragged `hi_start` down to a wrapped cut, producing a
+        # plasmid-wide highlight on Type IIS sites at the origin.
+        ext_cuts:  list[int] = []
+        wrap_cuts: list[int] = []
         for cut in (top_cut, bot_cut, ext_cut):
-            if cut is None or cut < 0:
+            if cut is None or cut < 0 or hi_start <= cut < hi_end:
                 continue
-            # Inclusive lower bound: when a cut sits BEFORE the
-            # recognition (reverse-strand Type IIS hit), the cut
-            # position IS the leftmost overhang base of the right
-            # fragment — should be in the highlight.
+            if strand >= 0 and cut < hi_start:
+                wrap_cuts.append(cut)
+            elif strand < 0 and cut >= hi_end:
+                wrap_cuts.append(cut)
+            else:
+                ext_cuts.append(cut)
+        for cut in ext_cuts:
+            # Inclusive lower bound: a cut sitting BEFORE the recognition
+            # IS the leftmost overhang base of the right fragment.
             if cut < hi_start:
                 hi_start = cut
-            # Exclusive upper bound: when a cut sits PAST the
-            # recognition (forward Type IIS), the cut position is
-            # the leftmost base of the right fragment — fully
-            # released and NOT part of the cut footprint. Setting
-            # `hi_end = cut` keeps that base out of the highlight
-            # so the visual ends right at the cut boundary.
-            if cut > hi_end:
+            # Exclusive upper bound: a cut sitting PAST the recognition
+            # is the leftmost base of the right fragment — fully released
+            # and NOT part of the cut footprint.
+            elif cut > hi_end:
                 hi_end = min(cut, n)
+        if wrap_cuts:
+            # Wrap-encode: `hi_end < hi_start` (forward wrap) or
+            # `hi_start > hi_end` (reverse wrap) means the highlight
+            # spans origin. The renderer detects this and tests
+            # `i >= reh_s or i < reh_e` instead of the linear form.
+            if strand >= 0:
+                hi_end = max(wrap_cuts)
+            else:
+                hi_start = min(wrap_cuts)
         return {
             "start":         hi_start,
             "end":           hi_end,
@@ -13275,6 +13416,7 @@ class SequencePanel(Widget):
                             orig_s = f.get("_orig_start", f["start"])
                             orig_e = f.get("_orig_end",   f["end"])
                             strand = f.get("strand", 1)
+                            cs_off = max(0, min(2, int(f.get("codon_start", 1)) - 1))
                             n = len(self._seq)
                             if orig_e >= orig_s:
                                 cds_len = orig_e - orig_s
@@ -13282,7 +13424,7 @@ class SequencePanel(Widget):
                             else:
                                 cds_len = (n - orig_s) + orig_e if n else 0
                                 virt_e  = orig_s + cds_len
-                            n_codons = cds_len // 3
+                            n_codons = max(0, (cds_len - cs_off) // 3)
                             # Virtual click bp: for wrap CDS clicks
                             # in the head, shift by `n` so the codon
                             # math works in linear coordinates.
@@ -13293,14 +13435,14 @@ class SequencePanel(Widget):
                             on_letter = False
                             codon_idx = -1
                             if strand == -1:
-                                # midpoint bp = virt_e - 3*i - 2
-                                delta = virt_e - virt_click - 2
+                                # midpoint bp = virt_e - cs_off - 3*i - 2
+                                delta = virt_e - cs_off - virt_click - 2
                                 if delta >= 0 and delta % 3 == 0:
                                     codon_idx = delta // 3
                                     on_letter = 0 <= codon_idx < n_codons
                             else:
-                                # midpoint bp = orig_s + 3*i + 1
-                                delta = virt_click - orig_s - 1
+                                # midpoint bp = orig_s + cs_off + 3*i + 1
+                                delta = virt_click - orig_s - cs_off - 1
                                 if delta >= 0 and delta % 3 == 0:
                                     codon_idx = delta // 3
                                     on_letter = 0 <= codon_idx < n_codons
@@ -21399,6 +21541,294 @@ def _dedupe_primers_by_sequence(entries: list[dict]) -> list[dict]:
     return out
 
 
+# App-level cache for the primer-usage index. Invalidated whenever any
+# code path that could change primer_bind features writes the library
+# or collections — see `_primer_usage_clear_cache()` calls in
+# `_save_library` and `_save_collections`. Without the cache, every
+# PrimerDesignScreen open would re-scan every plasmid (~2.5 s on a
+# 600-plasmid library after regex-extract optimisation).
+_primer_usage_cache: "dict[str, int] | None" = None
+# Generation counter — bumped on every cache invalidation. The scan
+# worker captures the generation at entry and refuses to write its
+# result back if the generation moved (i.e., an invalidation fired
+# mid-scan). Without this, a save firing mid-scan would let the
+# worker's stale result silently overwrite the just-cleared cache
+# and stick around until the next save.
+_primer_usage_cache_gen: int = 0
+
+
+def _primer_usage_clear_cache() -> None:
+    """Invalidate `_primer_usage_cache`. Called from `_save_library`
+    and `_save_collections` so the next PrimerDesignScreen open
+    sees a fresh scan that reflects any plasmid edits. Also bumps
+    `_primer_usage_cache_gen` so any in-flight scan worker drops
+    its stale result instead of writing it back to the cache."""
+    global _primer_usage_cache, _primer_usage_cache_gen
+    _primer_usage_cache = None
+    _primer_usage_cache_gen += 1
+
+
+def _normalize_primer_seq(raw: object) -> str:
+    """Whitespace-strip + uppercase a primer sequence. Robust to
+    multi-line wrapped GenBank qualifier values (Biopython joins
+    wrap-continued lines into a single string but may preserve
+    embedded whitespace) and to non-string inputs (returns empty).
+
+    Used by both the regex and SeqIO paths in
+    `_index_primer_usage_in_collections` /
+    `_find_primer_plasmid_usages` so a primer with a wrap-formatted
+    `primer_seq` qualifier matches the same primer's `.upper()` form
+    from the primer library — pre-fix the two paths used different
+    normalisation (`.strip().upper()` vs ``re.sub(r"\\s+", "", ...)``)
+    and could miss long primers wrapped at 58-col GenBank boundaries.
+    """
+    if not isinstance(raw, str):
+        return ""
+    return re.sub(r"\s+", "", raw).upper()
+
+
+# Regex-extract `/primer_seq="..."` qualifier values from raw GenBank
+# text. `[^"]+` matches across newlines, so wrapped multi-line
+# qualifier values (Biopython folds long sequences at ~58 chars)
+# capture as one match plus interior whitespace — stripped on the
+# caller side. Fast path for `_index_primer_usage_in_collections`:
+# the SpliceCraft `.dna`-import flow and PrimerDesignScreen save both
+# stamp this qualifier, so regex catches everything without the per-
+# plasmid SeqIO parse cost (~50× speed-up on 500-plasmid libraries).
+_PRIMER_SEQ_QUALIFIER_RE = re.compile(r'/primer_seq="([^"]+)"')
+_PRIMER_BIND_FEATURE_RE = re.compile(r'^\s+primer_bind\s', re.MULTILINE)
+
+
+def _index_primer_usage_in_collections(use_cache: bool = True) -> "dict[str, int]":
+    """Walk every plasmid in every collection and return
+    ``{primer_sequence_upper: n_plasmids_using_it}``.
+
+    Counts UNIQUE plasmids per primer — a plasmid with the same primer
+    appearing as both forward and reverse `primer_bind` features is
+    counted once. Surfaces "how popular is this primer across the
+    whole library" so the user can spot core primers vs one-offs
+    without manually scanning every plasmid's feature list.
+
+    **Fast path**: regex over the raw `gb_text` for
+    ``/primer_seq="..."`` qualifier values. Captures everything the
+    `.dna` importer and primer designer stamp on `primer_bind`
+    features (~99% of real-world entries) without paying the
+    SeqIO-parse cost per plasmid.
+
+    **Fallback**: plasmids whose `gb_text` carries `primer_bind`
+    feature lines but NO `/primer_seq=` qualifiers (legacy features
+    added by hand or by tools that don't stamp the qualifier) drop
+    into the SeqIO path. The fallback slices each feature's location
+    off the plasmid sequence — matches the binding region but not
+    any cloning tail.
+
+    Returns a shallow COPY of the cached result so caller mutations
+    can't poison the cache (invariant #17). Pass ``use_cache=False``
+    to force a fresh scan (test helper).
+    """
+    global _primer_usage_cache
+    if use_cache and _primer_usage_cache is not None:
+        return _primer_usage_cache.copy()
+    # Capture the cache generation at scan entry so we can detect a
+    # mid-scan invalidation (e.g., `_save_library` firing while we
+    # iterate collections) and refuse to write our stale result back.
+    entry_gen = _primer_usage_cache_gen
+    counts: "dict[str, set[str]]" = {}
+    try:
+        collections = _load_collections()
+    except Exception:
+        _log.exception("primer-usage index: collection load failed")
+        return {}
+    for coll in collections:
+        if not isinstance(coll, dict):
+            continue
+        coll_name = coll.get("name") or ""
+        plasmids = coll.get("plasmids") or []
+        for p in plasmids:
+            if not isinstance(p, dict):
+                continue
+            # Per-plasmid identity that's unique across collections so
+            # two plasmids sharing an `id` in different collections
+            # still count separately. Falls back to name when id is
+            # missing.
+            pid = (
+                f"{coll_name}:"
+                f"{p.get('id') or p.get('name') or ''}"
+            )
+            gb_text = p.get("gb_text") or ""
+            if not gb_text:
+                continue
+            # Fast path: regex `/primer_seq="..."` extraction.
+            raw_matches = _PRIMER_SEQ_QUALIFIER_RE.findall(gb_text)
+            if raw_matches:
+                for raw in raw_matches:
+                    seq = _normalize_primer_seq(raw)
+                    if seq:
+                        counts.setdefault(seq, set()).add(pid)
+                continue
+            # Fallback: only SeqIO-parse if there ARE `primer_bind`
+            # feature lines but none have a stamped primer_seq.
+            # Plasmids with no primer_bind features at all skip the
+            # parse entirely.
+            if not _PRIMER_BIND_FEATURE_RE.search(gb_text):
+                continue
+            try:
+                rec = _gb_text_to_record(gb_text)
+            except Exception:
+                _log.debug(
+                    "primer-usage index: %s failed to parse",
+                    pid, exc_info=True,
+                )
+                continue
+            n = len(rec.seq) if getattr(rec, "seq", None) is not None else 0
+            seq_str = str(rec.seq).upper() if n > 0 else ""
+            for feat in rec.features:
+                if feat.type != "primer_bind":
+                    continue
+                primer_seq = ""
+                quals = getattr(feat, "qualifiers", {}) or {}
+                ps_list = quals.get("primer_seq")
+                if isinstance(ps_list, list) and ps_list:
+                    primer_seq = _normalize_primer_seq(ps_list[0])
+                if not primer_seq and n > 0:
+                    bounds = _feat_bounds(feat, n)
+                    if bounds is not None:
+                        s, e, strand = bounds
+                        # Wrap-aware slice: origin-spanning primer
+                        # binding regions have end < start after
+                        # `_feat_bounds` normalisation.
+                        if e < s:
+                            primer_seq = seq_str[s:] + seq_str[:e]
+                        else:
+                            primer_seq = seq_str[s:e]
+                        if strand and strand < 0:
+                            primer_seq = _rc(primer_seq)
+                if primer_seq:
+                    counts.setdefault(primer_seq, set()).add(pid)
+    result = {seq: len(pids) for seq, pids in counts.items()}
+    # Only write back if the cache generation didn't move while we
+    # scanned — a `_save_library` mid-scan would have cleared the
+    # cache and bumped the generation; writing our pre-save result
+    # back would silently poison the cache with stale data until
+    # the next save fires.
+    if entry_gen == _primer_usage_cache_gen:
+        _primer_usage_cache = result
+    return result.copy()
+
+
+def _find_primer_plasmid_usages(primer_seq: str) -> "list[dict]":
+    """Find every plasmid carrying a `primer_bind` feature whose
+    primer sequence matches ``primer_seq`` (case-insensitive, exact).
+    Returns usage entries with keys:
+
+      * ``collection``    — collection name
+      * ``plasmid_id``    — library entry id (or name if id missing)
+      * ``plasmid_name``  — display name
+      * ``start``         — 0-based start (wrap-aware via `_feat_bounds`;
+                            ``end < start`` signals origin-spanning)
+      * ``end``           — 0-based end
+      * ``strand``        — +1 / -1 / 0
+
+    Used by `PrimerPlasmidsModal` to surface every plasmid that
+    references a given primer. Regex pre-filters by primer-seq
+    qualifier so SeqIO-parses only fire for plasmids that actually
+    match — a primer present in 5 of 600 plasmids costs ~5 parses,
+    not 600.
+
+    Slower fallback (SeqIO without qualifier match) kicks in only
+    when a plasmid has `primer_bind` lines but no `/primer_seq=`
+    qualifiers — covers legacy features added by hand or by tools
+    that don't stamp the qualifier.
+    """
+    target = primer_seq.strip().upper()
+    if not target:
+        return []
+    out: list[dict] = []
+    try:
+        collections = _load_collections()
+    except Exception:
+        _log.exception("primer-usages: collection load failed")
+        return []
+    for coll in collections:
+        if not isinstance(coll, dict):
+            continue
+        coll_name = coll.get("name") or ""
+        plasmids = coll.get("plasmids") or []
+        for p in plasmids:
+            if not isinstance(p, dict):
+                continue
+            gb_text = p.get("gb_text") or ""
+            if not gb_text:
+                continue
+            # Fast filter: does any `/primer_seq=` qualifier in this
+            # plasmid match `target`? Uses `_normalize_primer_seq` for
+            # consistency with the SeqIO path below — a wrap-formatted
+            # qualifier value with embedded whitespace would otherwise
+            # match in one path but not the other.
+            matched_qual = False
+            for raw in _PRIMER_SEQ_QUALIFIER_RE.findall(gb_text):
+                if _normalize_primer_seq(raw) == target:
+                    matched_qual = True
+                    break
+            if not matched_qual:
+                # No qualifier match → primer isn't carried by this
+                # plasmid (under the canonical primer_seq-stamped
+                # model). Skip without parsing.
+                #
+                # Edge case: legacy / hand-added `primer_bind` features
+                # without a `/primer_seq=` qualifier won't be matched
+                # by this lookup — the binding region is only knowable
+                # via a slice off `rec.seq` after a SeqIO parse, and
+                # paying that parse cost on every plasmid in the 0-
+                # match case (the common case when a user inspects an
+                # uncommon primer) makes the modal feel broken. Users
+                # whose plasmids carry such legacy features should
+                # re-import the `.dna` to re-stamp qualifiers, or use
+                # the BLAST modal (which doesn't rely on primer_seq)
+                # for sequence-based search.
+                continue
+            try:
+                rec = _gb_text_to_record(gb_text)
+            except Exception:
+                continue
+            n = len(rec.seq) if getattr(rec, "seq", None) is not None else 0
+            seq_str = str(rec.seq).upper() if n > 0 else ""
+            for feat in rec.features:
+                if feat.type != "primer_bind":
+                    continue
+                this_seq = ""
+                ps_list = (
+                    getattr(feat, "qualifiers", {}) or {}
+                ).get("primer_seq")
+                if isinstance(ps_list, list) and ps_list:
+                    this_seq = _normalize_primer_seq(ps_list[0])
+                if not this_seq and n > 0:
+                    bounds = _feat_bounds(feat, n)
+                    if bounds is not None:
+                        s, e, strand = bounds
+                        if e < s:
+                            this_seq = seq_str[s:] + seq_str[:e]
+                        else:
+                            this_seq = seq_str[s:e]
+                        if strand and strand < 0:
+                            this_seq = _rc(this_seq)
+                if this_seq != target:
+                    continue
+                bounds = _feat_bounds(feat, n)
+                if bounds is None:
+                    continue
+                fs, fe, fstrand = bounds
+                out.append({
+                    "collection":   coll_name,
+                    "plasmid_id":   p.get("id") or p.get("name") or "",
+                    "plasmid_name": p.get("name") or p.get("id") or "",
+                    "start":        fs,
+                    "end":          fe,
+                    "strand":       fstrand or 0,
+                })
+    return out
+
+
 def _dedupe_primers_by_name_longest_seq(entries: list[dict]) -> list[dict]:
     """Collapse primer entries that share a ``name`` field, keeping the
     one with the longest sequence — typically the variant carrying the
@@ -21467,6 +21897,10 @@ def _save_primers(entries: list[dict]) -> None:
     # legitimately stash same-name different-sequence variants, and
     # silently dropping any would lose primer data. Name-collision
     # cleanup is opt-in via `PrimerDuplicatesModal` at startup.
+    # The primer-usage cache stays valid here because adding/removing
+    # primer-library entries doesn't change which plasmids carry
+    # `primer_bind` features — that's `_save_library`/`_save_collections`'
+    # job to invalidate.
     deduped = _dedupe_primers_by_sequence(entries)
     _safe_save_json(_PRIMERS_FILE, deduped, "Primer library")
     # Deep-copy on save so the cache is independent of the caller's
@@ -22654,11 +23088,24 @@ def _design_detection_primers(
     fwd_pos = result["PRIMER_LEFT_0"]     # (start, length) on p3_seq
     rev_pos = result["PRIMER_RIGHT_0"]    # (start, length) — start is 3' end on p3_seq
 
-    # Unrotate positions back to original-template coordinates.
-    fwd_start = (fwd_pos[0] + rotation) % total
-    fwd_end   = (fwd_pos[0] + fwd_pos[1] + rotation) % total
-    rev_start = (rev_pos[0] - rev_pos[1] + 1 + rotation) % total
-    rev_end   = (rev_pos[0] + 1 + rotation) % total
+    # Unrotate positions back to original-template coordinates. Apply
+    # `% total` ONLY when the target region wraps origin (Primer3 ran
+    # on a rotated template). On the linear path, `rotation == 0` and
+    # the modulo is a no-op for most values BUT silently flips a primer
+    # 3'-ending at exact bp `total - 1` into `rev_end = total % total = 0`
+    # — which `_add_selected_to_map` then reads as a wrap-encoded primer
+    # (`p_end < p_start`) and stamps a wrap CompoundLocation with a 0-bp
+    # head part. Mirrors `_design_cloning_primers_raw` (gate-on-wraps).
+    if wraps:
+        fwd_start = (fwd_pos[0] + rotation) % total
+        fwd_end   = (fwd_pos[0] + fwd_pos[1] + rotation) % total
+        rev_start = (rev_pos[0] - rev_pos[1] + 1 + rotation) % total
+        rev_end   = (rev_pos[0] + 1 + rotation) % total
+    else:
+        fwd_start = fwd_pos[0]
+        fwd_end   = fwd_pos[0] + fwd_pos[1]
+        rev_start = rev_pos[0] - rev_pos[1] + 1
+        rev_end   = rev_pos[0] + 1
 
     return {
         "fwd_seq":      result["PRIMER_LEFT_0_SEQUENCE"],
@@ -24948,6 +25395,154 @@ class PrimerDuplicatesModal(ModalScreen):
 
     def action_cancel(self) -> None:
         self.dismiss(False)
+
+
+class PrimerPlasmidsModal(ModalScreen):
+    """Surfaces every plasmid (across every collection) that carries a
+    `primer_bind` feature matching a given primer-library entry's
+    sequence. Lets the user pick one to jump to — the dismiss handler
+    on `PrimerDesignScreen` then closes the primer-design screen and
+    `PlasmidApp._goto_primer_in_plasmid` navigates to the chosen
+    plasmid + scrolls the seq-panel cursor to the primer's binding
+    region, mirroring the click-a-feature UX.
+
+    Dismiss payload:
+      ``None`` — cancelled (Escape / Close button)
+      ``dict`` — chosen usage entry with keys
+        ``collection``, ``plasmid_id``, ``plasmid_name``,
+        ``start``, ``end``, ``strand``.
+    """
+
+    _blocks_undo: bool = True   # caller may swap `_current_record`
+
+    BINDINGS = [
+        Binding("escape",     "cancel",             "Cancel"),
+        Binding("tab",        "app.focus_next",     "Next",  show=False),
+        Binding("shift+tab",  "app.focus_previous", "Prev",  show=False),
+    ]
+
+    DEFAULT_CSS = """
+    PrimerPlasmidsModal { align: center middle; }
+    #pmp-dlg {
+        width: 92;
+        height: 40;
+        background: $surface;
+        border: heavy $primary;
+        padding: 1 2;
+    }
+    #pmp-title {
+        text-align: center;
+        background: $primary-darken-2;
+        color: $text;
+        padding: 0 1;
+        height: 1;
+    }
+    #pmp-info {
+        margin: 1 0;
+        padding: 0 1;
+        color: $text;
+        height: auto;
+    }
+    #pmp-table { height: 1fr; margin-top: 1; }
+    /* `min-height: 3` + `height: auto` so the buttons get the height
+       they declare even on terminals where the dialog box is the
+       minimum size — previous fixed `height: 3` could clip on tiny
+       terminals where the dialog box itself wasn't quite tall enough.
+       The Vertical above (#pmp-dlg) is 40 rows fixed, so the table
+       absorbs the slack. */
+    #pmp-btns {
+        height: auto;
+        min-height: 3;
+        align: right middle;
+        padding-top: 1;
+    }
+    #pmp-btns Button { margin-left: 1; }
+    """
+
+    def __init__(self, primer_entry: dict, usages: list[dict]):
+        super().__init__()
+        self._primer = primer_entry
+        # Sort once at construction (natural sort by collection, then
+        # plasmid name) so cursor-row → usage mapping is stable.
+        self._sorted_usages = sorted(
+            usages,
+            key=lambda u: (
+                _natural_sort_key(u.get("collection") or ""),
+                _natural_sort_key(u.get("plasmid_name") or ""),
+            ),
+        )
+
+    def compose(self) -> ComposeResult:
+        seq = (self._primer.get("sequence") or "")
+        seq_preview = seq[:80] + ("…" if len(seq) > 80 else "")
+        tm = self._primer.get("tm")
+        tm_str = (f"{float(tm):.1f}°C"
+                  if isinstance(tm, (int, float)) else "—")
+        name = self._primer.get("name", "?")
+        n_usages = len(self._sorted_usages)
+        with Vertical(id="pmp-dlg"):
+            yield Static(f" Plasmids using primer '{name}' ", id="pmp-title")
+            yield Static(
+                f"Sequence (5'→3'):  {seq_preview}\n"
+                f"Length: {len(seq)} nt    Tm: {tm_str}    "
+                f"Found in {n_usages} plasmid"
+                f"{'s' if n_usages != 1 else ''}",
+                id="pmp-info",
+                markup=False,
+            )
+            yield DataTable(id="pmp-table", cursor_type="row",
+                              zebra_stripes=True)
+            with Horizontal(id="pmp-btns"):
+                yield Button("Open plasmid", id="btn-pmp-open",
+                              variant="primary")
+                yield Button("Cancel", id="btn-pmp-cancel")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#pmp-table", DataTable)
+        t.add_columns("Collection", "Plasmid", "Position", "Strand")
+        for u in self._sorted_usages:
+            start = int(u.get("start") or 0)
+            end = int(u.get("end") or 0)
+            # 1-based inclusive for display (matches GenBank
+            # convention); wrap-aware features (end < start) render
+            # as "S..0..E" to match `_feat_span_label` style.
+            if end < start:
+                pos_str = f"{start + 1}..0..{end}"
+            else:
+                pos_str = f"{start + 1}–{end}"
+            strand = int(u.get("strand") or 0)
+            strand_str = ("+" if strand == 1
+                            else "-" if strand == -1 else ".")
+            t.add_row(
+                u.get("collection") or "",
+                u.get("plasmid_name") or "?",
+                pos_str,
+                strand_str,
+            )
+        t.focus()
+
+    @on(DataTable.RowSelected, "#pmp-table")
+    def _row_selected(self, event: DataTable.RowSelected) -> None:
+        row = event.cursor_row
+        if 0 <= row < len(self._sorted_usages):
+            self.dismiss(self._sorted_usages[row])
+
+    @on(Button.Pressed, "#btn-pmp-open")
+    def _btn_open(self, _) -> None:
+        try:
+            t = self.query_one("#pmp-table", DataTable)
+        except NoMatches:
+            return
+        row = t.cursor_row
+        if 0 <= row < len(self._sorted_usages):
+            self.dismiss(self._sorted_usages[row])
+
+    @on(Button.Pressed, "#btn-pmp-cancel")
+    def _btn_cancel(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class NewPlasmidModal(ModalScreen):
@@ -36923,15 +37518,20 @@ class MutagenizeModal(ModalScreen):
         for f in rec.features:
             if f.type not in ("CDS", "gene"):
                 continue
-            loc = f.location
-            # CompoundLocation (origin-wrap): int(loc.start)/int(loc.end) would
-            # flatten parts into min/max, losing the wrap. Use parts explicitly
-            # so wrap CDS features (end < start) round-trip correctly through
-            # _mut_extract_cds. Single-part FeatureLocation.parts == [self].
-            parts = list(loc.parts) if hasattr(loc, "parts") and loc.parts else [loc]
-            start = int(parts[0].start) % total if total else int(parts[0].start)
-            end   = int(parts[-1].end)   % total if total else int(parts[-1].end)
-            strand = 1 if (loc.strand in (None, 1)) else -1
+            # Route through the canonical wrap-aware bounds helper so a
+            # GenBank file that declares a wrap CDS in head-first order
+            # (`join(1..10, 95..100)` rather than tail-first
+            # `join(95..100, 1..10)`) doesn't silently flatten to the
+            # whole plasmid. Pre-2026-05-11 the loader used
+            # `parts[0].start` / `parts[-1].end` in declared order, which
+            # for head-first ordering yielded `(0, total)` instead of
+            # `(95, 10)`. `_feat_bounds` sorts parts and detects the wrap
+            # via the canonical `parts[0].start == 0` ∧ `parts[-1].end == total`
+            # shape.
+            bounds = _feat_bounds(f, total)
+            if bounds is None:
+                continue
+            start, end, strand = bounds
             label  = (f.qualifiers.get("label") or
                       f.qualifiers.get("gene")  or
                       f.qualifiers.get("product") or [f.type])[0]
@@ -37024,8 +37624,20 @@ class MutagenizeModal(ModalScreen):
 
     def _update_cds_info(self, cds: str, protein: str,
                          strand_label: str = "·") -> None:
-        atg = ("[green]ATG[/green]" if cds.startswith("ATG")
-               else "[yellow]no ATG at 5'[/yellow]")
+        start_codon = cds[:3] if len(cds) >= 3 else ""
+        if start_codon == "ATG":
+            atg = "[green]ATG[/green]"
+        elif start_codon in ("GTG", "TTG"):
+            # Alt-start: `_mut_design_fwd_anneal` unconditionally skips
+            # bp 0..2 and the AATG fusion overhang re-supplies an ATG,
+            # so the alt-start is silently substituted to ATG in the
+            # GB B3-grammar product. Flag it explicitly so the user can
+            # decide whether the substitution is acceptable for their
+            # downstream cloning. Documented 2026-05-11.
+            atg = (f"[yellow]{start_codon} alt-start "
+                   f"→ will be ATG in product (GB B3 AATG overhang)[/yellow]")
+        else:
+            atg = "[yellow]no ATG at 5'[/yellow]"
         stop_tag = cds[-3:] if len(cds) >= 3 else ""
         stop_s = (f"[green]{stop_tag}[/green]" if stop_tag in _MUT_STOPS
                   else f"[yellow]{stop_tag} (no stop)[/yellow]")
@@ -37887,8 +38499,22 @@ class PrimerDesignScreen(Screen):
 
     def on_mount(self) -> None:
         t = self.query_one("#pd-lib-table", DataTable)
-        t.add_columns("Name", "Sequence", "Len", "Tm", "Type", "Source", "Date", "Status")
+        t.add_columns("Name", "Sequence", "Len", "Tm", "Used",
+                        "Type", "Source", "Date", "Status")
+        # Cache for the cross-collection primer-usage index. Populated
+        # off-thread by `_index_usage_worker` on mount. `_refresh_library_table`
+        # reads this for the "Used" column; empty until the worker
+        # finishes, so initial render shows "…".
+        self._primer_usage_index: dict[str, int] = {}
+        self._primer_usage_ready: bool = False
         self._refresh_library_table()
+        # Defer the worker dispatch to the next refresh tick so the
+        # screen is fully mounted before the `@work` decorator routes
+        # through the worker manager. Calling a `@work`-decorated
+        # method directly from `on_mount` was silently dropping on
+        # some Textual versions; `call_after_refresh` is the canonical
+        # post-mount-init hook.
+        self.call_after_refresh(self._index_usage_worker)
         # Source defaults to Feature from map; mode defaults to Detection
         # (the Detection RadioButton has value=True).
         self._switch_source("feature")
@@ -37966,6 +38592,8 @@ class PrimerDesignScreen(Screen):
             ),
         )
         self._row_to_primer_idx = [orig_idx for orig_idx, _ in sorted_pairs]
+        usage_index = getattr(self, "_primer_usage_index", {})
+        usage_ready = getattr(self, "_primer_usage_ready", False)
         for orig_idx, p in sorted_pairs:
             seq    = p.get("sequence", "")
             marked = orig_idx in self._lib_selected
@@ -37981,11 +38609,22 @@ class PrimerDesignScreen(Screen):
                 if isinstance(tm_raw, (int, float))
                 else "—"
             )
+            # "Used" column: how many plasmids across all collections
+            # carry a `primer_bind` feature whose primer sequence
+            # matches this library entry. Shows "…" before the
+            # background scan completes, "—" when scan finished but
+            # this primer isn't used anywhere.
+            if not usage_ready:
+                used_cell = "…"
+            else:
+                n_used = usage_index.get(seq.strip().upper(), 0)
+                used_cell = str(n_used) if n_used > 0 else "—"
             t.add_row(
                 Text(mark + p.get("name", "?"), style="bold"),
                 Text(seq[:30], style="dim color(252)"),
                 f"{len(seq)} nt",
                 tm_cell,
+                used_cell,
                 p.get("primer_type", "?"),
                 p.get("source", ""),
                 p.get("date", ""),
@@ -37993,6 +38632,160 @@ class PrimerDesignScreen(Screen):
             )
         if primers and 0 <= saved_cursor < len(primers):
             t.move_cursor(row=saved_cursor)
+
+    @work(thread=True, exclusive=True, group="primer_usage_index")
+    def _index_usage_worker(self) -> None:
+        """Off-thread scan of every plasmid in every collection to
+        count how many plasmids carry each primer in the primer
+        library. Result lands in ``self._primer_usage_index`` and the
+        table re-renders with the new counts.
+
+        Fast path (regex extract of `/primer_seq="..."` qualifiers)
+        keeps the scan under 1 s on a ~600-plasmid library; SeqIO
+        fallback only fires for plasmids with `primer_bind` features
+        but no stamped qualifier. Cached at module scope so subsequent
+        opens are instant (invalidated on `_save_library` /
+        `_save_collections`). Toast surfaces on the FIRST fresh scan
+        per session so the user knows it's running.
+        """
+        # Check cache state BEFORE the call so we know whether this
+        # is a fresh scan worth toasting about. Cache-hit returns
+        # instantly and a toast would be noise.
+        fresh = (globals().get("_primer_usage_cache") is None)
+        if fresh:
+            self.app.call_from_thread(
+                self.app.notify,
+                "Indexing primer usage across collections…",
+                timeout=4,
+            )
+        _log.info("primer-usage worker: scan starting (fresh=%s)", fresh)
+        try:
+            usage = _index_primer_usage_in_collections()
+        except Exception:
+            _log.exception("primer-usage worker: scan crashed")
+            usage = {}
+        _log.info("primer-usage worker: scan done, %d sequences", len(usage))
+        try:
+            self.app.call_from_thread(
+                self._on_primer_usage_indexed, usage
+            )
+        except Exception:
+            _log.exception(
+                "primer-usage worker: callback dispatch failed"
+            )
+
+    def _on_primer_usage_indexed(self, usage: "dict[str, int]") -> None:
+        """UI-thread callback for `_index_usage_worker`. Stores the
+        index and refreshes the table so the "Used" column flips
+        from "…" placeholders to real counts."""
+        if not self.is_mounted:
+            _log.info(
+                "primer-usage callback: screen unmounted, dropping result"
+            )
+            return
+        self._primer_usage_index = usage
+        self._primer_usage_ready = True
+        _log.info(
+            "primer-usage callback: refreshing table with %d counts",
+            len(usage),
+        )
+        try:
+            self._refresh_library_table()
+        except Exception:
+            _log.exception(
+                "primer-usage callback: table refresh failed"
+            )
+
+    @on(DataTable.RowSelected, "#pd-lib-table")
+    def _on_lib_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Enter or click-on-cursor-row in the primer library table:
+        open `PrimerPlasmidsModal` showing every plasmid in every
+        collection whose `primer_bind` feature matches this primer's
+        sequence. Picking a plasmid from that modal dismisses both
+        modals and routes through `PlasmidApp._goto_primer_in_plasmid`
+        to load the plasmid and scroll the seq cursor to the primer's
+        binding region.
+
+        The lookup runs off-thread because a primer used in 100+
+        plasmids costs a SeqIO-parse on each match (~50 ms / plasmid).
+        Toast confirms the search kicked off so the user knows
+        something is happening during the 1–5 s gap.
+        """
+        row = event.cursor_row
+        if not (0 <= row < len(self._row_to_primer_idx)):
+            return
+        orig_idx = self._row_to_primer_idx[row]
+        primers = _load_primers()
+        if not (0 <= orig_idx < len(primers)):
+            return
+        primer = primers[orig_idx]
+        seq = (primer.get("sequence") or "").strip().upper()
+        if not seq:
+            self.app.notify(
+                "This primer has no sequence stored.",
+                severity="warning",
+            )
+            return
+        self.app.notify(
+            f"Finding plasmids using "
+            f"'{primer.get('name', '?')}'…",
+            timeout=3,
+        )
+        self._find_usages_worker(primer, seq)
+
+    @work(thread=True, exclusive=True, group="primer_usages_lookup")
+    def _find_usages_worker(self, primer: dict, seq: str) -> None:
+        """Off-thread per-primer plasmid-usage lookup. Falls back to
+        an empty list on any exception (logged) so the UI never gets
+        stuck waiting for a callback."""
+        _log.info(
+            "primer-usages lookup: %r (len=%d)",
+            primer.get("name", "?"), len(seq),
+        )
+        try:
+            usages = _find_primer_plasmid_usages(seq)
+        except Exception:
+            _log.exception("primer-usages lookup: crashed")
+            usages = []
+        _log.info(
+            "primer-usages lookup: %d usage(s) for %r",
+            len(usages), primer.get("name", "?"),
+        )
+        self.app.call_from_thread(
+            self._on_usages_found, primer, usages,
+        )
+
+    def _on_usages_found(self, primer: dict,
+                          usages: "list[dict]") -> None:
+        """UI-thread callback for `_find_usages_worker`. Pushes the
+        `PrimerPlasmidsModal` with the discovered usages."""
+        if not self.is_mounted:
+            return
+        if not usages:
+            self.app.notify(
+                f"'{primer.get('name', '?')}' isn't bound on any "
+                f"plasmid in your collections.",
+                severity="information",
+            )
+            return
+
+        def _on_pick(usage: "dict | None") -> None:
+            if usage is None:
+                return
+            # Dismiss this screen first so the main canvas is on top,
+            # then schedule navigation on the next refresh tick so the
+            # widgets the navigator touches (seq panel, plasmid map,
+            # library panel) are fully visible/active.
+            app = self.app
+            self.dismiss()
+            app.call_after_refresh(
+                app._goto_primer_in_plasmid, usage
+            )
+
+        self.app.push_screen(
+            PrimerPlasmidsModal(primer, usages),
+            callback=_on_pick,
+        )
 
     # ── GB type selector ─────────────────────────────────────────────────
 
@@ -45138,19 +45931,72 @@ SpeciesPickerModal { align: center middle; }
             annotations=dict(src.annotations),
         )
 
+        # Detect canonical wrap form (`parts[0].start == 0` ∧
+        # `parts[-1].end == src_total`) so an insert at bp 0 or bp
+        # `src_total` (the two origin-equivalent positions on a circular
+        # plasmid) can be handled to preserve the wrap. Pre-2026-05-11
+        # both endpoints broke canonical form: bp-0 insert shifted both
+        # halves equally (head no longer anchored at 0), bp-total insert
+        # left the tail anchored at the OLD total (no longer the new
+        # total). Either way `_feat_bounds` then fell through to its
+        # lossy "outer bounds" branch and the feature rendered as the
+        # backbone gap.
+        src_total = len(src.seq) if hasattr(src, "seq") else 0
+
         for feat in src.features:
             loc = feat.location
             if isinstance(loc, CompoundLocation):
-                new_parts = []
-                for part in loc.parts:
-                    shifted = _shift_range(int(part.start), int(part.end))
-                    if shifted is None:
-                        continue
-                    n_fs, n_fe = shifted
-                    new_parts.append(FeatureLocation(
-                        n_fs, n_fe,
-                        strand=getattr(part, "strand", None),
-                    ))
+                # Wrap-canonical-form preservation for origin-edge inserts.
+                parts_sorted = sorted(
+                    loc.parts, key=lambda p: int(p.start)
+                )
+                is_wrap_canonical = (
+                    mode == "insert"
+                    and src_total > 0
+                    and len(parts_sorted) == 2
+                    and int(parts_sorted[0].start) == 0
+                    and int(parts_sorted[-1].end) == src_total
+                    and int(parts_sorted[0].end) < int(parts_sorted[-1].start)
+                )
+                if is_wrap_canonical and s == 0 and ins_len > 0:
+                    head_part = parts_sorted[0]
+                    tail_part = parts_sorted[-1]
+                    new_parts = [
+                        FeatureLocation(
+                            0, int(head_part.end) + ins_len,
+                            strand=getattr(head_part, "strand", None),
+                        ),
+                        FeatureLocation(
+                            int(tail_part.start) + ins_len,
+                            int(tail_part.end)   + ins_len,
+                            strand=getattr(tail_part, "strand", None),
+                        ),
+                    ]
+                elif is_wrap_canonical and s == src_total and ins_len > 0:
+                    head_part = parts_sorted[0]
+                    tail_part = parts_sorted[-1]
+                    new_parts = [
+                        FeatureLocation(
+                            0, int(head_part.end),
+                            strand=getattr(head_part, "strand", None),
+                        ),
+                        FeatureLocation(
+                            int(tail_part.start),
+                            int(tail_part.end) + ins_len,
+                            strand=getattr(tail_part, "strand", None),
+                        ),
+                    ]
+                else:
+                    new_parts = []
+                    for part in loc.parts:
+                        shifted = _shift_range(int(part.start), int(part.end))
+                        if shifted is None:
+                            continue
+                        n_fs, n_fe = shifted
+                        new_parts.append(FeatureLocation(
+                            n_fs, n_fe,
+                            strand=getattr(part, "strand", None),
+                        ))
                 if not new_parts:
                     continue  # feature entirely consumed
                 if len(new_parts) == 1:
@@ -45837,8 +46683,9 @@ SpeciesPickerModal { align: center middle; }
             # translating so the copied AA string matches the AA
             # letters rendered above the DNA.
             exons = aa_feat.get("_exons")
+            cs    = int(aa_feat.get("codon_start", 1))
             aa_str = _translate_cds(
-                seq, f_s, f_e, strand, exons=exons,
+                seq, f_s, f_e, strand, exons=exons, codon_start=cs,
             ).rstrip("*")
             # Route through the 4-tier helper so a clipboard-broken
             # SSH session still gets the AA string via the disk-fallback
@@ -48466,6 +49313,222 @@ SpeciesPickerModal { align: center middle; }
                            event.entry.get("name", "?"))
             self.notify(f"Failed to load from library: {exc}", severity="error")
 
+    def _goto_primer_in_plasmid(self, usage: "dict") -> None:
+        """Navigate from the primer library to a specific plasmid +
+        scroll the seq-panel cursor to the primer's binding region.
+
+        Called from `PrimerDesignScreen._on_usages_found`'s
+        `_on_pick` callback when the user picks a plasmid from
+        `PrimerPlasmidsModal`. Steps:
+
+          1. Switch the active collection if needed (mirrors the
+             collection-picker flow — writes the persisted active
+             pointer + repopulates the LibraryPanel).
+          2. Locate the plasmid entry in the freshly-loaded library.
+          3. Apply the record (same path `_library_load` uses, with
+             the LOCUS-already-loaded short-circuit).
+          4. Find the `primer_bind` feature dict matching the usage
+             coordinates in the loaded record's feature list.
+          5. Call `_focus_feature(feat, bp=feat["start"])` — same
+             entry point a sequence-panel feature click goes through,
+             so sidebar / plasmid-map highlighting matches.
+
+        Falls back to a bare cursor-jump (no feature highlight) if
+        the primer_bind feature can't be located in the loaded
+        record — covers the edge case where the library entry got
+        edited between the PrimerPlasmidsModal scan and this navigation.
+
+        Outer try/except surfaces any unexpected error as a notify so
+        a typo in the usage dict (e.g., from an agent caller) doesn't
+        propagate as a raw traceback into the app event loop.
+        """
+        try:
+            self._goto_primer_in_plasmid_inner(usage)
+        except Exception as exc:
+            _log.exception("primer-goto: unexpected failure")
+            self.notify(
+                f"Couldn't jump to primer: {exc}",
+                severity="error", markup=False,
+            )
+
+    def _goto_primer_in_plasmid_inner(self, usage: "dict") -> None:
+        """Body of `_goto_primer_in_plasmid`; the outer wrapper
+        catches uncaught exceptions and surfaces a toast."""
+        if not isinstance(usage, dict):
+            return
+        coll = usage.get("collection") or ""
+        plasmid_id = (usage.get("plasmid_id") or "")
+        start = int(usage.get("start") or 0)
+        end = int(usage.get("end") or 0)
+        # Step 1: switch active collection.
+        current_coll = _get_active_collection_name()
+        if coll and coll != current_coll:
+            _set_active_collection_name(coll)
+            # Refresh LibraryPanel so the plasmid list reflects the
+            # new active collection. Same flow as the collections-picker
+            # callback uses.
+            try:
+                lib = self.query_one("#library", LibraryPanel)
+            except (NoMatches, AttributeError):
+                lib = None
+            if lib is not None:
+                try:
+                    lib._view_mode = "plasmids"
+                    lib._apply_view_mode()
+                    lib._repopulate_plasmids()
+                except Exception:
+                    _log.exception(
+                        "primer-goto: LibraryPanel refresh failed"
+                    )
+        # Step 2: find the plasmid entry in the (now-active) library.
+        entries = _load_library()
+        target_entry = None
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            if (plasmid_id
+                    and (e.get("id") == plasmid_id
+                          or e.get("name") == plasmid_id)):
+                target_entry = e
+                break
+        if target_entry is None:
+            self.notify(
+                f"Plasmid '{plasmid_id}' not found in collection "
+                f"'{coll}' — was it deleted?",
+                severity="warning",
+            )
+            return
+        # Step 3: load the record (with the same already-loaded
+        # short-circuit as `_library_load`).
+        gb_text = target_entry.get("gb_text", "")
+        if not gb_text:
+            self.notify(
+                f"Plasmid '{target_entry.get('name', '?')}' has no "
+                f"stored sequence.",
+                severity="warning",
+            )
+            return
+        entry_id = target_entry.get("id")
+        already_loaded = (
+            entry_id and self._current_record is not None
+            and getattr(self._current_record, "id", None) == entry_id
+        )
+        if not already_loaded:
+            try:
+                record = _gb_text_to_record(gb_text)
+                self._apply_record(record)
+            except Exception as exc:
+                _log.exception(
+                    "primer-goto: load failed for %r",
+                    target_entry.get("name", "?"),
+                )
+                self.notify(
+                    f"Failed to load plasmid: {exc}",
+                    severity="error",
+                )
+                return
+        # Step 4: locate the matching primer_bind feature + record
+        # its index in `pm._feats` for the cascade below.
+        try:
+            pm = self.query_one("#plasmid-map", PlasmidMap)
+        except NoMatches:
+            return
+        target_feat = None
+        target_idx = -1
+        # Exact bounds match first.
+        for i, f in enumerate(pm._feats):
+            if (f.get("type") == "primer_bind"
+                    and f.get("start") == start
+                    and f.get("end") == end):
+                target_feat = f
+                target_idx = i
+                break
+        # Fallback: any primer_bind whose span overlaps the target
+        # range. Covers the edge case where the feature shifted after
+        # an unrelated edit but the primer is still there.
+        if target_feat is None:
+            for i, f in enumerate(pm._feats):
+                if f.get("type") != "primer_bind":
+                    continue
+                fs = f.get("start", 0)
+                fe = f.get("end", 0)
+                if fs <= start < fe or fs < end <= fe:
+                    target_feat = f
+                    target_idx = i
+                    break
+        # Step 5a: highlight the loaded plasmid in the LibraryPanel
+        # (mirrors the click-on-library-row flow — `reveal_entry_id`
+        # switches to the plasmids view, clears any active search
+        # filter, repopulates, and moves the cursor to the row).
+        try:
+            lib = self.query_one("#library", LibraryPanel)
+        except (NoMatches, AttributeError):
+            lib = None
+        if lib is not None and entry_id:
+            try:
+                lib.reveal_entry_id(entry_id)
+            except Exception:
+                _log.exception(
+                    "primer-goto: LibraryPanel reveal_entry_id failed"
+                )
+        if target_feat is None:
+            # Primer feature not present in the loaded record —
+            # park the cursor at the recorded start so the user
+            # can at least see where the primer used to land.
+            try:
+                sp = self.query_one("#seq-panel", SequencePanel)
+                total = len(sp._seq) or 1
+                sp._cursor_pos = max(0, min(start, total - 1))
+                sp._refresh_view()
+                sp._ensure_cursor_visible()
+            except (NoMatches, AttributeError):
+                pass
+            self.notify(
+                "Loaded plasmid, but the primer_bind feature isn't "
+                "on it anymore — moved cursor to its recorded "
+                "position. Re-open the primer library to refresh "
+                "the usage index.",
+                severity="warning",
+                markup=False,
+            )
+            return
+        # Step 5b: full feature-pick cascade. Same set of method calls
+        # the seq-panel / sidebar / plasmid-map click handlers fire
+        # (see `_seq_click`, `_sidebar_row_activated`,
+        # `_plasmid_map_click`), so every panel ends up in the
+        # "clicked this feature" state.
+        try:
+            sidebar = self.query_one("#sidebar", FeatureSidebar)
+        except (NoMatches, AttributeError):
+            sidebar = None
+        try:
+            pm.select_feature(target_idx)
+        except Exception:
+            _log.exception(
+                "primer-goto: PlasmidMap.select_feature failed"
+            )
+        if sidebar is not None:
+            try:
+                sidebar.show_detail(target_feat)
+            except Exception:
+                _log.exception(
+                    "primer-goto: FeatureSidebar.show_detail failed"
+                )
+            try:
+                sidebar.highlight_row(target_idx)
+            except Exception:
+                _log.exception(
+                    "primer-goto: FeatureSidebar.highlight_row failed"
+                )
+        # Seq-panel + cursor + scroll. `_focus_feature` is the
+        # single-source UX for "user picked a feature" — it handles
+        # the wrap-aware highlight, cursor-on-5'-end placement, and
+        # viewport scroll under one call.
+        self._focus_feature(
+            target_feat,
+            bp=int(target_feat.get("start", 0) or 0),
+        )
+
     @on(LibraryPanel.AddCurrentRequested)
     def _library_add_current(self, _):
         # 2026-05-07: re-routed from `action_add_to_library` (which
@@ -49252,14 +50315,22 @@ SpeciesPickerModal { align: center middle; }
         feat_seq = _rc(fwd_slice) if strand == -1 else fwd_slice
         quals: dict = {}
         if self._current_record is not None:
+            total = len(seq)
             for bf in getattr(self._current_record, "features", []) or []:
                 if bf.type != feat.get("type"):
                     continue
-                try:
-                    bs = int(bf.location.start)
-                    be = int(bf.location.end)
-                except (TypeError, ValueError):
+                # Route through `_feat_bounds` so a wrap CompoundLocation
+                # doesn't flatten to (0, total) and silently miss the
+                # match against the wrap dict-feature's (s, e) pair.
+                # Pre-2026-05-11 used raw `int(bf.location.start)` which
+                # Biopython returns as `min(part.start)` for a Compound —
+                # zero for any canonical wrap — so the comparison
+                # never fired and gene/product/note qualifiers dropped
+                # silently from the prefill.
+                bounds = _feat_bounds(bf, total)
+                if bounds is None:
                     continue
+                bs, be, _bf_strand = bounds
                 if (bs, be) in ((s, e), (e, s)):
                     quals = {k: list(v) if isinstance(v, (list, tuple)) else [v]
                              for k, v in (bf.qualifiers or {}).items()}
