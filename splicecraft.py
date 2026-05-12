@@ -3364,14 +3364,22 @@ def _feat_bounds(feat, total: int) -> "tuple[int, int, int] | None":
 
 
 def _feat_span_label(start: int, end: int, total: int) -> str:
-    """Human-readable span for a feature dict's (start, end). Wrap
-    features render as ``"start..0..end"`` so the picker dropdown reflects
-    the actual biology rather than printing a misleading linear span
-    that looks like the backbone gap. Coords are kept 0-based (matches
-    every other in-app display)."""
+    """Human-readable span for a feature dict's (start, end). Coords
+    are GenBank-style 1-based inclusive: start gets ``+1``, end is
+    unchanged (0-based exclusive == 1-based inclusive numerically).
+
+    Wrap features (``end < start``) render as ``"S+1..0..E"`` so the
+    picker dropdown reflects the actual biology rather than printing a
+    misleading linear span that looks like the backbone gap.
+
+    Pre-fix this returned raw 0-based coords with the docstring claiming
+    "matches every other in-app display" — but the sidebar / tooltip /
+    primer-plasmids / domesticator dropdowns are all 1-based, so the
+    FeatureSearch + trad-cloning span columns silently disagreed by
+    one with every other coord display in the app."""
     if end < start:
-        return f"{start}..0..{end}"
-    return f"{start}..{end}"
+        return f"{start + 1}..0..{end}"
+    return f"{start + 1}..{end}"
 
 
 # Pre-built per-enzyme scan records: immutable derived values (compiled pattern,
@@ -8016,17 +8024,27 @@ def _pairwise_align(query_seq: str, target_seq: str,
         else:
             n_mismatches += 1
     aligned_cols = max(1, n_matches + n_mismatches + n_gaps)
+    # `identity_pct` is gap-inclusive (BLAST convention). For global
+    # alignment of length-mismatched pairs (e.g. a 200 bp insert vs a
+    # 5 kb backbone) the denominator is dominated by gap columns and
+    # identity collapses to single digits even when the aligned region
+    # is 100% matched. `ungapped_identity_pct` divides by aligned
+    # positions only, which is what the user usually wants for "how
+    # well does the aligned region match" — surfaced in the summary
+    # to disambiguate.
+    ungapped_cols = max(1, n_matches + n_mismatches)
     return {
-        "mode":         mode,
-        "score":        float(first.score),
-        "identity_pct": 100.0 * n_matches / aligned_cols,
-        "aligned_q":    aligned_q,
-        "aligned_t":    aligned_t,
-        "n_matches":    n_matches,
-        "n_mismatches": n_mismatches,
-        "n_gaps":       n_gaps,
-        "q_len":        len(q),
-        "t_len":        len(t),
+        "mode":                  mode,
+        "score":                 float(first.score),
+        "identity_pct":          100.0 * n_matches / aligned_cols,
+        "ungapped_identity_pct": 100.0 * n_matches / ungapped_cols,
+        "aligned_q":             aligned_q,
+        "aligned_t":             aligned_t,
+        "n_matches":             n_matches,
+        "n_mismatches":          n_mismatches,
+        "n_gaps":                n_gaps,
+        "q_len":                 len(q),
+        "t_len":                 len(t),
     }
 
 
@@ -10068,7 +10086,15 @@ class FeatureSidebar(Widget):
             for feat_i in sorted_feat_idxs:
                 f = feats[feat_i]
                 strand_sym = "+" if f["strand"] == 1 else ("−" if f["strand"] == -1 else "·")
-                bp_str     = f"{f['start']+1}‥{f['end']}"
+                # Wrap-aware: end<start means the feature crosses the
+                # origin. Show "S+1‥0‥E" so the user can tell at a
+                # glance vs a linear span — pre-fix wrap features
+                # rendered as "5801‥200" which could be misread as a
+                # bug (end-before-start would imply broken data).
+                if f["end"] < f["start"]:
+                    bp_str = f"{f['start']+1}‥0‥{f['end']}"
+                else:
+                    bp_str = f"{f['start']+1}‥{f['end']}"
                 t.add_row(
                     Text(f["type"][:12],  style=f["color"]),
                     Text(f["label"][:14], style=f["color"]),
@@ -11011,8 +11037,13 @@ class LibraryPanel(Widget):
 
     # ── Plasmid view: existing flow + back button ──────────────────────────
 
-    def add_entry(self, record) -> None:
+    def add_entry(self, record) -> bool:
         """Serialize record and persist into the active collection.
+
+        Returns True on a successful save, False on disk failure
+        (the caller can use this to gate a "saved" notification —
+        without it, callers fire success toasts on top of the error
+        toast `_notify_save_failure` already emits).
 
         Preserves any existing workflow `status` on the entry —
         re-saving a plasmid that was already marked VERIFIED keeps
@@ -11044,10 +11075,11 @@ class LibraryPanel(Widget):
             # per invariant #7. Surface to the user rather than letting
             # a raw stacktrace exit the key-press handler.
             _notify_save_failure(self.app, "Plasmid library", exc)
-            return
+            return False
         if self._view_mode == "plasmids":
             self._apply_panel_width()
             self._repopulate_plasmids()
+        return True
 
     def reveal_entry_id(self, entry_id: str) -> None:
         """Switch to the plasmids view, repopulate, and move the
@@ -11496,7 +11528,11 @@ class LibraryPanel(Widget):
                 "plasmids":    plasmids,
                 "saved":       _date.today().isoformat(),
             })
-            _save_collections(existing)
+            try:
+                _save_collections(existing)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Collections", exc)
+                return
             self._repopulate_collections()
         modal_ref = NewCollectionModal()
         self.app.push_screen(modal_ref, callback=_picked)
@@ -11540,7 +11576,11 @@ class LibraryPanel(Widget):
 
                 remaining = [c for c in _load_collections()
                              if c.get("name") != name]
-                _save_collections(remaining)
+                try:
+                    _save_collections(remaining)
+                except (OSError, RuntimeError) as exc:
+                    _notify_save_failure(self.app, "Collections", exc)
+                    return
                 # If the deleted collection was active, fall back to
                 # the first remaining collection (or default) so the
                 # library file mirrors something sensible. Without
@@ -11558,7 +11598,12 @@ class LibraryPanel(Widget):
                              else None) or []
                         ) if isinstance(p, dict)
                     ]
-                    _save_library(fallback_plasmids)
+                    try:
+                        _save_library(fallback_plasmids)
+                    except (OSError, RuntimeError) as exc:
+                        _notify_save_failure(
+                            self.app, "Plasmid library", exc)
+                        return
                 self._repopulate_collections()
                 # If the loaded record came from the deleted
                 # collection, clear the canvas — its source is gone.
@@ -11603,7 +11648,11 @@ class LibraryPanel(Widget):
                 if c.get("name") == old:
                     c["name"] = new_name
                     break
-            _save_collections(existing)
+            try:
+                _save_collections(existing)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Collections", exc)
+                return
             if _get_active_collection_name() == old:
                 _set_active_collection_name(new_name)
             self._repopulate_collections()
@@ -25343,17 +25392,23 @@ class PrimerDuplicatesModal(ModalScreen):
         to_remove = self._seq_duplicates + self._name_collisions
         lines: list[str] = []
         if self._seq_duplicates:
+            # `_seq_duplicates` is the number of entries that WOULD
+            # BE REMOVED, not the number that share — for a group of
+            # 3 primers with the same sequence we'd remove 2 and keep
+            # 1. Pre-fix this said "{2} entries share a DNA sequence"
+            # which under-counts the actual sharers.
             lines.append(
                 f"• {self._seq_duplicates} entr"
                 f"{'ies' if self._seq_duplicates != 1 else 'y'} "
-                f"share a DNA sequence with another entry"
+                f"would be removed for sharing a DNA sequence "
+                f"(longest preserved per group)"
             )
         if self._name_collisions:
             lines.append(
                 f"• {self._name_collisions} entr"
                 f"{'ies' if self._name_collisions != 1 else 'y'} "
-                f"share a name with another entry (longest sequence "
-                f"per name will be kept)"
+                f"would be removed for sharing a name "
+                f"(longest sequence preserved per name)"
             )
         breakdown = "\n".join(lines)
         with Vertical(id="pdup-dlg"):
@@ -25812,7 +25867,11 @@ class NewPlasmidModal(ModalScreen):
         promoted: list[dict] = []
         seen_spans: dict[tuple[int, int, int], dict] = {}
         for h in hits:
-            if h.get("identity_pct", 0.0) < min_id:
+            # HMMER / score-only hits have identity_pct=None (no
+            # per-domain alignment). Skip — they don't meet a
+            # numeric min_id threshold by definition.
+            ident = h.get("identity_pct")
+            if ident is None or ident < min_id:
                 continue
             q_start = int(h.get("q_start", 0))
             q_end   = int(h.get("q_end", 0))
@@ -25825,6 +25884,14 @@ class NewPlasmidModal(ModalScreen):
                 continue
             sub_name = (h.get("subject_name") or h.get("subject_id")
                         or "BLAST hit")
+            aln_len = h.get("aligned_len")
+            note = (
+                f"BLAST {h.get('subject_collection', '?')}"
+                f" / {h.get('subject_id', '?')} "
+                f"id={ident}%"
+            )
+            if aln_len is not None:
+                note += f" len={aln_len}"
             seen_spans[key] = {
                 "name":         str(sub_name)[:80],
                 "feature_type": "misc_feature",
@@ -25835,12 +25902,7 @@ class NewPlasmidModal(ModalScreen):
                 "color":        "",
                 "qualifiers":   {
                     "label": [str(sub_name)[:80]],
-                    "note":  [(
-                        f"BLAST {h.get('subject_collection', '?')}"
-                        f" / {h.get('subject_id', '?')} "
-                        f"id={h.get('identity_pct', 0)}% "
-                        f"len={h.get('aligned_len', 0)}"
-                    )],
+                    "note":  [note],
                 },
                 "description": "BLAST hit",
                 "score":       h.get("score", 0),
@@ -26756,8 +26818,12 @@ def _blast_search_pyhmmer(query: str, db: dict, *,
 
             doms = list(h.domains or [])
             if not doms:
-                # Score-only hit (no per-domain breakdown). Fall back
-                # to whole-query / whole-subject bounds.
+                # Score-only hit (no per-domain breakdown). No
+                # alignment data → identity / aligned_len / matches
+                # are unknown (None renders as "—"). Pre-fix this
+                # path stored -log10(evalue) under identity_pct and
+                # len(query) under aligned_len, which mislabeled
+                # e-value confidence as "% identity" in the table.
                 hits_out.append({
                     "subject_idx":        sub_idx,
                     "subject_id":         sub.get("id", name),
@@ -26770,10 +26836,9 @@ def _blast_search_pyhmmer(query: str, db: dict, *,
                     "s_start":            0,
                     "s_end":              sub.get("length", 0),
                     "score":              round(float(h.score), 1),
-                    "matches":            0,
-                    "aligned_len":        len(query),
-                    "identity_pct":       round(min(100.0, max(
-                        0.0, -math.log10(evalue))), 1),
+                    "matches":            None,
+                    "aligned_len":        None,
+                    "identity_pct":       None,
                     "evalue":             evalue,
                 })
                 continue
@@ -27015,6 +27080,7 @@ def _hmmscan_run(query_protein: str,
                 if h.score is None:
                     continue
                 doms = list(h.domains or [])
+                evalue = h.evalue if h.evalue and h.evalue > 0 else 1e-300
                 if doms:
                     best_dom = max(doms, key=lambda d: d.score)
                     ali = best_dom.alignment
@@ -27022,18 +27088,21 @@ def _hmmscan_run(query_protein: str,
                     q_end   = ali.target_to
                     s_start = ali.hmm_from - 1
                     s_end   = ali.hmm_to
+                    matches, aligned_len = _pyhmmer_alignment_identity(ali)
+                    identity_pct = (round(matches / aligned_len * 100.0, 1)
+                                     if aligned_len > 0 else None)
                 else:
                     q_start = 0
                     q_end   = len(cleaned)
                     s_start = 0
                     s_end   = 0
-                # HMMER e-value is "expected count of false hits this
-                # good or better"; treat low e-value as high confidence.
-                # Map to a 0-100 "id %"-ish display number for table
-                # consistency: -log10(evalue) capped at 100.
-                import math
-                evalue = h.evalue if h.evalue and h.evalue > 0 else 1e-300
-                conf_pct = round(min(100.0, max(0.0, -math.log10(evalue))), 1)
+                    # No domain alignment data → identity / aligned_len
+                    # unknown. Pre-fix stored -log10(evalue) under
+                    # identity_pct, which mislabeled confidence as
+                    # "% identity" in the results table.
+                    matches      = None
+                    aligned_len  = None
+                    identity_pct = None
                 # pyhmmer ≥0.10 sometimes returns Hit.name as `bytes`,
                 # other releases as `str`; handle both shapes.
                 def _to_str(v):
@@ -27055,9 +27124,9 @@ def _hmmscan_run(query_protein: str,
                     "s_start":            s_start,
                     "s_end":              s_end,
                     "score":              round(h.score, 1),
-                    "matches":            q_end - q_start,
-                    "aligned_len":        q_end - q_start,
-                    "identity_pct":       conf_pct,
+                    "matches":            matches,
+                    "aligned_len":        aligned_len,
+                    "identity_pct":       identity_pct,
                     "evalue":             evalue,
                 })
             # We only care about the first (and only) query's TopHits.
@@ -27253,6 +27322,19 @@ class BlastModal(ModalScreen):
             self.query_one("#blast-results", Static).update(msg)
         except NoMatches:
             pass
+
+    @on(Select.Changed, "#blast-program")
+    @on(Select.Changed, "#blast-source")
+    def _on_program_or_source_changed(self, _: Select.Changed) -> None:
+        """Clear the results / status panes when the user switches
+        program (BLASTN ↔ BLASTP ↔ HMMscan) or source collection so the
+        previous run's table doesn't claim to describe whatever's now
+        selected. Pre-fix the user could swap BLASTN→BLASTP and still
+        see the BLASTN results table + "17 HSPs found" status."""
+        if not self.is_mounted:
+            return
+        self._safe_status("[dim]Run to see results.[/dim]")
+        self._safe_results("")
 
     @on(Button.Pressed, "#btn-blast-run")
     def _run(self) -> None:
@@ -27589,15 +27671,25 @@ class BlastModal(ModalScreen):
                  f"hits={len(hits)}",
                  header]
         for h in hits:
-            name = _esc(str(h.get("subject_name") or h.get("subject_id")
-                              or "?"))[:28]
-            coll = _esc(str(h.get("subject_collection") or "?"))[:14]
+            # Truncate with ellipsis so two plasmids whose names share
+            # the first 28 chars don't appear identical in the table.
+            name_raw = str(h.get("subject_name") or h.get("subject_id") or "?")
+            coll_raw = str(h.get("subject_collection") or "?")
+            name = _esc(name_raw[:27] + "…" if len(name_raw) > 28
+                         else name_raw)
+            coll = _esc(coll_raw[:13] + "…" if len(coll_raw) > 14
+                         else coll_raw)
             q_rng = f"{h['q_start']+1}-{h['q_end']}"
             strand_marker = "" if h["strand"] >= 0 else "(–)"
             s_rng = f"{h['s_start']+1}-{h['s_end']}{strand_marker}"
+            # `aligned_len` / `identity_pct` are None for HMMER /
+            # BLASTP score-only hits where no per-domain alignment is
+            # available — render as "—" rather than faking a number.
+            aln_disp = "—" if h.get("aligned_len") is None else f"{h['aligned_len']}"
+            id_disp  = "—" if h.get("identity_pct") is None else f"{h['identity_pct']}"
             row = (f"{name:<28} {coll:<14} {q_rng:>10}  "
-                   f"{s_rng:>11}  {h['aligned_len']:>5} "
-                   f"{h['score']:>6} {h['identity_pct']:>5}")
+                   f"{s_rng:>11}  {aln_disp:>5} "
+                   f"{h['score']:>6} {id_disp:>5}")
             if has_evalue:
                 e = h.get("evalue", 1.0)
                 # Compact scientific notation: 2.3e-15 → "2.3e-15"
@@ -31154,7 +31246,11 @@ class PartsBinModal(Screen):
             part_dict.setdefault("level", 0)
             entries = _load_parts_bin()
             entries.insert(0, part_dict)
-            _save_parts_bin(entries)
+            try:
+                _save_parts_bin(entries)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Parts bin", exc)
+                return
             self._populate()
             self.app.notify(
                 f"Saved '{part_dict['name']}' to Parts Bin "
@@ -31596,7 +31692,12 @@ class PartsBinModal(Screen):
             try:
                 reason = _diagnose_part_cloning(r)
                 rec = _part_to_cloned_seqrecord(r)
-                lib.add_entry(rec)
+                if not lib.add_entry(rec):
+                    # add_entry handled the user-facing error notify
+                    # internally; just track it as a failure so the
+                    # toast count doesn't claim it succeeded.
+                    failed.append(r.get("name", "?"))
+                    continue
                 saved_names.append(rec.name)
                 if reason:
                     diagnostics.append((r.get("name", "?"), reason))
@@ -32397,6 +32498,12 @@ class PlasmidsaurusAlignModal(ModalScreen):
         self._zip_path: "Path | None" = None
         self._members: list[dict] = []
         self._selected_member: "str | None" = None
+        # Cancel flag for the alignment worker. The PairwiseAligner
+        # C-loop can't be interrupted (invariant #28), so cancel is
+        # cooperative — the worker checks this before pushing the
+        # AlignmentScreen, otherwise the user clicks Cancel and a
+        # full-screen result still pops up seconds later.
+        self._cancelled: bool = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="align-box"):
@@ -32627,6 +32734,12 @@ class PlasmidsaurusAlignModal(ModalScreen):
             if (getattr(self.app, "_record_load_counter", 0)
                     != entry_counter):
                 return
+            # Cancel guard: the C-loop can't be cancelled mid-flight,
+            # so if the user clicked Cancel while it ran, the result
+            # is still here. Don't surface it — pushing AlignmentScreen
+            # after the modal dismissed surprises the user.
+            if self._cancelled:
+                return
             self.app.push_screen(
                 AlignmentScreen(
                     query_label=query_label,
@@ -32640,9 +32753,11 @@ class PlasmidsaurusAlignModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-align-cancel")
     def _cancel_btn(self, _) -> None:
+        self._cancelled = True
         self.dismiss(None)
 
     def action_cancel(self) -> None:
+        self._cancelled = True
         self.dismiss(None)
 
 
@@ -32724,12 +32839,24 @@ class AlignmentScreen(Screen):
 
     def _summary_md(self) -> str:
         r = self._result
+        # Show both identity flavors so a user aligning length-
+        # mismatched plasmids isn't misled by the gap-inflated
+        # BLAST-style figure. `identity_pct` divides by ALL aligned
+        # columns (including gaps) — for a 200 bp insert vs 5 kb
+        # backbone the denominator is gap-dominated and the figure
+        # collapses to ~4% even when the insert region is 100%
+        # matched. `ungapped_identity_pct` divides only by matched
+        # + mismatched columns and reports the "how well does the
+        # aligned region match" number most users want.
+        ident_total   = r['identity_pct']
+        ident_ungap   = r.get('ungapped_identity_pct', ident_total)
         return (
             f"**Query**: `{_esc_md(self._query_label)}`  "
             f"({r['q_len']:,} bp)  \n"
             f"**Target**: `{_esc_md(self._target_label)}`  "
             f"({r['t_len']:,} bp)  \n"
-            f"**Identity**: {r['identity_pct']:.2f}%  ·  "
+            f"**Identity**: {ident_total:.2f}% "
+            f"(gap-inclusive) · {ident_ungap:.2f}% (aligned only)  ·  "
             f"**Score**: {r['score']:.0f}  ·  "
             f"**Matches**: {r['n_matches']:,}  ·  "
             f"**Mismatches**: {r['n_mismatches']:,}  ·  "
@@ -33774,7 +33901,11 @@ class DomesticatorModal(ModalScreen):
         by_name = {r["name"] for r in new_rows}
         entries = [e for e in entries if e.get("name") not in by_name]
         entries = new_rows + entries
-        _save_primers(entries)
+        try:
+            _save_primers(entries)
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(self.app, "Primer library", exc)
+            return
         msg = f"Saved {len(new_rows)} primer(s) to library."
         if dupes:
             msg += f" Skipped {len(dupes)} duplicate(s): {', '.join(dupes)}"
@@ -34190,7 +34321,15 @@ class TraditionalCloningPane(Vertical):
             )
             return
         if entry_counter != getattr(self.app, "_record_load_counter", 0):
-            return  # canvas moved on — drop the result
+            # Canvas moved on — drop the result. Pre-fix the worker
+            # returned silently here, leaving the "Simulating digest +
+            # ligation…" placeholder on screen forever; surface a
+            # short notice so the user knows their click was honored.
+            self.app.call_from_thread(
+                self._on_trad_simulate_failed,
+                "Cancelled — active plasmid changed mid-simulate.",
+            )
+            return
         self.app.call_from_thread(
             self._apply_trad_simulate_result, outcome
         )
@@ -38049,7 +38188,11 @@ class MutagenizeModal(ModalScreen):
                 ok = _upsert(name, seq, best["tm"], ptype, strand)
                 (saved if ok else skipped).append(name)
 
-        _save_primers(entries)
+        try:
+            _save_primers(entries)
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(self.app, "Primer library", exc)
+            return
         parts = [f"Saved {len(saved)} primer{'s' if len(saved) != 1 else ''} to library"]
         if skipped:
             parts.append(f"({len(skipped)} duplicate sequence(s) skipped)")
@@ -38619,9 +38762,10 @@ class PrimerDesignScreen(Screen):
             else:
                 n_used = usage_index.get(seq.strip().upper(), 0)
                 used_cell = str(n_used) if n_used > 0 else "—"
+            seq_disp = seq[:29] + "…" if len(seq) > 30 else seq
             t.add_row(
                 Text(mark + p.get("name", "?"), style="bold"),
-                Text(seq[:30], style="dim color(252)"),
+                Text(seq_disp, style="dim color(252)"),
                 f"{len(seq)} nt",
                 tm_cell,
                 used_cell,
@@ -38933,7 +39077,12 @@ class PrimerDesignScreen(Screen):
                 entries = _load_primers()
                 if pidx < len(entries):
                     entries[pidx]["status"] = nxt
-                    _save_primers(entries)
+                    try:
+                        _save_primers(entries)
+                    except (OSError, RuntimeError) as exc:
+                        _notify_save_failure(
+                            self.app, "Primer library", exc)
+                        return
                     self._refresh_library_table()
                     name = primers[pidx].get("name", "?")
                     self.app.notify(f"{name}: {nxt}", markup=False)
@@ -38964,11 +39113,24 @@ class PrimerDesignScreen(Screen):
                 return
             entries = _load_primers()
             name_set = set(names)
+            n_before = len(entries)
             entries = [e for e in entries if e.get("name") not in name_set]
-            _save_primers(entries)
+            try:
+                _save_primers(entries)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Primer library", exc)
+                return
             self._lib_selected.clear()
             self._refresh_library_table()
-            self.app.notify(f"Deleted {len(names)} primer{'s' if len(names) != 1 else ''}.")
+            # Report the count of entries we actually removed, not the
+            # count the user asked to delete — a stale list (concurrent
+            # rename / delete) could leave fewer to actually go. Pre-fix
+            # used `len(names)`, which over-reported when names were
+            # already gone.
+            n_removed = n_before - len(entries)
+            self.app.notify(
+                f"Deleted {n_removed} primer"
+                f"{'s' if n_removed != 1 else ''}.")
 
         self.app.push_screen(
             LibraryDeleteConfirmModal(label, 0, ""),
@@ -39338,7 +39500,11 @@ class PrimerDesignScreen(Screen):
                 "date":        today,
                 "status":      "Designed",
             })
-        _save_primers(entries)
+        try:
+            _save_primers(entries)
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(self.app, "Primer library", exc)
+            return
         self._refresh_library_table()
         self.app.notify(f"Saved {fwd_name} + {rev_name} to primer library.",
                         severity="success", markup=False)
@@ -39496,7 +39662,11 @@ class PrimerDesignScreen(Screen):
                 if e.get("name") == old_name:
                     e["name"] = new_name
                     break
-            _save_primers(entries)
+            try:
+                _save_primers(entries)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Primer library", exc)
+                return
             self._refresh_library_table()
             self.app.notify(f"Renamed {old_name!r} → {new_name!r}",
                             markup=False)
@@ -40111,13 +40281,19 @@ class AnnotationTransferModal(ModalScreen):
         t.add_columns("Label", "Type", "Target start",
                       "Target end", "Strand", "Length (bp)")
         for tr in self._transfers:
+            # Display is GenBank-style 1-based inclusive. Internal
+            # coords are 0-based half-open: start += 1, end stays
+            # (exclusive end == inclusive end numerically). Wrap
+            # features (target_end < target_start) get a "(wrap)"
+            # tag so the user can tell origin-spanning at a glance.
             wrap = (tr["target_end"] < tr["target_start"])
-            end_disp = (f"{tr['target_end']:,} (wrap)"
-                        if wrap else f"{tr['target_end']:,}")
+            start_disp = f"{tr['target_start'] + 1:,}"
+            end_disp   = (f"{tr['target_end']:,} (wrap)"
+                          if wrap else f"{tr['target_end']:,}")
             t.add_row(
                 Text(tr["label"], no_wrap=True, overflow="ellipsis"),
                 tr["type"],
-                f"{tr['target_start']:,}",
+                start_disp,
                 end_disp,
                 "+" if tr["target_strand"] == 1 else "-",
                 f"{tr['length']:,}",
@@ -41153,7 +41329,11 @@ class CollectionsModal(ModalScreen):
             "plasmids":    plasmids,
             "saved":       _date.today().isoformat(),
         })
-        _save_collections(existing)
+        try:
+            _save_collections(existing)
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(self.app, "Collections", exc)
+            return
         self.query_one("#coll-save-name", Input).value = ""
         status.update(
             f"[green]Saved '{name}' ({len(plasmids)} plasmid(s)).[/green]"
@@ -41182,7 +41362,11 @@ class CollectionsModal(ModalScreen):
         # from `coll`, the mirror writes the same content back — a true
         # no-op only because we read `plasmids` before the mirror runs.
         _set_active_collection_name(name)
-        _save_library(plasmids)
+        try:
+            _save_library(plasmids)
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(self.app, "Plasmid library", exc)
+            return
         self.dismiss({"loaded": name, "n_plasmids": len(plasmids)})
 
     @on(Button.Pressed, "#btn-coll-del")
@@ -41193,7 +41377,11 @@ class CollectionsModal(ModalScreen):
             status.update("[red]No collection selected.[/red]")
             return
         existing = [c for c in _load_collections() if c.get("name") != name]
-        _save_collections(existing)
+        try:
+            _save_collections(existing)
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(self.app, "Collections", exc)
+            return
         self._repopulate()
         status.update(f"[dim]Deleted collection '{name}'.[/dim]")
 
@@ -42560,6 +42748,25 @@ def _agent_dirty_guard(app, payload):
     return None
 
 
+def _agent_refresh_library_panel(app) -> None:
+    """Refresh the LibraryPanel after an agent mutation so the running
+    UI doesn't show stale rows. Best-effort: silent no-op when the
+    panel isn't mounted (headless tests / pre-mount window). MUST be
+    invoked via `app.call_from_thread(...)` from agent handlers since
+    the HTTP worker thread can't touch widgets directly."""
+    try:
+        lib = app.query_one("#library", LibraryPanel)
+    except (NoMatches, AttributeError):
+        return
+    try:
+        lib._repopulate()
+    except Exception:
+        # _repopulate touches widgets — defensive so a transient query
+        # failure (panel mid-mount) never bubbles out of the agent
+        # handler.
+        _log.exception("agent library refresh failed")
+
+
 @_agent_endpoint("status")
 def _h_status(app, payload):
     """Current session state: loaded record, dirty flag, source path."""
@@ -42820,8 +43027,17 @@ def _h_save(app, payload):
     if getattr(app, "_current_record", None) is None:
         return ({"error": "nothing to save"}, 422)
     ok = app.call_from_thread(app._do_save)
-    return {"ok": bool(ok),
-            "source_path": getattr(app, "_source_path", None)}
+    out: dict = {"ok": bool(ok),
+                 "source_path": getattr(app, "_source_path", None)}
+    if not ok:
+        # `_do_save` stashes a short reason on the app so the agent
+        # caller can distinguish disk-full / RO-mount / no-source-path
+        # without parsing a user-facing toast. Pre-fix the response
+        # was just `{"ok": false}` — the human got a notify, the agent
+        # got nothing to recover from.
+        reason = getattr(app, "_last_save_error", "") or "unknown error"
+        out["error"] = reason
+    return out
 
 
 # ── Sequence + feature CRUD (Tier 1) ──────────────────────────────────────────
@@ -43281,11 +43497,15 @@ def _h_delete_from_library(app, payload):
         return ({"error": "missing 'name'"}, 400)
 
     def _apply():
+        guard = _agent_dirty_guard(app, payload)
+        if guard is not None:
+            return guard
         entries = _load_library()
         kept = [e for e in entries if e.get("name") != name]
         if len(kept) == len(entries):
             return ({"error": f"no entry named {name!r}"}, 404)
         _save_library(kept)
+        _agent_refresh_library_panel(app)
         return len(entries) - len(kept)
 
     result = app.call_from_thread(_apply)
@@ -43566,7 +43786,12 @@ def _h_add_current_to_library(app, payload):
             lib = app.query_one("#library", LibraryPanel)
         except (NoMatches, AttributeError):
             return ({"error": "library panel not mounted"}, 500)
-        lib.add_entry(rec)
+        if not lib.add_entry(rec):
+            # add_entry surfaced the OS error to the human user via
+            # _notify_save_failure; agent caller gets a structured
+            # error rather than a phantom ok:True.
+            return ({"error": "library save failed (see app notification)"},
+                    500)
         return None
 
     err = app.call_from_thread(_apply)
@@ -43583,6 +43808,9 @@ def _h_create_collection(app, payload):
     is bulk-imported into the new collection (same path as the GUI
     NewCollectionModal). Returns counts; the full plasmid list is
     available via ``list-library`` after switching active collection."""
+    guard = _agent_dirty_guard(app, payload)
+    if guard is not None:
+        return guard
     name = _normalize_collection_name(payload.get("name"))
     if name is None:
         return ({"error": "missing or invalid 'name'"}, 400)
@@ -43616,6 +43844,7 @@ def _h_create_collection(app, payload):
         "saved":       _date.today().isoformat(),
     })
     _save_collections(colls)
+    app.call_from_thread(_agent_refresh_library_panel, app)
     return {
         "ok":          True,
         "name":        name,
@@ -43631,6 +43860,9 @@ def _h_delete_collection(app, payload):
     deleted collection is the active one, the active pointer is
     cleared and the panel returns to the collections-list view on
     next render."""
+    guard = _agent_dirty_guard(app, payload)
+    if guard is not None:
+        return guard
     name = _normalize_collection_name(payload.get("name"))
     if name is None:
         return ({"error": "missing or invalid 'name'"}, 400)
@@ -43641,12 +43873,16 @@ def _h_delete_collection(app, payload):
     _save_collections(remaining)
     if _get_active_collection_name() == name:
         _set_active_collection_name(None)
+    app.call_from_thread(_agent_refresh_library_panel, app)
     return {"ok": True, "deleted": name, "n_remaining": len(remaining)}
 
 
 @_agent_endpoint("rename-collection", write=True)
 def _h_rename_collection(app, payload):
     """Rename a collection. Body: ``{old, new}``."""
+    guard = _agent_dirty_guard(app, payload)
+    if guard is not None:
+        return guard
     old = _normalize_collection_name(payload.get("old"))
     new = _normalize_collection_name(payload.get("new"))
     if old is None or new is None:
@@ -43667,6 +43903,7 @@ def _h_rename_collection(app, payload):
     _save_collections(colls)
     if _get_active_collection_name() == old:
         _set_active_collection_name(new)
+    app.call_from_thread(_agent_refresh_library_panel, app)
     return {"ok": True, "old": old, "new": new}
 
 
@@ -43675,6 +43912,9 @@ def _h_set_active_collection(app, payload):
     """Switch the active collection. Body: ``{name}``. Mirrors the
     panel's Click-to-enter flow (writes the active pointer to
     settings.json + refreshes the in-memory library)."""
+    guard = _agent_dirty_guard(app, payload)
+    if guard is not None:
+        return guard
     name = _normalize_collection_name(payload.get("name"))
     if name is None:
         return ({"error": "missing or invalid 'name'"}, 400)
@@ -43685,6 +43925,7 @@ def _h_set_active_collection(app, payload):
     plasmids = [dict(p) for p in (coll.get("plasmids") or [])
                  if isinstance(p, dict)]
     _save_library(plasmids)
+    app.call_from_thread(_agent_refresh_library_panel, app)
     return {"ok": True, "active": name, "n_plasmids": len(plasmids)}
 
 
@@ -43696,6 +43937,9 @@ def _h_bulk_import_folder(app, payload):
     a second call to ``create-collection`` with the same name first to
     pre-create, or pick a unique target). Per-file failures are
     isolated; the response carries a per-file summary."""
+    guard = _agent_dirty_guard(app, payload)
+    if guard is not None:
+        return guard
     folder_raw = payload.get("folder")
     folder = _sanitize_path(folder_raw) if folder_raw else None
     if folder is None:
@@ -43717,6 +43961,7 @@ def _h_bulk_import_folder(app, payload):
         "saved":       _date.today().isoformat(),
     })
     _save_collections(colls)
+    app.call_from_thread(_agent_refresh_library_panel, app)
     return {
         "ok":         True,
         "collection": name,
@@ -43870,15 +44115,21 @@ def _h_set_plasmid_status(app, payload):
         return ({"error": "'status' must be a string or null"}, 400)
 
     def _apply():
+        guard = _agent_dirty_guard(app, payload)
+        if guard is not None:
+            return guard
         entries = _load_library()
         for e in entries:
             if e.get("name") == key or e.get("id") == key:
                 e["status"] = new_status
                 _save_library(entries)
+                _agent_refresh_library_panel(app)
                 return new_status
         return None
 
     result = app.call_from_thread(_apply)
+    if isinstance(result, tuple):
+        return result
     if result is None:
         return ({"error": f"no library entry matching {key!r}"}, 404)
     return {"ok": True, "name": key, "status": result}
@@ -43925,6 +44176,9 @@ def _h_set_entry_vector(app, payload):
     confirm it's valid GenBank and to extract the size — the parsed
     record itself is discarded; only the original text is persisted
     so the grammar editor's "open file" round-trip stays byte-exact."""
+    guard = _agent_dirty_guard(app, payload)
+    if guard is not None:
+        return guard
     gid = payload.get("grammar_id")
     if not isinstance(gid, str) or not gid:
         return ({"error": "missing or non-string 'grammar_id'"}, 400)
@@ -44416,6 +44670,11 @@ class PlasmidApp(App):
     # from "loaded then cleared", but a counter can.
     _record_load_counter: int = 0
     _MAX_UNDO = 50
+    # Last failure reason from `_do_save`, surfaced to the agent API
+    # via `_h_save` so a CLI / agent caller can distinguish disk-full
+    # from "no source path" without parsing the user-facing toast.
+    # Empty string on success (or when no save has been attempted).
+    _last_save_error: str = ""
     _restr_unique_only: bool = True
     _restr_min_len: int = 6
     _show_restr: bool = False
@@ -45779,18 +46038,38 @@ SpeciesPickerModal { align: center middle; }
         state = "on" if sp._show_connectors else "off"
         self.notify(f"Label connectors {state}")
 
+    def _guard_callback(self, callback, label: str = "Action"):
+        """Wrap a modal `push_screen` callback so it refuses to apply
+        if `_record_load_counter` shifted while the modal was up. The
+        counter is bumped on every `_apply_record`, so this catches
+        the (narrow) case where the agent API loads a different
+        plasmid while the user has a modal open — without the guard
+        the dismiss callback applies its edit at the same `[s, e)` of
+        the NEW sequence, silently corrupting it."""
+        counter = self._record_load_counter
+        def _wrapped(result):
+            if self._record_load_counter != counter:
+                self.notify(
+                    f"{label} dropped — active plasmid changed.",
+                    severity="warning", timeout=6,
+                )
+                return
+            callback(result)
+        return _wrapped
+
     def action_edit_seq(self) -> None:
         sp = self.query_one("#seq-panel", SequencePanel)
         if not sp._seq:
             self.notify("No sequence loaded.", severity="warning")
             return
+        cb = self._guard_callback(self._edit_dialog_result, "Edit")
         if sp._user_sel is not None:
             # Replace the shift-selected region
             s, e     = sp._user_sel
             existing = sp._seq[s:e]
             self.push_screen(
                 EditSeqDialog("replace", existing, s, e),
-                callback=self._edit_dialog_result,
+                callback=cb,
             )
         elif sp._cursor_pos >= 0:
             # No selection: replace the single base under the cursor.
@@ -45806,13 +46085,13 @@ SpeciesPickerModal { align: center middle; }
                 # last base) — fall back to plain insert there.
                 self.push_screen(
                     EditSeqDialog("insert", start=pos, end=pos),
-                    callback=self._edit_dialog_result,
+                    callback=cb,
                 )
             else:
                 existing = sp._seq[pos:pos + 1]
                 self.push_screen(
                     EditSeqDialog("replace", existing, pos, pos + 1),
-                    callback=self._edit_dialog_result,
+                    callback=cb,
                 )
         else:
             self.notify(
@@ -46094,8 +46373,9 @@ SpeciesPickerModal { align: center middle; }
             self.notify("No record loaded to add.", severity="warning")
             return
         lib = self.query_one("#library", LibraryPanel)
-        lib.add_entry(self._current_record)
-        self._notify_success(f"Added {self._current_record.name} to library.")
+        if lib.add_entry(self._current_record):
+            self._notify_success(
+                f"Added {self._current_record.name} to library.")
 
     # ── Mount: auto-load preloaded record ──────────────────────────────────────
 
@@ -46608,8 +46888,26 @@ SpeciesPickerModal { align: center middle; }
                 unique_only=unique_only,
                 circular=circular,
             )
-        except Exception:
+        except Exception as exc:
+            # Pre-fix the worker returned silently here — a malformed
+            # enzyme catalog or IUPAC pattern panic emptied the
+            # overlay cache and the user saw the restriction sites
+            # vanish with no toast and no log hint. Surface a brief
+            # notice so they can re-trigger via Settings → Restriction
+            # overlay (or open a bug report) rather than assuming the
+            # feature broke quietly.
             _log.exception("Restriction scan worker failed")
+            try:
+                self.call_from_thread(
+                    self.notify,
+                    f"Restriction scan failed — overlays unavailable "
+                    f"({type(exc).__name__}). See logs for detail.",
+                    severity="error",
+                )
+            except Exception:
+                # call_from_thread can fail during shutdown; the log
+                # exception above is the durable record.
+                pass
             return
 
         def _apply():
@@ -47365,10 +47663,15 @@ SpeciesPickerModal { align: center middle; }
         self.push_screen(WhatsNewModal(__version__))
 
     def _do_save(self) -> bool:
-        """Save current record to its source file and/or library. Returns True on success."""
+        """Save current record to its source file and/or library. Returns True on success.
+
+        On failure, sets `self._last_save_error` to a short reason
+        string so the agent-API caller can return a meaningful body
+        instead of just `{"ok": false}`. Cleared on success."""
         if self._current_record is None:
             self.notify("Nothing to save.", severity="warning")
             _log_event("save.no_record")
+            self._last_save_error = "nothing to save"
             return False
         _log_event(
             "save.start",
@@ -47390,20 +47693,33 @@ SpeciesPickerModal { align: center middle; }
                 self.notify(f"Save failed: {exc}", severity="error")
                 _log_event("save.failed", target="source",
                             error=str(exc))
+                self._last_save_error = (
+                    f"source file write failed: {exc}"
+                )
                 return False
 
         # Always update the library entry (add or overwrite)
         try:
             lib = self.query_one("#library", LibraryPanel)
-            lib.add_entry(self._current_record)
+            if not lib.add_entry(self._current_record):
+                # OSError / RuntimeError → caught inside add_entry,
+                # which already fired _notify_save_failure for the
+                # user. Surface the failure to _do_save's caller so
+                # the success path doesn't fire on top of the error.
+                _log_event("save.failed", target="library",
+                            error="library save failed")
+                self._last_save_error = "library save failed"
+                return False
         except Exception as exc:
             _log.exception("Library update failed during save")
             self.notify(f"Library update failed: {exc}", severity="error")
             _log_event("save.failed", target="library",
                         error=str(exc))
+            self._last_save_error = f"library update failed: {exc}"
             return False
 
         self._mark_clean()
+        self._last_save_error = ""
         _log_event("save.ok", source_path=self._source_path)
         if self._source_path:
             self._notify_success(f"Saved → {self._source_path}")
@@ -47855,9 +48171,22 @@ SpeciesPickerModal { align: center middle; }
 
         target_record = self._current_record
         target_label = target_record.name or target_record.id or "target"
+        # Capture the load counter at action-entry so the apply path
+        # below can refuse if the canvas swapped records (via agent
+        # API, since the modal stack blocks UI navigation). Without
+        # this, an agent-driven plasmid swap mid-flow would cause the
+        # accepted transfers to land on the wrong record's features.
+        entry_counter = self._record_load_counter
 
         def _on_transfers_done(accepted):
             if not accepted:
+                return
+            if self._record_load_counter != entry_counter:
+                self.notify(
+                    "Annotation transfer dropped — active plasmid "
+                    "changed mid-flow.",
+                    severity="warning", timeout=6,
+                )
                 return
             self._apply_annotation_transfers(accepted, target_record)
 
@@ -48062,6 +48391,14 @@ SpeciesPickerModal { align: center middle; }
             if self._record_load_counter != entry_counter:
                 # User loaded a different plasmid while we were aligning;
                 # the result no longer reflects what's on screen.
+                # Pre-fix the worker dropped silently here — the user
+                # saw the "Aligning…" toast disappear with no follow-up
+                # and assumed the alignment hung. Surface the cancel
+                # so they know to retry on the current canvas.
+                self.notify(
+                    "Alignment cancelled — active plasmid changed.",
+                    severity="warning", timeout=4,
+                )
                 return
             self.push_screen(AlignmentScreen(
                 query_label=query_record.name or query_record.id or "query",
@@ -48159,9 +48496,19 @@ SpeciesPickerModal { align: center middle; }
         except (AttributeError, KeyError):
             pass
         circular = topology.lower() != "linear"
+        # Capture counter so a mid-flow plasmid swap (via agent API,
+        # since the modal blocks UI nav) doesn't end up highlighting
+        # ORF coordinates against the wrong sequence.
+        entry_counter = self._record_load_counter
 
         def _on_done(result):
             if not result:
+                return
+            if self._record_load_counter != entry_counter:
+                self.notify(
+                    "ORF highlight dropped — active plasmid changed.",
+                    severity="warning", timeout=4,
+                )
                 return
             sp = self.query_one("#seq-panel", SequencePanel)
             # Synthesise a feature-like dict so highlight_feature's
@@ -48255,16 +48602,22 @@ SpeciesPickerModal { align: center middle; }
             self._source_path = source_path
         try:
             lib = self.query_one("#library", LibraryPanel)
-            lib.add_entry(record)
+            lib_saved = lib.add_entry(record)
             # Lead with "Loaded" so the user sees this as a file-open
             # confirmation; library auto-save is the side effect, not
             # the headline. Keeps the toast green via _notify_success.
+            # On library save failure, drop the "→ library" suffix so
+            # we don't claim a library write that didn't happen — the
+            # red error toast from add_entry already surfaced it.
             if source_path:
                 self._notify_success(
                     f"Loaded {record.name} from {source_path}", timeout=4)
-            else:
+            elif lib_saved:
                 self._notify_success(
                     f"Loaded {record.name} → library", timeout=4)
+            else:
+                self._notify_success(
+                    f"Loaded {record.name}", timeout=4)
         except Exception:
             # UI already loaded the record; log and warn but don't hide it.
             _log.exception("auto-persist on import failed")
@@ -49731,7 +50084,15 @@ SpeciesPickerModal { align: center middle; }
         else:
             self.notify("Library entry vanished.", severity="warning")
             return
-        _save_library(entries)
+        try:
+            _save_library(entries)
+        except (OSError, RuntimeError) as exc:
+            # Disk-full / RO-mount / EACCES per invariant #7. Pre-fix
+            # this fired "Renamed to X" even when the write failed,
+            # so the user saw the new name in the title bar but the
+            # next launch showed the old one with no warning.
+            _notify_save_failure(self, "Plasmid library", exc)
+            return
 
         # Refresh the library table so the new name shows.
         lib = self.query_one("#library", LibraryPanel)
