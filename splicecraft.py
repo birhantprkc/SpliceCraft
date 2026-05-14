@@ -7049,6 +7049,7 @@ def _augment_dna_record_from_packets(
             return float(2 * at + 4 * gc)
 
     feature_colors: list[str] = []
+    feature_names_from_xml: list[str] = []
     standalone_primers: list[dict] = []
 
     for type_byte, _length, payload in _iter_commercialsaas_packets(data):
@@ -7065,6 +7066,20 @@ def _augment_dna_record_from_packets(
                 feature_colors.append(
                     seg.get("color", "") if seg is not None else ""
                 )
+                # Capture the raw XML `name` attribute too. BioPython's
+                # `.dna` parser has been observed to mangle whitespace
+                # in feature names (GH #17, Cory Tobin 2026-05-13:
+                # spaces replaced with backslashes after import). We
+                # pin the label to whatever the XML actually contains
+                # so the user sees what their authoring tool wrote,
+                # not whatever BioPython did on the way in. Strip the
+                # control-char set we'd refuse to write anyway —
+                # NUL / CR / LF would break a single-row sidebar
+                # render — but SPACES + every other printable char
+                # survive verbatim.
+                xml_name = feat_el.get("name", "") or ""
+                xml_name = _CONTROL_CHARS_RE.sub("", xml_name)[:200]
+                feature_names_from_xml.append(xml_name)
         elif type_byte == _COMMERCIALSAAS_PACKET_PRIMERS:
             try:
                 root = _safe_xml_parse(payload.decode("utf-8"))
@@ -7094,29 +7109,46 @@ def _augment_dna_record_from_packets(
                     "status":      "Imported",
                 })
 
-    # Stamp colour qualifiers on features by enumeration order. The
-    # 0x0A packet only carries the features the editor itself created;
-    # any `source` row in the SeqRecord comes from BioPython's LOCUS
-    # parsing (not the 0x0A packet) so it doesn't consume a colour
-    # slot. Out-of-order or extra features are tolerated — we just
-    # stop when we run off the end of the colour list.
-    color_idx = 0
+    # Stamp colour qualifiers + override feature labels on features
+    # by enumeration order. The 0x0A packet only carries the features
+    # the editor itself created; any `source` row in the SeqRecord
+    # comes from BioPython's LOCUS parsing (not the 0x0A packet) so
+    # it doesn't consume a slot. Out-of-order or extra features are
+    # tolerated — we stop when we run off the end of either list.
+    #
+    # Label override: BioPython's `.dna` parser has been observed to
+    # mangle whitespace in feature names (GH #17 — user-typed
+    # "Integration Seq" or "Lambda T0 Terminator" comes out with
+    # backslashes inserted around the spaces). We pin
+    # `qualifiers["label"]` to the raw XML name attribute so the
+    # user sees what their authoring tool wrote, not whatever
+    # BioPython produced. Skipped when the XML name is empty (some
+    # third-party .dna writers omit the attribute), in which case
+    # BioPython's parsed label survives untouched.
+    feat_idx = 0
     for f in rec.features:
         if f.type == "source":
             continue
-        if color_idx >= len(feature_colors):
+        # Color stamp (existing behaviour).
+        if feat_idx < len(feature_colors):
+            c = feature_colors[feat_idx]
+            if c and isinstance(c, str):
+                c = c.strip()
+                # Defensive: only accept plausible CSS hex colours
+                # so a malformed packet can't sneak arbitrary strings
+                # into our qualifiers.
+                if c.startswith("#") and len(c) in (4, 7):
+                    f.qualifiers["ApEinfo_revcolor"] = [c]
+                    f.qualifiers["ApEinfo_fwdcolor"] = [c]
+        # Label override from raw XML.
+        if feat_idx < len(feature_names_from_xml):
+            xml_name = feature_names_from_xml[feat_idx]
+            if xml_name:
+                f.qualifiers["label"] = [xml_name]
+        feat_idx += 1
+        if (feat_idx >= len(feature_colors)
+                and feat_idx >= len(feature_names_from_xml)):
             break
-        c = feature_colors[color_idx]
-        color_idx += 1
-        if not c or not isinstance(c, str):
-            continue
-        # Defensive: only accept plausible CSS hex colours so a malformed
-        # packet can't sneak arbitrary strings into our qualifiers.
-        c = c.strip()
-        if not (c.startswith("#") and len(c) in (4, 7)):
-            continue
-        f.qualifiers["ApEinfo_revcolor"] = [c]
-        f.qualifiers["ApEinfo_fwdcolor"] = [c]
 
     # Build primer DB entries from the primer_bind features. Two
     # sources for the primer sequence:
@@ -11690,25 +11722,21 @@ class LibraryPanel(Widget):
             if not yes:
                 return
             entries = [e for e in _load_library() if e.get("id") != entry_id]
-            try:
-                # async_sync=True: defer the active-collection mirror
-                # to a background worker. On a 100+ MB collections.json
-                # the synchronous path took 5-8 s per delete, blocking
-                # the UI; the async path returns as soon as the
-                # library file is on disk, and the mirror catches up
-                # out-of-band (worker drained at app exit so the
-                # mirror always lands eventually).
-                _save_library(entries, async_sync=True)
-            except OSError as exc:
-                # Disk-full / permission-denied / RO mount: surface to
-                # the user instead of silently swallowing — they need to
-                # know the entry is still on disk and can retry.
-                _log.exception("Plasmid delete: save failed")
-                self.app.notify(
-                    f"Couldn't delete '{name}': {exc}.",
-                    severity="error",
-                )
-                return
+            # Update the in-memory cache + invalidate dependent caches
+            # synchronously so the panel repopulate below sees the
+            # post-delete state instantly. The actual disk write fires
+            # in the worker dispatched at the bottom. Pre-fix this
+            # called `_save_library(async_sync=True)` which only
+            # deferred the active-collection mirror; the main library
+            # write was still synchronous, blocking the UI for 5-8 s
+            # on a 156 MB plasmid_library.json. The 0.7.15.1 rename
+            # fix established the sync-cache + async-disk pattern;
+            # delete now uses it too.
+            global _library_cache
+            _library_cache = _typed_clone(entries)
+            _clear_primer_cache = globals().get("_primer_usage_clear_cache")
+            if _clear_primer_cache is not None:
+                _clear_primer_cache()
             # Cascade: remove any parts-bin entries that mirror the
             # deleted library plasmid. Match on (name, grammar) — a
             # name-only match would over-delete when two grammars
@@ -11717,9 +11745,10 @@ class LibraryPanel(Widget):
             # dedupe). The library entry's grammar lives on its
             # `source` field as `constructor:{gid}:{role}` (set by
             # `_persist_assembly`); legacy entries without that
-            # encoding fall back to name-only matching. Best-effort:
-            # failures are logged + a soft notify, but they don't
-            # block the library delete that already succeeded.
+            # encoding fall back to name-only matching. The filter
+            # itself runs synchronously (fast in-memory list comp);
+            # only the disk write is dispatched off-thread.
+            cascaded_bin: "list[dict] | None" = None
             try:
                 src_field = str(entry.get("source") or "")
                 lib_grammar = ""
@@ -11749,13 +11778,19 @@ class LibraryPanel(Widget):
                     ]
                 n_dropped = len(bin_entries) - len(kept)
                 if n_dropped > 0:
-                    _save_parts_bin(kept)
+                    # Update the bin cache sync so palette refreshes
+                    # already see the cascade; the disk write goes
+                    # to a separate worker dispatch below.
+                    global _parts_bin_cache
+                    _parts_bin_cache = _typed_clone(kept)
+                    _clear_assembly_fragment_cache()
+                    cascaded_bin = kept
                     _log.info(
                         "Plasmid delete: cascaded %d parts-bin row(s) "
                         "for %r (grammar %r)", n_dropped, name,
                         lib_grammar or "<any>",
                     )
-            except (OSError, ValueError) as exc:
+            except ValueError as exc:
                 _log.exception("Plasmid delete: parts-bin cascade failed")
                 self.app.notify(
                     f"Library entry deleted, but parts-bin cleanup "
@@ -11776,11 +11811,69 @@ class LibraryPanel(Widget):
                 clear = getattr(app, "_clear_canvas", None)
                 if callable(clear):
                     clear()
+            # Disk writes go off-thread. UI state (panel, caches, map)
+            # is already updated above so the user sees the delete
+            # land instantly; the slow JSON saves catch up in the
+            # background. Active-collection mirror inside the worker
+            # uses `async_write=True` so a burst of deletes coalesces
+            # into a single mirror write rather than queueing N
+            # sequential 150 MB rewrites.
+            self._delete_save_to_disk(entries, cascaded_bin)
 
         self.app.push_screen(
             LibraryDeleteConfirmModal(name, size, entry_id),
             callback=_on_confirm,
         )
+
+    @work(thread=True, exclusive=True, group="library_delete_save")
+    def _delete_save_to_disk(
+            self, entries: "list[dict]",
+            cascaded_bin: "list[dict] | None") -> None:
+        """Worker: persist a plasmid delete off-thread.
+
+        Writes library, then mirrors the active collection (the latter
+        via `async_write=True` so back-to-back deletes coalesce into a
+        single mirror write). Cascades the parts-bin write when the
+        deleted library entry had matching bin rows. Cache updates
+        already happened on the UI thread before dispatch.
+        """
+        try:
+            _safe_save_json(
+                _LIBRARY_FILE, entries, "Plasmid library",
+            )
+        except (OSError, RuntimeError) as exc:
+            _log.exception("Plasmid delete: library save failed")
+            self.app.call_from_thread(
+                _notify_save_failure,
+                self.app, "Plasmid library", exc,
+            )
+            return
+        try:
+            _sync_active_collection_plasmids(entries, async_write=True)
+        except Exception:
+            _log.exception(
+                "Plasmid delete: active-collection mirror dispatch failed",
+            )
+        if cascaded_bin is not None:
+            try:
+                _safe_save_json(
+                    _PARTS_BIN_FILE, cascaded_bin, "Parts bin",
+                )
+            except (OSError, RuntimeError) as exc:
+                _log.exception(
+                    "Plasmid delete: parts-bin cascade save failed",
+                )
+                self.app.call_from_thread(
+                    _notify_save_failure,
+                    self.app, "Parts bin", exc,
+                )
+                return
+            try:
+                _sync_active_parts_bin_parts(cascaded_bin)
+            except Exception:
+                _log.exception(
+                    "Plasmid delete: parts-bin mirror dispatch failed",
+                )
 
     # ── Collections view: enter / + / − / ✎ ────────────────────────────────
 
@@ -11845,28 +11938,58 @@ class LibraryPanel(Widget):
             self._apply_view_mode()
             self._repopulate_plasmids()
             return
-        # Set active BEFORE writing the library so _save_library's mirror
-        # writes back to the correct collection.
+        # Set active BEFORE writing the library so the mirror writes
+        # back to the correct collection.
         _set_active_collection_name(name)
         plasmids = [dict(p) for p in (coll.get("plasmids") or [])
                     if isinstance(p, dict)]
-        try:
-            _save_library(plasmids)
-        except OSError as exc:
-            # Disk-full / permission-denied / RO mount: surface so the
-            # user knows the collection switch didn't fully land. The
-            # active-collection pointer was already moved; next launch
-            # will re-resolve via `_restore_library_from_active_collection`.
-            _log.exception("Collection switch: library save failed")
-            self.app.notify(
-                f"Switched to '{name}' but library write failed: {exc}.",
-                severity="error",
-            )
-            return
+        # Update the in-memory cache synchronously so the panel
+        # repopulate below sees the new state immediately. The disk
+        # write fires asynchronously after the UI swap. Without this
+        # split a 156 MB library + 156 MB collections-mirror rewrite
+        # froze the UI for 5-10 s on every collection switch (same
+        # class of bug as the 0.7.15.1 rename fix). Skip the
+        # collection mirror entirely — `plasmids` came FROM the
+        # collection we just switched to, so mirroring back is a
+        # no-op data-wise (still 156 MB of disk I/O if not skipped).
+        global _library_cache
+        _library_cache = _typed_clone(plasmids)
+        _clear_primer_cache = globals().get("_primer_usage_clear_cache")
+        if _clear_primer_cache is not None:
+            _clear_primer_cache()
         self._view_mode = "plasmids"
         self._apply_view_mode()
         self._repopulate_plasmids()
         self.post_message(self.CollectionSwitched(name))
+        self._collection_switch_save_to_disk(plasmids)
+
+    @work(thread=True, exclusive=True, group="collection_switch_save")
+    def _collection_switch_save_to_disk(
+            self, plasmids: "list[dict]") -> None:
+        """Worker: write the freshly-switched collection's plasmids to
+        plasmid_library.json off-thread. Mirrors the 0.7.15.1 rename
+        pattern: in-memory cache is already updated and the panel is
+        already repopulated, so the disk write is purely persistence.
+
+        Skips the active-collection mirror entirely — the plasmids came
+        FROM the collection we just activated, so mirroring back would
+        rewrite an identical 100+ MB file for no data change.
+
+        Exclusive group: a second collection switch mid-flight cancels
+        the first. Safe because the in-memory cache is updated sync
+        before each dispatch, so the second worker captures the
+        cumulative state.
+        """
+        try:
+            _safe_save_json(
+                _LIBRARY_FILE, plasmids, "Plasmid library",
+            )
+        except (OSError, RuntimeError) as exc:
+            _log.exception("Collection switch: library save failed")
+            self.app.call_from_thread(
+                _notify_save_failure,
+                self.app, "Plasmid library", exc,
+            )
 
     @on(Button.Pressed, "#btn-coll-add")
     def _btn_coll_add(self):
@@ -35390,16 +35513,37 @@ class DomesticatorModal(ModalScreen):
         by_name = {r["name"] for r in new_rows}
         entries = [e for e in entries if e.get("name") not in by_name]
         entries = new_rows + entries
-        try:
-            _save_primers(entries)
-        except (OSError, RuntimeError) as exc:
-            _notify_save_failure(self.app, "Primer library", exc)
-            return
+        # Sync cache update + UI feedback, async disk write — keeps
+        # the button responsive on a 10k+ primer library where the
+        # atomic JSON save would otherwise block 5-15 s. Dedupe sync
+        # to keep the cache canonical (same contract as
+        # `_save_primers`).
+        deduped = _dedupe_primers_by_sequence(entries)
+        global _primers_cache
+        _primers_cache = _typed_clone(deduped)
         msg = f"Saved {len(new_rows)} primer(s) to library."
         if dupes:
             msg += f" Skipped {len(dupes)} duplicate(s): {', '.join(dupes)}"
         self.app.notify(msg, timeout=8)
         self.query_one("#btn-dom-save-primers", Button).disabled = True
+        self._dom_primers_save_to_disk(deduped)
+
+    @work(thread=True, exclusive=True, group="dom_primers_save")
+    def _dom_primers_save_to_disk(self, deduped: "list[dict]") -> None:
+        """Worker: persist newly designed domestication primers
+        off-thread. The cache already reflects the post-save state
+        from the UI thread.
+        """
+        try:
+            _safe_save_json(
+                _PRIMERS_FILE, deduped, "Primer library",
+            )
+        except (OSError, RuntimeError) as exc:
+            _log.exception("Domesticator primer save: disk write failed")
+            self.app.call_from_thread(
+                _notify_save_failure,
+                self.app, "Primer library", exc,
+            )
 
     @on(Button.Pressed, "#btn-dom-cancel")
     def _cancel_btn(self, _) -> None:
@@ -36160,11 +36304,16 @@ class TraditionalCloningPane(Vertical):
                               "for %s", name)
         entries = _load_library()
         entries.append(entry)
-        try:
-            _save_library(entries)
-        except (OSError, ValueError) as exc:
-            _notify_save_failure(self.app, "Plasmid library", exc)
-            return
+        # Sync cache update so the source/vector tables below see the
+        # new entry instantly. Disk write is dispatched to a worker
+        # so a 156 MB library + mirror doesn't freeze the UI for
+        # 5-10 s after the Save Forward / Save Reverse click. Same
+        # pattern as the 0.7.15.1 rename fix.
+        global _library_cache
+        _library_cache = _typed_clone(entries)
+        _clear_primer_cache = globals().get("_primer_usage_clear_cache")
+        if _clear_primer_cache is not None:
+            _clear_primer_cache()
         self.app.notify(
             f"Saved {name} ({len(rec.seq):,} bp) to library.",
             timeout=6,
@@ -36178,6 +36327,34 @@ class TraditionalCloningPane(Vertical):
         # product. The user can re-Simulate to save again with a
         # fresh increment.
         self._invalidate_results()
+        self._trad_save_to_disk(entries)
+
+    @work(thread=True, exclusive=True, group="trad_cloning_save")
+    def _trad_save_to_disk(self, entries: "list[dict]") -> None:
+        """Worker: write a Traditional cloning save off-thread.
+
+        Cache update already happened on the UI thread; this only
+        persists to disk + mirrors the active collection (async).
+        Exclusive group: rapid Save Fwd / Save Rev clicks coalesce
+        on the latest cumulative state.
+        """
+        try:
+            _safe_save_json(
+                _LIBRARY_FILE, entries, "Plasmid library",
+            )
+        except (OSError, RuntimeError) as exc:
+            _log.exception("Traditional cloning save: disk write failed")
+            self.app.call_from_thread(
+                _notify_save_failure,
+                self.app, "Plasmid library", exc,
+            )
+            return
+        try:
+            _sync_active_collection_plasmids(entries, async_write=True)
+        except Exception:
+            _log.exception(
+                "Traditional cloning save: collection mirror failed",
+            )
 
     # ── Construction history recording (Phase 4b) ───────────────────────────
 
@@ -37575,6 +37752,35 @@ class ConstructorModal(ModalScreen):
             f"Also added to Parts Bin under {level_label}.",
             severity="success", markup=False,
         )
+        # Clear the lane + refresh the palette so the user can stage
+        # the next iteration without manually clicking "Clear Lane"
+        # or switching radios. The newly-saved plasmid now appears in
+        # its level-target's palette (target_level=1 → TU palette,
+        # etc.) so a level-radio switch picks it up immediately. Find
+        # the right gid by matching the source-level mapping — this
+        # callback doesn't carry gid but the constructor only stages
+        # one lane per save flow, so we clear whatever gid is at the
+        # given source_level. Best-effort: a parallel save in another
+        # tab (rare) won't be clobbered because the lane only changes
+        # for the matching gid.
+        for gid, current_sl in list(self._source_levels.items()):
+            if current_sl == source_level and self._lanes.get(gid):
+                self._lanes[gid] = []
+                # Refresh lane table + palette so the new plasmid is
+                # visible if the user switches radios. Wrapped in
+                # try/except because the modal might already be on
+                # its way to dismissal (some callers close it after
+                # save — the refresh would NoMatches on a dismounted
+                # widget).
+                try:
+                    self._refresh_lane(gid)
+                    self._refresh_palette(gid)
+                    self._refresh_validation(gid)
+                except Exception:
+                    _log.debug(
+                        "constructor: post-save lane refresh skipped",
+                    )
+                break
 
     def _compose_assembly_name(self, vector_name: str,
                                   parts: list[dict]) -> str:
@@ -37938,11 +38144,31 @@ class ConstructorModal(ModalScreen):
             return
         if new_level == self._source_levels[gid]:
             return
+        prior_level = self._source_levels[gid]
         self._source_levels[gid] = new_level
         # Lane carries level-N overhangs; switching levels would
         # produce a chain that doesn't match the new destination's
         # dropout. Wipe it so the user starts fresh.
         self._lanes[gid] = []
+        # Backbone-rebind hint: the GB cycle alternates vector
+        # families (Alpha for Esp3I-dropout destinations, Omega for
+        # BsaI-dropout destinations) every level. A backbone that
+        # worked at L0→TU has the wrong dropout enzyme for TU→MOD,
+        # and vice versa. We don't auto-clear because the user might
+        # legitimately want a custom vector that breaks the
+        # convention, but a yellow notify cues them to check. Only
+        # fires when stepping UP (L0→TU, TU→MOD, MOD→next); stepping
+        # back down to a level already worked with the bound vector
+        # doesn't need re-checking.
+        if (new_level > prior_level
+                and self._backbones.get(gid)):
+            self.app.notify(
+                f"Source level changed — check that the bound "
+                f"backbone ({self._backbones[gid]}) is the right "
+                f"vector family for the new cycle (GB alternates "
+                f"Alpha ↔ Omega each level).",
+                severity="warning", timeout=8, markup=False,
+            )
         self._refresh_lane(gid)
         self._refresh_palette(gid)
         self._refresh_validation(gid)
@@ -40592,19 +40818,44 @@ class PrimerDesignScreen(Screen):
                 entries = _load_primers()
                 if pidx < len(entries):
                     entries[pidx]["status"] = nxt
-                    try:
-                        _save_primers(entries)
-                    except (OSError, RuntimeError) as exc:
-                        _notify_save_failure(
-                            self.app, "Primer library", exc)
-                        return
+                    # Sync cache update + UI refresh; disk write is
+                    # off-thread so repeated Shift+S keypresses don't
+                    # block on a 10k+ primer library's atomic JSON
+                    # save (5-15 s on disk per keypress pre-fix).
+                    # Dedupe sync to keep the cache canonical — same
+                    # contract as `_save_primers`.
+                    deduped = _dedupe_primers_by_sequence(entries)
+                    global _primers_cache
+                    _primers_cache = _typed_clone(deduped)
                     self._refresh_library_table()
                     name = primers[pidx].get("name", "?")
                     self.app.notify(f"{name}: {nxt}", markup=False)
+                    self._primer_status_save_to_disk(deduped)
             event.stop()
         elif event.key == "delete":
             self._delete_marked_or_cursor()
             event.stop()
+
+    @work(thread=True, exclusive=True, group="primer_status_save")
+    def _primer_status_save_to_disk(
+            self, deduped: "list[dict]") -> None:
+        """Worker: persist a primer status cycle off-thread.
+
+        Cache update happened on the UI thread before dispatch; this
+        only writes the deduped list to disk. Exclusive group: rapid
+        Shift+S keypresses cancel earlier writes (the cache is
+        cumulative so the latest worker captures all status changes).
+        """
+        try:
+            _safe_save_json(
+                _PRIMERS_FILE, deduped, "Primer library",
+            )
+        except (OSError, RuntimeError) as exc:
+            _log.exception("Primer status cycle: disk save failed")
+            self.app.call_from_thread(
+                _notify_save_failure,
+                self.app, "Primer library", exc,
+            )
 
     def _delete_marked_or_cursor(self) -> None:
         """If primers are marked, confirm deletion of all marked. Otherwise

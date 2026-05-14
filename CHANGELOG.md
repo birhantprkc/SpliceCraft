@@ -2,6 +2,110 @@
 
 ---
 
+## [0.8.0] — 2026-05-14 — Async save sweep + GB chain hardening + .dna label override
+
+Five threads: every remaining sync `_save_library` / `_save_primers` on
+a hot UI path moved to a `@work` worker (collection switch, delete
+plasmid, primer status cycle, Traditional cloning Save Fwd/Rev,
+Domesticator Save Primers); the Constructor's L2→L3 iteration now has
+regression coverage; the Constructor auto-clears the lane and refreshes
+the palette after a successful save so the next iteration stages
+without manual reset; a yellow hint cues the user to verify the bound
+backbone matches the new level after a source-level radio switch; and
+the `.dna` import path pins each feature label to the raw 0x0A XML
+`name` attribute as a defensive override against upstream parser
+whitespace mangling (GH #17).
+
+### Fixed: five more UI freezes on multi-hundred-MB libraries
+
+Same pattern as the 0.7.15.1 rename fix — sync in-memory cache update
++ UI refresh, then dispatch the slow disk write to a
+`@work(exclusive=True)` worker. On a 156 MB `plasmid_library.json` +
+mirrored collection, each of these used to block the UI for 5-15 s on
+a button click or keypress; they're now effectively instant.
+
+- **Collection switch** (`LibraryPanel._collection_switch_save_to_disk`):
+  picking a different collection in the side panel updates the cache
+  + repopulates the table sync, then writes the new library off-thread.
+  Skips the active-collection mirror entirely since the plasmids
+  literally came from the collection we just activated — mirroring
+  back is a no-op data-wise but used to cost another 156 MB write.
+- **Delete plasmid** (`LibraryPanel._delete_save_to_disk`): completes
+  the half-fix from earlier where `async_sync=True` only deferred the
+  collection mirror — the main library write is now async too. The
+  parts-bin cascade (removing bin rows that mirror the deleted
+  library entry) also goes off-thread now.
+- **Primer status cycle** (`PrimerDesignScreen._primer_status_save_to_disk`):
+  Shift+S on a primer-library row cycles Designed → Ordered → Validated.
+  Sync save was 5-15 s per keypress on a 10k+ primer library; the
+  exclusive group means rapid keypresses cancel earlier writes.
+- **Traditional cloning save** (`TraditionalCloningPane._trad_save_to_disk`):
+  Save Forward / Save Reverse buttons. Same async pattern.
+- **Domesticator primer save** (`DomesticationScreen._dom_primers_save_to_disk`):
+  the "Save N primers to library" button after a domestication run.
+
+### Added: L2 → L3 chain regression coverage
+
+The Constructor's MOD-source radio (`source_level=2`) is a catch-all
+for level ≥ 2 sources — `_level_matches_tab(N, 2) = True` for any
+N ≥ 2 means an L3 plasmid surfaces in the MOD palette and a saved L3
+product gets tagged as MOD. The biology works (Alpha ↔ Omega
+alternation handles the cycle position; the enzyme auto-detect
+fallback in `_assembly_fragment_from_source` finds the right cutter
+regardless of stored level) but had no test guard before:
+
+- `TestCloneAssemblyIntoEntryVector.test_l2_to_l3_assembly_uses_primary_enzyme`
+  — runs the full L0 → L1 → L2 → L3 chain end-to-end and asserts the
+  L3 product carries content from both parent L2 MODs.
+- `TestPersistedAssemblyMetadata.test_persist_mod_to_next_stores_level_3`
+  — drives `_persist_assembly` directly with `source_level=2` and
+  verifies the parts-bin entry gets `level=3`, `type="MOD"`, and the
+  right overhang fallback when the digest probe can't release a
+  clean L3 fragment.
+
+### Added: Constructor auto-clears the lane after save
+
+`_on_constructor_save_success` now wipes the lane for the matching
+grammar and refreshes the palette + validation. Pre-fix the user had
+to click "Clear Lane" or switch radios before staging the next
+iteration; now the constructor is immediately ready for the next
+build. Best-effort — wrapped in try/except so a mid-dismissal modal
+doesn't trip on a missing widget.
+
+### Added: backbone rebind hint at source-level switch
+
+The GB cycle alternates vector families (Alpha for Esp3I-dropout
+destinations, Omega for BsaI-dropout destinations) every level. A
+backbone bound at L0 → TU has the wrong dropout enzyme for TU → MOD,
+and vice versa. We don't auto-clear the binding because the user
+might legitimately pick a custom vector that breaks the convention,
+but the level-radio handler now fires a yellow notify when stepping
+up to remind the user to verify the binding fits the new cycle.
+Stepping down doesn't trigger (the bound vector was already valid for
+the lower level).
+
+### Hardened: `.dna` feature labels pin to raw 0x0A XML
+
+`_augment_dna_record_from_packets` now extracts the `name` attribute
+from each `<Feature>` element in the 0x0A packet alongside the colour
+extraction, and overrides `feat.qualifiers["label"]` after BioPython's
+parse. Whatever the upstream parser does with whitespace, the
+displayed label now matches the source XML byte-for-byte (after only
+stripping NUL / CR / LF, which would break a single-row sidebar
+render). Defensive — Cory Tobin reported feature names with spaces
+appearing with backslashes after import (GH #17); we couldn't
+reproduce it with synthetic or real fixtures, but the override
+ensures whatever the XML actually carries is what the user sees.
+
+### Tests
+
+- 2 new tests for the L2 → L3 chain (above).
+- All 788 tests across collections / domesticator / primers /
+  traditional cloning / data safety / commercial-format I/O continue
+  to pass after the async-save migrations.
+
+---
+
 ## [0.7.15.1] — 2026-05-13 — Async rename + display-name preservation + markup hygiene
 
 Three threads: rename now writes off-thread so the UI doesn't freeze

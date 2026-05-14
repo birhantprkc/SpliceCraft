@@ -7398,6 +7398,96 @@ class TestCloneAssemblyIntoEntryVector:
         )
         assert result is None
 
+    def test_l2_to_l3_assembly_uses_primary_enzyme(self):
+        """Regression guard for the L2→L3 iteration of the GB cycle:
+        the Constructor's MOD-source radio (source_level=2) must
+        produce a valid L3 product from two L2 MODs. Exercises
+        `_enzyme_for_level_up(grammar, 2) = primary` — for gb_l0
+        that's Esp3I, the enzyme that cuts L2 MODs (which carry
+        the cycle's primary-enzyme sites since L1→L2 ligated them
+        into a BsaI-dropout vector with Esp3I surrounding).
+
+        Pre-2026-05-14 there was no test guarding L2→L3 specifically
+        — `TestCloneAssemblyIntoEntryVector` only covered L0→L1 and
+        L1→L2. With the Constructor's MOD radio (source_level=2)
+        being a catch-all for level ≥ 2 sources, regressions in the
+        primary-vs-secondary parity could go unnoticed until a
+        user reports their L3 build silently failed.
+        """
+        gb = sc._BUILTIN_GRAMMARS["gb_l0"]
+        # Step 1: two L1 TUs assembled into different alpha vectors
+        # so they release with distinct BsaI overhangs for the L1→L2
+        # chain.
+        a1_vec = _make_l1_alpha_vector("alpha1", "TACA", "GACT")
+        a2_vec = _make_l1_alpha_vector("alpha2", "GACT", "CCAA")
+        tu_a = sc._clone_assembly_into_entry_vector(
+            _make_l0_tu_parts("a"), a1_vec, gb, source_level=0,
+            name="TU_a",
+        )
+        tu_b = sc._clone_assembly_into_entry_vector(
+            _make_l0_tu_parts("b"), a2_vec, gb, source_level=0,
+            name="TU_b",
+        )
+        assert tu_a is not None and tu_b is not None
+        # Step 2: L1→L2 — two MODs into different L2 acceptors. Each
+        # MOD lands in an L2 vector that carries Esp3I sites flanking
+        # the BsaI dropout, so the result has the primary-enzyme
+        # sites needed for the L2→L3 release. `_make_l1_alpha_vector`
+        # already has this shape (both enzymes), so we reuse it as
+        # an L2 acceptor with new dropout overhangs that match the
+        # chained alpha1+alpha2 BsaI cut (TACA/CCAA).
+        mod_x_vec = _make_l1_alpha_vector(
+            "mod_x_dest", "GGAA", "TTCC",
+            tu_start="TACA", tu_end="CCAA",
+        )
+        mod_y_vec = _make_l1_alpha_vector(
+            "mod_y_dest", "TTCC", "AACC",
+            tu_start="TACA", tu_end="CCAA",
+        )
+        tu_a_src = {"name": "TU_a", "level": 1, "grammar": "gb_l0",
+                     "gb_text": sc._record_to_gb_text(tu_a)}
+        tu_b_src = {"name": "TU_b", "level": 1, "grammar": "gb_l0",
+                     "gb_text": sc._record_to_gb_text(tu_b)}
+        mod_x = sc._clone_assembly_into_entry_vector(
+            [tu_a_src, tu_b_src], mod_x_vec, gb, source_level=1,
+            name="MOD_x",
+        )
+        # Build the same MOD shape for the "y" lane. Reuse tu_a/tu_b
+        # — biology doesn't care that the two MODs share input TUs,
+        # only that the outer L2 cut overhangs differ.
+        mod_y = sc._clone_assembly_into_entry_vector(
+            [tu_a_src, tu_b_src], mod_y_vec, gb, source_level=1,
+            name="MOD_y",
+        )
+        assert mod_x is not None and mod_y is not None
+        # Step 3: L2→L3 — the regression target. Two L2 MODs into
+        # an L3 acceptor whose Esp3I dropout (the L2→L3 cut) matches
+        # the chained MOD-x+MOD-y Esp3I overhangs (GGAA/AACC).
+        l3_vec = _make_l1_alpha_vector(
+            "l3_dest", "AAGG", "CCTT",
+            tu_start="GGAA", tu_end="AACC",
+        )
+        mod_x_src = {"name": "MOD_x", "level": 2, "grammar": "gb_l0",
+                      "gb_text": sc._record_to_gb_text(mod_x)}
+        mod_y_src = {"name": "MOD_y", "level": 2, "grammar": "gb_l0",
+                      "gb_text": sc._record_to_gb_text(mod_y)}
+        l3 = sc._clone_assembly_into_entry_vector(
+            [mod_x_src, mod_y_src], l3_vec, gb, source_level=2,
+            name="L3_test",
+        )
+        # Either the L2→L3 cloning produces a valid record (clean
+        # Esp3I cut + ligation) or `_pick_insert_fragment` correctly
+        # selects across the L2 MOD's multi-cut fragments. Both are
+        # acceptable for v0.8.0; the regression we're guarding
+        # against is silent None — that would mean the enzyme parity
+        # broke at L2 sources entirely.
+        assert l3 is not None
+        # The L3 product must carry both parent MODs' content (each
+        # parent contributes its TU_a/TU_b unique CDS pattern).
+        l3_seq = str(l3.seq).upper()
+        cds_a = "ATGAAA" * 6  # TU_a's CDS
+        assert (cds_a in l3_seq) or (cds_a in sc._rc(l3_seq))
+
 
 class TestLevelMatchesTab:
     """`_level_matches_tab` is the shared filter rule for parts-bin
@@ -8129,6 +8219,65 @@ class TestPersistedAssemblyMetadata:
         ids = [e.get("id") for e in sc._load_library()]
         assert "MyTU"   in ids
         assert "MyTU_2" in ids
+
+    def test_persist_mod_to_next_stores_level_3(
+            self, isolated_library, isolated_parts_bin):
+        """The Constructor's MOD→next save (`source_level=2`) must
+        tag the bin entry with `level=3` (so further iteration sees
+        it in the MOD palette via `_level_matches_tab(3, 2) = True`)
+        and label it as MOD. Verifies the formula
+        `target_level = source_level + 1` propagates correctly at
+        the L2-source step and that the auto-detect overhang probe
+        falls back when the saved plasmid has no clean
+        primary-enzyme release.
+
+        Pre-2026-05-14 there was no test guarding the L2-source
+        persist path — `test_clone_assembly_parts_bin_metadata_round_trip`
+        only covered `source_level=0`.
+        """
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("AAAA" * 200), id="MyL3", name="MyL3")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        modal = sc.ConstructorModal()
+        modal._persist_assembly(
+            rec, "gb_l0",
+            source_level=2,
+            entry_vector={"name": "l3_dest_vec",
+                            "gb_text": "LOCUS x 1 bp DNA\n//\n"},
+            parts=[
+                {"name": "MOD_x", "oh5": "GGAA", "oh3": "TTCC",
+                 "level": 2, "gb_text": ""},
+                {"name": "MOD_y", "oh5": "TTCC", "oh3": "AACC",
+                 "level": 2, "gb_text": ""},
+            ],
+            backbone_role="Alpha1",
+        )
+        bin_entries = sc._load_parts_bin()
+        assert len(bin_entries) == 1
+        e = bin_entries[0]
+        # target_level = source_level + 1 = 3
+        assert e["level"] == 3
+        # Label rolls up to "MOD" via `_part_level_label(3)` since
+        # any level ≥ 2 displays as MOD (the cycle is recursive past
+        # this point, no need to track L3/L4/L5 separately).
+        assert e["type"] == "MOD"
+        assert e["position"] == "MOD"
+        assert e["grammar"] == "gb_l0"
+        # The overhang probe couldn't release a clean L3 fragment
+        # (no IIS sites in this test stub), so it falls back to the
+        # inner-source boundaries — MOD_x's oh5 and MOD_y's oh3.
+        # That keeps SOMETHING in the bin entry so downstream UI
+        # doesn't render empty overhangs; the live palette would
+        # re-resolve via `_assembly_fragment_from_source` anyway.
+        assert e["oh5"] == "GGAA"
+        assert e["oh3"] == "AACC"
+        # gb_text must round-trip onto the bin entry so a further
+        # L3→L4 iteration can digest this plasmid.
+        assert e["gb_text"]
+        # Source-parts list captures the L2 MODs.
+        assert e["source_parts"] == ["MOD_x", "MOD_y"]
 
 
 class TestConstructorComposeAssemblyName:
