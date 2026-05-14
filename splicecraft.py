@@ -47709,15 +47709,19 @@ def _h_transfer_annotations(app, payload):
 @_agent_endpoint("diff-plasmid")
 def _h_diff_plasmid(app, payload):
     """Pairwise alignment of the loaded record against another plasmid
-    in the library. Body: ``{target_id: str, mode?: 'global'|'local'}``.
-    Returns the full result dict from `_pairwise_align`
-    (`{score, identity_pct, aligned_q, aligned_t, n_matches,
-    n_mismatches, n_gaps, q_len, t_len}`) plus `target_name` so an
-    agent can label the comparison without a second round-trip.
+    in the library. Body: ``{target_id, mode?, circular?}``.
 
-    Skips the UI and feeds an agent the same numbers `AlignmentScreen`
-    surfaces — a "how similar are pUC19 and my new construct" question
-    can be answered in one round-trip."""
+    `circular` (default `auto` — detected from the target's topology
+    annotation) drives the `_find_circular_alignment_offset` seed-kmer
+    rotation. Pass `false` to skip the rotation (matches the pre-0.8.4
+    behaviour); pass `true` to force it even when the target's
+    topology isn't annotated. Returns the full `_pairwise_align`
+    result plus `target_name` AND `rotation_offset` so an agent
+    can map back to original target coordinates.
+
+    Skips the UI and feeds an agent the same numbers
+    `AlignmentScreen` surfaces — a "how similar are pUC19 and my new
+    construct" question can be answered in one round-trip."""
     rec = getattr(app, "_current_record", None)
     if rec is None:
         return ({"error": "no plasmid loaded"}, 422)
@@ -47741,19 +47745,230 @@ def _h_diff_plasmid(app, payload):
         target_record = _gb_text_to_record(gb_text)
     except Exception as exc:
         return ({"error": f"target parse failed: {exc}"}, 500)
+    # Circular-alignment rotation (audit fix 2026-05-14): when the
+    # target is circular, the query's origin is rarely the same bp
+    # as the target's origin. Without rotation the global align pays
+    # gaps to slide the smaller offset back into register — exactly
+    # the GH #16 symptom Cory reported. Auto-detect from the
+    # target's topology annotation; agents can override with an
+    # explicit `circular` boolean.
+    circ_raw = payload.get("circular")
+    if circ_raw is None:
+        target_annotations = getattr(target_record, "annotations",
+                                       None) or {}
+        is_circular = (target_annotations.get("topology") == "circular")
+    else:
+        is_circular = bool(circ_raw)
+    query_seq = str(rec.seq)
+    target_seq_raw = str(target_record.seq)
+    rotation_offset = 0
+    if is_circular and query_seq and target_seq_raw:
+        try:
+            rotation_offset = _find_circular_alignment_offset(
+                query_seq, target_seq_raw,
+            )
+        except Exception:
+            _log.exception("diff-plasmid: rotation offset probe failed")
+    target_seq = (target_seq_raw[rotation_offset:]
+                  + target_seq_raw[:rotation_offset]
+                  if rotation_offset else target_seq_raw)
     try:
-        result = _pairwise_align(
-            str(rec.seq), str(target_record.seq), mode=mode,
-        )
+        result = _pairwise_align(query_seq, target_seq, mode=mode)
     except ValueError as exc:
         return ({"error": f"alignment rejected: {exc}"}, 400)
     except Exception as exc:
         return ({"error": f"alignment failed: {exc}"}, 500)
     return {
-        "ok":          True,
-        "target_id":   target_id,
-        "target_name": target_record.name or target_record.id or "",
-        "result":      result,
+        "ok":              True,
+        "target_id":       target_id,
+        "target_name":     target_record.name or target_record.id or "",
+        "circular":        is_circular,
+        "rotation_offset": rotation_offset,
+        "result":          result,
+    }
+
+
+# ── Plasmidsaurus alignment endpoints ──────────────────────────────────────────
+
+
+@_agent_endpoint("list-plasmidsaurus-members")
+def _h_list_plasmidsaurus_members(app, payload):
+    """List the GenBank-format members of a Plasmidsaurus result
+    zip. Body: ``{path}``. Returns ``{members: [{name, size}, ...]}``.
+
+    Cap-protected — zips above `_PLASMIDSAURUS_ZIP_MAX_BYTES`
+    (500 MB), members above `_PLASMIDSAURUS_MEMBER_MAX_BYTES` and
+    listings beyond `_PLASMIDSAURUS_MAX_MEMBERS` are refused or
+    skipped to keep the picker snappy and resistant to malformed
+    archives. Symlinks at the path are rejected via
+    `_safe_file_size_check` upstream.
+
+    Read-only — does not extract or align anything; the agent uses
+    the returned member name with `align-plasmidsaurus-zip` to run
+    the actual alignment.
+    """
+    raw_path = payload.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return ({"error": "missing 'path'"}, 400)
+    path = _sanitize_path(raw_path)
+    if path is None:
+        return ({"error": "could not sanitize 'path'"}, 400)
+    ok, reason = _safe_file_size_check(
+        path, _PLASMIDSAURUS_ZIP_MAX_BYTES, "Plasmidsaurus zip",
+    )
+    if not ok:
+        return ({"error": reason or "zip rejected"}, 422)
+    try:
+        members = _list_gbk_members_in_zip(path)
+    except ValueError as exc:
+        return ({"error": str(exc)}, 422)
+    except Exception as exc:
+        _log.exception("agent list-plasmidsaurus-members: zip walk failed")
+        return ({"error": f"zip walk failed: {exc}"}, 500)
+    return {"ok": True, "path": str(path),
+            "members": members, "count": len(members)}
+
+
+@_agent_endpoint("align-plasmidsaurus-zip")
+def _h_align_plasmidsaurus_zip(app, payload):
+    """Align a Plasmidsaurus zip member against a library plasmid.
+    Body: ``{path, member, target_id?, target_name?, mode?, circular?}``.
+
+    Either `target_id` (library entry id) or `target_name` is
+    required. `mode` is ``global`` (default) or ``local``.
+    `circular` defaults to the target's topology annotation;
+    passing it explicitly overrides the auto-detect.
+
+    Runs the same pipeline `_align_worker` uses in the UI:
+    extract the `.gbk` member from the zip, parse it as a
+    SeqRecord, find the circular alignment offset against the
+    target via `_find_circular_alignment_offset`, run
+    `_pairwise_align`. Returns the alignment result plus the
+    rotation offset so the agent can map matches back to the
+    target's original coordinates.
+
+    Read-only — does not register an overlay in the UI or persist
+    anything. The library is consulted to resolve the target only.
+    """
+    raw_path = payload.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return ({"error": "missing 'path'"}, 400)
+    member = payload.get("member")
+    if not isinstance(member, str) or not member:
+        return ({"error": "missing 'member' (zip member filename)"}, 400)
+    target_id_raw = payload.get("target_id")
+    target_name_raw = payload.get("target_name")
+    target_id = (_sanitize_label(target_id_raw, max_len=200)
+                 if isinstance(target_id_raw, str) else "")
+    target_name = (_sanitize_label(target_name_raw, max_len=200)
+                   if isinstance(target_name_raw, str) else "")
+    if not target_id and not target_name:
+        return ({"error": "missing 'target_id' or 'target_name'"}, 400)
+    mode = payload.get("mode", "global")
+    if mode not in ("global", "local"):
+        return ({"error": "'mode' must be 'global' or 'local'"}, 400)
+    path = _sanitize_path(raw_path)
+    if path is None:
+        return ({"error": "could not sanitize 'path'"}, 400)
+    ok, reason = _safe_file_size_check(
+        path, _PLASMIDSAURUS_ZIP_MAX_BYTES, "Plasmidsaurus zip",
+    )
+    if not ok:
+        return ({"error": reason or "zip rejected"}, 422)
+    # Resolve the target in the active library. Cross-collection
+    # search isn't this endpoint's job — agents should
+    # `set-active-collection` first when the target lives elsewhere.
+    target_entry: "dict | None" = None
+    for e in _load_library():
+        if target_id and e.get("id") == target_id:
+            target_entry = e
+            break
+        if target_name and e.get("name") == target_name:
+            target_entry = e
+            break
+    if target_entry is None:
+        descriptor = (f"id={target_id!r}" if target_id
+                      else f"name={target_name!r}")
+        return ({"error": f"no library entry matching {descriptor}"},
+                404)
+    gb_text_target = target_entry.get("gb_text") or ""
+    if not gb_text_target:
+        return ({"error": "target entry has no gb_text"}, 422)
+    try:
+        target_record = _gb_text_to_record(gb_text_target)
+    except Exception as exc:
+        return ({"error": f"target parse failed: {exc}"}, 500)
+    # Extract + parse the zip member.
+    try:
+        gb_text_query = _extract_gbk_member(path, member)
+    except ValueError as exc:
+        return ({"error": f"could not extract member: {exc}"}, 422)
+    except Exception as exc:
+        _log.exception("agent align-plasmidsaurus-zip: extract failed")
+        return ({"error": f"extract failed: {exc}"}, 500)
+    try:
+        query_record = _gb_text_to_record(gb_text_query)
+    except Exception as exc:
+        return ({"error": f"query parse failed: {exc}"}, 422)
+    query_seq = str(query_record.seq)
+    target_seq_raw = str(target_record.seq)
+    if not query_seq or not target_seq_raw:
+        return ({"error": "query or target sequence is empty"}, 422)
+    # Length-cap before kicking off the C-loop alignment. Even though
+    # `_pairwise_align` enforces the same cap, surfacing it as 413
+    # here gives a clearer error than a generic "rejected" downstream.
+    if len(query_seq) > _PAIRWISE_MAX_LEN:
+        return ({"error": f"query exceeds {_PAIRWISE_MAX_LEN:,} bp"},
+                413)
+    if len(target_seq_raw) > _PAIRWISE_MAX_LEN:
+        return ({"error": f"target exceeds {_PAIRWISE_MAX_LEN:,} bp"},
+                413)
+    # Circular rotation: same auto-detect as `diff-plasmid`.
+    circ_raw = payload.get("circular")
+    if circ_raw is None:
+        target_annotations = getattr(target_record, "annotations",
+                                       None) or {}
+        is_circular = (target_annotations.get("topology") == "circular")
+    else:
+        is_circular = bool(circ_raw)
+    rotation_offset = 0
+    if is_circular:
+        try:
+            rotation_offset = _find_circular_alignment_offset(
+                query_seq, target_seq_raw,
+            )
+        except Exception:
+            _log.exception(
+                "align-plasmidsaurus-zip: rotation offset probe failed",
+            )
+    target_seq = (target_seq_raw[rotation_offset:]
+                  + target_seq_raw[:rotation_offset]
+                  if rotation_offset else target_seq_raw)
+    try:
+        result = _pairwise_align(query_seq, target_seq, mode=mode)
+    except ValueError as exc:
+        return ({"error": f"alignment rejected: {exc}"}, 400)
+    except Exception as exc:
+        _log.exception("align-plasmidsaurus-zip: alignment failed")
+        return ({"error": f"alignment failed: {exc}"}, 500)
+    _log_event(
+        "alignment.agent",
+        path=str(path), member=member,
+        target=target_record.name or target_record.id or "",
+        identity_pct=round(float(result.get("identity_pct") or 0), 1),
+        rotation=rotation_offset,
+        mode=mode,
+    )
+    return {
+        "ok":              True,
+        "path":            str(path),
+        "member":          member,
+        "query_name":      query_record.name or query_record.id or "",
+        "target_id":       target_entry.get("id") or "",
+        "target_name":     target_record.name or target_record.id or "",
+        "circular":        is_circular,
+        "rotation_offset": rotation_offset,
+        "result":          result,
     }
 
 

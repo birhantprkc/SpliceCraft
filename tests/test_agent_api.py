@@ -431,6 +431,266 @@ class TestDiffPlasmidHandler:
         assert r["identity_pct"] == 100.0
         assert r["n_mismatches"] == 0
 
+    def test_circular_rotation_auto_detected_for_circular_target(
+            self, tiny_record, isolated_library,
+    ):
+        """When the target's topology annotation is `circular`, the
+        endpoint runs the seed-kmer rotation probe and reports the
+        offset alongside the alignment result. Regression for
+        2026-05-14 audit finding."""
+        # `tiny_record` is annotated `topology=circular` per conftest.
+        sc._save_library([{
+            "id":      "tgt",
+            "name":    "tgt",
+            "size":    len(tiny_record.seq),
+            "n_feats": 0,
+            "added":   "2026-05-06",
+            "gb_text": sc._record_to_gb_text(tiny_record),
+        }])
+        app = MockApp(record=tiny_record)
+        result = sc._h_diff_plasmid(app, {"target_id": "tgt"})
+        assert result["ok"] is True
+        assert result["circular"] is True
+        # Self-vs-self at the same origin: no rotation needed.
+        assert result["rotation_offset"] == 0
+
+    def test_circular_rotation_can_be_forced(self, tiny_record,
+                                                isolated_library):
+        """A linear target with `circular: true` in the payload runs
+        the rotation probe regardless of annotation."""
+        from Bio.SeqRecord import SeqRecord
+        # Re-stamp as linear so auto-detect would skip rotation.
+        linear_rec = SeqRecord(
+            tiny_record.seq, id=tiny_record.id, name=tiny_record.name,
+            features=list(tiny_record.features),
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        sc._save_library([{
+            "id":      "tgt",
+            "name":    "tgt",
+            "size":    len(linear_rec.seq),
+            "n_feats": 0,
+            "added":   "2026-05-06",
+            "gb_text": sc._record_to_gb_text(linear_rec),
+        }])
+        app = MockApp(record=tiny_record)
+        result = sc._h_diff_plasmid(
+            app, {"target_id": "tgt", "circular": True},
+        )
+        assert result["ok"] is True
+        assert result["circular"] is True
+
+    def test_circular_rotation_can_be_disabled(self, tiny_record,
+                                                isolated_library):
+        """`circular: false` skips the rotation even for circular
+        targets — preserves the pre-0.8.4 behaviour when callers want
+        it."""
+        sc._save_library([{
+            "id":      "tgt",
+            "name":    "tgt",
+            "size":    len(tiny_record.seq),
+            "n_feats": 0,
+            "added":   "2026-05-06",
+            "gb_text": sc._record_to_gb_text(tiny_record),
+        }])
+        app = MockApp(record=tiny_record)
+        result = sc._h_diff_plasmid(
+            app, {"target_id": "tgt", "circular": False},
+        )
+        assert result["ok"] is True
+        assert result["circular"] is False
+        assert result["rotation_offset"] == 0
+
+
+class TestPlasmidsaurusEndpoints:
+    """Plasmidsaurus zip alignment endpoints — list-plasmidsaurus-members
+    + align-plasmidsaurus-zip.
+
+    Both endpoints take a real path on disk; the tests synthesize a
+    minimal zip with one `.gbk` member so the parse + alignment
+    pipeline can exercise them without a network round-trip.
+    """
+
+    def _make_zip(self, tmp_path, record, member_name: str = "run.gbk"):
+        """Build a single-member `.zip` containing the given record as
+        GenBank text. Returns the path."""
+        import zipfile
+        zip_path = tmp_path / "plasmidsaurus.zip"
+        gb_text = sc._record_to_gb_text(record)
+        with zipfile.ZipFile(str(zip_path), "w") as zf:
+            zf.writestr(member_name, gb_text)
+        return zip_path
+
+    def test_list_members_returns_gbk_files(self, tiny_record, tmp_path):
+        zip_path = self._make_zip(tmp_path, tiny_record)
+        result = sc._h_list_plasmidsaurus_members(
+            MockApp(), {"path": str(zip_path)},
+        )
+        assert isinstance(result, dict)
+        assert result["ok"] is True
+        assert result["count"] == 1
+        assert result["members"][0]["name"] == "run.gbk"
+        assert result["members"][0]["size"] > 0
+
+    def test_list_members_missing_path_returns_400(self):
+        result = sc._h_list_plasmidsaurus_members(MockApp(), {})
+        assert isinstance(result, tuple)
+        assert result[1] == 400
+
+    def test_list_members_nonexistent_path_returns_422(self, tmp_path):
+        result = sc._h_list_plasmidsaurus_members(
+            MockApp(), {"path": str(tmp_path / "does-not-exist.zip")},
+        )
+        assert isinstance(result, tuple)
+        assert result[1] == 422
+
+    def test_list_members_non_zip_rejected(self, tmp_path):
+        bogus = tmp_path / "not-a-zip.zip"
+        bogus.write_text("hello world")
+        result = sc._h_list_plasmidsaurus_members(
+            MockApp(), {"path": str(bogus)},
+        )
+        assert isinstance(result, tuple)
+        assert result[1] == 422
+
+    def test_list_members_filters_non_gbk(self, tiny_record, tmp_path):
+        """Members with non-`.gbk`/`.gb`/`.genbank` extensions are
+        skipped so the agent gets the same picker view the UI uses."""
+        import zipfile
+        zip_path = tmp_path / "mixed.zip"
+        gb_text = sc._record_to_gb_text(tiny_record)
+        with zipfile.ZipFile(str(zip_path), "w") as zf:
+            zf.writestr("run.gbk",     gb_text)
+            zf.writestr("readme.txt",  "ignore me")
+            zf.writestr("data.csv",    "a,b,c")
+        result = sc._h_list_plasmidsaurus_members(
+            MockApp(), {"path": str(zip_path)},
+        )
+        assert result["ok"] is True
+        assert {m["name"] for m in result["members"]} == {"run.gbk"}
+
+    def test_align_self_vs_self_100pct(self, tiny_record, tmp_path,
+                                          isolated_library):
+        zip_path = self._make_zip(tmp_path, tiny_record)
+        sc._save_library([{
+            "id":      "tgt",
+            "name":    "tgt",
+            "size":    len(tiny_record.seq),
+            "n_feats": 0,
+            "added":   "2026-05-06",
+            "gb_text": sc._record_to_gb_text(tiny_record),
+        }])
+        result = sc._h_align_plasmidsaurus_zip(
+            MockApp(),
+            {
+                "path":      str(zip_path),
+                "member":    "run.gbk",
+                "target_id": "tgt",
+            },
+        )
+        assert isinstance(result, dict)
+        assert result["ok"] is True
+        assert result["target_id"] == "tgt"
+        # Self-vs-self: 100% identity, no rotation needed.
+        assert result["result"]["identity_pct"] == 100.0
+        assert result["rotation_offset"] == 0
+        # `tiny_record` is circular so the endpoint auto-detected it.
+        assert result["circular"] is True
+
+    def test_align_resolves_target_by_name(self, tiny_record, tmp_path,
+                                             isolated_library):
+        """`target_name` is a fallback when the agent doesn't know
+        the id. Mirrors `_h_delete_from_library`'s name-based lookup
+        contract — the library-entry's display name is the lookup
+        key, while the returned `target_name` is the parsed LOCUS
+        name from the gb_text (matches `_h_diff_plasmid`)."""
+        zip_path = self._make_zip(tmp_path, tiny_record)
+        sc._save_library([{
+            "id":      "tgt",
+            "name":    "Looked Up By Name",
+            "size":    len(tiny_record.seq),
+            "n_feats": 0,
+            "added":   "2026-05-06",
+            "gb_text": sc._record_to_gb_text(tiny_record),
+        }])
+        result = sc._h_align_plasmidsaurus_zip(
+            MockApp(),
+            {
+                "path":        str(zip_path),
+                "member":      "run.gbk",
+                "target_name": "Looked Up By Name",
+            },
+        )
+        assert result["ok"] is True
+        # The lookup matched by display name; returned `target_id` is
+        # the library entry's id, `target_name` is the parsed LOCUS
+        # name from the gb_text (TEST001 here per `tiny_record`).
+        assert result["target_id"] == "tgt"
+        assert result["target_name"] == "TEST001"
+
+    def test_align_missing_target_returns_404(self, tiny_record,
+                                                 tmp_path,
+                                                 isolated_library):
+        zip_path = self._make_zip(tmp_path, tiny_record)
+        sc._save_library([])
+        result = sc._h_align_plasmidsaurus_zip(
+            MockApp(),
+            {
+                "path":      str(zip_path),
+                "member":    "run.gbk",
+                "target_id": "ghost",
+            },
+        )
+        assert isinstance(result, tuple)
+        assert result[1] == 404
+
+    def test_align_missing_member_returns_400(self, tiny_record,
+                                                 tmp_path):
+        zip_path = self._make_zip(tmp_path, tiny_record)
+        result = sc._h_align_plasmidsaurus_zip(
+            MockApp(),
+            {"path": str(zip_path), "target_id": "x"},
+        )
+        assert isinstance(result, tuple)
+        assert result[1] == 400
+
+    def test_align_unknown_zip_member_returns_422(self, tiny_record,
+                                                     tmp_path,
+                                                     isolated_library):
+        zip_path = self._make_zip(tmp_path, tiny_record)
+        sc._save_library([{
+            "id":      "tgt",
+            "name":    "tgt",
+            "size":    len(tiny_record.seq),
+            "n_feats": 0,
+            "added":   "2026-05-06",
+            "gb_text": sc._record_to_gb_text(tiny_record),
+        }])
+        result = sc._h_align_plasmidsaurus_zip(
+            MockApp(),
+            {
+                "path":      str(zip_path),
+                "member":    "not-in-zip.gbk",
+                "target_id": "tgt",
+            },
+        )
+        assert isinstance(result, tuple)
+        assert result[1] == 422
+
+    def test_align_invalid_mode_rejected(self, tiny_record, tmp_path):
+        zip_path = self._make_zip(tmp_path, tiny_record)
+        result = sc._h_align_plasmidsaurus_zip(
+            MockApp(),
+            {
+                "path":      str(zip_path),
+                "member":    "run.gbk",
+                "target_id": "tgt",
+                "mode":      "fast",
+            },
+        )
+        assert isinstance(result, tuple)
+        assert result[1] == 400
+
 
 class TestFindOrfsHandler:
     """`_h_find_orfs` exposes the six-frame ORF scan (added 0.6.0.0).

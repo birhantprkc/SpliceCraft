@@ -2,6 +2,63 @@
 
 ---
 
+## [0.8.5] — 2026-05-14 — Plasmidsaurus agent endpoints + diff-plasmid circular
+
+Cleans up the last deferred item from 0.8.4 — the Plasmidsaurus
+alignment flow now has an agent-API surface — plus a related fix
+to `diff-plasmid` that the 0.8.1 alignment work missed.
+
+### `diff-plasmid` runs circular rotation
+
+Pre-fix the endpoint passed query and target straight into
+`_pairwise_align` without the seed-kmer rotation the UI path
+adopted in 0.8.1 (GH #16). For a circular target whose origin
+didn't match the query's, the C-loop paid hundreds of gap
+penalties to slide the smaller offset back into register. The
+fix mirrors the UI path:
+
+* Auto-detect `circular` from the target's topology annotation.
+* Probe a unique-kmer seed via `_find_circular_alignment_offset`.
+* Rotate the target before alignment when an offset is found.
+* Return `rotation_offset` so agents can map matches back to the
+  target's original coords.
+
+`circular` can be passed explicitly (`true`/`false`) to override
+the auto-detect — useful when the source GenBank doesn't carry a
+topology stamp.
+
+### Plasmidsaurus zip alignment (2 new endpoints)
+
+* **`list-plasmidsaurus-members`** (read; cap-protected by
+  `_PLASMIDSAURUS_ZIP_MAX_BYTES` = 500 MB). Body: `{path}`.
+  Returns `{members: [{name, size}], count, path}`.
+
+* **`align-plasmidsaurus-zip`** (read). Body: `{path, member,
+  target_id? | target_name?, mode? = "global", circular?}`.
+  Runs the same extract → parse → rotate → align pipeline the
+  UI's `_align_worker` uses, returns the full `_pairwise_align`
+  result plus `rotation_offset` + `query_name` so the agent can
+  label matches.
+
+Symlinks, oversized zips, oversized members, and bad zip
+signatures all bounce at the boundary (the helpers'
+`_safe_file_size_check` + `_is_safe_zip_member_name` + zip-lib's
+own signature check). The `_PAIRWISE_MAX_LEN` cap on each side is
+surfaced as 413 before the alignment kicks off so the error is
+specific.
+
+### Tests
+
+`tests/test_agent_api.py::TestPlasmidsaurusEndpoints` adds 10
+tests covering list-members happy / sad paths (missing path, bad
+zip, non-gbk filtering) and align happy / sad paths (self-vs-
+self, target-by-name resolution, 404 / 422 / 400 error shapes).
+`TestDiffPlasmidHandler` got three new tests for the circular
+rotation behaviour. Full suite: 2436 passed, 5 skipped (462 s on
+8 cores).
+
+---
+
 ## [0.8.4] — 2026-05-14 — Agent-API parity + collections async + screen resume
 
 Closes the 0.8.3 "deferred items" list: 19 new agent endpoints
