@@ -2,6 +2,112 @@
 
 ---
 
+## [0.8.4] — 2026-05-14 — Agent-API parity + collections async + screen resume
+
+Closes the 0.8.3 "deferred items" list: 19 new agent endpoints
+bringing the side-door surface to UI parity, three hardening
+fixes on existing endpoints, async collections-save in the
+LibraryPanel, a BLAST stale-collection guard, and `on_screen_resume`
+refresh hooks on FeatureLibraryScreen / PartsBinModal /
+PrimerDesignScreen.
+
+### New agent-API endpoints (19)
+
+* **Parts bin CRUD** — `list-parts` (filterable by grammar / level /
+  position; compact rows), `get-part` (full entry incl. `gb_text`),
+  `delete-part` (write), `classify-part` (read; runs
+  `_classify_part_from_plasmid` against a candidate sequence).
+* **Codon tables** — `add-codon-table` (write; Kazusa fetch by
+  taxid OR raw `{codon: count}` dict — 64-codon cap, IUPAC
+  validation), `delete-codon-table` (write; built-ins refused).
+* **Design + simulation** — `simulate-gibson` (read; dry-run),
+  `gibson-assemble` (write; simulate + save), `design-mutagenesis`
+  (read; SOE-PCR primers from a `W140F`-style mutation string),
+  `design-gb-part` (read; Golden Braid / MoClo domestication
+  primers), `design-primers` (read; generic Primer3 detection +
+  RE-cloning).
+* **Data safety** — `list-backups` (read; per-label, the four
+  recovery tiers), `restore-backup` (write; verifies the
+  source_path belongs to the label's backup set before applying),
+  `list-pre-update-snapshots` (read), `restore-pre-update-snapshot`
+  (write; sacred four checks enforced before `os.replace`).
+* **Utility** — `get-history` (read; returns the parsed
+  `_CommercialSaaSHistoryNode` tree as nested JSON),
+  `check-primer-duplicates` (read; flags shared-sequence groups),
+  `capture-snapshot` (write; same content as Alt+D, returns path).
+
+All write endpoints carry `write=True` (token-gated). Input
+validation:
+* Sequence caps: 1 Mbp on classifier, 30 kbp on mutagenesis CDS,
+  `_PAIRWISE_MAX_LEN` on primer-design template.
+* Grammar lookup goes through `_all_grammars()` (built-ins +
+  user-defined).
+* Backup `source_path` parameter is verified against the live
+  `_list_recoverable_backups` output — agents can't read or write
+  arbitrary files through the restore path.
+* Snapshot id rejected at the wire boundary against
+  `_PRE_UPDATE_NAME_RE` before reaching the underlying restorer.
+
+### Existing endpoint hardening
+
+* `_h_search_library` caps the `query` parameter at 200 chars.
+* `_h_export_genbank` / `_h_export_gff` / `_h_export_fasta` now
+  run `_check_agent_write_path` — refuses to write through a
+  symlink at the destination OR a parent-dir symlink (TOCTOU
+  defense). Parent dir must exist (no auto-mkdir for arbitrary
+  paths).
+* `_h_set_setting` got `write=True` in 0.8.3; coverage assertion
+  added.
+
+### Collections save → async pattern
+
+`LibraryPanel`'s collection rename / delete / new flows
+(splicecraft.py:12814/12862/12934) used to call `_save_collections`
+synchronously — a 100+ MB collections.json froze the UI 5–10 s on
+every click. New `_save_collections_async` helper updates the
+in-memory cache + invalidates dependent caches (BLAST, primer-usage)
+synchronously and dispatches the disk write to
+`_collections_save_to_disk`
+(`@work(thread=True, exclusive=True, group="collections_save")`).
+Errors surface via `_notify_save_failure` on the worker side.
+
+### BLAST stale-collection guard
+
+`_BLAST_CACHE_GENERATION` counter bumps on every
+`_blast_clear_cache()` (collection mutation paths fire this).
+`BlastModal._do_build` captures the generation at entry; the
+`_build_done` callback compares and surfaces "Index discarded —
+collections changed during the build. Click Index again to
+rebuild" instead of displaying an index tied to the old
+collection set.
+
+### Screen resume hooks
+
+`FeatureLibraryScreen.on_screen_resume`,
+`PartsBinModal.on_screen_resume`, and
+`PrimerDesignScreen.on_screen_resume` now re-fetch their backing
+list when the screen comes back to focus — so agent mutations
+underneath (`delete-part`, `update-primer`, etc.) are reflected
+without close+reopen. `FeatureLibraryScreen` skips the reload
+when there are pending edits so unsaved work isn't silently
+discarded.
+
+### Tests
+
+Targeted suite: 264 passed (agent + collections + BLAST). Full
+suite: 2422 passed, 5 skipped (328 s on 8 cores). One initial
+failure (`test_edit_replaces_entry_and_marks_dirty`) flagged that
+`FeatureLibraryScreen.on_screen_resume` was eagerly reloading
+in-flight edits; fixed by gating the reload on `_dirty_indices`.
+
+### What's not in this release
+
+* Agent endpoints for the Plasmidsaurus zip alignment flow (would
+  need a worker pattern + result-streaming, deferred).
+* Per-endpoint integration tests beyond the sanity passes above.
+
+---
+
 ## [0.8.3] — 2026-05-14 — Audit sweep: consistency, hardening, observability
 
 Mostly-mechanical follow-up sweep driven by four parallel audits

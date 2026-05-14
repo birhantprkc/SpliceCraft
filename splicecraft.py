@@ -12272,6 +12272,49 @@ class LibraryPanel(Widget):
                 "Plasmid add: active-collection mirror dispatch failed",
             )
 
+    def _save_collections_async(self, entries: "list[dict]") -> None:
+        """Update the in-memory collections cache synchronously +
+        dispatch the disk write off-thread.
+
+        Audit fix 2026-05-14: every UI callsite that ran
+        `_save_collections(entries)` (rename / delete / new) was
+        blocking the UI for 5–10 s on a 100+ MB collections.json.
+        Splits the helper's sync responsibilities (cache + dependent
+        cache invalidation) from the slow disk write so the panel
+        repopulates instantly.
+        """
+        global _collections_cache
+        _collections_cache = _typed_clone(entries)
+        # Same dependent-cache invalidation `_save_collections` does
+        # synchronously, preserved here so a freshly-renamed /
+        # deleted / new collection doesn't keep returning stale
+        # BLAST hits or primer-usage rows.
+        _clear_blast = globals().get("_blast_clear_cache")
+        if _clear_blast is not None:
+            _clear_blast()
+        _clear_primer = globals().get("_primer_usage_clear_cache")
+        if _clear_primer is not None:
+            _clear_primer()
+        self._collections_save_to_disk(entries)
+
+    @work(thread=True, exclusive=True, group="collections_save")
+    def _collections_save_to_disk(self,
+                                    entries: "list[dict]") -> None:
+        """Worker: persist a collections rename / delete / new
+        off-thread. Cache update already happened on the UI thread
+        before dispatch.
+        """
+        try:
+            _safe_save_json(
+                _COLLECTIONS_FILE, entries, "Plasmid collections",
+            )
+        except (OSError, RuntimeError) as exc:
+            _log.exception("Plasmid collections: save failed")
+            self.app.call_from_thread(
+                _notify_save_failure,
+                self.app, "Plasmid collections", exc,
+            )
+
     def reveal_entry_id(self, entry_id: str) -> None:
         """Switch to the plasmids view, repopulate, and move the
         cursor to the row whose key matches ``entry_id``. Used by
@@ -12810,11 +12853,10 @@ class LibraryPanel(Widget):
                 "plasmids":    plasmids,
                 "saved":       _date.today().isoformat(),
             })
-            try:
-                _save_collections(existing)
-            except (OSError, RuntimeError) as exc:
-                _notify_save_failure(self.app, "Collections", exc)
-                return
+            # Sync-cache + async-disk so a large collections.json
+            # doesn't freeze the UI. Errors surface from the worker
+            # via `_notify_save_failure` (audit fix 2026-05-14).
+            self._save_collections_async(existing)
             self._repopulate_collections()
         modal_ref = NewCollectionModal()
         self.app.push_screen(modal_ref, callback=_picked)
@@ -12858,11 +12900,8 @@ class LibraryPanel(Widget):
 
                 remaining = [c for c in _load_collections()
                              if c.get("name") != name]
-                try:
-                    _save_collections(remaining)
-                except (OSError, RuntimeError) as exc:
-                    _notify_save_failure(self.app, "Collections", exc)
-                    return
+                # Audit fix 2026-05-14: async-disk pattern.
+                self._save_collections_async(remaining)
                 # If the deleted collection was active, fall back to
                 # the first remaining collection (or default) so the
                 # library file mirrors something sensible. Without
@@ -12930,11 +12969,8 @@ class LibraryPanel(Widget):
                 if c.get("name") == old:
                     c["name"] = new_name
                     break
-            try:
-                _save_collections(existing)
-            except (OSError, RuntimeError) as exc:
-                _notify_save_failure(self.app, "Collections", exc)
-                return
+            # Audit fix 2026-05-14: async-disk pattern.
+            self._save_collections_async(existing)
             if _get_active_collection_name() == old:
                 _set_active_collection_name(new_name)
             self._repopulate_collections()
@@ -28823,10 +28859,20 @@ def _blast_get_db(program: str,
     return db
 
 
+_BLAST_CACHE_GENERATION: int = 0
+
+
 def _blast_clear_cache() -> None:
     """Drop the BLAST DB cache. Called from collection-mutation paths
     (delete, rename, save) so a stale db doesn't outlive the underlying
-    plasmids."""
+    plasmids.
+
+    Bumps `_BLAST_CACHE_GENERATION` so in-flight `_do_build` workers
+    can detect that their result was captured against the old
+    collection set and refuse to apply it (audit fix 2026-05-14).
+    """
+    global _BLAST_CACHE_GENERATION
+    _BLAST_CACHE_GENERATION += 1
     _BLAST_DB_CACHE.clear()
 
 
@@ -29419,21 +29465,39 @@ class BlastModal(ModalScreen):
     @work(thread=True, exclusive=True, group="blast_run")
     def _do_build(self, prog: str,
                   col_filter: "list[str] | None") -> None:
+        # Stale-collection guard (audit fix 2026-05-14): capture the
+        # BLAST cache generation at entry. If a `_blast_clear_cache`
+        # fires mid-build (collection rename/delete/save), the
+        # callback drops our result rather than displaying a DB
+        # built against the now-stale collection set.
+        entry_gen = _BLAST_CACHE_GENERATION
         six_frame = (prog == "blastp" and self._six_frame_active())
         try:
             db = _blast_get_db(prog, col_filter, six_frame=six_frame)
         except Exception as exc:
             _log.exception("BLAST DB build failed (worker)")
             self.app.call_from_thread(
-                self._build_done, None, f"Database build failed: {exc}",
+                self._build_done, None,
+                f"Database build failed: {exc}", entry_gen,
             )
             return
-        self.app.call_from_thread(self._build_done, db, None)
+        self.app.call_from_thread(self._build_done, db, None, entry_gen)
 
     def _build_done(self, db: "dict | None",
-                    err_msg: "str | None") -> None:
+                    err_msg: "str | None",
+                    entry_gen: int = -1) -> None:
         self._set_busy(False)
         if not self.is_mounted:
+            return
+        if entry_gen >= 0 and entry_gen != _BLAST_CACHE_GENERATION:
+            # The collection set changed under us mid-build. Surface
+            # a clear message and refuse to display the stale db so
+            # the user doesn't act on the wrong index.
+            self._safe_status(
+                "[yellow]Index discarded — collections changed during "
+                "the build. Click Index again to rebuild against the "
+                "current set.[/yellow]"
+            )
             return
         if err_msg or db is None:
             self._safe_status(f"[red]{err_msg or 'unknown failure'}[/red]")
@@ -30208,6 +30272,32 @@ class FeatureLibraryScreen(Screen):
     def on_mount(self) -> None:
         tbl = self.query_one("#flib-table", DataTable)
         tbl.add_columns("Name", "Type", "±", "bp", "Color")
+        self._repopulate_table()
+
+    def on_screen_resume(self) -> None:
+        """Re-fetch the feature library when the screen is brought
+        back to focus (e.g. after a child modal closed, or after an
+        agent mutation underneath). Without this, screens that read
+        their backing list once at `on_mount` show stale rows for
+        the lifetime of the screen.
+
+        Skips the reload when there are pending edits — overwriting
+        the in-memory entries would discard the user's unsaved work.
+        The trade-off: in the rare case where an agent adds a feature
+        while the user has unsaved edits open, the new agent entry
+        won't appear until the user saves + the screen is re-entered.
+        That's safer than silently losing edits.
+
+        Audit fix 2026-05-14: extends invariant #17's spirit to the
+        Screen-resume lifecycle.
+        """
+        if self._dirty_indices:
+            return
+        try:
+            self._entries = _load_features()
+        except Exception:
+            _log.exception("FeatureLibraryScreen: resume reload failed")
+            return
         self._repopulate_table()
 
     # ── rendering ────────────────────────────────────────────────────────────
@@ -32749,6 +32839,16 @@ class PartsBinModal(Screen):
             "Feat Lib", "Grammar",
         )
         self._populate()
+
+    def on_screen_resume(self) -> None:
+        """Re-populate when the screen comes back to focus so agent
+        mutations (`delete-part`, classify-and-save flows) are
+        reflected. Audit fix 2026-05-14.
+        """
+        try:
+            self._populate()
+        except Exception:
+            _log.exception("PartsBinModal: resume repopulate failed")
 
     @on(Tabs.TabActivated, "#parts-level-tabs")
     def _on_level_tab_changed(self, event: Tabs.TabActivated) -> None:
@@ -42248,6 +42348,16 @@ class PrimerDesignScreen(Screen):
         self._switch_source("feature")
         self._switch_mode("detection")
 
+    def on_screen_resume(self) -> None:
+        """Re-fetch the primer library on resume so agent
+        `update-primer` mutations underneath are reflected when the
+        screen comes back to focus. Audit fix 2026-05-14.
+        """
+        try:
+            self._refresh_library_table()
+        except Exception:
+            _log.exception("PrimerDesignScreen: resume refresh failed")
+
     _STATUS_COLORS = {
         "Designed":  "cyan",
         "Ordered":   "yellow",
@@ -46522,6 +46632,33 @@ def _sanitize_path(p: "str | None") -> "Path | None":
     return Path(p).expanduser()
 
 
+def _check_agent_write_path(path: Path) -> "str | None":
+    """Tighter validation for agent write endpoints (`export-*`,
+    `save`, etc.). Returns an error message string when the path is
+    rejected; None when safe to write.
+
+    Rejects:
+    * Symlinks at the destination — an agent shouldn't get to write
+      through a pre-placed symlink to `/etc/passwd` or similar.
+    * Existing symlinks in any parent component (TOCTOU defense — a
+      racing process can't redirect the write via a parent symlink).
+    * Paths whose parent doesn't exist (forces the user to mkdir
+      first rather than us auto-creating arbitrary directories).
+
+    Audit hardening 2026-05-14: previously the agent's export
+    endpoints used `_sanitize_path` only, which expands `~` and does
+    nothing else — symlink-as-destination was unprotected.
+    """
+    if path.is_symlink():
+        return f"refusing to write through symlink at {path!s}"
+    parent = path.parent
+    if not parent.exists():
+        return f"parent directory does not exist: {parent!s}"
+    if parent.is_symlink():
+        return f"parent directory is a symlink: {parent!s}"
+    return None
+
+
 # ── Plasmid lifecycle status ─────────────────────────────────────────────────
 # Workflow stage of a plasmid in the user's library. Stored on the
 # library entry dict under the `status` key (additive; missing on
@@ -47284,6 +47421,9 @@ def _h_export_genbank(app, payload):
     path = _sanitize_path(payload.get("path"))
     if path is None:
         return ({"error": "missing 'path'"}, 400)
+    err = _check_agent_write_path(path)
+    if err is not None:
+        return ({"error": err}, 403)
     try:
         result = _export_genbank_to_path(rec, path)
     except (OSError, ValueError) as exc:
@@ -47302,6 +47442,9 @@ def _h_export_gff(app, payload):
     path = _sanitize_path(payload.get("path"))
     if path is None:
         return ({"error": "missing 'path'"}, 400)
+    err = _check_agent_write_path(path)
+    if err is not None:
+        return ({"error": err}, 403)
     try:
         result = _export_gff_to_path(rec, path)
     except OSError as exc:
@@ -47319,6 +47462,9 @@ def _h_export_fasta(app, payload):
     path = _sanitize_path(payload.get("path"))
     if path is None:
         return ({"error": "missing 'path'"}, 400)
+    err = _check_agent_write_path(path)
+    if err is not None:
+        return ({"error": err}, 403)
     try:
         result = _export_fasta_to_path(
             rec.name or rec.id or "plasmid",
@@ -47382,6 +47528,10 @@ def _h_search_library(app, payload):
     query = payload.get("query")
     if query is not None and not isinstance(query, str):
         return ({"error": "'query' must be a string"}, 400)
+    # Cap query length to 200 chars so an agent's runaway prompt
+    # can't pin the fuzzy matcher (audit hardening 2026-05-14).
+    if query is not None and len(query) > 200:
+        return ({"error": "'query' exceeds 200-char cap"}, 400)
     raw_limit = payload.get("limit", 200)
     limit, lim_err = _coerce_int(raw_limit, name="limit")
     if lim_err is not None:
@@ -48381,6 +48531,931 @@ def _h_set_setting(app, payload):
         return ({"error": f"{key!r}: {err}"}, 400)
     _set_setting(key, cleaned)
     return {"ok": True, "key": key, "value": cleaned}
+
+
+# ── Parts bin CRUD (Tier 4 — mirrors PartsBinModal) ───────────────────────────
+
+
+def _parts_bin_entry_summary(p: dict) -> dict:
+    """Compact view of a parts-bin row for list endpoints. Drops the
+    `gb_text` blob so a 500-entry bin doesn't return 50+ MB; agents
+    that need full text call `get-part`."""
+    return {
+        "name":     p.get("name", ""),
+        "type":     p.get("type", ""),
+        "level":    p.get("level", 0),
+        "position": p.get("position", ""),
+        "grammar":  p.get("grammar", ""),
+        "oh5":      p.get("oh5", ""),
+        "oh3":      p.get("oh3", ""),
+        "size":     int(p.get("size") or len(str(p.get("sequence") or ""))),
+    }
+
+
+@_agent_endpoint("list-parts")
+def _h_list_parts(app, payload):
+    """List parts in the active parts bin. Optional body:
+    ``{grammar?: str, level?: int, position?: str}`` filters. Returns
+    compact rows (no `gb_text`); call `get-part` for full content."""
+    grammar = payload.get("grammar")
+    level   = payload.get("level")
+    position = payload.get("position")
+    if level is not None:
+        lvl, err = _coerce_int(level, name="level")
+        if err is not None:
+            return ({"error": err}, 400)
+    else:
+        lvl = None
+    if grammar is not None and not isinstance(grammar, str):
+        return ({"error": "'grammar' must be string"}, 400)
+    if position is not None and not isinstance(position, str):
+        return ({"error": "'position' must be string"}, 400)
+    rows = []
+    for p in _load_parts_bin():
+        if grammar and (p.get("grammar") or "") != grammar:
+            continue
+        if lvl is not None and int(p.get("level") or 0) != lvl:
+            continue
+        if position and (p.get("position") or "") != position:
+            continue
+        rows.append(_parts_bin_entry_summary(p))
+    return {"ok": True, "parts": rows, "count": len(rows)}
+
+
+@_agent_endpoint("get-part")
+def _h_get_part(app, payload):
+    """Fetch a single part by `name` (and optional `grammar` to
+    disambiguate when two grammars carry a part with the same name).
+    Returns the full entry including `gb_text` + `sequence` so the
+    agent can parse it locally."""
+    name = _sanitize_label(payload.get("name"), max_len=200)
+    if not name:
+        return ({"error": "missing 'name'"}, 400)
+    grammar = payload.get("grammar")
+    if grammar is not None and not isinstance(grammar, str):
+        return ({"error": "'grammar' must be string"}, 400)
+    for p in _load_parts_bin():
+        if p.get("name") != name:
+            continue
+        if grammar and (p.get("grammar") or "") != grammar:
+            continue
+        return {"ok": True, "part": p}
+    return ({"error": f"no part named {name!r}"
+              + (f" in grammar {grammar!r}" if grammar else "")}, 404)
+
+
+@_agent_endpoint("delete-part", write=True)
+def _h_delete_part(app, payload):
+    """Remove a part by `name` (optionally `grammar`). Returns count
+    deleted; 404 if nothing matches."""
+    name = _sanitize_label(payload.get("name"), max_len=200)
+    if not name:
+        return ({"error": "missing 'name'"}, 400)
+    grammar = payload.get("grammar")
+    if grammar is not None and not isinstance(grammar, str):
+        return ({"error": "'grammar' must be string"}, 400)
+
+    def _apply():
+        entries = _load_parts_bin()
+
+        def _match(p):
+            if p.get("name") != name:
+                return False
+            if grammar and (p.get("grammar") or "") != grammar:
+                return False
+            return True
+
+        kept = [p for p in entries if not _match(p)]
+        if len(kept) == len(entries):
+            return ({"error": f"no part named {name!r}"
+                      + (f" in grammar {grammar!r}" if grammar else "")}, 404)
+        try:
+            _save_parts_bin(kept)
+        except (OSError, RuntimeError) as exc:
+            _log.exception("agent delete-part: parts-bin save failed")
+            return ({"error": f"parts-bin save failed: {exc}"}, 500)
+        return len(entries) - len(kept)
+
+    result = app.call_from_thread(_apply)
+    if isinstance(result, tuple):
+        return result
+    return {"ok": True, "deleted": result, "name": name}
+
+
+@_agent_endpoint("classify-part")
+def _h_classify_part(app, payload):
+    """Classify a candidate part by digest-overhang matching, without
+    persisting. Body: ``{sequence, circular?: bool = true,
+    features?: list}`` — same interface `_classify_part_from_plasmid`
+    uses internally. Returns the (grammar, position, type, level,
+    oh5, oh3) tuple if a match is found, or `match=null` if not.
+    """
+    seq = payload.get("sequence")
+    if not isinstance(seq, str) or not seq.strip():
+        return ({"error": "missing or non-string 'sequence'"}, 400)
+    seq_clean = "".join(ch for ch in seq.upper()
+                          if ch in "ACGTRYWSMKBDHVN")
+    if not seq_clean:
+        return ({"error": "no IUPAC bases in 'sequence'"}, 400)
+    # Cap input size so a multi-MB paste can't pin the classifier on
+    # multiple-grammar digest loops.
+    if len(seq_clean) > 1_000_000:
+        return ({"error": "sequence exceeds 1 Mbp cap for classifier"},
+                413)
+    circular = bool(payload.get("circular", True))
+    raw_feats = payload.get("features") or []
+    if not isinstance(raw_feats, list):
+        return ({"error": "'features' must be a list"}, 400)
+    feats = [f for f in raw_feats if isinstance(f, dict)]
+    try:
+        result = _classify_part_from_plasmid(
+            seq_clean, circular=circular, features=feats,
+        )
+    except Exception as exc:
+        _log.exception("agent classify-part: classifier failed")
+        return ({"error": f"classification failed: {exc}"}, 500)
+    return {"ok": True, "match": result}
+
+
+# ── Codon table CRUD (mirrors SpeciesPickerModal) ─────────────────────────────
+
+
+@_agent_endpoint("add-codon-table", write=True)
+def _h_add_codon_table(app, payload):
+    """Add or replace a codon-usage table. Body either fetches from
+    Kazusa or stamps a raw dict directly:
+
+      * Fetch:   ``{taxid: str, name?: str, source: "kazusa"}``
+      * Raw:     ``{name: str, taxid?: str, raw: {<codon>: count, ...}}``
+
+    The Kazusa fetch is size-capped at `_KAZUSA_MAX_RESPONSE_BYTES`
+    and timeout-bounded; the raw path caps at 64 codons (the
+    standard genetic code) and validates each value is a non-negative
+    int.
+    """
+    source = payload.get("source", "user")
+    if not isinstance(source, str):
+        return ({"error": "'source' must be string"}, 400)
+    if source == "kazusa":
+        taxid_raw = payload.get("taxid")
+        if not isinstance(taxid_raw, str) or not taxid_raw.strip():
+            return ({"error": "'taxid' required for kazusa source"}, 400)
+        taxid = _sanitize_label(taxid_raw, max_len=32)
+        if not taxid or not taxid.isdigit():
+            return ({"error": "'taxid' must be a digit string"}, 400)
+        name_in = _sanitize_label(payload.get("name"), max_len=200)
+        try:
+            raw, msg = _codon_fetch_kazusa(taxid)
+        except Exception as exc:
+            _log.exception("agent add-codon-table: Kazusa fetch failed")
+            return ({"error": f"Kazusa fetch failed: {exc}"}, 502)
+        if raw is None:
+            return ({"error": msg or "Kazusa returned no data"}, 502)
+        display = name_in or f"Species (taxid {taxid})"
+        try:
+            entry = _codon_tables_add(display, taxid, raw, source="kazusa")
+        except (OSError, RuntimeError) as exc:
+            _log.exception("agent add-codon-table: save failed")
+            return ({"error": f"save failed: {exc}"}, 500)
+        return {"ok": True, "entry": {
+            "name":   entry["name"],
+            "taxid":  entry["taxid"],
+            "source": entry["source"],
+        }}
+    # Raw path.
+    name_in = _sanitize_label(payload.get("name"), max_len=200)
+    if not name_in:
+        return ({"error": "missing 'name'"}, 400)
+    raw = payload.get("raw")
+    if not isinstance(raw, dict):
+        return ({"error": "'raw' must be a dict of {codon: count}"}, 400)
+    if len(raw) > 64:
+        return ({"error": "'raw' has more than 64 codons"}, 400)
+    valid = set("ACGTU")
+    cleaned: dict = {}
+    for codon, count in raw.items():
+        if not isinstance(codon, str) or len(codon) != 3:
+            return ({"error": f"bad codon {codon!r} — must be 3-char str"},
+                    400)
+        if set(codon.upper()) - valid:
+            return ({"error": f"non-IUPAC codon {codon!r}"}, 400)
+        n, err = _coerce_int(count, name=f"raw[{codon!r}]")
+        if err is not None:
+            return ({"error": err}, 400)
+        if n < 0:
+            return ({"error": f"negative count for codon {codon!r}"}, 400)
+        cleaned[codon.upper().replace("U", "T")] = n
+    taxid_raw = payload.get("taxid", "")
+    taxid = (_sanitize_label(taxid_raw, max_len=32) if taxid_raw else "")
+    try:
+        entry = _codon_tables_add(name_in, taxid, cleaned, source="user")
+    except (OSError, RuntimeError) as exc:
+        _log.exception("agent add-codon-table: save failed")
+        return ({"error": f"save failed: {exc}"}, 500)
+    return {"ok": True, "entry": {
+        "name":   entry["name"],
+        "taxid":  entry["taxid"],
+        "source": entry["source"],
+    }}
+
+
+@_agent_endpoint("delete-codon-table", write=True)
+def _h_delete_codon_table(app, payload):
+    """Remove a codon-usage table by `taxid` or `name`. Built-in
+    tables (source='builtin') cannot be removed."""
+    key_raw = payload.get("taxid") or payload.get("name")
+    if not isinstance(key_raw, str) or not key_raw.strip():
+        return ({"error": "missing 'taxid' or 'name'"}, 400)
+    key = key_raw.strip().lower()
+    entries = _codon_tables_load()
+    target = None
+    for e in entries:
+        if (str(e.get("taxid") or "").lower() == key
+                or str(e.get("name") or "").lower() == key):
+            target = e
+            break
+    if target is None:
+        return ({"error": f"no codon table for {key_raw!r}"}, 404)
+    if (target.get("source") or "") == "builtin":
+        return ({"error": "built-in codon tables cannot be removed"}, 409)
+    kept = [e for e in entries
+            if (e.get("taxid") or e.get("name")) !=
+               (target.get("taxid") or target.get("name"))]
+    try:
+        _codon_tables_save(kept)
+    except (OSError, RuntimeError) as exc:
+        _log.exception("agent delete-codon-table: save failed")
+        return ({"error": f"save failed: {exc}"}, 500)
+    return {"ok": True, "removed": {
+        "name":   target.get("name", ""),
+        "taxid":  target.get("taxid", ""),
+    }}
+
+
+# ── Utility endpoints (history viewer, primer-dup, UI snapshot) ───────────────
+
+
+def _history_node_to_dict(node) -> "dict | None":
+    """Convert a `_CommercialSaaSHistoryNode` tree to a plain-dict JSON
+    shape. Mirrors the viewer's per-node fields so an agent gets the
+    same surface the UI sees without driving a TUI.
+    """
+    if node is None:
+        return None
+    out: dict = {
+        "name":       getattr(node, "name", "") or "",
+        "operation":  getattr(node, "operation", "") or "",
+        "seq_len":    int(getattr(node, "seq_len", 0) or 0),
+        "circular":   bool(getattr(node, "circular", False)),
+        "regenerated_sites": list(
+            getattr(node, "regenerated_sites", []) or []
+        ),
+        "input_summaries":   list(
+            getattr(node, "input_summaries", []) or []
+        ),
+        "parents":    [],
+    }
+    for p in (getattr(node, "parents", []) or []):
+        cd = _history_node_to_dict(p)
+        if cd is not None:
+            out["parents"].append(cd)
+    return out
+
+
+@_agent_endpoint("get-history")
+def _h_get_history(app, payload):
+    """Return the construction-history tree for a library entry as
+    nested JSON. Body: ``{name}`` (or ``{id}``). Returns ``history=null``
+    when the entry has no recorded history (NOT a 404)."""
+    name = _sanitize_label(payload.get("name"), max_len=200)
+    eid_raw = payload.get("id")
+    eid = (_sanitize_label(eid_raw, max_len=200)
+           if isinstance(eid_raw, str) else "")
+    if not name and not eid:
+        return ({"error": "missing 'name' or 'id'"}, 400)
+    entries = _load_library()
+    entry = None
+    for e in entries:
+        if eid and e.get("id") == eid:
+            entry = e
+            break
+        if name and e.get("name") == name:
+            entry = e
+            break
+    if entry is None:
+        return ({"error": f"no entry matching name={name!r} id={eid!r}"},
+                404)
+    xml = entry.get("history_xml") or ""
+    if not xml:
+        return {"ok": True, "history": None,
+                "name": entry.get("name"), "id": entry.get("id")}
+    try:
+        root = _parse_commercialsaas_history(xml)
+    except ValueError as exc:
+        _log.warning("agent get-history: malformed history_xml: %s", exc)
+        return ({"error": f"malformed history XML: {exc}"}, 422)
+    return {
+        "ok": True,
+        "name": entry.get("name"),
+        "id":   entry.get("id"),
+        "history": _history_node_to_dict(root),
+    }
+
+
+@_agent_endpoint("check-primer-duplicates")
+def _h_check_primer_duplicates(app, payload):
+    """Scan the primer library for duplicate sequences. Returns a
+    list of groups where multiple entries share the same canonical
+    primer sequence — useful for an agent to flag before saving a
+    designed primer. Empty list when the library is clean.
+
+    Read-only (no `write=True`) — running it via the agent doesn't
+    mutate state. The on-launch `PrimerDuplicatesModal` (sweep #3)
+    does the dedupe, but it's splash-time only; this endpoint lets
+    an agent inspect anytime.
+    """
+    entries = _load_primers()
+    by_seq: dict = {}
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        seq = _normalize_primer_seq(e.get("sequence") or "")
+        if not seq:
+            continue
+        by_seq.setdefault(seq, []).append({
+            "name":     e.get("name", ""),
+            "sequence": seq,
+            "tm":       e.get("tm"),
+            "primer_type": e.get("primer_type", ""),
+            "source":   e.get("source", ""),
+        })
+    duplicates = [grp for grp in by_seq.values() if len(grp) > 1]
+    return {
+        "ok": True,
+        "duplicates": duplicates,
+        "n_groups": len(duplicates),
+        "n_total_entries": len(entries),
+    }
+
+
+@_agent_endpoint("capture-snapshot", write=True)
+def _h_capture_snapshot(app, payload):
+    """Write a Markdown UI snapshot (same content as Alt+D) and
+    return the file path. Useful for an agent assembling a bug
+    report: snapshot first, then bundle the log dir.
+
+    Marked `write=True` because the call writes a new file under
+    `<DATA_DIR>/ui_snapshots/`; the snapshot itself doesn't mutate
+    user data, but creating a file is a write side-effect.
+    """
+    def _apply():
+        try:
+            snap = _collect_ui_snapshot(app)
+            text = _format_ui_snapshot(snap)
+            path = _save_ui_snapshot(text)
+            return str(path)
+        except OSError as exc:
+            _log.exception("agent capture-snapshot: write failed")
+            return ({"error": f"snapshot write failed: {exc}"}, 500)
+        except Exception as exc:
+            _log.exception("agent capture-snapshot: collect failed")
+            return ({"error": f"snapshot collect failed: {exc}"}, 500)
+    result = app.call_from_thread(_apply)
+    if isinstance(result, tuple):
+        return result
+    return {"ok": True, "path": result}
+
+
+# ── Data-safety endpoints (backups + pre-update snapshots) ────────────────────
+
+
+# Mapping of user-friendly data-file labels to the splicecraft attr
+# that holds the live path. Agents pass the friendly label so we don't
+# leak filesystem-paths into the wire surface, and so a relocated
+# DATA_DIR doesn't require an agent-side change.
+_AGENT_BACKUP_LABELS: dict = {
+    "plasmid_library":         "_LIBRARY_FILE",
+    "collections":             "_COLLECTIONS_FILE",
+    "parts_bin":               "_PARTS_BIN_FILE",
+    "parts_bin_collections":   "_PARTS_BIN_COLLECTIONS_FILE",
+    "primers":                 "_PRIMERS_FILE",
+    "features":                "_FEATURES_FILE",
+    "feature_colors":          "_FEATURE_COLORS_FILE",
+    "grammars":                "_GRAMMARS_FILE",
+    "entry_vectors":           "_ENTRY_VECTORS_FILE",
+    "codon_tables":            "_CODON_TABLES_FILE",
+    "settings":                "_SETTINGS_FILE",
+}
+
+
+def _resolve_backup_label(label: str) -> "tuple[Path | None, str]":
+    """Map a label → Path + human label. Returns (None, error_msg)
+    if the label isn't registered. Used by both list/restore agent
+    endpoints so the validation is uniform."""
+    if not isinstance(label, str) or not label:
+        return (None, "missing 'label'")
+    attr = _AGENT_BACKUP_LABELS.get(label)
+    if attr is None:
+        return (None,
+                f"unknown label {label!r} (valid: "
+                f"{sorted(_AGENT_BACKUP_LABELS)})")
+    path = globals().get(attr)
+    if not isinstance(path, Path):
+        return (None, f"label {label!r} not mapped to a Path")
+    return (path, label)
+
+
+@_agent_endpoint("list-backups")
+def _h_list_backups(app, payload):
+    """List recoverable backups for one user-data file. Body:
+    ``{label}`` where ``label`` is one of plasmid_library /
+    collections / parts_bin / parts_bin_collections / primers /
+    features / feature_colors / grammars / entry_vectors /
+    codon_tables / settings.
+
+    Returns rows from the four-layer JSON safety net: `legacy_bak`
+    (`<file>.bak`), `rotating_bak` (timestamped), `snapshot`
+    (daily), `lost_entries` (shrink-guard spillover). Newest first.
+    """
+    path, msg = _resolve_backup_label(payload.get("label"))
+    if path is None:
+        return ({"error": msg}, 400)
+    rows = []
+    for b in _list_recoverable_backups(path):
+        rows.append({
+            "kind":        b.get("kind", ""),
+            "source_path": str(b.get("source_path", "")),
+            "n_entries":   int(b.get("n_entries") or 0),
+            "mtime_str":   str(b.get("mtime_str") or ""),
+        })
+    return {"ok": True, "label": msg, "target_path": str(path),
+            "backups": rows, "count": len(rows)}
+
+
+@_agent_endpoint("restore-backup", write=True)
+def _h_restore_backup(app, payload):
+    """Restore one user-data file from a chosen backup. Body:
+    ``{label, source_path}`` where ``source_path`` must come from a
+    prior `list-backups` response (verified to belong to one of the
+    four backup tiers for the same target).
+
+    Triggers a fresh rotating backup of the current state as part of
+    `_safe_save_json`'s atomic write, so the pre-restore data is
+    NOT lost. Caches for the restored label are busted afterwards.
+    """
+    guard = _agent_dirty_guard(app, payload)
+    if guard is not None:
+        return guard
+    path, msg = _resolve_backup_label(payload.get("label"))
+    if path is None:
+        return ({"error": msg}, 400)
+    src_raw = payload.get("source_path")
+    if not isinstance(src_raw, str) or not src_raw:
+        return ({"error": "missing 'source_path'"}, 400)
+    # Verify the source_path matches one of the registered backup
+    # rows — otherwise an agent could read or write arbitrary files
+    # under the user's uid via this endpoint.
+    src = Path(src_raw).expanduser()
+    legitimate = {Path(b["source_path"])
+                  for b in _list_recoverable_backups(path)}
+    if src not in legitimate:
+        return ({"error": "source_path is not a registered backup for "
+                  f"label {msg!r}"}, 403)
+    try:
+        n = _restore_from_backup(path, src, label=msg)
+    except ValueError as exc:
+        return ({"error": f"unreadable backup: {exc}"}, 422)
+    except OSError as exc:
+        _log.exception("agent restore-backup: write failed")
+        return ({"error": f"restore write failed: {exc}"}, 500)
+    # Bust the in-memory cache for the restored label so the next
+    # read picks up the restored content.
+    cache_attr = {
+        "plasmid_library":       "_library_cache",
+        "collections":           "_collections_cache",
+        "parts_bin":             "_parts_bin_cache",
+        "parts_bin_collections": "_parts_bin_collections_cache",
+        "primers":               "_primers_cache",
+        "features":              "_features_cache",
+        "feature_colors":        "_feature_colors_cache",
+        "grammars":              "_grammars_cache",
+        "entry_vectors":         "_entry_vectors_cache",
+        "codon_tables":          "_codon_tables_cache",
+        "settings":              "_settings_cache",
+    }.get(msg)
+    if cache_attr is not None:
+        globals()[cache_attr] = None
+    return {"ok": True, "label": msg, "entries_restored": n,
+            "source_path": str(src)}
+
+
+@_agent_endpoint("list-pre-update-snapshots")
+def _h_list_pre_update_snapshots(app, payload):
+    """List pre-update snapshots created by `splicecraft update`.
+    Returns each snapshot's id, from_version, mtime, and counts —
+    same data the `--restore-pre-update` CLI shows."""
+    snaps = _list_pre_update_snapshots()
+    rows = []
+    for s in snaps:
+        rows.append({
+            "id":                  s.get("id", ""),
+            "path":                str(s.get("path", "")),
+            "mtime":               s.get("mtime"),
+            "from_version":        s.get("from_version", "?"),
+            "from_python_version": s.get("from_python_version", "?"),
+            "from_platform":       s.get("from_platform", "?"),
+            "schema_version":      s.get("schema_version", 1),
+            "n_files":             s.get("n_files", 0),
+            "n_dirs":              s.get("n_dirs", 0),
+            "total_size":          s.get("total_size", 0),
+        })
+    return {"ok": True, "snapshots": rows, "count": len(rows)}
+
+
+@_agent_endpoint("restore-pre-update-snapshot", write=True)
+def _h_restore_pre_update_snapshot(app, payload):
+    """Restore a pre-update snapshot by id (or "latest"). Body:
+    ``{id?: str}``. When ``id`` is missing or "latest", restores the
+    newest snapshot.
+
+    Same sacred four checks as the CLI path (schema version ≤
+    current, attr in `_USER_DATA_FILE_ATTRS`, name regex
+    `_PRE_UPDATE_NAME_RE`, SHA-256 re-verify before `os.replace`).
+    """
+    guard = _agent_dirty_guard(app, payload)
+    if guard is not None:
+        return guard
+    raw_id = payload.get("id") or "latest"
+    if not isinstance(raw_id, str):
+        return ({"error": "'id' must be string"}, 400)
+    raw_id = raw_id.strip() or "latest"
+    if raw_id != "latest":
+        # Enforce the regex on the wire boundary so a malformed id
+        # never reaches `_restore_pre_update_snapshot`'s validator.
+        if not _PRE_UPDATE_NAME_RE.match(raw_id):
+            return ({"error": f"id {raw_id!r} fails the pre-update "
+                      "snapshot name regex"}, 400)
+    try:
+        if raw_id == "latest":
+            snaps = _list_pre_update_snapshots()
+            if not snaps:
+                return ({"error": "no pre-update snapshots available"},
+                        404)
+            target = snaps[0]["path"]
+        else:
+            target = raw_id
+        report = _restore_pre_update_snapshot(target)
+    except FileNotFoundError as exc:
+        return ({"error": f"snapshot not found: {exc}"}, 404)
+    except ValueError as exc:
+        return ({"error": f"snapshot rejected: {exc}"}, 422)
+    except OSError as exc:
+        _log.exception("agent restore-pre-update-snapshot: write failed")
+        return ({"error": f"restore write failed: {exc}"}, 500)
+    # Bust every cached user-data so post-restore reads see the
+    # restored state.
+    for cache_attr in (
+            "_library_cache", "_collections_cache",
+            "_parts_bin_cache", "_parts_bin_collections_cache",
+            "_primers_cache", "_features_cache",
+            "_feature_colors_cache", "_grammars_cache",
+            "_entry_vectors_cache", "_codon_tables_cache",
+            "_settings_cache",
+    ):
+        globals()[cache_attr] = None
+    return {"ok": True, "report": report}
+
+
+# ── Design / simulation endpoints (Gibson, mutagenesis, primer design) ────────
+
+
+@_agent_endpoint("simulate-gibson")
+def _h_simulate_gibson(app, payload):
+    """Dry-run a Gibson assembly without saving. Body:
+    ``{fragments: [{name, sequence, features?}, ...],
+        min_overlap?: int = 15, circular?: bool = true}``.
+
+    Returns the full simulator result dict (overlaps, errors,
+    warnings, product features, product sequence). Read-only — pair
+    with ``gibson-assemble`` to commit.
+    """
+    fragments = payload.get("fragments")
+    if not isinstance(fragments, list):
+        return ({"error": "'fragments' must be a list"}, 400)
+    if len(fragments) > 64:
+        return ({"error": "too many fragments (max 64)"}, 400)
+    cleaned: list[dict] = []
+    for i, f in enumerate(fragments):
+        if not isinstance(f, dict):
+            return ({"error": f"fragment[{i}] is not a dict"}, 400)
+        seq = f.get("sequence")
+        if not isinstance(seq, str):
+            return ({"error": f"fragment[{i}].sequence missing or "
+                      "non-string"}, 400)
+        if len(seq) > 1_000_000:
+            return ({"error": f"fragment[{i}] exceeds 1 Mbp"}, 413)
+        name = _sanitize_label(f.get("name"), max_len=80) or f"F{i+1}"
+        feats_raw = f.get("features") or []
+        if not isinstance(feats_raw, list):
+            return ({"error": f"fragment[{i}].features must be a list"},
+                    400)
+        cleaned.append({
+            "name":     name,
+            "sequence": seq,
+            "features": [x for x in feats_raw if isinstance(x, dict)],
+        })
+    min_overlap, err = _coerce_int(
+        payload.get("min_overlap", _GIBSON_MIN_OVERLAP_BP),
+        name="min_overlap",
+    )
+    if err is not None:
+        return ({"error": err}, 400)
+    if not (1 <= min_overlap <= _GIBSON_MAX_OVERLAP_BP):
+        return ({"error": f"min_overlap out of range [1, "
+                  f"{_GIBSON_MAX_OVERLAP_BP}]"}, 400)
+    circular = bool(payload.get("circular", True))
+    try:
+        result = _simulate_gibson_assembly(
+            cleaned, min_overlap=min_overlap, circular=circular,
+        )
+    except Exception as exc:
+        _log.exception("agent simulate-gibson: simulator failed")
+        return ({"error": f"simulator failed: {exc}"}, 500)
+    return {"ok": True, "result": result}
+
+
+@_agent_endpoint("gibson-assemble", write=True)
+def _h_gibson_assemble(app, payload):
+    """Run a Gibson simulation AND save the product to the library.
+    Body extends ``simulate-gibson`` with:
+
+      * ``product_name?: str = "gibson-<n>"`` — library entry name
+        (autoname collision is resolved by bumping).
+
+    Returns the simulator result plus ``saved_name`` and
+    ``saved_id`` of the new library entry. Saves directly via
+    `_save_library` (not through `_gibson_save_worker`'s UI path)
+    because there's no Textual app on this thread — we're the
+    agent.
+    """
+    guard = _agent_dirty_guard(app, payload)
+    if guard is not None:
+        return guard
+    # Run simulator first via the read-only handler to share validation.
+    sim_resp = _h_simulate_gibson(app, payload)
+    if isinstance(sim_resp, tuple):
+        return sim_resp
+    result = sim_resp["result"]
+    if not result.get("success"):
+        return ({"error": "Gibson simulation failed; see 'result' for "
+                  "details",
+                  "result": result}, 422)
+    base_name = _sanitize_label(payload.get("product_name"),
+                                  max_len=80) or "gibson"
+    entries = _load_library()
+    existing = {e.get("name") for e in entries if isinstance(e, dict)}
+    n = 1
+    name = base_name
+    while name in existing:
+        n += 1
+        name = f"{base_name}-{n}"
+    rec = _gibson_record_from_result(result, name=name)
+    if rec is None:
+        return ({"error": "failed to build SeqRecord from product"}, 500)
+    try:
+        gb_text = _record_to_gb_text(rec)
+    except Exception as exc:
+        _log.exception("agent gibson-assemble: gb_text serialise failed")
+        return ({"error": f"gb_text serialise failed: {exc}"}, 500)
+    entry = {
+        "id":      name,
+        "name":    name,
+        "size":    len(rec.seq),
+        "n_feats": len(rec.features or []),
+        "source":  "agent:gibson",
+        "added":   _date.today().isoformat(),
+        "gb_text": gb_text,
+    }
+    entries.insert(0, entry)
+    try:
+        _save_library(entries)
+    except (OSError, RuntimeError) as exc:
+        _log.exception("agent gibson-assemble: library save failed")
+        return ({"error": f"library save failed: {exc}"}, 500)
+    _agent_refresh_library_panel(app)
+    return {"ok": True, "saved_name": name, "saved_id": name,
+            "result": result}
+
+
+_AGENT_MUT_RE = re.compile(r"^([A-Z])(\d{1,5})([A-Z\*])$")
+
+
+@_agent_endpoint("design-mutagenesis")
+def _h_design_mutagenesis(app, payload):
+    """Design SOE-PCR primers for a single-site mutation. Body:
+    ``{cds_dna, mutation, codon_taxid?}``. `mutation` is a string
+    like ``"W140F"`` (WT-aa, 1-based position, mutant-aa).
+
+    Returns ``{outer, inner}`` — the outer + inner primer pairs
+    `_mut_design_outer` / `_mut_design_inner` produce. The agent is
+    free to save the result via `update-primer` or by setting up a
+    Constructor save flow.
+    """
+    cds_dna = payload.get("cds_dna")
+    if not isinstance(cds_dna, str) or not cds_dna.strip():
+        return ({"error": "missing or non-string 'cds_dna'"}, 400)
+    cds_clean = "".join(ch for ch in cds_dna.upper()
+                          if ch in "ACGTRYWSMKBDHVN")
+    if not cds_clean:
+        return ({"error": "no IUPAC bases in 'cds_dna'"}, 400)
+    if len(cds_clean) > 30_000:
+        return ({"error": "'cds_dna' exceeds 30 kbp cap"}, 413)
+    if len(cds_clean) % 3 != 0:
+        return ({"error": f"'cds_dna' length {len(cds_clean)} is not a "
+                  "multiple of 3 (CDS must be whole codons)"}, 400)
+    mut_raw = payload.get("mutation")
+    if not isinstance(mut_raw, str):
+        return ({"error": "missing or non-string 'mutation'"}, 400)
+    m = _AGENT_MUT_RE.match(mut_raw.strip())
+    if m is None:
+        return ({"error": f"mutation {mut_raw!r} doesn't match the "
+                  "pattern '<WT-aa><1-based-pos><mut-aa>' "
+                  "(e.g. 'W140F')"}, 400)
+    wt_aa, pos_str, mut_aa = m.group(1), m.group(2), m.group(3)
+    pos = int(pos_str)
+    if pos < 1:
+        return ({"error": "mutation position must be >= 1"}, 400)
+    if (pos - 1) * 3 + 3 > len(cds_clean):
+        return ({"error": f"mutation position {pos} is past the end of "
+                  f"the {len(cds_clean) // 3}-aa CDS"}, 400)
+    codon_taxid = payload.get("codon_taxid")
+    codon_raw = None
+    if codon_taxid is not None:
+        if not isinstance(codon_taxid, str):
+            return ({"error": "'codon_taxid' must be string"}, 400)
+        entry = _codon_tables_get(codon_taxid)
+        if entry is None:
+            return ({"error": f"unknown codon_taxid {codon_taxid!r}"},
+                    404)
+        codon_raw = entry.get("raw")
+    try:
+        outer = _mut_design_outer(cds_clean)
+        inner = _mut_design_inner(cds_clean, pos, mut_aa, wt_aa,
+                                    codon_table=codon_raw)
+    except (ValueError, RuntimeError) as exc:
+        return ({"error": f"mutagenesis design failed: {exc}"}, 422)
+    except Exception as exc:
+        _log.exception("agent design-mutagenesis: unexpected failure")
+        return ({"error": f"unexpected failure: {exc}"}, 500)
+    return {"ok": True, "mutation": mut_raw, "outer": outer, "inner": inner}
+
+
+@_agent_endpoint("design-gb-part")
+def _h_design_gb_part(app, payload):
+    """Design Golden Braid / MoClo domestication primers. Body:
+    ``{template, start, end, part_type, grammar?, target_tm?,
+        codon_taxid?}``.
+
+    `template` is the source DNA sequence; `start`/`end` are 0-based
+    half-open coords (wrap-aware: end < start means origin-spanning
+    on a circular plasmid). `part_type` must be a position type in
+    the named grammar (default `gb_l0`). When `part_type` is a
+    coding type and `codon_taxid` resolves to a codon table,
+    internal forbidden sites are silently repaired via synonymous
+    substitution.
+
+    Returns the `_design_gb_primers` dict (insert_seq, primer pairs,
+    mutations list, overhang labels).
+    """
+    template = payload.get("template")
+    if not isinstance(template, str) or not template.strip():
+        return ({"error": "missing or non-string 'template'"}, 400)
+    template_clean = "".join(ch for ch in template.upper()
+                              if ch in "ACGTRYWSMKBDHVN")
+    if not template_clean:
+        return ({"error": "no IUPAC bases in 'template'"}, 400)
+    if len(template_clean) > _PAIRWISE_MAX_LEN:
+        return ({"error": f"'template' exceeds "
+                  f"{_PAIRWISE_MAX_LEN:,} bp cap"}, 413)
+    start, err = _coerce_int(payload.get("start"), name="start")
+    if err is not None:
+        return ({"error": err}, 400)
+    end, err = _coerce_int(payload.get("end"), name="end")
+    if err is not None:
+        return ({"error": err}, 400)
+    n = len(template_clean)
+    if not (0 <= start < n) or not (0 < end <= n):
+        return ({"error": f"start/end out of range for "
+                  f"{n}-bp template"}, 400)
+    part_type = payload.get("part_type")
+    if not isinstance(part_type, str) or not part_type:
+        return ({"error": "missing 'part_type'"}, 400)
+    gid = payload.get("grammar", "gb_l0")
+    if not isinstance(gid, str):
+        return ({"error": "'grammar' must be string"}, 400)
+    grammar = _all_grammars().get(gid)
+    if grammar is None:
+        return ({"error": f"unknown grammar id {gid!r}"}, 404)
+    target_tm = payload.get("target_tm", 60.0)
+    try:
+        target_tm = float(target_tm)
+    except (TypeError, ValueError):
+        return ({"error": "'target_tm' must be a number"}, 400)
+    if not (40.0 <= target_tm <= 90.0):
+        return ({"error": "'target_tm' must be in [40, 90] °C"}, 400)
+    codon_raw = None
+    codon_taxid = payload.get("codon_taxid")
+    if codon_taxid is not None:
+        if not isinstance(codon_taxid, str):
+            return ({"error": "'codon_taxid' must be string"}, 400)
+        entry = _codon_tables_get(codon_taxid)
+        if entry is None:
+            return ({"error": f"unknown codon_taxid {codon_taxid!r}"},
+                    404)
+        codon_raw = entry.get("raw")
+    try:
+        result = _design_gb_primers(
+            template_clean, start, end, part_type,
+            target_tm=target_tm, codon_raw=codon_raw, grammar=grammar,
+        )
+    except Exception as exc:
+        _log.exception("agent design-gb-part: design failed")
+        return ({"error": f"design failed: {exc}"}, 500)
+    if isinstance(result, dict) and result.get("error"):
+        return ({"error": result["error"]}, 422)
+    return {"ok": True, "result": result}
+
+
+@_agent_endpoint("design-primers")
+def _h_design_primers(app, payload):
+    """Generic primer-pair design over a target region. Body:
+    ``{template, start, end, mode?: "cloning"|"detection",
+        target_tm?: float, site_5?: str, site_3?: str}``.
+
+    Wraps `_design_detection_primers` and
+    `_design_cloning_primers_raw`. **Detection** mode picks a
+    diagnostic amplicon WITHIN the selected region (no overhangs).
+    **Cloning** mode requires `site_5` + `site_3` recognition-site
+    strings and appends them to the primers as RE-cloning tails;
+    for cloning-grammar overhangs (Golden Braid / MoClo Type IIS)
+    use `design-gb-part` instead.
+
+    Returns a primer dict with `fwd_full`, `rev_full`, `fwd_tm`,
+    `rev_tm`, `amplicon_len`, plus mode-specific keys.
+    """
+    template = payload.get("template")
+    if not isinstance(template, str) or not template.strip():
+        return ({"error": "missing or non-string 'template'"}, 400)
+    template_clean = "".join(ch for ch in template.upper()
+                              if ch in "ACGTRYWSMKBDHVN")
+    if not template_clean:
+        return ({"error": "no IUPAC bases in 'template'"}, 400)
+    if len(template_clean) > _PAIRWISE_MAX_LEN:
+        return ({"error": f"'template' exceeds "
+                  f"{_PAIRWISE_MAX_LEN:,} bp cap"}, 413)
+    start, err = _coerce_int(payload.get("start"), name="start")
+    if err is not None:
+        return ({"error": err}, 400)
+    end, err = _coerce_int(payload.get("end"), name="end")
+    if err is not None:
+        return ({"error": err}, 400)
+    n = len(template_clean)
+    if not (0 <= start < n) or not (0 < end <= n):
+        return ({"error": f"start/end out of range for "
+                  f"{n}-bp template"}, 400)
+    mode = payload.get("mode", "detection")
+    if mode not in ("cloning", "detection"):
+        return ({"error": "'mode' must be 'cloning' or 'detection'"},
+                400)
+    target_tm = payload.get("target_tm", 60.0)
+    try:
+        target_tm = float(target_tm)
+    except (TypeError, ValueError):
+        return ({"error": "'target_tm' must be a number"}, 400)
+    if not (40.0 <= target_tm <= 90.0):
+        return ({"error": "'target_tm' must be in [40, 90] °C"}, 400)
+    try:
+        if mode == "detection":
+            result = _design_detection_primers(
+                template_clean, start, end, target_tm=target_tm,
+            )
+        else:
+            site_5 = payload.get("site_5", "")
+            site_3 = payload.get("site_3", "")
+            if not isinstance(site_5, str) or not isinstance(site_3, str):
+                return ({"error": "cloning mode requires 'site_5' + "
+                          "'site_3' recognition-site strings"}, 400)
+            result = _design_cloning_primers_raw(
+                template_clean, start, end,
+                site_5=site_5.upper(), site_3=site_3.upper(),
+                target_tm=target_tm,
+            )
+    except Exception as exc:
+        _log.exception("agent design-primers: design failed")
+        return ({"error": f"design failed: {exc}"}, 500)
+    if isinstance(result, dict) and result.get("error"):
+        return ({"error": result["error"]}, 422)
+    return {"ok": True, "mode": mode, "result": result}
 
 
 # ── HTTP plumbing ──────────────────────────────────────────────────────────────
