@@ -3427,11 +3427,17 @@ def _scan_restriction_sites(
     min_recognition_len: int = 6,
     unique_only: bool = True,
     circular: bool = True,
+    allowed_enzymes: "frozenset[str] | None" = None,
 ) -> list[dict]:
     """Cached entry point for restriction-site scans. Identical
     signature + return shape to the inner `_scan_restriction_sites_impl`;
     consults `_RESTR_SCAN_CACHE` first so a `r`-toggle on a 5 Mb record
-    drops from ~3 s to ~5 ms after the first scan."""
+    drops from ~3 s to ~5 ms after the first scan.
+
+    `allowed_enzymes` (GH #13, 2026-05-14): when supplied, the scan
+    restricts to ONLY these names — overrides the `min_recognition_len`
+    / `unique_only` filters since the user has hand-picked the set.
+    Pass `None` to use the standard filter rules."""
     # Cache key uses `hash(seq)` rather than `id(seq)`: id-based keys
     # break for transient strings (e.g. unit tests build a fresh seq
     # per test, GC'd between calls — CPython's allocator can hand the
@@ -3439,8 +3445,11 @@ def _scan_restriction_sites(
     # CPython interns the string hash on the first call, so subsequent
     # scans of the same seq are still O(1). Same fix applied to
     # `_ENZYME_CUTS_CACHE`.
+    allowed_key = (
+        tuple(sorted(allowed_enzymes)) if allowed_enzymes else None
+    )
     key = (hash(seq), int(min_recognition_len),
-           bool(unique_only), bool(circular))
+           bool(unique_only), bool(circular), allowed_key)
     hit = _RESTR_SCAN_CACHE.get(key)
     if hit is not None:
         # Move to end (LRU touch) so a steady-state "I'm scanning the
@@ -3449,6 +3458,7 @@ def _scan_restriction_sites(
         return hit
     result = _scan_restriction_sites_impl(
         seq, min_recognition_len, unique_only, circular,
+        allowed_enzymes=allowed_enzymes,
     )
     if len(_RESTR_SCAN_CACHE) >= _RESTR_SCAN_CACHE_MAX:
         _RESTR_SCAN_CACHE.popitem(last=False)
@@ -3461,6 +3471,8 @@ def _scan_restriction_sites_impl(
     min_recognition_len: int = 6,
     unique_only: bool = True,
     circular: bool = True,
+    *,
+    allowed_enzymes: "frozenset[str] | None" = None,
 ) -> list[dict]:
     """Scan both strands; return resite + recut dicts for every hit.
 
@@ -3562,8 +3574,17 @@ def _scan_restriction_sites_impl(
 
     for entry in _SCAN_CATALOG:
         name, site, site_len, fwd_cut, rev_cut, color, pat, is_palindrome, rc_pat = entry
-        if site_len < min_recognition_len:
-            continue
+        # `allowed_enzymes` (GH #13): when set, the user has hand-
+        # picked a working list — bypass the length filter so a 4-cutter
+        # like Sau3AI shows up even when the global `restr_min_len`
+        # is 6. We DO still honour `unique_only` below, since "unique
+        # cutters of MY hand-picked list" is the common intent.
+        if allowed_enzymes is not None:
+            if name not in allowed_enzymes:
+                continue
+        else:
+            if site_len < min_recognition_len:
+                continue
         hits: list[dict] = []
 
         # Forward strand scan (over augmented sequence if circular)
@@ -3640,10 +3661,20 @@ def _scan_restriction_sites_impl(
 
     feats: list[dict] = []
     placed: set[tuple[int, int]] = set()   # (start, end) of resites already shown
+    # When a custom enzyme list is active, the user has hand-picked
+    # the set — surface every hit of those enzymes regardless of
+    # cut-count. The `unique_only` filter is a discovery aid for the
+    # default "show me 6+ bp unique cutters" workflow; it actively
+    # hides multi-cutters (BsaI in a Golden Gate plasmid, EcoRI in a
+    # repeat-laden synthetic construct) which is the opposite of what
+    # the user wants after they typed those enzymes in by hand.
+    effective_unique_only = (
+        unique_only and allowed_enzymes is None
+    )
     for name, hits in by_enzyme.items():
         # Count LABELED resites only — a wrap-around hit is emitted as one
         # labeled piece + one unlabeled continuation, but counts as 1 site.
-        if unique_only:
+        if effective_unique_only:
             n_sites = sum(
                 1 for h in hits if h["type"] == "resite" and h.get("label")
             )
@@ -7968,6 +7999,136 @@ def _find_annotation_transfers(source_rec, target_rec, *,
 
     transfers.sort(key=lambda x: (-x["length"], x["target_start"]))
     return transfers
+
+
+def _find_circular_alignment_offset(
+    query: str, target: str, *,
+    k: int = 25, n_attempts: int = 12,
+) -> int:
+    """Find the rotation offset that brings ``target`` into the best
+    register with ``query`` for a circular plasmid alignment.
+
+    Plasmidsaurus reads + GenBank references both start at arbitrary
+    origins on a circular molecule. A naive global alignment that
+    pairs bp 1 of each sequence is almost always wrong — the C-loop
+    pays gaps to slide the smaller offset back into register. This
+    helper finds a unique seed kmer in ``query``, locates it in
+    ``target``, and returns the offset (``target_pos - query_pos``)
+    needed to rotate ``target`` so the seeds line up.
+
+    Strategy: walk ``query`` in even-spaced strides, try each kmer
+    as a seed against ``target`` (case-insensitive, single uppercase
+    canonicalisation), and accept the FIRST seed that has exactly one
+    occurrence (uniqueness guard — multi-hit seeds map to repeats
+    inside the plasmid, e.g. the LB/RB borders, and would give a
+    wrong rotation). Skips low-complexity seeds (<4 distinct bases)
+    so a homopolymer run doesn't dominate.
+
+    Returns 0 when no clean seed is found — the caller should treat
+    that as "no rotation" and run the naive global align, which is
+    still no worse than the prior behaviour.
+
+    Reported by Cory Tobin (GH #16, 2026-05-14): the alignment was
+    lining up bp 1 of the query with bp 1 of the GenBank target,
+    producing huge mismatch / gap counts that disagreed visibly with
+    a CommercialSaaS alignment of the same pair.
+    """
+    if not query or not target:
+        return 0
+    q = query.upper()
+    t = target.upper()
+    qn = len(q)
+    tn = len(t)
+    if qn < k or tn < k:
+        return 0
+    # Doubled target so wrap-spanning seeds resolve cleanly (a seed at
+    # position tn-5 that runs into the origin would otherwise miss).
+    t_doubled = t + t
+    stride = max(k, qn // n_attempts)
+    for q_start in range(0, qn - k + 1, stride):
+        seed = q[q_start:q_start + k]
+        # Low-complexity skip — a poly-A run lights up everywhere.
+        if len(set(seed)) < 4:
+            continue
+        t_pos = t_doubled.find(seed)
+        if t_pos < 0:
+            continue
+        # Uniqueness: a second hit within the original (non-doubled)
+        # target means the seed isn't anchoring a specific position.
+        # Search the rest of the doubled string for any further
+        # occurrence; if the second hit is exactly ``tn`` apart from
+        # the first it's the wrap copy (same position) and we accept.
+        second = t_doubled.find(seed, t_pos + 1)
+        if second >= 0 and second != t_pos + tn:
+            continue
+        # Offset to rotate target so target[t_pos:] aligns with
+        # query[q_start:]. Modulo `tn` so a wrap-spanning seed
+        # collapses to the canonical [0, tn) range.
+        return ((t_pos - q_start) % tn) if tn else 0
+    return 0
+
+
+def _rotate_seq_record(record, offset: int):
+    """Return a NEW SeqRecord whose sequence + features are rotated
+    so position ``offset`` becomes the new origin (position 0).
+
+    Wrap-aware: features that straddle the new origin emit as a
+    `CompoundLocation` (BioPython's `join(...)`). Linear records (or
+    `offset == 0`) are returned unchanged.
+
+    Used by the Plasmidsaurus alignment path to render the target
+    in the same register as the aligned query. Doesn't mutate the
+    input — callers can keep the original record for other surfaces
+    (e.g. the library entry).
+    """
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    from Bio.SeqFeature import (
+        SeqFeature, FeatureLocation, CompoundLocation,
+    )
+    seq_str = str(getattr(record, "seq", "") or "")
+    n = len(seq_str)
+    if n == 0 or offset == 0:
+        return record
+    offset = offset % n
+    if offset == 0:
+        return record
+    new_seq = seq_str[offset:] + seq_str[:offset]
+    new_rec = SeqRecord(
+        Seq(new_seq),
+        id=getattr(record, "id", "") or "",
+        name=getattr(record, "name", "") or "",
+        description=getattr(record, "description", "") or "",
+        annotations=dict(record.annotations or {}),
+    )
+    for f in (record.features or []):
+        if f.type == "source":
+            continue
+        bounds = _feat_bounds(f, n)
+        if bounds is None:
+            new_rec.features.append(f)
+            continue
+        s, e, strand = bounds
+        # Re-frame to the rotated origin. `_feat_len` handles the
+        # wrap case where the feature crosses the original origin.
+        flen = _feat_len(s, e, n)
+        new_s = (s - offset) % n
+        new_e = (new_s + flen) % n if (new_s + flen) != n else n
+        if new_e == 0 and new_s + flen == n:
+            new_e = n
+        if new_e > new_s and new_e <= n:
+            # Linear span in the rotated frame.
+            loc = FeatureLocation(new_s, new_e, strand=strand)
+        else:
+            # Rotated span crosses the new origin → CompoundLocation.
+            loc = CompoundLocation([
+                FeatureLocation(new_s, n, strand=strand),
+                FeatureLocation(0, new_e, strand=strand),
+            ])
+        new_rec.features.append(SeqFeature(
+            loc, type=f.type, qualifiers=dict(f.qualifiers or {}),
+        ))
+    return new_rec
 
 
 def _pairwise_align(query_seq: str, target_seq: str,
@@ -15162,7 +15323,7 @@ class HistoryScreen(Screen):
     Same data shape as `HistoryViewerModal` — a `_CommercialSaaSHistoryNode`
     tree rendered into a Textual `Tree` widget plus a detail pane for
     the selected node — but takes the entire terminal. Opened from the
-    `History` top-bar menu, the `F5` key, or `Ctrl+H`.
+    `History` top-bar menu, the `F6` key, or `Ctrl+H`.
 
     Read-only. Closing returns to the main app; the tree is rebuilt
     fresh each open so the rendered lineage matches the current
@@ -18517,6 +18678,152 @@ class FastaExportModal(ModalScreen):
         self.dismiss(None)
 
 
+class CustomEnzymeListModal(ModalScreen):
+    """Edit the user's custom restriction-enzyme display list (GH #13).
+
+    Single-list MVP: the user types comma- (or newline-) separated
+    enzyme names into a text area, optionally toggles "Use this list",
+    and clicks Save. The Save handler:
+
+      1. Parses + validates the input against `_NEB_ENZYMES`.
+      2. Writes the canonical CSV to `restr_custom_enzymes`.
+      3. Writes the toggle to `restr_use_custom_list`.
+      4. Re-dispatches the restriction scan so the overlay updates
+         immediately.
+
+    Unknown names are dropped silently (not rejected outright) so a
+    typo or HF-variant rename doesn't strand the user — the count
+    summary shows how many were accepted vs dropped. The full enzyme
+    catalog is displayed in a side panel as a discovery aid.
+
+    Dismiss payload:
+      ``True``  — saved.
+      ``None``  — cancelled (no setting change).
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._initial_csv = str(_get_setting("restr_custom_enzymes", "") or "")
+        self._initial_active = bool(
+            _get_setting("restr_use_custom_list", False)
+        )
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="enzlist-box"):
+            yield Static(" Custom enzyme list ", id="enzlist-title")
+            yield Label(
+                "Comma- or newline-separated enzyme names "
+                "(EcoRI, BamHI, BsaI, …). Unknown names are dropped.",
+            )
+            yield TextArea(
+                self._initial_csv.replace(",", "\n"),
+                id="enzlist-input",
+            )
+            yield Checkbox(
+                "Use this list for the restriction overlay",
+                value=self._initial_active,
+                id="enzlist-use",
+            )
+            yield Static("", id="enzlist-status", markup=True)
+            with Horizontal(id="enzlist-btns"):
+                yield Button("Save", id="btn-enzlist-save",
+                              variant="primary")
+                yield Button("Cancel", id="btn-enzlist-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            ta = self.query_one("#enzlist-input", TextArea)
+        except NoMatches:
+            return
+        ta.focus()
+        self._refresh_status(ta.text)
+
+    @on(TextArea.Changed, "#enzlist-input")
+    def _on_input_changed(self, event: TextArea.Changed) -> None:
+        self._refresh_status(event.text_area.text)
+
+    def _refresh_status(self, raw: str) -> None:
+        try:
+            status = self.query_one("#enzlist-status", Static)
+        except NoMatches:
+            return
+        names = [
+            s.strip() for s in raw.replace(";", ",").replace("\n", ",").split(",")
+            if s and s.strip()
+        ]
+        valid = sorted({n for n in names if n in _NEB_ENZYMES})
+        dropped = sorted({n for n in names if n not in _NEB_ENZYMES})
+        if not names:
+            status.update(
+                "[dim]Empty list — toggle off and Save to clear, or "
+                "add names above.[/dim]"
+            )
+            return
+        parts = [f"[green]{len(valid)} valid[/green]"]
+        if dropped:
+            from rich.markup import escape as _esc
+            preview = ", ".join(_esc(n) for n in dropped[:5])
+            more = f" …(+{len(dropped) - 5})" if len(dropped) > 5 else ""
+            parts.append(
+                f"[yellow]{len(dropped)} unknown[/yellow] ({preview}{more})"
+            )
+        status.update(" · ".join(parts))
+
+    @on(Button.Pressed, "#btn-enzlist-save")
+    def _save(self, _: Button.Pressed) -> None:
+        try:
+            ta = self.query_one("#enzlist-input", TextArea)
+            chk = self.query_one("#enzlist-use", Checkbox)
+        except NoMatches:
+            self.dismiss(None)
+            return
+        raw = ta.text or ""
+        # Same parse as `_refresh_status` so the saved CSV matches the
+        # status-line count exactly.
+        names = [
+            s.strip() for s in raw.replace(";", ",").replace("\n", ",").split(",")
+            if s and s.strip()
+        ]
+        valid = sorted({n for n in names if n in _NEB_ENZYMES})
+        canonical = ",".join(valid)
+        active = bool(chk.value) and bool(valid)
+        _set_setting("restr_custom_enzymes", canonical)
+        _set_setting("restr_use_custom_list", active)
+        # Mirror onto the live app instance so the next scan reads the
+        # post-save state without a relaunch.
+        try:
+            app = self.app
+            app._restr_custom_enzymes = canonical
+            app._restr_use_custom_list = active
+            # Trigger an immediate rescan if a record is loaded.
+            cur = getattr(app, "_current_record", None)
+            if cur is not None and getattr(cur, "seq", None) is not None:
+                app._dispatch_restr_scan(str(cur.seq))
+        except (AttributeError, NoMatches):
+            pass
+        msg = (
+            f"Saved {len(valid)} enzyme(s); custom list "
+            f"{'ON' if active else 'OFF'}."
+        )
+        try:
+            self.app.notify(msg, severity="information", markup=False)
+        except Exception:
+            pass
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#btn-enzlist-cancel")
+    def _cancel_btn(self, _: Button.Pressed) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class ORFFinderModal(ModalScreen):
     """Find open reading frames in the loaded record.
 
@@ -21756,6 +22063,8 @@ _SETTINGS_SCHEMA: "dict[str, tuple[tuple, object]]" = {
     "show_restr":              ((bool,),               False),
     "restr_unique_only":       ((bool,),               True),
     "restr_min_len":           ((int,),                6),
+    "restr_custom_enzymes":    ((str,),                ""),
+    "restr_use_custom_list":   ((bool,),               False),
     "min_primer_binding":      ((int,),                15),
     "show_connectors":         ((bool,),               False),
     "linear_layout":           ((bool,),               False),
@@ -34089,32 +34398,74 @@ class PlasmidsaurusAlignModal(ModalScreen):
             "[dim]Aligning… (may take a few seconds for big plasmids)[/dim]"
         )
         target_label = target_entry.get("name") or target_id
+        target_is_circular = (
+            (target_rec.annotations or {}).get("topology", "").lower()
+            == "circular"
+        )
         self._align_worker(
             query_seq=str(query_rec.seq),
             target_seq=str(target_rec.seq),
             query_label=self._selected_member,
             target_label=target_label,
             target_record=target_rec,
+            target_is_circular=target_is_circular,
             entry_counter=getattr(self.app, "_record_load_counter", 0),
         )
 
     @work(thread=True, exclusive=True, group="plasmidsaurus_align")
     def _align_worker(self, *, query_seq: str, target_seq: str,
                        query_label: str, target_label: str,
-                       target_record, entry_counter: int) -> None:
+                       target_record, target_is_circular: bool,
+                       entry_counter: int) -> None:
         """Worker: run `_pairwise_align` off the UI thread, then push
         the visualisation screen. Inputs captured at entry; stale-load
         guard on the load counter (mirrors `_restr_scan_worker`).
+
+        Circular-target rotation (GH #16, 2026-05-14): when the target
+        is circular, find a unique seed kmer in the query, locate it
+        in the target, and rotate the target so the seeds align
+        before running the global align. Without this, the global
+        aligner pairs bp 1 of the query with bp 1 of the target —
+        catastrophic on a plasmid where Plasmidsaurus reads start at
+        an arbitrary origin and almost never match the GenBank origin.
 
         Also captures `_alignments_generation` so a user who hits
         Clear Alignments while the C-loop ran doesn't see this stale
         result reappear on the overlay band when the worker lands.
         """
         gen_at_entry = getattr(self.app, "_alignments_generation", 0)
+        rotation = 0
+        rotated_target_seq = target_seq
+        rotated_target_record = target_record
+        if target_is_circular:
+            try:
+                rotation = _find_circular_alignment_offset(
+                    query_seq, target_seq,
+                )
+            except Exception:
+                _log.exception(
+                    "plasmidsaurus align: seed-offset probe raised",
+                )
+                rotation = 0
+            if rotation:
+                rotated_target_seq = (
+                    target_seq[rotation:] + target_seq[:rotation]
+                )
+                try:
+                    rotated_target_record = _rotate_seq_record(
+                        target_record, rotation,
+                    )
+                except Exception:
+                    _log.exception(
+                        "plasmidsaurus align: target record rotation "
+                        "failed (offset=%d)", rotation,
+                    )
+                    rotated_target_record = target_record
         try:
             result = _pairwise_align(
-                query_seq, target_seq, mode="global",
+                query_seq, rotated_target_seq, mode="global",
             )
+            result["target_rotation"] = rotation
         except ValueError as exc:
             def _err():
                 try:
@@ -34159,12 +34510,15 @@ class PlasmidsaurusAlignModal(ModalScreen):
             # Register on the linear-map overlay band instead of pushing
             # AlignmentScreen — the user can click the lane to drill
             # into the full-screen viewer (kept for base-level review).
+            # Use the rotated target record so the viewer's feature
+            # lane lines up with the alignment columns when the
+            # circular-target seed offset was applied.
             try:
                 self.app._register_alignment(
                     name=query_label,
                     query_label=query_label,
                     target_label=target_label,
-                    target_record=target_record,
+                    target_record=rotated_target_record,
                     result=result,
                 )
             except Exception:
@@ -46406,6 +46760,29 @@ def _settings_validator_min_len_4_or_6(value):
     return v, None
 
 
+def _settings_validator_custom_enzymes_csv(value):
+    """Comma-separated list of enzyme names, each in `_NEB_ENZYMES`.
+    Whitespace tolerated; duplicates silently collapsed.
+
+    Defensive parse — we'd rather drop an unknown name than reject the
+    whole list, so a typo or a HF-variant rename doesn't strand the
+    user. Returns the canonicalised CSV form (sorted, deduped, valid
+    names only)."""
+    if value is None or value == "":
+        return "", None
+    if not isinstance(value, str):
+        return None, "must be a comma-separated string of enzyme names"
+    raw_names = [
+        s.strip() for s in value.replace(";", ",").split(",")
+        if s and s.strip()
+    ]
+    valid: list[str] = []
+    for nm in raw_names:
+        if nm in _NEB_ENZYMES and nm not in valid:
+            valid.append(nm)
+    return ",".join(sorted(valid)), None
+
+
 def _settings_validator_collection_name(value):
     """Empty string / null is allowed to clear the active collection.
     Otherwise route through `_normalize_collection_name`."""
@@ -46439,6 +46816,8 @@ _AGENT_SETTINGS_ALLOWLIST: "dict[str, tuple]" = {
     "restr_unique_only":     (_settings_validator_bool,                  True),
     "show_connectors":       (_settings_validator_bool,                  False),
     "restr_min_len":         (_settings_validator_min_len_4_or_6,        6),
+    "restr_custom_enzymes":  (_settings_validator_custom_enzymes_csv,    ""),
+    "restr_use_custom_list": (_settings_validator_bool,                  False),
     "min_primer_binding":    (_settings_validator_int_range(1, 60),      15),
     "active_collection":     (_settings_validator_collection_name,       ""),
     "active_grammar":        (_settings_validator_grammar_id,            "gb_l0"),
@@ -46739,6 +47118,14 @@ class PlasmidApp(App):
     _restr_min_len: int = 6
     _show_restr: bool = False
     _restr_cache: "list" = []
+    # Custom enzyme list (GH #13). When `_restr_use_custom_list` is True
+    # and `_restr_custom_enzymes` is non-empty, the restriction scan
+    # restricts to JUST these enzymes — overrides the min-len /
+    # unique-only filters. Stored as a comma-separated string for
+    # settings.json round-trip simplicity; parsed into a frozenset
+    # at scan time. Persisted across launches.
+    _restr_use_custom_list: bool = False
+    _restr_custom_enzymes: str = ""
     # Linear-map alignment overlay state. Each entry is one alignment
     # row stacked below the rail — same shape as the dict returned by
     # `_pairwise_align`, plus `name` / `query_label` / `target_label` /
@@ -47864,13 +48251,17 @@ SpeciesPickerModal { align: center middle; }
         Binding("f2",          "focus_panel_map",      "Map only",     show=False, priority=True),
         Binding("f3",          "focus_panel_sidebar",  "Features only",show=False, priority=True),
         Binding("f4",          "focus_panel_seq",      "Sequence only",show=False, priority=True),
-        # F5 → construction-history viewer for the loaded plasmid;
-        # F6 → restore the multi-panel main view (the previous F5 role,
-        # now also reachable on Ctrl+0). Ctrl+H is the cross-app
-        # muscle-memory alias for History.
-        Binding("f5",          "show_history",         "History",      show=False, priority=True),
+        # F5 → restore the multi-panel main view (the F1-F4 inverse,
+        # also reachable on Ctrl+0). F6 + Ctrl+H surface the
+        # construction-history viewer for the loaded plasmid.
+        # Reverted from the 0.7.11.0 binding swap (GH #15, Cory Tobin
+        # 2026-05-14) — F5 had years of muscle memory as the "return
+        # to all panels" key from the F1-F4 single-panel views, and
+        # the "F5 = restore" hint baked into the focus-mode notify
+        # strings made the regression doubly confusing.
+        Binding("f5",          "focus_panel_all",      "All panels",   show=False, priority=True),
+        Binding("f6",          "show_history",         "History",      show=False, priority=True),
         Binding("ctrl+h",      "show_history",         "History",      show=False, priority=True),
-        Binding("f6",          "focus_panel_all",      "All panels",   show=False, priority=True),
         # Ctrl+# aliases for the F-key fullscreen views — popular
         # plasmid editor muscle memory (Koeng101 + Cory Tobin in issue
         # #1). Ctrl+1
@@ -48009,6 +48400,18 @@ SpeciesPickerModal { align: center middle; }
         # hand-edited settings.json can't poison the scanner.
         rml = _get_setting("restr_min_len", 6)
         self._restr_min_len = rml if rml in (4, 6) else 6
+        # Custom enzyme list (GH #13). Comma-separated names already
+        # validated at settings-write time, so we trust the persisted
+        # form. Empty string + active=False (defaults) means "use the
+        # existing min-len / unique-only filters" — the catch-all
+        # default keeps behaviour identical to pre-fix when the user
+        # hasn't engaged the custom list.
+        self._restr_custom_enzymes = str(
+            _get_setting("restr_custom_enzymes", "") or ""
+        )
+        self._restr_use_custom_list = bool(
+            _get_setting("restr_use_custom_list", False)
+        )
         # Hybridization parameters: minimum contiguous 3'-end binding
         # length below which a primer is flagged as "weak" (warning
         # glyph in the seq panel + tooltip). Used by the partial-
@@ -48972,7 +49375,9 @@ SpeciesPickerModal { align: center middle; }
                             min_len: int,
                             unique_only: bool,
                             circular: bool,
-                            entry_counter: int) -> None:
+                            entry_counter: int,
+                            allowed_enzymes: "frozenset[str] | None" = None,
+                            ) -> None:
         """Worker: scan `seq` for restriction sites and apply the
         result if no record load has happened since entry. The scan
         itself is pure CPU and dominates `_apply_record` for big
@@ -49001,6 +49406,7 @@ SpeciesPickerModal { align: center middle; }
                 min_recognition_len=min_len,
                 unique_only=unique_only,
                 circular=circular,
+                allowed_enzymes=allowed_enzymes,
             )
         except Exception as exc:
             # Pre-fix the worker returned silently here — a malformed
@@ -49054,13 +49460,30 @@ SpeciesPickerModal { align: center middle; }
         `_scan_restriction_sites` synchronously from the UI thread —
         each was a 50-200 ms hitch on a 200 kb plasmid (worse on
         bigger ones). Capture is on the UI thread so the worker never
-        reads instance state across threads (finding #13)."""
+        reads instance state across threads (finding #13).
+
+        Custom enzyme list (GH #13): when `_restr_use_custom_list` is
+        True and the CSV is non-empty, parse it into a frozenset and
+        hand to the scan as the allow-list. The scan overrides
+        `min_len` / `unique_only` in this mode so the user's
+        hand-picked set always shows in full.
+        """
         circular = self._current_record_is_circular()
+        allowed: "frozenset[str] | None" = None
+        if (self._restr_use_custom_list
+                and self._restr_custom_enzymes):
+            parsed = frozenset(
+                s.strip() for s in self._restr_custom_enzymes.split(",")
+                if s and s.strip() and s.strip() in _NEB_ENZYMES
+            )
+            if parsed:
+                allowed = parsed
         self._restr_scan_worker(
             seq,
             min_len=self._restr_min_len,
             unique_only=self._restr_unique_only,
             circular=circular,
+            allowed_enzymes=allowed,
             entry_counter=self._record_load_counter,
         )
 
@@ -52771,6 +53194,7 @@ SpeciesPickerModal { align: center middle; }
         m6 = ck if self._restr_min_len == 6  else nc
         m4 = ck if self._restr_min_len == 4  else nc
         rs = ck if self._show_restr        else nc
+        cl = ck if self._restr_use_custom_list else nc
 
         # Settings dropdown is built from a flat list of toggles. Adding
         # a new boolean preference: append `(label, action_name)` to
@@ -52839,6 +53263,9 @@ SpeciesPickerModal { align: center middle; }
                 (f"[{u}] Unique cutters",         "toggle_restr_unique"),
                 (f"[{m6}] 6+ bp sites",           "toggle_restr_min6"),
                 (f"[{m4}] 4+ bp sites",           "toggle_restr_min4"),
+                ("---",                            None),
+                ("Edit custom enzyme list…",      "edit_custom_enzyme_list"),
+                (f"[{cl}] Use custom list",       "toggle_custom_enzyme_list"),
                 ("---",                            None),
                 ("Toggle connectors",              "toggle_connectors"),
             ],
@@ -53147,6 +53574,28 @@ SpeciesPickerModal { align: center middle; }
         _set_setting("restr_min_len", 4)
         self._rescan_restrictions()
         self.notify("Showing 4+ bp recognition sites")
+
+    def action_edit_custom_enzyme_list(self) -> None:
+        """Open the custom-enzyme-list modal (GH #13). Save commits
+        the parsed CSV + active toggle to settings and re-scans the
+        restriction overlay so the change is visible immediately."""
+        self.push_screen(CustomEnzymeListModal())
+
+    def action_toggle_custom_enzyme_list(self) -> None:
+        """Flip `restr_use_custom_list`. If the list is empty, the
+        toggle still saves but the scan falls back to the default
+        filters (the dispatch guards on a non-empty parsed set)."""
+        self._restr_use_custom_list = not self._restr_use_custom_list
+        _set_setting(
+            "restr_use_custom_list", self._restr_use_custom_list,
+        )
+        self._rescan_restrictions()
+        state = "on" if self._restr_use_custom_list else "off"
+        names = self._restr_custom_enzymes or "(empty)"
+        self.notify(
+            f"Custom enzyme list {state} — {names}",
+            markup=False,
+        )
 
     def action_capture_to_features(self) -> None:
         """Ctrl+Shift+F: grab the drag-selected DNA *or* the highlighted feature

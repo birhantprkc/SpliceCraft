@@ -5156,12 +5156,14 @@ class TestShiftClickFeatureExtend:
     async def test_focus_panel_f_key_bindings_fire(
             self, isolated_library):
         """End-to-end binding test: F1–F4 fire the matching
-        `action_focus_*`; Ctrl+0 restores the multi-panel view.
-        Regression guard for the 2026-05-04 binding settle (F-keys
-        chosen because terminals collapse Ctrl+digit and eat Alt+digit
-        for tab-switching). F5 was the original "all panels" key but
-        moved to `show_history` on 2026-05-11; Ctrl+0 stayed bound
-        to `focus_panel_all` as the surviving full-restore key."""
+        `action_focus_*`; F5 + Ctrl+0 both restore the multi-panel
+        view. Regression guard for the 2026-05-04 binding settle
+        (F-keys chosen because terminals collapse Ctrl+digit and eat
+        Alt+digit for tab-switching). F5 was reassigned to
+        `show_history` on 2026-05-11 but reverted to `focus_panel_all`
+        on 2026-05-14 (GH #15, Cory Tobin) — the muscle memory was too
+        strong and the focus-mode notify strings still said "F5 =
+        restore". History now lives on F6 + Ctrl+H."""
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
         rec = SeqRecord(Seq("A" * 200), id="L", name="L",

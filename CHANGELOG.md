@@ -2,6 +2,76 @@
 
 ---
 
+## [0.8.1] — 2026-05-14 — Cory Tobin issue sweep: F5 + alignment offset + custom enzyme list
+
+Four threads, all driven by Cory Tobin's open GH issues:
+
+* **GH #15 — F5 muscle-memory restoration.** F5 was reassigned from
+  "restore all panels" to "show construction history" in 0.7.11.0;
+  Cory reported that the new binding kept showing "No construction
+  history recorded" instead of returning him to the split-window
+  layout. Reverted: F5 → `focus_panel_all` (the F1-F4 inverse);
+  history moves to F6 + Ctrl+H + the History menu tab. The
+  "F5 = restore" hint baked into the focus-mode notify strings now
+  matches reality again.
+
+* **GH #16 — Circular alignment offset.** Plasmidsaurus reads + the
+  GenBank reference both start at arbitrary origins on a circular
+  plasmid, but the pairwise align was naively pairing bp 1 of each
+  sequence — producing huge mismatch / gap counts that disagreed
+  visibly with the equivalent alignment in another editor. The
+  align worker now finds a unique seed kmer in the query, locates
+  it in the target, and rotates the target so the seeds register
+  before running the global align. Synthetic test case: a 700-bp-
+  rotated read aligned at 66% identity / 526 gaps pre-fix vs 100% /
+  0 gaps post-fix. The target record's features are rotated by the
+  same offset so the AlignmentScreen's feature lane lines up with
+  the alignment columns.
+
+* **GH #13 — Custom enzyme list.** New `Enzymes → Edit custom enzyme
+  list…` menu entry opens a modal where the user types comma- or
+  newline-separated enzyme names. Save commits the parsed CSV to
+  `restr_custom_enzymes` (settings.json) and toggles
+  `restr_use_custom_list`; when active, the restriction overlay
+  shows ONLY those enzymes, with the `unique_only` and
+  `min_recognition_len` filters bypassed (the user has hand-picked
+  the set, so a multi-cutter or 4-cutter shouldn't be hidden).
+  Unknown names are silently dropped with a yellow count summary —
+  a typo or HF-variant rename doesn't strand the rest of the list.
+  MVP single-list design; multi-named lists can land in a future
+  release if users start asking for them.
+
+* **GH #9 verification.** The intron-aware translation fix shipped
+  in v0.7.9.0 is still working — `_exons` stamping in
+  `PlasmidMap._parse`, splice-aware `_cds_aa_list`, and
+  `_spliced_idx_to_genomic_bp` are all intact. Posted on GH asking
+  Cory to confirm so we can close.
+
+### Added: `_find_circular_alignment_offset` + `_rotate_seq_record`
+
+Two new helpers in the alignment path. `_find_circular_alignment_offset`
+walks the query in even-spaced strides, tries each kmer as a seed
+against a doubled target (so wrap-spanning seeds resolve cleanly), and
+returns the FIRST unique-hit seed's offset. Low-complexity seeds
+(<4 distinct bases) skipped so homopolymer runs don't dominate.
+`_rotate_seq_record` builds a new SeqRecord whose sequence + features
+are rotated so a chosen position becomes the new origin; features
+that straddle the new origin emit as a `CompoundLocation`.
+
+### Tests
+
+- 13 new regression tests:
+  * 6 for `_find_circular_alignment_offset` + `_pairwise_align`
+    behaviour at the rotation boundary
+  * 4 for `_rotate_seq_record` (zero offset, simple shift, metadata
+    preservation, wrap-aware feature handling)
+  * 8 for the custom-enzyme allow-list filter (min-len override,
+    unique-only override, unknown-name drop, empty-list semantics)
+- F5 / F6 binding swap reflected in the existing
+  `test_app_has_history_and_restore_bindings` assertion.
+
+---
+
 ## [0.8.0] — 2026-05-14 — Async save sweep + GB chain hardening + .dna label override
 
 Five threads: every remaining sync `_save_library` / `_save_primers` on

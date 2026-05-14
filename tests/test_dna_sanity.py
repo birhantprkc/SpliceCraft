@@ -1525,3 +1525,109 @@ class TestAnnotationTransfer:
                         and t["target_end"] == len(body)
                         and t["target_strand"] == 1]
         assert len(full_matches) == 1
+
+
+class TestCustomEnzymeListFilter:
+    """`allowed_enzymes` parameter on `_scan_restriction_sites` (GH #13,
+    Cory Tobin 2026-05-14). When supplied, the scan restricts to JUST
+    those enzymes — overrides `min_recognition_len` and `unique_only`
+    so a hand-picked list always shows in full, regardless of cut
+    count or recognition length.
+    """
+
+    def test_allow_list_overrides_min_len(self):
+        """A 4-cutter like Sau3AI (GATC) wouldn't appear with the
+        default `min_recognition_len=6`, but should when the user
+        explicitly picks it."""
+        seq = "AAAGATCAAAATCGAAAAAGATCAAA"
+        # Default scan with min_recognition_len=6: Sau3AI excluded
+        default = sc._scan_restriction_sites(
+            seq, min_recognition_len=6, unique_only=False, circular=False,
+        )
+        assert not any(h.get("label") == "Sau3AI" for h in default)
+        # Allow-list with Sau3AI: hits surface
+        allowed = sc._scan_restriction_sites(
+            seq, circular=False,
+            allowed_enzymes=frozenset({"Sau3AI"}),
+        )
+        sau_hits = [h for h in allowed
+                    if h.get("label") == "Sau3AI"
+                    and h.get("type") == "resite"]
+        assert len(sau_hits) >= 1
+
+    def test_allow_list_overrides_unique_only(self):
+        """A repeat-laden sequence that breaks the unique-cutter
+        filter should still show every hit when the user explicitly
+        picks the enzyme. Pre-fix the `unique_only=True` filter
+        applied even with `allowed_enzymes` set, hiding multi-cutters
+        from the user's hand-picked list — the opposite of what the
+        user actually wants."""
+        # GAATTC × 100 — way too many EcoRI sites to be "unique"
+        seq = "GAATTCAAAA" * 100
+        default = sc._scan_restriction_sites(
+            seq, unique_only=True, circular=False,
+        )
+        assert not any(h.get("label") == "EcoRI" for h in default)
+        allowed = sc._scan_restriction_sites(
+            seq, unique_only=True, circular=False,
+            allowed_enzymes=frozenset({"EcoRI"}),
+        )
+        ecori_hits = [h for h in allowed
+                       if h.get("label") == "EcoRI"
+                       and h.get("type") == "resite"]
+        assert len(ecori_hits) == 100
+
+    def test_allow_list_excludes_other_enzymes(self):
+        """Only enzymes in the allow-list should appear. A site like
+        BamHI shouldn't surface if only EcoRI is allowed, even when
+        both recognition sequences are present."""
+        seq = "GAATTCAAAAGGATCCAAAAGAATTCAAAA"
+        allowed = sc._scan_restriction_sites(
+            seq, circular=False,
+            allowed_enzymes=frozenset({"EcoRI"}),
+        )
+        labels = {h.get("label") for h in allowed if h.get("label")}
+        assert "EcoRI" in labels
+        assert "BamHI" not in labels
+
+    def test_unknown_enzyme_in_allow_list_silently_dropped(self):
+        """A typo or HF-variant rename in the allow-list shouldn't
+        crash the scan — unknown names just don't match anything."""
+        seq = "GAATTCAAAA"
+        result = sc._scan_restriction_sites(
+            seq, circular=False,
+            allowed_enzymes=frozenset({"EcoRI", "BogusEnzyme123"}),
+        )
+        labels = {h.get("label") for h in result if h.get("label")}
+        assert labels == {"EcoRI"}
+
+    def test_empty_allow_list_returns_nothing(self):
+        """An empty frozenset means "no enzymes" — not "use defaults".
+        The caller is responsible for passing None when they mean
+        defaults; the dispatch in PlasmidApp handles that."""
+        seq = "GAATTCAAAAGGATCC"
+        result = sc._scan_restriction_sites(
+            seq, circular=False, allowed_enzymes=frozenset(),
+        )
+        assert result == []
+
+    def test_settings_validator_canonicalises_csv(self):
+        """`_settings_validator_custom_enzymes_csv` drops unknown
+        names, dedupes, sorts, and produces a canonical CSV that
+        survives a settings.json round-trip."""
+        v_fn = sc._settings_validator_custom_enzymes_csv
+        result, err = v_fn("BamHI, EcoRI, BamHI, BogusEnzyme, BsaI")
+        assert err is None
+        assert result == "BamHI,BsaI,EcoRI"
+
+    def test_settings_validator_handles_empty_string(self):
+        v_fn = sc._settings_validator_custom_enzymes_csv
+        result, err = v_fn("")
+        assert err is None
+        assert result == ""
+
+    def test_settings_validator_rejects_non_string(self):
+        v_fn = sc._settings_validator_custom_enzymes_csv
+        result, err = v_fn(42)
+        assert result is None
+        assert err is not None

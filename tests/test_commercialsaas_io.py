@@ -736,7 +736,7 @@ class TestHistoryScreen:
             self, tiny_record, isolated_library):
         """`PlasmidApp.action_show_history` looks the loaded record up
         in the active library by id and, if it has `history_xml`,
-        pushes `HistoryScreen` (not the legacy modal). Wired to F5 /
+        pushes `HistoryScreen` (not the legacy modal). Wired to F6 /
         Ctrl+H / the `History` top-bar menu tab.
 
         Seeds the library AFTER the app mounts so the auto-persist
@@ -786,15 +786,18 @@ class TestHistoryScreen:
         assert "History" in sc.MenuBar.MENUS
 
     def test_app_has_history_and_restore_bindings(self):
-        """F5 + Ctrl+H route to `show_history`; F6 restores the
-        multi-panel view via `focus_panel_all`. Surface assertions
-        only — the click and modal-stack tests above cover behavior."""
+        """F6 + Ctrl+H route to `show_history`; F5 restores the
+        multi-panel view via `focus_panel_all`. Reverted from the
+        0.7.11.0 swap that broke Cory Tobin's muscle memory (GH #15) —
+        F5 returns to "all panels" again as the F1-F4 inverse. Surface
+        assertions only — the click and modal-stack tests above cover
+        behavior."""
         keys_to_action = {
             (b.key, b.action) for b in sc.PlasmidApp.BINDINGS
         }
-        assert ("f5", "show_history") in keys_to_action
+        assert ("f5", "focus_panel_all") in keys_to_action
+        assert ("f6", "show_history") in keys_to_action
         assert ("ctrl+h", "show_history") in keys_to_action
-        assert ("f6", "focus_panel_all") in keys_to_action
 
 
 class TestHistoryScreenHardening:
