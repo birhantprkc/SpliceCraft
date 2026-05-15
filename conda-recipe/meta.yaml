@@ -1,5 +1,5 @@
 {% set name = "splicecraft" %}
-{% set version = "0.5.1.2" %}
+{% set version = "0.8.9" %}
 
 # Conda-forge / bioconda recipe for SpliceCraft.
 #
@@ -20,7 +20,7 @@ package:
 source:
   url: https://pypi.io/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}.tar.gz
   # Regenerate this on every version bump (see comment above).
-  sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  sha256: a4b3680d3322c4617010efb76473ffe28709024d893cfa2e5b90c7ff85f2d0a9
 
 build:
   noarch: python
@@ -37,11 +37,11 @@ requirements:
     - hatchling >=1.24
   run:
     - python >=3.10
-    - textual >=8.2.5
+    - textual >=8.2.6
     - biopython >=1.87
     - primer3-py >=2.3.0
-    - platformdirs >=4.9
-    - pyhmmer >=0.12
+    - platformdirs >=4.9.6
+    - pyhmmer >=0.12.1
 
 test:
   imports:
