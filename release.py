@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """release.py — cut a new SpliceCraft release.
 
-Usage:  ./release.py 0.4.0
+Usage:  ./release.py 0.8.7
 
 Pure-Python replacement for the old release.sh. Same five steps, same
 ordering, same abort-on-failure semantics:

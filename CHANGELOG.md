@@ -2,6 +2,65 @@
 
 ---
 
+## [0.8.7] — 2026-05-15 — argparse migration · pyright sweep #2 · comment hygiene
+
+### CLI (issue #11, Psy-Fer)
+
+* `main()`, `splicecraft logs`, and `splicecraft update` now parse
+  arguments via `argparse` instead of manual `sys.argv` scanning.
+  Same flag surface (every existing flag works in any position),
+  same error wording (`unknown argument …`, `--out requires a path
+  argument`), and the agent-API contract (`--agent-api`,
+  `--agent-api-port`, `SPLICECRAFT_AGENT_API` env) is preserved
+  verbatim.
+* New `_SubcommandParser` / `_CliExit` scaffolding converts parser
+  errors into int return codes so `_run_logs_subcommand` /
+  `_run_update_subcommand` keep their historical "returns an exit
+  code, never sys.exit" shape.
+* Small UX improvement: flag-after-positional now works — e.g.
+  `splicecraft L09137 -V` prints the version instead of erroring
+  with "takes at most one positional argument".
+
+### Pyright sweep #2
+
+* New `_seq_len(record)` helper — guards `len(record.seq)` against
+  BioPython's `Seq | MutableSeq | None` typing. Applied at every
+  call site where pyright was flagging implicit None propagation.
+* `_coerce_int(value, *, name)` return shape changed from
+  `tuple[int | None, str | None]` to `int | str`. Callers narrow
+  via `isinstance(result, str)` — no separate `assert value is not
+  None` needed at every callsite. All 22 callsites migrated.
+* Three `action_*` overrides renamed to avoid Textual's
+  `reportIncompatibleMethodOverride` flag:
+  - `HistoryViewerModal.action_dismiss` → `action_dismiss_history`
+  - `MultiAlignPickerModal.action_toggle` → `action_toggle_selection`
+  - `LoadPartSourceModal.action_toggle` → `action_toggle_selection`
+  Bindings updated to match. `DomesticatorModal._design` attribute
+  renamed to `_design_result` (the button-handler method `_design`
+  was unchanged).
+* ~30 narrow `# type: ignore[...]` annotations added where pyright
+  couldn't follow attribute access on third-party types (Textual
+  `App` / `Screen`, BioPython `Location.start`, primer3 kwargs).
+  All changes are typing-system only — no runtime behavior change.
+
+### Comment hygiene
+
+Six stale comments fixed across `splicecraft.py` and tests:
+
+* Two line-number refs (`"line 2569"`, `"line 916"`) replaced with
+  function-name refs (`_scan_restriction_sites`, etc.) — line
+  numbers rot; function names are stable.
+* `LoadPartSourceModal._update_status_line` docstring referenced
+  the pre-rename `action_toggle`.
+* `test_domesticator.py:4296` mentioned the pre-rename `_design`
+  attribute.
+* `tests/conftest.py` module docstring listed three JSON files but
+  the actual `_DATA_FILES` list has twelve.
+* `release.py` usage example bumped from `./release.py 0.4.0` to a
+  current-style example.
+
+---
+
 ## [0.8.6] — 2026-05-14 — Polish: flake fix · Pyright sweep · docs
 
 Cleanup release. No new features; four small categories of fixes.

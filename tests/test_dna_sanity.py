@@ -540,8 +540,9 @@ class TestRestrictionScan:
             f"{c['start']} (expected 9 — off-by-one regression?)"
         )
 
-        # And the top-strand `ext_cut_bp` (rev_cut path, line 916) should
-        # land at p + site_len - rev_cut = 10 + 6 - 11 = 5, NOT 4 (buggy).
+        # And the top-strand `ext_cut_bp` (rev_cut path in
+        # `_scan_restriction_sites`) should land at
+        # p + site_len - rev_cut = 10 + 6 - 11 = 5, NOT 4 (buggy).
         resites = [f for f in feats
                    if f.get("label") == "BsaI" and f.get("type") == "resite"]
         assert len(resites) == 1

@@ -685,10 +685,10 @@ class TestDomesticatorCodonPickerUI:
             await pilot.pause()
             await pilot.pause(0.1)
             # _design result should carry mutations
-            assert modal._design is not None
-            assert "error" not in modal._design, modal._design
-            assert "GGTCTC" not in modal._design["insert_seq"]
-            assert modal._design["mutations"], (
+            assert modal._design_result is not None
+            assert "error" not in modal._design_result, modal._design_result
+            assert "GGTCTC" not in modal._design_result["insert_seq"]
+            assert modal._design_result["mutations"], (
                 "mutations list should be populated"
             )
             # Save should now be enabled
@@ -715,8 +715,8 @@ class TestDomesticatorCodonPickerUI:
             modal.query_one("#btn-dom-design", sc.Button).press()
             await pilot.pause()
             await pilot.pause(0.1)
-            assert "error" in modal._design
-            assert "codon table" in modal._design["error"].lower()
+            assert "error" in modal._design_result
+            assert "codon table" in modal._design_result["error"].lower()
             # Save must stay disabled on error
             assert modal.query_one("#btn-dom-save", sc.Button).disabled is True
 
@@ -2434,7 +2434,7 @@ class TestLoadPartSourceModal:
             # 2026-05-13: picker is now multi-select via toggle — the
             # cursor row must be toggled (space) before Load Selected
             # has anything to do.
-            picker.action_toggle()
+            picker.action_toggle_selection()
             await pilot.pause()
             picker.query_one("#btn-loadpart-ok", sc.Button).press()
             await pilot.pause()
@@ -2994,7 +2994,7 @@ class TestLoadPartSourceModalShutdown:
             t = picker.query_one("#loadpart-table", sc.DataTable)
             t.move_cursor(row=0)
             await pilot.pause()
-            picker.action_toggle()
+            picker.action_toggle_selection()
             await pilot.pause()
             # Select via OK button — dismisses with the record list.
             picker.query_one("#btn-loadpart-ok", sc.Button).press()
@@ -4191,7 +4191,7 @@ class TestDomesticatorBackboneFromEntryVector:
             # run_test has exited and the captured list would
             # otherwise be empty when we check.
             modal.dismiss = lambda v=None: captured.append(v)  # type: ignore
-            modal._design = {
+            modal._design_result = {
                 "part_type":   "CDS",
                 "position":    "Pos 3-4",
                 "oh5":         oh5, "oh3": oh3,
@@ -4223,7 +4223,7 @@ class TestDomesticatorBackboneFromEntryVector:
             await pilot.pause()
             await pilot.pause(0.1)
             modal.dismiss = lambda v=None: captured.append(v)  # type: ignore
-            modal._design = {
+            modal._design_result = {
                 "part_type":   "CDS",
                 "position":    "Pos 3-4",
                 "oh5":         "AATG", "oh3": "GCTT",
@@ -4293,9 +4293,9 @@ class TestDomesticatorSavePersistsSimulations:
 
     async def test_save_includes_simulated_sequences(
             self, isolated_parts_bin, tiny_record):
-        # Build a domesticator with a pre-canned _design so we can drive
-        # _save without running primer3. The design fields mirror what
-        # _design_gb_primers produces.
+        # Build a domesticator with a pre-canned _design_result so we
+        # can drive _save without running primer3. The design fields
+        # mirror what _design_gb_primers produces.
         insert = "ATGCATGCATGCATGCATGCATGC"
         oh5, oh3 = "AATG", "GCTT"
         app = sc.PlasmidApp()
@@ -4308,7 +4308,7 @@ class TestDomesticatorSavePersistsSimulations:
             app.push_screen(modal)
             await pilot.pause()
             await pilot.pause(0.1)
-            modal._design = {
+            modal._design_result = {
                 "part_type":   "CDS",
                 "position":    "Pos 3-4",
                 "oh5":         oh5,
@@ -5136,11 +5136,11 @@ class TestDomesticatorSavePrimersButton:
             assert fwd["strand"] == 1
             assert rev["strand"] == -1
             # Full sequences match the designed primers
-            assert fwd["sequence"] == modal._design["pairs"][0]["fwd_full"]
-            assert rev["sequence"] == modal._design["pairs"][0]["rev_full"]
+            assert fwd["sequence"] == modal._design_result["pairs"][0]["fwd_full"]
+            assert rev["sequence"] == modal._design_result["pairs"][0]["rev_full"]
             # Tm carried through
-            assert fwd["tm"] == modal._design["pairs"][0]["fwd_tm"]
-            assert rev["tm"] == modal._design["pairs"][0]["rev_tm"]
+            assert fwd["tm"] == modal._design_result["pairs"][0]["fwd_tm"]
+            assert rev["tm"] == modal._design_result["pairs"][0]["rev_tm"]
 
     async def test_save_primers_without_part_name_errors(
             self, isolated_library):
@@ -6766,7 +6766,7 @@ class TestClassifyPartFromPlasmidLevels:
             await pilot.pause()
             # 2026-05-13: picker is now multi-select via toggle —
             # toggle the cursor row before Load Selected.
-            picker.action_toggle()
+            picker.action_toggle_selection()
             await pilot.pause()
             picker.query_one("#btn-loadpart-ok", sc.Button).press()
             # Worker runs `@work(thread=True)` — give it room to land.

@@ -21,6 +21,7 @@ Run standalone:
     python3 splicecraft.py myplasmid.gb    # open local file
 """
 
+import argparse
 import json
 import logging
 import math
@@ -519,7 +520,10 @@ _CURRENT_SCHEMA_VERSION = 1
 # explicit migrations. Register one only when fields are *renamed*,
 # *split*, *merged*, or *deleted* — the cases where defaults can't
 # silently cover the gap.
-from typing import Callable as _Callable
+from typing import Any as _Any, Callable as _Callable, TYPE_CHECKING as _TYPE_CHECKING
+
+if _TYPE_CHECKING:
+    from Bio.SeqRecord import SeqRecord  # noqa: F401 (used in type-only annotations)
 
 _ENTRY_MIGRATIONS: "dict[str, dict[tuple[int, int], _Callable[[dict], dict]]]" = {
     # No migrations registered yet — schema is at v1 across every file.
@@ -2177,6 +2181,67 @@ def _save_ui_snapshot(text: str,
 # `/home/<username>/...` out of every text artifact so the bundle
 # is shareable without exposing the user's account name.
 
+# ── CLI argument-parsing helpers ────────────────────────────────────────────
+# Shared scaffolding for `splicecraft`, `splicecraft update`, and
+# `splicecraft logs`. Migrated from manual sys.argv scanning (issue #11,
+# Psy-Fer) so that argparse handles the heavy lifting: composable short/long
+# flags, automatic `--help`, mutually-exclusive groups, type coercion. The
+# subcommand handlers (`_run_update_subcommand` / `_run_logs_subcommand`)
+# return integer exit codes rather than calling sys.exit, so we subclass
+# ArgumentParser to convert parser errors into a sentinel exception the
+# caller turns into a return code. The custom error() also reformats
+# argparse's default messages to the historical wording the test suite +
+# downstream `splicecraft-cli` tooling match on (`unknown argument …`,
+# `--out requires a path argument`). The agent-API surface
+# (`--agent-api[-port=PORT]` and `SPLICECRAFT_AGENT_API` env) is preserved
+# verbatim — the JSON side-door is a stable contract for the companion
+# `splicecraft-cli` driver and external agent clients.
+
+
+class _CliExit(Exception):
+    """Raised by `_SubcommandParser` instead of calling sys.exit. The
+    enclosing subcommand handler catches it and returns the carried
+    integer code, preserving the historical `int`-returning shape of
+    `_run_update_subcommand` / `_run_logs_subcommand`."""
+    def __init__(self, code: int):
+        super().__init__(f"_CliExit({code})")
+        self.code = code
+
+
+class _SubcommandParser(argparse.ArgumentParser):
+    """ArgumentParser tuned for splicecraft's subcommand handlers.
+    Diverges from argparse defaults in two ways:
+      1. `error()` / `exit()` raise `_CliExit` instead of calling
+         `sys.exit`, so the handler can return an int.
+      2. Error messages are reformatted to the historical splicecraft
+         wording: argparse's `unrecognized arguments: --bogus` becomes
+         `splicecraft <subcmd>: unknown argument '--bogus'.`, and
+         `--out: expected one argument` becomes
+         `splicecraft <subcmd>: --out requires a path argument`.
+    """
+
+    def error(self, message: str):
+        prog = self.prog
+        if message.startswith("unrecognized arguments:"):
+            bogus = message[len("unrecognized arguments:"):].strip()
+            sys.stderr.write(
+                f"{prog}: unknown argument {bogus!r}.  "
+                f"Run `{prog} --help` for usage.\n"
+            )
+        elif "--out" in message and "expected one argument" in message:
+            sys.stderr.write(
+                f"{prog}: --out requires a path argument\n"
+            )
+        else:
+            sys.stderr.write(f"{prog}: {message}\n")
+        raise _CliExit(2)
+
+    def exit(self, status: int = 0, message: "str | None" = None):
+        if message:
+            sys.stderr.write(message)
+        raise _CliExit(status)
+
+
 _DIAGNOSTIC_BUNDLE_MAX_UI_SNAPSHOTS = 5
 _DIAGNOSTIC_BUNDLE_HELP_TEXT = (
     "splicecraft logs — manage diagnostic logs\n"
@@ -2372,51 +2437,36 @@ def _create_diagnostic_bundle(out_path: "Path | None" = None) -> Path:
 
 def _run_logs_subcommand(argv: "list[str]") -> int:
     """Entry point for `splicecraft logs`. Returns a shell exit code."""
-    bundle = False
-    where = False
-    out_path: "Path | None" = None
+    parser = _SubcommandParser(
+        prog="splicecraft logs",
+        add_help=False,
+    )
+    parser.add_argument("--help", "-h", action="store_true", dest="want_help")
+    parser.add_argument("--bundle", action="store_true")
+    parser.add_argument("--where", action="store_true")
+    parser.add_argument("--out", metavar="PATH", default=None)
 
-    i = 0
-    while i < len(argv):
-        a = argv[i]
-        if a == "--bundle":
-            bundle = True
-            i += 1
-        elif a == "--where":
-            where = True
-            i += 1
-        elif a == "--out":
-            if i + 1 >= len(argv):
-                print("splicecraft logs: --out requires a path argument",
-                      file=sys.stderr)
-                return 2
-            out_path = Path(argv[i + 1]).expanduser()
-            i += 2
-        elif a.startswith("--out="):
-            out_path = Path(a.split("=", 1)[1]).expanduser()
-            i += 1
-        elif a in ("--help", "-h"):
-            print(_DIAGNOSTIC_BUNDLE_HELP_TEXT)
-            return 0
-        else:
-            print(
-                f"splicecraft logs: unknown argument {a!r}.  "
-                "Run `splicecraft logs --help` for usage.",
-                file=sys.stderr,
-            )
-            return 2
+    try:
+        args = parser.parse_args(list(argv))
+    except _CliExit as exc:
+        return exc.code
 
-    if where:
+    if args.want_help:
+        print(_DIAGNOSTIC_BUNDLE_HELP_TEXT)
+        return 0
+
+    if args.where:
         print(_LOG_PATH)
         return 0
 
-    if not bundle:
+    if not args.bundle:
         # No-arg invocation: print log path + brief help.
         print(f"Log file: {_LOG_PATH}")
         print()
         print(_DIAGNOSTIC_BUNDLE_HELP_TEXT)
         return 0
 
+    out_path = Path(args.out).expanduser() if args.out else None
     try:
         path = _create_diagnostic_bundle(out_path)
     except OSError as exc:
@@ -3300,6 +3350,19 @@ def _feat_len(start: int, end: int, total: int) -> int:
     """Circular-aware feature length. A wrap feature (end < start) is
     (total - start) + end bp long; a linear feature is end - start."""
     return (total - start) + end if end < start else end - start
+
+
+def _seq_len(record) -> int:
+    """Length of ``record.seq`` in bp, or 0 if the record has no
+    sequence attached. BioPython's ``SeqRecord.seq`` is typed as
+    ``Seq | MutableSeq | None`` because the dataclass allows records
+    without sequences (rare — e.g. annotation-only GenBank views).
+    SpliceCraft always loads records with sequence content, but
+    routing length lookups through this helper sidesteps the
+    ``"None" is not assignable to "Sized"`` pyright noise at every
+    ``len(rec.seq)`` call site without an inline None guard."""
+    seq = getattr(record, "seq", None)
+    return len(seq) if seq is not None else 0
 
 
 def _slice_circular(seq: str, start: int, end: int) -> str:
@@ -4746,7 +4809,7 @@ def _simulate_gibson_assembly(fragments: list[dict], *,
     }
 
 
-def _gibson_record_from_result(result: dict, *, name: str) -> "object | None":
+def _gibson_record_from_result(result: dict, *, name: str) -> "SeqRecord | None":
     """Build a SeqRecord from a successful ``_simulate_gibson_assembly``
     result. Returns ``None`` when ``result["success"] is False``.
 
@@ -5837,8 +5900,9 @@ def _build_seq_text(seq: str, feats: list[dict], line_width: int = 60,
     # used `id(aa_highlight)` which collides if two distinct dicts
     # land at the same allocator slot — the broader id()-keying issue
     # we cleaned up across the chunk caches. `aa_highlight` is one of
-    # the feature dicts in `feats` (line 2569 `f is aa_highlight`
-    # check), so its coords are a stable identity.
+    # the feature dicts in `feats` (the `f is aa_highlight` check
+    # inside the per-feature loop above), so its coords are a stable
+    # identity.
     aa_id = (
         (aa_highlight["start"], aa_highlight["end"],
          aa_highlight.get("strand", 0))
@@ -7988,7 +8052,7 @@ def _bulk_import_folder(
                 continue
             try:
                 rec = load_genbank(str(path))
-                if len(rec.seq) == 0:
+                if _seq_len(rec) == 0:
                     failures.append((path, "empty sequence (no bases)"))
                     continue
                 # CommercialSaaS .dna files carry a construction-history
@@ -13272,7 +13336,7 @@ class SequencePanel(Widget):
         # the same whether triggered from sidebar Enter, sidebar
         # double-click, or seq-panel Enter.
         try:
-            self.app._open_feature_editor(idx)
+            self.app._open_feature_editor(idx)  # type: ignore[attr-defined]
         except AttributeError:
             pass
 
@@ -13381,8 +13445,10 @@ class SequencePanel(Widget):
             (above_p, below_p, above_rows, below_rows),
             styles, num_w, seq_upper,
             self._show_connectors,
-            -1, -1, -1, -1, -1, -1, -1, -1, -1,
-            None,
+            -1, -1, -1, -1,          # sel_s, sel_e, usr_s, usr_e
+            -1, -1, -1, -1,          # reh_s, reh_e, reh_top_cut, reh_bot_cut
+            -1, -1, -1,              # reh_rec_s, reh_rec_e, cursor_pos
+            None,                    # aa_highlight
         )
         plain_lines = stub.plain.split("\n")
         # Annotate each line with its row classification.
@@ -15791,8 +15857,8 @@ class HistoryViewerModal(ModalScreen):
     """
 
     BINDINGS = [
-        Binding("escape", "dismiss", "Close"),
-        Binding("q",      "dismiss", "Close"),
+        Binding("escape", "dismiss_history", "Close"),
+        Binding("q",      "dismiss_history", "Close"),
     ]
 
     DEFAULT_CSS = """
@@ -15873,7 +15939,12 @@ class HistoryViewerModal(ModalScreen):
     def _on_close(self, _: Button.Pressed) -> None:
         self.dismiss(None)
 
-    def action_dismiss(self) -> None:
+    def action_dismiss_history(self) -> None:
+        """Close the history viewer modal. Named distinctly from the
+        Textual base `Screen.action_dismiss` (which is async + takes a
+        result kwarg) so the override doesn't trip
+        `reportIncompatibleMethodOverride` — the binding above routes
+        to this method by name."""
         self.dismiss(None)
 
     @on(Tree.NodeSelected, "#hist-tree")
@@ -17543,6 +17614,10 @@ def _restore_pre_update_snapshot(snap_id_or_path: "str | Path",
                 (name, f"runtime attr {attr!r} is not a Path")
             )
             continue
+        # Initialised pre-try so the except cleanup can see it even
+        # if the OSError fires on mkdir before the staging path is
+        # assigned (otherwise pyright flags `tmp` as possibly unbound).
+        tmp: "Path | None" = None
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             tmp = target.with_name(target.name + ".restoring")
@@ -17573,7 +17648,7 @@ def _restore_pre_update_snapshot(snap_id_or_path: "str | Path",
         except (OSError, shutil.Error) as exc:
             # Best-effort: clean up any half-written staging file.
             try:
-                if 'tmp' in locals() and tmp.exists():
+                if tmp is not None and tmp.exists():
                     tmp.unlink()
             except OSError:
                 pass
@@ -17726,60 +17801,63 @@ def _format_pre_update_snapshot_table(snaps: "list[dict]") -> str:
     return "\n".join(lines)
 
 
+_RESTORE_LIST_SENTINEL = "\x00splicecraft-restore-list-only\x00"
+
+
 def _run_update_subcommand(argv: "list[str]") -> int:
     """Entry point for `splicecraft update`. Returns a shell exit
     code. Never raises — every failure path is converted to a printed
     message + numeric exit code."""
-    # Parse flags. Accept either order; reject unknown flags loudly so
-    # typos don't silently no-op.
-    check_only = False
-    force = False
-    assume_yes = False
-    list_snapshots = False
-    restore_mode = False
-    restore_id: str | None = None
-    dry_run = False
+    parser = _SubcommandParser(
+        prog="splicecraft update",
+        add_help=False,
+    )
+    parser.add_argument("--help", "-h", action="store_true",
+                          dest="want_help")
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--yes", "-y", action="store_true",
+                          dest="assume_yes")
+    parser.add_argument("--list-snapshots", action="store_true",
+                          dest="list_snapshots")
+    parser.add_argument("--dry-run", action="store_true", dest="dry_run")
+    # `--restore-pre-update` accepts an optional ID. argparse's nargs="?"
+    # with const=<sentinel> models the trio of historical shapes:
+    #   --restore-pre-update            → const sentinel → restore mode, no id
+    #   --restore-pre-update foo        → "foo"           → restore mode, id="foo"
+    #   --restore-pre-update --flag     → const sentinel → restore mode, no id
+    #     (argparse refuses to swallow a token starting with `-` as a value
+    #     for an optional positional, mirroring the historical guard)
+    # `--restore-pre-update=` (empty after =) is normalised to None below
+    # to match the legacy `a.split("=", 1)[1] or None` behaviour.
+    parser.add_argument(
+        "--restore-pre-update",
+        nargs="?",
+        const=_RESTORE_LIST_SENTINEL,
+        default=None,
+        metavar="ID",
+        dest="restore_raw",
+    )
 
-    i = 0
-    while i < len(argv):
-        a = argv[i]
-        if a == "--check":
-            check_only = True
-            i += 1
-        elif a == "--force":
-            force = True
-            i += 1
-        elif a in ("--yes", "-y"):
-            assume_yes = True
-            i += 1
-        elif a == "--list-snapshots":
-            list_snapshots = True
-            i += 1
-        elif a == "--dry-run":
-            dry_run = True
-            i += 1
-        elif a == "--restore-pre-update":
-            restore_mode = True
-            # Optional next arg as ID (must not start with `-`).
-            if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
-                restore_id = argv[i + 1]
-                i += 2
-            else:
-                i += 1
-        elif a.startswith("--restore-pre-update="):
-            restore_mode = True
-            restore_id = a.split("=", 1)[1] or None
-            i += 1
-        elif a in ("--help", "-h"):
-            print(_UPDATE_HELP_TEXT)
-            return 0
-        else:
-            print(
-                f"splicecraft update: unknown argument {a!r}.  "
-                "Run `splicecraft update --help` for usage.",
-                file=sys.stderr,
-            )
-            return 2
+    try:
+        args = parser.parse_args(list(argv))
+    except _CliExit as exc:
+        return exc.code
+
+    if args.want_help:
+        print(_UPDATE_HELP_TEXT)
+        return 0
+
+    check_only = args.check
+    force = args.force
+    assume_yes = args.assume_yes
+    list_snapshots = args.list_snapshots
+    dry_run = args.dry_run
+    restore_mode = args.restore_raw is not None
+    if restore_mode and args.restore_raw not in (_RESTORE_LIST_SENTINEL, ""):
+        restore_id: str | None = args.restore_raw
+    else:
+        restore_id = None
 
     # `--check` and `--dry-run` are mutually exclusive: `--check` skips
     # the snapshot (read-only); `--dry-run` exercises everything up to
@@ -18458,7 +18536,7 @@ class OpenFileModal(ModalScreen):
             self.app.call_from_thread(_err)
             return
 
-        record._tui_source = path
+        record._tui_source = path  # type: ignore[attr-defined]
 
         def _ok():
             # Modal dismissed during parse → drop the parsed record on
@@ -19439,12 +19517,12 @@ class CustomEnzymeListModal(ModalScreen):
         # post-save state without a relaunch.
         try:
             app = self.app
-            app._restr_custom_enzymes = canonical
-            app._restr_use_custom_list = active
+            app._restr_custom_enzymes = canonical  # type: ignore[attr-defined]
+            app._restr_use_custom_list = active  # type: ignore[attr-defined]
             # Trigger an immediate rescan if a record is loaded.
             cur = getattr(app, "_current_record", None)
             if cur is not None and getattr(cur, "seq", None) is not None:
-                app._dispatch_restr_scan(str(cur.seq))
+                app._dispatch_restr_scan(str(cur.seq))  # type: ignore[attr-defined]
         except (AttributeError, NoMatches):
             pass
         msg = (
@@ -19736,11 +19814,11 @@ class MenuBar(Widget):
                     self.app.push_screen(FeatureLibraryScreen())
                     break
                 if name == "History":
-                    self.app.action_show_history()
+                    self.app.action_show_history()  # type: ignore[attr-defined]
                     break
                 x = region.x
                 y = region.y + 1
-                self.app.open_menu(name, x, y)
+                self.app.open_menu(name, x, y)  # type: ignore[attr-defined]
                 break
 
 
@@ -20844,7 +20922,7 @@ def _assembly_fragment_from_source(
     # rows (whole-record metadata, not biology) and tolerates
     # whatever qualifier the original GenBank carried for the label.
     src_features: list[dict] = []
-    total_src = len(rec.seq) if getattr(rec, "seq", None) is not None else 0
+    total_src = _seq_len(rec)
     for f in (rec.features or []):
         if f.type == "source":
             continue
@@ -21701,16 +21779,21 @@ def _pick_binding_region(seq: str, target_tm: float = 60.0,
     Returns (binding_sequence, tm). If primer3-py is not installed, falls
     back to a crude 2+4 rule estimate.
     """
+    # Type the dispatcher as a `(str) -> float` Callable so pyright can
+    # accept both primer3.calc_tm (which has a richly-typed signature
+    # with extra defaulted kwargs) and the fallback approximation
+    # below. Using two separate names avoids the param-name mismatch
+    # pyright flags when a `def _tm(s)` re-defines the same binding.
+    def _tm_fallback(s: str) -> float:
+        gc = sum(1 for c in s.upper() if c in "GC")
+        at = sum(1 for c in s.upper() if c in "AT")
+        return float(2 * at + 4 * gc)
+    _tm: "_Callable[..., float]"
     try:
         import primer3
         _tm = primer3.calc_tm
     except ImportError:
-        # Crude fallback so the code still runs without primer3-py; the UI
-        # will warn the user that Tm values are approximate.
-        def _tm(s):
-            gc = sum(1 for c in s.upper() if c in "GC")
-            at = sum(1 for c in s.upper() if c in "AT")
-            return 2 * at + 4 * gc
+        _tm = _tm_fallback
 
     # Defensive init: if the caller forgot the len(seq) >= min_len guard,
     # the loop below won't execute and we'd otherwise return Tm=0 with a
@@ -22826,7 +22909,13 @@ def _save_settings(settings: dict) -> None:
     _settings_cache = deepcopy(settings)
 
 
-def _get_setting(key: str, default=None):
+def _get_setting(key: str, default: "_Any" = None) -> "_Any":
+    """Return the persisted value for ``key``, or ``default`` if absent.
+    Typed as ``Any`` so callers like ``_active_grammar_id`` can declare
+    a narrower return type (`-> str`) without a cast — pyright treats
+    ``Any`` as universally assignable, sidestepping the
+    ``Unknown | None`` propagation from the loose `_load_settings()`
+    return."""
     return _load_settings().get(key, default)
 
 
@@ -23080,7 +23169,11 @@ def _design_gb_primers(
             and bool(codon_raw)
             and len(insert) % 3 == 0
         )
-        if can_attempt_fix:
+        if can_attempt_fix and codon_raw:
+            # Inline `codon_raw` narrowing for pyright: the `bool(codon_raw)`
+            # inside `can_attempt_fix` is not visible across the assignment,
+            # so re-asserting truthiness here lets the type checker see
+            # `codon_raw` as non-None at the call site below.
             protein = _mut_translate(insert)
             if protein:
                 fixed_insert, mutations = _codon_fix_sites(
@@ -23596,7 +23689,7 @@ def _index_primer_usage_in_collections(use_cache: bool = True) -> "dict[str, int
                     pid, exc_info=True,
                 )
                 continue
-            n = len(rec.seq) if getattr(rec, "seq", None) is not None else 0
+            n = _seq_len(rec)
             seq_str = str(rec.seq).upper() if n > 0 else ""
             for feat in rec.features:
                 if feat.type != "primer_bind":
@@ -23707,7 +23800,7 @@ def _find_primer_plasmid_usages(primer_seq: str) -> "list[dict]":
                 rec = _gb_text_to_record(gb_text)
             except Exception:
                 continue
-            n = len(rec.seq) if getattr(rec, "seq", None) is not None else 0
+            n = _seq_len(rec)
             seq_str = str(rec.seq).upper() if n > 0 else ""
             for feat in rec.features:
                 if feat.type != "primer_bind":
@@ -25294,7 +25387,7 @@ def _mut_next_cursor(current: int, protein_len: int, line_width: int,
 def _mut_tm(seq: str) -> float:
     try:
         import primer3
-        return primer3.calc_tm(seq, **_MUT_P3)
+        return primer3.calc_tm(seq, **_MUT_P3)  # type: ignore[arg-type]
     except Exception:
         gc = sum(1 for c in seq.upper() if c in "GC")
         at = sum(1 for c in seq.upper() if c in "AT")
@@ -25304,7 +25397,7 @@ def _mut_tm(seq: str) -> float:
 def _mut_hairpin_dg(seq: str) -> float:
     try:
         import primer3
-        return primer3.calc_hairpin(seq, **_MUT_P3).dg
+        return primer3.calc_hairpin(seq, **_MUT_P3).dg  # type: ignore[arg-type]
     except Exception:
         return 0.0
 
@@ -25312,7 +25405,7 @@ def _mut_hairpin_dg(seq: str) -> float:
 def _mut_homodimer_dg(seq: str) -> float:
     try:
         import primer3
-        return primer3.calc_homodimer(seq, **_MUT_P3).dg
+        return primer3.calc_homodimer(seq, **_MUT_P3).dg  # type: ignore[arg-type]
     except Exception:
         return 0.0
 
@@ -25611,6 +25704,9 @@ class PlasmidFeaturePickerModal(ModalScreen):
         row_keys = list(t.rows.keys())
         if 0 <= t.cursor_row < len(row_keys):
             key = row_keys[t.cursor_row].value
+            if key is None:
+                self.dismiss(None)
+                return
             try:
                 idx = int(key)
             except (TypeError, ValueError):
@@ -26407,7 +26503,7 @@ class FeatureEditModal(ModalScreen):
             self._color = color
             self._refresh_color_swatch()
 
-        self.app.push_screen(ColorPickerModal(default=default), _on_picked)
+        self.app.push_screen(ColorPickerModal(ftype, default), _on_picked)
 
     @on(Button.Pressed, "#btn-featedit-color-clear")
     def _on_color_auto(self) -> None:
@@ -26984,7 +27080,7 @@ class PrimerEditModal(ModalScreen):
             try:
                 w = self.query_one(sel)
                 if hasattr(w, "read_only"):
-                    w.read_only = not on
+                    w.read_only = not on  # type: ignore[attr-defined]
                 else:
                     w.disabled = not on
             except NoMatches:
@@ -28057,6 +28153,11 @@ def _ungapped_extend(
     best_right = cur
     best_q_right, best_s_right = q_right, s_right
     matches_right = 0
+    # Pre-initialise so the value is bound even when no extension beats
+    # the seed (the inner `if cur > best_right` branch may never fire).
+    # Replaces the older `if "best_matches_right" not in locals()` guard
+    # which pyright couldn't narrow.
+    best_matches_right = 0
     while q_right < len(s_query) and s_right < len(s_subject):
         a, b = s_query[q_right], s_subject[s_right]
         cur += scorer(a, b)
@@ -28077,9 +28178,6 @@ def _ungapped_extend(
         # Loop exited without break (hit end of either string). The
         # best-right position is the loop's `best_q/s_right` already.
         pass
-    # If no extension improved on seed, best_matches_right wasn't set.
-    if "best_matches_right" not in locals():
-        best_matches_right = 0
 
     # Extend left.
     q_left = q_pos - 1
@@ -28463,14 +28561,19 @@ def _blast_search_pure(query: str, db: dict, *, max_hits: int = 25) -> list[dict
     if len(q) < k or not db.get("subjects"):
         return []
 
+    # Scorer signature: `(query_char, subject_char) -> score`. The two
+    # branches assign different callables to the same name; the
+    # explicit Callable cast keeps pyright from inferring the
+    # literal-narrowed scorer in the blastn branch as incompatible
+    # with `_blosum62_score`'s wider `(str, str) -> int` signature.
+    scorer: "_Callable[[str, str], int]"
     if program == "blastn":
         match    = _BLAST_BLASTN_MATCH
         mismatch = _BLAST_BLASTN_MISMATCH
         x_drop   = _BLAST_BLASTN_X_DROP
         min_score = _BLAST_BLASTN_MIN_SCORE
         min_id    = _BLAST_BLASTN_MIN_ID
-        def scorer(a, b):
-            return match if a == b else mismatch
+        scorer = lambda a, b: (match if a == b else mismatch)  # noqa: E731
     else:  # blastp
         x_drop   = _BLAST_BLASTP_X_DROP
         min_score = _BLAST_BLASTP_MIN_SCORE
@@ -28680,7 +28783,7 @@ def _blast_search_pyhmmer(query: str, db: dict, *,
     # phmmer/nhmmer return a TopHits per query. We pass exactly one,
     # so consume just the first iteration.
     try:
-        top_hits_iter = search_fn([q_digital], targets, cpus=1)
+        top_hits_iter = search_fn([q_digital], targets, cpus=1)  # type: ignore[arg-type]
     except Exception:
         _log.exception("pyhmmer search dispatch failed")
         return []
@@ -28967,7 +29070,7 @@ def _hmmscan_run(query_protein: str,
     # query. We pass exactly one query, so we collect just the first.
     with HMMFile(str(p)) as hmm_file:
         for top_hits in pyhmmer.hmmer.hmmscan(
-                [digital_seq], hmm_file, cpus=1):
+                [digital_seq], hmm_file, cpus=1):  # type: ignore[arg-type]
             for h in top_hits:
                 # Each `h` is a `pyhmmer.plan7.Hit`. The best domain
                 # gives us the alignment span on the query.
@@ -31163,7 +31266,8 @@ class GrammarEditorModal(ModalScreen):
         # focus the just-saved row instead of resetting the cursor
         # to the top of the table.
         self.app.notify(f"Saved grammar '{parsed.get('name')}'.",
-                        severity="success", markup=False)
+                        severity="success",  # type: ignore[arg-type]
+                        markup=False)
         self.dismiss(self._grammar_id)
 
     @on(Button.Pressed, "#btn-ged-delete")
@@ -31985,7 +32089,7 @@ class PartEditModal(ModalScreen):
         coerced to float when possible; non-numeric / zero values
         render as a plain label without a Tm suffix."""
         try:
-            tm_f = float(tm)  # handles int, str-of-float, np.float64
+            tm_f = float(tm)  # type: ignore[arg-type] # handles int, str-of-float, np.float64
         except (TypeError, ValueError):
             tm_f = 0.0
         if tm_f > 0:
@@ -33371,7 +33475,8 @@ class PartsBinModal(Screen):
         ok = _copy_to_clipboard_osc52(text)
         if ok:
             self.app.notify(f"Copied {label} to clipboard ({bp_note}).",
-                            severity="success", markup=False)
+                            severity="success",  # type: ignore[arg-type]
+                            markup=False)
         else:
             self.app.notify(
                 f"Could not access clipboard — select the sequence "
@@ -33489,7 +33594,8 @@ class PartsBinModal(Screen):
             self._populate()
             self.app.notify(
                 f"Updated '{new_entry.get('name', '?')}'",
-                severity="success", markup=False,
+                severity="success",  # type: ignore[arg-type]
+                markup=False,
             )
 
         self.app.push_screen(
@@ -34167,7 +34273,8 @@ class PartsBinModal(Screen):
         if n:
             self.app.notify(
                 f"Saved {n} part(s) to '{coll_name}': {tail}{suffix}",
-                severity="success", markup=False,
+                severity="success",  # type: ignore[arg-type]
+                markup=False,
             )
         else:
             self.app.notify(
@@ -34308,7 +34415,8 @@ class PartsBinModal(Screen):
             suffix = f" ({'; '.join(extras)})" if extras else ""
             self.app.notify(
                 f"Removed {n_removed} part(s) from bin{suffix}",
-                severity="success", markup=False,
+                severity="success",  # type: ignore[arg-type]
+                markup=False,
             )
             self._populate()
 
@@ -35253,7 +35361,7 @@ class PlasmidsaurusAlignModal(ModalScreen):
             # lane lines up with the alignment columns when the
             # circular-target seed offset was applied.
             try:
-                self.app._register_alignment(
+                self.app._register_alignment(  # type: ignore[attr-defined]
                     name=query_label,
                     query_label=query_label,
                     target_label=target_label,
@@ -35545,7 +35653,7 @@ class MultiAlignPickerModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel",         "Cancel"),
-        Binding("space",  "toggle",         "Toggle"),
+        Binding("space",  "toggle_selection",         "Toggle"),
         Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
@@ -35632,9 +35740,13 @@ class MultiAlignPickerModal(ModalScreen):
             except NoMatches:
                 pass
 
-    def action_toggle(self) -> None:
+    def action_toggle_selection(self) -> None:
         """Flip the cursor row's selection state. Updates the column-0
-        marker and the running count line."""
+        marker and the running count line. Named distinctly from
+        Textual's base ``DOMNode.action_toggle(attribute_name)`` (which
+        expects an arg) so the override doesn't trip
+        ``reportIncompatibleMethodOverride`` — the binding above routes
+        to this method by name."""
         t = self.query_one("#mam-table", DataTable)
         key = _cursor_row_key(t)
         if not key:
@@ -35769,7 +35881,7 @@ class DomesticatorModal(ModalScreen):
         super().__init__()
         self._template = template_seq.upper()
         self._feats    = feats   # from PlasmidMap._feats (the *current* plasmid)
-        self._design:  "dict | None" = None   # result of _design_gb_primers
+        self._design_result:  "dict | None" = None   # result of _design_gb_primers
         # ── Source-picker state ────────────────────────────────────────────
         # Four sources for the part's DNA:
         #   "direct"  : user types/pastes into a TextArea
@@ -36361,7 +36473,7 @@ class DomesticatorModal(ModalScreen):
 
         codon_raw = (self._codon_entry or {}).get("raw")
         try:
-            self._design = _design_gb_primers(
+            self._design_result = _design_gb_primers(
                 template, start, end, part_type, codon_raw=codon_raw,
                 grammar=grammar,
             )
@@ -36374,9 +36486,9 @@ class DomesticatorModal(ModalScreen):
             )
             return
 
-        if "error" in self._design:
-            msg = self._design["error"]
-            muts = self._design.get("mutations") or []
+        if "error" in self._design_result:
+            msg = self._design_result["error"]
+            muts = self._design_result.get("mutations") or []
             body = f"[red]{msg}[/red]"
             if muts:
                 body += "\n\n[dim]Silent mutations that were applied before "
@@ -36386,7 +36498,7 @@ class DomesticatorModal(ModalScreen):
             status.update(body)
             return
 
-        d = self._design
+        d = self._design_result
         pairs = d.get("pairs") or []
         t = Text()
         t.append("── Primers designed ─────────────────────────────────\n",
@@ -36470,7 +36582,7 @@ class DomesticatorModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-dom-save")
     def _save(self, _) -> None:
-        if self._design is None:
+        if self._design_result is None:
             return
         name = self.query_one("#dom-name", Input).value.strip()
         if not name:
@@ -36478,7 +36590,7 @@ class DomesticatorModal(ModalScreen):
                 "[red]Enter a part name before saving.[/red]"
             )
             return
-        d = self._design
+        d = self._design_result
         insert = d["insert_seq"]
         oh5    = d["oh5"]
         oh3    = d["oh3"]
@@ -36537,14 +36649,14 @@ class DomesticatorModal(ModalScreen):
         domestication run.
         """
         status = self.query_one("#dom-primer-results", Static)
-        if self._design is None:
+        if self._design_result is None:
             status.update("[red]Design primers first.[/red]")
             return
         part_name = self.query_one("#dom-name", Input).value.strip()
         if not part_name:
             status.update("[red]Enter a part name before saving primers.[/red]")
             return
-        pairs = self._design.get("pairs") or []
+        pairs = self._design_result.get("pairs") or []
         if not pairs:
             status.update("[red]No primer pairs to save.[/red]")
             return
@@ -36677,7 +36789,7 @@ class TraditionalCloningPane(Vertical):
         self._rev_product: "dict | None" = None
         # Cache parsed library entries so we don't re-parse the GenBank
         # text on every dropdown rebuild. Key: entry_id → SeqRecord.
-        self._record_cache: "dict[str, object]" = {}
+        self._record_cache: "dict[str, SeqRecord]" = {}
 
     # ── Compose ───────────────────────────────────────────────────────────────
 
@@ -36847,7 +36959,7 @@ class TraditionalCloningPane(Vertical):
         feat_select = self.query_one("#trad-feature-select", Select)
         opts: list[tuple[str, str]] = []
         idx = 0
-        total = len(rec.seq) if getattr(rec, "seq", None) is not None else 0
+        total = _seq_len(rec)
         for f in rec.features:
             if f.type == "source":
                 continue
@@ -36886,7 +36998,7 @@ class TraditionalCloningPane(Vertical):
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _record_for_table_row(self, row_idx: int,
-                                 table_id: str) -> "object | None":
+                                 table_id: str) -> "SeqRecord | None":
         """Look up the SeqRecord for the entry at row `row_idx` of
         the named DataTable. Returns None on lookup failure."""
         try:
@@ -37212,7 +37324,7 @@ class TraditionalCloningPane(Vertical):
         so an origin-spanning vector feature carries through
         `_excise_fragment_pair` with the correct dropout coords."""
         out: list[dict] = []
-        total = len(rec.seq) if getattr(rec, "seq", None) is not None else 0
+        total = _seq_len(rec)
         for f in rec.features:
             if f.type == "source":
                 continue
@@ -37376,7 +37488,7 @@ class TraditionalCloningPane(Vertical):
         entry = {
             "id":      name,
             "name":    name,
-            "size":    len(rec.seq),
+            "size":    _seq_len(rec),
             "gb_text": buf.getvalue(),
         }
         # Construction-history auto-record (Phase 4b). Build a
@@ -37386,7 +37498,7 @@ class TraditionalCloningPane(Vertical):
         # CommercialSaaS), so the result inherits the full lineage.
         try:
             history_xml = self._build_history_for_product(
-                name=name, product_seq_len=len(rec.seq),
+                name=name, product_seq_len=_seq_len(rec),
                 suffix=suffix,
             )
             if history_xml:
@@ -37408,7 +37520,7 @@ class TraditionalCloningPane(Vertical):
         if _clear_primer_cache is not None:
             _clear_primer_cache()
         self.app.notify(
-            f"Saved {name} ({len(rec.seq):,} bp) to library.",
+            f"Saved {name} ({_seq_len(rec):,} bp) to library.",
             timeout=6,
         )
         # Refresh the source/vector tables so the new entry is visible
@@ -37643,7 +37755,7 @@ class GibsonAssemblyPane(Vertical):
         self._product: "dict | None" = None
         # Cache parsed library entries so we don't re-parse on every
         # dropdown rebuild. Mirror of TraditionalCloningPane's cache.
-        self._record_cache: "dict[str, object]" = {}
+        self._record_cache: "dict[str, SeqRecord]" = {}
 
     # ── Compose ───────────────────────────────────────────────────────────────
 
@@ -37742,7 +37854,7 @@ class GibsonAssemblyPane(Vertical):
             size = (e.get("size") or len(gb_text) or 0)
             t.add_row(Text(name), str(size))
 
-    def _record_for_table_row(self, row_idx: int) -> "object | None":
+    def _record_for_table_row(self, row_idx: int) -> "SeqRecord | None":
         if row_idx < 0:
             return None
         entries = sorted(
@@ -37817,7 +37929,7 @@ class GibsonAssemblyPane(Vertical):
         feat_select = self.query_one("#gib-feature-select", Select)
         opts: list[tuple[str, str]] = []
         idx = 0
-        total = len(rec.seq) if getattr(rec, "seq", None) is not None else 0
+        total = _seq_len(rec)
         for f in rec.features:
             if f.type == "source":
                 continue
@@ -37899,7 +38011,7 @@ class GibsonAssemblyPane(Vertical):
             if not (0 <= feat_idx < len(feats_iter)):
                 raise ValueError("Selected feature out of range.")
             feat = feats_iter[feat_idx]
-            total = len(rec.seq)
+            total = _seq_len(rec)
             bounds = _feat_bounds(feat, total)
             if bounds is None:
                 raise ValueError("Feature has unparseable coordinates.")
@@ -37976,7 +38088,7 @@ class GibsonAssemblyPane(Vertical):
         in the product when the product's topology still has them
         spanning a junction."""
         out: list[dict] = []
-        total = len(rec.seq) if getattr(rec, "seq", None) is not None else 0
+        total = _seq_len(rec)
         wrap_counter = 0
         for f in rec.features:
             if f.type == "source":
@@ -38311,7 +38423,7 @@ class GibsonAssemblyPane(Vertical):
         entry = {
             "id":      name,
             "name":    name,
-            "size":    len(rec.seq),
+            "size":    _seq_len(rec),
             "n_feats": len(rec.features or []),
             "source":  "constructor:gibson",
             "added":   _date_mod.today().isoformat(),
@@ -38319,7 +38431,7 @@ class GibsonAssemblyPane(Vertical):
         }
         try:
             entry["history_xml"] = self._build_history_for_gibson(
-                name=name, product_seq_len=len(rec.seq),
+                name=name, product_seq_len=_seq_len(rec),
                 lane=lane, circular=circular,
                 library_entries=entries,
             )
@@ -38352,13 +38464,13 @@ class GibsonAssemblyPane(Vertical):
             return
         _log_event(
             "gibson.save.ok",
-            name=name, bp=len(rec.seq),
+            name=name, bp=_seq_len(rec),
             n_feats=len(rec.features or []),
             fragments=len(lane), circular=circular,
         )
         self.app.call_from_thread(
             self._on_gibson_save_success,
-            name, len(rec.seq), len(rec.features or []),
+            name, _seq_len(rec), len(rec.features or []),
         )
 
     def _on_gibson_save_failed(self, msg: str) -> None:
@@ -39371,7 +39483,11 @@ class ConstructorModal(ModalScreen):
             else:
                 bb_sel  = bb.get("selection", "")
                 bb_note = bb.get("note", "")
-                target  = str(bound.get("name") or "?")
+                # The chain above leaves `bound` as a non-None dict here
+                # (the `not has_vector` branch already short-circuited
+                # the bound-is-None case). The isinstance check re-asserts
+                # this for pyright so it can narrow through `.get`.
+                target  = str(bound.get("name") or "?") if isinstance(bound, dict) else "?"
                 sel_part  = f", {bb_sel} selection" if bb_sel else ""
                 note_part = f", {bb_note}" if bb_note else ""
                 t.append("\n")
@@ -39660,7 +39776,7 @@ class ConstructorModal(ModalScreen):
                                      entry_counter))
         self.app.call_from_thread(
             self._on_constructor_save_success,
-            new_id, len(new_rec.seq), source_level, name,
+            new_id, _seq_len(new_rec), source_level, name,
             canvas_stale,
         )
 
@@ -39715,7 +39831,8 @@ class ConstructorModal(ModalScreen):
             f"Saved '{name}' to {coll_part} "
             f"({seq_len:,} bp, level {level_label}). "
             f"Also added to Parts Bin under {level_label}.",
-            severity="success", markup=False,
+            severity="success",  # type: ignore[arg-type]
+            markup=False,
         )
         # Clear the lane + refresh the palette so the user can stage
         # the next iteration without manually clicking "Clear Lane"
@@ -39903,7 +40020,7 @@ class ConstructorModal(ModalScreen):
         lib_entry = {
             "id":      unique_id,
             "name":    final_display_name,
-            "size":    len(new_rec.seq),
+            "size":    _seq_len(new_rec),
             "n_feats": len(new_rec.features or []),
             "source":  f"constructor:{gid}:{backbone_role}",
             "added":   date.today().isoformat(),
@@ -39919,7 +40036,7 @@ class ConstructorModal(ModalScreen):
         try:
             history_xml = self._build_history_for_assembly(
                 name=final_display_name,
-                product_seq_len=len(new_rec.seq),
+                product_seq_len=_seq_len(new_rec),
                 gid=gid, grammar=grammar_for_digest,
                 entry_vector=entry_vector, parts=parts,
                 source_level=source_level,
@@ -40014,7 +40131,7 @@ class ConstructorModal(ModalScreen):
             "constructor: saved assembly %r (level %d, gid %s) — "
             "%d bp, %d parts, vector %r",
             unique_id, target_level, gid,
-            len(new_rec.seq), len(parts),
+            _seq_len(new_rec), len(parts),
             entry_vector.get("name"),
         )
         return unique_id
@@ -40154,7 +40271,7 @@ class ConstructorModal(ModalScreen):
             return
         _set_setting("constructor_filter_by_grammar", new_val)
         try:
-            self.app._constructor_filter_by_grammar = new_val
+            self.app._constructor_filter_by_grammar = new_val  # type: ignore[attr-defined]
         except AttributeError:
             pass
         for gid, _ in _CONSTRUCTOR_GRAMMARS_FOR_TABS:
@@ -42302,7 +42419,8 @@ class PrimerDesignScreen(Screen):
                         new_rec.name)
                     self._update_feature_dropdown()
                     self.app.notify(f"Loaded {new_rec.name} as primer template.",
-                                    severity="success", markup=False)
+                                    severity="success",  # type: ignore[arg-type]
+                                    markup=False)
                     return
             self.app.notify("Entry not found.", severity="warning")
 
@@ -42643,7 +42761,7 @@ class PrimerDesignScreen(Screen):
             app = self.app
             self.dismiss()
             app.call_after_refresh(
-                app._goto_primer_in_plasmid, usage
+                app._goto_primer_in_plasmid, usage  # type: ignore[attr-defined]
             )
 
         self.app.push_screen(
@@ -43252,7 +43370,8 @@ class PrimerDesignScreen(Screen):
             return
         self._refresh_library_table()
         self.app.notify(f"Saved {fwd_name} + {rev_name} to primer library.",
-                        severity="success", markup=False)
+                        severity="success",  # type: ignore[arg-type]
+                        markup=False)
         self._reset_for_new_design()
 
     # ── Add selected library primers as features ──────────────────────────
@@ -43288,7 +43407,7 @@ class PrimerDesignScreen(Screen):
         for f in rec.features:
             new_rec.features.append(deepcopy(f))
 
-        total = len(new_rec.seq)
+        total = _seq_len(new_rec)
         added = []
         for idx in sorted(self._lib_selected):
             if idx < 0 or idx >= len(primers):
@@ -43321,7 +43440,8 @@ class PrimerDesignScreen(Screen):
                     return [(int(p.start), int(p.end)) for p in f_loc.parts] == \
                            [(int(p.start), int(p.end)) for p in loc.parts]
                 if isinstance(f_loc, FeatureLocation) and isinstance(loc, FeatureLocation):
-                    return int(f_loc.start) == p_start and int(f_loc.end) == p_end
+                    return (int(f_loc.start) == p_start  # type: ignore[arg-type]
+                            and int(f_loc.end) == p_end)  # type: ignore[arg-type]
                 return False
 
             already = any(
@@ -43355,11 +43475,11 @@ class PrimerDesignScreen(Screen):
         try:
             # clear_undo=False keeps the primer-add in the undo stack AND
             # preserves _source_path so Ctrl+S still targets the right file.
-            self.app._push_undo()
-            self.app._apply_record(new_rec, clear_undo=False)
-            self.app._mark_dirty()
+            self.app._push_undo()  # type: ignore[attr-defined]
+            self.app._apply_record(new_rec, clear_undo=False)  # type: ignore[attr-defined]
+            self.app._mark_dirty()  # type: ignore[attr-defined]
             lib = self.app.query_one("#library")
-            lib.add_entry(new_rec)
+            lib.add_entry(new_rec)  # type: ignore[attr-defined]
         except Exception:
             _log.exception("Failed to add primer features to map")
 
@@ -44225,7 +44345,7 @@ class LoadPartSourceModal(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "cancel",         "Cancel"),
-        Binding("space",  "toggle",         "Toggle"),
+        Binding("space",  "toggle_selection",         "Toggle"),
         Binding("tab",    "app.focus_next", "Next",   show=False),
     ]
 
@@ -44383,8 +44503,8 @@ class LoadPartSourceModal(ModalScreen):
     def _update_status_line(self, *, search_failed: bool = False) -> None:
         """Refresh the dim status line with the match count, the count
         of toggled rows, and a brief hint. Extracted from `_refresh`
-        because `action_toggle` also needs to update the line without
-        rebuilding the whole table."""
+        because `action_toggle_selection` also needs to update the line
+        without rebuilding the whole table."""
         if search_failed:
             self.query_one("#loadpart-status", Static).update(
                 "[red]Library load failed — see log. Esc to "
@@ -44438,9 +44558,12 @@ class LoadPartSourceModal(ModalScreen):
         if 0 <= idx < len(self._matches):
             self._toggle_index(idx)
 
-    def action_toggle(self) -> None:
+    def action_toggle_selection(self) -> None:
         """Space-bar toggle on the cursor row. Mirrors
-        `MultiAlignPickerModal.action_toggle`."""
+        `MultiAlignPickerModal.action_toggle_selection`. Named
+        distinctly from Textual's base
+        ``DOMNode.action_toggle(attribute_name)`` to avoid
+        ``reportIncompatibleMethodOverride``."""
         if self._dismissing:
             return
         try:
@@ -44875,7 +44998,8 @@ class FeatureSearchModal(ModalScreen):
 
     def _dismiss_with_cursor(self, t: DataTable) -> None:
         try:
-            row_key = t.coordinate_to_cell_key((t.cursor_row, 0)).row_key
+            from textual.coordinate import Coordinate
+            row_key = t.coordinate_to_cell_key(Coordinate(t.cursor_row, 0)).row_key
         except Exception:
             return
         if row_key and row_key.value:
@@ -46728,32 +46852,39 @@ def _sanitize_plasmid_status(s) -> str:
     return s if s in _PLASMID_STATUS_VALUES else ""
 
 
-def _coerce_int(value, *, name: str = "value") -> "tuple[int | None, str | None]":
+def _coerce_int(value, *, name: str = "value") -> "int | str":
     """Type-safe int coercion for agent-API JSON payloads.
 
-    Returns ``(value, None)`` on success or ``(None, error_msg)`` on
-    failure. Accepts ``bool`` / ``int`` / finite ``float`` / digit
-    ``str``. Rejects ``None`` / dict / list / NaN / +-Inf — all of
-    which would either AttributeError on a downstream `.get` or
-    raise ``OverflowError`` on a naked ``int(value)`` (the case that
-    bit us when an agent sent ``{"max_hits": Infinity}`` and a
+    Returns the integer on success, or a human-readable error message
+    (string) on failure. Accepts ``bool`` / ``int`` / finite ``float``
+    / digit ``str``. Rejects ``None`` / dict / list / NaN / +-Inf —
+    all of which would either AttributeError on a downstream `.get`
+    or raise ``OverflowError`` on a naked ``int(value)`` (the case
+    that bit us when an agent sent ``{"max_hits": Infinity}`` and a
     downstream ``int(...)`` blew up before our range check).
+
+    The return shape is ``int | str`` rather than the older
+    ``tuple[int | None, str | None]`` so that a caller-side
+    ``isinstance(result, str)`` guard narrows the value to ``int``
+    automatically — no separate ``assert value is not None`` needed
+    and no tuple unpacking that loses pyright's discriminated-union
+    narrowing.
     """
     import math as _m
     if isinstance(value, bool):
-        return int(value), None
+        return int(value)
     if isinstance(value, int):
-        return value, None
+        return value
     if isinstance(value, float):
         if not _m.isfinite(value):
-            return None, f"{name!r} must be a finite number"
-        return int(value), None
+            return f"{name!r} must be a finite number"
+        return int(value)
     if isinstance(value, str):
         try:
-            return int(value), None
+            return int(value)
         except ValueError:
-            return None, f"{name!r} must be an integer"
-    return None, f"{name!r} must be an integer"
+            return f"{name!r} must be an integer"
+    return f"{name!r} must be an integer"
 
 
 def _sanitize_bases(s: "str | None", *,
@@ -46847,7 +46978,7 @@ def _h_status(app, payload):
         "loaded":      rec is not None,
         "name":        rec.name if rec else None,
         "id":          rec.id   if rec else None,
-        "length":      len(rec.seq) if rec else 0,
+        "length":      _seq_len(rec) if rec else 0,
         "topology":    (rec.annotations.get("topology") if rec else None),
         "n_features":  len(pm._feats) if pm else 0,
         "dirty":       bool(getattr(app, "_unsaved", False)),
@@ -47053,9 +47184,9 @@ def _h_add_feature(app, payload):
                 400)
     label = _sanitize_label(payload.get("label"))
     feat_type = _sanitize_feat_type(payload.get("type"))
-    strand, str_err = _coerce_int(payload.get("strand", 1), name="strand")
-    if str_err is not None:
-        return ({"error": str_err}, 400)
+    strand = _coerce_int(payload.get("strand", 1), name="strand")
+    if isinstance(strand, str):
+        return ({"error": strand}, 400)
     if strand not in (-1, 0, 1):
         return ({"error": "'strand' must be -1, 0, or 1"}, 400)
 
@@ -47161,7 +47292,7 @@ def _h_replace_sequence(app, payload):
     bases, err = _sanitize_bases(payload.get("bases"))
     if err is not None:
         return ({"error": err}, 400)
-    n = len(rec.seq)
+    n = _seq_len(rec)
     if not (0 <= start <= n) or not (0 <= end <= n) or start > end:
         return ({"error":
                   f"need 0 <= start <= end <= {n} (linear replace)"},
@@ -47325,9 +47456,9 @@ def _h_update_feature(app, payload):
                   if "type" in payload else None)
     new_strand = payload.get("strand")
     if new_strand is not None:
-        new_strand, ns_err = _coerce_int(new_strand, name="strand")
-        if ns_err is not None:
-            return ({"error": ns_err}, 400)
+        new_strand = _coerce_int(new_strand, name="strand")
+        if isinstance(new_strand, str):
+            return ({"error": new_strand}, 400)
         if new_strand not in (-1, 0, 1):
             return ({"error": "'strand' must be -1, 0, or 1"}, 400)
 
@@ -47558,9 +47689,9 @@ def _h_search_library(app, payload):
     if query is not None and len(query) > 200:
         return ({"error": "'query' exceeds 200-char cap"}, 400)
     raw_limit = payload.get("limit", 200)
-    limit, lim_err = _coerce_int(raw_limit, name="limit")
-    if lim_err is not None:
-        return ({"error": lim_err}, 400)
+    limit = _coerce_int(raw_limit, name="limit")
+    if isinstance(limit, str):
+        return ({"error": limit}, 400)
     limit = max(1, min(1000, limit))
     matches = _search_collections_library(query or "", limit=limit)
     return {"matches": matches, "count": len(matches)}
@@ -47634,10 +47765,10 @@ def _h_list_restriction_sites(app, payload):
     enzymes = payload.get("enzymes")
     if enzymes is not None and not isinstance(enzymes, list):
         return ({"error": "'enzymes' must be a list"}, 400)
-    min_len, ml_err = _coerce_int(payload.get("min_length", 4),
-                                    name="min_length")
-    if ml_err is not None:
-        return ({"error": ml_err}, 400)
+    min_len = _coerce_int(payload.get("min_length", 4),
+                            name="min_length")
+    if isinstance(min_len, str):
+        return ({"error": min_len}, 400)
     unique = bool(payload.get("unique_only", False))
     seq = str(rec.seq)
     is_circular = rec.annotations.get("topology") == "circular"
@@ -47681,9 +47812,9 @@ def _h_transfer_annotations(app, payload):
     if not source_id:
         return ({"error": "missing 'source_id'"}, 400)
     raw_min = payload.get("min_len", _ANNOT_TRANSFER_MIN_LEN)
-    min_len, ml_err = _coerce_int(raw_min, name="min_len")
-    if ml_err is not None:
-        return ({"error": ml_err}, 400)
+    min_len = _coerce_int(raw_min, name="min_len")
+    if isinstance(min_len, str):
+        return ({"error": min_len}, 400)
     if min_len < 1:
         return ({"error": "'min_len' must be ≥ 1"}, 400)
     dry_run = bool(payload.get("dry_run", True))
@@ -48008,9 +48139,9 @@ def _h_find_orfs(app, payload):
     rec = getattr(app, "_current_record", None)
     if rec is None:
         return ({"error": "no plasmid loaded"}, 422)
-    min_aa, ma_err = _coerce_int(payload.get("min_aa", 30), name="min_aa")
-    if ma_err is not None:
-        return ({"error": ma_err}, 400)
+    min_aa = _coerce_int(payload.get("min_aa", 30), name="min_aa")
+    if isinstance(min_aa, str):
+        return ({"error": min_aa}, 400)
     if min_aa < 1:
         return ({"error": "'min_aa' must be ≥ 1"}, 400)
     alt = bool(payload.get("include_alt_starts", False))
@@ -48117,7 +48248,7 @@ def _h_add_current_to_library(app, payload):
     if err is not None:
         return err
     return {"ok": True, "id": rec.id, "name": rec.name,
-            "size": len(rec.seq)}
+            "size": _seq_len(rec)}
 
 
 @_agent_endpoint("create-collection", write=True)
@@ -48335,10 +48466,10 @@ def _h_blast(app, payload):
                           f"invalid collection name in list: {n!r}"}, 400)
             coll_names.append(norm)
 
-    max_hits, mh_err = _coerce_int(payload.get("max_hits", 25),
-                                     name="max_hits")
-    if mh_err is not None:
-        return ({"error": mh_err}, 400)
+    max_hits = _coerce_int(payload.get("max_hits", 25),
+                             name="max_hits")
+    if isinstance(max_hits, str):
+        return ({"error": max_hits}, 400)
     max_hits = max(1, min(max_hits, 500))
 
     six_frame = bool(payload.get("six_frame", False))
@@ -48380,10 +48511,10 @@ def _h_hmmscan(app, payload):
         return ({"error": "missing 'hmm_path'"}, 400)
     if not hmm_path.exists():
         return ({"error": f"hmm file not found: {hmm_path}"}, 404)
-    max_hits, mh_err = _coerce_int(payload.get("max_hits", 25),
-                                     name="max_hits")
-    if mh_err is not None:
-        return ({"error": mh_err}, 400)
+    max_hits = _coerce_int(payload.get("max_hits", 25),
+                             name="max_hits")
+    if isinstance(max_hits, str):
+        return ({"error": max_hits}, 400)
     max_hits = max(1, min(max_hits, 500))
     try:
         hits = _hmmscan_run(raw_query, str(hmm_path), max_hits=max_hits)
@@ -48530,7 +48661,7 @@ def _h_set_entry_vector(app, payload):
     source = source_raw if isinstance(source_raw, str) else ""
     vector = {
         "name":     name,
-        "size":     len(rec.seq),
+        "size":     _seq_len(rec),
         "source":   source[:300],   # cap source for paranoia
         "gb_text":  gb_text,
     }
@@ -48561,9 +48692,9 @@ def _h_update_primer(app, payload):
     rec = getattr(app, "_current_record", None)
     if rec is None:
         return ({"error": "no plasmid loaded"}, 422)
-    idx, idx_err = _coerce_int(payload.get("idx"), name="idx")
-    if idx_err is not None:
-        return ({"error": idx_err}, 400)
+    idx = _coerce_int(payload.get("idx"), name="idx")
+    if isinstance(idx, str):
+        return ({"error": idx}, 400)
     try:
         pm = app.query_one("#plasmid-map", PlasmidMap)
     except (NoMatches, AttributeError):
@@ -48595,16 +48726,17 @@ def _h_update_primer(app, payload):
         new_pseq = clean
     new_strand: "int | None" = None
     if "strand" in payload:
-        new_strand, ns_err = _coerce_int(payload["strand"], name="strand")
-        if ns_err is not None:
-            return ({"error": ns_err}, 400)
-        if new_strand not in (-1, 0, 1):
+        coerced_strand = _coerce_int(payload["strand"], name="strand")
+        if isinstance(coerced_strand, str):
+            return ({"error": coerced_strand}, 400)
+        if coerced_strand not in (-1, 0, 1):
             return ({"error": "'strand' must be -1, 0, or 1"}, 400)
+        new_strand = coerced_strand
     new_notes = None
     if "notes" in payload:
         new_notes = _sanitize_note(payload["notes"])
 
-    edit_payload = {"idx": idx}
+    edit_payload: "dict[str, _Any]" = {"idx": idx}
     if new_label is not None:
         edit_payload["label"] = new_label
     if new_pseq is not None:
@@ -48639,12 +48771,12 @@ def _settings_validator_bool(value):
 
 def _settings_validator_int_range(lo: int, hi: int):
     def _v(value):
-        v, err = _coerce_int(value, name="value")
-        if err is not None:
-            return None, err
-        if not (lo <= v <= hi):
+        result = _coerce_int(value, name="value")
+        if isinstance(result, str):
+            return None, result
+        if not (lo <= result <= hi):
             return None, f"must be in [{lo}, {hi}]"
-        return v, None
+        return result, None
     return _v
 
 
@@ -48657,12 +48789,12 @@ def _settings_validator_choice(*choices):
 
 
 def _settings_validator_min_len_4_or_6(value):
-    v, err = _coerce_int(value, name="value")
-    if err is not None:
-        return None, err
-    if v not in (4, 6):
+    result = _coerce_int(value, name="value")
+    if isinstance(result, str):
+        return None, result
+    if result not in (4, 6):
         return None, "must be 4 or 6"
-    return v, None
+    return result, None
 
 
 def _settings_validator_custom_enzymes_csv(value):
@@ -48801,9 +48933,9 @@ def _h_list_parts(app, payload):
     level   = payload.get("level")
     position = payload.get("position")
     if level is not None:
-        lvl, err = _coerce_int(level, name="level")
-        if err is not None:
-            return ({"error": err}, 400)
+        lvl = _coerce_int(level, name="level")
+        if isinstance(lvl, str):
+            return ({"error": lvl}, 400)
     else:
         lvl = None
     if grammar is not None and not isinstance(grammar, str):
@@ -48979,9 +49111,9 @@ def _h_add_codon_table(app, payload):
                     400)
         if set(codon.upper()) - valid:
             return ({"error": f"non-IUPAC codon {codon!r}"}, 400)
-        n, err = _coerce_int(count, name=f"raw[{codon!r}]")
-        if err is not None:
-            return ({"error": err}, 400)
+        n = _coerce_int(count, name=f"raw[{codon!r}]")
+        if isinstance(n, str):
+            return ({"error": n}, 400)
         if n < 0:
             return ({"error": f"negative count for codon {codon!r}"}, 400)
         cleaned[codon.upper().replace("U", "T")] = n
@@ -49404,12 +49536,12 @@ def _h_simulate_gibson(app, payload):
             "sequence": seq,
             "features": [x for x in feats_raw if isinstance(x, dict)],
         })
-    min_overlap, err = _coerce_int(
+    min_overlap = _coerce_int(
         payload.get("min_overlap", _GIBSON_MIN_OVERLAP_BP),
         name="min_overlap",
     )
-    if err is not None:
-        return ({"error": err}, 400)
+    if isinstance(min_overlap, str):
+        return ({"error": min_overlap}, 400)
     if not (1 <= min_overlap <= _GIBSON_MAX_OVERLAP_BP):
         return ({"error": f"min_overlap out of range [1, "
                   f"{_GIBSON_MAX_OVERLAP_BP}]"}, 400)
@@ -49470,7 +49602,7 @@ def _h_gibson_assemble(app, payload):
     entry = {
         "id":      name,
         "name":    name,
-        "size":    len(rec.seq),
+        "size":    _seq_len(rec),
         "n_feats": len(rec.features or []),
         "source":  "agent:gibson",
         "added":   _date.today().isoformat(),
@@ -49577,12 +49709,12 @@ def _h_design_gb_part(app, payload):
     if len(template_clean) > _PAIRWISE_MAX_LEN:
         return ({"error": f"'template' exceeds "
                   f"{_PAIRWISE_MAX_LEN:,} bp cap"}, 413)
-    start, err = _coerce_int(payload.get("start"), name="start")
-    if err is not None:
-        return ({"error": err}, 400)
-    end, err = _coerce_int(payload.get("end"), name="end")
-    if err is not None:
-        return ({"error": err}, 400)
+    start = _coerce_int(payload.get("start"), name="start")
+    if isinstance(start, str):
+        return ({"error": start}, 400)
+    end = _coerce_int(payload.get("end"), name="end")
+    if isinstance(end, str):
+        return ({"error": end}, 400)
     n = len(template_clean)
     if not (0 <= start < n) or not (0 < end <= n):
         return ({"error": f"start/end out of range for "
@@ -49653,12 +49785,12 @@ def _h_design_primers(app, payload):
     if len(template_clean) > _PAIRWISE_MAX_LEN:
         return ({"error": f"'template' exceeds "
                   f"{_PAIRWISE_MAX_LEN:,} bp cap"}, 413)
-    start, err = _coerce_int(payload.get("start"), name="start")
-    if err is not None:
-        return ({"error": err}, 400)
-    end, err = _coerce_int(payload.get("end"), name="end")
-    if err is not None:
-        return ({"error": err}, 400)
+    start = _coerce_int(payload.get("start"), name="start")
+    if isinstance(start, str):
+        return ({"error": start}, 400)
+    end = _coerce_int(payload.get("end"), name="end")
+    if isinstance(end, str):
+        return ({"error": end}, 400)
     n = len(template_clean)
     if not (0 <= start < n) or not (0 < end <= n):
         return ({"error": f"start/end out of range for "
@@ -51574,6 +51706,13 @@ SpeciesPickerModal { align: center middle; }
 
         src = (source_record if source_record is not None
                 else self._current_record)
+        if src is None:
+            # No record to rebuild against. Callers always guard for this
+            # (the edit path is only reachable when a plasmid is loaded),
+            # but the explicit check keeps pyright narrowing happy through
+            # the rest of the body and turns a "would crash" into a clear
+            # no-op should the invariant ever slip.
+            return None
 
         ins_len  = len(new_bases)
         del_len  = 0 if mode == "insert" else (e - s)
@@ -51717,15 +51856,22 @@ SpeciesPickerModal { align: center middle; }
         # by Harley King in closed PR #7.
         from Bio.SeqFeature import SeqFeature
 
+        src = self._current_record
+        if src is None:
+            # Delete-feature is only reachable when a plasmid is loaded;
+            # the early-return keeps pyright narrowing through the
+            # SeqRecord field reads below and prevents an AttributeError
+            # if the invariant ever slips.
+            return None
         new_record = SeqRecord(
-            Seq(str(self._current_record.seq)),
-            id=self._current_record.id,
-            name=self._current_record.name,
-            description=self._current_record.description,
-            annotations=dict(self._current_record.annotations),
+            Seq(str(src.seq)),
+            id=src.id,
+            name=src.name,
+            description=src.description,
+            annotations=dict(src.annotations),
         )
         non_source_idx = 0
-        for feat in self._current_record.features:
+        for feat in src.features:
             if feat.type == "source":
                 new_record.features.append(SeqFeature(
                     feat.location, type=feat.type,
@@ -51769,6 +51915,13 @@ SpeciesPickerModal { align: center middle; }
         label = feat.get("label") or feat.get("type", "feature")
         self._push_undo()
         new_record = self._rebuild_record_without_feature(pm.selected_idx)
+        if new_record is None:
+            # _rebuild_record_without_feature returns None when there's
+            # no current record — should be unreachable from this entry
+            # point (selected_idx is only valid with a loaded record)
+            # but the guard makes pyright happy and avoids an
+            # AttributeError if the invariant ever slips.
+            return
         sp = self.query_one("#seq-panel", SequencePanel)
         self._apply_snapshot(str(new_record.seq), sp._cursor_pos, new_record)
         self.notify(f"Deleted '{label}'  (Ctrl+Z to undo)", markup=False)
@@ -52051,7 +52204,7 @@ SpeciesPickerModal { align: center middle; }
         try:
             _atomic_write_text(path, _record_to_gb_text(record))
             _log.info("Autosaved %s to %s (%d bp)",
-                      record.name, path, len(record.seq))
+                      record.name, path, _seq_len(record))
         except Exception:
             # Autosave is a safety net — never interrupt the user if it fails.
             _log.exception("Autosave to %s failed", path)
@@ -52163,7 +52316,7 @@ SpeciesPickerModal { align: center middle; }
         crash from this path. Best-effort by design.
         """
         try:
-            now = time.time()
+            now = _time.time()
             try:
                 last_check = float(_get_setting("last_update_check_ts", 0)
                                      or 0)
@@ -52929,7 +53082,7 @@ SpeciesPickerModal { align: center middle; }
     def _mark_dirty(self) -> None:
         self._unsaved = True
         if self._current_record:
-            n = len(self._current_record.seq)
+            n = _seq_len(self._current_record)
             display = self._record_display_name(self._current_record)
             self.title = f"SpliceCraft — *{display}  ({n:,} bp)"
         try:
@@ -52941,7 +53094,7 @@ SpeciesPickerModal { align: center middle; }
     def _mark_clean(self) -> None:
         self._unsaved = False
         if self._current_record:
-            n = len(self._current_record.seq)
+            n = _seq_len(self._current_record)
             display = self._record_display_name(self._current_record)
             self.title = f"SpliceCraft — {display}  ({n:,} bp)"
         try:
@@ -53122,7 +53275,7 @@ SpeciesPickerModal { align: center middle; }
             "save.start",
             name=self._current_record.name,
             source_path=self._source_path,
-            length=len(self._current_record.seq),
+            length=_seq_len(self._current_record),
             n_features=len(self._current_record.features),
         )
 
@@ -53212,7 +53365,7 @@ SpeciesPickerModal { align: center middle; }
             "save.start",
             name=record_name,
             source_path=source_path,
-            length=len(record.seq),
+            length=_seq_len(record),
             n_features=len(record.features),
         )
 
@@ -53253,7 +53406,7 @@ SpeciesPickerModal { align: center middle; }
             entries.insert(0, {
                 "name":    record_name or record_id,
                 "id":      record_id,
-                "size":    len(record.seq),
+                "size":    _seq_len(record),
                 "n_feats": len([f for f in record.features
                                  if f.type != "source"]),
                 "source":  getattr(record, "_tui_source", f"id:{record_id}"),
@@ -53288,7 +53441,13 @@ SpeciesPickerModal { align: center middle; }
 
         self.call_from_thread(_finish)
 
-    def action_quit(self) -> None:
+    def action_quit(self) -> None:  # type: ignore[override]
+        # Sync override of Textual's `App.action_quit` (which is async).
+        # Textual's action dispatcher accepts both sync and async
+        # handlers, and binding-side callers never await the return
+        # value, so the sync override is safe at runtime. The
+        # `type: ignore[override]` silences pyright's incompatibility
+        # check for this intentional API simplification.
         # Two paths: with unsaved edits → Save / Abandon / Cancel modal;
         # clean state → simple Yes / No confirm modal (default No). The
         # second path is new — we used to exit() outright, which could
@@ -53785,8 +53944,8 @@ SpeciesPickerModal { align: center middle; }
             # Sanity guard before kicking off the worker — `_pairwise_align`
             # itself raises on this, but failing fast here is faster + lets
             # us surface a friendlier message to the user.
-            q_len = len(self._current_record.seq)
-            t_len = len(target_record.seq)
+            q_len = _seq_len(self._current_record)
+            t_len = _seq_len(target_record)
             if max(q_len, t_len) > _PAIRWISE_MAX_LEN:
                 self.notify(
                     f"Plasmid too long for pairwise alignment "
@@ -53795,6 +53954,7 @@ SpeciesPickerModal { align: center middle; }
                     severity="warning", timeout=8,
                 )
                 return
+            assert self._current_record is not None  # _seq_len call above guards
             self.notify(
                 f"Aligning {self._current_record.name} vs "
                 f"{target_record.name} ({q_len:,} bp × {t_len:,} bp)…",
@@ -54027,9 +54187,9 @@ SpeciesPickerModal { align: center middle; }
         current_id = getattr(self._current_record, "id", None)
 
         def _on_picked(picked_ids):
-            if not picked_ids:
+            if not picked_ids or self._current_record is None:
                 return
-            q_len = len(self._current_record.seq)
+            q_len = _seq_len(self._current_record)
             # Resolve + size-check each target on the UI thread so we
             # can surface friendly errors before the worker starts.
             # The worker only sees pre-validated SeqRecords.
@@ -54075,6 +54235,7 @@ SpeciesPickerModal { align: center middle; }
                 targets.append((entry_id, target_record))
             if not targets:
                 return
+            assert self._current_record is not None  # narrowed by early-return above
             self.notify(
                 f"Aligning {len(targets)} target(s) against "
                 f"{self._current_record.name}…",
@@ -54282,8 +54443,9 @@ SpeciesPickerModal { align: center middle; }
         seq_str = str(self._current_record.seq)
         topology = ""
         try:
-            topology = (self._current_record.annotations or {}).get(
-                "topology", "") or ""
+            if self._current_record is not None:
+                topology = str((self._current_record.annotations or {}).get(
+                    "topology", "") or "")
         except (AttributeError, KeyError):
             pass
         circular = topology.lower() != "linear"
@@ -55855,6 +56017,12 @@ SpeciesPickerModal { align: center middle; }
                         severity="error",
                     )
                     return
+            if event.entry_id is None:
+                # event.entry_id should always be set when the rename
+                # modal fires this callback; the guard keeps pyright
+                # narrowed and bails cleanly if a future change ever
+                # routes a None through.
+                return
             self._rename_library_entry(event.entry_id, new_name)
 
         self.push_screen(
@@ -55938,7 +56106,7 @@ SpeciesPickerModal { align: center middle; }
             # `_tui_display_name` from the prior library load lingers
             # and the title bar shows the old name until reload.
             try:
-                self._current_record._tui_display_name = new_name
+                self._current_record._tui_display_name = new_name  # type: ignore[attr-defined]
             except Exception:
                 _log.debug(
                     "rename: couldn't update _tui_display_name on "
@@ -56769,7 +56937,7 @@ SpeciesPickerModal { align: center middle; }
 
         if self._current_record is None:
             raise RuntimeError("Load a plasmid first.")
-        n = len(self._current_record.seq)
+        n = _seq_len(self._current_record)
         if not (0 <= start < n):
             raise ValueError(f"start {start} out of range [0, {n})")
         if not (0 <= end <= n):
@@ -57039,7 +57207,14 @@ SpeciesPickerModal { align: center middle; }
     # report shows the failed push.
     _MODAL_STACK_SOFT_CAP = 12
 
-    def push_screen(self, screen, *args, **kwargs):
+    def push_screen(self, screen, *args, **kwargs):  # type: ignore[override]
+        # Override of Textual's `App.push_screen` to gate on the soft
+        # modal-stack cap (issue: a stuck modal chain could otherwise
+        # grow without bound and freeze the terminal). The base
+        # method returns `AwaitMount`; we either delegate to it (and
+        # return whatever it returns) or return None when capped.
+        # `type: ignore[override]` covers the return-type mismatch
+        # since no in-tree caller `await`s push_screen.
         # Defensive: refuse pushes that would blow past the soft cap.
         # Returns the awaitable that Textual normally returns so
         # callers `await app.push_screen(...)` keep working — but
@@ -57217,43 +57392,61 @@ SpeciesPickerModal { align: center middle; }
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
-    # Pluck `--no-splash` out of argv before the positional-argument
-    # parsing so it composes with any other flag in any position.
-    args = list(sys.argv[1:])
-    skip_splash = False
-    for flag in ("--no-splash", "-Q"):
-        if flag in args:
-            args.remove(flag)
-            skip_splash = True
+    # Global-flag parsing via argparse (issue #11). `parse_known_args`
+    # extracts the globally-applicable flags (`--no-splash`, `--agent-api`,
+    # `--agent-api-port`, `--version`, `--help`) regardless of their
+    # position in argv, leaving subcommand names (`update`, `logs`) and
+    # the positional file/accession in `rest`. We keep manual dispatch
+    # below rather than wiring subparsers because the historical
+    # behaviour silently ignored stray unknown tokens (e.g. a typo
+    # falling through to the TUI as an "open this accession" attempt),
+    # and `parse_known_args` preserves that.
+    #
     # Agent-API opt-in: `--agent-api` (default port) or
     # `--agent-api-port=PORT`. Both also accept the env-var
     # alternative SPLICECRAFT_AGENT_API=1 / =PORT for shell pipelines.
-    enable_agent_api = False
+    # The agent side-door is a stable contract for `splicecraft-cli`
+    # and external agents; do NOT alter this flag surface.
+    main_parser = argparse.ArgumentParser(
+        prog="splicecraft",
+        add_help=False,
+        allow_abbrev=False,
+    )
+    main_parser.add_argument("--version", "-V", action="store_true",
+                              dest="want_version")
+    main_parser.add_argument("--help", "-h", action="store_true",
+                              dest="want_help")
+    main_parser.add_argument("--no-splash", "-Q", action="store_true",
+                              dest="skip_splash")
+    main_parser.add_argument("--agent-api", action="store_true",
+                              dest="agent_api")
+    main_parser.add_argument("--agent-api-port", type=int, default=None,
+                              metavar="PORT", dest="agent_api_port")
+
+    try:
+        parsed, rest = main_parser.parse_known_args(sys.argv[1:])
+    except SystemExit:
+        # `type=int` failure on --agent-api-port raises via argparse's
+        # error() → exit(2). The default error path writes to stderr
+        # already; just propagate the exit code.
+        raise
+
+    skip_splash = parsed.skip_splash
+    enable_agent_api = parsed.agent_api
     agent_port = _AGENT_API_PORT_DEFAULT
-    if "--agent-api" in args:
-        args.remove("--agent-api")
+    if parsed.agent_api_port is not None:
+        agent_port = parsed.agent_api_port
         enable_agent_api = True
-    for a in list(args):
-        if a.startswith("--agent-api-port="):
-            try:
-                agent_port = int(a.split("=", 1)[1])
-            except ValueError:
-                print(f"Invalid --agent-api-port value: {a}",
-                      file=sys.stderr)
-                sys.exit(2)
-            args.remove(a)
-            enable_agent_api = True
     env_api = os.environ.get("SPLICECRAFT_AGENT_API", "").strip()
     if env_api and env_api.lower() not in ("0", "false", "no", ""):
         enable_agent_api = True
         if env_api.isdigit() and int(env_api) > 1:
             agent_port = int(env_api)
-    arg = args[0] if args else None
     # Handle --version / -V without loading the TUI
-    if arg in ("--version", "-V"):
+    if parsed.want_version:
         print(f"splicecraft {__version__}")
         return
-    if arg in ("--help", "-h"):
+    if parsed.want_help:
         print(
             f"splicecraft {__version__}\n"
             "Usage: splicecraft [ACCESSION | FILE.gb | update | logs] [--no-splash] "
@@ -57276,6 +57469,8 @@ def main():
             "Inside the running app: Alt+D captures a UI snapshot for bug reports."
         )
         return
+    args = list(rest)
+    arg = args[0] if args else None
     # `splicecraft update` — self-update subcommand. Dispatches BEFORE the
     # `Path(arg).exists()` file-load check so a stray file named "update"
     # in the CWD doesn't shadow the subcommand. If such a file exists,
@@ -57407,7 +57602,7 @@ def main():
     # `PrimerDuplicatesModal` doesn't pop during async pilots.
     app._skip_primer_dedupe_check = False
     if enable_agent_api:
-        app._agent_api_port = agent_port
+        app._agent_api_port = agent_port  # type: ignore[attr-defined]
 
     if arg:
         looks_like_file = arg.lower().endswith((".gb", ".gbk", ".genbank", ".dna"))

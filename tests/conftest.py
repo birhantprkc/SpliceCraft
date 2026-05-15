@@ -1,13 +1,15 @@
 """
 conftest — shared fixtures for the SpliceCraft test suite.
 
-CRITICAL SAFETY RULE: the _protect_user_data autouse fixture redirects ALL
-JSON persistence files (plasmid_library.json, parts_bin.json, primers.json)
-to a temporary directory for the ENTIRE test session. No test, fixture, or
-ad-hoc import can ever touch the user's real data files.
+CRITICAL SAFETY RULE: the _protect_user_data autouse fixture redirects
+EVERY user-data JSON file enumerated in `_DATA_FILES` (plus the
+crash-recovery, .dna-sidecar, and plugin directories) to a temporary
+location for the lifetime of each test. No test, fixture, or ad-hoc
+import can ever touch the user's real data files.
 
-If you add a new persistence file to splicecraft.py, you MUST add it to the
-_DATA_FILES list in _protect_user_data below.
+If you add a new persistence file to splicecraft.py, you MUST add it
+to the _DATA_FILES list in _protect_user_data below — the
+`test_no_real_files_touched` smoke test will fail otherwise.
 """
 import sys
 from pathlib import Path
