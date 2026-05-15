@@ -2,6 +2,88 @@
 
 ---
 
+## [0.8.6] — 2026-05-14 — Polish: flake fix · Pyright sweep · docs
+
+Cleanup release. No new features; four small categories of fixes.
+
+### Test stability
+
+* `test_unmount_cancels_pending_debounce` (test_smoke.py) was flaking
+  ~5% of full-suite runs under xdist — the assertion fired before the
+  `Input.Changed` message could dispatch the debounce timer. Added
+  `await pilot.pause()` between the value mutation and the timer
+  check so the test passes deterministically regardless of parallel
+  load.
+
+### Pyright tech debt
+
+Knocked down the persistent module-level errors that have been
+bleeding into every diagnostic stream:
+
+* `_bulk_import_folder`: `progress_cb` annotation switched from the
+  builtin `callable` to `_Callable` (the actual type).
+* `Style.from_rich_style = classmethod(...)` monkey-patch: explicit
+  `# type: ignore[assignment]` since Pyright can't model dynamic
+  attribute assignment on third-party classes.
+* `PlasmidMap._draw` / `_draw_linear_map` use `getattr(record, "name",
+  None)` on the post-`render`-guard record so Pyright can't see a
+  spurious `None` access.
+* `_pairwise_align` reads `first.score` via `getattr` (the attribute
+  is stable BioPython API but missing from Pyright's stubs).
+* `_echo_click_modifiers` calls on `self.app` (PlasmidMap /
+  FeatureSidebar / SequencePanel) routed through `getattr` — Pyright
+  was complaining about attribute access on `App[Unknown]` for a
+  method that only exists on the `PlasmidApp` subclass.
+* `_do_save` / `_discard_changes` on `LibraryPanel._btn_back` same
+  fix.
+* `PlasmidApp._preload_record` annotated `"object | None"` so test
+  scaffolding can assign a `SeqRecord` to it without a type error.
+
+These are all typing-system limitations, not behavior changes. The
+remaining splicecraft.py errors are BioPython stub gaps (Position
+arithmetic in CompoundLocation) or test-file Screen-attr access —
+not actionable in the main module.
+
+### GitHub issues
+
+* **#4 closed** — the `[ v = linear ]` discoverability hint on the
+  circular view shipped in v0.7.8.1 alongside Koeng101's open-issue
+  sweep. The issue was still open; reading the code confirms the
+  fix is already in place.
+
+### Documentation
+
+* `README.md`:
+  - **Cloning** section now mentions **Gibson assembly** as a
+    Constructor tab and describes the RC-orientation hint.
+  - **Agent API** section enumerates the ~60 endpoints across
+    Records / Files / Library / Parts / Design / Alignment /
+    History / Codon tables / Search / Data safety / Settings /
+    Utility — bringing the doc in sync with the 0.8.x growth.
+  - **Key bindings** table: `F1`–`F4` focus modes, `F5` restore
+    panels, `F6` / `Ctrl+H` history viewer, `Alt+D` UI snapshot,
+    `Alt+Shift+D` hover-debug. The pre-fix `Alt+D` description
+    was stale (it moved from hover-debug to UI-snapshot in 0.7.x).
+  - **Menus** table updated: Settings menu present; Enzymes
+    custom-enzyme entry; History menu tab; Constructor tab
+    breakdown (Traditional + Gibson + GB / MoClo).
+  - **Data files** table: parts_bin_collections, entry_vectors,
+    dna_originals, logs, ui_snapshots, snapshots/lost_entries,
+    pre-update backups.
+
+### Release checklist
+
+* `RELEASE_CHECKLIST.md` de-versioned (was hard-coded to "1.0.0.0
+  release checklist") so the file is reusable across releases. The
+  per-terminal matrix, agent-API smoke list, and documentation-freeze
+  steps all generalise; only the literal version strings changed.
+
+### Tests
+
+Full suite: 2436 passed, 5 skipped (451 s on 8 cores).
+
+---
+
 ## [0.8.5] — 2026-05-14 — Plasmidsaurus agent endpoints + diff-plasmid circular
 
 Cleans up the last deferred item from 0.8.4 — the Plasmidsaurus

@@ -442,7 +442,9 @@ def _from_rich_style_cached(cls, rich_style, console=None):
         # Textual / Rich version with breaking-change behaviour.
         return _orig_from_rich_style(cls, rich_style, console)
 
-_tstyle_mod.Style.from_rich_style = classmethod(_from_rich_style_cached)
+_tstyle_mod.Style.from_rich_style = classmethod(  # type: ignore[assignment]
+    _from_rich_style_cached,
+)
 
 from textual.widgets import (  # noqa: E402
     Button, Checkbox, DataTable, DirectoryTree, Footer, Header, Input, Label,
@@ -7905,7 +7907,7 @@ def _try_extract_history_xml_from_dna_path(path: Path) -> "str | None":
 def _bulk_import_folder(
     folder: Path,
     *,
-    progress_cb: "callable | None" = None,
+    progress_cb: "_Callable | None" = None,
 ) -> "tuple[list[dict], list[tuple[Path, str]]]":
     """Walk `folder` for .dna / .gb / .gbk / .genbank files and load each.
 
@@ -8727,7 +8729,9 @@ def _pairwise_align(query_seq: str, target_seq: str,
     ungapped_cols = max(1, n_matches + n_mismatches)
     return {
         "mode":                  mode,
-        "score":                 float(first.score),
+        # BioPython's Alignment.score isn't in Pyright's stubs but
+        # is the public scalar API (documented + stable since 1.81).
+        "score":                 float(getattr(first, "score", 0.0)),
         "identity_pct":          100.0 * n_matches / aligned_cols,
         "ungapped_identity_pct": 100.0 * n_matches / ungapped_cols,
         "aligned_q":             aligned_q,
@@ -10151,7 +10155,12 @@ class PlasmidMap(Widget):
         # (Alt+M) can echo it for users diagnosing terminal-eats-shift
         # issues.
         try:
-            self.app._echo_click_modifiers("plasmid map", event)
+            # `_echo_click_modifiers` is a PlasmidApp method; Pyright
+            # sees the base App[Unknown] and complains. getattr keeps
+            # the call defensive AND silences the type error.
+            echo = getattr(self.app, "_echo_click_modifiers", None)
+            if callable(echo):
+                echo("plasmid map", event)
         except Exception:
             pass
         _log_event(
@@ -10480,8 +10489,14 @@ class PlasmidMap(Widget):
         # as `_tui_display_name`) so spaces and `+` survive the round-
         # trip through the GenBank LOCUS sanitiser. Falls back to
         # `record.name` for fresh records that haven't been saved yet.
-        name     = (getattr(self.record, "_tui_display_name", None)
-                    or self.record.name or self.record.id or "?")[:w // 3]
+        # `render` guarantees self.record non-None before calling _draw,
+        # but Pyright can't carry that across method boundaries; getattr
+        # silences the false positive without changing the runtime path.
+        record = self.record
+        name     = (getattr(record, "_tui_display_name", None)
+                    or getattr(record, "name", None)
+                    or getattr(record, "id", None)
+                    or "?")[:w // 3]
         size_txt = f"{total:,} bp"
         orig_txt = f"▲ {self.origin_bp:,}"
         for i, (txt, sty) in enumerate([
@@ -10821,8 +10836,12 @@ class PlasmidMap(Widget):
         # ── Header ──
         # Same display-name preference as the circular header (see
         # `_draw` for rationale).
-        name = (getattr(self.record, "_tui_display_name", None)
-                or self.record.name or self.record.id or "?")[:w // 3]
+        # Same Pyright-false-positive guard as the circular draw path.
+        record = self.record
+        name = (getattr(record, "_tui_display_name", None)
+                or getattr(record, "name", None)
+                or getattr(record, "id", None)
+                or "?")[:w // 3]
         canvas.put_text(margin_l, 0, f"{name}  {total:,} bp", "bold white")
         hint = "[ flag  ·  v = circular ]"
         canvas.put_text(w - len(hint) - 1, 0, hint, "dim")
@@ -11284,7 +11303,9 @@ class FeatureSidebar(Widget):
         # cursor row, so the idx may be stale.
         self._pending_double_click = (getattr(event, "chain", 1) >= 2)
         try:
-            self.app._echo_click_modifiers("sidebar", event)
+            echo = getattr(self.app, "_echo_click_modifiers", None)
+            if callable(echo):
+                echo("sidebar", event)
         except Exception:
             pass
 
@@ -12389,11 +12410,13 @@ class LibraryPanel(Widget):
                 # _do_save marks clean on success and notifies. If the
                 # save fails (e.g. write error), stay in plasmids view
                 # so the user can retry.
-                if hasattr(app, "_do_save") and app._do_save():
+                do_save = getattr(app, "_do_save", None)
+                if callable(do_save) and do_save():
                     self._do_back()
             elif result == "discard":
-                if hasattr(app, "_discard_changes"):
-                    app._discard_changes()
+                discard = getattr(app, "_discard_changes", None)
+                if callable(discard):
+                    discard()
                 self._do_back()
             # None → cancel; user stays in plasmids view.
 
@@ -14418,7 +14441,9 @@ class SequencePanel(Widget):
         ext = bool(getattr(event, "shift", False)
                     or getattr(event, "ctrl",  False))
         try:
-            self.app._echo_click_modifiers("seq panel", event)
+            echo = getattr(self.app, "_echo_click_modifiers", None)
+            if callable(echo):
+                echo("seq panel", event)
         except Exception:
             pass
         self.post_message(self.SequenceClick(
@@ -49921,7 +49946,7 @@ class PlasmidApp(App):
     # real estate, and the SpliceCraft surface is small enough that
     # the dedicated `?` Help modal covers shortcut discovery.
     ENABLE_COMMAND_PALETTE = False
-    _preload_record = None
+    _preload_record: "object | None" = None
     _current_record = None   # last-loaded SeqRecord
     _source_path:   "str | None" = None   # file the current record was loaded from
     _unsaved:        bool         = False  # True when there are unsaved edits

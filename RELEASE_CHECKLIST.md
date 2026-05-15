@@ -1,15 +1,15 @@
-# SpliceCraft 1.0.0.0 release checklist
+# SpliceCraft release checklist
 
-The bits `pytest -n auto` can't catch. Walk top-to-bottom before tagging the
-1.0.0.0 release. Anything that fails here that wasn't already in `tests/`
-should land as a regression guard in the same PR as the fix.
+The bits `pytest -n auto` can't catch. Walk top-to-bottom before any
+substantial release tag. Anything that fails here that wasn't already in
+`tests/` should land as a regression guard in the same PR as the fix.
 
 ## Per-terminal smoke matrix
 
 The 0.5.5.x churn (Ctrl+digit → Alt+digit → F1-F5) was caused by terminals
 that intercept keystrokes before they reach the app. Every terminal in this
 matrix should be exercised on a clean install of the published package
-(`pipx install splicecraft==1.0.0.0`) — not the dev tree.
+(`pipx install splicecraft==X.Y.Z`) — not the dev tree.
 
 For each terminal, load pUC19 (`splicecraft L09137`) and verify:
 
@@ -69,16 +69,15 @@ under `pytest`. Verify the user-facing flow:
 ## Pre-tag release-script dry run
 
 ```bash
-./release.py 1.0.0.0 --dry-run    # if release.py supports --dry-run; else
-git diff master..HEAD              # eyeball the rolled-up changelog
-python3 -m pytest -n auto -q       # one final pass on a clean checkout
-pip install --user dist/splicecraft-1.0.0.0-*.whl  # install + run the wheel
+git diff master..HEAD                              # eyeball the changelog delta
+python3 -m pytest -n auto -q                       # one final pass on a clean checkout
+pip install --user dist/splicecraft-X.Y.Z-*.whl    # install + run the published wheel
 ```
 
 ## Documentation freeze
 
-- [ ] `CHANGELOG.md` 1.0.0.0 section reads as a "what's in 1.0" overview,
-      not just the delta from 0.5.x
+- [ ] `CHANGELOG.md` section for the release reads as a coherent
+      "what's in this release" overview
 - [ ] `README.md` screenshot is current (status field, weak-primer ⚠,
       Plasmidsaurus modal)
 - [ ] `CLAUDE.md` line-count + persisted-settings list are up to date
@@ -88,8 +87,8 @@ pip install --user dist/splicecraft-1.0.0.0-*.whl  # install + run the wheel
 
 ## Agent-API surface — sanity checks
 
-The agent surface grew from 27 to 37 endpoints in the 1.0 polish pass.
-Smoke them once on a real running server (not just pytest):
+The agent surface is now 60+ endpoints. Smoke a representative
+slice on a real running server (not just pytest):
 
 - `POST /list-plasmid-statuses` — vocabulary discovery
 - `POST /set-plasmid-status` `{name, status}` — round-trip a workflow tag

@@ -2672,6 +2672,14 @@ class TestSearchInputWidget:
             await pilot.pause()
             inp = app.query_one("#harness-search", sc._SearchInput)
             inp.value = "queued"
+            # Setting `value` posts an `Input.Changed` message;
+            # `on_input_changed` (where the timer is set) runs on
+            # the next event loop tick. Without this pause the
+            # assertion below races the dispatcher under heavy
+            # xdist load — the test flaked once on 2026-05-14
+            # during release.py. Pause keeps the assertion
+            # deterministic regardless of load.
+            await pilot.pause()
             assert inp._filter_timer is not None
         # `app.run_test` exits → on_unmount fires → timer cancelled.
         # Extra wait past the original 0.20 s window — if the

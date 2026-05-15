@@ -184,7 +184,14 @@ Press `?` once running for the full keyboard-shortcut reference.
   matching the released fragment's overhangs against the grammar's
   position table — register an externally-domesticated part without
   manually picking grammar / position.
-- **Constructor** — assembly UI for chaining L0 parts into a TU.
+- **Constructor** — multi-tab assembly UI: Traditional restriction
+  cloning, Golden Braid / MoClo Type IIS assembly, and **Gibson
+  assembly**. The Gibson tab stages N linear fragments, detects the
+  longest exact-match overlap at every junction (incl. the wrap
+  junction for circular topology), validates against a configurable
+  minimum, and produces a single assembled product with each overlap
+  appearing once. Reverse-orientation fragments surface a "did you
+  mean to flip" hint instead of silently failing.
 - **Traditional cloning** — restriction-digest + ligation simulator
   with three insert sources (current plasmid, library entry, free-form
   PCR product). 2-enzyme directional cuts produce both forward and
@@ -273,10 +280,37 @@ Press `?` once running for the full keyboard-shortcut reference.
 ### Drive it from outside the GUI
 - **Agent API** (`splicecraft --agent-api`) exposes a localhost JSON
   API with bearer-token auth, covering every GUI action external AI
-  agents need: get / set sequence, list features, add / update / delete
-  features, export GenBank / FASTA, list library / collections, scan
-  restriction sites, look up codon tables, optimize protein sequences,
-  load files (chromosome-scale safe via the path-based loader).
+  agents need. Sixty-plus endpoints across:
+  - **Records** — get / set sequence, add / update / delete features,
+    list features, find ORFs, transfer annotations.
+  - **Files** — load (chromosome-scale safe via the path-based
+    loader), export GenBank / GFF3 / FASTA (symlink-guarded), bulk
+    import a folder.
+  - **Library + collections** — list, search across collections,
+    delete entries, create / rename / delete collections, set the
+    active collection, list / set plasmid statuses.
+  - **Parts** — list-parts, get-part, delete-part, classify-part
+    (overhang-pair lookup against every grammar).
+  - **Design** — gibson-assemble, simulate-gibson, design-mutagenesis,
+    design-gb-part (Golden Braid / MoClo), design-primers (generic
+    Primer3 detection or restriction cloning).
+  - **Alignment** — diff-plasmid (circular rotation auto-detected),
+    list-plasmidsaurus-members, align-plasmidsaurus-zip.
+  - **History** — get-history returns the parsed `<HistoryTree>`
+    lineage as nested JSON.
+  - **Codon tables** — list, add (Kazusa fetch or raw dict),
+    delete.
+  - **Search** — blast, hmmscan.
+  - **Data safety** — list-backups, restore-backup,
+    list-pre-update-snapshots, restore-pre-update-snapshot.
+  - **Settings** — get-settings, set-setting (allowlisted toggles).
+  - **Utility** — check-primer-duplicates, capture-snapshot (writes
+    a Markdown UI snapshot for bug reports), entry-vector CRUD.
+
+  All write endpoints require the bearer token; all reads are
+  unauthenticated to keep scripted introspection ergonomic. Inputs
+  are length-, range-, and shape-validated at the boundary; paths
+  that would write through symlinks are refused.
 - **`splicecraft-cli`** — stdlib-only sidecar (~50 ms cold start) that
   reads connection details from `~/.local/share/splicecraft/agent_token`
   and drives the running GUI. Intended for Claude Code, Cursor, aider,
@@ -379,7 +413,11 @@ can drag-select a key combo to copy it).
 | `Ctrl+Shift+Z` / `Ctrl+Y` | Redo                              |
 | `Ctrl+C`       | Copy selection (top strand 5'→3', or AA when CDS highlighted) |
 | `Alt+C`        | Copy selection (bottom strand, reverse-complement) |
-| `Alt+D`        | Toggle hover-status diagnostic row           |
+| `F1` – `F4`    | Focus mode: library / map / features / sequence |
+| `F5`           | Restore all panels (split-window layout)     |
+| `F6` / `Ctrl+H` | Construction-history viewer (full-screen)   |
+| `Alt+D`        | Capture UI snapshot to `<DATA_DIR>/ui_snapshots/` (bug-report attach) |
+| `Alt+Shift+D`  | Toggle hover-status diagnostic row           |
 | `?`            | Help modal                                   |
 | `Ctrl+Q`       | Quit                                         |
 
@@ -402,15 +440,17 @@ can drag-select a key combo to copy it).
 
 | Menu        | Items                                                                            |
 |-------------|----------------------------------------------------------------------------------|
-| File        | Open · Fetch from NCBI · New Plasmid · Add to Library · Save · Export GenBank · Collections · Quit |
-| Edit        | Edit Sequence · Undo · Redo · Add Feature · Capture → feat-lib · Delete Feature  |
-| Enzymes     | Show RE sites · Unique cutters · 6+/4+ bp sites · Connectors                     |
+| File        | Open · Fetch from NCBI · New Plasmid · Add to Library · Save · Export GenBank / GFF3 / FASTA · Align sequencing run (Plasmidsaurus) · Bulk import folder · Restore from backup · Quit |
+| Settings    | Persisted toggles (RE overlay, primer binding length, custom enzyme list, …)     |
+| Edit        | Edit Sequence · Undo · Redo · Add Feature · Capture → feat-lib · Delete Feature · Find plasmid… |
+| Enzymes     | Show RE sites · Unique cutters · 6+/4+ bp sites · Connectors · Edit custom enzyme list… |
 | Features    | Feature Library workbench                                                        |
 | Primers     | Full-screen Primer Design workbench                                              |
 | Mutagenize  | SOE-PCR site-directed mutagenesis designer (4-source CDS picker)                 |
-| Parts       | Parts Bin (per-grammar)                                                          |
-| Constructor | Assembly Constructor for TU building                                             |
-| BLAST       | BLAST / HMMscan modal                                                            |
+| Parts       | Parts Bin (per-grammar; multi-bin via Parts Bin collections)                     |
+| Constructor | Traditional cloning · Gibson assembly · Golden Braid / MoClo / custom grammar assembly |
+| History     | Construction-history viewer (`<HistoryTree>` for the loaded plasmid)             |
+| BLAST       | BLAST / HMMscan modal (Ctrl+B)                                                   |
 
 ---
 
@@ -419,19 +459,25 @@ can drag-select a key combo to copy it).
 All user data persists as human-readable JSON in the user data
 directory; every save is atomic and writes a `.bak` first.
 
-| File                       | Purpose                                                  |
-|----------------------------|----------------------------------------------------------|
-| `collections.json`         | Named collections of plasmids — source of truth          |
-| `plasmid_library.json`     | Live mirror of the active collection's plasmids          |
-| `parts_bin.json`           | User-domesticated cloning parts                          |
-| `primers.json`             | Designed primer library                                  |
-| `features.json`            | Reusable feature snippets                                |
-| `feature_colors.json`      | Per-type feature color overrides                         |
-| `codon_tables.json`        | Cached codon-usage tables fetched from Kazusa            |
-| `cloning_grammars.json`    | User-defined cloning grammars (Golden Braid / MoClo / custom) |
-| `settings.json`            | App preferences (active collection, active grammar, …)   |
-| `crash_recovery/*.gb`      | Per-record crash-recovery autosaves                      |
-| `*.json.bak`               | Automatic backup — written before each save              |
+| File                            | Purpose                                                  |
+|---------------------------------|----------------------------------------------------------|
+| `collections.json`              | Named collections of plasmids — source of truth          |
+| `plasmid_library.json`          | Live mirror of the active collection's plasmids          |
+| `parts_bin.json`                | Active parts-bin's user-domesticated cloning parts       |
+| `parts_bin_collections.json`    | Named parts-bin snapshots (multi-bin storage)            |
+| `primers.json`                  | Designed primer library                                  |
+| `features.json`                 | Reusable feature snippets                                |
+| `feature_colors.json`           | Per-type feature color overrides                         |
+| `codon_tables.json`             | Cached codon-usage tables fetched from Kazusa            |
+| `cloning_grammars.json`         | User-defined cloning grammars (Golden Braid / MoClo / custom) |
+| `entry_vectors.json`            | Entry vectors bound to grammars (per `(grammar_id, role)`) |
+| `settings.json`                 | App preferences (active collection, active grammar, …)   |
+| `crash_recovery/*.gb`           | Per-record crash-recovery autosaves                      |
+| `dna_originals/*.dna`           | Sidecars for round-tripping commercial-editor .dna files |
+| `logs/splicecraft.log`          | Rotating per-session log (5 MB × 4)                      |
+| `ui_snapshots/*.md`             | Alt+D bug-report dumps                                   |
+| `snapshots/`, `*.bak.*`, `lost_entries/` | Four-layer JSON safety net (snapshots, rotating backups, shrink-guard spillover) |
+| `../splicecraft-update-backups/` | Pre-update snapshots created by `splicecraft update`     |
 
 The schema envelope (`{"_schema_version": 1, "entries": [...]}`)
 silently accepts the legacy bare-list format (pre-0.3.1) and rewrites
