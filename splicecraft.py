@@ -801,7 +801,13 @@ def _migrate_entries(entries: list,
             # default-handling at field-read time covers missing keys.
             current = next_step
             continue
+        _log_event(
+            "migration.step", label=label,
+            from_v=current, to_v=next_step,
+            n_entries=len(out),
+        )
         migrated: list = []
+        n_failed = 0
         for entry in out:
             if not isinstance(entry, dict):
                 # Non-dict entries can't be migrated; surface a
@@ -810,6 +816,7 @@ def _migrate_entries(entries: list,
                     f"{label}: dropped non-dict entry during "
                     f"v{current} → v{next_step} migration: {type(entry).__name__}"
                 )
+                n_failed += 1
                 continue
             try:
                 # Migrators MUST return a fresh dict; we don't deep-
@@ -821,12 +828,24 @@ def _migrate_entries(entries: list,
                     f"{label}: v{current} → v{next_step} migration "
                     f"failed for entry: {exc}"
                 )
+                _log_event(
+                    "migration.failed", label=label,
+                    from_v=current, to_v=next_step,
+                    exc_type=type(exc).__name__,
+                )
+                n_failed += 1
                 # Keep the entry as-is rather than drop it; better to
                 # surface a v1-shaped entry in a v2 list than to lose
                 # the user's data outright.
                 migrated.append(entry)
         out = migrated
         current = next_step
+        if n_failed > 0:
+            _log_event(
+                "migration.step.done", label=label,
+                to_v=next_step, n_entries=len(out),
+                n_failed=n_failed,
+            )
     return out, warnings
 
 
@@ -2836,6 +2855,7 @@ def _build_system_info() -> dict:
     return info
 
 
+@_timed("op.diagnostic_bundle")
 def _create_diagnostic_bundle(out_path: "Path | None" = None) -> Path:
     """Pack logs + UI snapshots + sanitized settings + system info
     into a single ZIP. Returns the path to the saved bundle.
@@ -3282,6 +3302,26 @@ def _typed_clone(obj: _TC) -> _TC:
 
 
 _LIBRARY_FILE = _DATA_DIR / "plasmid_library.json"
+# Module-level lock that every `_save_*` JSON helper grabs around its
+# disk-write + cache-reassignment pair. Without this, two concurrent
+# saves (UI thread + a worker doing its own `_save_*`) could land
+# their `os.replace` calls on disk in order A → B while their cache
+# reassignments land in order B → A — leaving `_<label>_cache` pointing
+# at older state than what's on disk, so the next `_load_*` returns
+# stale data. The disk write alone is atomic (POSIX rename), the
+# Python assignment alone is atomic (GIL), but the *pair* is not.
+#
+# RLock rather than Lock because save chains nest: `_save_library`
+# triggers `_sync_active_collection_plasmids`, which in the synchronous
+# path runs `_save_collections` — both want the same lock. Re-entry on
+# the same thread is a no-op; re-entry from a different thread waits.
+#
+# Sweep #6 fix (CLAUDE.md §46) — pairs with sweep #5's invariant
+# #17 deep-clone-on-both-sides guarantee. Cache reads do NOT acquire
+# this lock; the GIL plus `_typed_clone` on the return value already
+# protect callers from observing a partially-updated cache.
+_cache_lock = threading.RLock()
+
 _library_cache: "list | None" = None
 
 def _load_library() -> list[dict]:
@@ -3311,13 +3351,14 @@ def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
     read back collection state right after save (Constructor's
     cascade-into-active-collection, tests) keep working unchanged."""
     global _library_cache
-    _safe_save_json(_LIBRARY_FILE, entries, "Plasmid library")
-    # Deep-copy the post-save state into the cache so the cache is
-    # independent of the caller's reference. Without this, a caller
-    # that keeps editing `entries` after `_save_library` returns would
-    # poison the in-memory cache with their staged-but-not-yet-saved
-    # mutations — and the next `_load_library` would surface them.
-    _library_cache = _typed_clone(entries)
+    with _cache_lock:
+        _safe_save_json(_LIBRARY_FILE, entries, "Plasmid library")
+        # Deep-copy the post-save state into the cache so the cache is
+        # independent of the caller's reference. Without this, a caller
+        # that keeps editing `entries` after `_save_library` returns would
+        # poison the in-memory cache with their staged-but-not-yet-saved
+        # mutations — and the next `_load_library` would surface them.
+        _library_cache = _typed_clone(entries)
     # Invalidate the primer-usage cache: every library write potentially
     # changes the set of plasmids whose `primer_bind` features are
     # counted by `_index_primer_usage_in_collections`. The cache is
@@ -3366,8 +3407,9 @@ def _load_collections() -> list[dict]:
 
 def _save_collections(entries: list[dict]) -> None:
     global _collections_cache
-    _safe_save_json(_COLLECTIONS_FILE, entries, "Plasmid collections")
-    _collections_cache = _typed_clone(entries)
+    with _cache_lock:
+        _safe_save_json(_COLLECTIONS_FILE, entries, "Plasmid collections")
+        _collections_cache = _typed_clone(entries)
     # Invalidate any cached BLAST databases so a freshly-renamed /
     # deleted / edited collection doesn't keep returning hits from the
     # old contents. The engine helpers are defined later in this file,
@@ -3399,7 +3441,11 @@ def _get_active_collection_name() -> "str | None":
 
 def _set_active_collection_name(name: "str | None") -> None:
     """Persist (or clear) the active-collection pointer."""
-    _set_setting("active_collection", name or "")
+    prev = _get_active_collection_name()
+    target = name or ""
+    if prev != target:
+        _log_event("collection.switched", prev=prev or "", new=target)
+    _set_setting("active_collection", target)
 
 
 def _find_collection(name: str) -> "dict | None":
@@ -4891,6 +4937,7 @@ def _excise_fragment_pair(seq: str, enzyme_names: list[str], *,
     return fragments, None
 
 
+@_timed("op.simulate_traditional_cloning")
 def _simulate_traditional_cloning(insert_frag: dict,
                                     vector_frag: dict,
                                    ) -> dict:
@@ -7383,6 +7430,11 @@ def fetch_genbank(accession: str, email: str = "splicecraft@local"):
                         "NCBI fetch attempt 1 failed for %r (%s); retrying",
                         accession, exc,
                     )
+                    _log_event(
+                        "net.retry", endpoint="ncbi",
+                        accession=accession, attempt=1,
+                        exc_type=type(exc).__name__,
+                    )
                     _time.sleep(0.25)
                     continue
                 # Both attempts failed — re-raise so the caller's
@@ -7441,6 +7493,7 @@ def _detect_plasmid_format(path: str) -> str:
     return "genbank"
 
 
+@_timed("op.load_genbank")
 def load_genbank(path: str):
     """Load a plasmid file (GenBank .gb/.gbk or .dna). Returns
     SeqRecord.
@@ -7923,6 +7976,7 @@ def _commercialsaas_iter_location_parts(location):
         yield location
 
 
+@_timed("op.write_commercialsaas_dna")
 def _write_commercialsaas_dna_bytes(record, *,
                                  history_xml: "str | None" = None) -> bytes:
     """Return a complete `.dna` byte stream from a SeqRecord.
@@ -8437,6 +8491,7 @@ def _augment_dna_record_from_packets(
     return merged
 
 
+@_timed("op.parse_commercialsaas_history")
 def _parse_commercialsaas_history(xml_text: str) -> "_CommercialSaaSHistoryNode | None":
     """Parse `<HistoryTree>` XML into a node tree. Returns the root
     `<Node>` (the result plasmid) or ``None`` if the XML is empty /
@@ -8575,6 +8630,7 @@ def _try_extract_history_xml_from_dna_path(path: Path) -> "str | None":
         return None
 
 
+@_timed("op.bulk_import_folder")
 def _bulk_import_folder(
     folder: Path,
     *,
@@ -8768,8 +8824,25 @@ def _record_to_gb_text(record) -> str:
     SeqIO.write(rec, buf, "genbank")
     return buf.getvalue()
 
+_GB_TEXT_MAX_BYTES = 64 * 1024 * 1024
+
+
 def _gb_text_to_record(text: str):
-    """Parse GenBank format text back to a SeqRecord."""
+    """Parse GenBank format text back to a SeqRecord.
+
+    Defence-in-depth: cap input length at 64 MB before handing to
+    BioPython's parser. Library entries are gated through
+    `_safe_load_json`'s 1 GB cap and zip extracts through the 50 MB
+    member cap, but the GenBank parser itself is unbounded internally;
+    a single record line that happens to slip past upstream caps would
+    otherwise allocate intermediate parser objects without ceiling.
+    """
+    if len(text) > _GB_TEXT_MAX_BYTES:
+        raise ValueError(
+            f"GenBank text too large to parse "
+            f"({len(text):,} bytes > "
+            f"{_GB_TEXT_MAX_BYTES:,} cap)"
+        )
     from Bio import SeqIO
     return SeqIO.read(StringIO(text), "genbank")
 
@@ -17238,6 +17311,10 @@ def _fetch_latest_pypi_version(timeout: float = _UPDATE_CHECK_TIMEOUT_S
             last_exc = exc
             if attempt == 0:
                 _log.debug("PyPI fetch attempt 1 failed (%s); retrying", exc)
+                _log_event(
+                    "net.retry", endpoint="pypi",
+                    attempt=1, exc_type=type(exc).__name__,
+                )
                 _time.sleep(0.25)
                 continue
             # Both attempts failed — fall through to the error path.
@@ -17934,6 +18011,7 @@ def _enforce_pre_update_retention(backup_dir: Path,
         _log.warning("Pre-update retention sweep failed: %s", exc)
 
 
+@_timed("op.create_pre_update_snapshot")
 def _create_pre_update_snapshot(version_from: str,
                                  *,
                                  backup_dir: "Path | None" = None,
@@ -18177,6 +18255,7 @@ def _validate_snapshot_member(snap_path: Path, name: str) -> "Path | None":
     return candidate
 
 
+@_timed("op.restore_pre_update_snapshot")
 def _restore_pre_update_snapshot(snap_id_or_path: "str | Path",
                                   *,
                                   backup_dir: "Path | None" = None,
@@ -21873,6 +21952,7 @@ def _assembly_fragment_from_source(
     return result
 
 
+@_timed("op.clone_assembly_into_entry_vector")
 def _clone_assembly_into_entry_vector(
     sources: list[dict],
     entry_vector: dict,
@@ -22666,8 +22746,9 @@ def _load_custom_grammars() -> list[dict]:
 
 def _save_custom_grammars(entries: list[dict]) -> None:
     global _grammars_cache
-    _safe_save_json(_GRAMMARS_FILE, entries, "Cloning grammars")
-    _grammars_cache = _typed_clone(entries)
+    with _cache_lock:
+        _safe_save_json(_GRAMMARS_FILE, entries, "Cloning grammars")
+        _grammars_cache = _typed_clone(entries)
     # Invalidate the assembly-fragment digest cache: a grammar enzyme
     # / level_up_enzyme change shifts which fragment a TU/MOD
     # releases, so the cached overhangs from the previous grammar
@@ -22750,8 +22831,9 @@ def _load_entry_vectors() -> list[dict]:
 
 def _save_entry_vectors(entries: list[dict]) -> None:
     global _entry_vectors_cache
-    _safe_save_json(_ENTRY_VECTORS_FILE, entries, "Entry vectors")
-    _entry_vectors_cache = _typed_clone(entries)
+    with _cache_lock:
+        _safe_save_json(_ENTRY_VECTORS_FILE, entries, "Entry vectors")
+        _entry_vectors_cache = _typed_clone(entries)
     # Drop the digest cache built around the previous EV list — old
     # entries hanging on after a reconfigure waste cache slots and,
     # for users who rotate vectors often (testing custom grammars),
@@ -23625,8 +23707,9 @@ def _save_settings(settings: dict) -> None:
     and defers the disk write to a background thread."""
     global _settings_cache
     entries = [{"key": k, "value": v} for k, v in settings.items()]
-    _safe_save_json(_SETTINGS_FILE, entries, "Settings")
-    _settings_cache = _typed_clone(settings)
+    with _cache_lock:
+        _safe_save_json(_SETTINGS_FILE, entries, "Settings")
+        _settings_cache = _typed_clone(settings)
 
 
 def _get_setting(key: str, default: "_Any" = None) -> "_Any":
@@ -23706,6 +23789,15 @@ def _set_setting(key: str, value) -> None:
     if prev != value:
         _log.info("setting changed: %s = %r (was %r)",
                     key, _repr_for_log(value), _repr_for_log(prev))
+        # Structured counterpart so AI parsers of bug-report logs can
+        # filter by setting key without regex-scraping the human-readable
+        # line above. Values are run through `_repr_for_log` to truncate
+        # over-long lists / cap any accidental sequence content.
+        _log_event(
+            "settings.changed",
+            key=key, value=_repr_for_log(value),
+            prev=_repr_for_log(prev),
+        )
     settings[key] = value
     _settings_cache = dict(settings)
     if os.environ.get("SPLICECRAFT_SKIP_SETTINGS_FLUSH", "").strip().lower() in (
@@ -24070,12 +24162,13 @@ def _load_parts_bin() -> list[dict]:
 
 def _save_parts_bin(entries: list[dict]) -> None:
     global _parts_bin_cache
-    _safe_save_json(_PARTS_BIN_FILE, entries, "Parts bin")
-    # Deep-copy on save so the cache is independent of the caller's
-    # reference — pre-fix `list(entries)` shared dict refs with the
-    # caller, so subsequent caller mutations (e.g. modal Cancel that
-    # didn't actually save) leaked back into the next `_load_parts_bin`.
-    _parts_bin_cache = _typed_clone(entries)
+    with _cache_lock:
+        _safe_save_json(_PARTS_BIN_FILE, entries, "Parts bin")
+        # Deep-copy on save so the cache is independent of the caller's
+        # reference — pre-fix `list(entries)` shared dict refs with the
+        # caller, so subsequent caller mutations (e.g. modal Cancel that
+        # didn't actually save) leaked back into the next `_load_parts_bin`.
+        _parts_bin_cache = _typed_clone(entries)
     # Invalidate the assembly-fragment digest cache: a part edit
     # (re-domestication, gb_text rewrite, deleted entry) shifts what
     # `_assembly_fragment_from_source` yields, so stale digests
@@ -24138,10 +24231,11 @@ def _save_parts_bin_collections(entries: list[dict]) -> None:
     parts identity.
     """
     global _parts_bin_collections_cache
-    _safe_save_json(
-        _PARTS_BIN_COLLECTIONS_FILE, entries, "Parts-bin collections",
-    )
-    _parts_bin_collections_cache = _typed_clone(entries)
+    with _cache_lock:
+        _safe_save_json(
+            _PARTS_BIN_COLLECTIONS_FILE, entries, "Parts-bin collections",
+        )
+        _parts_bin_collections_cache = _typed_clone(entries)
     # Same cache-invalidation hygiene as `_save_collections`: a bin
     # rename / delete / parts-list edit changes what
     # `_assembly_fragment_from_source` digests.
@@ -24670,12 +24764,13 @@ def _save_primers(entries: list[dict]) -> None:
     # `primer_bind` features — that's `_save_library`/`_save_collections`'
     # job to invalidate.
     deduped = _dedupe_primers_by_sequence(entries)
-    _safe_save_json(_PRIMERS_FILE, deduped, "Primer library")
-    # Deep-copy on save so the cache is independent of the caller's
-    # reference — pre-fix `list(entries)` shared dict refs with the
-    # caller, so subsequent caller mutations (e.g. an aborted modal)
-    # leaked back into the next `_load_primers`.
-    _primers_cache = _typed_clone(deduped)
+    with _cache_lock:
+        _safe_save_json(_PRIMERS_FILE, deduped, "Primer library")
+        # Deep-copy on save so the cache is independent of the caller's
+        # reference — pre-fix `list(entries)` shared dict refs with the
+        # caller, so subsequent caller mutations (e.g. an aborted modal)
+        # leaked back into the next `_load_primers`.
+        _primers_cache = _typed_clone(deduped)
 
 
 # ── Feature library persistence ───────────────────────────────────────────────
@@ -24816,9 +24911,10 @@ def _save_features(entries: list[dict]) -> None:
     the post-save mutations stuck in the cache.
     """
     global _features_cache, _features_generation
-    _safe_save_json(_FEATURES_FILE, entries, "Feature library")
-    _features_cache = _typed_clone(entries)
-    _features_generation += 1
+    with _cache_lock:
+        _safe_save_json(_FEATURES_FILE, entries, "Feature library")
+        _features_cache = _typed_clone(entries)
+        _features_generation += 1
 
 
 # Generation-keyed cache of the (name, feature_type) → sequence index.
@@ -24943,8 +25039,9 @@ def _save_feature_colors(mapping: dict[str, str]) -> None:
     global _feature_colors_cache
     entries = [{"feature_type": ft, "color": col}
                for ft, col in mapping.items()]
-    _safe_save_json(_FEATURE_COLORS_FILE, entries, "Feature colors")
-    _feature_colors_cache = _typed_clone(mapping)
+    with _cache_lock:
+        _safe_save_json(_FEATURE_COLORS_FILE, entries, "Feature colors")
+        _feature_colors_cache = _typed_clone(mapping)
 
 
 def _resolve_feature_color(entry: dict) -> str:
@@ -25240,8 +25337,9 @@ def _codon_tables_save(entries: list[dict]) -> None:
         "added":  e.get("added", ""),
         "raw":    _codon_raw_to_json(e.get("raw", {})),
     } for e in entries]
-    _safe_save_json(_CODON_TABLES_FILE, serializable, "Codon table library")
-    _codon_tables_cache = _typed_clone(entries)
+    with _cache_lock:
+        _safe_save_json(_CODON_TABLES_FILE, serializable, "Codon table library")
+        _codon_tables_cache = _typed_clone(entries)
 
 
 def _codon_tables_add(name: str, taxid: str, raw: dict,
@@ -43463,6 +43561,14 @@ class PrimerDesignScreen(Screen):
         opens are instant (invalidated on `_save_library` /
         `_save_collections`). Toast surfaces on the FIRST fresh scan
         per session so the user knows it's running.
+
+        Captures the active-collection name at dispatch and passes it
+        to the callback. If the user switches collections mid-scan,
+        the index would otherwise be for the OLD library's contents
+        but land in the NEW collection's `_primer_usage_index` — making
+        every "Used" count read wrong until the next save invalidates
+        the module-level cache. Mirrors the stale-record-counter
+        pattern (CLAUDE.md invariant #28) but for the collection axis.
         """
         # Check cache state BEFORE the call so we know whether this
         # is a fresh scan worth toasting about. Cache-hit returns
@@ -43474,7 +43580,11 @@ class PrimerDesignScreen(Screen):
                 "Indexing primer usage across collections…",
                 timeout=4,
             )
-        _log.info("primer-usage worker: scan starting (fresh=%s)", fresh)
+        coll_at_entry = _get_active_collection_name()
+        _log.info(
+            "primer-usage worker: scan starting (fresh=%s, coll=%r)",
+            fresh, coll_at_entry,
+        )
         try:
             usage = _index_primer_usage_in_collections()
         except Exception:
@@ -43483,20 +43593,32 @@ class PrimerDesignScreen(Screen):
         _log.info("primer-usage worker: scan done, %d sequences", len(usage))
         try:
             self.app.call_from_thread(
-                self._on_primer_usage_indexed, usage
+                self._on_primer_usage_indexed, usage, coll_at_entry,
             )
         except Exception:
             _log.exception(
                 "primer-usage worker: callback dispatch failed"
             )
 
-    def _on_primer_usage_indexed(self, usage: "dict[str, int]") -> None:
+    def _on_primer_usage_indexed(self, usage: "dict[str, int]",
+                                   coll_at_entry: "str | None" = None,
+                                   ) -> None:
         """UI-thread callback for `_index_usage_worker`. Stores the
         index and refreshes the table so the "Used" column flips
-        from "…" placeholders to real counts."""
+        from "…" placeholders to real counts. Drops the result if the
+        active collection switched mid-scan — the index is then for
+        the wrong dataset and applying it would surface stale counts."""
         if not self.is_mounted:
             _log.info(
                 "primer-usage callback: screen unmounted, dropping result"
+            )
+            return
+        coll_now = _get_active_collection_name()
+        if coll_at_entry is not None and coll_now != coll_at_entry:
+            _log.info(
+                "primer-usage callback: collection switched %r → %r "
+                "mid-scan, dropping stale index",
+                coll_at_entry, coll_now,
             )
             return
         self._primer_usage_index = usage
@@ -50439,7 +50561,13 @@ def _h_capture_snapshot(app, payload):
         except OSError as exc:
             _log.exception("agent capture-snapshot: write failed")
             return ({"error": f"snapshot write failed: {exc}"}, 500)
-        except Exception as exc:
+        except (ValueError, AttributeError, TypeError) as exc:
+            # `_collect_ui_snapshot` is defensive (returns empty fields
+            # rather than raising on missing widgets) but a future
+            # snapshot field that touches a not-yet-mounted widget
+            # could still raise. Narrowed from base `Exception` so a
+            # genuine bug (e.g. KeyboardInterrupt during shutdown)
+            # propagates rather than being silently mapped to 500.
             _log.exception("agent capture-snapshot: collect failed")
             return ({"error": f"snapshot collect failed: {exc}"}, 500)
     result = app.call_from_thread(_apply)
@@ -55378,17 +55506,19 @@ SpeciesPickerModal { align: center middle; }
         def _on_picked(picked_ids):
             if not picked_ids or self._current_record is None:
                 return
-            q_len = _seq_len(self._current_record)
-            # Resolve + size-check each target on the UI thread so we
-            # can surface friendly errors before the worker starts.
-            # The worker only sees pre-validated SeqRecords.
-            targets: "list[tuple[str, object]]" = []
+            # Resolve entries (fast — dict lookups) on the UI thread,
+            # but DEFER GenBank parsing to the worker. Selecting 10
+            # multi-Mb targets used to block the UI for several seconds
+            # before the worker even started because `_gb_text_to_record`
+            # ran synchronously per target. Per-target gb_text payloads
+            # are passed through; the worker parses + size-checks +
+            # surfaces per-target warnings via call_from_thread.
+            raw_targets: "list[tuple[str, str]]" = []
+            library = _load_library()
             for entry_id in picked_ids:
-                target_entry = None
-                for e in _load_library():
-                    if e.get("id") == entry_id:
-                        target_entry = e
-                        break
+                target_entry = next(
+                    (e for e in library if e.get("id") == entry_id), None,
+                )
                 if target_entry is None:
                     self.notify(
                         f"Library entry {entry_id!r} not found — skipping.",
@@ -55402,35 +55532,16 @@ SpeciesPickerModal { align: center middle; }
                         severity="warning", timeout=3,
                     )
                     continue
-                try:
-                    target_record = _gb_text_to_record(gb_text)
-                except Exception as exc:
-                    _log.exception(
-                        "Multi-align target parse failed for %r", entry_id,
-                    )
-                    self.notify(
-                        f"Could not parse {entry_id!r}: {exc}",
-                        severity="error", timeout=4,
-                    )
-                    continue
-                t_len = len(target_record.seq)
-                if max(q_len, t_len) > _PAIRWISE_MAX_LEN:
-                    self.notify(
-                        f"{entry_id!r} too long for pairwise align "
-                        f"(cap {_PAIRWISE_MAX_LEN:,} bp).",
-                        severity="warning", timeout=4,
-                    )
-                    continue
-                targets.append((entry_id, target_record))
-            if not targets:
+                raw_targets.append((entry_id, gb_text))
+            if not raw_targets:
                 return
             assert self._current_record is not None  # narrowed by early-return above
             self.notify(
-                f"Aligning {len(targets)} target(s) against "
+                f"Aligning {len(raw_targets)} target(s) against "
                 f"{self._current_record.name}…",
                 timeout=4,
             )
-            self._multi_align_worker(self._current_record, targets)
+            self._multi_align_worker(self._current_record, raw_targets)
 
         self.push_screen(
             MultiAlignPickerModal(current_id=current_id),
@@ -55462,12 +55573,13 @@ SpeciesPickerModal { align: center middle; }
         entry_counter = self._record_load_counter
         gen_at_entry  = self._alignments_generation
         q_seq  = str(query_record.seq)
+        q_len  = len(q_seq)
         q_name = (
             query_record.name or query_record.id or "query"
         )
         successes = 0
         failures  = 0
-        for entry_id, target_record in targets:
+        for entry_id, target_payload in targets:
             if self._record_load_counter != entry_counter:
                 self.call_from_thread(
                     self.notify,
@@ -55482,13 +55594,41 @@ SpeciesPickerModal { align: center middle; }
                     severity="warning", timeout=4,
                 )
                 return
+            # `target_payload` is either a pre-parsed SeqRecord (legacy
+            # callers) or a raw GenBank text string (new path). Parsing
+            # off the UI thread lets a 10-target multi-Mb pick proceed
+            # without freezing the picker on dismiss.
+            if isinstance(target_payload, str):
+                try:
+                    target_record = _gb_text_to_record(target_payload)
+                except Exception as exc:
+                    _log.exception(
+                        "Multi-align target parse failed for %r", entry_id,
+                    )
+                    self.call_from_thread(
+                        self.notify,
+                        f"Could not parse {entry_id!r}: {exc}",
+                        severity="error", timeout=4,
+                    )
+                    failures += 1
+                    continue
+            else:
+                target_record = target_payload
+            t_seq = str(target_record.seq)
+            if max(q_len, len(t_seq)) > _PAIRWISE_MAX_LEN:
+                self.call_from_thread(
+                    self.notify,
+                    f"{entry_id!r} too long for pairwise align "
+                    f"(cap {_PAIRWISE_MAX_LEN:,} bp).",
+                    severity="warning", timeout=4,
+                )
+                failures += 1
+                continue
             t_name = (
                 target_record.name or target_record.id or entry_id
             )
             try:
-                result = _pairwise_align(
-                    q_seq, str(target_record.seq), mode="global",
-                )
+                result = _pairwise_align(q_seq, t_seq, mode="global")
             except Exception as exc:
                 _log.exception(
                     "Multi-align: %r failed (%s)", entry_id, exc,

@@ -2,6 +2,110 @@
 
 ---
 
+## [0.8.10] — 2026-05-15 — sweep #6 · deferred items · bioconda lint
+
+Closes out the items deferred from sweep #5 + adds regression tests +
+clears the bioconda lint blockers from PR #65440 so the recipe is
+mergeable. CLAUDE.md invariant #46 documents the sweep. 2,457 tests
+pass (up from 2,436; +21 new regression tests).
+
+### Regression tests for sweep #5 safety paths
+
+New `tests/test_sweep5.py` (21 cases) locks in the data-integrity
+fixes a future refactor could quietly regress:
+
+* Sidecar case-collision discrimination + legacy-path migration +
+  path-length cap (T1a)
+* `.bak` recovery atomicity (T1b) — verifies `_atomic_write_bytes`
+  is the recovery path, not `shutil.copy2`
+* SHA-256 mandatory on pre-update restore (T1c) — both refuse and
+  accept paths
+* Pre-update manifest size cap (T1d)
+* Backup-prune glob matches collision-bumped `.bak.<ts>.<N>` files
+  (T1f)
+* `_safe_save_json` symlink refusal (T1g)
+* `_load_dna_original` size cap (T1j)
+* Orphan tempfile sweep (T1k) — old removed, recent kept, user files
+  with `.tmp` substring left alone
+
+### Cross-thread cache-reassignment lock
+
+New module-level `_cache_lock` (RLock) wraps every `_save_*` JSON
+helper's disk-write + cache-reassignment pair. Without it, two
+concurrent saves could land their `os.replace` calls on disk in
+order A → B while their cache reassignments land in order B → A —
+leaving `_<label>_cache` pointing at older state than what's on
+disk. Applied to 11 helpers: `_save_library`, `_save_collections`,
+`_save_custom_grammars`, `_save_entry_vectors`, `_save_settings`,
+`_save_parts_bin`, `_save_parts_bin_collections`, `_save_primers`,
+`_save_features`, `_save_feature_colors`, `_codon_tables_save`.
+Reads don't take the lock — `_typed_clone`-on-return plus the GIL
+already protect callers from partial states.
+
+### Stale-collection guard on `_index_usage_worker`
+
+PrimerDesignScreen's primer-usage indexer now captures the active
+collection name at dispatch and refuses-on-apply if it switched
+mid-scan. Pre-fix, a scan running against the OLD library's
+contents at the moment of switch would land its result in the NEW
+collection's `_primer_usage_index`, surfacing wrong counts until
+the next save invalidated the cache. Mirrors the
+`_record_load_counter` pattern (CLAUDE.md invariant #28) along the
+collection axis.
+
+### MultiAlignPickerModal off-thread parse
+
+`action_open_align_picker._on_picked` no longer parses GenBank
+synchronously on the UI thread. Selecting 10 multi-Mb targets used
+to block the picker for several seconds before the worker even
+started. Now the worker receives `(entry_id, gb_text)` tuples and
+parses + size-checks each off-thread, surfacing per-target warnings
+via `call_from_thread`.
+
+### Observability: heavy-op timing + state-transition + net-retry events
+
+* `@_timed` added to 9 heavy ops (load_genbank, simulate_traditional_cloning,
+  write_commercialsaas_dna_bytes, parse_commercialsaas_history,
+  bulk_import_folder, create/restore_pre_update_snapshot,
+  clone_assembly_into_entry_vector, create_diagnostic_bundle).
+* `_set_active_collection_name` emits `collection.switched`.
+* `_set_setting` emits structured `settings.changed` (covers
+  active_grammar / active_parts_bin switches via the key=).
+* `_migrate_entries` emits `migration.step` / `migration.step.done`
+  / `migration.failed`.
+* Network retries (NCBI + PyPI) emit `net.retry` events with
+  endpoint, attempt, and exception class.
+
+### Defence-in-depth
+
+* `_gb_text_to_record` caps input at 64 MB before handing to
+  BioPython's GenBank parser. Library entries are already gated via
+  `_safe_load_json`'s 1 GB cap and zip extracts via the 50 MB member
+  cap, but the parser itself was internally unbounded.
+* `_h_capture_snapshot._apply` narrows the broad `except Exception`
+  to `(ValueError, AttributeError, TypeError)` so a genuine bug (or
+  KeyboardInterrupt during shutdown) propagates rather than being
+  mapped to a generic 500.
+
+### Bioconda recipe — pre-merge lint fixes
+
+PR #65440 (the 0.8.9 first-submission) was rejected by the bot for
+two recipe issues; both fixed here:
+
+* `run_exports` added under `build:` with `max_pin="x.x"` (0.x.y
+  semver permits breaks between minor releases, so downstreams must
+  pin to the same minor to stay compatible). Bumps to ≥1.0.0 should
+  relax this to `max_pin="x"`.
+* `about.summary` trimmed to a short title; the long description
+  moved into `about.description`. Matches bioconda's contributor
+  policy where summary acts as a title in listings.
+
+`./release.py` re-runs `_sync_conda_recipe` + `_submit_bioconda_pr`
+automatically for 0.8.10, so the bot will see the fixes on the new
+PR; the 0.8.9 PR can be closed once 0.8.10's is verified green.
+
+---
+
 ## [0.8.9] — 2026-05-15 — adversarial audit sweep #5 · data integrity first
 
 Seven-surface parallel audit on top of sweep #4, with **data integrity

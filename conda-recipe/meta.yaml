@@ -25,6 +25,12 @@ source:
 build:
   noarch: python
   number: 0
+  # `max_pin="x.x"` because SpliceCraft is on 0.x.y — semver permits
+  # breaking changes between 0.minor releases, so downstreams must
+  # pin to the same minor to stay compatible. Bumps to >=1.0.0 should
+  # relax this to `max_pin="x"`.
+  run_exports:
+    - {{ pin_subpackage('splicecraft', max_pin="x.x") }}
   script: {{ PYTHON }} -m pip install . --no-deps --no-build-isolation -vv
   entry_points:
     - splicecraft     = splicecraft:main
@@ -57,19 +63,24 @@ about:
   license: MIT
   license_family: MIT
   license_file: LICENSE
-  summary: Terminal-based plasmid workbench — map viewer, sequence editor, primer / mutagenesis / Golden Braid + MoClo cloning, in-process BLAST + HMMscan
+  summary: Terminal plasmid workbench (map viewer, sequence editor, cloning)
   description: |
-    SpliceCraft is a terminal-native plasmid workbench built for daily lab
-    work. It renders circular and linear maps via Unicode braille graphics,
-    edits sequence with full undo / redo, designs primers (detection,
-    cloning, Golden Braid L0, generic) via Primer3, runs SOE-PCR
-    site-directed mutagenesis on any CDS, manages a collection-driven
-    plasmid library with atomic writes and on-disk backups, and provides
-    in-process similarity search (BLASTN / BLASTP / HMMscan) via pyhmmer
-    against the user's plasmid collections — no external blast+ install.
-    Local .gb / .gbk and .dna files (popular commercial plasmid editor
-    format) load directly; bulk-import an archive into a new collection
-    from the panel.
+    SpliceCraft is a terminal-native plasmid workbench built for daily
+    lab work. Renders circular and linear maps via Unicode braille
+    graphics, edits sequence with full undo / redo, designs primers
+    (detection, cloning, Golden Braid L0, generic) via Primer3, runs
+    SOE-PCR site-directed mutagenesis on any CDS.
+
+    Manages a collection-driven plasmid library with atomic writes and
+    on-disk backups (four-tier safety net: legacy `.bak`, timestamped
+    rotation, daily snapshots, shrink-guard spillover). Provides
+    in-process similarity search (BLASTN / BLASTP / HMMscan) via
+    pyhmmer against the user's plasmid collections — no external
+    blast+ install required.
+
+    Local `.gb` / `.gbk` and `.dna` files (popular commercial plasmid
+    editor format) load directly; bulk-import an archive into a new
+    collection from the panel.
   dev_url: https://github.com/Binomica-Labs/SpliceCraft
   doc_url: https://github.com/Binomica-Labs/SpliceCraft
 
