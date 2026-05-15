@@ -59,15 +59,32 @@ def _token_file() -> Path:
     return _data_dir() / TOKEN_FILENAME
 
 
+_CLI_TOKEN_FILE_MAX_BYTES = 1024
+
+
 def _read_session() -> tuple[str, int, str]:
     """Return `(host, port, token)` from the running session's token
-    file. Exits with a helpful message if no session is up."""
+    file. Exits with a helpful message if no session is up.
+
+    Capped at 1 KB defensively. A local-attacker-with-write or a
+    misbehaving co-resident process can fill the token file; reading
+    unbounded would let a hostile fill DoS the CLI."""
     f = _token_file()
     if not f.exists():
         sys.exit(
             f"No SpliceCraft session found.\n"
             f"  Expected token file: {f}\n"
             f"  Start the GUI with: splicecraft --agent-api"
+        )
+    try:
+        size = f.stat().st_size
+    except OSError as exc:
+        sys.exit(f"Could not stat token file {f}: {exc}")
+    if size > _CLI_TOKEN_FILE_MAX_BYTES:
+        sys.exit(
+            f"Refusing to read oversized token file {f} "
+            f"({size:,} bytes > {_CLI_TOKEN_FILE_MAX_BYTES}-byte cap). "
+            f"Restart the GUI to regenerate."
         )
     lines = f.read_text(encoding="utf-8").strip().splitlines()
     if len(lines) < 2:
@@ -80,6 +97,9 @@ def _read_session() -> tuple[str, int, str]:
     except ValueError:
         sys.exit(f"Malformed port in {f}: {lines[0]!r}")
     return DEFAULT_HOST, port, lines[1].strip()
+
+
+_CLI_RESPONSE_MAX_BYTES = 50 * 1024 * 1024
 
 
 def _request(endpoint: str, method: str = "GET",
@@ -95,7 +115,19 @@ def _request(endpoint: str, method: str = "GET",
         req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8")
+            # Cap the read size symmetric with the server's cap; a
+            # compromised / buggy server returning an unbounded stream
+            # would otherwise OOM the CLI. Read 1 byte over the cap so
+            # we can detect oversize and abort with a useful message
+            # rather than silently truncating.
+            raw = resp.read(_CLI_RESPONSE_MAX_BYTES + 1)
+            if len(raw) > _CLI_RESPONSE_MAX_BYTES:
+                sys.exit(
+                    f"Error: response from SpliceCraft exceeds "
+                    f"{_CLI_RESPONSE_MAX_BYTES:,}-byte cap "
+                    f"(endpoint={endpoint!r}). Refusing to read."
+                )
+            body = raw.decode("utf-8")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8") if exc.fp else ""
         try:

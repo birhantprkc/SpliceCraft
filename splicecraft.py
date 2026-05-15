@@ -105,8 +105,16 @@ def _migrate_legacy_data() -> None:
     """One-shot migration from Path(__file__).parent → _DATA_DIR.
     Idempotent: only copies files whose destination doesn't already exist.
     Preserves the source files (copy, not move) so a dev running from the
-    repo checkout can still use them via $SPLICECRAFT_DATA_DIR."""
-    import shutil
+    repo checkout can still use them via $SPLICECRAFT_DATA_DIR.
+
+    Each copy is atomic (tempfile + fsync + os.replace). The `.migrated`
+    marker is also atomically written. Pre-0.8.9 used a bare
+    `shutil.copy2` + `Path.write_text` pair; a crash mid-copy left a
+    partial dest, and the `not dst.exists()` guard would *skip* the
+    retry on next launch — silently locking in the corruption. Atomic
+    discipline means a crash either leaves dst untouched OR fully
+    written, with no halfway state."""
+    import shutil, tempfile, os as _os
     legacy_root = Path(__file__).parent
     if legacy_root.resolve() == _DATA_DIR.resolve():
         return   # running from the data dir itself (no migration needed)
@@ -114,19 +122,68 @@ def _migrate_legacy_data() -> None:
         "plasmid_library.json", "parts_bin.json", "primers.json",
         "plasmid_library.json.bak", "parts_bin.json.bak", "primers.json.bak",
     ]
+
+    def _atomic_copy(src: Path, dst: Path) -> None:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{dst.name}.", suffix=".migrating",
+            dir=str(dst.parent),
+        )
+        try:
+            with open(src, "rb") as fsrc, _os.fdopen(fd, "wb") as fdst:
+                shutil.copyfileobj(fsrc, fdst)
+                fdst.flush()
+                try:
+                    _os.fsync(fdst.fileno())
+                except OSError:
+                    pass
+            try:
+                shutil.copystat(str(src), tmp_name)
+            except OSError:
+                pass
+            _os.replace(tmp_name, str(dst))
+        except Exception:
+            try:
+                _os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+
+    def _atomic_marker_write(target: Path, text: str) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp",
+            dir=str(target.parent),
+        )
+        try:
+            with _os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                try:
+                    _os.fsync(f.fileno())
+                except OSError:
+                    pass
+            _os.replace(tmp_name, str(target))
+        except Exception:
+            try:
+                _os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+
     migrated = []
     for name in names:
         src = legacy_root / name
         dst = _DATA_DIR / name
         if src.exists() and not dst.exists():
             try:
-                shutil.copy2(src, dst)
+                _atomic_copy(src, dst)
                 migrated.append(name)
             except OSError:
                 pass
     if migrated:
         try:
-            (_DATA_DIR / ".migrated").write_text("\n".join(migrated))
+            _atomic_marker_write(_DATA_DIR / ".migrated", "\n".join(migrated))
         except OSError:
             pass
 
@@ -182,7 +239,16 @@ class _SessionFilter(logging.Filter):
         return True
 
 _log = logging.getLogger("splicecraft")
-_log.setLevel(logging.INFO)
+# DEBUG-level logs are off by default — bump via SPLICECRAFT_DEBUG=1
+# so a user reproducing a bug can capture cache-invalidation / retry /
+# pre-flight events that normally don't surface. Network retry events,
+# cache-clear events, and other diagnostic-only signals key off this.
+if os.environ.get("SPLICECRAFT_DEBUG", "").strip().lower() in (
+    "1", "true", "yes"
+):
+    _log.setLevel(logging.DEBUG)
+else:
+    _log.setLevel(logging.INFO)
 _log.propagate = False
 if not _log.handlers:
     try:
@@ -318,7 +384,7 @@ def _log_startup_banner() -> None:
     _log.info("=" * 60)
 
 
-def _log_event(event: str, **fields) -> None:
+def _log_event(event: str, *, _stacklevel: int = 2, **fields) -> None:
     """One-line AI-parseable structured event for diagnostic logs.
 
     Output line shape (JSON payload after the prefix):
@@ -370,7 +436,7 @@ def _log_event(event: str, **fields) -> None:
     if not _log.isEnabledFor(logging.INFO):
         return
     if not fields:
-        _log.info("event %s", event, stacklevel=2)
+        _log.info("event %s", event, stacklevel=_stacklevel)
         return
     safe: dict = {}
     for k, v in fields.items():
@@ -432,7 +498,7 @@ def _log_event(event: str, **fields) -> None:
         # Final-resort fallback for non-JSON-encodable values that
         # also slip past `_repr_for_log`. Should be unreachable.
         payload = repr(safe)[:500]
-    _log.info("event %s %s", event, payload, stacklevel=2)
+    _log.info("event %s %s", event, payload, stacklevel=_stacklevel)
 
 
 def _action_log(event_name: str):
@@ -471,7 +537,11 @@ def _action_log(event_name: str):
                         )
                         if rid:
                             ctx["rec"] = rid
-                    _log_event(event_name, **ctx)
+                    # _stacklevel=3 so the logger's funcName:lineno
+                    # points at the wrapped action method, not at this
+                    # wrapper. Without it every action shows up in the
+                    # log as "_action_log:531" — useless for tracing.
+                    _log_event(event_name, _stacklevel=3, **ctx)
                 except Exception:  # noqa: BLE001 — logging must never raise
                     pass
             return func(self, *args, **kwargs)
@@ -519,7 +589,10 @@ def _timed(path: str, threshold_ms: float = 0.0):
             finally:
                 dt_ms = (_time.perf_counter() - t0) * 1000
                 if dt_ms >= threshold_ms:
-                    _log_event("op.timed",
+                    # _stacklevel=3 so the funcName:lineno prefix
+                    # points at the wrapped function, not at this
+                    # wrapper closure.
+                    _log_event("op.timed", _stacklevel=3,
                                 path=path,
                                 elapsed_ms=round(dt_ms, 1))
         return wrapper
@@ -877,8 +950,17 @@ def _notify_save_failure(app, label: str, exc: BaseException,
 
     `app` may be `None` (test contexts that don't run an App). Falls
     back to logging only.
+
+    Emits a structured `save.failed` event so AI parsers of bug-report
+    log dumps can correlate the failure target + exception class
+    without regex-scraping the human-readable `Save failed for X` log
+    line. Sweep #5 — pre-fix, 30+ save sites went through this helper
+    silently from a structured-event perspective.
     """
     _log.exception("Save failed for %s", label)
+    _log_event("save.failed", target=label,
+                exc_type=type(exc).__name__,
+                exc_msg=str(exc))
     msg = f"{label} save failed: {exc}"
     if app is None:
         return
@@ -1028,9 +1110,43 @@ _BACKUP_RETENTION_COUNT = 10
 _LOST_ENTRIES_DIR_NAME  = "lost_entries"
 
 
+def _backup_filename_patterns(path: Path) -> "tuple[str, ...]":
+    """Glob patterns matching every timestamped backup of `path`.
+
+    Two patterns are returned and the caller is expected to union them:
+      * ``<name>.bak.????????-??????`` — the base timestamp form
+      * ``<name>.bak.????????-??????.*`` — collision-bumped variants
+        (``.bak.20260515-123456.1``, ``.2``, …) which `_safe_save_json`
+        emits when two saves land in the same wall-second
+
+    Pre-0.8.9 returned only the base pattern, so collision-bumped
+    backups leaked forever — a rapid-Ctrl+S burst on a slow disk would
+    accumulate `.bak.<ts>.<N>` files that the pruner never matched.
+    """
+    base = f"{path.name}.bak.????????-??????"
+    return (base, base + ".*")
+
+
 def _backup_filename_pattern(path: Path) -> str:
-    """Glob pattern matching every timestamped backup of `path`."""
-    return f"{path.name}.bak.????????-??????"
+    """Deprecated single-pattern accessor (returned only the base
+    timestamp form). Kept for any external probe that may have
+    referenced it; new code should use `_backup_filename_patterns`."""
+    return _backup_filename_patterns(path)[0]
+
+
+def _iter_backups(path: Path) -> "list[Path]":
+    """Return all timestamped backups for `path` across both glob
+    patterns, de-duplicated. Lexicographic sort works because the
+    timestamp `YYYYMMDD-HHMMSS` is the dominant ordering component and
+    collision-bumps (`.<N>`) sort after the base within the same second."""
+    seen: "dict[str, Path]" = {}
+    for pat in _backup_filename_patterns(path):
+        try:
+            for p in path.parent.glob(pat):
+                seen[p.name] = p
+        except OSError:
+            continue
+    return [seen[k] for k in sorted(seen.keys())]
 
 
 def _prune_backups(path: Path, keep: "int | None" = None) -> None:
@@ -1043,13 +1159,7 @@ def _prune_backups(path: Path, keep: "int | None" = None) -> None:
     the module constant and observe the new value."""
     if keep is None:
         keep = _BACKUP_RETENTION_COUNT
-    try:
-        candidates = sorted(
-            path.parent.glob(_backup_filename_pattern(path)),
-            key=lambda p: p.name,
-        )
-    except OSError:
-        return
+    candidates = _iter_backups(path)
     # Sort descending (newest first by lex-sortable timestamp), keep
     # the head, prune the tail.
     candidates.reverse()
@@ -1156,9 +1266,28 @@ def _safe_save_json(path: Path, entries: list, label: str,
     Errors (disk full, RO mount, permission denied) are logged AND
     re-raised so callers can `notify` the user. Silent swallow used
     to desync UI state from disk — sacred invariant #7.
+
+    Refuses to write through a symlink. Pre-0.8.9 the symlink check
+    only lived at agent endpoints (`_check_agent_write_path`); the
+    library / collections / parts-bin etc. save path itself trusted
+    `path` to be a regular file. A symlink at the target (planted
+    accidentally or otherwise) would let the backup-read step at the
+    top of this function — `path.read_bytes()` follows symlinks — copy
+    arbitrary file content into the user-readable `.bak`, and the
+    subsequent atomic-write would overwrite the link target. Refuse
+    up front so neither leak nor overwrite can happen.
     """
     import os
     import tempfile
+
+    if path.is_symlink():
+        msg = (
+            f"Refusing to save {label} through symlink at {path}. "
+            f"Move/remove the symlink and rerun, or set the data "
+            f"dir to a path with no symlinks in it."
+        )
+        _log.error(msg)
+        raise OSError(msg)
 
     # Schema-version stamp: preserve the highest observed version for
     # this file. A file written by a newer SpliceCraft (recorded via
@@ -1569,15 +1698,13 @@ def _list_recoverable_backups(target_path: Path) -> "list[dict]":
         if info:
             found.append({"kind": "legacy_bak",
                           "source_path": legacy, **info})
-    # Rotating multi-gen backups.
-    try:
-        for bak in data_dir.glob(_backup_filename_pattern(target_path)):
-            info = _backup_info(bak)
-            if info:
-                found.append({"kind": "rotating_bak",
-                              "source_path": bak, **info})
-    except OSError:
-        pass
+    # Rotating multi-gen backups (covers both `.bak.<ts>` and
+    # collision-bumped `.bak.<ts>.<N>`).
+    for bak in _iter_backups(target_path):
+        info = _backup_info(bak)
+        if info:
+            found.append({"kind": "rotating_bak",
+                          "source_path": bak, **info})
     # Daily snapshots.
     snap_dir = data_dir / _SNAPSHOT_DIR_NAME
     if snap_dir.exists():
@@ -1740,12 +1867,21 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
             if entries is not None:
                 _log.info("Restored %s from backup %s (%d entries)",
                           label, bak, len(entries))
-                # Overwrite the corrupt main file with the good backup
+                # Atomically overwrite the corrupt main file with the
+                # good backup. Pre-0.8.9 used `shutil.copy2(bak, path)`
+                # which is a non-atomic stream copy: a power loss or
+                # process kill mid-copy would leave the main file
+                # truncated — paradoxically *less* recoverable than
+                # the corrupt state we were rescuing from. Routing
+                # through `_atomic_write_bytes` (tempfile + replace +
+                # parent-dir fsync) preserves the recovery's guarantee.
                 try:
-                    import shutil
-                    shutil.copy2(str(bak), str(path))
+                    _atomic_write_bytes(path, bak.read_bytes())
                 except OSError:
-                    pass
+                    _log.warning(
+                        "Could not rewrite main file %s from backup",
+                        path,
+                    )
                 return entries, (
                     f"{label} was corrupt — restored {len(entries)} entries "
                     f"from backup."
@@ -1770,6 +1906,11 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
 
 _DNA_ORIGINALS_DIR = _DATA_DIR / "dna_originals"
 _DNA_SIDECAR_MAX_BYTES = 50 * 1024 * 1024   # 50 MB — same as bulk import
+# Cap the sidecar basename so the full path stays under NTFS's 260-char
+# default limit on reasonable installs. Raised to 200 from the implicit
+# OS limit so a hostile / accidentally-pasted multi-KB entry_id can't
+# trip ENAMETOOLONG at write time.
+_DNA_SIDECAR_BASENAME_MAX = 200
 
 # ── Data-dir version stamp ────────────────────────────────────────────────────
 #
@@ -1936,7 +2077,20 @@ def _acquire_data_dir_lock(
 
     # Open with O_RDWR so we can both lock AND write the holder PID.
     # 0o600 keeps the lockfile (which carries PID + version) private.
-    fd = os.open(str(lockfile), os.O_CREAT | os.O_RDWR, 0o600)
+    # Use O_EXCL on the first attempt so we know whether WE created the
+    # lockfile (vs. opened a pre-existing one): on contention we can
+    # then unlink only the file WE just created, rather than potentially
+    # removing another process's lockfile during a race.
+    we_created_lockfile = False
+    try:
+        fd = os.open(
+            str(lockfile),
+            os.O_CREAT | os.O_EXCL | os.O_RDWR,
+            0o600,
+        )
+        we_created_lockfile = True
+    except FileExistsError:
+        fd = os.open(str(lockfile), os.O_RDWR)
 
     held_by: "str | None" = None
     held_by_pid: "int | None" = None
@@ -2000,7 +2154,7 @@ def _acquire_data_dir_lock(
                     "retaking the lock.",
                     lockfile, held_by_pid,
                 )
-                _log_event("lock.stale", path=str(lockfile),
+                _log_event("lock.stale", path=_scrub_path(str(lockfile)),
                             stale_pid=held_by_pid)
                 try:
                     if sys.platform != "win32":
@@ -2014,7 +2168,18 @@ def _acquire_data_dir_lock(
                     os.close(fd)
                 except OSError:
                     pass
-                _log_event("lock.contended", path=str(lockfile),
+                # If WE just created the lockfile but couldn't flock
+                # it (rare race: a second instance won the lock between
+                # our open and our flock), don't leave a zero-byte
+                # lockfile behind. Only the creating process is allowed
+                # to clean up — otherwise we'd race-remove the holding
+                # process's metadata file.
+                if we_created_lockfile:
+                    try:
+                        lockfile.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                _log_event("lock.contended", path=_scrub_path(str(lockfile)),
                             held_by=held_by or "unknown")
                 hint = f" (held by PID {held_by})" if held_by else ""
                 raise DataDirLockError(
@@ -2041,7 +2206,7 @@ def _acquire_data_dir_lock(
                 pass
         except OSError as exc:
             _log.warning("Could not write lockfile metadata: %s", exc)
-        _log_event("lock.acquired", path=str(lockfile), pid=os.getpid())
+        _log_event("lock.acquired", path=_scrub_path(str(lockfile)), pid=os.getpid())
         return fd, lockfile
     except DataDirLockError:
         raise
@@ -2079,6 +2244,75 @@ def _release_data_dir_lock(fd: "int | None") -> None:
         except OSError:
             pass
         _log_event("lock.released")
+
+
+_ORPHAN_TMP_MIN_AGE_S = 3600   # 1 hour
+_ORPHAN_TMP_SUFFIXES = (".tmp", ".migrating", ".restoring")
+_ORPHAN_TMP_PREFIXES = (".tmp_", ".tmp-")
+
+
+def _sweep_orphan_tmp_files(data_dir: "Path | None" = None) -> int:
+    """Remove orphaned tempfile leftovers from `_DATA_DIR` and a small
+    set of subdirs. Returns the number of files removed.
+
+    Pre-0.8.9 leaked tempfiles on SIGKILL / OOM-kill / power-loss
+    between `tempfile.mkstemp` and the `os.replace` seal. Every atomic
+    writer cleans up its own temp on `try/except`, but a process kill
+    during the write window leaves the temp on disk forever. This
+    sweep is the GC for those leaks. Called from `main()` AFTER the
+    data-dir lock is acquired so no other instance is in-flight on a
+    legitimate temp.
+
+    Safety: refuses to delete files newer than `_ORPHAN_TMP_MIN_AGE_S`
+    (default 1 hour). Even though we hold the lock, the conservative
+    age cap means a legitimate in-flight write inside the current
+    process is never collected. Names are matched against narrow
+    suffix / prefix whitelists so a user-named file like
+    `notes.tmp.txt` is never matched.
+    """
+    import stat as _stat
+    if data_dir is None:
+        data_dir = _DATA_DIR
+    now = _time.time()
+    removed = 0
+
+    def _looks_like_orphan(name: str) -> bool:
+        if name.endswith(_ORPHAN_TMP_SUFFIXES):
+            return True
+        for prefix in _ORPHAN_TMP_PREFIXES:
+            if name.startswith(prefix):
+                return True
+        return False
+
+    candidate_roots: "list[Path]" = [data_dir]
+    for sub in (_DNA_ORIGINALS_DIR, data_dir / _SNAPSHOT_DIR_NAME,
+                data_dir / _LOST_ENTRIES_DIR_NAME):
+        if sub.exists() and sub != data_dir:
+            candidate_roots.append(sub)
+
+    for root in candidate_roots:
+        try:
+            for p in root.iterdir():
+                if not _looks_like_orphan(p.name):
+                    continue
+                try:
+                    st = p.lstat()
+                    if not _stat.S_ISREG(st.st_mode):
+                        continue
+                    if now - st.st_mtime < _ORPHAN_TMP_MIN_AGE_S:
+                        continue
+                    p.unlink()
+                    removed += 1
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    if removed:
+        _log.info("Swept %d orphan tempfile(s) from %s",
+                  removed, data_dir)
+        _log_event("orphan_tmp.swept", count=removed,
+                   data_dir=str(data_dir))
+    return removed
 
 
 def _drain_in_flight_workers(timeout_s: float = 2.0) -> "list[str]":
@@ -2715,6 +2949,7 @@ def _create_diagnostic_bundle(out_path: "Path | None" = None) -> Path:
             )
         # Atomic finalisation: rename temp → final.
         os.replace(tmp_name, out_path)
+        _fsync_parent_dir(out_path)
     except Exception:
         try:
             os.unlink(tmp_name)
@@ -2783,15 +3018,43 @@ def _dna_sidecar_path(entry_id: str) -> "Path":
     or ``foo/bar`` can't break out of the originals dir. NUL bytes are
     rejected (POSIX would raise ``ValueError`` on the join, but normalising
     here gives a stable sentinel). Empty / non-string ids fall back to a
-    sentinel so the path is always under ``_DNA_ORIGINALS_DIR``."""
+    sentinel so the path is always under ``_DNA_ORIGINALS_DIR``.
+
+    The basename is case-folded AND suffixed with an 8-char SHA-1 prefix
+    of the original (un-folded) entry_id. Without the case-fold + hash:
+    on case-insensitive filesystems (macOS APFS default, NTFS) two
+    library entries ``pUC19`` and ``puc19`` collided on the same on-disk
+    sidecar — silently overwriting each other's round-trip bytes, so
+    exporting the older entry to `.dna` emitted the wrong molecule.
+    The hash is computed on the raw id (pre-sanitisation) so two ids
+    that collapse to the same `safe` after separator scrubbing
+    (``a/b`` vs ``a_b``) also stay distinct. Total basename is capped
+    so the resulting path stays under NTFS's 260-char total-path limit
+    on reasonable installs (suffix `-<8>.dna` reserves 13 chars).
+    """
     raw = str(entry_id) if entry_id else "_unknown_"
-    # Strip any traversal/separator components first so Path.name returns
-    # only the basename even on inputs like "/etc/passwd" or "../foo".
     cleaned = raw.replace("/", "_").replace("\\", "_").replace("\x00", "_")
     safe = Path(cleaned).name or "_unknown_"
-    # Belt + braces: forbid leading dots so a hostile id like ``..`` (which
-    # `Path("..").name` returns as ``""`` only on some platforms) can't
-    # become an empty / dotfile.
+    if safe in (".", "..") or not safe.strip("."):
+        safe = "_unknown_"
+    import hashlib as _hashlib
+    digest = _hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()[:8]
+    safe_lower = safe.lower()
+    max_safe = _DNA_SIDECAR_BASENAME_MAX - len(digest) - len(".dna") - 1
+    if len(safe_lower) > max_safe:
+        safe_lower = safe_lower[:max_safe]
+    return _DNA_ORIGINALS_DIR / f"{safe_lower}-{digest}.dna"
+
+
+def _dna_sidecar_legacy_path(entry_id: str) -> "Path":
+    """Pre-0.8.9 sidecar path (case-sensitive, no hash discriminator).
+    Migration scaffolding — `_load_dna_original` falls back to this
+    when the canonical path is missing, and `_save_dna_original` /
+    `_delete_dna_original` clean it up alongside the canonical write.
+    Safe to remove a few releases after all-users-migrated."""
+    raw = str(entry_id) if entry_id else "_unknown_"
+    cleaned = raw.replace("/", "_").replace("\\", "_").replace("\x00", "_")
+    safe = Path(cleaned).name or "_unknown_"
     if safe in (".", "..") or not safe.strip("."):
         safe = "_unknown_"
     return _DNA_ORIGINALS_DIR / f"{safe}.dna"
@@ -2828,6 +3091,7 @@ def _save_dna_original(entry_id: str, data: bytes) -> bool:
                        _DNA_ORIGINALS_DIR, exc)
         return False
     target = _dna_sidecar_path(entry_id)
+    legacy = _dna_sidecar_legacy_path(entry_id)
     try:
         fd, tmp_path = _tempfile.mkstemp(prefix=".tmp_",
                                             dir=str(_DNA_ORIGINALS_DIR))
@@ -2837,12 +3101,18 @@ def _save_dna_original(entry_id: str, data: bytes) -> bool:
                 f.flush()
                 _os.fsync(f.fileno())
             _os.replace(tmp_path, target)
+            _fsync_parent_dir(target)
         except Exception:
             try:
                 _os.unlink(tmp_path)
             except OSError:
                 pass
             raise
+        if legacy != target:
+            try:
+                legacy.unlink(missing_ok=True)
+            except OSError:
+                pass
     except OSError as exc:
         _log.warning("dna sidecar: write failed for %r: %s",
                        entry_id, exc)
@@ -2853,36 +3123,60 @@ def _save_dna_original(entry_id: str, data: bytes) -> bool:
 def _load_dna_original(entry_id: str) -> "bytes | None":
     """Return the sidecar bytes for `entry_id`, or None if missing /
     unreadable. Used by the export path to splice fresh history into
-    the original .dna byte stream."""
+    the original .dna byte stream. Read size-capped via
+    `_safe_file_size_check` so a hand-edited or filesystem-corrupted
+    sidecar can't OOM the export path."""
     if not entry_id:
         return None
     target = _dna_sidecar_path(entry_id)
+    legacy = _dna_sidecar_legacy_path(entry_id)
     try:
-        if not target.exists():
-            return None
-        return target.read_bytes()
+        if target.exists():
+            ok, reason = _safe_file_size_check(
+                target, _DNA_SIDECAR_MAX_BYTES, "dna sidecar",
+            )
+            if not ok:
+                _log.warning("dna sidecar: %s", reason)
+                return None
+            return target.read_bytes()
+        if legacy != target and legacy.exists():
+            ok, reason = _safe_file_size_check(
+                legacy, _DNA_SIDECAR_MAX_BYTES, "dna sidecar (legacy)",
+            )
+            if not ok:
+                _log.warning("dna sidecar: %s", reason)
+                return None
+            return legacy.read_bytes()
+        return None
     except OSError as exc:
         _log.warning("dna sidecar: read failed for %r: %s", entry_id, exc)
         return None
 
 
 def _delete_dna_original(entry_id: str) -> bool:
-    """Remove the sidecar for `entry_id`. Returns True if the file
-    existed and was removed; False on any failure (logged) or if it
-    didn't exist. Idempotent — safe to call when removing a library
-    entry whether or not it had a sidecar."""
+    """Remove the sidecar for `entry_id` (both canonical and any
+    pre-0.8.9 legacy path). Returns True if at least one file was
+    removed; False on any failure (logged) or if neither existed.
+    Idempotent — safe to call when removing a library entry whether or
+    not it had a sidecar. Uses `unlink(missing_ok=True)` so a race
+    where another process deletes the file between our `exists()` and
+    `unlink()` doesn't false-negative on the otherwise-successful op."""
     if not entry_id:
         return False
     target = _dna_sidecar_path(entry_id)
-    try:
-        if not target.exists():
-            return False
-        target.unlink()
-        return True
-    except OSError as exc:
-        _log.warning("dna sidecar: delete failed for %r: %s",
-                       entry_id, exc)
-        return False
+    legacy = _dna_sidecar_legacy_path(entry_id)
+    paths = (target,) if target == legacy else (target, legacy)
+    removed = False
+    for p in paths:
+        try:
+            had = p.exists()
+            p.unlink(missing_ok=True)
+            if had:
+                removed = True
+        except OSError as exc:
+            _log.warning("dna sidecar: delete failed for %r at %s: %s",
+                           entry_id, p, exc)
+    return removed
 
 
 def _export_commercialsaas_dna(entry: dict, out_path: "Path | str") -> "str":
@@ -2946,6 +3240,7 @@ def _export_commercialsaas_dna(entry: dict, out_path: "Path | str") -> "str":
             f.flush()
             _os.fsync(f.fileno())
         _os.replace(tmp_path, out)
+        _fsync_parent_dir(out)
     except Exception:
         try:
             _os.unlink(tmp_path)
@@ -3229,7 +3524,13 @@ def _sync_active_collection_plasmids(
     name = _get_active_collection_name()
     if not name:
         return
-    snapshot = [dict(e) for e in entries if isinstance(e, dict)]
+    # Deep-clone via `_typed_clone` so a caller that keeps mutating
+    # `entries` after the sync dispatch (e.g., a follow-up CRUD on the
+    # same in-memory list) can't poison the queued snapshot — invariant
+    # #17 requires deepcopy on both read AND save sides for cached
+    # state. The pre-0.8.9 shallow `dict(e)` shared nested
+    # qualifiers / features / plasmids lists by reference.
+    snapshot = [_typed_clone(e) for e in entries if isinstance(e, dict)]
     if not async_write:
         colls = _load_collections()
         for c in colls:
@@ -12592,7 +12893,12 @@ class LibraryPanel(Widget):
         # `_natural_sort_key`. Splits each name into text + integer
         # runs so the sort respects numeric magnitude rather than the
         # lexicographic `pBin10 < pBin2 < pBin20` ordering.
-        for entry in sorted(_load_library(),
+        # Reuse `lib_entries` instead of re-loading: the pre-0.8.9
+        # `_load_library()` call here was a redundant `_typed_clone`
+        # of the entire cached library (hundreds of ms on a 1000-row
+        # library with `gb_text` blobs) — fired on every Filter
+        # keystroke. The caller has already loaded once at line 12861.
+        for entry in sorted(lib_entries,
                              key=lambda e: _natural_sort_key(
                                  e.get("name") or e.get("id") or "")):
             name = entry.get("name") or entry.get("id") or "?"
@@ -13908,11 +14214,18 @@ class SequencePanel(Widget):
             return
         # Privacy invariant (CLAUDE.md #38): `plain` can contain the
         # DNA letter under cursor — log its length, not its content.
-        _log_event("seq.hover_copy",
-                   screen_x=mx, screen_y=my, text_len=len(plain), **{
-                       k: (v.get("label") if isinstance(v, dict) else v)
-                       for k, v in info.items()
-                   })
+        # Filter out `_stacklevel` from `info` so a future caller can't
+        # accidentally pass our internal stacklevel kwarg via the
+        # spread (pyright also flags the unfiltered spread).
+        extras = {
+            k: (v.get("label") if isinstance(v, dict) else v)
+            for k, v in info.items() if k != "_stacklevel"
+        }
+        _log_event(
+            "seq.hover_copy",
+            screen_x=mx, screen_y=my, text_len=len(plain),
+            **extras,  # type: ignore[arg-type]
+        )
         try:
             self.app.copy_to_clipboard(plain)
         except Exception:
@@ -17387,6 +17700,13 @@ _PRE_UPDATE_SNAPSHOT_RETENTION = 5
 # Filenames inside each snapshot directory.
 _PRE_UPDATE_MANIFEST_NAME = "manifest.json"
 _PRE_UPDATE_STAGING_PREFIX = ".tmp-"
+# Manifests are pure JSON metadata (file list + checksums + small
+# headers). Real manifests run ~2-16 KB; a few-MB cap leaves slack for
+# unforeseen growth while refusing a planted multi-GB manifest that
+# would OOM the launch-time listing or the restore handler. The
+# directory is user-writable (sibling of _DATA_DIR by default), so a
+# defensive cap matters even though normal flows never approach it.
+_PRE_UPDATE_MANIFEST_MAX_BYTES = 4 * 1024 * 1024
 
 # Snapshot manifest schema version. Bump this when the on-disk shape
 # changes incompatibly (e.g., a new required field). Restore code
@@ -17788,6 +18108,13 @@ def _list_pre_update_snapshots(backup_dir: "Path | None" = None
         manifest = p / _PRE_UPDATE_MANIFEST_NAME
         if not manifest.is_file():
             continue
+        ok_size, _reason = _safe_file_size_check(
+            manifest, _PRE_UPDATE_MANIFEST_MAX_BYTES, "pre-update manifest",
+        )
+        if not ok_size:
+            _log.warning("pre-update snapshot %s: manifest rejected (%s)",
+                         p.name, _reason)
+            continue
         try:
             data = json.loads(manifest.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
@@ -17908,6 +18235,11 @@ def _restore_pre_update_snapshot(snap_id_or_path: "str | Path",
         raise FileNotFoundError(
             f"snapshot is incomplete (no manifest): {snap_path}"
         )
+    ok_size, reason = _safe_file_size_check(
+        manifest_path, _PRE_UPDATE_MANIFEST_MAX_BYTES, "pre-update manifest",
+    )
+    if not ok_size:
+        raise ValueError(f"manifest rejected: {reason}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict):
         raise ValueError(f"manifest is not a JSON object: {manifest_path}")
@@ -17984,31 +18316,59 @@ def _restore_pre_update_snapshot(snap_id_or_path: "str | Path",
         # Initialised pre-try so the except cleanup can see it even
         # if the OSError fires on mkdir before the staging path is
         # assigned (otherwise pyright flags `tmp` as possibly unbound).
+        # The staging name is randomised via `mkstemp` so concurrent
+        # restore attempts (UI + agent API in the same process) can't
+        # collide on a deterministic `<target>.restoring` path and
+        # truncate each other mid-copy.
         tmp: "Path | None" = None
+        tmp_fd: "int | None" = None
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            tmp = target.with_name(target.name + ".restoring")
+            import tempfile as _tempfile
+            tmp_fd, tmp_str = _tempfile.mkstemp(
+                prefix=f".{target.name}.", suffix=".restoring",
+                dir=str(target.parent),
+            )
+            os.close(tmp_fd)
+            tmp_fd = None
+            tmp = Path(tmp_str)
             shutil.copy2(src, tmp)
             _fsync_path(tmp)
             # Hardening #3: verify SHA-256 against the manifest BEFORE
             # the atomic overwrite of the live file. A bit-rotted /
             # tampered snapshot cannot silently corrupt good live data.
+            # The sha256 entry is MANDATORY (one of invariant #39's
+            # sacred-four checks); pre-0.8.9 silently skipped verify
+            # when the field was missing/empty, which a tampered manifest
+            # in the user-writable backup dir could exploit. Refuse the
+            # restore rather than fall through to a blind rename.
             expected = entry.get("sha256")
-            if isinstance(expected, str) and expected:
-                actual = _sha256_file(tmp)
-                if actual != expected:
-                    # Discard the staged copy and skip the rename. The
-                    # user's live file remains intact.
-                    try:
-                        tmp.unlink()
-                    except OSError:
-                        pass
-                    summary["failed"].append(
-                        (name,
-                         f"sha256 mismatch (snapshot corrupted): "
-                         f"expected {expected[:16]}…, got {actual[:16]}…")
-                    )
-                    continue
+            if not isinstance(expected, str) or not expected:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                summary["failed"].append(
+                    (name,
+                     "manifest entry is missing the mandatory sha256 "
+                     "field — refusing restore (snapshot may be tampered "
+                     "or written by an unsupported tool)")
+                )
+                continue
+            actual = _sha256_file(tmp)
+            if actual != expected:
+                # Discard the staged copy and skip the rename. The
+                # user's live file remains intact.
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                summary["failed"].append(
+                    (name,
+                     f"sha256 mismatch (snapshot corrupted): "
+                     f"expected {expected[:16]}…, got {actual[:16]}…")
+                )
+                continue
             os.replace(tmp, target)
             _fsync_path(target.parent)
             summary["restored_files"].append(name)
@@ -23191,13 +23551,6 @@ def _validate_settings(raw: dict) -> "tuple[dict, list[str]]":
     for k, v in raw.items():
         if k in _SETTINGS_SCHEMA:
             allowed, default = _SETTINGS_SCHEMA[k]
-            if isinstance(v, allowed) and not isinstance(v, bool) is False:
-                # The `not isinstance(v, bool)` clause: bool is a
-                # subclass of int in Python, so a `bool` setting
-                # whose schema is `(int,)` should NOT be accepted
-                # (a stray True would propagate as `1`). Allow only
-                # exact-type matches for non-bool numeric keys.
-                pass
             # Strict bool/int discrimination: bool matches int
             # isinstance check, so we have to special-case.
             if isinstance(v, bool) and bool not in allowed:
@@ -23292,26 +23645,43 @@ def _settings_flush_worker() -> None:
     `_set_setting`. Multiple bursts spawn at most one worker at a time
     (`_settings_flush_running` gate); subsequent `_set_setting` calls
     just overwrite the pending payload, so the worker writes the latest
-    state once it gets the lock."""
+    state once it gets the lock.
+
+    `_settings_flush_running` MUST always reach False on exit, even on
+    an unforeseen exception (e.g., a non-JSON-serialisable value
+    sneaking in past `_validate_settings`). Pre-0.8.9 had a narrow
+    `except (OSError, RuntimeError)`; an unexpected exception would
+    propagate up, kill the worker thread, AND leave the flag set —
+    wedging every subsequent `_set_setting` because the gate check
+    silently refuses to spawn a fresh worker.
+    """
     global _settings_flush_pending, _settings_flush_running
-    while True:
+    try:
+        while True:
+            with _settings_flush_lock:
+                payload = _settings_flush_pending
+                _settings_flush_pending = None
+                if payload is None:
+                    return
+            entries = [{"key": k, "value": v} for k, v in payload.items()]
+            try:
+                _safe_save_json(_SETTINGS_FILE, entries, "Settings")
+            except (OSError, RuntimeError) as exc:
+                # The cache was already updated synchronously, so the
+                # in-process state stays consistent; only the on-disk
+                # mirror is stale until the next successful flush.
+                # Surface to the UI so a persistable-toggle keystroke
+                # that the user thinks "took" can't silently revert
+                # at next launch.
+                _bg_notify_save_failure("Settings", exc)
+            except Exception:
+                _log.exception(
+                    "settings flush: unexpected error while writing %s",
+                    _SETTINGS_FILE,
+                )
+    finally:
         with _settings_flush_lock:
-            payload = _settings_flush_pending
-            _settings_flush_pending = None
-            if payload is None:
-                _settings_flush_running = False
-                return
-        entries = [{"key": k, "value": v} for k, v in payload.items()]
-        try:
-            _safe_save_json(_SETTINGS_FILE, entries, "Settings")
-        except (OSError, RuntimeError) as exc:
-            # The cache was already updated synchronously, so the
-            # in-process state stays consistent; only the on-disk
-            # mirror is stale until the next successful flush.
-            # Surface to the UI so a persistable-toggle keystroke
-            # that the user thinks "took" can't silently revert
-            # at next launch.
-            _bg_notify_save_failure("Settings", exc)
+            _settings_flush_running = False
 
 
 def _set_setting(key: str, value) -> None:
@@ -23319,7 +23689,14 @@ def _set_setting(key: str, value) -> None:
     subsequent `_load_settings()` (in this process) sees the new value
     immediately. The disk write is deferred to a daemon thread so a
     keypress that toggles a setting (e.g. `r`) doesn't block the UI on
-    fsync. Coalesces bursts of toggles into fewer disk writes."""
+    fsync. Coalesces bursts of toggles into fewer disk writes.
+
+    Set ``SPLICECRAFT_SKIP_SETTINGS_FLUSH=1`` to bypass the daemon
+    thread and write synchronously — used by tests so they get
+    deterministic disk state without a trailing daemon thread on exit.
+    Matches the `_skip_seed` / `_skip_snapshot` / `_skip_update_check`
+    pattern other startup gates already follow.
+    """
     global _settings_cache, _settings_flush_pending, _settings_flush_running
     settings = _load_settings()
     # Log only when the value actually changes — avoids spamming the
@@ -23331,6 +23708,15 @@ def _set_setting(key: str, value) -> None:
                     key, _repr_for_log(value), _repr_for_log(prev))
     settings[key] = value
     _settings_cache = dict(settings)
+    if os.environ.get("SPLICECRAFT_SKIP_SETTINGS_FLUSH", "").strip().lower() in (
+        "1", "true", "yes"
+    ):
+        entries = [{"key": k, "value": v} for k, v in settings.items()]
+        try:
+            _safe_save_json(_SETTINGS_FILE, entries, "Settings")
+        except (OSError, RuntimeError):
+            _log.exception("settings sync write failed (skip-flush mode)")
+        return
     with _settings_flush_lock:
         _settings_flush_pending = dict(settings)
         if _settings_flush_running:
@@ -23832,7 +24218,9 @@ def _sync_active_parts_bin_parts(entries: list[dict]) -> None:
     name = _get_active_parts_bin_name()
     if not name:
         return
-    snapshot = [dict(e) for e in entries if isinstance(e, dict)]
+    # Deep-clone via `_typed_clone` — invariant #17 (see the matching
+    # comment in `_sync_active_collection_plasmids`).
+    snapshot = [_typed_clone(e) for e in entries if isinstance(e, dict)]
     bins = _load_parts_bin_collections()
     for b in bins:
         if b.get("name") == name:
@@ -29789,7 +30177,7 @@ class BlastModal(ModalScreen):
             return ""
         return (inp.value or "").strip()
 
-    @work(thread=True, exclusive=True, group="blast_run")
+    @work(thread=True, exclusive=True, group="hmmscan_run")
     def _do_run_hmmscan(self, query: str, hmm_path: str,
                         truncated: bool) -> None:
         try:
@@ -29980,7 +30368,7 @@ class BlastModal(ModalScreen):
         )
         self._do_build(prog, col_filter)
 
-    @work(thread=True, exclusive=True, group="blast_run")
+    @work(thread=True, exclusive=True, group="blast_build")
     def _do_build(self, prog: str,
                   col_filter: "list[str] | None") -> None:
         # Stale-collection guard (audit fix 2026-05-14): capture the
@@ -30720,6 +31108,8 @@ class FeatureLibraryScreen(Screen):
     work. Routes through ``_load_features`` / ``_save_features`` which
     enforce the schema envelope (sacred invariant #7).
     """
+
+    _blocks_undo: bool = True
 
     BINDINGS = [
         Binding("escape", "close",     "Close"),
@@ -33148,6 +33538,8 @@ class PartsBinModal(Screen):
     Feature, Ctrl+Shift+F capture, or the Feature Library workbench
     without paying the scan cost on every populate.
     """
+
+    _blocks_undo: bool = True
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
@@ -35781,7 +36173,11 @@ class PlasmidsaurusAlignModal(ModalScreen):
                 )
             except Exception:
                 pass
-            self.dismiss(result)
+            # is_mounted guard mirrors the export modals — if the modal
+            # was dismissed during the C-loop (Cancel, parent screen
+            # pop, app exit), calling dismiss again would raise.
+            if self.is_mounted:
+                self.dismiss(result)
         self.app.call_from_thread(_show)
 
     @on(Button.Pressed, "#btn-align-cancel")
@@ -42483,6 +42879,8 @@ class PrimerDesignScreen(Screen):
     primer_bind features to the currently-loaded plasmid.
     """
 
+    _blocks_undo: bool = True
+
     BINDINGS = [
         Binding("escape",  "cancel",     "Close",         show=True),
         Binding("m",       "noop",       "Mark (★)",      show=True, key_display="m"),
@@ -47211,10 +47609,40 @@ def _sanitize_path(p: "str | None") -> "Path | None":
     their permissions, so OS-level file mode controls trust. We just
     normalize so a relative path lands at CWD rather than a surprise
     location, and reject non-string types so a JSON ``{"path": {}}``
-    can't smuggle a dict's str() into a Path constructor."""
+    can't smuggle a dict's str() into a Path constructor.
+
+    Refuses ``~user`` syntax (where ``user`` is anything other than
+    the empty current user). `Path.expanduser` will happily resolve
+    ``~daemon/.bashrc`` to /var/lib/daemon/... and similar — combined
+    with `_h_load_file`'s 404 vs 400 distinction this would be a
+    user-enumeration oracle for an agent caller. Only ``~`` (current
+    user, no trailing identifier) is allowed.
+    """
     if not isinstance(p, str) or not p:
         return None
+    if p.startswith("~") and len(p) > 1 and p[1] not in ("/", "\\"):
+        return None
     return Path(p).expanduser()
+
+
+def _check_agent_read_dir(path: Path) -> "str | None":
+    """Reject directory args that resolve through a symlink. `Path.is_dir`
+    follows symlinks — a pre-placed symlink in the user's home pointing
+    at `/etc` would let an agent caller scan system directories. Apply
+    `lstat` + `S_ISDIR` so the agent path is strictly stricter than
+    the GUI's filesystem trust. Returns the pre-0.8.9 "not a directory"
+    string for any unresolvable / non-dir path so existing callers'
+    expected-error matchers stay green."""
+    import stat as _stat
+    try:
+        st = path.lstat()
+    except OSError:
+        return f"not a directory: {path!s}"
+    if _stat.S_ISLNK(st.st_mode):
+        return f"refusing to read through symlink at {path!s}"
+    if not _stat.S_ISDIR(st.st_mode):
+        return f"not a directory: {path!s}"
+    return None
 
 
 def _check_agent_write_path(path: Path) -> "str | None":
@@ -47925,7 +48353,13 @@ def _h_replace_sequence(app, payload):
             app._dispatch_restr_scan(new_seq)
             app._mark_dirty()
             return new_record.id
-        except (ValueError, RuntimeError) as exc:
+        except (ValueError, RuntimeError, NoMatches, AttributeError) as exc:
+            # NoMatches / AttributeError covers the screen-unmount
+            # window: if the user dismissed the seq-panel / sidebar /
+            # plasmid-map between `_check_dirty_and_snapshot` and this
+            # apply (rapid screen swap during a big rebuild), don't
+            # bubble a 500 with a useless traceback — surface a clean
+            # error.
             return ({"error": str(exc)}, 400)
 
     result = app.call_from_thread(_apply)
@@ -48128,6 +48562,28 @@ def _h_get_feature(app, payload):
     }
 
 
+_EXPORT_GENBANK_EXTS = (".gb", ".gbk", ".genbank")
+_EXPORT_GFF_EXTS     = (".gff", ".gff3")
+_EXPORT_FASTA_EXTS   = (".fa", ".fasta", ".fna")
+
+
+def _check_export_extension(path: Path, allowed: "tuple[str, ...]",
+                              fmt: str) -> "str | None":
+    """Enforce an extension whitelist on agent export targets. Without
+    this an agent can write `/home/user/.bashrc` as GenBank text (which
+    starts with `LOCUS` — not executable but visually hostile / footgun-
+    y) or write a `.sh` extension that the user later double-clicks by
+    accident. Matches the GUI ExportModal's "save as <FMT>" behaviour
+    where the user can't pick an arbitrary extension."""
+    suffix = path.suffix.lower()
+    if suffix in allowed:
+        return None
+    return (
+        f"refusing to write {fmt} to {path.name!r}: extension must be "
+        f"one of {allowed}"
+    )
+
+
 @_agent_endpoint("export-genbank", write=True)
 def _h_export_genbank(app, payload):
     """Write the current record to `path` as GenBank. Body: ``{path}``.
@@ -48140,6 +48596,9 @@ def _h_export_genbank(app, payload):
     path = _sanitize_path(payload.get("path"))
     if path is None:
         return ({"error": "missing 'path'"}, 400)
+    if (ext_err := _check_export_extension(
+            path, _EXPORT_GENBANK_EXTS, "GenBank")) is not None:
+        return ({"error": ext_err}, 400)
     err = _check_agent_write_path(path)
     if err is not None:
         return ({"error": err}, 403)
@@ -48161,6 +48620,9 @@ def _h_export_gff(app, payload):
     path = _sanitize_path(payload.get("path"))
     if path is None:
         return ({"error": "missing 'path'"}, 400)
+    if (ext_err := _check_export_extension(
+            path, _EXPORT_GFF_EXTS, "GFF3")) is not None:
+        return ({"error": ext_err}, 400)
     err = _check_agent_write_path(path)
     if err is not None:
         return ({"error": err}, 403)
@@ -48181,6 +48643,9 @@ def _h_export_fasta(app, payload):
     path = _sanitize_path(payload.get("path"))
     if path is None:
         return ({"error": "missing 'path'"}, 400)
+    if (ext_err := _check_export_extension(
+            path, _EXPORT_FASTA_EXTS, "FASTA")) is not None:
+        return ({"error": ext_err}, 400)
     err = _check_agent_write_path(path)
     if err is not None:
         return ({"error": err}, 403)
@@ -48511,6 +48976,21 @@ def _h_diff_plasmid(app, payload):
         is_circular = bool(circ_raw)
     query_seq = str(rec.seq)
     target_seq_raw = str(target_record.seq)
+    # Pre-cap both seqs at `_PAIRWISE_MAX_LEN` BEFORE the circular
+    # rotation step — `_find_circular_alignment_offset` doubles the
+    # target (`t + t`) so a 50 MB library entry would allocate 100 MB
+    # before we even reach `_pairwise_align`'s own cap. Mirrors the
+    # sibling endpoint `_h_align_plasmidsaurus_zip` which caps at the
+    # same constant.
+    if (len(query_seq) > _PAIRWISE_MAX_LEN
+            or len(target_seq_raw) > _PAIRWISE_MAX_LEN):
+        return ({
+            "error": (
+                f"sequence too long for diff "
+                f"(query={len(query_seq):,}, target={len(target_seq_raw):,}, "
+                f"cap={_PAIRWISE_MAX_LEN:,})"
+            ),
+        }, 413)
     rotation_offset = 0
     if is_circular and query_seq and target_seq_raw:
         try:
@@ -48873,8 +49353,8 @@ def _h_create_collection(app, payload):
     n_failures_total = 0
     description = ""
     if folder is not None:
-        if not folder.is_dir():
-            return ({"error": f"not a directory: {folder}"}, 400)
+        if (dir_err := _check_agent_read_dir(folder)) is not None:
+            return ({"error": dir_err}, 400)
         entries, failures = _bulk_import_folder(folder)
         plasmids = entries
         n_failures_total = len(failures)
@@ -49031,8 +49511,8 @@ def _h_bulk_import_folder(app, payload):
     folder = _sanitize_path(folder_raw) if folder_raw else None
     if folder is None:
         return ({"error": "missing 'folder'"}, 400)
-    if not folder.is_dir():
-        return ({"error": f"not a directory: {folder}"}, 400)
+    if (dir_err := _check_agent_read_dir(folder)) is not None:
+        return ({"error": dir_err}, 400)
     name = _normalize_collection_name(payload.get("collection"))
     if name is None:
         return ({"error": "missing or invalid 'collection'"}, 400)
@@ -49300,7 +49780,10 @@ def _h_set_entry_vector(app, payload):
     if bool(payload.get("clear")):
         def _clear():
             _set_entry_vector(gid, None)
-        app.call_from_thread(_clear)
+        if (err := _agent_save_or_500(
+                lambda: app.call_from_thread(_clear),
+                "entry_vectors")) is not None:
+            return err
         return {"ok": True, "grammar_id": gid, "vector": None}
 
     name = _sanitize_label(payload.get("name"), max_len=200)
@@ -49333,7 +49816,10 @@ def _h_set_entry_vector(app, payload):
     def _apply():
         _set_entry_vector(gid, vector)
 
-    app.call_from_thread(_apply)
+    if (err := _agent_save_or_500(
+            lambda: app.call_from_thread(_apply),
+            "entry_vectors")) is not None:
+        return err
     out = dict(vector); out.pop("gb_text", None)
     return {"ok": True, "grammar_id": gid, "vector": out}
 
@@ -50533,6 +51019,13 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
             return data if isinstance(data, dict) else {}
         except (json.JSONDecodeError, UnicodeDecodeError):
             return {}
+        except OSError as exc:
+            # Broken socket / connection-reset mid-read. Log for
+            # diagnostic trail, return empty so the dispatch wrapper
+            # converts to a clean 400, not a generic 500 with an OS
+            # error in the body.
+            _log.warning("agent-api: read_body socket error: %s", exc)
+            return {}
 
     def _send(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload, default=str).encode("utf-8")
@@ -50706,6 +51199,7 @@ def _start_agent_api(app, port: int = _AGENT_API_PORT_DEFAULT):
                 pass
             raise
         os.replace(str(tmp_path), str(_AGENT_TOKEN_FILE))
+        _fsync_parent_dir(_AGENT_TOKEN_FILE)
     except OSError:
         _log.exception("agent-api: failed to write token file %s",
                        _AGENT_TOKEN_FILE)
@@ -53541,16 +54035,7 @@ SpeciesPickerModal { align: center middle; }
             bp = sp._cursor_pos
             pm = self.query_one("#plasmid-map", PlasmidMap)
             sidebar = self.query_one("#sidebar", FeatureSidebar)
-            total = len(sp._seq)
-            best_idx  = -1
-            best_span = float("inf")
-            for i, f in enumerate(pm._feats):
-                if not pm._bp_in(bp, f):
-                    continue
-                span = _feat_len(f["start"], f["end"], total) if total else 0
-                if span < best_span:
-                    best_span = span
-                    best_idx  = i
+            best_idx = pm._smallest_enclosing_feature(bp)
             if best_idx < 0:
                 return
             f = pm._feats[best_idx]
@@ -55312,12 +55797,37 @@ SpeciesPickerModal { align: center middle; }
         """
         if record is None:
             return
+        # Emit structured `record.loaded` event so AI parsers can
+        # correlate every subsequent panel/scan event back to a single
+        # canvas-swap boundary. Pre-0.8.9 only the large-plasmid warning
+        # surfaced this transition; smaller plasmids loaded silently.
+        try:
+            seq_len = len(getattr(record, "seq", "") or "")
+        except Exception:
+            seq_len = 0
+        try:
+            n_features = len(getattr(record, "features", []) or [])
+        except Exception:
+            n_features = 0
+        topology = ""
+        try:
+            ann = getattr(record, "annotations", None) or {}
+            topology = str(ann.get("topology") or "")
+        except Exception:
+            pass
+        _log_event(
+            "record.loaded",
+            rec=getattr(record, "id", "?"),
+            bp=seq_len,
+            n_features=n_features,
+            topology=topology,
+            clear_undo=bool(clear_undo),
+        )
         # Big-plasmid heads-up: the user gets a one-shot warning so
         # "the UI feels heavy" doesn't read as a bug. Logged so the
         # diagnostic bundle records when the user is operating on
         # records that strain the renderer.
         try:
-            seq_len = len(getattr(record, "seq", "") or "")
             if seq_len >= self._LARGE_PLASMID_BP:
                 _log.warning(
                     "Large plasmid loaded: %r (%d bp) — render and "
@@ -55825,15 +56335,7 @@ SpeciesPickerModal { align: center middle; }
         used_fallback = False
         if best_idx < 0:
             used_fallback = True
-            total = len(seq_pnl._seq)
-            best_span = float("inf")
-            for i, f in enumerate(pm._feats):
-                if not pm._bp_in(bp, f):
-                    continue
-                span = _feat_len(f["start"], f["end"], total) if total else 0
-                if span < best_span:
-                    best_span = span
-                    best_idx  = i
+            best_idx = pm._smallest_enclosing_feature(bp)
         if best_idx >= 0:
             f = pm._feats[best_idx]
             _log_event(
@@ -58286,6 +58788,17 @@ def main():
         # the lock; the existing data-safety net still catches most
         # corruption modes.
         _log.warning("Could not acquire data-dir lock: %s", exc)
+
+    # Orphan tempfile sweep — collect leftovers from previous runs that
+    # were SIGKILL'd / OOM-killed / power-cycled between mkstemp and
+    # os.replace. Lock-guarded (only when we hold the data-dir lock)
+    # AND age-gated (only files older than 1 h) so a legitimate
+    # in-flight write inside the current process is never collected.
+    if _data_lock_fd is not None:
+        try:
+            _sweep_orphan_tmp_files()
+        except Exception:
+            _log.exception("orphan-tmp sweep failed (non-fatal)")
 
     # Install a thread-level excepthook so an unhandled exception in
     # any background worker (BLAST/HMMER/Primer3/restriction scan/
