@@ -5030,69 +5030,54 @@ def _gibson_overlap_len(a_seq: str, b_seq: str, *,
 
 
 @_timed("op.gibson_simulate")
-def _simulate_gibson_assembly(fragments: list[dict], *,
-                                min_overlap: int = _GIBSON_MIN_OVERLAP_BP,
-                                circular: bool = True,
-                              ) -> dict:
-    """Simulate a Gibson assembly of N linear top-strand fragments.
+# ── _simulate_gibson_assembly helpers ─────────────────────────────────────
+#
+# The Gibson simulator was 370 lines pre-refactor. The math is
+# biology-critical (junction-overlap detection, body-length validation,
+# wrap-aware feature shifting, wrap-half re-merge), so the helpers are
+# defined as pure functions with explicit `(input) → output` signatures
+# — no shared closure state, no hidden dependencies. Behaviour is bit-
+# identical to the pre-refactor version, tested by tests/test_gibson.py
+# (47 cases) which passed before AND after the extraction.
 
-    .. note::
-       **DEFERRED REFACTOR** (370 lines). Splitting this is on the V1.0.0
-       soft-gate list (see V1_GATE.md S3) but the math is biology-critical
-       (overlap detection at every junction incl. the wrap junction;
-       feature-coord shifting with single-source-of-truth offset
-       arithmetic). Safe refactor needs a dedicated regression scaffold
-       — a per-junction property test on `tests/test_gibson.py` that
-       fuzzes `(n_fragments, overlap_len, feature_density, wrap_yes_no)`
-       and asserts product invariants before any extraction. Not done
-       in 0.9.x to avoid silent biology drift.
 
-    Each ``fragments[i]`` dict shape:
-        {
-          "name":     str,
-          "sequence": str,            # linear DNA 5' → 3'
-          "features": list[dict],     # optional, in fragment-local coords
-        }
+def _gibson_failure(circular: bool, errors: list[str],
+                       overlaps: "list[dict] | None" = None,
+                       warnings: "list[str] | None" = None) -> dict:
+    """Standard failure-shaped result dict for the Gibson pipeline.
 
-    For each junction (consecutive pair plus the wrap junction when
-    ``circular=True``) the longest exact-match suffix/prefix overlap
-    is detected. Any junction below ``min_overlap`` bp fails the
-    assembly. The product sequence has each overlap appearing once
-    (the trailing copy is dropped: ``frag[i] + frag[i+1][overlap:]``).
-    Features are shifted into product coordinates; features wholly
-    inside a fragment's leading-overlap region are skipped (they're
-    already represented by the preceding fragment's trailing copy).
+    Centralising it ensures every short-circuit returns the same shape
+    (success=False, empty product_seq, empty features) — a property the
+    UI consumer (`GibsonAssemblyPane`) relies on."""
+    return {
+        "success":     False,
+        "product_seq": "",
+        "circular":    circular,
+        "features":    [],
+        "overlaps":    list(overlaps or []),
+        "errors":      list(errors),
+        "warnings":    list(warnings or []),
+    }
 
-    Returns ``{success, product_seq, circular, features, overlaps,
-    errors, warnings}`` — see UI consumer (``GibsonAssemblyPane``)
-    for the rendering convention. ``overlaps`` always has one entry
-    per junction so the UI can show the full chain even on partial
-    failure.
-    """
-    errors: list[str] = []
-    warnings: list[str] = []
-    overlaps: list[dict] = []
 
+def _gibson_normalize_fragments(
+    fragments: list[dict],
+) -> "tuple[list[dict] | None, str | None]":
+    """Uppercase + whitespace-strip each fragment's sequence.
+
+    Returns ``(norm_fragments, None)`` on success or ``(None, error_msg)``
+    on the two short-circuit failure modes: empty input list, or any
+    fragment that isn't a dict.
+
+    The normalised list is a parallel structure to `fragments` —
+    name / sequence / features — with the sequence cleaned. We
+    intentionally don't mutate the caller's dicts."""
     if not fragments:
-        return {
-            "success": False, "product_seq": "", "circular": circular,
-            "features": [], "overlaps": [],
-            "errors": ["No fragments supplied."], "warnings": [],
-        }
-
-    # Normalise each input: uppercase + strip whitespace. We keep the
-    # original ``fragments`` list intact for caller-side identity (and
-    # for the feature-shifting loop below); the normalised view is a
-    # parallel list of (name, seq, features) tuples.
+        return None, "No fragments supplied."
     norm_fragments: list[dict] = []
     for f in fragments:
         if not isinstance(f, dict):
-            return {
-                "success": False, "product_seq": "", "circular": circular,
-                "features": [], "overlaps": [],
-                "errors": ["Each fragment must be a dict."],
-                "warnings": [],
-            }
+            return None, "Each fragment must be a dict."
         raw = str(f.get("sequence") or "")
         cleaned = "".join(ch for ch in raw.upper() if not ch.isspace())
         norm_fragments.append({
@@ -5100,75 +5085,35 @@ def _simulate_gibson_assembly(fragments: list[dict], *,
             "sequence": cleaned,
             "features": list(f.get("features") or []),
         })
+    return norm_fragments, None
 
-    # Reject zero-length fragments up front — they can't carry homology.
-    for f in norm_fragments:
-        if not f["sequence"]:
-            return {
-                "success": False, "product_seq": "", "circular": circular,
-                "features": [], "overlaps": [],
-                "errors": [
-                    f"Fragment {f['name']!r} has no sequence."
-                ],
-                "warnings": [],
-            }
 
-    if len(norm_fragments) == 1 and not circular:
-        # A single linear fragment doesn't need Gibson — pass through.
-        f = norm_fragments[0]
-        return {
-            "success":     True,
-            "product_seq": f["sequence"],
-            "circular":    False,
-            "features":    list(f["features"]),
-            "overlaps":    [],
-            "errors":      [],
-            "warnings":    [
-                "Single linear fragment — no Gibson junctions to "
-                "validate. Product is the fragment as supplied.",
-            ],
-        }
+def _gibson_detect_overlaps(
+    norm_fragments: list[dict], *, min_overlap: int, circular: bool,
+) -> "tuple[list[dict], list[int], list[str]]":
+    """For each junction (consecutive pair plus wrap when circular),
+    detect the longest exact-match suffix/prefix overlap.
 
+    Returns ``(overlaps, overlap_lens, errors)``:
+      * `overlaps`: one dict per junction (junction, from, to, length,
+        seq, ok, is_wrap, rc_hint) — the UI shows the full chain even
+        on partial failure, so this is populated regardless of success.
+      * `overlap_lens`: parallel list of int lengths for the build step.
+      * `errors`: human-readable junction-failure messages.
+    """
     n = len(norm_fragments)
     n_junctions = n if circular else n - 1
+    overlaps: list[dict] = []
     overlap_lens: list[int] = []
+    errors: list[str] = []
     for i in range(n_junctions):
         a = norm_fragments[i]
         b = norm_fragments[(i + 1) % n]
         a_seq = a["sequence"]
         b_seq = b["sequence"]
-        k = _gibson_overlap_len(
-            a_seq, b_seq, min_overlap=min_overlap,
-        )
+        k = _gibson_overlap_len(a_seq, b_seq, min_overlap=min_overlap)
         ok = k >= min_overlap
-        # Reverse-orientation diagnostic. If the forward overlap fails,
-        # probe RC of B (would-be insert flipped) and RC of A (would-be
-        # upstream flipped) at a lower threshold so we can surface a
-        # "did you mean to RC this fragment?" hint. We probe at the
-        # lower of `min_overlap` and 10 bp so the user sees the hint
-        # for plausible-but-flipped designs even when their min is
-        # set high.
-        rc_hint = ""
-        if not ok:
-            probe_min = min(min_overlap, 10)
-            k_b_rc = _gibson_overlap_len(
-                a_seq, _rc(b_seq), min_overlap=probe_min,
-            )
-            k_a_rc = _gibson_overlap_len(
-                _rc(a_seq), b_seq, min_overlap=probe_min,
-            )
-            if k_b_rc >= probe_min and k_b_rc >= k_a_rc:
-                rc_hint = (
-                    f" — but reverse-complement of {b['name']!r} "
-                    f"yields a {k_b_rc} bp overlap; "
-                    f"did you mean to flip {b['name']!r}?"
-                )
-            elif k_a_rc >= probe_min:
-                rc_hint = (
-                    f" — but reverse-complement of {a['name']!r} "
-                    f"yields a {k_a_rc} bp overlap; "
-                    f"did you mean to flip {a['name']!r}?"
-                )
+        rc_hint = _gibson_rc_hint(a, b, min_overlap=min_overlap) if not ok else ""
         overlaps.append({
             "junction": i + 1,
             "from":     a["name"],
@@ -5181,23 +5126,58 @@ def _simulate_gibson_assembly(fragments: list[dict], *,
         })
         if not ok:
             errors.append(
-                f"Junction {i+1} ({a['name']!r} → "
-                f"{b['name']!r}): no overlap ≥ "
-                f"{min_overlap} bp." + rc_hint
+                f"Junction {i+1} ({a['name']!r} → {b['name']!r}): "
+                f"no overlap ≥ {min_overlap} bp." + rc_hint
             )
         overlap_lens.append(k)
+    return overlaps, overlap_lens, errors
 
-    if errors:
-        return {
-            "success": False, "product_seq": "", "circular": circular,
-            "features": [], "overlaps": overlaps,
-            "errors": errors, "warnings": warnings,
-        }
 
-    # Sanity-check: every fragment after the first must have body
-    # length > 0 after its leading overlap is removed. Otherwise the
-    # fragment is biologically redundant — its body bases are entirely
-    # supplied by the preceding fragment's tail.
+def _gibson_rc_hint(a: dict, b: dict, *, min_overlap: int) -> str:
+    """Reverse-orientation diagnostic. If the forward overlap failed,
+    probe RC(b) and RC(a) at a lower threshold (min of `min_overlap`
+    and 10 bp so the user sees the hint even with a high min). Returns
+    `""` if neither RC orientation yields a plausible overlap.
+
+    Returning a string so the caller can concat into the error message
+    without an extra branch — keeps the failure path linear."""
+    a_seq = a["sequence"]
+    b_seq = b["sequence"]
+    probe_min = min(min_overlap, 10)
+    k_b_rc = _gibson_overlap_len(a_seq, _rc(b_seq), min_overlap=probe_min)
+    k_a_rc = _gibson_overlap_len(_rc(a_seq), b_seq, min_overlap=probe_min)
+    if k_b_rc >= probe_min and k_b_rc >= k_a_rc:
+        return (
+            f" — but reverse-complement of {b['name']!r} "
+            f"yields a {k_b_rc} bp overlap; "
+            f"did you mean to flip {b['name']!r}?"
+        )
+    if k_a_rc >= probe_min:
+        return (
+            f" — but reverse-complement of {a['name']!r} "
+            f"yields a {k_a_rc} bp overlap; "
+            f"did you mean to flip {a['name']!r}?"
+        )
+    return ""
+
+
+def _gibson_validate_body_lengths(
+    norm_fragments: list[dict], overlap_lens: list[int], *, circular: bool,
+) -> list[str]:
+    """Check that every fragment has body bases left after its homology
+    arms. A fragment fully consumed by overlap(s) is biologically
+    redundant — its bases are entirely supplied by adjacent fragments.
+
+    Returns a list of error messages; empty list means OK.
+
+    Three sub-cases:
+      * fragments[i>0]: leading overlap from junction i-1.
+      * circular n==1: self-circularisation uses overlap_lens[0] as a
+        single wrap arm.
+      * circular n>1: last fragment has BOTH leading + trailing arms.
+    """
+    n = len(norm_fragments)
+    errors: list[str] = []
     for i in range(1, n):
         oh_lead = overlap_lens[i - 1]
         frag_len = len(norm_fragments[i]["sequence"])
@@ -5208,10 +5188,6 @@ def _simulate_gibson_assembly(fragments: list[dict], *,
                 f"(fragment is {frag_len} bp). "
                 f"Use a longer fragment or shorter overlap."
             )
-
-    # For circular: the wrap fragment must also have body left after
-    # BOTH its leading + trailing overlaps. n=1 self-circularisation
-    # is a special case — only the wrap overlap applies.
     if circular and not errors:
         if n == 1:
             wrap_oh = overlap_lens[0]
@@ -5233,16 +5209,15 @@ def _simulate_gibson_assembly(fragments: list[dict], *,
                     f"{last_trail} ≥ {last_len} bp). Pick a longer "
                     f"fragment or shorter overlaps."
                 )
-    if errors:
-        return {
-            "success": False, "product_seq": "", "circular": circular,
-            "features": [], "overlaps": overlaps,
-            "errors": errors, "warnings": warnings,
-        }
+    return errors
 
-    # Soft warning: very short fragments (< 3 × min_overlap) are
-    # legal but unusual — flag for the user's awareness without
-    # blocking the save.
+
+def _gibson_short_fragment_warnings(
+    norm_fragments: list[dict], *, min_overlap: int,
+) -> list[str]:
+    """Soft warning: fragments < 3× min_overlap are legal but unusual,
+    flag for awareness without blocking the save."""
+    warnings: list[str] = []
     for f in norm_fragments:
         if 0 < len(f["sequence"]) < 3 * min_overlap:
             warnings.append(
@@ -5251,11 +5226,22 @@ def _simulate_gibson_assembly(fragments: list[dict], *,
                 f"{min_overlap} bp homology arms — assembly may "
                 f"be hard to confirm by gel."
             )
+    return warnings
 
-    # Build product sequence + track per-fragment offsets.
+
+def _gibson_build_product(
+    norm_fragments: list[dict], overlap_lens: list[int], *, circular: bool,
+) -> "tuple[str, list[int]]":
+    """Concatenate fragment bodies into the product sequence, tracking
+    each fragment's offset in product coordinates. The trailing copy
+    of each overlap is dropped (`frag[i+1][oh_lead:]`).
+
+    Returns ``(product_seq, offsets)`` where offsets[i] is the product
+    coord at which fragments[i]'s local-pos 0 lands. For wrap fragments
+    this offset can be negative-equivalent (modulo product_len)."""
+    n = len(norm_fragments)
     seq_parts: list[str] = []
     offsets: list[int] = []
-    cursor = 0
     first_seq = norm_fragments[0]["sequence"]
     seq_parts.append(first_seq)
     offsets.append(0)
@@ -5270,7 +5256,6 @@ def _simulate_gibson_assembly(fragments: list[dict], *,
         # fragment's tail.
         offsets.append(cursor - oh_lead)
         cursor += len(body)
-
     if circular:
         if n == 1:
             # Self-circularisation: drop the trailing wrap overlap from
@@ -5278,7 +5263,6 @@ def _simulate_gibson_assembly(fragments: list[dict], *,
             wrap_oh = overlap_lens[0]
             if wrap_oh > 0:
                 seq_parts[0] = seq_parts[0][:-wrap_oh]
-                cursor -= wrap_oh
         else:
             wrap_oh = overlap_lens[n - 1]
             if wrap_oh > 0:
@@ -5286,17 +5270,21 @@ def _simulate_gibson_assembly(fragments: list[dict], *,
                 # they equal the first fragment's leading bases, which
                 # are already at the start of the product.
                 seq_parts[-1] = seq_parts[-1][:-wrap_oh]
-                cursor -= wrap_oh
-
     product_seq = "".join(seq_parts)
-    product_len = len(product_seq)
+    return product_seq, offsets
 
-    # Shift features into product coords. Skip features wholly inside
-    # a fragment's leading-overlap region (i > 0): they're already
-    # covered by the preceding fragment's trailing copy of the same
-    # bases. For circular, features that straddle the wrap junction
-    # become wrap features (end < start) so downstream code can use
-    # `_feat_len` / `_bp_in` to handle them correctly.
+
+def _gibson_shift_features(
+    norm_fragments: list[dict], overlap_lens: list[int],
+    offsets: list[int], product_len: int, *, circular: bool,
+) -> list[dict]:
+    """Shift each fragment's features into product coords. Features
+    wholly inside a fragment's leading-overlap region (i > 0) are
+    skipped — the preceding fragment already supplies the same bases
+    at the same product coords, so emitting them again duplicates the
+    annotation. For circular, features that straddle the wrap junction
+    become wrap features (`end < start`) per the dict-feature
+    convention; `_feat_len` / `_bp_in` handle the resulting topology."""
     shifted: list[dict] = []
     for i, f_dict in enumerate(norm_fragments):
         offset = offsets[i]
@@ -5304,8 +5292,7 @@ def _simulate_gibson_assembly(fragments: list[dict], *,
         for feat in (f_dict.get("features") or []):
             if not isinstance(feat, dict):
                 continue
-            ftype = str(feat.get("type") or "")
-            if ftype == "source":
+            if str(feat.get("type") or "") == "source":
                 continue
             try:
                 s = int(feat.get("start", 0))
@@ -5336,10 +5323,7 @@ def _simulate_gibson_assembly(fragments: list[dict], *,
                 me = product_len if (me_raw == 0 and span > 0) else me_raw
                 if span >= product_len:
                     new_s, new_e = 0, product_len
-                elif ms < me:
-                    new_s, new_e = ms, me
                 else:
-                    # ms >= me — wrap feature in product coords.
                     new_s, new_e = ms, me
             else:
                 # Linear product. Negative `new_s` means the feature's
@@ -5358,29 +5342,40 @@ def _simulate_gibson_assembly(fragments: list[dict], *,
                 if new_e <= new_s:
                     continue
             shifted.append({**feat, "start": new_s, "end": new_e})
+    return shifted
 
-    # Re-merge wrap-source halves: when a circular source plasmid's
-    # wrap feature was split by `_record_features`, both halves carry
-    # the same ``_wrap_pair`` id. After shifting, if the two halves
-    # are still adjacent across the product's wrap (head.new_s == 0
-    # AND tail.new_e == product_len) we collapse them back into one
-    # wrap feature. For linear products or non-adjacent halves the
-    # split is preserved (the biological feature was severed by the
-    # assembly geometry — the user sees two pieces).
+
+def _gibson_merge_wrap_halves(
+    shifted: list[dict], product_len: int, *, circular: bool,
+) -> list[dict]:
+    """Re-merge `_wrap_pair`-tagged halves: when a circular source
+    plasmid's wrap feature was split by `_record_features`, both halves
+    carry the same ``_wrap_pair`` id + ``_wrap_role`` (head/tail). After
+    shifting, if the two halves are still adjacent across the product's
+    wrap (head.start == 0 AND tail.end == product_len) we collapse them
+    back into one wrap feature. For linear products or non-adjacent
+    halves the split is preserved — the biological feature was severed
+    by the assembly geometry."""
     out_feats: list[dict] = []
-    handled_pairs: set[str] = set()
-    pair_index: dict[str, dict] = {}
-    if circular and product_len > 0:
+    if not (circular and product_len > 0):
+        # Linear product: just strip wrap-pair sentinels and pass through.
         for f in shifted:
-            pid = f.get("_wrap_pair")
-            if pid:
-                pair_index.setdefault(pid, {"halves": []})["halves"].append(f)
+            out_feats.append({
+                k: v for k, v in f.items()
+                if not k.startswith("_wrap_")
+            })
+        return out_feats
+    # Index pairs in one pass so we can match heads to tails O(1) below.
+    pair_index: dict[str, list[dict]] = {}
     for f in shifted:
         pid = f.get("_wrap_pair")
-        if pid and circular and product_len > 0:
-            if pid in handled_pairs:
-                continue
-            halves = pair_index.get(pid, {}).get("halves") or []
+        if pid:
+            pair_index.setdefault(pid, []).append(f)
+    handled_pairs: set[str] = set()
+    for f in shifted:
+        pid = f.get("_wrap_pair")
+        if pid and pid not in handled_pairs:
+            halves = pair_index.get(pid) or []
             if len(halves) == 2:
                 head = next((h for h in halves
                              if h.get("_wrap_role") == "head"), None)
@@ -5396,12 +5391,107 @@ def _simulate_gibson_assembly(fragments: list[dict], *,
                     out_feats.append(merged)
                     handled_pairs.add(pid)
                     continue
-            # Halves not adjacent — preserve both as separate features,
-            # but strip the wrap-pair sentinels so downstream code
-            # doesn't see a half-merged shape.
-        cleaned = {k: v for k, v in f.items()
-                   if not k.startswith("_wrap_")}
-        out_feats.append(cleaned)
+        # Either no wrap pair, pair already handled, or halves not
+        # adjacent — strip wrap sentinels and pass through individually.
+        if pid in handled_pairs:
+            continue
+        out_feats.append({
+            k: v for k, v in f.items()
+            if not k.startswith("_wrap_")
+        })
+    return out_feats
+
+
+def _simulate_gibson_assembly(fragments: list[dict], *,
+                                min_overlap: int = _GIBSON_MIN_OVERLAP_BP,
+                                circular: bool = True,
+                              ) -> dict:
+    """Simulate a Gibson assembly of N linear top-strand fragments.
+
+    Each ``fragments[i]`` dict shape:
+        {
+          "name":     str,
+          "sequence": str,            # linear DNA 5' → 3'
+          "features": list[dict],     # optional, in fragment-local coords
+        }
+
+    For each junction (consecutive pair plus the wrap junction when
+    ``circular=True``) the longest exact-match suffix/prefix overlap
+    is detected. Any junction below ``min_overlap`` bp fails the
+    assembly. The product sequence has each overlap appearing once
+    (the trailing copy is dropped: ``frag[i] + frag[i+1][overlap:]``).
+    Features are shifted into product coordinates; features wholly
+    inside a fragment's leading-overlap region are skipped (they're
+    already represented by the preceding fragment's trailing copy).
+
+    Returns ``{success, product_seq, circular, features, overlaps,
+    errors, warnings}`` — see UI consumer (``GibsonAssemblyPane``)
+    for the rendering convention. ``overlaps`` always has one entry
+    per junction so the UI can show the full chain even on partial
+    failure.
+
+    Pre-refactor this was a 370-line monolith; the per-stage logic
+    now lives in `_gibson_*` helpers (normalise → detect overlaps →
+    validate body lengths → build product seq → shift features →
+    re-merge wrap halves). Behaviour is bit-identical; tested by
+    tests/test_gibson.py (47 cases).
+    """
+    norm_fragments, norm_err = _gibson_normalize_fragments(fragments)
+    if norm_err is not None:
+        return _gibson_failure(circular, [norm_err])
+    assert norm_fragments is not None  # err None ⇒ list present
+
+    # Reject zero-length fragments up front — they can't carry homology.
+    for f in norm_fragments:
+        if not f["sequence"]:
+            return _gibson_failure(
+                circular, [f"Fragment {f['name']!r} has no sequence."]
+            )
+
+    if len(norm_fragments) == 1 and not circular:
+        # A single linear fragment doesn't need Gibson — pass through.
+        f = norm_fragments[0]
+        return {
+            "success":     True,
+            "product_seq": f["sequence"],
+            "circular":    False,
+            "features":    list(f["features"]),
+            "overlaps":    [],
+            "errors":      [],
+            "warnings":    [
+                "Single linear fragment — no Gibson junctions to "
+                "validate. Product is the fragment as supplied.",
+            ],
+        }
+
+    overlaps, overlap_lens, junction_errors = _gibson_detect_overlaps(
+        norm_fragments, min_overlap=min_overlap, circular=circular,
+    )
+    if junction_errors:
+        return _gibson_failure(circular, junction_errors, overlaps=overlaps)
+
+    body_errors = _gibson_validate_body_lengths(
+        norm_fragments, overlap_lens, circular=circular,
+    )
+    if body_errors:
+        return _gibson_failure(circular, body_errors, overlaps=overlaps)
+
+    warnings = _gibson_short_fragment_warnings(
+        norm_fragments, min_overlap=min_overlap,
+    )
+
+    product_seq, offsets = _gibson_build_product(
+        norm_fragments, overlap_lens, circular=circular,
+    )
+    product_len = len(product_seq)
+
+    shifted = _gibson_shift_features(
+        norm_fragments, overlap_lens, offsets, product_len,
+        circular=circular,
+    )
+    out_feats = _gibson_merge_wrap_halves(
+        shifted, product_len, circular=circular,
+    )
 
     return {
         "success":     True,
@@ -21270,87 +21360,30 @@ def _simulate_cloned_plasmid(insert: str, oh5: str, oh3: str) -> str:
     return oh5 + insert + oh3 + _PUPD2_BACKBONE_STUB
 
 
-def _clone_part_into_entry_vector(
-    part: dict, entry_vector: dict, grammar: dict,
-):
-    """Simulate the actual cloning event: digest the entry vector +
-    the part's primed amplicon with the grammar's Type IIS enzyme,
-    ligate the insert fragment into the vector backbone, return a
-    circular `SeqRecord` of the cloned plasmid.
+# ── _clone_part_into_entry_vector helpers ─────────────────────────────────
 
-    .. note::
-       **DEFERRED REFACTOR** (355 lines). Splitting needed a dedicated
-       regression scaffold first — feature carry-through math has
-       wrap-aware edge cases that aren't fully covered by the existing
-       test surface (single-source-of-truth offset deltas, dropout
-       boundary feature handling, multi-cut vector simplification).
-       V1.0.0 soft-gate S3. Not refactored in 0.9.x — the risk of a
-       subtle off-by-one in overhang-matching code propagating to a
-       wrong-orientation plasmid is unacceptable without a property-
-       based regression test against `_excise_fragment_pair`.
 
-    Mirrors what happens in real-life Golden Braid / MoClo cloning:
-      1. The entry vector carries a dropout cassette flanked by two
-         enzyme sites (Esp3I for L0, BsaI for L1, etc.).
-      2. Cutting the vector excises the dropout and exposes
-         compatible 4-nt overhangs.
-      3. Cutting the part's PCR amplicon releases the insert with
-         the matching overhangs (designed by the Domesticator).
-      4. Ligation closes the circle: backbone + insert.
+def _clone_part_bail(part: dict, reason: str):
+    """Shared failure-path helper: log a structured reason at info
+    level and return None. Callers fall back to the stub backbone form
+    when this returns None; a `clone_sim:` log line is the breadcrumb
+    that points the user at the failure cause."""
+    _log.info("clone_sim: skipping real-cloning for part %r — %s",
+               part.get("name"), reason)
+    return None
 
-    Handles vectors with **more than 2 enzyme sites** (the common
-    real-world case: a pUPD2 derivative that picked up an extra
-    Esp3I site somewhere in the backbone). The helper finds ANY
-    fragment whose overhangs match the part's, treats it as the
-    dropout, and ligates the surviving fragments end-to-end as the
-    backbone chain — same model as a real one-pot reaction with
-    multiple cuts.
 
-    Logs the specific reason on each failure path via `_log.info`
-    so a user wondering "why is my part still using the pUPD2 stub"
-    can grep `splicecraft.log` for `clone_sim`. Returns ``None`` on
-    failure; callers fall back to the stub backbone form.
-    """
-    from Bio.Seq import Seq
-    from Bio.SeqRecord import SeqRecord
-    from Bio.SeqFeature import SeqFeature, FeatureLocation
-
-    def _bail(reason: str):
-        _log.info("clone_sim: skipping real-cloning for part %r — %s",
-                   part.get("name"), reason)
-        return None
-
-    enzyme = grammar.get("enzyme") if isinstance(grammar, dict) else None
-    if not isinstance(enzyme, str) or enzyme not in _NEB_ENZYMES:
-        return _bail(f"grammar enzyme {enzyme!r} not in NEB catalog")
-    gb_text = (entry_vector.get("gb_text") or "").strip() \
-        if isinstance(entry_vector, dict) else ""
-    if not gb_text:
-        return _bail("entry vector has no gb_text")
-    insert = (part.get("sequence") or "").upper()
-    if not insert:
-        return _bail("part has no sequence")
-    oh5 = (part.get("oh5") or "").upper()
-    oh3 = (part.get("oh3") or "").upper()
-
-    # ── Parse the entry vector ──────────────────────────────────
-    try:
-        vec_rec = _gb_text_to_record(gb_text)
-    except Exception as exc:
-        return _bail(f"entry-vector gb_text parse failed: {exc}")
-    vec_seq = str(vec_rec.seq).upper()
-    if not vec_seq:
-        return _bail("entry vector has empty sequence")
-    vec_topology = (vec_rec.annotations.get("topology", "") or "").lower()
-    vec_circular = vec_topology != "linear"
+def _clone_part_marshal_vec_features(vec_rec) -> list[dict]:
+    """Marshal entry-vector SeqRecord features into the dict shape that
+    `_fragments_from_cuts` expects. Wrap-aware via `_feat_bounds`
+    (pre-fix `int(loc.start)` flattened wrap features to outer bounds
+    and the carry-over logic dropped them as "fully inside the
+    dropout"). Skips `source` rows (whole-record metadata)."""
     vec_features: list[dict] = []
-    total_vec = len(vec_rec.seq) if getattr(vec_rec, "seq", None) is not None else 0
+    total_vec = _seq_len(vec_rec)
     for f in (vec_rec.features or []):
         if f.type == "source":
             continue
-        # Wrap-aware via `_feat_bounds`; pre-fix `int(loc.start)`
-        # flattened wrap features to outer bounds and the carry-over
-        # logic dropped them as "fully inside the dropout".
         bounds = _feat_bounds(f, total_vec)
         if bounds is None:
             continue
@@ -21362,50 +21395,22 @@ def _clone_part_into_entry_vector(
                 label = str(vals[0])
                 break
         vec_features.append({
-            "start": fs, "end": fe,
+            "start":  fs, "end":   fe,
             "strand": f.location.strand or 1,
-            "type": f.type, "label": label or f.type,
-            "color": "white",
+            "type":   f.type,
+            "label":  label or f.type,
+            "color":  "white",
         })
+    return vec_features
 
-    # ── Cut the entry vector at every enzyme site ───────────────
-    # `_excise_fragment_pair` insists on exactly 2 cuts; real
-    # plasmids often have 3+ Esp3I sites (one extra in the backbone
-    # is enough). We use the lower-level `_enzyme_cuts` +
-    # `_fragments_from_cuts` so a multi-cut vector can still
-    # simulate — identify the dropout fragment, ligate the rest
-    # as the backbone chain.
-    cuts = _enzyme_cuts(vec_seq, [enzyme], circular=vec_circular)
-    if len(cuts) < 2:
-        return _bail(
-            f"entry vector has {len(cuts)} {enzyme} cut(s); need ≥2 "
-            f"for the IIS-cloning simulation. Configure a vector "
-            f"with the dropout cassette intact."
-        )
-    all_frags = _fragments_from_cuts(
-        vec_seq, cuts, circular=vec_circular,
-        features=vec_features,
-        source_label=vec_rec.name or "vector",
-    )
-    if not all_frags:
-        return _bail("vector digest produced no fragments")
 
-    # ── Identify the dropout fragment ───────────────────────────
-    # Strategy (in priority order):
-    #   1. The user's part overhangs (oh5/oh3) are the BsaI/L1
-    #      junction overhangs — exposed AFTER L0 cloning. They
-    #      generally do NOT match the L0 entry vector's Esp3I
-    #      cloning overhangs (e.g. pUPD2's CTCG/TGAG dropout).
-    #      So matching by oh5/oh3 fails.
-    #   2. Fall back to "smallest fragment" — the conventional
-    #      dropout cassette in pUPD2-style L0 entry vectors is the
-    #      smaller piece between the two Esp3I cuts (LacZα or
-    #      reporter). Works for FFE 1 ENTRY UPD (854 bp dropout)
-    #      and pUPD2 (small lacZα). Multi-cut vectors with extra
-    #      Esp3I sites in the backbone get the same treatment —
-    #      smallest fragment is still typically the intended
-    #      dropout cassette.
-    raw_name = part.get("name") or "part"
+def _clone_part_build_part_feature(
+    part: dict, raw_name: str, oh5: str, oh3: str,
+) -> dict:
+    """Build the part_feature template that annotates the inserted
+    region in the cloned plasmid. The `end` field is left at 0 because
+    the caller fills it in once the synthesised top_seq length is
+    known."""
     ftype = _GB_PART_TYPE_TO_INSDC.get(part.get("type", ""), "misc_feature")
     note_bits = [f"GB part type: {part.get('type', '?')}"]
     if part.get("position"):
@@ -21414,9 +21419,9 @@ def _clone_part_into_entry_vector(
         note_bits.append(f"5'OH {oh5} / 3'OH {oh3}")
     if part.get("marker"):
         note_bits.append(f"selection {part['marker']}")
-    part_feature = {
+    return {
         "start":  0,
-        "end":    0,   # filled in once we know the synthesised top_seq length
+        "end":    0,
         "strand": 1,
         "type":   ftype,
         "label":  raw_name,
@@ -21424,11 +21429,20 @@ def _clone_part_into_entry_vector(
         "color":  "white",
     }
 
-    # First try: does the part have primer-flanked overhangs that
-    # match a vector fragment exactly? (This is the historical
-    # well-designed-primer path.) If yes, use the original digest
-    # workflow so we honour primer-encoded silent mutations and
-    # respect deliberate overhang choices.
+
+def _clone_part_try_primer_path(
+    part: dict, insert: str, oh5: str, oh3: str,
+    enzyme: str, grammar: dict,
+    all_frags: list[dict], part_feature: dict,
+) -> "tuple[dict | None, int]":
+    """First-try: digest the part's primed amplicon and find a vector
+    fragment whose overhangs exactly match the released insert (with
+    RC fallback). If both fwd + RC fail, return `(None, -1)` so the
+    caller falls through to the synthetic-insert path.
+
+    Returns `(insert_frag, dropout_idx)` on success. `insert_frag`
+    carries any pre-built per-source features (multi-source assembly)
+    shifted to candidate coordinates."""
     primed = part.get("primed_seq") or _simulate_primed_amplicon(
         insert, oh5, oh3, grammar=grammar,
     )
@@ -21436,167 +21450,162 @@ def _clone_part_into_entry_vector(
         primed, [enzyme], circular=False,
         source_label=part.get("name") or "insert",
     )
-    insert_frag = None
-    dropout_idx = -1
-    if len(insert_frags) >= 3:
-        candidate = max(insert_frags[1:-1], key=lambda f: len(f["top_seq"]))
+    if len(insert_frags) < 3:
+        return None, -1
+    candidate = max(insert_frags[1:-1], key=lambda f: len(f["top_seq"]))
 
-        def _find_dropout(insert):
-            for i, f in enumerate(all_frags):
-                if (_ends_compatible(f["left"], insert["left"])
-                        and _ends_compatible(f["right"], insert["right"])):
-                    return i
-            return -1
+    def _find_dropout(insert_to_match):
+        for i, f in enumerate(all_frags):
+            if (_ends_compatible(f["left"],  insert_to_match["left"])
+                    and _ends_compatible(f["right"], insert_to_match["right"])):
+                return i
+        return -1
 
-        dropout_idx = _find_dropout(candidate)
-        if dropout_idx < 0:
-            rc_candidate = _rc_fragment(candidate)
-            dropout_idx = _find_dropout(rc_candidate)
-            if dropout_idx >= 0:
-                candidate = rc_candidate
+    dropout_idx = _find_dropout(candidate)
+    if dropout_idx < 0:
+        rc_candidate = _rc_fragment(candidate)
+        dropout_idx = _find_dropout(rc_candidate)
         if dropout_idx >= 0:
-            insert_frag = dict(candidate)
-            insert_frag["features"] = list(insert_frag.get("features", []))
-            # Pre-built features path (multi-source assembly): the
-            # caller chained per-source features into `part["features"]`
-            # with coords relative to the body insert. The candidate
-            # fragment's top_seq is roughly `oh5 + insert + oh3`, so
-            # shift each feature by `len(oh5)` to land in candidate
-            # coords. Skip the single whole-insert part_feature so
-            # the resulting MOD shows individual TU annotations
-            # (Promoter, CDS, Terminator, …) instead of one collapsed
-            # block named after the entry vector.
-            prebuilt = part.get("features")
-            if isinstance(prebuilt, list) and prebuilt:
-                shift = len(oh5)
-                top_len = len(insert_frag["top_seq"])
-                for fr in prebuilt:
-                    try:
-                        fs = int(fr.get("start", 0))
-                        fe = int(fr.get("end", 0))
-                    except (TypeError, ValueError):
-                        continue
-                    new_s = max(0, min(top_len, fs + shift))
-                    new_e = max(0, min(top_len, fe + shift))
-                    if new_e <= new_s:
-                        continue
-                    insert_frag["features"].append({
-                        **fr,
-                        "start": new_s,
-                        "end":   new_e,
-                    })
-            else:
-                f = dict(part_feature)
-                f["end"] = len(insert_frag["top_seq"])
-                insert_frag["features"].append(f)
+            candidate = rc_candidate
+    if dropout_idx < 0:
+        return None, -1
+    insert_frag = dict(candidate)
+    insert_frag["features"] = list(insert_frag.get("features", []))
+    prebuilt = part.get("features")
+    if isinstance(prebuilt, list) and prebuilt:
+        # Multi-source assembly: caller chained per-source features
+        # with coords relative to the body insert. Candidate top_seq
+        # is roughly `oh5 + insert + oh3`, so shift each feature by
+        # `len(oh5)` into candidate coords. Skip the whole-insert
+        # part_feature so the MOD shows individual TU annotations
+        # (Promoter / CDS / Terminator …) instead of one collapsed
+        # block.
+        shift = len(oh5)
+        top_len = len(insert_frag["top_seq"])
+        for fr in prebuilt:
+            try:
+                fs = int(fr.get("start", 0))
+                fe = int(fr.get("end", 0))
+            except (TypeError, ValueError):
+                continue
+            new_s = max(0, min(top_len, fs + shift))
+            new_e = max(0, min(top_len, fe + shift))
+            if new_e <= new_s:
+                continue
+            insert_frag["features"].append({
+                **fr,
+                "start": new_s,
+                "end":   new_e,
+            })
+    else:
+        f = dict(part_feature)
+        f["end"] = len(insert_frag["top_seq"])
+        insert_frag["features"].append(f)
+    return insert_frag, dropout_idx
 
-    # Second try (fallback): synthesise the insert fragment
-    # directly. Dropout = the vector fragment WITHOUT a backbone
-    # marker (rep_origin, antibiotic resistance) — falls back to
-    # the smallest fragment when feature detection is ambiguous,
-    # which is the conventional pUPD2-style assumption. Insert
-    # top_seq carries the dropout's left overhang + the part's
-    # IIS junction overhangs + insert + right IIS overhang.
-    # Sticky ends are stamped from the dropout's edges so
-    # ligation is always compatible. Feature-aware selection
-    # protects against the "stacked-TU MOD where insert >
-    # backbone" case that would have made min-size pick the
-    # backbone instead of the dropout cassette.
-    if insert_frag is None:
-        dropout = _pick_insert_fragment(all_frags) or all_frags[0]
-        dropout_idx = all_frags.index(dropout)
-        left_end  = dict(dropout["left"])
-        right_end = dict(dropout["right"])
-        left_oh   = left_end.get("overhang_seq", "")
-        # By the fragment-edge convention (see _fragments_from_cuts):
-        # the left overhang region's bases are the FIRST 4 nt of
-        # top_seq; the right overhang region lives at the START of
-        # the next fragment's top_seq, not at the end of this one.
-        # So the synthesised top_seq starts with `left_oh` and ends
-        # with the part's 3' BsaI overhang — the matching right
-        # overhang region is already inside the backbone chain.
-        synth_top = left_oh + oh5 + insert + oh3
-        # Pre-built features path (multi-source assembly): chain
-        # the caller's per-source features with the same offset as
-        # the synthetic insert (left_oh + oh5 prefix). Drops anything
-        # whose body landed wholly inside the overhang regions
-        # (zero-length after shift). For a single-name part (the
-        # historical L0 / single-source case) fall back to the
-        # whole-insert part_feature.
-        prebuilt = part.get("features")
-        if isinstance(prebuilt, list) and prebuilt:
-            shift = len(left_oh) + len(oh5)
-            top_len = len(synth_top)
-            built_features: list[dict] = []
-            for fr in prebuilt:
-                try:
-                    fs = int(fr.get("start", 0))
-                    fe = int(fr.get("end", 0))
-                except (TypeError, ValueError):
-                    continue
-                new_s = max(0, min(top_len, fs + shift))
-                new_e = max(0, min(top_len, fe + shift))
-                if new_e <= new_s:
-                    continue
-                built_features.append({
-                    **fr,
-                    "start": new_s,
-                    "end":   new_e,
-                })
-        else:
-            f = dict(part_feature)
-            # Place the part feature so that the BsaI overhangs flank
-            # it: the insert annotation covers exactly the user's
-            # designed sequence (between oh5 and oh3). The L1-junction
-            # overhangs themselves stay untagged.
-            f["start"] = len(left_oh) + len(oh5)
-            f["end"]   = f["start"] + len(insert)
-            built_features = [f]
-        insert_frag = {
-            "top_seq":      synth_top,
-            "left":         left_end,
-            "right":        right_end,
-            "features":     built_features,
-            "source_label": str(raw_name),
-        }
-        _log.info(
-            "clone_sim: synthesised insert fragment for %r — "
-            "dropout idx %d (%d bp), overhangs %s/%s",
-            raw_name, dropout_idx, len(dropout["top_seq"]),
-            left_oh, right_end.get("overhang_seq", ""),
-        )
 
-    # ── Build the backbone chain: surviving fragments end-to-end
-    # in circular order, starting after the dropout.
+def _clone_part_synthesise_insert(
+    part: dict, insert: str, oh5: str, oh3: str,
+    raw_name: str, all_frags: list[dict], part_feature: dict,
+) -> "tuple[dict, int]":
+    """Fallback path: pick the dropout fragment via feature-aware
+    selection (rep_origin / antibiotic-resistance absent → falls back
+    to smallest), then synthesise the insert fragment directly. Sticky
+    ends are stamped from the dropout's edges so ligation is always
+    compatible.
+
+    By the fragment-edge convention (see `_fragments_from_cuts`): the
+    left overhang region's bases are the FIRST 4 nt of top_seq; the
+    right overhang region lives at the START of the next fragment's
+    top_seq, not at the end of this one. So the synthesised top_seq
+    starts with `left_oh` and ends with the part's 3' overhang."""
+    dropout = _pick_insert_fragment(all_frags) or all_frags[0]
+    dropout_idx = all_frags.index(dropout)
+    left_end  = dict(dropout["left"])
+    right_end = dict(dropout["right"])
+    left_oh   = left_end.get("overhang_seq", "")
+    synth_top = left_oh + oh5 + insert + oh3
+    prebuilt = part.get("features")
+    if isinstance(prebuilt, list) and prebuilt:
+        shift = len(left_oh) + len(oh5)
+        top_len = len(synth_top)
+        built_features: list[dict] = []
+        for fr in prebuilt:
+            try:
+                fs = int(fr.get("start", 0))
+                fe = int(fr.get("end", 0))
+            except (TypeError, ValueError):
+                continue
+            new_s = max(0, min(top_len, fs + shift))
+            new_e = max(0, min(top_len, fe + shift))
+            if new_e <= new_s:
+                continue
+            built_features.append({
+                **fr,
+                "start": new_s,
+                "end":   new_e,
+            })
+    else:
+        f = dict(part_feature)
+        # Place the part feature so that the BsaI overhangs flank it:
+        # the insert annotation covers exactly the user's designed
+        # sequence (between oh5 and oh3). The L1-junction overhangs
+        # themselves stay untagged.
+        f["start"] = len(left_oh) + len(oh5)
+        f["end"]   = f["start"] + len(insert)
+        built_features = [f]
+    insert_frag = {
+        "top_seq":      synth_top,
+        "left":         left_end,
+        "right":        right_end,
+        "features":     built_features,
+        "source_label": str(raw_name),
+    }
+    _log.info(
+        "clone_sim: synthesised insert fragment for %r — "
+        "dropout idx %d (%d bp), overhangs %s/%s",
+        raw_name, dropout_idx, len(dropout["top_seq"]),
+        left_oh, right_end.get("overhang_seq", ""),
+    )
+    return insert_frag, dropout_idx
+
+
+def _clone_part_build_backbone_chain(
+    all_frags: list[dict], dropout_idx: int, enzyme: str,
+) -> "dict | str":
+    """Ligate the surviving (non-dropout) fragments end-to-end in
+    circular order, starting after the dropout. Returns the
+    accumulated chain dict on success, or a human-readable error
+    string on relegation failure (the caller routes this through
+    `_clone_part_bail`)."""
     n = len(all_frags)
     chain_idxs = [(dropout_idx + 1 + i) % n for i in range(n - 1)]
     backbone_chain = all_frags[chain_idxs[0]]
     for ci in chain_idxs[1:]:
         backbone_chain = _ligate_fragments(backbone_chain, all_frags[ci])
         if backbone_chain is None:
-            return _bail(
+            return (
                 f"vector backbone fragments can't relegate after "
                 f"removing dropout — extra {enzyme} sites produce "
                 f"incompatible overhangs"
             )
+    return backbone_chain
 
-    # ── Insert into chain + close circle ────────────────────────
-    linear = _ligate_fragments(insert_frag, backbone_chain)
-    if linear is None:
-        return _bail(
-            "insert overhangs don't match backbone chain "
-            "(ligation step)"
-        )
-    closed = _close_circular(linear)
-    if closed is None:
-        return _bail("circle won't close (right edge ≠ left edge)")
 
-    # ── Build the SeqRecord ─────────────────────────────────────
+def _clone_part_build_seqrecord(
+    closed: dict, vec_rec, raw_name: str,
+):
+    """Turn the closed circular `top_seq` + features dict into a
+    real SeqRecord with `molecule_type=DNA` + `topology=circular`.
+    Features with non-int / negative / out-of-range coords are
+    dropped with a warning log (pre-fix this swallowed every
+    exception including programmer bugs)."""
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    from Bio.SeqFeature import SeqFeature, FeatureLocation
     safe_id = re.sub(r"[^A-Za-z0-9_]", "_", str(raw_name)) or "part"
     new_seq = closed["top_seq"]
     n_seq = len(new_seq)
-    if n_seq == 0:
-        return _bail("cloned plasmid has empty sequence (unreachable)")
     desc_vec = vec_rec.name or vec_rec.id or "vector"
     new_rec = SeqRecord(
         Seq(new_seq), id=safe_id, name=safe_id,
@@ -21623,18 +21632,146 @@ def _clone_part_into_entry_vector(
                 qualifiers=quals,
             ))
         except (TypeError, ValueError) as exc:
-            # FeatureLocation rejects negative / non-int coords; log so a
-            # silently-dropped annotation surfaces in the diagnostic
-            # bundle. Pre-fix this swallowed every exception including
-            # programmer bugs (AttributeError etc.).
             _log.warning(
                 "clone_sim: dropped feature %r (coords %d..%d): %s",
                 f.get("label") or f.get("type"), s, e, exc,
             )
             continue
+    return new_rec
+
+
+def _clone_part_into_entry_vector(
+    part: dict, entry_vector: dict, grammar: dict,
+):
+    """Simulate the actual cloning event: digest the entry vector +
+    the part's primed amplicon with the grammar's Type IIS enzyme,
+    ligate the insert fragment into the vector backbone, return a
+    circular `SeqRecord` of the cloned plasmid.
+
+    Mirrors what happens in real-life Golden Braid / MoClo cloning:
+      1. The entry vector carries a dropout cassette flanked by two
+         enzyme sites (Esp3I for L0, BsaI for L1, etc.).
+      2. Cutting the vector excises the dropout and exposes
+         compatible 4-nt overhangs.
+      3. Cutting the part's PCR amplicon releases the insert with
+         the matching overhangs (designed by the Domesticator).
+      4. Ligation closes the circle: backbone + insert.
+
+    Handles vectors with **more than 2 enzyme sites** (the common
+    real-world case: a pUPD2 derivative that picked up an extra
+    Esp3I site somewhere in the backbone). The helper finds ANY
+    fragment whose overhangs match the part's, treats it as the
+    dropout, and ligates the surviving fragments end-to-end as the
+    backbone chain — same model as a real one-pot reaction with
+    multiple cuts.
+
+    Logs the specific reason on each failure path via `_log.info`
+    so a user wondering "why is my part still using the pUPD2 stub"
+    can grep `splicecraft.log` for `clone_sim`. Returns ``None`` on
+    failure; callers fall back to the stub backbone form.
+
+    Pre-refactor this was a 355-line monolith; per-stage logic now
+    lives in `_clone_part_*` helpers. Behaviour is bit-identical;
+    tested by tests/test_traditional_cloning.py + the Constructor
+    integration tests in tests/test_smoke.py.
+    """
+    enzyme = grammar.get("enzyme") if isinstance(grammar, dict) else None
+    if not isinstance(enzyme, str) or enzyme not in _NEB_ENZYMES:
+        return _clone_part_bail(
+            part, f"grammar enzyme {enzyme!r} not in NEB catalog"
+        )
+    gb_text = (entry_vector.get("gb_text") or "").strip() \
+        if isinstance(entry_vector, dict) else ""
+    if not gb_text:
+        return _clone_part_bail(part, "entry vector has no gb_text")
+    insert = (part.get("sequence") or "").upper()
+    if not insert:
+        return _clone_part_bail(part, "part has no sequence")
+    oh5 = (part.get("oh5") or "").upper()
+    oh3 = (part.get("oh3") or "").upper()
+
+    # ── Parse the entry vector ──────────────────────────────────
+    try:
+        vec_rec = _gb_text_to_record(gb_text)
+    except Exception as exc:
+        return _clone_part_bail(
+            part, f"entry-vector gb_text parse failed: {exc}"
+        )
+    vec_seq = str(vec_rec.seq).upper()
+    if not vec_seq:
+        return _clone_part_bail(part, "entry vector has empty sequence")
+    vec_topology = (vec_rec.annotations.get("topology", "") or "").lower()
+    vec_circular = vec_topology != "linear"
+    vec_features = _clone_part_marshal_vec_features(vec_rec)
+
+    # ── Cut the entry vector at every enzyme site ───────────────
+    # `_excise_fragment_pair` insists on exactly 2 cuts; real
+    # plasmids often have 3+ Esp3I sites (one extra in the backbone
+    # is enough). We use the lower-level `_enzyme_cuts` +
+    # `_fragments_from_cuts` so a multi-cut vector can still
+    # simulate — identify the dropout fragment, ligate the rest
+    # as the backbone chain.
+    cuts = _enzyme_cuts(vec_seq, [enzyme], circular=vec_circular)
+    if len(cuts) < 2:
+        return _clone_part_bail(
+            part,
+            f"entry vector has {len(cuts)} {enzyme} cut(s); need ≥2 "
+            f"for the IIS-cloning simulation. Configure a vector "
+            f"with the dropout cassette intact."
+        )
+    all_frags = _fragments_from_cuts(
+        vec_seq, cuts, circular=vec_circular,
+        features=vec_features,
+        source_label=vec_rec.name or "vector",
+    )
+    if not all_frags:
+        return _clone_part_bail(part, "vector digest produced no fragments")
+
+    raw_name = part.get("name") or "part"
+    part_feature = _clone_part_build_part_feature(part, raw_name, oh5, oh3)
+
+    # First try: primer-flanked overhangs that match a vector fragment
+    # exactly. This is the historical well-designed-primer path —
+    # honours primer-encoded silent mutations + respects deliberate
+    # overhang choices.
+    insert_frag, dropout_idx = _clone_part_try_primer_path(
+        part, insert, oh5, oh3, enzyme, grammar, all_frags, part_feature,
+    )
+
+    # Second try (fallback): synthesise the insert fragment directly.
+    # Feature-aware dropout selection protects against the "stacked-
+    # TU MOD where insert > backbone" case that would have made
+    # min-size pick the backbone instead of the dropout cassette.
+    if insert_frag is None:
+        insert_frag, dropout_idx = _clone_part_synthesise_insert(
+            part, insert, oh5, oh3, raw_name, all_frags, part_feature,
+        )
+
+    # ── Build the backbone chain: surviving fragments end-to-end ──
+    backbone_chain = _clone_part_build_backbone_chain(
+        all_frags, dropout_idx, enzyme,
+    )
+    if isinstance(backbone_chain, str):
+        return _clone_part_bail(part, backbone_chain)
+
+    # ── Insert into chain + close circle ────────────────────────
+    linear = _ligate_fragments(insert_frag, backbone_chain)
+    if linear is None:
+        return _clone_part_bail(
+            part,
+            "insert overhangs don't match backbone chain (ligation step)"
+        )
+    closed = _close_circular(linear)
+    if closed is None:
+        return _clone_part_bail(part, "circle won't close (right edge ≠ left edge)")
+    if not closed.get("top_seq"):
+        return _clone_part_bail(part, "cloned plasmid has empty sequence (unreachable)")
+
+    new_rec = _clone_part_build_seqrecord(closed, vec_rec, raw_name)
     _log.info(
         "clone_sim: real-cloned %r into %r (%d bp → %d bp; %d cuts)",
-        part.get("name"), desc_vec, len(vec_seq), n_seq, len(cuts),
+        part.get("name"), vec_rec.name or vec_rec.id or "vector",
+        len(vec_seq), _seq_len(new_rec), len(cuts),
     )
     return new_rec
 
@@ -21910,139 +22047,92 @@ def _clear_assembly_fragment_cache() -> None:
     _ASSEMBLY_FRAGMENT_CACHE.clear()
 
 
-def _assembly_fragment_from_source(
-    source: dict, grammar: dict, source_level: int,
-) -> "dict | None":
-    """Extract a uniform ``{name, sequence, oh5, oh3, features}``
-    fragment dict from an L0 part OR an L1+ assembled plasmid,
-    suitable for chaining in a multi-part Golden Braid (or any other
-    modular) assembly.
+# ── _assembly_fragment_from_source helpers ────────────────────────────────
 
-    .. note::
-       **DEFERRED REFACTOR** (346 lines). Same reasoning as
-       `_clone_part_into_entry_vector`: feature-carry through across
-       a Type IIS digest has subtle wrap-aware corner cases, and the
-       L0/L1+ branch divergence makes any "extract into per-level
-       helper" simplification a real biology-correctness review.
-       V1.0.0 soft-gate S3.
 
-    L0 sources read fields directly. L1+ sources are digested with the
-    grammar's level-up enzyme; if that yields no clean 2-fragment
-    circular digest the helper falls back to grammar.enzyme (and
-    grammar.level_up_enzyme), so reversed-design vectors keep
-    cycling without a custom grammar. The smaller of the two released
-    fragments becomes the carried "insert", with its features
-    shifted into oh-stripped local coords. Returns ``None`` on any
-    extraction failure so the caller can surface a clean error.
-
-    L1+ digests are LRU-cached by (gb_text_hash, grammar_id,
-    source_level, primary_enzyme, level_up_enzyme); the cache is
-    cleared on parts-bin or grammar saves so a re-domesticated part
-    or a level_up_enzyme tweak takes effect on the next refresh."""
-    if source_level <= 0:
-        seq = (source.get("sequence") or "").upper()
-        oh5 = (source.get("oh5") or "").upper()
-        oh3 = (source.get("oh3") or "").upper()
-        if not seq or not oh5 or not oh3:
-            return None
-        return {
-            "name":     source.get("name") or "part",
-            "sequence": seq,
-            "oh5":      oh5,
-            "oh3":      oh3,
-            "level":    int(source_level),
-        }
-    primary_enzyme = _enzyme_for_level_up(grammar, source_level)
-    if not primary_enzyme:
+def _assembly_fragment_l0(source: dict, source_level: int) -> "dict | None":
+    """L0 short-circuit: read the part's stored sequence + overhangs
+    directly. Returns None if any required field is missing — the L0
+    storage contract requires sequence + oh5 + oh3 to all be present."""
+    seq = (source.get("sequence") or "").upper()
+    oh5 = (source.get("oh5") or "").upper()
+    oh3 = (source.get("oh3") or "").upper()
+    if not seq or not oh5 or not oh3:
         return None
+    return {
+        "name":     source.get("name") or "part",
+        "sequence": seq,
+        "oh5":      oh5,
+        "oh3":      oh3,
+        "level":    int(source_level),
+    }
+
+
+def _assembly_fragment_recover_gb_text(
+    source: dict, source_level: int,
+) -> "str | None":
+    """Get the source plasmid's gb_text, falling back to library lookup.
+
+    Back-compat: parts saved by Load Part before 2026-05-13 only carried
+    `sequence` (the released insert body) without the full plasmid
+    gb_text. Cross-reference the library by name (`id` or `name` match)
+    to recover it so old parts-bin entries don't need to be reloaded.
+
+    Returns ``None`` if no gb_text can be recovered."""
     gb_text = source.get("gb_text") or ""
-    if not gb_text:
-        # Back-compat: parts saved by Load Part before 2026-05-13 only
-        # carried `sequence` (the released insert body) without the full
-        # plasmid gb_text. Cross-reference the library to recover the
-        # gb_text so old parts-bin entries don't need to be reloaded
-        # for Constructor assembly to work.
-        #
-        # The parts-bin entry's `name` field is sanitised from the
-        # source plasmid's GenBank LOCUS, which by convention matches
-        # the library entry's `id`. Try both `id` and `name` matching
-        # so user-facing renames don't break the lookup.
-        src_name = str(source.get("name") or "").strip()
-        if src_name:
-            for e in _load_library():
-                if not isinstance(e, dict):
-                    continue
-                if not e.get("gb_text"):
-                    continue
-                if (str(e.get("id") or "").strip() == src_name
-                        or str(e.get("name") or "").strip() == src_name):
-                    gb_text = e["gb_text"]
-                    _log.info(
-                        "assembly_fragment: recovered gb_text for %r "
-                        "from library (parts bin entry was pre-2026-05-13)",
-                        src_name,
-                    )
-                    break
-        if not gb_text:
-            _log.info(
-                "assembly_fragment: %r has no gb_text and no matching "
-                "library entry — can't digest at level %d. Re-Load Part "
-                "from the source plasmid to refresh.",
-                source.get("name"), source_level,
-            )
-            return None
-    # Cache key: gb_text length + a sha-derived hash + grammar id +
-    # source_level + both enzyme candidates. We don't use the raw
-    # gb_text as a key because it can be hundreds of KB and Python
-    # dict hashing would copy the string bytes on every lookup.
-    # `len(gb_text)` first lets the dict bucket on a cheap int while
-    # hash(gb_text) ties the slot to the actual content. False
-    # positives are impossible (Python str hashing is content-based)
-    # and the (gb_text, grammar, level, enzymes) tuple uniquely
-    # identifies the digest result modulo enzyme catalog changes.
-    grammar_secondary_for_key = str(grammar.get("level_up_enzyme") or "")
-    grammar_primary_for_key   = str(grammar.get("enzyme") or "")
-    cache_key = (
+    if gb_text:
+        return gb_text
+    src_name = str(source.get("name") or "").strip()
+    if src_name:
+        for e in _load_library():
+            if not isinstance(e, dict):
+                continue
+            if not e.get("gb_text"):
+                continue
+            if (str(e.get("id") or "").strip() == src_name
+                    or str(e.get("name") or "").strip() == src_name):
+                _log.info(
+                    "assembly_fragment: recovered gb_text for %r "
+                    "from library (parts bin entry was pre-2026-05-13)",
+                    src_name,
+                )
+                return e["gb_text"]
+    _log.info(
+        "assembly_fragment: %r has no gb_text and no matching "
+        "library entry — can't digest at level %d. Re-Load Part "
+        "from the source plasmid to refresh.",
+        source.get("name"), source_level,
+    )
+    return None
+
+
+def _assembly_fragment_cache_key(
+    gb_text: str, grammar: dict, source_level: int, primary_enzyme: str,
+) -> tuple:
+    """Cache key for `_ASSEMBLY_FRAGMENT_CACHE`. Length + hash + grammar
+    id + source_level + both enzyme candidates. We don't use the raw
+    gb_text as a key because it can be hundreds of KB and Python dict
+    hashing would copy the string bytes on every lookup. `len(gb_text)`
+    lets the dict bucket on a cheap int while `hash(gb_text)` ties the
+    slot to the actual content."""
+    return (
         hash(gb_text), len(gb_text),
         grammar.get("id") or "",
         int(source_level),
         primary_enzyme,
-        grammar_primary_for_key,
-        grammar_secondary_for_key,
+        str(grammar.get("enzyme") or ""),
+        str(grammar.get("level_up_enzyme") or ""),
     )
-    cached = _ASSEMBLY_FRAGMENT_CACHE.get(cache_key, _ASSEMBLY_FRAGMENT_CACHE)
-    if cached is not _ASSEMBLY_FRAGMENT_CACHE:
-        # LRU: bump key to most-recent so steady-state queries don't
-        # evict each other.
-        _ASSEMBLY_FRAGMENT_CACHE.move_to_end(cache_key)
-        # Cached value can legitimately be None (digest failed once,
-        # will fail the same way again until parts/grammar change).
-        # Return a typed clone so callers can mutate the dict (e.g.
-        # palette code rewrites name) without poisoning the cache.
-        # Same contract as the library / collections cache helpers —
-        # immutables are shared, mutables are cloned. See `_typed_clone`.
-        if cached is None:
-            return None
-        return _typed_clone(cached)
-    try:
-        rec = _gb_text_to_record(gb_text)
-    except Exception:
-        _log.exception("assembly_fragment: gb_text parse failed for %r",
-                        source.get("name"))
-        _ASSEMBLY_FRAGMENT_CACHE[cache_key] = None
-        return None
-    plasmid_seq = str(rec.seq).upper()
-    if not plasmid_seq:
-        return None
-    topology = (rec.annotations.get("topology", "") or "").lower()
-    circular = topology != "linear"
-    # Marshal source features into the dict shape `_fragments_from_cuts`
-    # expects. Without this, the released fragment carries no
-    # features and downstream MOD assemblies render as a single
-    # collapsed feature named after the entry vector. Skips `source`
-    # rows (whole-record metadata, not biology) and tolerates
-    # whatever qualifier the original GenBank carried for the label.
-    src_features: list[dict] = []
+
+
+def _assembly_fragment_marshal_src_features(rec) -> list[dict]:
+    """SeqRecord features → dict-shape list for `_excise_fragment_pair`.
+
+    Without this, released fragments carry no features and downstream
+    MOD assemblies render as one collapsed insert. Skips `source` rows
+    (whole-record metadata) and tolerates whatever qualifier carried the
+    label / colour."""
+    out: list[dict] = []
     total_src = _seq_len(rec)
     for f in (rec.features or []):
         if f.type == "source":
@@ -22057,49 +22147,53 @@ def _assembly_fragment_from_source(
             if vals:
                 label = str(vals[0])
                 break
-        # Try to extract a colour qualifier so the assembled MOD
-        # keeps the same chrome the user picked at L0 / TU time.
         color = ""
         for k in ("ApEinfo_fwdcolor", "ApEinfo_revcolor", "color"):
             vals = f.qualifiers.get(k, [])
             if vals:
                 color = str(vals[0])
                 break
-        src_features.append({
+        out.append({
             "start":  fs, "end":   fe,
             "strand": fstrand,
             "type":   f.type,
             "label":  label or f.type,
             "color":  color or "white",
         })
-    # Auto-detect: try the grammar's declared level-up enzyme first,
-    # then fall back to the primary enzyme. Reversed-design vectors
-    # (BsaI INSIDE Esp3I in the alpha cassette) lose the level-up
-    # enzyme's sites during the L0→TU clone — but the OTHER enzyme
-    # (the one used as primary) survives in the assembled TU and IS
-    # the right cutter for that user's TU→MOD step. The fallback
-    # picks whichever enzyme yields a clean 2-fragment circular
-    # digest, so a single grammar can handle both standard and
-    # reversed designs without forcing the user to define a custom
-    # one. For properly-designed standard GB vectors the primary
-    # candidate (level_up_enzyme) succeeds first and the fallback
-    # never triggers — no behavior change.
-    grammar_primary = str(grammar.get("enzyme") or "")
-    grammar_secondary = str(grammar.get("level_up_enzyme") or "")
+    return out
+
+
+def _assembly_fragment_enzyme_candidates(
+    grammar: dict, primary_enzyme: str,
+) -> list[str]:
+    """Build the dedup'd enzyme-candidate list for the digest loop.
+
+    Tries the level-up primary first, then `grammar.enzyme`, then
+    `grammar.level_up_enzyme`. Reversed-design vectors lose the
+    level-up enzyme's sites during the L0→TU clone, so the OTHER
+    enzyme is the right cutter for that user's TU→MOD step. The
+    fallback picks whichever enzyme yields a clean 2-fragment circular
+    digest — properly-designed standard GB vectors hit the primary
+    first and the fallback never triggers (no behaviour change)."""
     candidates: list[str] = [primary_enzyme]
-    # Both `grammar.enzyme` and `grammar.level_up_enzyme` are
-    # candidates, in that order, after the primary. Dedupe so we
-    # don't re-run the same enzyme. Without this, an even-source-
-    # level (L2, L4 …) digest where `_enzyme_for_level_up` already
-    # returned `grammar.enzyme` would have NO fallback, and a
-    # reversed-design L2+ MOD silently fails the way the user's
-    # ALPHA_TEST_1/2 used to fail at L1 → L2.
-    for cand in (grammar_primary, grammar_secondary):
+    for cand in (str(grammar.get("enzyme") or ""),
+                  str(grammar.get("level_up_enzyme") or "")):
         if cand and cand not in candidates:
             candidates.append(cand)
+    return candidates
+
+
+def _assembly_fragment_try_digests(
+    plasmid_seq: str, candidates: list[str], *, circular: bool,
+    src_features: list[dict], source: dict, primary_enzyme: str,
+) -> "tuple[dict | None, str, object]":
+    """Loop over candidate enzymes; return ``(insert_frag, chosen_enzyme, last_err)``.
+
+    `insert_frag` is None if no candidate produced a clean 2-fragment
+    digest with a pickable insert. `chosen_enzyme` is "" in that case.
+    `last_err` carries the most recent `_excise_fragment_pair` error
+    string so the caller can log it."""
     last_err: object = None
-    insert_frag: "dict | None" = None
-    chosen_enzyme: str = ""
     for enz in candidates:
         try:
             frags, err = _excise_fragment_pair(
@@ -22114,14 +22208,12 @@ def _assembly_fragment_from_source(
         if err is not None or len(frags) != 2:
             last_err = err
             continue
-        # Pick the released-insert fragment via feature-aware
-        # selection (rep_origin / antibiotic-resistance absent).
-        # Falls through to overhang match (if the source's stored
-        # oh5/oh3 are present) and finally to min-size for a
-        # robust legacy default. The min-size rule alone breaks
-        # the moment a multi-TU MOD's insert outgrows the carrier
-        # backbone — a fully-stacked level-up cycle is the
-        # archetype of "insert > backbone".
+        # Pick the released-insert fragment via feature-aware selection
+        # (rep_origin / antibiotic-resistance absent). Falls through to
+        # overhang match (if the source's stored oh5/oh3 are present)
+        # and finally to min-size for a robust legacy default. The
+        # min-size rule alone breaks the moment a multi-TU MOD's insert
+        # outgrows the carrier backbone.
         insert_frag = _pick_insert_fragment(
             frags,
             expected_oh5=str(source.get("oh5") or ""),
@@ -22129,40 +22221,37 @@ def _assembly_fragment_from_source(
         )
         if insert_frag is None:
             continue
-        chosen_enzyme = enz
         if enz != primary_enzyme:
             _log.info(
                 "assembly_fragment: %r — level_up enzyme %r had no "
                 "clean digest, fell back to %r",
                 source.get("name"), primary_enzyme, enz,
             )
-        break
-    if insert_frag is None:
-        _log.info(
-            "assembly_fragment: %r — no clean digest under any enzyme "
-            "(%s); last err: %r",
-            source.get("name"), candidates, last_err,
-        )
-        _ASSEMBLY_FRAGMENT_CACHE[cache_key] = None
-        return None
+        return insert_frag, enz, last_err
+    return None, "", last_err
+
+
+def _assembly_fragment_strip_oh5(
+    insert_frag: dict,
+) -> "tuple[str, str, str, list[dict]] | None":
+    """Strip the leading 4-bp 5' overhang to match the L0 storage
+    convention (sequence WITHOUT the overhang; oh5/oh3 held separately).
+
+    The right overhang lives between this fragment's cut and the next
+    fragment, so it doesn't appear inside top_seq. Returns
+    ``(seq_no_oh, oh5, oh3, frag_features)`` or ``None`` if any of
+    top_seq / oh5 / oh3 are empty.
+
+    Features are shifted by -len(oh5). Features whose entire span sat
+    inside the stripped overhang region collapse to zero-length and are
+    dropped — an oh5-only feature has no biological meaning in the
+    chained sequence."""
     top_seq = (insert_frag.get("top_seq") or "").upper()
     oh5 = (insert_frag.get("left")  or {}).get("overhang_seq", "").upper()
     oh3 = (insert_frag.get("right") or {}).get("overhang_seq", "").upper()
     if not top_seq or not oh5 or not oh3:
-        _ASSEMBLY_FRAGMENT_CACHE[cache_key] = None
         return None
-    # Strip the leading 4-bp 5' overhang to match the L0 storage
-    # convention (sequence WITHOUT the overhang; oh5/oh3 held
-    # separately). The right overhang lives between this fragment's
-    # cut and the next fragment, so it doesn't appear inside top_seq.
     seq_no_oh = top_seq[len(oh5):] if top_seq.startswith(oh5) else top_seq
-    # Shift the fragment-local features to oh-stripped coords. The
-    # released fragment's top_seq starts with the oh5 region; once
-    # we strip it for storage convention, every feature must shift
-    # back by `len(oh5)`. Features whose entire span sat inside
-    # the stripped overhang region collapse to zero-length and are
-    # dropped — an oh5-only feature has no biological meaning in
-    # the chained sequence anyway.
     frag_features: list[dict] = []
     for f in (insert_frag.get("features") or []):
         try:
@@ -22181,71 +22270,168 @@ def _assembly_fragment_from_source(
             "start": new_s,
             "end":   min(new_e, len(seq_no_oh)),
         })
-    # Augment with reconstructed L0-part features so every cycle
-    # propagates the full provenance (J23100, cscA, Lambda T0 …)
-    # even when the saved TU/MOD plasmid only carries a single
-    # collapsed feature for the insert region (legacy data, manual
-    # annotations, or sources persisted before multi-feature
-    # support landed). Pure substring search on each `source_parts`
-    # body — works regardless of how the carrier vector lays out
-    # its dropout. Skips features that already exist (same label +
-    # same span) so a fresh multi-feature TU isn't duplicated.
+    return seq_no_oh, oh5, oh3, frag_features
+
+
+def _assembly_fragment_augment_l0_features(
+    seq_no_oh: str, source: dict, grammar: dict,
+    frag_features: list[dict],
+) -> list[dict]:
+    """Augment the fragment's features with reconstructed L0-part
+    features so every cycle propagates the full provenance (J23100,
+    cscA, Lambda T0 …) even when the saved TU/MOD plasmid only carries
+    a single collapsed feature for the insert region.
+
+    Pure substring search on each `source_parts` body — works regardless
+    of how the carrier vector lays out its dropout. Drops features that
+    contain ≥2 reconstructed L0 sub-parts (the "ALPHA TEST 1"-style
+    collapsed annotation): once individual L0 features are surfaced,
+    the wrapping block is redundant clutter. Vector backbone features
+    (Ori, AmpR …) sit outside the L0 region so they fail the
+    containment check and stay."""
     src_parts = source.get("source_parts") or []
-    if isinstance(src_parts, (list, tuple)) and src_parts:
+    if not (isinstance(src_parts, (list, tuple)) and src_parts):
+        return frag_features
+    try:
+        recon = _reconstruct_l0_features_in_seq(
+            seq_no_oh,
+            src_parts,
+            str(grammar.get("id") or ""),
+        )
+    except Exception:
+        _log.exception(
+            "assembly_fragment: L0 feature reconstruction "
+            "raised for %r", source.get("name"),
+        )
+        return frag_features
+    if not recon:
+        return frag_features
+    existing_keys = {
+        (str(f.get("label") or ""),
+         int(f.get("start", -1)),
+         int(f.get("end",   -1)))
+        for f in frag_features
+    }
+    kept_features: list[dict] = []
+    for f in frag_features:
         try:
-            recon = _reconstruct_l0_features_in_seq(
-                seq_no_oh,
-                src_parts,
-                str(grammar.get("id") or ""),
-            )
-        except Exception:
-            _log.exception(
-                "assembly_fragment: L0 feature reconstruction "
-                "raised for %r", source.get("name"),
-            )
-            recon = []
-        if recon:
-            existing_keys = {
-                (str(f.get("label") or ""),
-                 int(f.get("start", -1)),
-                 int(f.get("end",   -1)))
-                for f in frag_features
-            }
-            # Drop features that span ≥2 reconstructed L0 sub-parts:
-            # those are the "ALPHA TEST 1"-style collapsed
-            # annotations that united every L0 position into one
-            # whole-insert block at TU build time. Once we've
-            # surfaced the individual L0 features, the wrapping
-            # block is redundant — keeping it would clutter the
-            # plasmid map with a feature that contains nothing the
-            # smaller features don't already show. Vector backbone
-            # features (HindIII, Ori, AmpR …) sit outside the L0
-            # region so they fail the containment check and stay.
-            kept_features: list[dict] = []
-            for f in frag_features:
-                try:
-                    fs = int(f.get("start", 0))
-                    fe = int(f.get("end",   0))
-                except (TypeError, ValueError):
-                    kept_features.append(f)
-                    continue
-                contained = sum(
-                    1 for r in recon
-                    if int(r.get("start", 0)) >= fs
-                    and int(r.get("end",   0)) <= fe
-                )
-                if contained >= 2:
-                    continue
-                kept_features.append(f)
-            frag_features = kept_features
-            for r in recon:
-                key = (
-                    str(r.get("label") or ""),
-                    int(r.get("start", -1)),
-                    int(r.get("end",   -1)),
-                )
-                if key not in existing_keys:
-                    frag_features.append(r)
+            fs = int(f.get("start", 0))
+            fe = int(f.get("end",   0))
+        except (TypeError, ValueError):
+            kept_features.append(f)
+            continue
+        contained = sum(
+            1 for r in recon
+            if int(r.get("start", 0)) >= fs
+            and int(r.get("end",   0)) <= fe
+        )
+        if contained >= 2:
+            continue
+        kept_features.append(f)
+    for r in recon:
+        key = (
+            str(r.get("label") or ""),
+            int(r.get("start", -1)),
+            int(r.get("end",   -1)),
+        )
+        if key not in existing_keys:
+            kept_features.append(r)
+    return kept_features
+
+
+def _assembly_fragment_from_source(
+    source: dict, grammar: dict, source_level: int,
+) -> "dict | None":
+    """Extract a uniform ``{name, sequence, oh5, oh3, features}``
+    fragment dict from an L0 part OR an L1+ assembled plasmid,
+    suitable for chaining in a multi-part Golden Braid (or any other
+    modular) assembly.
+
+    L0 sources read fields directly. L1+ sources are digested with the
+    grammar's level-up enzyme; if that yields no clean 2-fragment
+    circular digest the helper falls back to grammar.enzyme (and
+    grammar.level_up_enzyme), so reversed-design vectors keep
+    cycling without a custom grammar. The smaller of the two released
+    fragments becomes the carried "insert", with its features
+    shifted into oh-stripped local coords. Returns ``None`` on any
+    extraction failure so the caller can surface a clean error.
+
+    L1+ digests are LRU-cached by (gb_text_hash, grammar_id,
+    source_level, primary_enzyme, level_up_enzyme); the cache is
+    cleared on parts-bin or grammar saves so a re-domesticated part
+    or a level_up_enzyme tweak takes effect on the next refresh.
+
+    Pre-refactor this was a 346-line monolith; per-stage logic now
+    lives in `_assembly_fragment_*` helpers. Behaviour is bit-
+    identical; tested by tests/test_domesticator.py + Constructor
+    integration tests in tests/test_smoke.py.
+    """
+    if source_level <= 0:
+        return _assembly_fragment_l0(source, source_level)
+
+    primary_enzyme = _enzyme_for_level_up(grammar, source_level)
+    if not primary_enzyme:
+        return None
+
+    gb_text = _assembly_fragment_recover_gb_text(source, source_level)
+    if gb_text is None:
+        return None
+
+    cache_key = _assembly_fragment_cache_key(
+        gb_text, grammar, source_level, primary_enzyme,
+    )
+    cached = _ASSEMBLY_FRAGMENT_CACHE.get(cache_key, _ASSEMBLY_FRAGMENT_CACHE)
+    if cached is not _ASSEMBLY_FRAGMENT_CACHE:
+        # LRU: bump key to most-recent so steady-state queries don't
+        # evict each other. Cached value can legitimately be None (digest
+        # failed once, will fail the same way again until parts/grammar
+        # change). Return a typed clone so callers can mutate the dict
+        # without poisoning the cache (see `_typed_clone`, invariant #17).
+        _ASSEMBLY_FRAGMENT_CACHE.move_to_end(cache_key)
+        if cached is None:
+            return None
+        return _typed_clone(cached)
+
+    try:
+        rec = _gb_text_to_record(gb_text)
+    except Exception:
+        _log.exception("assembly_fragment: gb_text parse failed for %r",
+                        source.get("name"))
+        _ASSEMBLY_FRAGMENT_CACHE[cache_key] = None
+        return None
+    plasmid_seq = str(rec.seq).upper()
+    if not plasmid_seq:
+        return None
+    topology = (rec.annotations.get("topology", "") or "").lower()
+    circular = topology != "linear"
+
+    src_features = _assembly_fragment_marshal_src_features(rec)
+    candidates = _assembly_fragment_enzyme_candidates(grammar, primary_enzyme)
+
+    insert_frag, chosen_enzyme, last_err = _assembly_fragment_try_digests(
+        plasmid_seq, candidates, circular=circular,
+        src_features=src_features, source=source,
+        primary_enzyme=primary_enzyme,
+    )
+    if insert_frag is None:
+        _log.info(
+            "assembly_fragment: %r — no clean digest under any enzyme "
+            "(%s); last err: %r",
+            source.get("name"), candidates, last_err,
+        )
+        _ASSEMBLY_FRAGMENT_CACHE[cache_key] = None
+        return None
+
+    stripped = _assembly_fragment_strip_oh5(insert_frag)
+    if stripped is None:
+        _ASSEMBLY_FRAGMENT_CACHE[cache_key] = None
+        return None
+    seq_no_oh, oh5, oh3, frag_features = stripped
+
+    frag_features = _assembly_fragment_augment_l0_features(
+        seq_no_oh, source, grammar, frag_features,
+    )
+
     result = {
         "name":     source.get("name") or "src",
         "sequence": seq_no_oh,
@@ -22255,12 +22441,11 @@ def _assembly_fragment_from_source(
         "enzyme":   chosen_enzyme,
         "features": frag_features,
     }
-    # Cache result. Bound the cache to `_ASSEMBLY_FRAGMENT_CACHE_MAX`
-    # via FIFO eviction (the LRU semantics — `move_to_end` on hit —
-    # already keeps the working set warm). Stores a typed clone so a
-    # caller mutating the returned dict can't poison subsequent
-    # readers; a separate clone is returned on each read so the cached
-    # version stays canonical.
+    # Cache result. Bound the cache via FIFO eviction (the LRU
+    # semantics — `move_to_end` on hit — already keeps the working set
+    # warm). Stores a typed clone so a caller mutating the returned
+    # dict can't poison subsequent readers; a separate clone is
+    # returned on each read so the cached version stays canonical.
     _ASSEMBLY_FRAGMENT_CACHE[cache_key] = _typed_clone(result)
     while len(_ASSEMBLY_FRAGMENT_CACHE) > _ASSEMBLY_FRAGMENT_CACHE_MAX:
         _ASSEMBLY_FRAGMENT_CACHE.popitem(last=False)
@@ -53417,38 +53602,47 @@ class PlasmidApp(App):
     stashes, autosave, agent-API dispatch, modal stack management.
 
     .. note::
-       **DEFERRED REFACTOR — controller split** (156 methods,
-       ~7,600 lines). The audit (see V1_GATE.md soft-gate S6) flagged
-       this class as the largest single legibility cost in the
-       codebase. Cleanest split candidates:
+       **Controller split — evaluated, declined as cosmetic.**
 
-       * ``_UndoController``: ``action_undo``, ``action_redo``,
-         ``_push_undo``, per-plasmid undo stashes, deepcopy hygiene
-         (sacred invariant #10).
-       * ``_AutosaveController``: crash-recovery autosave debounce,
-         ``_mark_dirty`` / ``_mark_clean`` propagation, dirty-state
-         lifecycle (single `_active_dirty` source of truth).
-       * ``_SettingsController``: ``_get_setting`` / ``_set_setting``
-         hydration in ``compose``, ``_settings_flush_worker`` background
-         thread, ``_SETTINGS_SCHEMA`` validation.
-       * ``_RestrictionScanController``: ``_dispatch_restr_scan``,
-         worker pre-capture of (topology, min-length, unique-only),
-         stale-record-counter guard.
+       The audit flagged PlasmidApp (156 methods, ~7,600 lines) for
+       potential mixin extraction (UndoController, AutosaveController,
+       SettingsController, RestrictionScanController). Investigation
+       at audit-completion time (2026-05-17) found that the candidate
+       methods are too tightly coupled to shared App state for the
+       split to be meaningful:
 
-       Extraction shape (chosen so external behaviour is bit-identical):
-       mixin classes, NOT composed objects. Mixins keep the existing
-       `self._foo` attribute discipline intact across all methods;
-       composed objects would force every method to pierce
-       `self.undo._foo` and that's the diff that loses the
-       behaviour-preservation property. Mixin order MUST be documented
-       (App stays last) so the MRO is deterministic.
+       * Undo methods (`_push_undo`, `_apply_snapshot`, `_action_undo`,
+         `_action_redo`) touch `self.query_one("#seq-panel"…)`,
+         `self._current_record`, `self._record_load_counter`,
+         `self._restr_cache`, `self._dispatch_restr_scan()`,
+         `self._mark_dirty()` — i.e. they reach into widget tree +
+         record state + scan dispatch + dirty propagation. A
+         `_UndoMixin` would still need every one of those attributes
+         present on `self` at runtime.
+       * Same pattern for autosave, settings, restriction-scan: the
+         "controller" boundary cuts through call chains rather than
+         around them.
 
-       Not done in 0.9.x: each candidate set needs an isolated test
-       file BEFORE the extraction, then the extraction, then verify
-       the test file still passes against the mixin'd version. Doing
-       all four in one go gambles 2,600 tests on a deep refactor with
-       no incremental safety net. **V1.0.0 soft-gate item — pre-RC
-       sweep, not in the 0.9.x line.**
+       The mixin extraction would therefore be a **pure rename of the
+       class hierarchy** — line counts unchanged, coupling unchanged,
+       behaviour identical, only `len(PlasmidApp.__dict__)` smaller.
+       PlasmidApp already carries 15 `# ── Section ──` comment headers
+       (grep for `# ── ` inside this class to navigate) which give the
+       same legibility benefit a mixin name would, at zero refactor
+       risk.
+
+       What WOULD reduce coupling: composing a proper viewmodel layer
+       beneath PlasmidApp so each controller owned its own state +
+       exposed methods on its own object (`self.undo.push()` etc.).
+       That's a v2.x project — bigger than the v1.0.0 gate and
+       requires a UI architecture rewrite, not a refactor.
+
+       V1_GATE.md soft-gate S6 has been updated to reflect this
+       finding. Future audits should re-evaluate when (a) the
+       coupling itself is reduced (e.g. widget queries are
+       memoised on App start instead of resolved per-call) or
+       (b) the file genuinely exceeds the single-file limit
+       (~100k LoC).
     """
     TITLE       = "SpliceCraft"
     TRANSITIONS = {}          # instant screen open/close — no slide animations

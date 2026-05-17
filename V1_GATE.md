@@ -43,7 +43,7 @@ criteria slip, the date slips.
 | S3 | `_run_update_subcommand` (currently 532 lines) and the other 200+-line functions are below 200 lines each | Reviewability |
 | S4 | Conda-forge / bioconda recipe has been accepted upstream | Reach beyond PyPI |
 | S5 | Performance regression suite (`tests/test_performance.py`) has CI-asserted baselines, not just smoke-runs | Catch silent perf cliffs |
-| S6 | `PlasmidApp` (currently 156 methods) has been factored into composed controllers, OR a written justification for keeping the god-class | Long-term maintainability |
+| S6 | `PlasmidApp` (currently 156 methods) factor-OR-document decision **resolved 2026-05-17**: mixin extraction declined as cosmetic — controllers cut through call chains, not around them. See `PlasmidApp.__doc__` for the full rationale. v2.x viewmodel layer is the proper-decoupling project. | Long-term maintainability |
 | S7 | Issue templates have been used at least once by a real reporter | Validates the channel |
 | S8 | Conda recipe has an open PR or merged PR in bioconda-recipes | Documents the canonical-copy promise |
 

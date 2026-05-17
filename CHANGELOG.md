@@ -46,17 +46,31 @@ PlasmidApp controller split, with a written extraction plan).
   re-imported into `splicecraft.py` so `sc._rc(...)` keeps working
   for every existing caller. Sacred invariants #3, #4, #8 are now
   owned by the new module.
-- **`_run_update_subcommand`**: 532-line god-function split into
-  `_update_build_parser`, `_update_reconcile_pin`,
-  `_update_handle_list_snapshots`, `_update_handle_restore`,
-  `_update_refuse_unsupported_install`, `_update_take_snapshot`,
-  `_update_run_install`. Sacred invariant #39 (snapshot before
-  install subprocess) is preserved — the dispatcher's only
-  responsibility now is making the ordering visible.
-- **Deferred-refactor notes** on `_simulate_gibson_assembly`,
-  `_clone_part_into_entry_vector`, `_assembly_fragment_from_source`,
-  and `PlasmidApp` explain what needs to land first before each one
-  is safe to split.
+- **Four giant functions refactored** into helpers with explicit
+  signatures (no shared closure state, behaviour bit-identical,
+  every existing test still passes):
+  - `_run_update_subcommand` (532 → 210 line dispatcher + 7
+    `_update_*` helpers). Sacred invariant #39 (snapshot before
+    install subprocess) preserved.
+  - `_simulate_gibson_assembly` (370 → 100 line dispatcher + 7
+    `_gibson_*` helpers). All 47 Gibson tests pass.
+  - `_assembly_fragment_from_source` (346 → 100 line dispatcher
+    + 7 `_assembly_fragment_*` helpers). Cache contract preserved
+    (invariant #17). All 569 domesticator + traditional-cloning
+    tests pass.
+  - `_clone_part_into_entry_vector` (355 → 95 line dispatcher
+    + 6 `_clone_part_*` helpers). Both digest paths (primer-flanked
+    overhang match and synthetic-insert fallback) extracted. All
+    616 cloning tests pass.
+- **PlasmidApp controller split — evaluated, declined as cosmetic**
+  (V1_GATE.md S6 resolved). The candidate mixin clusters (Undo,
+  Autosave, Settings, RestrictionScan) cut through call chains
+  rather than around them — every method touches widget queries,
+  `_current_record`, `_record_load_counter`, etc. A mixin
+  extraction would be a pure rename of the class hierarchy with
+  no decoupling benefit. The real decoupling project is a v2.x
+  viewmodel layer beneath PlasmidApp. Documented at length in
+  PlasmidApp's class docstring.
 
 ### Tests
 
