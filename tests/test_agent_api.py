@@ -293,6 +293,68 @@ class TestAddFeatureHandler:
         # Tuple == error; dict == success.
         assert isinstance(result, dict), result
 
+    def test_stale_load_counter_rejects(self, tiny_app):
+        """Regression guard for 2026-05-17 adversarial audit: a canvas
+        swap between handler entry and `_apply` running on the UI thread
+        must drop the agent edit with 409. Pre-fix, `_h_add_feature`
+        would happily annotate whatever record happened to be on the
+        canvas at apply time — wrong molecule corruption."""
+        tiny_app._record_load_counter = 0
+
+        # Simulate the race: between handler entry (which captures
+        # counter==0) and `_apply` execution, the UI thread loads a new
+        # plasmid and bumps `_record_load_counter` to 1.
+        orig_call = tiny_app.call_from_thread
+        def racy_call(fn, *args, **kwargs):
+            tiny_app._record_load_counter = 1
+            return orig_call(fn, *args, **kwargs)
+        tiny_app.call_from_thread = racy_call
+
+        result = sc._h_add_feature(
+            tiny_app, {"start": 0, "end": 10, "label": "t"}
+        )
+        assert isinstance(result, tuple), result
+        payload, status = result
+        assert status == 409
+        assert "canvas reloaded" in payload["error"]
+
+
+class TestDeleteUpdateFeatureStaleLoadGuard:
+    """Regression guards for 2026-05-17 adversarial audit: the agent
+    `delete-feature` and `update-feature` endpoints used to do all
+    their work inside `_apply` on the UI thread without first
+    capturing `_record_load_counter`. A canvas reload between
+    handler entry and the queued `_apply` execution would have the
+    handler delete / update feature `idx` of the WRONG molecule —
+    silent cross-record data corruption."""
+
+    def _racy_app(self, tiny_app):
+        tiny_app._record_load_counter = 0
+        orig_call = tiny_app.call_from_thread
+        def racy_call(fn, *args, **kwargs):
+            tiny_app._record_load_counter = 1
+            return orig_call(fn, *args, **kwargs)
+        tiny_app.call_from_thread = racy_call
+        return tiny_app
+
+    def test_delete_feature_rejects_on_stale_counter(self, tiny_app):
+        app = self._racy_app(tiny_app)
+        result = sc._h_delete_feature(app, {"idx": 0})
+        assert isinstance(result, tuple), result
+        payload, status = result
+        assert status == 409
+        assert "canvas reloaded" in payload["error"]
+
+    def test_update_feature_rejects_on_stale_counter(self, tiny_app):
+        app = self._racy_app(tiny_app)
+        result = sc._h_update_feature(
+            app, {"idx": 0, "label": "should-not-apply"}
+        )
+        assert isinstance(result, tuple), result
+        payload, status = result
+        assert status == 409
+        assert "canvas reloaded" in payload["error"]
+
 
 class TestSaveHandler:
     def test_refuses_when_no_record(self):
@@ -1894,8 +1956,9 @@ class TestPlasmidStatusEndpoints:
 def _minimal_gb_text() -> str:
     """Smallest GenBank text that round-trips through SeqIO — used
     so set-entry-vector's parse-validate step has something real to
-    chew on without fixture sprawl."""
-    return ("LOCUS       test                  10 bp    DNA     "
+    chew on without fixture sprawl. Column widths match SeqIO's own
+    LOCUS-line formatter so Biopython parses it without warning."""
+    return ("LOCUS       test                      10 bp    DNA     "
             "circular SYN 01-JAN-2026\n"
             "FEATURES             Location/Qualifiers\n"
             "ORIGIN      \n"

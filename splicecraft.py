@@ -172,6 +172,7 @@ def _migrate_legacy_data() -> None:
             raise
 
     migrated = []
+    failed: list[tuple[str, str]] = []
     for name in names:
         src = legacy_root / name
         dst = _DATA_DIR / name
@@ -179,13 +180,41 @@ def _migrate_legacy_data() -> None:
             try:
                 _atomic_copy(src, dst)
                 migrated.append(name)
-            except OSError:
-                pass
+            except OSError as exc:
+                # Pre-0.9.3 silently swallowed: a RO mount / disk-full /
+                # permission-denied left the user thinking their library
+                # had vanished (the new `_DATA_DIR` was missing entries
+                # that lived in `legacy_root`). Surface to stderr — the
+                # logger isn't wired up this early in import, but stderr
+                # at launch is loud enough that pipx / pixi / dev shells
+                # will all show it.
+                failed.append((name, str(exc)))
+    if failed:
+        import sys
+        sys.stderr.write(
+            "SpliceCraft: legacy data migration could not copy "
+            f"{len(failed)} file(s) from {legacy_root} → {_DATA_DIR}:\n"
+        )
+        for name, msg in failed:
+            sys.stderr.write(f"  {name}: {msg}\n")
+        sys.stderr.write(
+            "Your existing data is intact at the source path; the new "
+            "data dir is unwritable. Set $SPLICECRAFT_DATA_DIR to a "
+            "writable location, or fix permissions on the destination.\n"
+        )
     if migrated:
         try:
             _atomic_marker_write(_DATA_DIR / ".migrated", "\n".join(migrated))
-        except OSError:
-            pass
+        except OSError as exc:
+            # Idempotent — `not dst.exists()` skips already-migrated files
+            # so we'd retry next launch — but a missing marker means we
+            # can't tell users-of-this-tree the migration ran. Visible
+            # warning to stderr; subsequent runs are silent re-attempts.
+            import sys
+            sys.stderr.write(
+                f"SpliceCraft: migration marker write failed at "
+                f"{_DATA_DIR / '.migrated'}: {exc}\n"
+            )
 
 _migrate_legacy_data()
 
@@ -50288,7 +50317,17 @@ def _h_add_feature(app, payload):
         "qualifiers":   {},
     }
 
+    # Stale-load guard (invariant #28). Coordinates in the payload refer
+    # to the molecule the agent SAW at dispatch; if the user (or another
+    # agent call) pages to a different plasmid before `_apply` lands on
+    # the UI thread, the annotation would write to the wrong record.
+    entry_counter = getattr(app, "_record_load_counter", 0)
+
     def _apply():
+        if entry_counter != getattr(app, "_record_load_counter", 0):
+            return ({"error":
+                      "canvas reloaded mid-edit — agent edit dropped"},
+                    409)
         guard = _agent_dirty_guard(app, payload)
         if guard is not None:
             return guard
@@ -50485,7 +50524,16 @@ def _h_delete_feature(app, payload):
     except (KeyError, ValueError, TypeError, OverflowError):
         return ({"error": "missing or invalid 'idx'"}, 400)
 
+    # Stale-load guard (invariant #28). `idx` refers to the feature
+    # table at dispatch; if the canvas paged to a different plasmid
+    # before `_apply` runs, idx would index the WRONG molecule.
+    entry_counter = getattr(app, "_record_load_counter", 0)
+
     def _apply():
+        if entry_counter != getattr(app, "_record_load_counter", 0):
+            return ({"error":
+                      "canvas reloaded mid-edit — agent edit dropped"},
+                    409)
         guard = _agent_dirty_guard(app, payload)
         if guard is not None:
             return guard
@@ -50559,7 +50607,16 @@ def _h_update_feature(app, payload):
         if new_strand not in (-1, 0, 1):
             return ({"error": "'strand' must be -1, 0, or 1"}, 400)
 
+    # Stale-load guard (invariant #28). Same race as delete-feature:
+    # `idx` is a row-index in the feature table the agent saw; a
+    # canvas swap before apply would re-target the WRONG molecule.
+    entry_counter = getattr(app, "_record_load_counter", 0)
+
     def _apply():
+        if entry_counter != getattr(app, "_record_load_counter", 0):
+            return ({"error":
+                      "canvas reloaded mid-edit — agent edit dropped"},
+                    409)
         guard = _agent_dirty_guard(app, payload)
         if guard is not None:
             return guard

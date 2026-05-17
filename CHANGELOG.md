@@ -14,7 +14,7 @@
 
 ---
 
-## [Unreleased] — Professional-audit sweep
+## [0.9.3] — 2026-05-17 — Professional-audit sweep + adversarial audit sweep #7
 
 Audit-pass sweep landing 17 of the 20 action items from a
 professional code-review pass; 1 partial (`_run_update_subcommand`
@@ -23,7 +23,44 @@ helpers; the three cloning functions get documented deferred-refactor
 notes pending dedicated regression scaffolding); 1 deferred (the
 PlasmidApp controller split, with a written extraction plan).
 
-### Hardening
+Adversarial audit sweep #7 layered on top: 4 parallel audit agents
+(concurrency, security, biology correctness, data integrity) found
+3 HIGH race conditions in the agent-API feature handlers and 1
+MEDIUM silent-failure in legacy-data migration.
+
+### Adversarial sweep #7 — agent-API race + migration visibility
+
+- **HIGH — `_record_load_counter` guards on three agent endpoints**:
+  `_h_add_feature`, `_h_delete_feature`, `_h_update_feature` did
+  all their work inside `_apply` closures dispatched via
+  `call_from_thread`, but never captured `_record_load_counter`
+  at handler entry. A user-triggered plasmid reload between agent
+  dispatch and the queued UI-thread execution would cause the
+  handler to mutate the WRONG molecule (delete feature idx N from
+  the newly-loaded plasmid, write annotation coordinates that point
+  into the new sequence, etc.) — silent cross-record data
+  corruption. Now each handler captures the counter at entry and
+  the `_apply` closure returns 409 `"canvas reloaded mid-edit"`
+  if it shifted. Sacred invariant #28 now covers these three
+  endpoints. Regression tests in
+  `TestAddFeatureHandler.test_stale_load_counter_rejects` and
+  `TestDeleteUpdateFeatureStaleLoadGuard` (3 tests).
+- **MEDIUM — legacy-data migration visibility**: `_migrate_legacy_data`
+  pre-0.9.3 silently swallowed `OSError` on `_atomic_copy` and
+  marker write. A RO mount, disk-full, or permission-denied on the
+  destination data dir left users thinking their library had
+  vanished — the new data dir was missing entries that lived at
+  the source path. Now writes a clear stderr message at startup
+  listing each unmigrated file and pointing at
+  `$SPLICECRAFT_DATA_DIR` as the workaround. The logger isn't
+  wired up that early in import, so stderr is the right surface
+  (pipx / pixi / dev shells all show it).
+- **Test fixture warning**: corrected LOCUS-line column widths in
+  `_minimal_gb_text()` to match Biopython's SeqIO formatter; the
+  two `TestEntryVectorEndpoints` tests no longer emit
+  `BiopythonParserWarning: malformed locus line`.
+
+### Professional audit — hardening
 
 - **Real bug fix**: 4 sites where an `except Exception as exc:`
   closure later referenced `exc` from a `call_from_thread` callback,
