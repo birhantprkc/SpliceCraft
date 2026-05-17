@@ -504,6 +504,99 @@ def _ensure_bioconda_fork(owner: str) -> None:
           "--clone=false", "--default-branch-only"])
 
 
+def _version_tuple(v: str) -> tuple[int, ...]:
+    """Parse 'X.Y.Z[.suffix]' into a comparable tuple. Non-numeric
+    suffix segments contribute their leading digits only (so 0.9.0rc1
+    sorts as (0, 9, 0, 1)) — good enough for the supersede check in
+    `_close_superseded_bioconda_prs`; the rich PEP-440 ordering isn't
+    needed because we only compare same-tool branches."""
+    parts: list[int] = []
+    for piece in v.split("."):
+        try:
+            parts.append(int(piece))
+        except ValueError:
+            digits = "".join(ch for ch in piece if ch.isdigit())
+            parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def _close_superseded_bioconda_prs(owner: str, new_version: str) -> None:
+    """Close any open splicecraft PRs in bioconda-recipes whose branch
+    targets a version OLDER than `new_version`. Same-version PRs are
+    left alone — `_submit_bioconda_pr`'s existing check handles those.
+
+    Why: bioconda reviewers are volunteers and a multi-PR stack for
+    the same software with sequential versions creates ambiguity ("is
+    one of these the canonical ask, or did the maintainer change
+    their mind?"). Closing supersedes with an explicit pointer makes
+    the queue obvious. Without this guard, every `release.py` invocation
+    piles on a new PR while leaving prior ones open — exactly what
+    happened during the 0.8.9 → 0.9.2 stretch where four "first
+    submission" PRs sat green for days while the maintainer waited
+    for the queue to clarify itself.
+
+    Branch convention: `splicecraft-<version>` (see
+    `_submit_bioconda_pr` below — both producer + this consumer).
+    Failures are non-fatal (`check=False`); the new PR opens regardless.
+    """
+    import json as _json
+    result = subprocess.run(
+        ["gh", "pr", "list",
+         "--repo", BIOCONDA_UPSTREAM,
+         "--author", owner,
+         "--state", "open",
+         "--search", "splicecraft in:title",
+         "--json", "number,headRefName,url",
+         "--limit", "20"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return
+    try:
+        prs = _json.loads(result.stdout)
+    except _json.JSONDecodeError:
+        return
+    if not isinstance(prs, list):
+        return
+    new_tuple = _version_tuple(new_version)
+    for pr in prs:
+        branch = pr.get("headRefName", "") or ""
+        if not branch.startswith("splicecraft-"):
+            continue
+        pr_version = branch[len("splicecraft-"):]
+        if _version_tuple(pr_version) >= new_tuple:
+            # Equal or newer — leave alone. Same-version is handled
+            # by the existing branch-match check inside
+            # `_submit_bioconda_pr`; newer would mean something
+            # unexpected (manual PR ahead of release.py) and we'd
+            # rather not auto-close that.
+            continue
+        print(f"  Closing superseded bioconda PR #{pr['number']} "
+              f"(v{pr_version} < v{new_version})")
+        comment_body = (
+            f"Superseded by the upcoming PR for v{new_version}. "
+            f"Closing to clear the queue so a maintainer only needs "
+            f"to review the latest — the recipe content for each "
+            f"interim version is functionally identical apart from "
+            f"version + sha256."
+        )
+        # Comment THEN close, both `check=False` — leaving them
+        # non-fatal so a transient gh / API hiccup doesn't block the
+        # release. Worst case: an older PR stays open and we manually
+        # close it later (the same situation as before this guard).
+        subprocess.run(
+            ["gh", "pr", "comment", str(pr["number"]),
+             "--repo", BIOCONDA_UPSTREAM,
+             "--body", comment_body],
+            check=False, capture_output=True,
+        )
+        subprocess.run(
+            ["gh", "pr", "close", str(pr["number"]),
+             "--repo", BIOCONDA_UPSTREAM],
+            check=False, capture_output=True,
+        )
+
+
 def _submit_bioconda_pr(new_version: str) -> None:
     """Open (or update) a bioconda PR with the current recipe.
 
@@ -511,15 +604,18 @@ def _submit_bioconda_pr(new_version: str) -> None:
       1. Verify `gh` is authed; skip with a note if not.
       2. Fork bioconda/bioconda-recipes if the maintainer's account
          doesn't already host a fork.
-      3. Shallow-clone the fork to a temp dir, fast-forward its
+      3. Close any open splicecraft PRs at an older version so the
+         queue surfaces only the canonical ask
+         (`_close_superseded_bioconda_prs`).
+      4. Shallow-clone the fork to a temp dir, fast-forward its
          master to upstream (so our branch is fresh).
-      4. Drop in `recipes/splicecraft/meta.yaml` from our in-repo
+      5. Drop in `recipes/splicecraft/meta.yaml` from our in-repo
          recipe (which `_sync_conda_recipe` just refreshed).
-      5. Branch, commit, force-push to the fork (force-with-lease so
+      6. Branch, commit, force-push to the fork (force-with-lease so
          a stale branch from a previous failed attempt doesn't block
          us; per-version branches make collisions impossible across
          releases).
-      6. Open the PR against the upstream master. If one for this
+      7. Open the PR against the upstream master. If one for this
          version already exists (re-run), print the URL and skip.
 
     First-time submissions (no `recipes/splicecraft/` directory in
@@ -540,6 +636,7 @@ def _submit_bioconda_pr(new_version: str) -> None:
 
     print(f"  gh authenticated as {owner}")
     _ensure_bioconda_fork(owner)
+    _close_superseded_bioconda_prs(owner, new_version)
 
     import tempfile
     with tempfile.TemporaryDirectory(prefix="bioconda-pr-") as tmp:
