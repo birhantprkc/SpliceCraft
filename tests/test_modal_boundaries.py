@@ -318,6 +318,14 @@ _MODAL_CASES = [
                                                 "MyCustomGrammar",
                                                 "  Test body markup line.\n"
                                                 "  3 dependents.")),
+    # SimulatorScreen is a full-screen workbench (like PrimerDesignScreen /
+    # FeatureLibraryScreen). Tested with a small linear template + minimal
+    # feats so compose has no I/O.
+    ("SimulatorScreen",            lambda: sc.SimulatorScreen(
+                                                "ATGC" * 100,
+                                                _make_feats(),
+                                                "test",
+                                                "circular")),
 ]
 
 

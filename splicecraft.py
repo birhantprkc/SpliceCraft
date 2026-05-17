@@ -6323,15 +6323,24 @@ def _build_seq_inputs(seq: str, feats: list[dict]) -> tuple[list[str], list[dict
         if f.get("type") in ("resite", "recut"):
             continue
         col = f["color"]
+        # Slice assignment is C-backed in CPython; ~10× faster than the
+        # equivalent per-base for-loop on long features (5 kb CDS etc).
+        # `[col] * k` allocates a single list; `styles[a:b] = list` is a
+        # memcpy. Guards keep us off the negative-index path — features
+        # carry start/end in [0, total] by _feat_bounds construction.
         if f["end"] >= f["start"]:
-            for i in range(f["start"], min(f["end"], n)):
-                styles[i] = col
+            e = min(f["end"], n)
+            s = f["start"]
+            if e > s:
+                styles[s:e] = [col] * (e - s)
         else:
             # Wrap feature: colour tail [start, n) + head [0, end).
-            for i in range(f["start"], n):
-                styles[i] = col
-            for i in range(0, min(f["end"], n)):
-                styles[i] = col
+            s = f["start"]
+            if s < n:
+                styles[s:n] = [col] * (n - s)
+            e = min(f["end"], n)
+            if e > 0:
+                styles[:e] = [col] * e
     # Filter out scan-derived restriction-site overlays (they're
     # painted via `pm._restr_feats`, not the lane art). Preserve the
     # caller's insertion order so `_pack_features_2d` can pack
@@ -9940,6 +9949,15 @@ class _Canvas:
         for j, ch in enumerate(text):
             self.put(col + j, row, ch, style)
 
+
+# Pre-built lookup table for braille glyphs U+2800..U+28FF. The combine
+# loop in `_BrailleCanvas.render` writes one cell per (col, row) — on a
+# 160×48 canvas that's ~7,000 chr() calls per render. CPython's small-int
+# char cache stops at chr(255), so braille codepoints miss it. Indexing
+# into a pre-built list saves ~1–2 ms/frame on the circular-map render.
+_BRAILLE_LUT: list[str] = [chr(0x2800 + i) for i in range(256)]
+
+
 class _BrailleCanvas:
     """
     Sub-character resolution canvas using Unicode braille (U+2800–U+28FF).
@@ -10013,7 +10031,7 @@ class _BrailleCanvas:
                         st = tcs_row[col]
                         result.append(tc_ch, style=st) if st else result.append(tc_ch)
                     else:
-                        ch = chr(0x2800 + bc_bits_row[col])
+                        ch = _BRAILLE_LUT[bc_bits_row[col]]
                         c  = bc_colors_row[col]
                         result.append(ch, style=c) if c != " " else result.append(ch)
             if blank_run:
@@ -16351,6 +16369,15 @@ _HELP_BODY_MD = """\
 | `Alt+A` | Align current plasmid against one or more library plasmids — each pick adds a row to the linear-map alignment overlay (blue match · red mismatch · gray gap, with a coverage histogram above). Click a read lane to drill into AlignmentScreen. |
 | `Alt+Shift+A` | Clear every alignment row from the overlay. |
 
+### Menu workbenches (no keyboard shortcut — open from the menu bar)
+
+| Menu | What it does |
+|---|---|
+| `Parts` | Parts bin: browse / classify / edit Type IIS-cloning parts. |
+| `Constructor` | Multi-grammar assembler: Golden Braid · MoClo · Gibson. |
+| `Mutagenize` | SOE-PCR primer design for single-site mutations. |
+| `Simulator` | In-silico PCR (exact-match binding model) + agarose gel rendering. Run a virtual amplification on the loaded template; preview band migration at user-selectable agarose %. |
+
 ### Map / view
 
 | Key | Action |
@@ -20325,9 +20352,20 @@ class CustomEnzymeListModal(ModalScreen):
             app = self.app
             app._restr_custom_enzymes = canonical  # type: ignore[attr-defined]
             app._restr_use_custom_list = active  # type: ignore[attr-defined]
-            # Trigger an immediate rescan if a record is loaded.
+            # Trigger an immediate rescan if a record is loaded. Clear
+            # the stale overlay first — mirrors the `_h_replace_sequence`
+            # pattern (splicecraft.py:49806-49809). Without this, on a
+            # 5 Mb record the user sees old-enzyme-set overlays for the
+            # full scan duration after Save.
             cur = getattr(app, "_current_record", None)
             if cur is not None and getattr(cur, "seq", None) is not None:
+                app._restr_cache = []  # type: ignore[attr-defined]
+                try:
+                    pm = app.query_one("#plasmid-map", PlasmidMap)
+                    pm._restr_feats = []
+                    pm.refresh()
+                except NoMatches:
+                    pass
                 app._dispatch_restr_scan(str(cur.seq))  # type: ignore[attr-defined]
         except (AttributeError, NoMatches):
             pass
@@ -20597,7 +20635,7 @@ class MenuBar(Widget):
     """
 
     MENUS = ["File", "Settings", "Edit", "Enzymes", "Features", "Primers",
-             "Mutagenize", "Parts", "Constructor", "History"]
+             "Mutagenize", "Parts", "Constructor", "Simulator", "History"]
 
     def compose(self) -> ComposeResult:
         for name in self.MENUS:
@@ -30645,12 +30683,16 @@ _ANSI16_HEX: list[str] = [
 ]
 
 
+@_functools.lru_cache(maxsize=256)
 def _xterm_index_to_hex(idx: int) -> str:
     """Convert an xterm-256 color index (0..255) to the closest 24-bit RGB
     hex. Matches the xterm default palette — terminals may remap these but
     the vast majority follow the spec. Cube levels use the canonical
     ``[0, 95, 135, 175, 215, 255]`` ramp; grayscale uses
-    ``8 + 10 * k`` for k in 0..23."""
+    ``8 + 10 * k`` for k in 0..23.
+
+    LRU-cached at maxsize=256 (entire palette) — `_XtermColorGrid.render`
+    calls this 256× per mount and the output is deterministic."""
     idx = max(0, min(255, int(idx)))
     if idx < 16:
         return _ANSI16_HEX[idx]
@@ -35409,6 +35451,97 @@ def _parse_fasta_single(path: str) -> tuple[str, str]:
     return (rec.id or "fasta", seq)
 
 
+# ── Demo plasmid for default no-arg launch ────────────────────────────────────
+#
+# A 1000-bp synthetic circular plasmid used as the default canvas content
+# when `splicecraft` launches without an accession / file argument. The
+# sequence is deterministic — same bytes on every launch — so screenshots,
+# bug reports, and CLI demos all reproduce the same view. Layout:
+#
+#   bp 0..200   — ori-like spacer (pseudo-random)
+#   bp 200..250 — MCS with embedded EcoRI/HindIII/BamHI/XbaI sites
+#                 (so the Simulator gel sub-tab has cuts to demonstrate)
+#   bp 250..550 — synthetic 300-bp ORF (ATG…TAA, no internal stops)
+#   bp 550..700 — terminator-like region (pseudo-random)
+#   bp 700..1000 — backbone spacer (pseudo-random)
+#
+# Generated once via `random.Random(0xC57A1)` and embedded as a literal
+# below — no runtime randomness, no `random` import, no surprises.
+_DEMO_PLASMID_NAME = "demo_1kb"
+_DEMO_PLASMID_SEQ = (
+    "CTGAGCCCGTCCCCTTAATAATCAGTGGGTAGTTTCTTTCAATCGGAGACAGGCCCTATC"
+    "CGGAACTCCCGGCGAATAGTGGTTGGCGGTATTGCTCACTGCTGTCTCGTAACCTTAACC"
+    "CCCCAGATTGAAATTAGGCGTTGGTCCGGGACACAAGTAGCGTTAGCTTTTTCATCAAGG"
+    "CTGCTAGCTTCCCATTTGGCCCTCTCGAATTCCAGTTAAGCTTTATACGGATCCCGGCAT"
+    "CTAGAGGTAAATGGAAGTAATCTTTCAATTCGATCCCGAACTGTCGTATACACTACTCGT"
+    "GACGCGGGTAATAGAGGTTTCAGGCTGTGTCGGATACCGTGCTAAGTCATCTGAGTGGGT"
+    "GGGCGGTAACCATGAAGTCTCGACGTTGGAAACATTTCAAAAAATTCTCGTTATTTCACT"
+    "CAGACGACTACGAGGCAATAACAGGTGTATTGTTAAGTGGCTCTGGTCGTTGTATCGTGT"
+    "CTCCGGCGTCGCTTTAAAACTCATATGTATGAGAATAGGGTCCGTTCATGAAGCAAAACG"
+    "TCAATCGTAATAAGTGGTCCACGAAATTGTCAAACATGGCACTCTCGCCGGATCAGGGTA"
+    "AGTGAGAGTTCCGAGTATCTTCCTATCTCCCTCATGTTCACCTGGATTACGGAAGAACAA"
+    "CACTGCACCTAATCGTCTAAGTCGGAGGGTAAGTAACACGACTTGTGTCATGACAATCAG"
+    "GAAAAATCGCGGTGGCGATGAATTGAACTGCGCCTCATTGACTTGGTCAAGTAAGCTAAG"
+    "AGCGCTATTTTGGTATACTTCACCGATGCCGGCCGTGAAAATCGTAAATCTCTCCACTGG"
+    "TTGTCTCTGATGACGTGGTTCTAAGCTTGAGCAGCTTTAGTATACAACCGGACAGAGCGT"
+    "ACGGGTTTACGCATCGATGCTCAATTCCCGAGGGCACAGGCAATATGGCTACGATGACCA"
+    "AGTTATAGCGCTGTGTTGATCTCTCAGCGAGATAAGTGTG"
+)
+
+
+def _make_demo_record():
+    """Build the 1000-bp synthetic circular plasmid used as the default
+    no-arg launch canvas. Pure constructor — no I/O, no randomness, no
+    library write. The caller is expected to load this through
+    `_apply_record` (not `_import_and_persist`) so the demo doesn't
+    pollute the user's library on every cold launch."""
+    from Bio.Seq            import Seq
+    from Bio.SeqRecord       import SeqRecord
+    from Bio.SeqFeature      import SeqFeature, FeatureLocation
+    if len(_DEMO_PLASMID_SEQ) != 1000:
+        # Defensive: editing the literal above and breaking the length
+        # invariant would silently desync the documented layout from
+        # the feature coordinates below.
+        raise RuntimeError(
+            f"_DEMO_PLASMID_SEQ length is {len(_DEMO_PLASMID_SEQ)} bp, "
+            f"expected 1000"
+        )
+    rec = SeqRecord(
+        Seq(_DEMO_PLASMID_SEQ),
+        id=_DEMO_PLASMID_NAME, name=_DEMO_PLASMID_NAME,
+        description=("SpliceCraft demo · 1 kb synthetic circular plasmid "
+                      "with embedded EcoRI / HindIII / BamHI / XbaI sites"),
+    )
+    rec.annotations["molecule_type"] = "DNA"
+    rec.annotations["topology"]      = "circular"
+    rec.features = [
+        SeqFeature(FeatureLocation(0, 200, strand=1),
+                    type="rep_origin",
+                    qualifiers={"label": ["demo_ori"],
+                                  "note":  ["synthetic origin-of-replication "
+                                             "placeholder"]}),
+        SeqFeature(FeatureLocation(200, 250, strand=1),
+                    type="misc_feature",
+                    qualifiers={"label": ["MCS"],
+                                  "note":  ["EcoRI / HindIII / BamHI / XbaI"]}),
+        SeqFeature(FeatureLocation(250, 550, strand=1),
+                    type="CDS",
+                    qualifiers={"label": ["demo_CDS"],
+                                  "translation": [
+                                      "MKSRGFETLGYHFISLPTLATEGVSEPVISLFTRDIQ"
+                                      "DSLYRGFETPLLGHTRSAYNDYDPCEYLLTPGSGNTI"
+                                      "SDLGGSTTGTQRQEHHGGCYDFENMRRPCNRGR"],
+                                  "note":  ["synthetic ORF, ATG→TAA, "
+                                             "no internal stop"]}),
+        SeqFeature(FeatureLocation(550, 700, strand=1),
+                    type="terminator",
+                    qualifiers={"label": ["demo_term"],
+                                  "note":  ["transcriptional terminator "
+                                             "placeholder"]}),
+    ]
+    return rec
+
+
 def _fasta_path_to_record(path: str):
     """Parse a single-record FASTA at `path` into a `SeqRecord` ready
     to feed `_apply_record`.
@@ -37135,31 +37268,13 @@ class DomesticatorModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-dom-pick-fasta")
     def _pick_fasta(self, _) -> None:
-        """Open the FASTA file picker; on selection, parse the file and
-        display a preview. The picker starts in ``$HOME`` when first opened,
-        then remembers the last picked directory via `self._fasta_path`."""
+        """Open the FASTA file picker; on selection, parse the file in
+        a worker and display a preview. The picker starts in ``$HOME``
+        when first opened, then remembers the last picked directory via
+        `self._fasta_path`."""
         def _on_picked(path: "str | None") -> None:
-            if not path:
-                return
-            try:
-                name, seq = _parse_fasta_single(path)
-            except ValueError as exc:
-                self.app.notify(str(exc), severity="error")
-                return
-            self._fasta_path = path
-            self._fasta_name = name
-            self._fasta_seq  = seq
-            try:
-                display = Path(path).name or path
-                self.query_one("#dom-fasta-name", Static).update(display)
-                head = seq[:40] + ("…" if len(seq) > 40 else "")
-                self.query_one("#dom-fasta-preview", Static).update(
-                    f"  [dim]{name} · {len(seq)} bp[/dim]   {head}"
-                )
-                self.query_one("#dom-primer-results", Static).update("")
-                self.query_one("#btn-dom-save", Button).disabled = True
-            except NoMatches:
-                pass
+            if path:
+                self._parse_fasta_worker(path)
 
         start_dir = (
             str(Path(self._fasta_path).parent)
@@ -37169,6 +37284,48 @@ class DomesticatorModal(ModalScreen):
             FastaFilePickerModal(start_path=start_dir),
             callback=_on_picked,
         )
+
+    @work(thread=True, exclusive=True, group="dom_fasta_parse")
+    def _parse_fasta_worker(self, path: str) -> None:
+        """Parse the picked FASTA off the UI thread; preview update is
+        routed back via `call_from_thread`. Multi-MB FASTA files at the
+        50 MB ingest cap would otherwise freeze the modal for hundreds
+        of ms during `SeqIO.parse`."""
+        try:
+            name, seq = _parse_fasta_single(path)
+        except ValueError as exc:
+            self.app.call_from_thread(
+                self.app.notify, str(exc), severity="error",
+            )
+            return
+        except Exception as exc:
+            _log.exception("Domesticator FASTA parse failed for %s", path)
+            self.app.call_from_thread(
+                self.app.notify, f"FASTA parse failed: {exc}",
+                severity="error",
+            )
+            return
+        self.app.call_from_thread(self._apply_fasta_result, path, name, seq)
+
+    def _apply_fasta_result(self, path: str, name: str, seq: str) -> None:
+        """UI-thread continuation of `_parse_fasta_worker`: stores the
+        parsed FASTA on self and refreshes the preview Statics. The
+        modal may have been dismissed mid-parse — `NoMatches` swallow
+        handles that."""
+        self._fasta_path = path
+        self._fasta_name = name
+        self._fasta_seq  = seq
+        try:
+            display = Path(path).name or path
+            self.query_one("#dom-fasta-name", Static).update(display)
+            head = seq[:40] + ("…" if len(seq) > 40 else "")
+            self.query_one("#dom-fasta-preview", Static).update(
+                f"  [dim]{name} · {len(seq)} bp[/dim]   {head}"
+            )
+            self.query_one("#dom-primer-results", Static).update("")
+            self.query_one("#btn-dom-save", Button).disabled = True
+        except NoMatches:
+            pass
 
     @on(Select.Changed, "#dom-plasmid-feat-select")
     def _plasmid_feat_preview(self, event: Select.Changed) -> None:
@@ -39530,8 +39687,8 @@ def _palette_rows_for_grammar(
 # left-to-right after the Traditional tab. The first tab is the
 # default-opened one when the modal mounts.
 _CONSTRUCTOR_GRAMMARS_FOR_TABS: list[tuple[str, str]] = [
-    ("gb_l0",       "Golden Braid (L0 → L1)"),
-    ("moclo_plant", "MoClo Plant (L0 → L1)"),
+    ("gb_l0",       "Golden Braid"),
+    ("moclo_plant", "MoClo Plant"),
 ]
 
 # Per-grammar L1 destination acceptors. GB uses pDGB1_*; MoClo uses
@@ -39670,11 +39827,9 @@ class ConstructorModal(ModalScreen):
         with Vertical(id="ctor-box"):
             yield Static(" Constructor ", id="ctor-title")
             with TabbedContent(initial="ctor-tab-traditional", id="ctor-tabs"):
-                with TabPane("Traditional  (Restriction digest + ligate)",
-                              id="ctor-tab-traditional"):
+                with TabPane("Traditional", id="ctor-tab-traditional"):
                     yield TraditionalCloningPane(id="ctor-trad-pane")
-                with TabPane("Gibson  (Overlap homology assembly)",
-                              id="ctor-tab-gibson"):
+                with TabPane("Gibson", id="ctor-tab-gibson"):
                     yield GibsonAssemblyPane(id="ctor-gib-pane")
                 for gid, label in _CONSTRUCTOR_GRAMMARS_FOR_TABS:
                     with TabPane(label, id=f"ctor-tab-{gid}"):
@@ -44511,6 +44666,1262 @@ class PrimerDesignScreen(Screen):
         self.dismiss(None)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Simulator — in-silico PCR + agarose gel electrophoresis
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Two flavors of in-silico bench experiment, packaged behind one screen:
+#
+#   1. PCR — `_simulate_pcr` finds every legal amplicon for a (fwd, rev)
+#      primer pair on the loaded template. Exact-match binding model:
+#      primers must match the template verbatim (no mismatch tolerance).
+#      Misprime detection comes "for free" because every match position
+#      is paired against every other downstream rev hit. Wrap-aware on
+#      circular templates. Amplicons can be saved to the plasmid library
+#      as linear DNA fragments (a fresh entry with topology=linear,
+#      molecule_type=DNA).
+#
+#   2. Gel — `_agarose_mobility` translates fragment size + DNA form to
+#      a relative migration distance using the Helling-Goodman-Boyer
+#      empirical observation (within each agarose %'s resolution window,
+#      distance ∝ -log10(bp)) plus the standard form-correction rules
+#      (supercoiled migrates faster than linear of equal size, nicked /
+#      open-circle slower). `_render_gel_image` paints the result as
+#      Rich Text — one lane = one column, well-at-top to dye-front-at-
+#      bottom, with the leftmost ladder used as a tick column for bp
+#      labels.
+#
+# Per-lane sources cover the realistic bench workflow: ladder / uncut
+# plasmid (3-band SC/L/N pattern for circular) / restriction digest of
+# the loaded plasmid / PCR amplicon designed in the PCR sub-tab.
+#
+# `SimulatorScreen` is a full-screen `Screen` (not `ModalScreen`) — it
+# follows the same workbench convention as `PrimerDesignScreen` and
+# `FeatureLibraryScreen`. `TabbedContent` separates PCR + Gel; both
+# panes share the screen's template state (so the user designs an
+# amplicon in PCR, switches to Gel, and the amplicon is already in the
+# PCR lane source).
+
+# ── PCR backend ────────────────────────────────────────────────────────────────
+
+_PCR_MIN_PRIMER_LEN     = 10       # primers shorter than this can't anneal
+_PCR_MAX_PRIMER_LEN     = 80       # absurdly long primer = user error
+_PCR_DEFAULT_MAX_AMPLICON = 20_000   # bp — beyond this is wishful long-PCR
+_PCR_AMPLICON_HARD_CAP  = 100_000  # bp — safety cap regardless of UI input
+_PCR_MAX_AMPLICONS      = 50       # cap on result count (a mispriming primer
+                                   # on a repetitive template can yield 1000s)
+_PCR_MAX_TEMPLATE_BP    = 5_000_000  # 5 Mb — above this we skip the run rather
+                                     # than freeze the UI on chromosome-scale
+                                     # inputs (genome chunks via FASTA import
+                                     # routinely break this threshold).
+# Pathological case: a 10-bp ACGT-only primer on a 5 Mb template can yield
+# ≈ 4,768 expected hits at random; an A-rich primer on an A-rich tract can
+# yield orders of magnitude more. The fwd × rev double-loop is O(N²); cap
+# either side at this many positions and refuse — surfacing a clearer error
+# than a multi-second UI freeze on a pure-A primer.
+_PCR_MAX_PRIMER_HITS    = 5_000
+
+
+def _exact_match_positions(text: str, pattern: str) -> list[int]:
+    """All start positions where `pattern` exactly matches `text`.
+    Overlapping matches are included (`AAAA` in `AAAAA` yields [0, 1])."""
+    if not pattern or not text or len(pattern) > len(text):
+        return []
+    positions: list[int] = []
+    start = 0
+    while True:
+        idx = text.find(pattern, start)
+        if idx == -1:
+            break
+        positions.append(idx)
+        start = idx + 1
+    return positions
+
+
+@_timed("op.simulate_pcr")
+def _simulate_pcr(
+    template_seq: str,
+    fwd_primer:   str,
+    rev_primer:   str,
+    *,
+    circular:      bool = False,
+    max_amplicon:  int  = _PCR_DEFAULT_MAX_AMPLICON,
+) -> list[dict]:
+    """Find every legal amplicon produced by `(fwd_primer, rev_primer)`
+    on `template_seq`.
+
+    Binding model: exact match. The primer must appear verbatim on the
+    template (forward primer on the top strand, reverse primer on the
+    bottom strand → reverse-complement match on top). Mismatch
+    tolerance / Tm-aware annealing is intentionally out of scope for
+    this MVP; cloning primers with 5' tails should be designed via
+    `_design_cloning_primers_raw` and tested by hand.
+
+    Returns a list of dicts sorted by length descending:
+
+        [{
+            "start":         int,    # 5' on top strand (0-based)
+            "end":           int,    # 3' exclusive on top strand
+            "length":        int,    # amplicon bp
+            "wraps":         bool,   # crosses the origin (circular only)
+            "fwd_seq":       str,    # the supplied forward primer
+            "rev_seq":       str,    # the supplied reverse primer
+            "amplicon_seq":  str,    # full top-strand product
+            "gc_pct":        float,  # 0..100
+            "fwd_tm":        float | None,
+            "rev_tm":        float | None,
+        }, ...]
+
+    Honors `_PCR_MAX_AMPLICONS` so a mispriming primer on a repetitive
+    template doesn't generate a runaway result list.
+    """
+    if not isinstance(template_seq, str) or \
+            not isinstance(fwd_primer, str) or \
+            not isinstance(rev_primer, str):
+        return []
+    seq = template_seq.upper()
+    fwd = fwd_primer.upper().strip()
+    rev = rev_primer.upper().strip()
+    n   = len(seq)
+
+    if n == 0 or not fwd or not rev:
+        return []
+    if n > _PCR_MAX_TEMPLATE_BP:
+        # Refuse rather than freeze the UI. Caller surfaces a notice.
+        return []
+    if len(fwd) < _PCR_MIN_PRIMER_LEN or len(rev) < _PCR_MIN_PRIMER_LEN:
+        return []
+    if len(fwd) > _PCR_MAX_PRIMER_LEN or len(rev) > _PCR_MAX_PRIMER_LEN:
+        return []
+    if any(c not in "ACGT" for c in fwd):
+        return []
+    if any(c not in "ACGT" for c in rev):
+        return []
+
+    max_amp = max(1, min(int(max_amplicon), _PCR_AMPLICON_HARD_CAP))
+    min_amp = len(fwd) + len(rev)
+    if max_amp < min_amp:
+        return []
+
+    rev_rc = _rc(rev)
+
+    # Wrap-aware search on circular templates — extend by `max_amp` so
+    # any amplicon ≤ max_amp that crosses the origin is found in a
+    # single linear scan. Cap the extension at `n` to keep allocation
+    # bounded for tiny plasmids with huge `max_amp` inputs.
+    if circular:
+        extend_by = min(max_amp, n)
+        search_seq = seq + seq[:extend_by]
+    else:
+        search_seq = seq
+
+    fwd_hits    = _exact_match_positions(search_seq, fwd)
+    rev_rc_hits = _exact_match_positions(search_seq, rev_rc)
+
+    if not fwd_hits or not rev_rc_hits:
+        return []
+    # Defence against the O(N²) double-loop blowup on pathologically
+    # repetitive primers (e.g. an all-A primer on an A-rich template).
+    # See `_PCR_MAX_PRIMER_HITS`.
+    if len(fwd_hits) > _PCR_MAX_PRIMER_HITS or \
+            len(rev_rc_hits) > _PCR_MAX_PRIMER_HITS:
+        return []
+
+    # Canonical fwd hits live in [0, n) on circular; the wrapped tail
+    # is only for finding amplicons that extend past the origin.
+    if circular:
+        fwd_hits = [p for p in fwd_hits if p < n]
+
+    amplicons: list[dict] = []
+    seen: set[tuple[int, int]] = set()
+
+    for fp in fwd_hits:
+        for rp in rev_rc_hits:
+            # rev primer must be downstream of fwd primer (forward
+            # orientation of the amplicon).
+            if rp < fp:
+                continue
+            length = rp + len(rev_rc) - fp
+            if length < min_amp or length > max_amp:
+                continue
+            # Linear: rev primer must fit within the template.
+            if not circular and rp + len(rev_rc) > n:
+                continue
+
+            wraps = circular and (rp + len(rev_rc) > n)
+            start_t = fp
+            end_t   = (rp + len(rev_rc)) % n if circular else rp + len(rev_rc)
+            # `end_t == 0` is a legitimate wrap end-at-origin; preserve.
+            if circular and end_t == 0 and (rp + len(rev_rc)) == n:
+                end_t = n
+            key = (start_t, end_t)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if circular and wraps:
+                amplicon_seq = seq[fp:] + seq[:(rp + len(rev_rc)) - n]
+            else:
+                amplicon_seq = seq[fp:fp + length] if not circular else \
+                               search_seq[fp:fp + length]
+
+            gc_pct = (sum(1 for c in amplicon_seq if c in "GC")
+                      / max(1, len(amplicon_seq))) * 100.0
+
+            amplicons.append({
+                "start":        start_t,
+                "end":          end_t,
+                "length":       length,
+                "wraps":        wraps,
+                "fwd_seq":      fwd,
+                "rev_seq":      rev,
+                "amplicon_seq": amplicon_seq,
+                "gc_pct":       gc_pct,
+                "fwd_tm":       _primer_tm_safe(fwd),
+                "rev_tm":       _primer_tm_safe(rev),
+            })
+            if len(amplicons) >= _PCR_MAX_AMPLICONS:
+                # Stop early — likely a mispriming runaway. The UI
+                # surfaces a hint to the user when this cap fires.
+                amplicons.sort(key=lambda a: (-a["length"], a["start"]))
+                return amplicons
+
+    amplicons.sort(key=lambda a: (-a["length"], a["start"]))
+    return amplicons
+
+
+# ── Gel migration physics ──────────────────────────────────────────────────────
+
+# Empirical agarose-gel resolution windows. Within each window, distance
+# migrated is approximately linear in -log10(bp) (the Helling-Goodman-
+# Boyer 1974 observation; see Sambrook & Russell, "Molecular Cloning",
+# 3e Table 5-1). Outside the window, bands either run with the dye front
+# (small fragments) or stick near the well (large fragments).
+#
+# Keys are agarose percentages (w/v). Values are (bp_lower_resolution,
+# bp_upper_resolution). The lower bound is the smallest fragment that
+# doesn't run with the dye front; the upper bound is the largest fragment
+# that still resolves from the well.
+_AGAROSE_RANGES: dict[float, tuple[int, int]] = {
+    0.5:  (1000, 30_000),
+    0.7:  ( 800, 12_000),
+    0.8:  ( 800, 12_000),
+    1.0:  ( 500, 10_000),
+    1.2:  ( 400,  7_000),
+    1.5:  ( 200,  4_000),
+    2.0:  ( 100,  2_000),
+    2.5:  ( 100,  1_500),
+    3.0:  (  50,  1_000),
+    4.0:  (  25,    500),
+}
+
+_AGAROSE_CHOICES: tuple[float, ...] = tuple(sorted(_AGAROSE_RANGES.keys()))
+
+# Effective MW multiplier per DNA form. Supercoiled runs faster than
+# linear of equal size → effectively migrates as a smaller linear.
+# Nicked / open-circle (relaxed) migrates slower → effectively a larger
+# linear. The exact factors vary by gel %, voltage, and ionic strength;
+# 0.7×/1.4× are the textbook midline values (Lewis & Slater 1986).
+_GEL_FORM_FACTOR: dict[str, float] = {
+    "linear":      1.0,
+    "supercoiled": 0.7,
+    "nicked":      1.4,
+    "relaxed":     1.4,   # synonym for nicked / open-circle
+}
+
+
+def _agarose_mobility(bp: int, gel_pct: float,
+                       dna_form: str = "linear") -> float:
+    """Return relative mobility in [0, 1]: 0 = at the well (origin), 1
+    = at the dye front. Distance migrated on a rendered gel of height
+    H rows is `round(mobility * (H - 1))`.
+
+    Below the gel's lower resolution bound → mobility ≈ 1 (band at
+    dye front); above the upper bound → mobility ≈ 0 (band at well).
+    Within the window, mobility is linear in -log10(bp).
+
+    `dna_form` ∈ {"linear", "supercoiled", "nicked", "relaxed"}. Unknown
+    forms are treated as linear.
+    """
+    if bp is None or bp <= 0:
+        return 1.0
+    factor = _GEL_FORM_FACTOR.get(dna_form, 1.0)
+    eff_bp = max(1, int(round(bp * factor)))
+    # Snap to nearest configured gel %.
+    gel_pct = min(_AGAROSE_CHOICES, key=lambda g: abs(g - gel_pct))
+    bp_min, bp_max = _AGAROSE_RANGES[gel_pct]
+    if eff_bp <= bp_min:
+        return 0.97   # near dye front but distinguishable
+    if eff_bp >= bp_max:
+        return 0.03   # near well but distinguishable
+    log_lo = math.log10(bp_min)
+    log_hi = math.log10(bp_max)
+    log_x  = math.log10(eff_bp)
+    return (log_hi - log_x) / (log_hi - log_lo)
+
+
+# Standard agarose-gel size ladders. Each entry maps a ladder name to a
+# list of band sizes in bp (top-to-bottom on the gel — largest first).
+# Curated to span the common bench workflow: NEB-style 1 kb Plus and
+# 1 kb for routine cloning; NEB 100 bp for small-fragment work; Lambda
+# digests for legacy / large-fragment work.
+_GEL_LADDERS: dict[str, list[int]] = {
+    "1 kb Plus":  [15000, 10000, 7000, 5000, 4000, 3000, 2000, 1500, 1000,
+                   850, 650, 500, 400, 300, 200, 100],
+    "1 kb":       [10000, 8000, 6000, 5000, 4000, 3000, 2500, 2000, 1500,
+                   1000, 750, 500, 250],
+    "100 bp":     [1517, 1200, 1000, 900, 800, 700, 600, 500, 400,
+                   300, 200, 100],
+    "Lambda/HindIII": [23130, 9416, 6557, 4361, 2322, 2027, 564, 125],
+}
+
+_LADDER_NAMES: tuple[str, ...] = tuple(_GEL_LADDERS.keys())
+
+
+# Per-lane source kinds. The UI surfaces these in a Select dropdown.
+_LANE_SOURCES: tuple[tuple[str, str], ...] = (
+    ("Empty",          "empty"),
+    ("Ladder",         "ladder"),
+    ("Plasmid (uncut)", "plasmid"),
+    ("Digest",         "digest"),
+    ("PCR amplicon",   "pcr"),
+)
+
+
+def _gel_bands_for_lane(
+    lane:          dict,
+    *,
+    template_seq:  str,
+    template_circular: bool,
+    pcr_amplicon: "dict | None",
+) -> list[tuple[int, str]]:
+    """Resolve a lane's source descriptor into a list of `(bp, form)`
+    bands. Pure function for testability — UI rendering separately maps
+    each (bp, form) to a row index.
+
+    Returns an empty list for empty / unrecognised sources.
+    """
+    src    = (lane.get("source") or "empty").lower()
+    detail = (lane.get("detail") or "").strip()
+    bands: list[tuple[int, str]] = []
+    if src == "ladder":
+        name = detail if detail in _GEL_LADDERS else _LADDER_NAMES[0]
+        for bp in _GEL_LADDERS[name]:
+            bands.append((bp, "linear"))
+    elif src == "plasmid":
+        seq_len = len(template_seq or "")
+        if seq_len <= 0:
+            return []
+        if template_circular:
+            # Uncut circular plasmid presents three bands: supercoiled
+            # (fastest), linear (rare — from nicking during prep), nicked
+            # / open-circle (slowest). Bench reality: a fresh prep is
+            # mostly supercoiled with a faint nicked band; show both so
+            # the user reads the rendering as a real gel image.
+            bands.append((seq_len, "supercoiled"))
+            bands.append((seq_len, "nicked"))
+        else:
+            bands.append((seq_len, "linear"))
+    elif src == "digest":
+        if not template_seq:
+            return []
+        enz_list = [e.strip() for e in detail.split(",") if e.strip()]
+        if not enz_list:
+            return []
+        try:
+            frags = _digest_with_enzymes(template_seq, enz_list,
+                                          circular=template_circular)
+        except (ValueError, KeyError, RuntimeError):
+            return []
+        for f in frags:
+            bp = len(f.get("top_seq", "") or "")
+            if bp > 0:
+                bands.append((bp, "linear"))
+    elif src == "pcr":
+        if isinstance(pcr_amplicon, dict):
+            # Defensive: agent endpoint accepts an arbitrary dict for
+            # `pcr_amplicon`; a hostile / malformed payload could carry
+            # a non-numeric `length`. `int()` on the bad value would
+            # surface as a 500 — better to render an empty lane than
+            # crash the gel.
+            try:
+                bp = int(pcr_amplicon.get("length", 0))
+            except (TypeError, ValueError):
+                bp = 0
+            if bp > 0:
+                bands.append((bp, "linear"))
+    return bands
+
+
+def _render_gel_image(
+    lane_specs:    list[dict],
+    *,
+    template_seq:  str,
+    template_circular: bool,
+    pcr_amplicon: "dict | None",
+    agarose_pct:   float,
+    height:        int = 22,
+    lane_width:    int = 7,
+    label_col:     int = 7,
+) -> Text:
+    """Render the gel as Rich `Text`. One column per lane, well-at-top
+    to dye-front-at-bottom. Returns a ready-to-`Static.update()` Text.
+
+    `lane_specs` is the live list of lane config dicts from the gel
+    tab. `pcr_amplicon` is the currently-selected PCR result from the
+    PCR tab (or None if no PCR has been run). All migration math
+    routes through `_agarose_mobility`.
+    """
+    rt = Text()
+    n_lanes = len(lane_specs)
+    if n_lanes == 0:
+        rt.append("(no lanes — add at least one to render a gel)\n",
+                   style="dim italic")
+        return rt
+    # Resolve lane bands.
+    lane_bands: list[list[tuple[int, str]]] = []
+    ladder_lane_idx = -1
+    for li, lane in enumerate(lane_specs):
+        bands = _gel_bands_for_lane(
+            lane,
+            template_seq=template_seq,
+            template_circular=template_circular,
+            pcr_amplicon=pcr_amplicon,
+        )
+        lane_bands.append(bands)
+        if (lane.get("source") or "").lower() == "ladder" and ladder_lane_idx == -1:
+            ladder_lane_idx = li
+
+    # Pre-compute row indices.
+    band_grid: dict[tuple[int, int], int] = {}   # (row, lane) → band count
+    ladder_rows: dict[int, int] = {}             # row → bp size (for tick column)
+    for li, bands in enumerate(lane_bands):
+        for bp, form in bands:
+            mob = _agarose_mobility(bp, agarose_pct, dna_form=form)
+            row = max(0, min(height - 1, int(round(mob * (height - 1)))))
+            band_grid[(row, li)] = band_grid.get((row, li), 0) + 1
+            if li == ladder_lane_idx:
+                # The largest bp at this row wins the tick label.
+                ladder_rows[row] = max(ladder_rows.get(row, 0), bp)
+
+    # Header row: lane numbers.
+    head = " " * label_col
+    for li in range(n_lanes):
+        head += f"{li+1:^{lane_width}} "
+    rt.append(head.rstrip() + "\n", style="bold white")
+    # Lane names (truncated/padded).
+    names = " " * label_col
+    for li in range(n_lanes):
+        label = (lane_specs[li].get("name") or "")[:lane_width]
+        names += f"{label:^{lane_width}} "
+    rt.append(names.rstrip() + "\n", style="cyan")
+    # Wells row.
+    wells = " " * label_col
+    for li in range(n_lanes):
+        wells += "█" * lane_width + " "
+    rt.append(wells.rstrip() + "\n", style="grey50")
+    # Body rows.
+    for row in range(height):
+        if row in ladder_rows:
+            bp = ladder_rows[row]
+            if bp >= 1000:
+                label = f"{bp/1000:>4.1f}k"
+            else:
+                label = f"{bp:>5}"
+            line_left = f"{label} "
+        else:
+            line_left = " " * label_col
+        line = line_left
+        for li in range(n_lanes):
+            count = band_grid.get((row, li), 0)
+            if count == 0:
+                line += " " * lane_width + " "
+            elif count == 1:
+                line += "━" * lane_width + " "
+            elif count == 2:
+                line += "▆" * lane_width + " "
+            else:
+                line += "█" * lane_width + " "
+        rt.append(line.rstrip() + "\n",
+                   style="bright_white" if line_left.strip() else "white")
+    # Dye-front row.
+    front = " " * label_col
+    for li in range(n_lanes):
+        front += "░" * lane_width + " "
+    rt.append(front.rstrip(), style="dim cyan")
+    # Surface a hint about PCR lanes that have no amplicon — the empty
+    # lane is otherwise indistinguishable from a digest that failed or
+    # a plasmid lane the user forgot to configure. Caller hint, not a
+    # `_gel_bands_for_lane` change — the pure function still returns
+    # an empty list per its documented contract.
+    pcr_empty = [
+        li + 1 for li, lane in enumerate(lane_specs)
+        if (lane.get("source") or "").lower() == "pcr"
+        and not lane_bands[li]
+    ]
+    if pcr_empty:
+        nums  = ", ".join(str(n) for n in pcr_empty)
+        label = "lanes" if len(pcr_empty) > 1 else "lane"
+        rt.append(
+            f"\n  PCR {label} {nums}: no amplicon — run a PCR first to populate.",
+            style="dim italic yellow",
+        )
+    return rt
+
+
+# ── Simulator screen ───────────────────────────────────────────────────────────
+
+class SimulatorScreen(Screen):
+    """Full-screen Simulator: PCR (in-silico amplification) + Gel
+    (agarose electrophoresis). Tabs share the loaded template; an
+    amplicon designed in PCR is immediately available as a Gel lane
+    source.
+
+    Layout fits the 160×48 baseline terminal — PCR pane stacks
+    primer inputs + results above a sequence preview; Gel pane keeps
+    the lane config compact (one row per lane) so up to 8 lanes
+    coexist with the rendered image."""
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel",        "Close", show=True),
+        Binding("tab",    "app.focus_next", "",     show=False),
+    ]
+
+    DEFAULT_CSS = """
+    #sim-box {
+        width: 100%; height: 1fr;
+        background: $surface; padding: 0 1;
+    }
+    #sim-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; height: 1;
+    }
+    #sim-tabs { width: 100%; height: 1fr; }
+    #sim-tabs TabPane { padding: 0 1; }
+
+    /* ── PCR pane ───────────────────────────────────────────── */
+    #sim-pcr-pane { width: 100%; height: 1fr; }
+    #sim-pcr-template-row { height: 1; margin: 0 0 1 0; }
+    #sim-pcr-template-row Label { width: auto; padding: 0 1 0 0; }
+    #sim-pcr-template-name {
+        width: auto; max-width: 40;
+        color: $accent; padding: 0 1 0 0;
+    }
+    #sim-pcr-template-meta {
+        width: auto; color: $text-muted; padding: 0 1;
+    }
+
+    .sim-pcr-primer-row { height: 1; margin: 0 0 1 0; }
+    .sim-pcr-primer-row Label { width: 9; padding: 0 1 0 0; content-align: right middle; }
+    .sim-pcr-primer-row Input { width: 1fr; }
+    .sim-pcr-primer-row .sim-tm {
+        width: 12; padding: 0 1;
+        content-align: center middle; color: $text-muted;
+    }
+
+    #sim-pcr-params-row { height: 1; margin: 0 0 1 0; }
+    #sim-pcr-params-row Label {
+        width: auto; padding: 0 1 0 0;
+        content-align: right middle;
+    }
+    #sim-pcr-params-row Input { width: 10; }
+    #sim-pcr-params-row Static {
+        width: auto; color: $text-muted; padding: 0 1;
+    }
+    #sim-pcr-hint { width: 1fr; }
+
+    #sim-pcr-btns { height: 3; margin: 0 0 1 0; }
+    #sim-pcr-btns Button { margin-right: 1; }
+
+    #sim-pcr-status { height: 1; color: $text-muted; margin: 0 0 1 0; }
+    #sim-pcr-table { height: 10; border: solid $primary-darken-2; }
+    #sim-pcr-preview {
+        height: 5; border: solid $primary-darken-2;
+        padding: 0 1; margin-top: 1; color: $accent;
+    }
+
+    /* ── Gel pane (side-by-side: lane config on the left, gel image
+       on the right). Each lane row gets height: 3 so Input + Select
+       widgets render with their borders intact — Textual's Input is
+       cramped at heights < 3. Lane container scrolls vertically when
+       lanes exceed the available height. ─────────────────────────── */
+    #sim-gel-pane { width: 100%; height: 1fr; }
+    #sim-gel-top-row { height: 3; margin: 0 0 1 0; }
+    #sim-gel-top-row Label {
+        width: auto; padding: 0 1 0 0; content-align: right middle;
+    }
+    #sim-gel-top-row Select { width: 16; }
+    #sim-gel-top-row Static {
+        width: 1fr; color: $text-muted; padding: 0 1;
+        content-align: left middle;
+    }
+
+    #sim-gel-split { width: 100%; height: 1fr; }
+    #sim-gel-left {
+        width: 64; height: 1fr; padding-right: 1;
+    }
+    #sim-gel-right { width: 1fr; height: 1fr; }
+
+    #sim-gel-lanes {
+        height: 1fr; min-height: 12;
+        border: solid $primary-darken-2;
+        overflow-y: auto;
+        padding: 0 1;
+    }
+    .sim-gel-lane-row {
+        height: 3; width: 100%; margin: 0 0 0 0;
+    }
+    .sim-gel-lane-num {
+        width: 3; padding: 0 1 0 0;
+        color: $text-muted; content-align: center middle;
+    }
+    .sim-gel-lane-name   { width: 14; }
+    .sim-gel-lane-source { width: 22; }
+    .sim-gel-lane-detail { width: 1fr; min-width: 10; }
+    .sim-gel-lane-del    { width: 5;  min-width: 5; }
+
+    #sim-gel-btns { height: 3; margin-top: 1; }
+    #sim-gel-btns Button { margin-right: 1; min-width: 11; }
+
+    #sim-gel-image {
+        height: 1fr; min-height: 14;
+        border: solid $primary-darken-2;
+        padding: 0 1;
+    }
+
+    #sim-bottom { height: 3; margin-top: 1; }
+    #sim-bottom Button { margin-right: 1; }
+    """
+
+    _MAX_LANES = 8
+
+    def __init__(self,
+                  template_seq:  str = "",
+                  feats:         "list[dict] | None" = None,
+                  plasmid_name:  str = "",
+                  topology:      str = "circular") -> None:
+        super().__init__()
+        # Defensive: callers can pass None or non-str via test paths.
+        if not isinstance(template_seq, str):
+            template_seq = ""
+        if not isinstance(plasmid_name, str):
+            plasmid_name = ""
+        if not isinstance(topology, str):
+            topology = "circular"
+        self._template          = template_seq.upper()
+        self._feats             = list(feats or [])
+        self._plasmid_name      = plasmid_name or "(no plasmid)"
+        self._template_circular = topology.lower() != "linear"
+        self._pcr_amplicons:    list[dict] = []
+        self._selected_pcr_idx: int = -1
+        self._row_to_amp_idx:   list[int] = []
+        # Stale-canvas guard: snapshot the app's load counter at modal-open
+        # time. Saves refuse to apply if the user switched records under us.
+        # See invariant #28.
+        app_ref = _LIVE_APP_REF.get()
+        self._entry_counter = (getattr(app_ref, "_record_load_counter", 0)
+                                if app_ref is not None else 0)
+        # Default lane config — sensible starting point: ladder, uncut
+        # plasmid, digest, PCR. User can edit any of these.
+        self._lanes: list[dict] = [
+            {"name": "Ladder",    "source": "ladder",  "detail": "1 kb"},
+            {"name": "Uncut",     "source": "plasmid", "detail": ""},
+            {"name": "Digest",    "source": "digest",  "detail": "EcoRI"},
+            {"name": "PCR",       "source": "pcr",     "detail": ""},
+        ]
+        self._agarose_pct   = 1.0
+        self._lane_widget_counter = 0   # monotonic widget-id suffix
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        """Always allow Screen-level actions (mirrors PrimerDesignScreen)."""
+        return True
+
+    # ── Layout ─────────────────────────────────────────────────────────────────
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical(id="sim-box"):
+            yield Static(" Simulator  —  PCR + Agarose Gel ", id="sim-title")
+            with TabbedContent(initial="sim-tab-pcr", id="sim-tabs"):
+                with TabPane("PCR", id="sim-tab-pcr"):
+                    yield from self._compose_pcr_pane()
+                with TabPane("Gel", id="sim-tab-gel"):
+                    yield from self._compose_gel_pane()
+            with Horizontal(id="sim-bottom"):
+                yield Button("Close  [Esc]", id="btn-sim-close")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        # Fwd primer Input is the natural first action — every workflow
+        # starts with "enter primers". Mirrors PrimerDesignScreen's
+        # focus-the-primary-input pattern.
+        try:
+            self.query_one("#sim-pcr-fwd", Input).focus()
+        except NoMatches:
+            pass
+
+    def _compose_pcr_pane(self):
+        with Vertical(id="sim-pcr-pane"):
+            with Horizontal(id="sim-pcr-template-row"):
+                yield Label("Template:")
+                yield Static(self._plasmid_name, id="sim-pcr-template-name")
+                meta = (f"{len(self._template):,} bp · "
+                         f"{'circular' if self._template_circular else 'linear'}"
+                        if self._template
+                        else "(no plasmid loaded)")
+                yield Static(meta, id="sim-pcr-template-meta")
+            with Horizontal(classes="sim-pcr-primer-row"):
+                yield Label("Forward:")
+                yield Input(placeholder="5' → 3' (ACGT only, 10–80 bp)",
+                              id="sim-pcr-fwd")
+                yield Static("Tm —", classes="sim-tm", id="sim-pcr-fwd-tm")
+            with Horizontal(classes="sim-pcr-primer-row"):
+                yield Label("Reverse:")
+                yield Input(placeholder="5' → 3' (ACGT only, 10–80 bp)",
+                              id="sim-pcr-rev")
+                yield Static("Tm —", classes="sim-tm", id="sim-pcr-rev-tm")
+            with Horizontal(id="sim-pcr-params-row"):
+                yield Label("Max amplicon (bp):")
+                yield Input(str(_PCR_DEFAULT_MAX_AMPLICON),
+                              id="sim-pcr-maxamp")
+                yield Static("· primers must match template exactly",
+                              id="sim-pcr-hint")
+            with Horizontal(id="sim-pcr-btns"):
+                yield Button("Run PCR", id="btn-sim-pcr-run",
+                              variant="primary")
+                yield Button("Save amplicon to library",
+                              id="btn-sim-pcr-save")
+                yield Button("Send to Gel lane",
+                              id="btn-sim-pcr-togel")
+            yield Static("Enter forward + reverse primers, then click Run.",
+                          id="sim-pcr-status")
+            table = DataTable(id="sim-pcr-table", cursor_type="row",
+                               zebra_stripes=True)
+            table.add_columns("#", "Start", "End", "Length", "Wrap",
+                               "GC%", "Fwd Tm", "Rev Tm")
+            yield table
+            yield Static("(no amplicon selected)", id="sim-pcr-preview")
+
+    def _compose_gel_pane(self):
+        with Vertical(id="sim-gel-pane"):
+            with Horizontal(id="sim-gel-top-row"):
+                yield Label("Agarose %:")
+                yield Select(
+                    [(f"{g:.1f}%", str(g)) for g in _AGAROSE_CHOICES],
+                    id="sim-gel-agarose",
+                    value=str(self._agarose_pct),
+                    allow_blank=False,
+                )
+                yield Static("lanes left-to-right, well-at-top, dye front "
+                              "at bottom · pick a source per lane below")
+            with Horizontal(id="sim-gel-split"):
+                with Vertical(id="sim-gel-left"):
+                    with Vertical(id="sim-gel-lanes"):
+                        for li, lane in enumerate(self._lanes):
+                            yield self._build_lane_row(li, lane)
+                    with Horizontal(id="sim-gel-btns"):
+                        yield Button("+ Lane", id="btn-sim-gel-addlane")
+                        yield Button("− Lane", id="btn-sim-gel-rmlane")
+                        yield Button("Run gel", id="btn-sim-gel-run",
+                                      variant="primary")
+                with Vertical(id="sim-gel-right"):
+                    yield Static("", id="sim-gel-image")
+
+    def _build_lane_row(self, idx: int, lane: dict) -> Horizontal:
+        """Construct a lane row as a single Horizontal widget. Used by
+        both `compose()` (yields directly) and `_refresh_lane_rows()`
+        (mounts at runtime). Generators with `with Horizontal(): yield …`
+        only collect into a parent inside Textual's compose machinery; at
+        runtime they yield bare widgets without the wrapper, so add /
+        remove cycles need a concrete widget."""
+        # IDs use a monotonic counter so an Add-then-Remove-then-Add
+        # cycle can't reuse a stale ID against a still-mounted widget.
+        self._lane_widget_counter += 1
+        suffix = self._lane_widget_counter
+        row = Horizontal(
+            Static(f"{idx+1}", classes="sim-gel-lane-num",
+                    id=f"sim-gel-lane-num-{suffix}"),
+            Input(value=lane.get("name", ""),
+                   classes="sim-gel-lane-name",
+                   id=f"sim-gel-lane-name-{suffix}",
+                   placeholder="Name"),
+            Select(
+                list(_LANE_SOURCES),
+                value=lane.get("source", "empty"),
+                allow_blank=False,
+                classes="sim-gel-lane-source",
+                id=f"sim-gel-lane-source-{suffix}",
+            ),
+            Input(value=lane.get("detail", ""),
+                   classes="sim-gel-lane-detail",
+                   id=f"sim-gel-lane-detail-{suffix}",
+                   placeholder="(detail — see help)"),
+            Button("✕", classes="sim-gel-lane-del",
+                    id=f"btn-sim-gel-rm-{suffix}"),
+            classes="sim-gel-lane-row",
+            id=f"sim-gel-lane-row-{suffix}",
+        )
+        lane["_suffix"] = suffix
+        return row
+
+    # ── Lane config sync ───────────────────────────────────────────────────────
+
+    def _read_lanes_from_widgets(self) -> None:
+        """Pull current widget values into `self._lanes`. Called before
+        any run / save / add / remove so the in-memory model never
+        drifts from what the user typed."""
+        for lane in self._lanes:
+            suffix = lane.get("_suffix")
+            if suffix is None:
+                continue
+            try:
+                name_w = self.query_one(f"#sim-gel-lane-name-{suffix}", Input)
+                src_w  = self.query_one(f"#sim-gel-lane-source-{suffix}",
+                                          Select)
+                det_w  = self.query_one(f"#sim-gel-lane-detail-{suffix}",
+                                          Input)
+            except NoMatches:
+                continue
+            lane["name"]   = name_w.value
+            lane["source"] = str(src_w.value) if src_w.value is not None \
+                              else "empty"
+            lane["detail"] = det_w.value
+
+    # ── PCR handlers ───────────────────────────────────────────────────────────
+
+    @on(Input.Changed, "#sim-pcr-fwd")
+    def _on_fwd_changed(self, event: Input.Changed) -> None:
+        self._update_primer_tm("sim-pcr-fwd", "sim-pcr-fwd-tm")
+
+    @on(Input.Changed, "#sim-pcr-rev")
+    def _on_rev_changed(self, event: Input.Changed) -> None:
+        self._update_primer_tm("sim-pcr-rev", "sim-pcr-rev-tm")
+
+    def _update_primer_tm(self, input_id: str, tm_id: str) -> None:
+        try:
+            txt = self.query_one(f"#{input_id}", Input).value
+            lbl = self.query_one(f"#{tm_id}", Static)
+        except NoMatches:
+            return
+        seq = (txt or "").upper().strip()
+        if not seq or any(c not in "ACGT" for c in seq) or \
+                not (_PCR_MIN_PRIMER_LEN <= len(seq) <= _PCR_MAX_PRIMER_LEN):
+            lbl.update("Tm —")
+            return
+        tm = _primer_tm_safe(seq)
+        lbl.update(f"Tm {tm:.1f}°C" if tm is not None else "Tm —")
+
+    @on(Button.Pressed, "#btn-sim-pcr-run")
+    def _on_pcr_run(self, _) -> None:
+        try:
+            fwd = self.query_one("#sim-pcr-fwd", Input).value.upper().strip()
+            rev = self.query_one("#sim-pcr-rev", Input).value.upper().strip()
+            max_amp_txt = self.query_one("#sim-pcr-maxamp", Input).value.strip()
+            status = self.query_one("#sim-pcr-status", Static)
+            table  = self.query_one("#sim-pcr-table", DataTable)
+            preview = self.query_one("#sim-pcr-preview", Static)
+        except NoMatches:
+            return
+        if not self._template:
+            status.update("[red]No template loaded.[/]")
+            return
+        if not fwd or not rev:
+            status.update("[red]Enter both forward and reverse primers.[/]")
+            return
+        if len(fwd) < _PCR_MIN_PRIMER_LEN or len(rev) < _PCR_MIN_PRIMER_LEN:
+            status.update(
+                f"[red]Primers must be at least {_PCR_MIN_PRIMER_LEN} bp.[/]")
+            return
+        if any(c not in "ACGT" for c in fwd):
+            status.update("[red]Forward primer must be ACGT only.[/]")
+            return
+        if any(c not in "ACGT" for c in rev):
+            status.update("[red]Reverse primer must be ACGT only.[/]")
+            return
+        try:
+            max_amp = int(max_amp_txt)
+        except ValueError:
+            status.update("[red]Max amplicon must be an integer.[/]")
+            return
+        if max_amp <= 0:
+            status.update("[red]Max amplicon must be positive.[/]")
+            return
+        if len(self._template) > _PCR_MAX_TEMPLATE_BP:
+            status.update(
+                f"[yellow]Template is {len(self._template):,} bp — exceeds "
+                f"the {_PCR_MAX_TEMPLATE_BP:,} bp PCR-sim cap (UI would "
+                f"freeze on a chromosome-scale find).[/]"
+            )
+            return
+        amps = _simulate_pcr(self._template, fwd, rev,
+                              circular=self._template_circular,
+                              max_amplicon=max_amp)
+        _log_event("simulator.pcr.run",
+                    template_bp=len(self._template),
+                    circular=self._template_circular,
+                    fwd_len=len(fwd), rev_len=len(rev),
+                    max_amplicon=max_amp,
+                    n_amplicons=len(amps),
+                    capped=(len(amps) >= _PCR_MAX_AMPLICONS))
+        self._pcr_amplicons = amps
+        self._selected_pcr_idx = 0 if amps else -1
+        table.clear()
+        self._row_to_amp_idx = []
+        if not amps:
+            status.update(
+                "[yellow]No amplicons found. Check primer orientation, "
+                "verify the primers match the template exactly, and "
+                "confirm the template is loaded.[/]"
+            )
+            preview.update("(no amplicon selected)")
+            return
+        for i, amp in enumerate(amps):
+            fwd_tm = (f"{amp['fwd_tm']:.1f}°C"
+                      if amp.get("fwd_tm") is not None else "—")
+            rev_tm = (f"{amp['rev_tm']:.1f}°C"
+                      if amp.get("rev_tm") is not None else "—")
+            table.add_row(
+                str(i + 1),
+                str(amp["start"] + 1),     # 1-based for display
+                str(amp["end"]),
+                f"{amp['length']:,}",
+                "yes" if amp["wraps"] else "—",
+                f"{amp['gc_pct']:.1f}",
+                fwd_tm,
+                rev_tm,
+            )
+            self._row_to_amp_idx.append(i)
+        runaway = (len(amps) >= _PCR_MAX_AMPLICONS)
+        msg = f"Found {len(amps)} amplicon{'s' if len(amps) != 1 else ''}."
+        if runaway:
+            msg += (f" [yellow](result capped at {_PCR_MAX_AMPLICONS} — "
+                    "consider tighter primers)[/]")
+        status.update(msg)
+        # Select first row + preview.
+        from textual.coordinate import Coordinate
+        table.cursor_coordinate = Coordinate(0, 0)
+        self._refresh_pcr_preview()
+
+    @on(DataTable.RowHighlighted, "#sim-pcr-table")
+    def _on_pcr_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        row = event.cursor_row
+        if 0 <= row < len(self._row_to_amp_idx):
+            self._selected_pcr_idx = self._row_to_amp_idx[row]
+            self._refresh_pcr_preview()
+
+    def _refresh_pcr_preview(self) -> None:
+        try:
+            preview = self.query_one("#sim-pcr-preview", Static)
+        except NoMatches:
+            return
+        if not (0 <= self._selected_pcr_idx < len(self._pcr_amplicons)):
+            preview.update("(no amplicon selected)")
+            return
+        amp = self._pcr_amplicons[self._selected_pcr_idx]
+        seq = amp["amplicon_seq"]
+        if len(seq) > 80:
+            shown = f"{seq[:38]}…{seq[-38:]}"
+        else:
+            shown = seq
+        wrap_note = "  (wraps origin)" if amp["wraps"] else ""
+        preview.update(
+            f"#{self._selected_pcr_idx + 1}  "
+            f"{amp['start'] + 1}…{amp['end']}  "
+            f"{amp['length']:,} bp{wrap_note}\n"
+            f"{shown}"
+        )
+
+    @on(Button.Pressed, "#btn-sim-pcr-save")
+    def _on_pcr_save(self, _) -> None:
+        if not (0 <= self._selected_pcr_idx < len(self._pcr_amplicons)):
+            self.app.notify("No amplicon selected to save.",
+                              severity="warning", markup=False)
+            return
+        # Stale-canvas guard (invariant #28): refuse to save if the user
+        # swapped records under us between PCR run + Save click. The
+        # amplicon was computed against `self._template`, which is now
+        # disconnected from whatever is loaded.
+        current_counter = getattr(self.app, "_record_load_counter", 0)
+        if current_counter != self._entry_counter:
+            self.app.notify(
+                "Active plasmid changed since this amplicon was designed — "
+                "re-run PCR before saving.",
+                severity="warning", markup=False,
+            )
+            return
+        amp = self._pcr_amplicons[self._selected_pcr_idx]
+        try:
+            new_entry = self._build_amplicon_library_entry(amp)
+        except (ValueError, RuntimeError, AttributeError) as exc:
+            _log.exception("Simulator: build amplicon entry failed")
+            self.app.notify(f"Could not build library entry: {exc}",
+                              severity="error", markup=False)
+            return
+        try:
+            entries = _load_library()
+            entries.append(new_entry)
+            _save_library(entries)
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(self.app, "Plasmid library", exc)
+            return
+        _log_event("simulator.amplicon.saved",
+                    entry_id=new_entry.get("id", ""),
+                    size=new_entry.get("size", 0),
+                    wraps=amp.get("wraps", False))
+        self.app.notify(
+            f"Saved amplicon as linear fragment: {new_entry['name']!r} "
+            f"({new_entry['size']:,} bp).",
+            markup=False,
+        )
+
+    @on(Button.Pressed, "#btn-sim-pcr-togel")
+    def _on_pcr_send_to_gel(self, _) -> None:
+        if not (0 <= self._selected_pcr_idx < len(self._pcr_amplicons)):
+            self.app.notify("No amplicon selected — run PCR first.",
+                              severity="warning", markup=False)
+            return
+        # Switch to the Gel tab so the user can see it land.
+        try:
+            tabs = self.query_one("#sim-tabs", TabbedContent)
+            tabs.active = "sim-tab-gel"
+        except NoMatches:
+            pass
+        amp = self._pcr_amplicons[self._selected_pcr_idx]
+        _log_event("simulator.amplicon.sent_to_gel",
+                    idx=self._selected_pcr_idx,
+                    length=amp.get("length", 0),
+                    wraps=amp.get("wraps", False))
+        self.app.notify("Amplicon available to any Gel lane with "
+                          "source = 'PCR amplicon'.", markup=False)
+
+    def _build_amplicon_library_entry(self, amp: dict) -> dict:
+        """Construct a library entry dict for a PCR amplicon. The
+        SeqRecord is built locally (topology=linear, molecule_type=DNA)
+        and serialised via `_record_to_gb_text` so the entry round-
+        trips through SpliceCraft's standard load path."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        seq = amp["amplicon_seq"]
+        if not seq:
+            raise ValueError("amplicon sequence is empty")
+        base_name = (self._plasmid_name or "amplicon").split()[0]
+        base_name = re.sub(r"[^A-Za-z0-9_-]+", "_", base_name).strip("_") \
+                    or "amplicon"
+        amp_name = (f"{base_name}_PCR_{amp['length']}bp_"
+                     f"{amp['start']+1}-{amp['end']}")
+        rec = SeqRecord(Seq(seq), id=amp_name[:16], name=amp_name[:16],
+                         description=f"in-silico PCR amplicon "
+                                      f"(start={amp['start']+1}, "
+                                      f"end={amp['end']}, "
+                                      f"length={amp['length']} bp)")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"]      = "linear"
+        # Annotate the primer binding sites at the ends.
+        fwd_len = len(amp["fwd_seq"])
+        rev_len = len(amp["rev_seq"])
+        if fwd_len <= len(seq):
+            rec.features.append(SeqFeature(
+                FeatureLocation(0, fwd_len, strand=1),
+                type="primer_bind",
+                qualifiers={"label": ["fwd_primer"],
+                              "note":  [amp["fwd_seq"]]},
+            ))
+        if rev_len <= len(seq):
+            rec.features.append(SeqFeature(
+                FeatureLocation(len(seq) - rev_len, len(seq), strand=-1),
+                type="primer_bind",
+                qualifiers={"label": ["rev_primer"],
+                              "note":  [amp["rev_seq"]]},
+            ))
+        gb_text = _record_to_gb_text(rec)
+        # Disambiguate name against existing library.
+        existing = {e.get("name", "") for e in _load_library()}
+        final_name = amp_name
+        if final_name in existing:
+            n = 2
+            while f"{amp_name}_{n}" in existing:
+                n += 1
+            final_name = f"{amp_name}_{n}"
+        entry_id = re.sub(r"[^A-Za-z0-9_-]+", "_", final_name).strip("_")
+        return {
+            "id":      entry_id,
+            "name":    final_name,
+            "size":    len(seq),
+            "n_feats": len(rec.features),
+            "source":  "simulator:pcr",
+            "added":   _date.today().isoformat(),
+            "gb_text": gb_text,
+        }
+
+    # ── Gel handlers ───────────────────────────────────────────────────────────
+
+    @on(Select.Changed, "#sim-gel-agarose")
+    def _on_agarose_changed(self, event: Select.Changed) -> None:
+        try:
+            self._agarose_pct = float(str(event.value))
+        except (TypeError, ValueError):
+            return
+
+    @on(Button.Pressed, "#btn-sim-gel-addlane")
+    def _on_gel_add_lane(self, _) -> None:
+        if len(self._lanes) >= self._MAX_LANES:
+            self.app.notify(f"Lane cap is {self._MAX_LANES}.",
+                              severity="warning", markup=False)
+            return
+        self._read_lanes_from_widgets()
+        new_lane = {"name": f"Lane {len(self._lanes) + 1}",
+                     "source": "empty", "detail": ""}
+        self._lanes.append(new_lane)
+        self._refresh_lane_rows()
+        _log_event("simulator.lane.added", n_lanes=len(self._lanes))
+
+    @on(Button.Pressed, "#btn-sim-gel-rmlane")
+    def _on_gel_remove_lane(self, _) -> None:
+        if len(self._lanes) <= 1:
+            self.app.notify("At least one lane required.",
+                              severity="warning", markup=False)
+            return
+        self._read_lanes_from_widgets()
+        self._lanes.pop()
+        self._refresh_lane_rows()
+        _log_event("simulator.lane.removed", n_lanes=len(self._lanes))
+
+    @on(Button.Pressed, ".sim-gel-lane-del")
+    def _on_gel_remove_specific_lane(self, event: Button.Pressed) -> None:
+        """Per-lane delete button. Class-based selector so this handler
+        ONLY fires for the lane-row trash icons — never for the
+        +/−/Run buttons or for unrelated screen-level buttons."""
+        bid = event.button.id or ""
+        if not bid.startswith("btn-sim-gel-rm-"):
+            return
+        try:
+            suffix = int(bid.rsplit("-", 1)[-1])
+        except ValueError:
+            return
+        if len(self._lanes) <= 1:
+            self.app.notify("At least one lane required.",
+                              severity="warning", markup=False)
+            return
+        self._read_lanes_from_widgets()
+        for i, lane in enumerate(self._lanes):
+            if lane.get("_suffix") == suffix:
+                self._lanes.pop(i)
+                break
+        self._refresh_lane_rows()
+        _log_event("simulator.lane.removed_specific",
+                    n_lanes=len(self._lanes),
+                    suffix=suffix)
+
+    @on(Select.Changed, ".sim-gel-lane-source")
+    def _on_lane_source_changed(self, event: Select.Changed) -> None:
+        """When the source dropdown changes, pre-fill the detail input
+        with a sensible default for the new source so users aren't left
+        guessing what to type."""
+        widget_id = event.select.id or ""
+        if not widget_id.startswith("sim-gel-lane-source-"):
+            return
+        try:
+            suffix = int(widget_id.rsplit("-", 1)[-1])
+        except ValueError:
+            return
+        new_source = str(event.value) if event.value is not None else "empty"
+        defaults = {
+            "empty":   "",
+            "ladder":  _LADDER_NAMES[0] if _LADDER_NAMES else "",
+            "plasmid": "",
+            "digest":  "EcoRI",
+            "pcr":     "",
+        }
+        new_detail = defaults.get(new_source, "")
+        try:
+            det = self.query_one(f"#sim-gel-lane-detail-{suffix}", Input)
+        except NoMatches:
+            return
+        # Only overwrite if the field is empty OR carries a previous
+        # default — never clobber a user-typed value.
+        if det.value.strip() in ("", "EcoRI") + _LADDER_NAMES:
+            det.value = new_detail
+
+    def _refresh_lane_rows(self) -> None:
+        """Tear down + rebuild the lane rows after add/remove. We
+        rebuild the whole list rather than insert/remove because
+        Textual's `compose` + `mount` is simpler than juggling
+        sibling refs, and the lane count is small (≤8)."""
+        try:
+            container = self.query_one("#sim-gel-lanes", Vertical)
+        except NoMatches:
+            return
+        # Clear _suffix (so _build_lane_row re-allocates fresh widget IDs).
+        for lane in self._lanes:
+            lane.pop("_suffix", None)
+        container.remove_children()
+        for li, lane in enumerate(self._lanes):
+            container.mount(self._build_lane_row(li, lane))
+
+    @on(Button.Pressed, "#btn-sim-gel-run")
+    def _on_gel_run(self, _) -> None:
+        self._read_lanes_from_widgets()
+        try:
+            image_widget = self.query_one("#sim-gel-image", Static)
+        except NoMatches:
+            return
+        pcr_amp = None
+        if 0 <= self._selected_pcr_idx < len(self._pcr_amplicons):
+            pcr_amp = self._pcr_amplicons[self._selected_pcr_idx]
+        # Size the rendered gel to the actual widget area so the image
+        # fills the panel instead of looking cramped. Subtract the
+        # border + padding rows / cols, with sensible floors.
+        widget_h = max(14, image_widget.region.height - 5)
+        widget_w = max(40, image_widget.region.width  - 4)
+        n_lanes  = max(1, len(self._lanes))
+        # Reserve label col + 1 char gap between lanes.
+        label_col = 7
+        lane_w    = max(4, min(10,
+                                 (widget_w - label_col) // n_lanes - 1))
+        try:
+            rt = _render_gel_image(
+                self._lanes,
+                template_seq=self._template,
+                template_circular=self._template_circular,
+                pcr_amplicon=pcr_amp,
+                agarose_pct=self._agarose_pct,
+                height=widget_h,
+                lane_width=lane_w,
+                label_col=label_col,
+            )
+        except (ValueError, RuntimeError, KeyError) as exc:
+            # Defensive: a malformed lane dict / unknown source kind
+            # shouldn't crash the screen. Surface the error instead.
+            _log.exception("Simulator: gel render failed")
+            self.app.notify(f"Gel render failed: {exc}",
+                              severity="error", markup=False)
+            return
+        image_widget.update(rt)
+        # Source-mix summary for the structured log: which lane kinds
+        # the user rendered (no sequence content — privacy invariant #38).
+        source_mix: dict[str, int] = {}
+        for lane in self._lanes:
+            src = (lane.get("source") or "empty")
+            source_mix[src] = source_mix.get(src, 0) + 1
+        _log_event("simulator.gel.run",
+                    n_lanes=len(self._lanes),
+                    agarose_pct=self._agarose_pct,
+                    sources=source_mix,
+                    has_pcr_amplicon=(pcr_amp is not None))
+
+    # ── Close ──────────────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-sim-close")
+    def _close(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ── Unsaved-changes quit dialog ────────────────────────────────────────────────
 
 class UnsavedQuitModal(ModalScreen):
@@ -48921,8 +50332,15 @@ def _h_list_restriction_sites(app, payload):
     if rec is None:
         return ({"error": "no plasmid loaded"}, 422)
     enzymes = payload.get("enzymes")
-    if enzymes is not None and not isinstance(enzymes, list):
-        return ({"error": "'enzymes' must be a list"}, 400)
+    if enzymes is not None:
+        if not isinstance(enzymes, list):
+            return ({"error": "'enzymes' must be a list"}, 400)
+        # Reject non-string elements up front — otherwise a mixed-type
+        # list (e.g. `[1, 2.5, null]`) builds a set whose `not in` check
+        # silently filters every hit to zero. The endpoint owes agents
+        # an explicit 400 rather than an empty `sites: []` result.
+        if not all(isinstance(e, str) for e in enzymes):
+            return ({"error": "'enzymes' must contain only strings"}, 400)
     min_len = _coerce_int(payload.get("min_length", 4),
                             name="min_length")
     if isinstance(min_len, str):
@@ -50897,6 +52315,256 @@ def _h_gibson_assemble(app, payload):
             "result": result}
 
 
+# ── Simulator endpoints (in-silico PCR + agarose gel rendering) ──────────────
+
+
+@_agent_endpoint("simulate-pcr")
+def _h_simulate_pcr(app, payload):
+    """Run an in-silico PCR. Body:
+    ``{template_seq, fwd_primer, rev_primer,
+        circular?: bool = true,
+        max_amplicon?: int = 20000}``.
+
+    Binding model is exact-match (no mismatch tolerance, no Tm-aware
+    annealing — see `_simulate_pcr` for the contract). Primers must be
+    10–80 bp, ACGT only. Templates above ``_PCR_MAX_TEMPLATE_BP``
+    (5 Mb) are refused rather than risking a chromosome-scale find.
+    Returns up to ``_PCR_MAX_AMPLICONS`` (50) amplicons sorted by
+    length descending; the ``capped`` field flags mispriming runaway.
+
+    Read-only. To save an amplicon as a linear library entry, use the
+    Simulator screen (which constructs a SeqRecord with primer_bind
+    features at the ends) — the agent flow is meant for analysis.
+    """
+    template = payload.get("template_seq")
+    if not isinstance(template, str):
+        return ({"error": "missing or non-string 'template_seq'"}, 400)
+    if len(template) > _PCR_MAX_TEMPLATE_BP:
+        return ({"error": f"'template_seq' exceeds "
+                  f"{_PCR_MAX_TEMPLATE_BP:,} bp PCR-sim cap"}, 413)
+    fwd = payload.get("fwd_primer")
+    rev = payload.get("rev_primer")
+    if not isinstance(fwd, str) or not isinstance(rev, str):
+        return ({"error": "missing or non-string 'fwd_primer' / "
+                  "'rev_primer'"}, 400)
+    fwd_clean = fwd.upper().strip()
+    rev_clean = rev.upper().strip()
+    if not fwd_clean or not rev_clean:
+        return ({"error": "'fwd_primer' and 'rev_primer' must be "
+                  "non-empty"}, 400)
+    if len(fwd_clean) < _PCR_MIN_PRIMER_LEN or \
+            len(rev_clean) < _PCR_MIN_PRIMER_LEN:
+        return ({"error": f"primers must be at least "
+                  f"{_PCR_MIN_PRIMER_LEN} bp"}, 400)
+    if len(fwd_clean) > _PCR_MAX_PRIMER_LEN or \
+            len(rev_clean) > _PCR_MAX_PRIMER_LEN:
+        return ({"error": f"primers must be at most "
+                  f"{_PCR_MAX_PRIMER_LEN} bp"}, 400)
+    if any(c not in "ACGT" for c in fwd_clean):
+        return ({"error": "'fwd_primer' must be ACGT only "
+                  "(IUPAC ambiguity not supported)"}, 400)
+    if any(c not in "ACGT" for c in rev_clean):
+        return ({"error": "'rev_primer' must be ACGT only "
+                  "(IUPAC ambiguity not supported)"}, 400)
+    max_amp = _coerce_int(payload.get("max_amplicon",
+                                        _PCR_DEFAULT_MAX_AMPLICON),
+                           name="max_amplicon")
+    if isinstance(max_amp, str):
+        return ({"error": max_amp}, 400)
+    if not (1 <= max_amp <= _PCR_AMPLICON_HARD_CAP):
+        return ({"error": f"'max_amplicon' must be in "
+                  f"[1, {_PCR_AMPLICON_HARD_CAP}]"}, 400)
+    circular = bool(payload.get("circular", True))
+    try:
+        amps = _simulate_pcr(template, fwd_clean, rev_clean,
+                              circular=circular, max_amplicon=max_amp)
+    except Exception as exc:
+        _log.exception("agent simulate-pcr: simulator failed")
+        return ({"error": f"simulator failed: {exc}"}, 500)
+    _log_event("simulator.pcr.agent",
+                template_bp=len(template),
+                circular=circular,
+                fwd_len=len(fwd_clean), rev_len=len(rev_clean),
+                max_amplicon=max_amp,
+                n_amplicons=len(amps),
+                capped=(len(amps) >= _PCR_MAX_AMPLICONS))
+    return {
+        "ok":         True,
+        "n":          len(amps),
+        "capped":     len(amps) >= _PCR_MAX_AMPLICONS,
+        "amplicons":  amps,
+    }
+
+
+# Display-parameter caps for `simulate-gel`. Match `_render_gel_image`
+# defaults but bound the agent-facing knobs so a hostile body can't
+# request a million-row gel.
+_GEL_HEIGHT_MIN     = 4
+_GEL_HEIGHT_MAX     = 200
+_GEL_LANE_WIDTH_MIN = 1
+_GEL_LANE_WIDTH_MAX = 32
+_GEL_MAX_LANES      = 16   # 2× the in-UI cap of 8; agent flows may batch
+
+
+@_agent_endpoint("simulate-gel")
+def _h_simulate_gel(app, payload):
+    """Render an in-silico agarose gel. Body:
+    ``{lanes:           [{name?, source, detail?}, ...],
+        agarose_pct?:    float = 1.0,
+        template_seq?:   str = "",
+        template_circular?: bool = true,
+        pcr_amplicon?:   dict | null = null,
+        height?:         int = 22,
+        lane_width?:     int = 7,
+        include_image?:  bool = false}``.
+
+    `source` is one of ``"empty" | "ladder" | "plasmid" | "digest" |
+    "pcr"``. `detail` semantics depend on source: ladder → ladder
+    name (``"1 kb Plus"``, ``"1 kb"``, ``"100 bp"``,
+    ``"Lambda/HindIII"``); digest → comma-separated enzyme names;
+    plasmid/pcr/empty → ignored. `pcr_amplicon` is the output of
+    ``simulate-pcr`` (when source = ``"pcr"``).
+
+    Returns structured band data per lane (bp / form / mobility /
+    display row). When ``include_image=true``, also returns the
+    rendered gel as a plain-text string (one line per row).
+
+    Read-only.
+    """
+    lanes = payload.get("lanes")
+    if not isinstance(lanes, list):
+        return ({"error": "'lanes' must be a list"}, 400)
+    if not lanes:
+        return ({"error": "'lanes' must contain at least one lane"}, 400)
+    if len(lanes) > _GEL_MAX_LANES:
+        return ({"error": f"too many lanes (max {_GEL_MAX_LANES})"}, 400)
+    cleaned_lanes: list[dict] = []
+    for i, lane in enumerate(lanes):
+        if not isinstance(lane, dict):
+            return ({"error": f"lanes[{i}] must be a dict"}, 400)
+        src = lane.get("source")
+        if not isinstance(src, str) or not src:
+            return ({"error": f"lanes[{i}].source missing or "
+                      "non-string"}, 400)
+        valid_sources = {kind for _, kind in _LANE_SOURCES}
+        if src.lower() not in valid_sources:
+            return ({"error": f"lanes[{i}].source {src!r} not in "
+                      f"{sorted(valid_sources)}"}, 400)
+        name = _sanitize_label(lane.get("name"), max_len=80) or f"L{i+1}"
+        detail = lane.get("detail", "")
+        if not isinstance(detail, str):
+            return ({"error": f"lanes[{i}].detail must be a string"},
+                    400)
+        if len(detail) > 200:
+            return ({"error": f"lanes[{i}].detail exceeds 200 chars"},
+                    400)
+        cleaned_lanes.append({
+            "name":   name,
+            "source": src.lower(),
+            "detail": detail,
+        })
+    template = payload.get("template_seq", "")
+    if not isinstance(template, str):
+        return ({"error": "'template_seq' must be a string"}, 400)
+    if len(template) > _PCR_MAX_TEMPLATE_BP:
+        return ({"error": f"'template_seq' exceeds "
+                  f"{_PCR_MAX_TEMPLATE_BP:,} bp cap"}, 413)
+    template_circular = bool(payload.get("template_circular", True))
+    pcr_amplicon = payload.get("pcr_amplicon")
+    if pcr_amplicon is not None and not isinstance(pcr_amplicon, dict):
+        return ({"error": "'pcr_amplicon' must be a dict or null"}, 400)
+    agarose = payload.get("agarose_pct", 1.0)
+    try:
+        agarose = float(agarose)
+    except (TypeError, ValueError):
+        return ({"error": "'agarose_pct' must be a number"}, 400)
+    # _agarose_mobility snaps to nearest configured %, but reject
+    # absurdly out-of-range values up front so the agent gets a
+    # clear error instead of silent snapping.
+    if not (0.1 <= agarose <= 10.0):
+        return ({"error": "'agarose_pct' must be in [0.1, 10.0]"}, 400)
+    height = _coerce_int(payload.get("height", 22), name="height")
+    if isinstance(height, str):
+        return ({"error": height}, 400)
+    if not (_GEL_HEIGHT_MIN <= height <= _GEL_HEIGHT_MAX):
+        return ({"error": f"'height' must be in "
+                  f"[{_GEL_HEIGHT_MIN}, {_GEL_HEIGHT_MAX}]"}, 400)
+    lane_width = _coerce_int(payload.get("lane_width", 7),
+                              name="lane_width")
+    if isinstance(lane_width, str):
+        return ({"error": lane_width}, 400)
+    if not (_GEL_LANE_WIDTH_MIN <= lane_width <= _GEL_LANE_WIDTH_MAX):
+        return ({"error": f"'lane_width' must be in "
+                  f"[{_GEL_LANE_WIDTH_MIN}, "
+                  f"{_GEL_LANE_WIDTH_MAX}]"}, 400)
+    include_image = bool(payload.get("include_image", False))
+    # Compute per-lane bands + mobility.
+    lane_results: list[dict] = []
+    try:
+        for li, lane in enumerate(cleaned_lanes):
+            bands = _gel_bands_for_lane(
+                lane,
+                template_seq=template,
+                template_circular=template_circular,
+                pcr_amplicon=pcr_amplicon,
+            )
+            band_info: list[dict] = []
+            for bp, form in bands:
+                mob = _agarose_mobility(bp, agarose, dna_form=form)
+                row = max(0, min(height - 1, int(round(mob * (height - 1)))))
+                band_info.append({
+                    "bp":       bp,
+                    "form":     form,
+                    "mobility": mob,
+                    "row":      row,
+                })
+            lane_results.append({
+                "index":  li,
+                "name":   lane["name"],
+                "source": lane["source"],
+                "detail": lane["detail"],
+                "bands":  band_info,
+            })
+    except Exception as exc:
+        _log.exception("agent simulate-gel: band computation failed")
+        return ({"error": f"band computation failed: {exc}"}, 500)
+    response: dict = {
+        "ok":          True,
+        "agarose_pct": min(_AGAROSE_CHOICES,
+                            key=lambda g: abs(g - agarose)),
+        "height":      height,
+        "lane_width":  lane_width,
+        "lanes":       lane_results,
+    }
+    if include_image:
+        try:
+            rt = _render_gel_image(
+                cleaned_lanes,
+                template_seq=template,
+                template_circular=template_circular,
+                pcr_amplicon=pcr_amplicon,
+                agarose_pct=agarose,
+                height=height,
+                lane_width=lane_width,
+            )
+            # `Text.plain` strips Rich styles — agent gets a plain
+            # ASCII rendering it can paste into a terminal.
+            response["image"] = rt.plain
+        except Exception as exc:
+            _log.exception("agent simulate-gel: image render failed")
+            return ({"error": f"image render failed: {exc}"}, 500)
+    source_mix: dict[str, int] = {}
+    for lane in cleaned_lanes:
+        source_mix[lane["source"]] = source_mix.get(lane["source"], 0) + 1
+    _log_event("simulator.gel.agent",
+                n_lanes=len(cleaned_lanes),
+                agarose_pct=agarose,
+                template_bp=len(template),
+                sources=source_mix,
+                include_image=include_image)
+    return response
+
+
 _AGENT_MUT_RE = re.compile(r"^([A-Z])(\d{1,5})([A-Z\*])$")
 
 
@@ -51375,7 +53043,12 @@ class PlasmidApp(App):
     # real estate, and the SpliceCraft surface is small enough that
     # the dedicated `?` Help modal covers shortcut discovery.
     ENABLE_COMMAND_PALETTE = False
-    _preload_record: "object | None" = None
+    _preload_record:      "object | None" = None
+    # Demo plasmid loaded on no-arg launch. Distinct from `_preload_record`
+    # because the demo must NOT be persisted to the user's library — it's
+    # a transient canvas filler, not an import. Routed through
+    # `_apply_record` in `on_mount` rather than `_import_and_persist`.
+    _preload_demo_record: "object | None" = None
     _current_record = None   # last-loaded SeqRecord
     _source_path:   "str | None" = None   # file the current record was loaded from
     _unsaved:        bool         = False  # True when there are unsaved edits
@@ -51528,7 +53201,6 @@ FetchModal { align: center middle; }
 #fetch-status { height: 1; margin-top: 1; }
 
 /* ── Open-file modal ─────────────────────────────────────── */
-OpenFileModal { align: center middle; }
 OpenFileModal { align: center middle; }
 #open-box {
     width: 90; max-width: 95%; min-width: 60;
@@ -53376,6 +55048,16 @@ SpeciesPickerModal { align: center middle; }
             def _load_preload():
                 self._import_and_persist(self._preload_record)
             self.call_after_refresh(_load_preload)
+        elif self._preload_demo_record is not None:
+            # No-arg launch → display the synthetic demo plasmid as the
+            # default canvas content. NOT persisted: `_apply_record` only
+            # routes through the canvas, leaving `plasmid_library.json`
+            # untouched (the library panel still shows the user's real
+            # entries — they pick one to switch).
+            demo = self._preload_demo_record
+            def _load_demo(r=demo):
+                self._apply_record(r)
+            self.call_after_refresh(_load_demo)
         else:
             lib = _load_library()
             if lib:
@@ -57611,6 +59293,9 @@ SpeciesPickerModal { align: center middle; }
         if name == "Mutagenize":
             self.action_open_mutagenize()
             return
+        if name == "Simulator":
+            self.action_open_simulator()
+            return
 
         # ── Multi-action menus (dropdown) ──────────────────────────────────
         ck = "\u2713"  # checkmark
@@ -58574,6 +60259,25 @@ SpeciesPickerModal { align: center middle; }
             pass
         self.push_screen(MutagenizeModal(seq, feats, name))
 
+    @_action_log("app.open.simulator")
+    def action_open_simulator(self) -> None:
+        """Open the PCR + agarose gel simulator. Works with or without
+        a loaded plasmid — an empty template just disables the Plasmid /
+        Digest / PCR lane sources; Ladder lanes still render."""
+        rec = self._current_record
+        seq  = str(rec.seq) if rec is not None else ""
+        name = (rec.name or "") if rec is not None else ""
+        topology = "circular"
+        if rec is not None:
+            topology = str((rec.annotations or {}).get("topology",
+                                                          "circular"))
+        feats: list = []
+        try:
+            feats = self.query_one("#plasmid-map", PlasmidMap)._feats
+        except NoMatches:
+            pass
+        self.push_screen(SimulatorScreen(seq, feats, name, topology))
+
     # Soft cap on modal stack depth. Anything sane lives below ~5
     # (a Splash → Main → Picker → Confirm chain might briefly hit 4).
     # 12 is generous but catches a runaway loop where a modal's
@@ -58828,7 +60532,7 @@ def main():
             f"splicecraft {__version__}\n"
             "Usage: splicecraft [ACCESSION | FILE.gb | update | logs] [--no-splash] "
             "[--agent-api[-port=PORT]]\n\n"
-            "  splicecraft               # empty canvas\n"
+            "  splicecraft               # load 1 kb synthetic demo plasmid\n"
             "  splicecraft L09137        # fetch pUC19 from NCBI\n"
             "  splicecraft my.gb         # open a local GenBank file\n"
             "  splicecraft update        # upgrade to the latest PyPI release\n"
@@ -59017,6 +60721,17 @@ def main():
                 print(f"Fetch failed: {exc}", file=sys.stderr)
                 sys.exit(1)
         app._preload_record = record
+    else:
+        # No CLI arg → preload the 1 kb synthetic demo plasmid. Best-
+        # effort: if `_make_demo_record` ever raises (e.g. someone edits
+        # the literal and breaks the length invariant), log it and fall
+        # back to the historical "auto-load first library entry / NCBI
+        # seed" path so a launch never wedges on the demo helper.
+        try:
+            app._preload_demo_record = _make_demo_record()
+        except (RuntimeError, ValueError, ImportError) as exc:
+            _log.exception("Demo plasmid build failed; falling back: %s",
+                            exc)
 
     try:
         app.run()

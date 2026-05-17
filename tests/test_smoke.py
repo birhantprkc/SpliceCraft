@@ -1798,6 +1798,71 @@ class TestRestrictionEnzymeClickHighlight:
             assert sp._re_highlight is None
 
 
+class TestCustomEnzymeListModalSaveClearsOverlay:
+    """Regression guard for 2026-05-17 audit fix: when the user saves
+    the custom enzyme list, the modal must clear `app._restr_cache`
+    and `pm._restr_feats` BEFORE dispatching the rescan. Without this,
+    on a 5 Mb record the user sees old-enzyme-set overlays for the
+    full worker duration — a confusing flash that suggests the save
+    didn't take. Mirrors the `_h_replace_sequence` clear-then-rescan
+    pattern at splicecraft.py:49806-49810."""
+
+    async def test_save_clears_app_restr_cache_and_pm_restr_feats(
+            self, tiny_record, isolated_library):
+        from textual.widgets import TextArea, Checkbox, Button
+        from textual.css.query import NoMatches
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Populate stale overlay state on both the app cache and
+            # the plasmid-map widget. The fixture's tiny_record may
+            # have already populated _restr_cache from the on-mount
+            # scan — overwrite it with a known-marker entry.
+            stale = [{
+                "label": "STALE_MARKER", "type": "resite",
+                "start": 0, "end": 6,
+                "top_cut_bp": 0, "bottom_cut_bp": 0,
+                "color": "red", "name": "STALE_MARKER",
+            }]
+            app._restr_cache = list(stale)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm._restr_feats = list(stale)
+            # Replace `_dispatch_restr_scan` so the real worker can't
+            # race against the assertion below by re-populating the
+            # cache before we read it. Captures the call so we can
+            # also assert the rescan WAS dispatched after clearing.
+            dispatched: list = []
+            app._dispatch_restr_scan = (   # type: ignore[attr-defined,method-assign]
+                lambda seq, _captured=dispatched: _captured.append(seq)
+            )
+            # Open the modal and click Save with a valid enzyme name.
+            app.push_screen(sc.CustomEnzymeListModal())
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal = app.screen
+            try:
+                modal.query_one("#enzlist-input", TextArea).text = "EcoRI"
+                modal.query_one("#enzlist-use", Checkbox).value = True
+                modal.query_one(
+                    "#btn-enzlist-save", Button,
+                ).action_press()
+            except NoMatches:
+                pytest.fail("CustomEnzymeListModal widgets not mounted")
+            await pilot.pause()
+            await pilot.pause(0.05)
+            # Cache + lane overlay BOTH cleared before dispatch ran.
+            assert app._restr_cache == [], \
+                f"expected empty _restr_cache; got {app._restr_cache!r}"
+            assert pm._restr_feats == [], \
+                f"expected empty pm._restr_feats; got {pm._restr_feats!r}"
+            # And the rescan was still dispatched (with the record's
+            # full sequence) so the new overlay can repopulate.
+            assert dispatched, \
+                "expected _dispatch_restr_scan to have been called"
+            assert dispatched[0] == str(tiny_record.seq)
+
+
 class TestTypeIISCutRegionHighlight:
     """Type IIS enzymes cut OUTSIDE their recognition site. Clicking
     a Type IIS resite should highlight the recognition span PLUS the

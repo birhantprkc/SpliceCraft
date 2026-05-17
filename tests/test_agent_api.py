@@ -1,3 +1,16 @@
+# pyright: reportArgumentType=false, reportCallIssue=false, reportAttributeAccessIssue=false
+#
+# Handlers (`_h_*`) return ``dict | tuple[dict, int]`` (success payload OR
+# error tuple). Tests routinely unpack one or the other after asserting a
+# status code — pyright can't follow the runtime invariant and tags every
+# index op as an arg-type mismatch. Negative-input tests on the sanitizer
+# helpers (`_sanitize_label`, `_sanitize_feat_type`, …) deliberately pass
+# wrong types to verify rejection. `MockApp` stub methods preserve the
+# real `PlasmidApp` signature for duck-typing even when the body ignores
+# parameters (e.g. `clear_undo`). All three classes of noise are non-bugs
+# and would drown out genuine signal; the project's `pyproject.toml`
+# already excludes `tests/**` from pyright analysis for the same reason.
+# This file-scope pragma keeps the harness diagnostics quiet too.
 """Tests for the agent-API HTTP server (0.4.6+).
 
 Covers the BYO-AI integration that lets an external CLI agent (Claude
@@ -1709,6 +1722,49 @@ class TestNumericCoercionHardening:
             status = exc.code
         assert status == 400
 
+    def test_list_restriction_sites_rejects_non_string_enzymes(
+            self, http_server, tiny_record):
+        """Regression guard for 2026-05-17 audit fix: every element of
+        `enzymes` must be a string. Pre-fix a mixed-type list like
+        ``[1, 2.5, null]`` built a set whose ``not in`` check silently
+        filtered every hit to zero — agents got an empty result with
+        no signal that their payload was malformed."""
+        base, token, _ = http_server
+        body_json = '{"enzymes": [1, 2.5, null]}'
+        import urllib.request, urllib.error
+        req = urllib.request.Request(
+            f"{base}/list-restriction-sites", data=body_json.encode(),
+            headers={"Authorization": f"Bearer {token}",
+                       "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5).read()
+            status = 200
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        assert status == 400
+
+    def test_list_restriction_sites_accepts_all_string_enzymes(
+            self, http_server, tiny_record):
+        """Positive case for the 2026-05-17 type check: a well-formed
+        all-string enzymes list must NOT 400."""
+        base, token, _ = http_server
+        body_json = '{"enzymes": ["EcoRI", "BamHI"]}'
+        import urllib.request, urllib.error
+        req = urllib.request.Request(
+            f"{base}/list-restriction-sites", data=body_json.encode(),
+            headers={"Authorization": f"Bearer {token}",
+                       "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5).read()
+            status = 200
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        assert status == 200
+
 
 class TestRequestDispatcherHardening:
     """The HTTP dispatcher must hand handlers a real dict (never None,
@@ -2090,3 +2146,342 @@ class TestSettingsEndpoints:
                 body={"key": "restr_min_len", "value": bad}, token=token,
             )
             assert status == 400, (bad, payload)
+
+
+# ── Simulator agent endpoints (2026-05-17 release) ────────────────────────────
+#
+# `simulate-pcr` and `simulate-gel` are pure read-only wrappers around
+# the SimulatorScreen's underlying functions. Tested at the handler
+# layer (no HTTP round-trip) — input validation is the bulk of the
+# surface; the underlying physics is covered by `tests/test_simulator.py`.
+
+
+class TestSimulatePcrHandler:
+
+    _SEQ = ("ATGCGATCGATCGATCGCGT"   # fwd binding site 0..20
+            + "A" * 60
+            + "GCATCGTAGCTAGCTGATCG") # rev-rc binding site 80..100
+    _FWD = "ATGCGATCGATCGATCGCGT"
+    _REV = "CGATCAGCTAGCTACGATGC"     # = rc("GCATCGTAGCTAGCTGATCG")
+
+    def test_happy_path_linear(self):
+        resp = sc._h_simulate_pcr(None, {
+            "template_seq": self._SEQ,
+            "fwd_primer":   self._FWD,
+            "rev_primer":   self._REV,
+            "circular":     False,
+        })
+        assert isinstance(resp, dict)
+        assert resp["ok"] is True
+        assert resp["n"] == 1
+        assert resp["capped"] is False
+        assert resp["amplicons"][0]["length"] == 100
+        assert resp["amplicons"][0]["wraps"] is False
+
+    def test_circular_wrap_amplicon(self):
+        # Place fwd-binding-site near end, rev-binding-site near start;
+        # amplicon must cross the origin.
+        # seq pos 20..40: ATGCGATCGATCGATCGCGT  (the rev-binding target)
+        # seq pos 50..70: GCATCGTAGCTAGCTGATCG  (the fwd-binding site)
+        seq = ("A" * 20 + self._FWD + "A" * 10
+                + "GCATCGTAGCTAGCTGATCG" + "A" * 30)
+        resp = sc._h_simulate_pcr(None, {
+            "template_seq": seq,
+            "fwd_primer":   "GCATCGTAGCTAGCTGATCG",
+            "rev_primer":   sc._rc(self._FWD),
+            "circular":     True,
+            "max_amplicon": 200,
+        })
+        assert isinstance(resp, dict) and resp["ok"] is True
+        wrap_amps = [a for a in resp["amplicons"] if a["wraps"]]
+        assert wrap_amps, "expected a wrapping amplicon"
+
+    def test_no_match_returns_empty(self):
+        resp = sc._h_simulate_pcr(None, {
+            "template_seq": "ATGC" * 100,
+            "fwd_primer":   "AAAAAAAAAAAAAAAA",
+            "rev_primer":   "TTTTTTTTTTTTTTTT",
+        })
+        assert resp["ok"] is True
+        assert resp["n"] == 0
+        assert resp["amplicons"] == []
+
+    def test_missing_template_seq_returns_400(self):
+        payload, status = sc._h_simulate_pcr(None, {
+            "fwd_primer": self._FWD, "rev_primer": self._REV,
+        })
+        assert status == 400
+        assert "template_seq" in payload["error"]
+
+    def test_non_string_template_returns_400(self):
+        payload, status = sc._h_simulate_pcr(None, {
+            "template_seq": 123,
+            "fwd_primer":   self._FWD,
+            "rev_primer":   self._REV,
+        })
+        assert status == 400
+
+    def test_template_over_cap_returns_413(self):
+        payload, status = sc._h_simulate_pcr(None, {
+            "template_seq": "A" * (sc._PCR_MAX_TEMPLATE_BP + 1),
+            "fwd_primer":   self._FWD,
+            "rev_primer":   self._REV,
+        })
+        assert status == 413
+        assert "template_seq" in payload["error"]
+
+    def test_missing_primer_returns_400(self):
+        payload, status = sc._h_simulate_pcr(None, {
+            "template_seq": self._SEQ,
+            "fwd_primer":   self._FWD,
+        })
+        assert status == 400
+
+    def test_short_primer_returns_400(self):
+        payload, status = sc._h_simulate_pcr(None, {
+            "template_seq": self._SEQ,
+            "fwd_primer":   "ATGCG",
+            "rev_primer":   self._REV,
+        })
+        assert status == 400
+        assert "at least" in payload["error"]
+
+    def test_long_primer_returns_400(self):
+        payload, status = sc._h_simulate_pcr(None, {
+            "template_seq": self._SEQ,
+            "fwd_primer":   "A" * (sc._PCR_MAX_PRIMER_LEN + 1),
+            "rev_primer":   self._REV,
+        })
+        assert status == 400
+        assert "at most" in payload["error"]
+
+    def test_non_acgt_primer_returns_400(self):
+        for bad in ("NNNNNNNNNNNNNNN", "ATGCGATCGAT-GATCG", "atgcga"):
+            payload, status = sc._h_simulate_pcr(None, {
+                "template_seq": self._SEQ,
+                "fwd_primer":   bad if not bad.islower() else bad.upper() + "X",
+                "rev_primer":   self._REV,
+            })
+            assert status == 400, (bad, payload)
+
+    def test_max_amplicon_out_of_range_returns_400(self):
+        for bad in (0, -1, sc._PCR_AMPLICON_HARD_CAP + 1):
+            payload, status = sc._h_simulate_pcr(None, {
+                "template_seq": self._SEQ,
+                "fwd_primer":   self._FWD,
+                "rev_primer":   self._REV,
+                "max_amplicon": bad,
+            })
+            assert status == 400, (bad, payload)
+
+    def test_max_amplicon_non_int_returns_400(self):
+        payload, status = sc._h_simulate_pcr(None, {
+            "template_seq": self._SEQ,
+            "fwd_primer":   self._FWD,
+            "rev_primer":   self._REV,
+            "max_amplicon": "not-an-int",
+        })
+        assert status == 400
+
+    def test_empty_primer_strings_return_400(self):
+        for fwd, rev in [("", self._REV), (self._FWD, ""), ("   ", "  ")]:
+            payload, status = sc._h_simulate_pcr(None, {
+                "template_seq": self._SEQ,
+                "fwd_primer":   fwd,
+                "rev_primer":   rev,
+            })
+            assert status == 400, (fwd, rev, payload)
+
+
+class TestSimulateGelHandler:
+
+    def test_happy_path_ladder(self):
+        resp = sc._h_simulate_gel(None, {
+            "lanes": [{"source": "ladder", "detail": "1 kb"}],
+            "agarose_pct": 1.0,
+        })
+        assert isinstance(resp, dict)
+        assert resp["ok"] is True
+        assert len(resp["lanes"]) == 1
+        assert len(resp["lanes"][0]["bands"]) > 0
+        # Every band has bp + form + mobility + row.
+        for b in resp["lanes"][0]["bands"]:
+            assert {"bp", "form", "mobility", "row"} <= set(b.keys())
+            assert 0.0 <= b["mobility"] <= 1.0
+            assert 0 <= b["row"] < resp["height"]
+
+    def test_plasmid_lane_with_circular_template(self):
+        resp = sc._h_simulate_gel(None, {
+            "lanes": [{"source": "plasmid", "detail": ""}],
+            "template_seq": "AT" * 1500,
+            "template_circular": True,
+            "agarose_pct": 1.0,
+        })
+        assert resp["ok"] is True
+        # Circular uncut → SC + nicked = 2 bands.
+        assert len(resp["lanes"][0]["bands"]) == 2
+        forms = {b["form"] for b in resp["lanes"][0]["bands"]}
+        assert "supercoiled" in forms
+        assert "nicked" in forms
+
+    def test_digest_lane(self):
+        resp = sc._h_simulate_gel(None, {
+            "lanes": [{"source": "digest", "detail": "EcoRI"}],
+            "template_seq": "GAATTC" + "A" * 100 + "GAATTC" + "A" * 50,
+            "template_circular": True,
+            "agarose_pct": 1.0,
+        })
+        assert resp["ok"] is True
+        # Two EcoRI sites on a circular template → 2 fragments.
+        assert len(resp["lanes"][0]["bands"]) >= 2
+
+    def test_pcr_lane_with_amplicon(self):
+        resp = sc._h_simulate_gel(None, {
+            "lanes": [{"source": "pcr", "detail": ""}],
+            "pcr_amplicon": {"length": 800, "wraps": False,
+                              "amplicon_seq": "A" * 800,
+                              "start": 0, "end": 800,
+                              "fwd_seq": "A" * 20, "rev_seq": "T" * 20,
+                              "gc_pct": 0.0, "fwd_tm": None,
+                              "rev_tm": None},
+        })
+        assert resp["ok"] is True
+        assert len(resp["lanes"][0]["bands"]) == 1
+        assert resp["lanes"][0]["bands"][0]["bp"] == 800
+
+    def test_include_image_returns_text(self):
+        resp = sc._h_simulate_gel(None, {
+            "lanes": [{"source": "ladder", "detail": "1 kb"}],
+            "include_image": True,
+            "height": 10, "lane_width": 5,
+        })
+        assert resp["ok"] is True
+        assert "image" in resp
+        assert isinstance(resp["image"], str)
+        assert "\n" in resp["image"]   # multi-row rendering
+
+    def test_missing_lanes_returns_400(self):
+        payload, status = sc._h_simulate_gel(None, {})
+        assert status == 400
+
+    def test_empty_lanes_returns_400(self):
+        payload, status = sc._h_simulate_gel(None, {"lanes": []})
+        assert status == 400
+
+    def test_lanes_not_list_returns_400(self):
+        payload, status = sc._h_simulate_gel(None, {
+            "lanes": {"source": "ladder"},   # dict, not list
+        })
+        assert status == 400
+
+    def test_too_many_lanes_returns_400(self):
+        lanes = [{"source": "empty"}] * (sc._GEL_MAX_LANES + 1)
+        payload, status = sc._h_simulate_gel(None, {"lanes": lanes})
+        assert status == 400
+
+    def test_lane_missing_source_returns_400(self):
+        payload, status = sc._h_simulate_gel(None, {
+            "lanes": [{"name": "no-source"}],
+        })
+        assert status == 400
+        assert "source" in payload["error"]
+
+    def test_lane_unknown_source_returns_400(self):
+        payload, status = sc._h_simulate_gel(None, {
+            "lanes": [{"source": "gibberish"}],
+        })
+        assert status == 400
+
+    def test_lane_non_dict_returns_400(self):
+        payload, status = sc._h_simulate_gel(None, {
+            "lanes": ["not-a-dict"],
+        })
+        assert status == 400
+
+    def test_lane_detail_too_long_returns_400(self):
+        payload, status = sc._h_simulate_gel(None, {
+            "lanes": [{"source": "digest", "detail": "X" * 300}],
+        })
+        assert status == 400
+
+    def test_lane_detail_wrong_type_returns_400(self):
+        payload, status = sc._h_simulate_gel(None, {
+            "lanes": [{"source": "ladder", "detail": 42}],
+        })
+        assert status == 400
+
+    def test_agarose_out_of_range_returns_400(self):
+        for bad in (0, 0.05, 11.0, -1.0):
+            payload, status = sc._h_simulate_gel(None, {
+                "lanes": [{"source": "ladder", "detail": "1 kb"}],
+                "agarose_pct": bad,
+            })
+            assert status == 400, (bad, payload)
+
+    def test_agarose_non_numeric_returns_400(self):
+        payload, status = sc._h_simulate_gel(None, {
+            "lanes": [{"source": "ladder", "detail": "1 kb"}],
+            "agarose_pct": "high",
+        })
+        assert status == 400
+
+    def test_height_out_of_range_returns_400(self):
+        for bad in (sc._GEL_HEIGHT_MIN - 1, sc._GEL_HEIGHT_MAX + 1, 0, -10):
+            payload, status = sc._h_simulate_gel(None, {
+                "lanes": [{"source": "ladder", "detail": "1 kb"}],
+                "height": bad,
+            })
+            assert status == 400, (bad, payload)
+
+    def test_lane_width_out_of_range_returns_400(self):
+        payload, status = sc._h_simulate_gel(None, {
+            "lanes": [{"source": "ladder", "detail": "1 kb"}],
+            "lane_width": sc._GEL_LANE_WIDTH_MAX + 1,
+        })
+        assert status == 400
+
+    def test_template_over_cap_returns_413(self):
+        payload, status = sc._h_simulate_gel(None, {
+            "lanes": [{"source": "plasmid", "detail": ""}],
+            "template_seq": "A" * (sc._PCR_MAX_TEMPLATE_BP + 1),
+        })
+        assert status == 413
+
+    def test_template_wrong_type_returns_400(self):
+        payload, status = sc._h_simulate_gel(None, {
+            "lanes": [{"source": "plasmid"}],
+            "template_seq": 12345,
+        })
+        assert status == 400
+
+    def test_pcr_amplicon_wrong_type_returns_400(self):
+        payload, status = sc._h_simulate_gel(None, {
+            "lanes": [{"source": "pcr"}],
+            "pcr_amplicon": "not-a-dict",
+        })
+        assert status == 400
+
+    def test_pcr_lane_without_amplicon_returns_empty_bands(self):
+        # Not a validation error — gel renders a lane with no bands
+        # and the user sees an empty column. Mirrors UI behaviour.
+        resp = sc._h_simulate_gel(None, {
+            "lanes": [{"source": "pcr"}],
+        })
+        assert resp["ok"] is True
+        assert resp["lanes"][0]["bands"] == []
+
+
+class TestSimulatorAgentRegistration:
+    """Both new endpoints must be registered as READ-ONLY (write=False)
+    so an unauthenticated caller can run simulations without a token —
+    matches `simulate-gibson` semantics."""
+
+    def test_simulate_pcr_registered_read_only(self):
+        eps = {ep["name"]: ep for ep in sc._h_tools(None, {})["endpoints"]}
+        assert "simulate-pcr" in eps
+        assert eps["simulate-pcr"]["write"] is False
+
+    def test_simulate_gel_registered_read_only(self):
+        eps = {ep["name"]: ep for ep in sc._h_tools(None, {})["endpoints"]}
+        assert "simulate-gel" in eps
+        assert eps["simulate-gel"]["write"] is False

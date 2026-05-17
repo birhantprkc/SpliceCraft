@@ -2,6 +2,168 @@
 
 ---
 
+## [0.9.0] — 2026-05-17 — Simulator workbench (PCR + agarose gel)
+
+A new menu-bar workbench — `Simulator` — that pairs in-silico PCR with
+an agarose-gel renderer. Built behind the same hardening bar the rest
+of the codebase has been held to: bounded inputs, narrow exception
+types, structured event logging, and 56 regression tests (37 agent
+endpoint + 19 pure-function / hardening guards) before the merge.
+
+### New: in-silico PCR
+
+`_simulate_pcr` enumerates every legal amplicon for a `(fwd, rev)`
+primer pair on the loaded template. Binding model is exact-match
+(verbatim primer on top strand for fwd; reverse-complement on top
+strand for rev) — no mismatch tolerance, no Tm-aware annealing. The
+MVP is intentionally minimal: cloning primers with 5' tails are
+designed via the existing Primer Design workbench; this surface is
+for hypothesis-testing "do these primers actually amplify what I
+think they do?" against a real template.
+
+* Wrap-aware on circular plasmids — amplicons that cross the origin
+  are detected, reported with `wraps=True`, and the amplicon
+  sequence is reconstructed as `seq[fwd:] + seq[:rev_end]`.
+* `_PCR_MAX_AMPLICONS = 50` cap on result count so a mispriming
+  primer on a repetitive template can't generate thousands of rows
+  (a `(result capped at 50)` hint surfaces in the status bar when
+  this fires).
+* `_PCR_MAX_TEMPLATE_BP = 5 Mb` cap so a chromosome-scale FASTA
+  import doesn't freeze the UI; refusal surfaces a clear message.
+* `_PCR_MIN_PRIMER_LEN = 10` / `_PCR_MAX_PRIMER_LEN = 80`; primers
+  outside this range are rejected at the input boundary.
+* Primers must be ACGT only — IUPAC ambiguity is rejected at the
+  boundary (the exact-match model can't honour `N`, and silently
+  failing to amplify would be worse than refusing).
+* **`_PCR_MAX_PRIMER_HITS = 5,000` defence-in-depth cap.** A
+  pathological case (e.g. a 10-bp all-A primer on a polyA template)
+  could yield millions of binding positions, blowing up the
+  `fwd × rev_rc` double loop into trillions of pairings. The cap
+  refuses with an empty result rather than freeze the UI; surfaces
+  the same "no amplicons" status the user sees for any other
+  null-result case.
+
+Amplicons round-trip to the plasmid library as linear DNA entries
+with `primer_bind` features auto-annotated at both ends (the fwd
+primer at `[0, len(fwd))` on the top strand, the rev primer at
+`[len(seq) − len(rev), len(seq))` on the bottom). The save path
+respects the stale-canvas guard (invariant #28) — if the user paged
+to a different plasmid between PCR run and Save click, the save is
+refused with a re-run hint.
+
+### New: agarose gel renderer
+
+`_agarose_mobility` translates fragment size + DNA form to a
+relative migration distance using the Helling-Goodman-Boyer (1974)
+empirical observation: within each agarose %'s resolution window,
+migration distance ∝ −log₁₀(bp). Plus the standard form corrections
+from Lewis & Slater (1986): supercoiled migrates at 0.7× its linear
+size, nicked / open-circle at 1.4×.
+
+Per-lane sources cover the realistic bench workflow:
+
+* **Ladder** — 1 kb Plus / 1 kb / 100 bp / Lambda-HindIII; sized to
+  the loaded ladder, smallest band at dye front.
+* **Plasmid (uncut)** — circular templates resolve into supercoiled
+  + nicked bands; linear templates resolve as one band.
+* **Digest** — restriction-digest the template with one or more
+  enzymes (comma-separated in the lane's detail field); each
+  fragment becomes one linear band.
+* **PCR amplicon** — the currently-selected amplicon from the PCR
+  sub-tab; `Send to Gel lane` puts it in scope.
+
+Agarose percentage snaps to the configured choices (0.5 / 0.7 / 0.8
+/ 1.0 / 1.2 / 1.5 / 2.0 / 2.5 / 3.0 / 4.0%) with each %'s
+resolution window from Sambrook & Russell 3e Table 5-1. Up to
+8 lanes per gel in the UI (16 via agent for batch flows). The
+rendered image is a single Rich `Text` block — one column per lane,
+well-at-top to dye-front-at-bottom, with the leftmost ladder
+contributing a bp-label tick column.
+
+### New: agent endpoints — `simulate-pcr`, `simulate-gel`
+
+Both read-only (no token required), mirror the `simulate-gibson`
+shape:
+
+* `POST /simulate-pcr {template_seq, fwd_primer, rev_primer,
+  circular?, max_amplicon?}` → `{ok, n, capped, amplicons:[...]}`.
+* `POST /simulate-gel {lanes:[{source, name?, detail?}],
+  agarose_pct?, template_seq?, template_circular?, pcr_amplicon?,
+  height?, lane_width?, include_image?}` → `{ok, agarose_pct,
+  height, lane_width, lanes:[{index, name, source, detail,
+  bands:[{bp, form, mobility, row}]}], image?}`.
+
+Same validation policy as `simulate-gibson`: types checked at the
+boundary, size caps enforced (template ≤ 5 Mb, lanes ≤ 16, primers
+10–80 bp ACGT, height ≤ 200), unknown sources return 400 with the
+allowed set listed. `include_image=true` returns the rendered gel
+as a plain-text string the agent can paste into a terminal or LLM
+context window.
+
+### Structured event logging
+
+Six new events (`_log_event`) on the user-visible state transitions:
+
+* `simulator.pcr.run` (UI) / `simulator.pcr.agent` (agent) — template
+  length + circularity + primer lengths + max amplicon + result
+  count + whether the result was capped.
+* `simulator.amplicon.saved` — entry id + size + wrap flag.
+* `simulator.amplicon.sent_to_gel` — selected idx + amplicon length
+  + wrap flag.
+* `simulator.lane.added` / `simulator.lane.removed` /
+  `simulator.lane.removed_specific` — lane count after the
+  operation (+ suffix for the targeted-delete case).
+* `simulator.gel.run` (UI) / `simulator.gel.agent` (agent) — lane
+  count + agarose % + per-source histogram + whether a PCR amplicon
+  was in scope.
+
+Sacred privacy invariant #38 (no sequence content in logs) is
+preserved — events log lengths, counts, and flags, never bases.
+
+### Defensive hardening
+
+* **Malformed `pcr_amplicon` in `_gel_bands_for_lane`.** The agent
+  endpoint accepts an arbitrary dict for `pcr_amplicon` (not just
+  the shape `_simulate_pcr` produces). A hostile payload with a
+  non-numeric `length` field used to surface as a 500 from
+  `int("garbage")`; now coerces to 0 and renders an empty lane.
+* **Non-dict `pcr_amplicon`.** Bare list / int / string would raise
+  AttributeError on `.get("length")`. Now gates on `isinstance`.
+* **`_PCR_MAX_PRIMER_HITS = 5,000` cap.** See above.
+
+### UI polish
+
+* **`on_mount` focus on `SimulatorScreen`** — the fwd primer Input
+  is the natural first action; the screen mirrors the
+  PrimerDesignScreen focus-the-primary-input pattern.
+* **Help text now lists menu workbenches.** The `?` Help modal had a
+  keyboard-shortcut-only convention which left Parts / Constructor
+  / Mutagenize / Simulator undiscoverable from the help. New `Menu
+  workbenches` section covers all four with one-line descriptions.
+* **Duplicate CSS rule removed.** `OpenFileModal { align: center
+  middle; }` appeared twice in `PlasmidApp.CSS`. Cosmetic but
+  loud-in-diff cleanup.
+
+### Tests
+
+* `tests/test_simulator.py` — 19 new regression cases (primer-hit
+  cap refusal, just-below-cap acceptance, malformed `pcr_amplicon`
+  defensive paths, non-dict amplicon defensive paths).
+* `tests/test_agent_api.py` — 37 new cases across
+  `TestSimulatePcrHandler`, `TestSimulateGelHandler`, and
+  `TestSimulatorAgentRegistration` (read-only / write-flag check).
+* `tests/test_modal_boundaries.py` — `SimulatorScreen` added to the
+  160 × 48 baseline-terminal fit matrix.
+* File-scope `# pyright:` pragma added to `test_agent_api.py` and
+  `test_simulator.py` to silence the `dict | tuple[dict, int]`
+  narrowing noise. The project's `pyproject.toml` already excludes
+  `tests/**` from pyright; the file pragma keeps editor / harness
+  diagnostics aligned with that policy.
+
+2,513 tests pass (up from 2,457; +56 new).
+
+---
+
 ## [0.8.10] — 2026-05-15 — sweep #6 · deferred items · bioconda lint
 
 Closes out the items deferred from sweep #5 + adds regression tests +

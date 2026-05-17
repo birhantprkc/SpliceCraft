@@ -234,6 +234,22 @@ Press `?` once running for the full keyboard-shortcut reference.
   within 60 nt of a CDS end) auto-fall back to a 2-primer modified-outer
   PCR.
 
+### Simulate
+- **In-silico PCR + agarose gel** (Simulator menu) — design a primer
+  pair against the loaded plasmid and the simulator enumerates every
+  legal amplicon (exact-match binding model, wrap-aware on circular
+  templates, capped at 50 results to flag mispriming runaway).
+  Amplicons round-trip to the library as linear DNA entries with
+  `primer_bind` features at both ends.
+- **Agarose gel renderer** — paint up to 8 lanes (ladder / uncut
+  plasmid / restriction digest / PCR amplicon) on a virtual gel at
+  user-selectable agarose % (0.5 → 4.0). Mobility uses the Helling-
+  Goodman-Boyer empirical curve (distance ∝ −log₁₀ bp within each
+  agarose's resolution window) plus the standard form corrections —
+  supercoiled migrates faster than linear, nicked / open-circle
+  slower. Lane sources share the screen's template, so the amplicon
+  designed in the PCR tab is immediately runnable in the Gel tab.
+
 ### Search
 - **In-process BLAST** (`Ctrl+B`):
   - **BLASTN** (DNA → DNA) and **BLASTP** (protein → protein) via
@@ -315,6 +331,10 @@ Press `?` once running for the full keyboard-shortcut reference.
   - **Design** — gibson-assemble, simulate-gibson, design-mutagenesis,
     design-gb-part (Golden Braid / MoClo), design-primers (generic
     Primer3 detection or restriction cloning).
+  - **Simulate** — simulate-pcr (exact-match in-silico amplification,
+    wrap-aware on circular templates) and simulate-gel (per-lane band
+    positions + optional rendered ASCII gel image; ladder / plasmid /
+    digest / PCR-amplicon sources).
   - **Alignment** — diff-plasmid (circular rotation auto-detected),
     list-plasmidsaurus-members, align-plasmidsaurus-zip.
   - **History** — get-history returns the parsed `<HistoryTree>`
@@ -470,6 +490,7 @@ can drag-select a key combo to copy it).
 | Mutagenize  | SOE-PCR site-directed mutagenesis designer (4-source CDS picker)                 |
 | Parts       | Parts Bin (per-grammar; multi-bin via Parts Bin collections)                     |
 | Constructor | Traditional cloning · Gibson assembly · Golden Braid / MoClo / custom grammar assembly |
+| Simulator   | In-silico PCR (exact-match binding) + agarose gel rendering (0.5–4.0%, ladder / uncut / digest / amplicon lanes) |
 | History     | Construction-history viewer (`<HistoryTree>` for the loaded plasmid)             |
 | BLAST       | BLAST / HMMscan modal (Ctrl+B)                                                   |
 
