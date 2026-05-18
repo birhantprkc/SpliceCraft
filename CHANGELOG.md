@@ -14,6 +14,14 @@
 
 ---
 
+## [0.9.5] — 2026-05-18
+
+_(auto-generated from commits since v0.9.4)_
+
+* Auto-load picks natural-sort-first library entry (was insertion-order)
+
+---
+
 ## [0.9.4] — 2026-05-18
 
 _(auto-generated from commits since v0.9.3)_
