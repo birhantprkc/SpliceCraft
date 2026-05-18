@@ -10761,6 +10761,58 @@ class TestUpdateSubcommandMainDispatch:
         assert "ignored in favour of the update subcommand" in err
 
 
+class TestNoArgLaunchHasNoDemo:
+    """Shipping releases must NOT auto-load the 1 kb synthetic demo
+    plasmid on a no-arg launch — those were internal-testing scaffolding
+    that confused users into thinking the demo was one of their saved
+    plasmids. Also: the first-run NCBI seed of MW463917.1 is suppressed
+    in releases (was on by default, now opt-in)."""
+
+    def _run_main_capturing_app(self, monkeypatch, args):
+        """Run `sc.main()` with `sys.argv = args`, intercept the call
+        to `PlasmidApp.run()`, and return the prepared app instance
+        without actually launching the Textual TUI."""
+        monkeypatch.setattr(sys, "argv", args)
+        # main() bails with `sys.exit(2)` when the host terminal is
+        # under 100x30; tests are commonly run in 80x24 CI shells so
+        # report a wide-enough size to reach the run() call.
+        import shutil as _shutil
+        monkeypatch.setattr(
+            _shutil, "get_terminal_size",
+            lambda *_a, **_k: _shutil.os.terminal_size((160, 48)),
+        )
+        captured = {}
+        def _capture_run(self_app, *a, **k):
+            captured["app"] = self_app
+            return None
+        monkeypatch.setattr(sc.PlasmidApp, "run", _capture_run,
+                              raising=True)
+        # Block the splash + network paths that main() also wires up
+        # — we only care about the demo / seed gating here.
+        monkeypatch.setattr(sc, "_check_and_stamp_data_version",
+                              lambda *a, **k: None, raising=False)
+        sc.main()
+        return captured.get("app")
+
+    def test_no_arg_launch_does_not_preload_demo(self, monkeypatch):
+        """`splicecraft` with no positional arg: neither
+        `_preload_record` nor `_preload_demo_record` is set, so the
+        on_mount fallback either auto-loads the first library entry
+        or leaves the canvas empty — no internal-testing demo leaks."""
+        app = self._run_main_capturing_app(monkeypatch, ["splicecraft"])
+        assert app is not None
+        assert app._preload_record is None
+        assert app._preload_demo_record is None
+
+    def test_no_arg_launch_suppresses_ncbi_seed(self, monkeypatch):
+        """`splicecraft` with no positional arg: `_skip_seed=True`
+        so a fresh install doesn't silently pull MW463917.1 from
+        NCBI on first launch."""
+        app = self._run_main_capturing_app(monkeypatch, ["splicecraft"])
+        assert app is not None
+        assert app._skip_seed is True
+
+
 class TestAgentFlagAlias:
     """Regression guard for 2026-05-17: `--agent` and `--agent-port`
     are friendly aliases for `--agent-api` / `--agent-api-port`. The

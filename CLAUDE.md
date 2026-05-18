@@ -13,7 +13,7 @@ Terminal-based circular plasmid map viewer, sequence editor, and cloning/mutagen
 ## How to run
 
 ```bash
-python3 splicecraft.py                       # empty canvas
+python3 splicecraft.py                       # empty canvas (or auto-loads first library entry)
 python3 splicecraft.py L09137                # fetch pUC19 from NCBI
 python3 splicecraft.py myplasmid.gb          # local GenBank (.gb/.gbk/.dna)
 python3 -m pytest -n auto -q                 # full suite (2,250+ tests, ~5–6 min on 8 cores)
@@ -22,6 +22,8 @@ python3 -m pytest tests/test_dna_sanity.py   # biology only (< 2 s — fast inne
 ```
 
 End users: `pipx install splicecraft && splicecraft`.
+
+Shipped no-arg launch shows an empty canvas (or auto-loads the first library entry if any). The 1 kb synthetic demo plasmid (`_make_demo_record` / `_DEMO_PLASMID_SEQ`) is **kept in the source for tests / ad-hoc development** but `main()` no longer pre-sets `_preload_demo_record`. Similarly, the first-run NCBI seed (`_seed_default_library` → MW463917.1) is suppressed in releases: `main()` flips `_skip_seed = True`. Both used to fire on `splicecraft` no-arg launches in earlier versions; shipping them confused users into thinking the demo was one of their saved plasmids. Dev / demo builds wanting the historical "auto-seed on empty library" behaviour can flip `_skip_seed = False` before `app.run()`.
 
 Logs: `~/.local/share/splicecraft/logs/splicecraft.log` (override `$SPLICECRAFT_LOG`). Every line prefixed with 8-char session ID.
 
@@ -127,20 +129,35 @@ Adding one is mechanical:
 3. In `action_toggle_my_setting`, call `_set_setting("my_setting", self._my_setting)` after flipping.
 4. Surface in the Settings menu (`MenuBar.MENUS` between File and Edit; populated by the `Settings` entry in `PlasmidApp.open_menu`'s `menus` dict).
 
-Currently persisted user toggles: `show_feature_tooltips`, `click_debug`, `check_updates`, `show_restr`, `restr_unique_only`, `restr_min_len`, `min_primer_binding`, `show_connectors`, `linear_layout`, `active_collection`, `active_grammar`. `map_mode` is deliberately NOT persisted (re-derived from each record's `topology` field on load). `show_connectors` and `linear_layout` need a deferred apply via `_pending_show_connectors` / `_pending_linear_layout` because their target widgets aren't composed yet when `compose()` runs; `on_mount` reads the pending values once the children exist.
+Currently persisted user toggles: `show_feature_tooltips`, `click_debug`, `check_updates`, `show_restr`, `restr_unique_only`, `restr_min_len`, `min_primer_binding`, `show_connectors`, `linear_layout`, `active_collection`, `active_grammar`. `map_mode` is **per-plasmid**, persisted on each library entry's `map_mode` field (not in `settings.json`). `_library_load` stashes the entry's preference onto the record as `_tui_map_mode`; `pm.load_record` honours the stash over the topology default; `action_toggle_map_view` + `_register_alignment` write through `_persist_map_mode_for_active` so the user's choice sticks across reloads. Sequencing-aligned plasmids auto-tag `linear` (so re-opens default to the diff-friendly view). `show_connectors` and `linear_layout` need a deferred apply via `_pending_show_connectors` / `_pending_linear_layout` because their target widgets aren't composed yet when `compose()` runs; `on_mount` reads the pending values once the children exist.
 
 Persisted infrastructure (not user-facing toggles): `last_seen_version` (drives the What's New auto-push), `last_known_latest` + `last_update_check_ts` (24 h cache for the PyPI update probe), `hmm_db_path` (last-used HMM database path).
 
-## Pairwise alignment + Plasmidsaurus ingestion (0.5.3+)
+## Pairwise alignment + Plasmidsaurus ingestion (0.5.3+, sub-tabs 0.9.5+)
 
 Two-stage pipeline:
 
 1. **Zip ingestion** — `_list_gbk_members_in_zip(path)` lists `.gbk` / `.gb` / `.genbank` members; `_extract_gbk_member(path, name)` reads one out as text. Both are size-capped (`_PLASMIDSAURUS_ZIP_MAX_BYTES = 500 MB`, `_PLASMIDSAURUS_MEMBER_MAX_BYTES = 50 MB`, `_PLASMIDSAURUS_MAX_MEMBERS = 2000`) so a malformed archive can't OOM the picker. Dotfile members and directories are filtered.
-2. **Alignment** — `_pairwise_align(query, target, mode='global'|'local')` wraps `Bio.Align.PairwiseAligner`. Returns `{mode, score, identity_pct, aligned_q, aligned_t, n_matches, n_mismatches, n_gaps, q_len, t_len}`. Length-capped at `_PAIRWISE_MAX_LEN = 200_000`. **Aligned strings come from `Alignment[0]` / `Alignment[1]`**, NOT `format()`-parsing — the text format wraps at 60 cols with coordinate prefixes which is fragile to parse.
 
-Entry point: `File → Align sequencing run (Plasmidsaurus .zip)…` → `PlasmidsaurusAlignModal` → on submit pushes `AlignmentScreen` (full-screen viewer with target features lane + parallel target / query rows + match track + mismatch-red highlighting). Both modal and screen are in `splicecraft.py` near the FASTA file picker.
+2. **Structured parse** — `_parse_plasmidsaurus_zip(path)` walks the zip and groups files per sample (`{gbk, fasta, summary, perbase, histogram, coverage_plot, interactive_map, ab1_files, summary_text, perbase_coverage}`). Run-level extras (`<run>_gel.png`, README) land in `run_files`. Category folders are matched on the `_<suffix>` anchor (`_genbank-files`, `_fasta-files`, `_summary-files`, `_per-base-data`, `_histograms`, `_coverage-plots`, `_interactive-map`, `_ab1-files`) so the run-ID prefix is inferred by majority vote on the prefix-before-suffix. Standalone `.gbk` files outside any category folder are still surfaced as samples (back-compat with the older `_list_gbk_members_in_zip` shape). Summary-file bodies (≤`_PLASMIDSAURUS_SUMMARY_MAX_BYTES = 4 KB`) are streamed inline so the QC tab parses k-mer + contamination without re-opening the zip; per-base TSVs are stream-summarised line-by-line into `{mean, min, max, n_pos, above_20x}`. `_parse_plasmidsaurus_summary(text)` extracts k-mer (moles/mass) percentages + contamination % + organism source from the per-sample `.txt`.
 
-Future expansion (already designed for): a Plasmidsaurus API key tab in the same modal that downloads run zips directly. Same downstream alignment + visualisation pipeline; only the ingestion source changes.
+3. **Alignment** — `_pairwise_align(query, target, mode='global'|'local')` wraps `Bio.Align.PairwiseAligner`. Returns `{mode, score, identity_pct, aligned_q, aligned_t, n_matches, n_mismatches, n_gaps, q_len, t_len}`. Length-capped at `_PAIRWISE_MAX_LEN = 200_000`. **Aligned strings come from `Alignment[0]` / `Alignment[1]`**, NOT `format()`-parsing — the text format wraps at 60 cols with coordinate prefixes which is fragile to parse.
+
+Entry point: `Sequencing → Plasmidsaurus` sub-tab on the `SequencingScreen` (full-screen toolbar). The Plasmidsaurus pane hosts a **nested `TabbedContent`** with 4 sub-sub-tabs:
+
+* **General** (always enabled) — `_ZipAwareDirectoryTree` zip picker + run-overview Static (run ID, sample count, gbk / per-base coverage / run-level counts). Owns the load tooling.
+* **Samples** (disabled until zip loaded) — per-sample DataTable (`#align-members`): name · bp · #features · cov mean · contam % · AB1 count. Row keys carry the gbk member name so `_on_member_selected` can pipe the pick directly through `_extract_gbk_member` without re-walking the parsed dict.
+* **Quality** (disabled until zip loaded) — two stacked DataTables (`#plasmidsaurus-quality-table` + `#plasmidsaurus-runfiles-table`) for k-mer / contamination / coverage metrics + run-level files.
+* **Align** (disabled until zip loaded) — query indicator + target Select (`#align-target`) + Align button (`#btn-align-go`). Reads `_selected_member` set on Samples-tab row select.
+
+Sub-tab gating runs through `_apply_subtab_gating(enabled: bool)` which toggles the `disabled` attribute on Samples / Quality / Align panes AND redirects `tabs.active` back to `psaurus-sub-general` when disabling so the user can't be stranded on a disabled-now-empty pane. Same-path re-pick short-circuits at the top of `_on_zip_picked` to avoid paying the ~50–300 ms-per-sample parse cost twice. `PlasmidsaurusAlignModal` is kept as a module-level alias of `SequencingScreen` for back-compat with tests / agent paths.
+
+Hardening sweep (0.9.4):
+* **Per-base TSV zip-bomb defence** — `_PLASMIDSAURUS_PERBASE_MAX_BYTES = 100 MB` two-layer cap: refuses upfront when central-directory `file_size` overshoots, and `_summarize_perbase_tsv` chunked-reads (64 KB) via `codecs.getincrementaldecoder` so a hostile zip decompressing into a single multi-GB line without newlines can't OOM `io.TextIOWrapper`'s line buffer.
+* **Single-pass zip-open for Samples table** — `_batch_extract_gbk_meta` reads every sample's gbk inside one `ZipFile` open instead of 50× re-opens. Test asserts the open count via `monkeypatch` on `zipfile.ZipFile.__init__`.
+* **NUL-anchored sentinels** — `_NO_GBK_KEY_PREFIX = "\x00no-gbk\x00"` and `_EMPTY_LIBRARY_SENTINEL = "\x00no-library\x00"` replace ambiguous `"_no_gbk_"` / `"—"` strings. NUL is rejected by `_is_safe_zip_member_name` and never appears in LOCUS-safe ids → collision-proof against any real row key.
+
+Future expansion (already designed for): a Plasmidsaurus API key tab in the same screen that downloads run zips directly. Same downstream parse + alignment pipeline; only the ingestion source changes.
 
 ## Architecture pointers
 

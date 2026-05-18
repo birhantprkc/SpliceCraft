@@ -50,6 +50,13 @@ installs and the user-data directory location.
   with edge-case fallback to 2-primer modified-outer PCR.
 - **Simulate** PCR + agarose gels (0.5–4% with the Helling-Goodman-
   Boyer mobility curve and form corrections).
+- **Align sequencing runs** from the Sequencing toolbar — drop in a
+  Plasmidsaurus `.zip`, browse a nested 4-tab view of the run (General
+  overview · per-Samples table · Quality metrics including k-mer +
+  contamination + coverage · Align), pick a sample + target plasmid;
+  the pairwise alignment lands as a sequencing-read lane on the
+  linear map right next to the rail, and the target's library entry
+  auto-tags to linear view for future opens.
 - **Search** your library with in-process BLASTN / BLASTP / HMMscan
   (via `pyhmmer` — no external `blast+` install).
 - **Drive from outside** via a 60+ endpoint localhost JSON API

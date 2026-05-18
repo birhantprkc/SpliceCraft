@@ -36,6 +36,13 @@ primers.json
 /*.gb
 /*.gbk
 
+# Plasmidsaurus result zips — local testing artefacts only, never committed.
+# Pattern matches `<jobid>_results.zip` (e.g. `34XK5N_results.zip`) anywhere
+# in the tree. WSL drops a `:Zone.Identifier` NTFS-stream sidecar next to
+# any file downloaded via a browser; ignore those globally too.
+*_results.zip
+*:Zone.Identifier
+
 # Editor / OS
 .vscode/
 .idea/

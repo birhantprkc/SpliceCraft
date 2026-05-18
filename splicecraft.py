@@ -4345,7 +4345,21 @@ def _scan_restriction_sites_impl(
             by_enzyme[name] = hits
 
     feats: list[dict] = []
-    placed: set[tuple[int, int]] = set()   # (start, end) of resites already shown
+    # `placed` tracks (start, end, recognition_site) — keying on the
+    # recognition string in addition to the span means HF / iso
+    # variants of the SAME enzyme (e.g., EcoRI vs EcoRI-HF, both with
+    # site "GAATTC") still collapse, but two enzymes with DIFFERENT
+    # recognition patterns whose hits happen to land on the same
+    # bp range (e.g., AccI/GTMKAC and BstZ17I/GTATAC both matching
+    # GTATAC at one position) stay independent. Pre-2026-05-18 this
+    # was `set[tuple[int, int]]` which over-collapsed and caused
+    # `unique_only=True`/`False` to disagree on which enzyme to
+    # surface when the catalog-order winner was a multi-cutter
+    # filtered out by `unique_only=True` but kept by `unique_only=False`.
+    placed: set[tuple[int, int, str]] = set()
+    site_of: dict[str, str] = {
+        entry[0]: entry[1] for entry in _SCAN_CATALOG
+    }
     # When a custom enzyme list is active, the user has hand-picked
     # the set — surface every hit of those enzymes regardless of
     # cut-count. The `unique_only` filter is a discovery aid for the
@@ -4365,9 +4379,14 @@ def _scan_restriction_sites_impl(
             )
             if n_sites != 1:
                 continue
-        # Skip isoschizomers / HF-variants that land on an already-placed site
+        # Skip isoschizomers / HF-variants of the SAME recognition that
+        # land on an already-placed site. The recognition string is
+        # part of the key so genuinely-different enzymes (different
+        # recognition patterns) with accidental position overlap stay
+        # independent.
+        site_key = site_of.get(name, "")
         positions = {
-            (h["start"], h["end"]) for h in hits
+            (h["start"], h["end"], site_key) for h in hits
             if h["type"] == "resite" and h.get("label")
         }
         if positions & placed:
@@ -9115,6 +9134,483 @@ def _extract_gbk_member(zip_path: Path, member_name: str) -> str:
         return raw.decode("latin-1", errors="replace")
 
 
+# ── Plasmidsaurus run-zip structured parser ───────────────────────────────────
+#
+# A standard Plasmidsaurus results zip groups files by category and
+# names each by `<run>_<sample-idx>_<sample-name>.<ext>`. Categories
+# seen in the wild:
+#
+#   <run>_genbank-files/<base>.gbk          — annotated consensus
+#   <run>_fasta-files/<base>.fasta          — bare consensus FASTA
+#   <run>_summary-files/<base>.txt          — k-mer % + contamination %
+#   <run>_per-base-data/<base>.tsv          — per-bp coverage / quality
+#   <run>_histograms/<base>.png             — read-length histogram
+#   <run>_coverage-plots/<base>.png         — coverage plot
+#   <run>_interactive-map/<base>.html       — Bokeh interactive map
+#   <run>_ab1-files/<base>.<n-of-m>.ab1     — Sanger trace
+#   <run>_gel.png                            — run-level virtual gel
+#
+# The `_parse_plasmidsaurus_zip` walk groups every member under its
+# sample's canonical base name, surfaces run-level files separately,
+# and returns small dicts the Sequencing toolbar's sub-tabs can render
+# without re-reading the zip per tab. The summary-file body and the
+# per-base TSV header are streamed inline (both tiny — <500 KB) so
+# the QC tab can render contamination / coverage stats without a
+# second pass.
+
+# Cap on the inline-cached summary-file text we keep on the SequencingScreen
+# instance. Per the Plasmidsaurus summary files inspected (≤200 bytes
+# typical), 4 KB is generous; refuse anything larger to keep the
+# in-memory cache bounded even on malformed runs.
+_PLASMIDSAURUS_SUMMARY_MAX_BYTES = 4 * 1024
+
+# Cap on per-base TSV reads. Real Plasmidsaurus per-base data is
+# ~50 bytes/row × plasmid bp (so a 10 kbp plasmid ships ~500 KB).
+# 100 MB is generous for the largest plasmids we'd ever see (200 kbp
+# ≈ 10 MB) while still bounding a hostile zip that claims a tiny
+# `file_size` in the central directory but streams unbounded data on
+# decompress. Sacred-invariant defence-in-depth: also enforced inside
+# `_summarize_perbase_tsv` via a chunked read so a single bombing
+# line without newlines can't OOM `io.TextIOWrapper`'s buffer.
+_PLASMIDSAURUS_PERBASE_MAX_BYTES = 100 * 1024 * 1024
+
+
+def _normalize_zip_member(name: str) -> str:
+    """Return `name` with backslashes folded to forward slashes. Some
+    Windows-built zips ship `category\\sample.ext` member names; the
+    rest of this module assumes forward slashes."""
+    return (name or "").replace("\\", "/")
+
+
+def _parse_plasmidsaurus_zip(zip_path: Path) -> dict:
+    """Inspect a Plasmidsaurus results zip and return a structured
+    summary keyed by sample.
+
+    Returns ``{"run_id", "samples": [{"base", "name", "gbk", "fasta",
+    "summary", "summary_text", "perbase", "perbase_coverage",
+    "histogram", "coverage_plot", "interactive_map", "ab1_files"}, ...],
+    "run_files": [{"name", "size", "category"}, ...], "total_files",
+    "total_size"}``.
+
+    Each ``gbk``/``fasta``/``summary``/``perbase`` value is the zip
+    member name (or None when absent). ``summary_text`` is a verbatim
+    decode of the summary file body when it is below
+    ``_PLASMIDSAURUS_SUMMARY_MAX_BYTES``; consumers parse contamination
+    + k-mer percentages from this. ``perbase_coverage`` carries
+    coverage stats {"mean", "min", "max", "n_pos", "above_20x"} derived
+    from the per-base TSV's `reads_all` column. Both summary_text and
+    perbase_coverage are best-effort — missing / unreadable members
+    leave them as ``""`` and ``{}``.
+
+    All size caps from `_list_gbk_members_in_zip` apply. Members with
+    paths failing `_is_safe_zip_member_name` are silently skipped.
+
+    Raises ValueError on the zip itself being missing / oversized /
+    corrupt — same surface as `_list_gbk_members_in_zip`.
+    """
+    import zipfile
+    p = Path(zip_path)
+    if not p.exists():
+        raise ValueError(f"zip not found: {p}")
+    if not p.is_file():
+        raise ValueError(f"not a regular file: {p}")
+    try:
+        size = p.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"could not stat zip: {exc}") from exc
+    if size > _PLASMIDSAURUS_ZIP_MAX_BYTES:
+        raise ValueError(
+            f"zip too large ({size:,} bytes; cap "
+            f"{_PLASMIDSAURUS_ZIP_MAX_BYTES:,})"
+        )
+    try:
+        zf = zipfile.ZipFile(str(p), "r")
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise ValueError(f"could not open zip: {exc}") from exc
+
+    # Per-sample dict keyed by canonical base name (filename without
+    # the category-folder prefix, minus extension).
+    samples: dict[str, dict] = {}
+    run_files: list[dict] = []
+    total_files = 0
+    total_size = 0
+    # Run ID: parent folder name prefix shared by category dirs
+    # (e.g., `34XK5N_genbank-files/...` → run_id=`34XK5N`). Inferred
+    # by majority vote so a malformed zip with mixed prefixes doesn't
+    # pick a stale one.
+    prefix_votes: dict[str, int] = {}
+
+    # Category folder → field-name on the sample dict. Anchored on the
+    # underscore-separator pattern Plasmidsaurus uses so a sample whose
+    # own filename happens to contain `_genbank-files` doesn't false-
+    # positive. We probe per-suffix rather than full prefix because
+    # the run-ID prefix varies per zip.
+    _CATEGORY_SUFFIXES = (
+        ("_genbank-files",      "gbk"),
+        ("_fasta-files",        "fasta"),
+        ("_summary-files",      "summary"),
+        ("_per-base-data",      "perbase"),
+        ("_histograms",         "histogram"),
+        ("_coverage-plots",     "coverage_plot"),
+        ("_interactive-map",    "interactive_map"),
+        ("_ab1-files",          "ab1"),   # multiple per sample
+    )
+
+    try:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            raw_name = _normalize_zip_member(info.filename)
+            if not _is_safe_zip_member_name(raw_name):
+                _log.warning(
+                    "plasmidsaurus: skipping unsafe zip member name %r",
+                    raw_name,
+                )
+                continue
+            total_files += 1
+            total_size += int(info.file_size or 0)
+            parts = raw_name.split("/")
+            if len(parts) < 2:
+                # Top-level file (e.g., `<run>_gel.png`, `README.txt`).
+                base = parts[0]
+                # Run-level: anchor the prefix vote on a typical
+                # top-level naming, e.g. `34XK5N_gel.png` → `34XK5N`.
+                stem = base.rsplit(".", 1)[0]
+                if "_" in stem:
+                    prefix_votes[stem.split("_", 1)[0]] = (
+                        prefix_votes.get(stem.split("_", 1)[0], 0) + 1
+                    )
+                run_files.append({
+                    "name": base,
+                    "size": int(info.file_size or 0),
+                    "category": "run",
+                })
+                continue
+            folder = parts[0]
+            # Match a category suffix anchored on `_<suffix>` at end.
+            matched_field: "str | None" = None
+            for suffix, field in _CATEGORY_SUFFIXES:
+                if folder.endswith(suffix):
+                    matched_field = field
+                    # Vote: everything before the matched suffix is
+                    # the run-ID candidate (e.g. `34XK5N` from
+                    # `34XK5N_genbank-files`). A zip whose folders
+                    # share one prefix wins by majority.
+                    prefix_candidate = folder[: -len(suffix)]
+                    if prefix_candidate:
+                        prefix_votes[prefix_candidate] = (
+                            prefix_votes.get(prefix_candidate, 0) + 1
+                        )
+                    break
+            if matched_field is None:
+                # Unknown category folder. If the file itself is a
+                # .gbk / .gb / .genbank, treat it as a standalone
+                # sample so test-fixture-style zips (no
+                # `_genbank-files/` subfolder, just `sample_A/x.gbk`)
+                # still surface every plasmid. Otherwise surface
+                # under `run_files` so a custom Plasmidsaurus build
+                # with an extra folder is still inspectable.
+                leaf_raw = parts[-1]
+                low = leaf_raw.lower()
+                if any(low.endswith(ext) for ext in _GBK_EXTS):
+                    matched_field = "gbk"
+                else:
+                    run_files.append({
+                        "name": raw_name,
+                        "size": int(info.file_size or 0),
+                        "category": folder,
+                    })
+                    continue
+            leaf = parts[-1]
+            # Canonical sample base: filename minus dot-extensions.
+            # `.1-of-2.ab1` collapses to the base+strip-of-tail logic
+            # below so all ab1s for a sample group under the same key.
+            base = leaf
+            for _ in range(4):  # at most a couple of dot segments
+                if "." not in base:
+                    break
+                stem, _, ext = base.rpartition(".")
+                if not stem:
+                    break
+                # Stop on the canonical biology extensions; everything
+                # past `.ab1`, `.gbk`, `.fasta`, `.tsv`, `.txt`,
+                # `.png`, `.html` is part of the sample name.
+                if ext.lower() in (
+                    "gbk", "gb", "genbank", "fasta", "fa", "tsv", "txt",
+                    "png", "jpg", "jpeg", "html", "ab1",
+                ):
+                    base = stem
+                    continue
+                # `.1-of-2` style sub-suffix on ab1 — strip too so all
+                # trace files for a sample collapse to one entry.
+                if matched_field == "ab1" and "-of-" in ext:
+                    base = stem
+                    continue
+                break
+            entry = samples.setdefault(base, {
+                "base": base,
+                "name": base,
+                "gbk": None, "fasta": None, "summary": None,
+                "perbase": None, "histogram": None,
+                "coverage_plot": None, "interactive_map": None,
+                "ab1_files": [],
+                "summary_text": "", "perbase_coverage": {},
+            })
+            if matched_field == "ab1":
+                entry["ab1_files"].append(raw_name)
+            else:
+                entry[matched_field] = raw_name
+
+        # Stream the small text bodies inline so the QC sub-tab can
+        # render contamination / coverage without re-opening the zip.
+        for sample in samples.values():
+            sm = sample.get("summary")
+            if sm:
+                try:
+                    info = zf.getinfo(sm)
+                    if info.file_size <= _PLASMIDSAURUS_SUMMARY_MAX_BYTES:
+                        with zf.open(info, "r") as fh:
+                            data = fh.read(
+                                _PLASMIDSAURUS_SUMMARY_MAX_BYTES + 1,
+                            )
+                        if len(data) <= _PLASMIDSAURUS_SUMMARY_MAX_BYTES:
+                            try:
+                                sample["summary_text"] = data.decode(
+                                    "utf-8",
+                                )
+                            except UnicodeDecodeError:
+                                sample["summary_text"] = data.decode(
+                                    "latin-1", errors="replace",
+                                )
+                except (KeyError, OSError, zipfile.BadZipFile):
+                    _log.exception(
+                        "plasmidsaurus: failed to read summary for %s",
+                        sample.get("base", "?"),
+                    )
+            pb = sample.get("perbase")
+            if pb:
+                try:
+                    info = zf.getinfo(pb)
+                    # Per-base TSV can run multi-MB on large plasmids;
+                    # stream-decode rather than load fully into memory.
+                    # Two-layer cap: refuse outright on a central-directory
+                    # `file_size` that already overshoots the limit, then
+                    # pass the cap into the streamer so a hostile zip with
+                    # an under-claimed size that decompresses into GB still
+                    # bails before OOM.
+                    if info.file_size > _PLASMIDSAURUS_PERBASE_MAX_BYTES:
+                        _log.warning(
+                            "plasmidsaurus: skipping oversize perbase %s "
+                            "(%d bytes; cap %d)",
+                            pb, info.file_size,
+                            _PLASMIDSAURUS_PERBASE_MAX_BYTES,
+                        )
+                    else:
+                        with zf.open(info, "r") as fh:
+                            sample["perbase_coverage"] = (
+                                _summarize_perbase_tsv(
+                                    fh,
+                                    max_bytes=(
+                                        _PLASMIDSAURUS_PERBASE_MAX_BYTES
+                                    ),
+                                )
+                            )
+                except (KeyError, OSError, zipfile.BadZipFile):
+                    _log.exception(
+                        "plasmidsaurus: failed to read perbase for %s",
+                        sample.get("base", "?"),
+                    )
+    finally:
+        zf.close()
+
+    # Resolve the run ID by majority vote on the prefixes we saw.
+    run_id = ""
+    if prefix_votes:
+        run_id = max(prefix_votes.items(), key=lambda kv: kv[1])[0]
+
+    # Natural-sort samples by name so MAV32 < MAV34 < ... < MAV310.
+    sample_list = sorted(
+        samples.values(),
+        key=lambda s: _natural_sort_key(s.get("name") or ""),
+    )
+    return {
+        "run_id": run_id,
+        "samples": sample_list,
+        "run_files": run_files,
+        "total_files": total_files,
+        "total_size": total_size,
+    }
+
+
+def _summarize_perbase_tsv(fh, *, max_bytes: "int | None" = None) -> dict:
+    """Stream the per-base TSV file handle and return summary coverage
+    stats: ``{"mean", "min", "max", "n_pos", "above_20x"}``.
+
+    Assumes the Plasmidsaurus column layout (col 0=pos, col 1=ref,
+    col 2=reads_all, ...). Defensive on header detection — header row
+    is skipped if col 2 isn't an integer. Returns an empty dict on
+    parse failure so the caller can degrade gracefully.
+
+    Streams in 64 KB chunks with a hard byte cap (``max_bytes``). A
+    zip-bomb that decompresses into a single multi-GB line without
+    newlines would otherwise let ``io.TextIOWrapper`` buffer the whole
+    line in memory before yielding it. ``max_bytes=None`` skips the
+    cap for trusted callers (no current caller hits this path — the
+    Plasmidsaurus parser always passes its cap).
+    """
+    import io
+    total = 0
+    n = 0
+    lo = 10 ** 9
+    hi = -1
+    above_20x = 0
+    import codecs
+    chunk_size = 64 * 1024
+    try:
+        utf8_decoder = codecs.getincrementaldecoder("utf-8")(
+            errors="replace",
+        )
+    except LookupError:
+        # Should never happen on a stdlib build, but degrade rather
+        # than raising — the caller treats {} as "couldn't summarise".
+        return {}
+    consumed = 0
+    pending = ""
+    truncated = False
+
+    def _consume_line(line: str, header_seen_box: list[bool]) -> None:
+        nonlocal n, total, lo, hi, above_20x
+        cols = line.rstrip("\r").split("\t")
+        if len(cols) < 3:
+            return
+        if not header_seen_box[0]:
+            header_seen_box[0] = True
+            # Header: skip iff col 2 isn't numeric.
+            try:
+                int(cols[2])
+            except ValueError:
+                return
+        try:
+            v = int(cols[2])
+        except ValueError:
+            return
+        n += 1
+        total += v
+        if v < lo:
+            lo = v
+        if v > hi:
+            hi = v
+        if v >= 20:
+            above_20x += 1
+
+    header_seen = [False]
+    try:
+        while True:
+            try:
+                chunk = fh.read(chunk_size)
+            except (OSError, ValueError):
+                _log.exception(
+                    "plasmidsaurus: perbase TSV read failed mid-stream"
+                )
+                return {}
+            if not chunk:
+                # Tail flush — last line without trailing newline.
+                if pending:
+                    _consume_line(pending, header_seen)
+                break
+            consumed += len(chunk)
+            if max_bytes is not None and consumed > max_bytes:
+                truncated = True
+            text = utf8_decoder.decode(chunk, final=truncated)
+            pending += text
+            lines = pending.split("\n")
+            pending = lines.pop()  # last fragment may be partial
+            for line in lines:
+                _consume_line(line, header_seen)
+            if truncated:
+                # Flush any partial tail we have, then stop.
+                if pending:
+                    _consume_line(pending, header_seen)
+                _log.warning(
+                    "plasmidsaurus: perbase TSV exceeded %d-byte cap; "
+                    "summary truncated", max_bytes,
+                )
+                break
+    except Exception:
+        _log.exception("plasmidsaurus: perbase TSV summarize failed")
+        return {}
+    if n == 0:
+        return {}
+    return {
+        "mean":      total / n,
+        "min":       lo if lo != 10 ** 9 else 0,
+        "max":       hi if hi >= 0 else 0,
+        "n_pos":     n,
+        "above_20x": above_20x,
+    }
+
+
+def _parse_plasmidsaurus_summary(text: str) -> dict:
+    """Parse the body of a Plasmidsaurus `<run>_<n>_<name>.txt` summary
+    file. Returns ``{"kmer_moles_pct": float, "kmer_mass_pct": float,
+    "contamination_pct": float, "contamination_source": str,
+    "raw_text": str}``. Missing fields default to ``None``.
+
+    Format observed in the wild::
+
+            1-mer (%)  2-mer (%)
+        moles       97.5        2.5
+        mass        95.1        4.9
+
+
+        *************************
+
+
+        E. coli genomic contamination: 18.0%
+
+    Both the column count (`<n>-mer`) and the contamination source
+    line vary across runs; we extract the first numeric token after
+    `moles`/`mass` (the canonical 1-mer percentages) and grep the
+    contamination line for the % value + source organism.
+    """
+    out: dict = {
+        "kmer_moles_pct":      None,
+        "kmer_mass_pct":       None,
+        "contamination_pct":   None,
+        "contamination_source": "",
+        "raw_text":             text,
+    }
+    if not text:
+        return out
+    import re as _re
+    moles_match = _re.search(
+        r"^\s*moles\s+([0-9.]+)", text, _re.MULTILINE,
+    )
+    mass_match = _re.search(
+        r"^\s*mass\s+([0-9.]+)",  text, _re.MULTILINE,
+    )
+    if moles_match:
+        try:
+            out["kmer_moles_pct"] = float(moles_match.group(1))
+        except (TypeError, ValueError):
+            pass
+    if mass_match:
+        try:
+            out["kmer_mass_pct"] = float(mass_match.group(1))
+        except (TypeError, ValueError):
+            pass
+    contam_match = _re.search(
+        r"([^\n]+?)\s*contamination:\s*([0-9.]+)%", text, _re.IGNORECASE,
+    )
+    if contam_match:
+        out["contamination_source"] = contam_match.group(1).strip()
+        try:
+            out["contamination_pct"] = float(contam_match.group(2))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
 # ── Pairwise alignment (sequencing data ↔ plasmid map) ────────────────────────
 #
 # Wraps Bio.Align.PairwiseAligner so callers get a small dict result
@@ -10315,20 +10811,31 @@ class PlasmidMap(Widget):
             self._feats[i]["start"] for i in self._feats_by_start
         ]
         self._restr_feats = []
-        # Default the map view to match the record's topology. The
-        # GenBank `topology` annotation is the authoritative answer
-        # — circular plasmids open in circular, true linear records
-        # (PCR products, sequencing fragments, mitochondrial linear
-        # DNA, partial maps) open in linear. Missing / unknown values
-        # fall back to circular since that's the common case for
-        # this app's primary user. Within a session the user can
-        # always toggle with `v`; this just sets the per-load default.
-        topology = ""
+        # Per-plasmid persisted map-view preference takes precedence over
+        # topology default. `_tui_map_mode` is stashed by `_library_load`
+        # (and the Plasmidsaurus alignment flow) from the library entry's
+        # `map_mode` field. Falls back to the GenBank `topology`
+        # annotation when the entry has no stored preference — circular
+        # plasmids open in circular, true linear records (PCR products,
+        # sequencing fragments, partial maps) open in linear. Missing /
+        # unknown values fall back to circular since that's the common
+        # case for this app's primary user. Within a session the user
+        # can always toggle with `v`; the toggle persists the new
+        # preference into the library entry so it sticks across reloads.
+        stashed_mode = ""
         try:
-            topology = (record.annotations or {}).get("topology", "") or ""
+            stashed_mode = str(getattr(record, "_tui_map_mode", "") or "").lower()
         except Exception:
-            pass
-        self._map_mode = "linear" if str(topology).lower() == "linear" else "circular"
+            stashed_mode = ""
+        if stashed_mode in ("linear", "circular"):
+            self._map_mode = stashed_mode
+        else:
+            topology = ""
+            try:
+                topology = (record.annotations or {}).get("topology", "") or ""
+            except Exception:
+                pass
+            self._map_mode = "linear" if str(topology).lower() == "linear" else "circular"
         # Auto-fog: very long records open zoomed in so labels / arrows
         # remain readable. Below the threshold, default to whole-record
         # view (zoom=1.0). User can `0` to reset or `-` to zoom out.
@@ -10820,6 +11327,15 @@ class PlasmidMap(Widget):
                 pass
             return
         self._map_mode = "linear" if self._map_mode == "circular" else "circular"
+        # Persist the user's choice on the active library entry so a
+        # later reload defaults to the same view. No-op when the
+        # currently-loaded plasmid isn't tracked in the library.
+        try:
+            persist = getattr(self.app, "_persist_map_mode_for_active", None)
+            if callable(persist):
+                persist(self._map_mode)
+        except Exception:
+            _log.exception("toggle_map_view: persist failed")
         self.refresh()
 
     def select_feature(self, idx: int) -> None:
@@ -11650,11 +12166,28 @@ class PlasmidMap(Widget):
             lanes[chosen].append((cx0, cx1))
             placed.append((i, feat, cx0, cx1, is_fwd, chosen))
 
+        # ── Pre-pack alignment lanes ──
+        # Sequencing-read / library-diff alignments sit closest to the
+        # rail (user-visible centerline) so the user can read base-by-
+        # base diff against the target without scanning past the
+        # feature band. Packed BEFORE rev features so we can offset
+        # the rev-band downward by the alignment lane count. Empty
+        # list when no alignments are registered — no displacement.
+        self._align_bboxes = []
+        align_placed: "list[tuple[int, dict, int, int, int]]" = []
+        align_lanes_count = 0
+        if self._alignments:
+            align_placed, align_lanes_count = self._pack_alignment_lanes(
+                margin_l, usable_w, view_s, view_e, w, bp_to_col,
+            )
+
         # ── Render features ──
         # Lane k for forward sits at row `rail_row - 2 - k`, leaving
         # row `rail_row - 1` clear for stems. Lane k for reverse sits
-        # at row `rail_row + 2 + k`, with row `rail_row + 1` for the
-        # bp tick labels and stems threading through it.
+        # at row `rail_row + 2 + align_lanes_count + k`, leaving row
+        # `rail_row + 1` for the bp tick labels and rows
+        # `rail_row + 2 .. rail_row + 1 + align_lanes_count` for the
+        # alignment band (closest-to-rail position, painted further down).
         for i, feat, cx0, cx1, is_fwd, lane_idx in placed:
             color  = feat["color"]
             label  = feat.get("label", feat.get("type", ""))
@@ -11666,8 +12199,9 @@ class PlasmidMap(Widget):
                 if feat_row < 1:
                     continue
             else:
-                # Push reverse lanes further down to avoid the tick row.
-                feat_row = rail_row + 2 + lane_idx
+                # Push reverse lanes below the alignment band (when
+                # present) so the alignment lanes stay nearest the rail.
+                feat_row = rail_row + 2 + align_lanes_count + lane_idx
                 if feat_row >= h:
                     continue
 
@@ -11706,30 +12240,37 @@ class PlasmidMap(Widget):
             # Stem from feature midpoint down/up to the rail. Walk one
             # cell at a time and only paint into blank cells so we
             # don't tear through another feature's bar that happens to
-            # share the column.
+            # share the column. Rev stems skip the alignment-band rows
+            # entirely so blank gaps within the band aren't threaded
+            # with disconnected `│` glyphs (the band is supposed to
+            # read as a continuous sequencing-read lane).
             stem_col = (cx0 + cx1 - 1) // 2
             if is_fwd:
                 stem_rows = range(feat_row + 1, rail_row)
+                align_skip_lo = align_skip_hi = -1
             else:
                 stem_rows = range(rail_row + 1, feat_row)
+                align_skip_lo = rail_row + 2
+                align_skip_hi = rail_row + 1 + align_lanes_count
             for sr in stem_rows:
                 if 0 <= sr < h:
+                    if align_skip_lo <= sr <= align_skip_hi:
+                        continue
                     existing = canvas._chars[sr][stem_col]
                     if existing == " ":
                         canvas.put(stem_col, sr, "│", color)
 
         # ── Alignment overlay band ──
-        # Sequencing-read / library-diff alignments stack below the
-        # reverse-feature lanes. Rows are packed IGV-style (greedy
-        # first-fit so short alignments share lanes when their target
-        # spans don't overlap). Bar mode at <1 col/bp (blue match /
-        # red mismatch / gray gap blocks); letter mode at ≥1 col/bp
-        # (query base letter in the same 3-colour scheme).
-        self._align_bboxes = []
-        if self._alignments:
+        # Alignments were pre-packed up front so the rev-feature band
+        # could be offset; now paint the lanes immediately below the
+        # tick label row (closest-to-rail). Bar mode at <1 col/bp (blue
+        # match / red mismatch / gray gap blocks); letter mode at
+        # ≥1 col/bp (query base letter in the same 3-colour scheme).
+        if align_placed:
             self._draw_alignment_band(
                 canvas, w, h, margin_l, usable_w, view_s, view_e,
-                visible_bp, bp_to_col, rail_row, rev_lanes,
+                visible_bp, bp_to_col, rail_row,
+                align_placed=align_placed,
             )
 
         # ── Header ──
@@ -11747,32 +12288,20 @@ class PlasmidMap(Widget):
 
         return bc.combine(canvas)
 
-    def _draw_alignment_band(
-        self, canvas, w: int, h: int, margin_l: int, usable_w: int,
-        view_s: int, view_e: int, visible_bp: int,
-        bp_to_col, rail_row: int, rev_lanes: "list",
-    ) -> None:
-        """Paint the linear-view alignment overlay onto `canvas`.
-
-        Helper extracted from `_draw_linear_flag` so the main render
-        stays readable. The contract is: caller has already drawn the
-        rail, ticks, restriction marks, and forward/reverse feature
-        lanes; `rev_lanes` is the list-of-lists used by the feature
-        packer so we know how far below the rail the feature band ends.
-
-        Per-frame work:
-          * filter `self._alignments` to those overlapping the visible bp window
-          * IGV-style greedy first-fit lane packing on column extents
-          * per-alignment bar render (bar mode <1 col/bp, letter mode otherwise)
-          * strand arrowhead at the right end
-          * click bboxes appended to `self._align_bboxes`
-          * "+N more" overflow indicator if alignments exceed available rows
-
-        2026-05-12: separate coverage-histogram row removed per user
-        request — the lane stack alone carries enough information and
-        the histogram read as a confusing second band.
-        """
-        # 1. Filter alignments to those touching the visible window.
+    def _pack_alignment_lanes(
+        self, margin_l: int, usable_w: int,
+        view_s: int, view_e: int, w: int, bp_to_col,
+    ) -> tuple[list, int]:
+        """Filter `self._alignments` to those overlapping the visible
+        bp window, then IGV-style greedy first-fit lane-pack them
+        (sort by target start asc, length desc so the longest spans
+        claim low lanes nearest the rail). Returns
+        ``(align_placed, n_lanes)`` where each placed entry is
+        ``(ai, align, lane_idx, cx0, cx1)``.
+        Extracted from `_draw_alignment_band` so `_draw_linear_flag`
+        can learn the lane count BEFORE rendering rev features and
+        offset that band downward (keeping the alignment lanes
+        closest to the rail / centerline)."""
         visible_aligns: "list[tuple[int, dict]]" = []
         for ai, align in enumerate(self._alignments):
             t_lo = align.get("t_lo", 0)
@@ -11781,11 +12310,7 @@ class PlasmidMap(Widget):
                 continue
             visible_aligns.append((ai, align))
         if not visible_aligns:
-            return
-
-        # 2. Lane packing — sort by target start asc, then length desc
-        #    so longest spans claim low lanes (closest to rail). This
-        #    matches the feature-pack order in the parent function.
+            return [], 0
         visible_aligns.sort(
             key=lambda t: (
                 t[1].get("t_lo", 0),
@@ -11813,18 +12338,47 @@ class PlasmidMap(Widget):
                 chosen = len(align_lanes) - 1
             align_lanes[chosen].append((cx0, cx1))
             align_placed.append((ai, align, chosen, cx0, cx1))
+        return align_placed, len(align_lanes)
 
-        # 3. Compute row positions for the band.
-        # Last row consumed by the rev-feature band: tick label row
-        # (rail+1) plus one row per reverse lane. One blank separator,
-        # then alignment lanes start.
-        rev_lane_count = len(rev_lanes) if rev_lanes else 0
-        rev_last_used  = rail_row + 1 + rev_lane_count
-        align_band_top = rev_last_used + 2
+    def _draw_alignment_band(
+        self, canvas, w: int, h: int, margin_l: int, usable_w: int,
+        view_s: int, view_e: int, visible_bp: int,
+        bp_to_col, rail_row: int,
+        align_placed: "list[tuple[int, dict, int, int, int]]",
+    ) -> None:
+        """Paint the linear-view alignment overlay onto `canvas`.
+
+        Helper extracted from `_draw_linear_flag` so the main render
+        stays readable. The contract is: caller has already drawn the
+        rail + ticks + restriction marks and pre-packed alignment
+        lanes via `_pack_alignment_lanes`. The band sits at
+        ``rail_row + 2`` (closest-to-centerline, user request
+        2026-05-18) so sequencing-read diffs land right under the
+        sequence tick row instead of below the feature stack.
+
+        Per-frame work:
+          * per-alignment bar render (bar mode <1 col/bp, letter mode otherwise)
+          * strand arrowhead at the right end
+          * click bboxes appended to `self._align_bboxes`
+          * "+N more" overflow indicator if alignments exceed available rows
+
+        2026-05-12: separate coverage-histogram row removed per user
+        request — the lane stack alone carries enough information and
+        the histogram read as a confusing second band.
+        2026-05-18: lanes moved from below-rev-features to immediately
+        below the tick row; rev features now offset down by the lane
+        count to keep alignment bars closest to the rail.
+        """
+        if not align_placed:
+            return
+        # Place the alignment band right below the tick label row.
+        # `rail_row + 1` is the bp tick label; alignment lane 0 lands at
+        # `rail_row + 2` — the first row below the rail visually.
+        align_band_top = rail_row + 2
         if align_band_top >= h:
             # Terminal too short — surface a single-row hint where the
             # rev band ends rather than silently dropping the lanes.
-            hint_row = rev_last_used + 1
+            hint_row = rail_row + 1
             if 0 <= hint_row < h:
                 hint = f"[{len(self._alignments)} alignment(s) — terminal too short]"
                 canvas.put_text(
@@ -21043,7 +21597,8 @@ class MenuBar(Widget):
     """
 
     MENUS = ["File", "Settings", "Edit", "Enzymes", "Features", "Primers",
-             "Mutagenize", "Parts", "Constructor", "Simulator", "History"]
+             "Mutagenize", "Parts", "Constructor", "Simulator", "Sequencing",
+             "History"]
 
     def compose(self) -> ComposeResult:
         for name in self.MENUS:
@@ -36532,58 +37087,149 @@ class _ZipAwareDirectoryTree(DirectoryTree):
         super()._populate_node(node, sorted_content)
 
 
-# ── Plasmidsaurus alignment ingestion ─────────────────────────────────────────
+# ── Sequencing toolbar screen ────────────────────────────────────────────────
 #
-# `PlasmidsaurusAlignModal` is the entry point for "I have a Plasmidsaurus
-# results .zip and want to align the consensus to one of my library
-# plasmids". Three-step flow rolled into one modal so users don't bounce
-# between dialogs:
+# `SequencingScreen` is the user-facing entry for sequencing-data
+# workflows. Currently hosts one tab — Plasmidsaurus pairwise alignment
+# of a .zip result against a library plasmid — and is designed to grow
+# additional tabs (direct Plasmidsaurus API ingestion, nanopore consensus
+# tools, sequencing-report diffs) without disturbing the alignment path.
 #
-#   1. Type a .zip path (with `~` expansion).
-#   2. Listing of .gbk members surfaces — pick one.
-#   3. Target plasmid (from the active collection) is auto-selected to
-#      the currently-loaded record; user can change to any library entry.
-#   4. Run → pushes `AlignmentScreen` with the pairwise result.
+# Plasmidsaurus tab flow:
+#   1. Pick a .zip from the file tree (lime-green = .zip files).
+#   2. Tab lists .gbk members; click one.
+#   3. Target plasmid (from the active library) is auto-selected to the
+#      currently-loaded record; user can change to any library entry.
+#   4. Run → pairwise alignment posts onto the linear-map overlay band
+#      on the main screen, and the target's library entry is tagged
+#      `map_mode: "linear"` so re-opens default to linear view.
 #
-# Future: the same modal will gain a "Download from Plasmidsaurus
-# account" tab once the API integration lands; the alignment pipeline
-# downstream is unchanged.
+# `PlasmidsaurusAlignModal` is preserved as a module-level alias for
+# back-compat with test fixtures and any agent-API call sites that
+# referenced the old class name.
 
-class PlasmidsaurusAlignModal(ModalScreen):
-    """Modal: pick a Plasmidsaurus .zip, pick a .gbk member, pick a
-    library target plasmid, run pairwise alignment.
+class SequencingScreen(Screen):
+    """Full-screen Sequencing toolbar — tabbed workbench for
+    sequencing-data ingestion + alignment.
 
-    Dismisses with ``None`` on cancel. On submit, pushes
-    `AlignmentScreen` directly and dismisses with the alignment dict
-    so the caller can chain (currently only the menu action drives
-    this; the dismiss payload is unused but kept for symmetry).
+    Currently a single Plasmidsaurus tab; designed to absorb future
+    tabs without rewriting the alignment pipeline downstream.
+
+    Dismisses with ``None`` on Esc / Close. On a successful alignment
+    the worker pushes the result onto the main map's overlay band
+    (`PlasmidApp._register_alignment`) and dismisses with the
+    alignment dict so legacy callers chaining the result still work.
     """
 
+    # App-level Ctrl+Z must not undo edits while the user is staging
+    # an alignment (invariant #41 — modal Ctrl+Z opts out).
+    _blocks_undo: bool = True
+
     BINDINGS = [
-        Binding("escape", "cancel",         "Cancel"),
+        Binding("escape", "cancel",         "Close",  show=True),
         Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
     DEFAULT_CSS = """
-    PlasmidsaurusAlignModal { align: center middle; }
-    #align-box {
-        width: 110; max-width: 96%; min-width: 80;
-        height: 44;  max-height: 96%;
-        background: $surface; border: solid $accent; padding: 1 2;
+    /* ── Frame ──────────────────────────────────────────────── */
+    #seq-box {
+        width: 100%; height: 1fr;
+        background: $surface; padding: 0 1;
     }
-    #align-title  { background: $accent-darken-2; color: $text;
-                    padding: 0 1; margin-bottom: 1; }
-    #align-box Label { color: $text-muted; margin-top: 1; }
-    #align-zip-tree { height: 12; border: solid $primary-darken-2; }
-    #align-selected-zip { height: 1; color: $text-muted; }
-    #align-members  { height: 1fr; border: solid $primary-darken-2; }
-    #align-target   { margin-top: 1; }
-    #align-status   { height: 1; margin-top: 1; }
-    #align-btns     { height: 3; margin-top: 1; }
-    #align-btns Button { margin-right: 1; min-width: 12; }
+    #seq-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; height: 1;
+    }
+    /* Top-level tab strip ("Plasmidsaurus" + future siblings). */
+    #seq-tabs { width: 100%; height: 1fr; }
+    #seq-tabs > TabPane { padding: 0 1; }
+
+    /* ── Plasmidsaurus pane (parent of the sub-sub-tabs) ────── */
+    #sequencing-plasmidsaurus { width: 100%; height: 1fr; }
+    #plasmidsaurus-subtabs { width: 100%; height: 1fr; }
+    /* `padding: 0 1` leaves 1-cell horizontal breathing room either
+       side of every sub-tab's body without burning a row at top/
+       bottom. Looser spacing (`padding: 1`) costs ~10% of the
+       baseline 48-row terminal across two TabbedContent layers. */
+    #plasmidsaurus-subtabs > TabPane { padding: 0 1; }
+
+    /* Plain-text labels in any sub-tab get a 1-row top margin so
+       they don't crash into the widget above. Bare `Label` rule
+       only — Static rows with `margin-top: 1` set explicitly
+       below stay independent. */
+    #sequencing-plasmidsaurus Label { color: $text-muted; margin-top: 1; }
+
+    /* ── General sub-tab ───────────────────────────────────────
+       Zip-picker tree on top (fixed 12 rows — enough to scroll
+       through ~10 entries before scrolling kicks in) and the run
+       summary below (flexes into remaining height with a 4-row
+       floor so even short terminals show the headline counts). */
+    #align-zip-tree {
+        height: 12; min-height: 8;
+        border: solid $primary-darken-2;
+    }
+    #align-selected-zip {
+        height: 1; color: $text-muted; margin-top: 1;
+    }
+    #plasmidsaurus-run-meta {
+        height: 1fr; min-height: 4;
+        color: $text; margin-top: 1;
+    }
+
+    /* ── Samples sub-tab ───────────────────────────────────────
+       Single DataTable flexed into the pane. Hint above (1 row,
+       no top margin so it tucks under the tab header). */
+    #plasmidsaurus-sample-hint { height: 1; color: $text-muted; }
+    #align-members  {
+        height: 1fr; min-height: 6;
+        border: solid $primary-darken-2;
+        margin-top: 1;
+    }
+
+    /* ── Quality sub-tab ───────────────────────────────────────
+       Two stacked tables (per-sample QC metrics on top, run-level
+       files below). The QC table flexes to fill available rows;
+       the run-files table is fixed-height (8 rows is enough for
+       the typical ≤3 run-level files; scrolls otherwise). */
+    #plasmidsaurus-quality-hint { height: 1; color: $text-muted; }
+    #plasmidsaurus-quality-table {
+        height: 1fr; min-height: 6;
+        border: solid $primary-darken-2;
+        margin-top: 1;
+    }
+    #plasmidsaurus-runfiles-table {
+        height: 8; min-height: 4;
+        border: solid $primary-darken-2;
+        margin-top: 1;
+    }
+
+    /* ── Align sub-tab ─────────────────────────────────────────
+       Query indicator (1 row, accent-colored), target dropdown,
+       status line, and the run button. Compact stack because
+       this pane is short on content. */
+    #plasmidsaurus-align-query {
+        height: 1; color: $accent;
+    }
+    #align-target {
+        width: 100%; margin-top: 1;
+    }
+    #align-status {
+        height: 1; color: $text-muted; margin-top: 1;
+    }
+    #align-btns {
+        height: 3; margin-top: 1; align: left middle;
+    }
+    #align-btns Button { margin-right: 1; min-width: 14; }
+
+    /* ── Screen-level footer with the Close button ──────────── */
+    #seq-bottom {
+        height: 3; margin-top: 1; align: left middle;
+    }
+    #seq-bottom Button { margin-right: 1; min-width: 14; }
     """
 
-    def __init__(self, start_path: "str | None" = None) -> None:
+    def __init__(self, start_path: "str | None" = None,
+                  initial_tab: str = "plasmidsaurus") -> None:
         super().__init__()
         # Tree starts at the user's home dir by default. A custom
         # start_path lets future entry points (e.g. an agent-API
@@ -36596,50 +37242,144 @@ class PlasmidsaurusAlignModal(ModalScreen):
             start = Path.home()
         self._tree_start: str = str(start)
         self._zip_path: "Path | None" = None
+        # `_members` retained for back-compat with tests / agent paths
+        # that scrape the flat .gbk member list off the screen state.
+        # New code reads `_parsed_run["samples"]` instead.
         self._members: list[dict] = []
         self._selected_member: "str | None" = None
+        # Structured parse of the loaded zip — populated by
+        # `_on_zip_picked` via `_parse_plasmidsaurus_zip`. Empty dict
+        # until a valid zip lands, which is also how the sub-tab
+        # gating (`_apply_subtab_gating`) detects "data loaded?".
+        self._parsed_run: dict = {}
         # Cancel flag for the alignment worker. The PairwiseAligner
         # C-loop can't be interrupted (invariant #28), so cancel is
-        # cooperative — the worker checks this before pushing the
-        # AlignmentScreen, otherwise the user clicks Cancel and a
-        # full-screen result still pops up seconds later.
+        # cooperative — the worker checks this before registering on
+        # the overlay band, otherwise the user closes the screen and
+        # a stale alignment still surfaces seconds later.
         self._cancelled: bool = False
+        self._initial_tab: str = initial_tab or "plasmidsaurus"
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        """Allow Screen-level actions (mirrors `SimulatorScreen`)."""
+        return True
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="align-box"):
-            yield Static(
-                " Align sequencing run (Plasmidsaurus .zip) ",
-                id="align-title",
-            )
-            yield Label("Browse for the run .zip "
-                        "(highlighted lime-green):")
-            yield _ZipAwareDirectoryTree(
-                self._tree_start, id="align-zip-tree",
-            )
-            yield Static(
-                "[dim]No zip selected.[/dim]",
-                id="align-selected-zip", markup=True,
-            )
-            yield Label(".gbk members inside the zip (click to pick):")
-            yield DataTable(id="align-members", cursor_type="row",
-                              zebra_stripes=True)
-            yield Label("Target plasmid (from active collection):")
-            yield Select(
-                self._target_options(),
-                id="align-target",
-                allow_blank=False,
-            )
-            yield Static("", id="align-status", markup=True)
-            with Horizontal(id="align-btns"):
-                yield Button("Align", id="btn-align-go",
-                              variant="primary", disabled=True)
-                yield Button("Cancel", id="btn-align-cancel")
+        yield Header()
+        with Vertical(id="seq-box"):
+            yield Static(" Sequencing toolbar ", id="seq-title")
+            with TabbedContent(
+                initial=f"seq-tab-{self._initial_tab}", id="seq-tabs",
+            ):
+                with TabPane("Plasmidsaurus", id="seq-tab-plasmidsaurus"):
+                    yield from self._compose_plasmidsaurus_pane()
+            with Horizontal(id="seq-bottom"):
+                yield Button("Close  [Esc]", id="btn-sequencing-close")
+        yield Footer()
+
+    def _compose_plasmidsaurus_pane(self) -> ComposeResult:
+        with Vertical(id="sequencing-plasmidsaurus"):
+            with TabbedContent(
+                initial="psaurus-sub-general",
+                id="plasmidsaurus-subtabs",
+            ):
+                with TabPane("General", id="psaurus-sub-general"):
+                    yield from self._compose_general_subtab()
+                with TabPane("Samples", id="psaurus-sub-samples",
+                              disabled=True):
+                    yield from self._compose_samples_subtab()
+                with TabPane("Quality", id="psaurus-sub-quality",
+                              disabled=True):
+                    yield from self._compose_quality_subtab()
+                with TabPane("Align", id="psaurus-sub-align",
+                              disabled=True):
+                    yield from self._compose_align_subtab()
+
+    def _compose_general_subtab(self) -> ComposeResult:
+        """General sub-sub-tab: zip file picker + run-level overview.
+        The only tab enabled before a zip is loaded."""
+        yield Label("Browse for the run .zip "
+                    "(highlighted lime-green):")
+        yield _ZipAwareDirectoryTree(
+            self._tree_start, id="align-zip-tree",
+        )
+        yield Static(
+            "[dim]No zip selected.[/dim]",
+            id="align-selected-zip", markup=True,
+        )
+        yield Static(
+            "[dim]Load a Plasmidsaurus results zip to unlock the "
+            "Samples / Quality / Align tabs.[/dim]",
+            id="plasmidsaurus-run-meta", markup=True,
+        )
+
+    def _compose_samples_subtab(self) -> ComposeResult:
+        """Samples sub-sub-tab: per-sample DataTable. Clicking a row
+        marks that sample as the alignment query — the Align tab
+        reads `_selected_member` to know which .gbk to pipe through
+        the aligner."""
+        yield Static(
+            "[dim]Click a sample row to mark it as the alignment "
+            "query. The Align tab will use the picked sample's .gbk "
+            "consensus.[/dim]",
+            id="plasmidsaurus-sample-hint", markup=True,
+        )
+        yield DataTable(id="align-members", cursor_type="row",
+                          zebra_stripes=True)
+
+    def _compose_quality_subtab(self) -> ComposeResult:
+        """Quality sub-sub-tab: contamination / k-mer / coverage
+        per sample, plus the run-level extras (gel.png etc.)."""
+        yield Static(
+            "[dim]Per-sample QC metrics parsed from the run's "
+            "summary-files/ and per-base-data/ folders.[/dim]",
+            id="plasmidsaurus-quality-hint", markup=True,
+        )
+        yield DataTable(id="plasmidsaurus-quality-table",
+                         cursor_type="row", zebra_stripes=True)
+        yield Label("Run-level files:")
+        yield DataTable(id="plasmidsaurus-runfiles-table",
+                         cursor_type="row", zebra_stripes=True)
+
+    def _compose_align_subtab(self) -> ComposeResult:
+        """Align sub-sub-tab: pick a target + run pairwise alignment
+        against the sample chosen on the Samples tab."""
+        yield Static(
+            "[dim]No sample picked yet — switch to the Samples tab "
+            "and click a row.[/dim]",
+            id="plasmidsaurus-align-query", markup=True,
+        )
+        yield Label("Target plasmid (from active collection):")
+        yield Select(
+            self._target_options(),
+            id="align-target",
+            allow_blank=False,
+        )
+        yield Static("", id="align-status", markup=True)
+        with Horizontal(id="align-btns"):
+            yield Button("Align", id="btn-align-go",
+                          variant="primary", disabled=True)
+
+    # Sentinel value the Select shows when the library is empty.
+    # `_go` checks for this string before kicking off the align so
+    # the user is told to add a plasmid first instead of crashing on
+    # a missing target. NUL-prefixed to make collision with a real
+    # library `id` impossible (NCBI/locus ids never carry NUL).
+    _EMPTY_LIBRARY_SENTINEL = "\x00no-library\x00"
 
     def _target_options(self) -> list[tuple[str, str]]:
         """Build the (label, value) list for the target dropdown.
         Pulls from the library so the user can align against any
         plasmid in the active collection. Each value is the entry's
-        `id` (LOCUS-safe), label is the display name + size."""
+        `id` (LOCUS-safe), label is the display name + size.
+
+        Library load errors degrade to an empty-library sentinel row
+        so the Select stays mountable; the user sees an explicit
+        hint instead of a crash. Narrow except per invariant #1:
+        `_load_library` only surfaces through `_safe_load_json`'s
+        contract, which logs internally — so the failures we'd see
+        here are typed JSON / encoding / OSError paths.
+        """
         opts: list[tuple[str, str]] = []
         try:
             entries = sorted(
@@ -36650,26 +37390,68 @@ class PlasmidsaurusAlignModal(ModalScreen):
             )
             for e in entries:
                 eid = e.get("id") or ""
+                # Defence: a library entry whose id happens to be our
+                # sentinel would alias to the "no library" row. Refuse
+                # to surface it.
+                if eid == self._EMPTY_LIBRARY_SENTINEL:
+                    continue
                 name = e.get("name") or eid
                 size = e.get("size", 0)
                 opts.append((f"{name}  ({size:,} bp)", eid))
-        except Exception:
-            _log.exception("PlasmidsaurusAlignModal: library load failed")
+        except (OSError, ValueError, TypeError) as exc:
+            _log.exception(
+                "SequencingScreen: library load failed (%s)",
+                type(exc).__name__,
+            )
         if not opts:
-            opts.append(("(no plasmids in library — save one first)", "—"))
+            opts.append(
+                ("(no plasmids in library — save one first)",
+                 self._EMPTY_LIBRARY_SENTINEL),
+            )
         return opts
 
     def on_mount(self) -> None:
-        t = self.query_one("#align-members", DataTable)
-        t.add_columns("Member", "Size")
-        # Pre-select the currently-loaded record if it has a saved
-        # library entry. Otherwise the dropdown's first row stands.
+        # Samples sub-tab: per-sample summary table.
+        try:
+            t = self.query_one("#align-members", DataTable)
+            t.add_columns("Sample", "bp", "Feats",
+                            "Cov mean", "Contam %", "AB1")
+        except NoMatches:
+            pass
+        # Quality sub-tab: contamination / k-mer / coverage detail.
+        try:
+            q = self.query_one(
+                "#plasmidsaurus-quality-table", DataTable,
+            )
+            q.add_columns(
+                "Sample", "1-mer moles %", "1-mer mass %",
+                "Contam %", "Source",
+                "Cov mean", "Cov min", "≥ 20×",
+            )
+        except NoMatches:
+            pass
+        try:
+            rf = self.query_one(
+                "#plasmidsaurus-runfiles-table", DataTable,
+            )
+            rf.add_columns("File", "Size", "Category")
+        except NoMatches:
+            pass
+        # Pre-select the currently-loaded record on the target dropdown
+        # so the user doesn't have to re-pick it in the common case
+        # where they want to diff the run against the loaded plasmid.
+        # Skips the empty-library sentinel so a `cur.id` collision
+        # against it (extremely unlikely — sentinel is NUL-anchored)
+        # can't accidentally activate the "no library" placeholder.
+        # Library is cached after first `_target_options()` call so
+        # the second invocation here is microseconds, not a re-load.
         try:
             cur = getattr(self.app, "_current_record", None)
-            if cur is not None:
+            cur_id = getattr(cur, "id", None) if cur is not None else None
+            if cur_id and cur_id != self._EMPTY_LIBRARY_SENTINEL:
                 sel = self.query_one("#align-target", Select)
                 for _label, val in self._target_options():
-                    if val == cur.id:
+                    if val == cur_id and val != self._EMPTY_LIBRARY_SENTINEL:
                         sel.value = val
                         break
         except (NoMatches, AttributeError):
@@ -36678,64 +37460,436 @@ class PlasmidsaurusAlignModal(ModalScreen):
     @on(DirectoryTree.FileSelected, "#align-zip-tree")
     def _on_zip_picked(self, event) -> None:
         """User clicked a file in the directory tree. If it's a .zip,
-        list its .gbk members; if anything else, surface a helpful
-        warning so the user knows what kind of file this modal needs."""
+        parse the structured run; if not, surface a helpful warning
+        without disabling anything that's already in a good state.
+
+        Skips re-parse when the same path is clicked twice in a row
+        — a Plasmidsaurus zip parse takes ~50-300 ms per sample
+        (zip seeks + .gbk + per-base TSV scan), so the user double-
+        clicking shouldn't pay the cost twice."""
         path = Path(str(event.path))
-        sel  = self.query_one("#align-selected-zip", Static)
-        t    = self.query_one("#align-members", DataTable)
-        status = self.query_one("#align-status", Static)
-        # Reset the downstream state every time the user picks a new
-        # file — even one we end up rejecting. Otherwise the previous
-        # zip's members list lingers and the Align button might still
-        # be enabled when the user has clicked through to garbage.
-        t.clear()
-        self._members = []
-        self._selected_member = None
-        self._zip_path = None
-        self.query_one("#btn-align-go", Button).disabled = True
+        # Same-path short-circuit: nothing to re-do if state is intact.
+        if (self._zip_path is not None
+                and Path(self._zip_path) == path
+                and self._parsed_run):
+            return
+        try:
+            sel  = self.query_one("#align-selected-zip", Static)
+            meta = self.query_one("#plasmidsaurus-run-meta", Static)
+        except NoMatches:
+            return
+        # Reset downstream state on every pick — even one we'll reject.
+        self._reset_zip_state()
         if not _is_seq_zip_path(path):
             sel.update(
                 f"[yellow]Not a .zip: {_esc_md(path.name)}[/yellow]"
             )
-            status.update("")
+            meta.update(
+                "[dim]Load a Plasmidsaurus results zip to unlock the "
+                "Samples / Quality / Align tabs.[/dim]"
+            )
             return
         try:
-            members = _list_gbk_members_in_zip(path)
+            parsed = _parse_plasmidsaurus_zip(path)
         except ValueError as exc:
-            sel.update(
-                f"[dim]Picked:[/dim] {_esc_md(str(path))}"
+            sel.update(f"[dim]Picked:[/dim] {_esc_md(str(path))}")
+            meta.update(f"[red]{_esc_md(str(exc))}[/red]")
+            return
+        except (OSError, RuntimeError, MemoryError) as exc:
+            # OSError covers filesystem hiccups during stat / open;
+            # RuntimeError is what `_safe_xml_parse`-style helpers
+            # raise from inside `_parse_plasmidsaurus_zip` on unsafe
+            # input shapes; MemoryError caps an oversize per-base read
+            # that slipped past the size guard. Narrow per invariant
+            # #1 — defensive catches must enumerate the expected
+            # exception types so a real bug isn't silently swallowed.
+            _log.exception(
+                "SequencingScreen: unexpected zip parse failure",
             )
-            status.update(f"[red]{_esc_md(str(exc))}[/red]")
+            sel.update(f"[dim]Picked:[/dim] {_esc_md(str(path))}")
+            meta.update(
+                f"[red]Could not parse zip: "
+                f"{_esc_md(type(exc).__name__)}[/red]"
+            )
             return
         self._zip_path = path
-        self._members  = members
+        self._parsed_run = parsed
+        # Flat back-compat list of .gbk members for any caller still
+        # reading `_members` (currently only legacy tests).
+        self._members = [
+            {"name": s["gbk"], "size": 0}
+            for s in parsed.get("samples", [])
+            if s.get("gbk")
+        ]
         sel.update(f"[dim]Picked:[/dim] {_esc_md(str(path))}")
-        if not members:
-            status.update(
-                "[yellow]No .gbk / .gb / .genbank members found "
-                "inside.[/yellow]"
+        self._populate_general_meta(parsed)
+        self._populate_samples_table(parsed)
+        self._populate_quality_tables(parsed)
+        self._apply_subtab_gating(enabled=bool(parsed.get("samples")))
+
+    def _reset_zip_state(self) -> None:
+        """Clear every cached / displayed artefact from a previous
+        zip so a fresh pick can't show stale rows. Called from
+        `_on_zip_picked` at the top of every pick attempt."""
+        self._zip_path = None
+        self._parsed_run = {}
+        self._members = []
+        self._selected_member = None
+        # Tables clear silently if they're not mounted yet (e.g.
+        # an early `_on_zip_picked` fired during compose race).
+        for tid in (
+            "#align-members",
+            "#plasmidsaurus-quality-table",
+            "#plasmidsaurus-runfiles-table",
+        ):
+            try:
+                self.query_one(tid, DataTable).clear()
+            except NoMatches:
+                pass
+        try:
+            self.query_one("#btn-align-go", Button).disabled = True
+        except NoMatches:
+            pass
+        try:
+            self.query_one(
+                "#plasmidsaurus-align-query", Static,
+            ).update(
+                "[dim]No sample picked yet — switch to the Samples tab "
+                "and click a row.[/dim]"
+            )
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#align-status", Static).update("")
+        except NoMatches:
+            pass
+        self._apply_subtab_gating(enabled=False)
+
+    _DEPENDENT_SUBTABS = (
+        "psaurus-sub-samples",
+        "psaurus-sub-quality",
+        "psaurus-sub-align",
+    )
+
+    def _apply_subtab_gating(self, *, enabled: bool) -> None:
+        """Toggle the `disabled` state on the Samples / Quality /
+        Align sub-tabs. General stays enabled either way (it owns
+        the zip picker). When disabling, also redirect the active
+        sub-tab back to General so the user doesn't end up staring
+        at a disabled-and-empty pane."""
+        for tab_id in self._DEPENDENT_SUBTABS:
+            try:
+                pane = self.query_one(f"#{tab_id}", TabPane)
+                pane.disabled = not enabled
+            except NoMatches:
+                continue
+        if not enabled:
+            # Force focus back to General so a previously-active
+            # Samples / Quality / Align sub-tab can't strand the
+            # user on a now-disabled pane. Wrapped in a broad except
+            # because Textual's `TabbedContent.active` setter raises
+            # `LookupError` if the target id isn't mounted yet (the
+            # mount race lands here when the screen is composed +
+            # `_reset_zip_state` fires before children settle).
+            try:
+                tabs = self.query_one(
+                    "#plasmidsaurus-subtabs", TabbedContent,
+                )
+                if tabs.active in self._DEPENDENT_SUBTABS:
+                    tabs.active = "psaurus-sub-general"
+            except (NoMatches, LookupError, AttributeError):
+                pass
+
+    def _populate_general_meta(self, parsed: dict) -> None:
+        """Write the General sub-tab's run-overview text from the
+        parsed-zip dict. Empty / missing parsed → graceful hint."""
+        try:
+            meta = self.query_one(
+                "#plasmidsaurus-run-meta", Static,
+            )
+        except NoMatches:
+            return
+        samples = parsed.get("samples") or []
+        if not samples:
+            meta.update(
+                "[yellow]No samples found in this zip — no "
+                "`<run>_genbank-files/` folder or standalone .gbk "
+                "files detected.[/yellow]"
             )
             return
-        for m in members:
-            t.add_row(m["name"], f"{m['size']:,}", key=m["name"])
-        status.update(
-            f"[dim]Found {len(members)} member(s). Click one to "
-            f"select.[/dim]"
+        run_id    = parsed.get("run_id", "") or "(unknown)"
+        n_files   = parsed.get("total_files", 0)
+        total_b   = parsed.get("total_size", 0)
+        size_mb   = total_b / (1024 * 1024)
+        n_samp    = len(samples)
+        n_with_gbk    = sum(1 for s in samples if s.get("gbk"))
+        n_with_perbase = sum(1 for s in samples if s.get("perbase"))
+        run_files = parsed.get("run_files") or []
+        meta.update(
+            f"[bold]Run:[/bold] {_esc_md(run_id)}  ·  "
+            f"[bold]{n_samp}[/bold] sample"
+            f"{'s' if n_samp != 1 else ''}  ·  "
+            f"{n_files} file{'s' if n_files != 1 else ''} "
+            f"({size_mb:.2f} MB)\n"
+            f"[dim]GenBank:[/dim] {n_with_gbk}/{n_samp}  ·  "
+            f"[dim]per-base coverage:[/dim] {n_with_perbase}/{n_samp}"
+            f"  ·  [dim]run-level files:[/dim] {len(run_files)}\n"
+            f"\n[dim]→ Open the Samples tab to pick an alignment "
+            f"query.[/dim]"
         )
+
+    # Distinctive sentinel for rows whose sample has no .gbk consensus
+    # — `_on_member_selected` checks this prefix to refuse the align
+    # advance. The leading `\x00` makes it impossible for a real zip
+    # member name (rejected by `_is_safe_zip_member_name`) to collide.
+    _NO_GBK_KEY_PREFIX = "\x00no-gbk\x00"
+
+    def _populate_samples_table(self, parsed: dict) -> None:
+        """Fill the Samples sub-tab's per-sample table. One row per
+        sample; cells show bp + feature count for the consensus .gbk,
+        mean coverage, contamination %, and AB1 trace count.
+
+        Opens the run zip ONCE for the whole walk rather than per
+        sample. Pre-fix a 50-sample run incurred 50 `ZipFile.__init__`
+        calls (~50 × 50 ms central-directory scan = 2-3 s frozen UI
+        on the picker). The single-open variant amortises the cost.
+        """
+        try:
+            t = self.query_one("#align-members", DataTable)
+        except NoMatches:
+            return
+        t.clear()
+        samples = parsed.get("samples") or []
+        # Pre-pass: read every sample's gbk in one zip-open so the
+        # table-render loop below doesn't pay the per-sample open cost.
+        # On a malformed zip we bail to the per-row "—" placeholders;
+        # the table still renders, just without bp/feats counts.
+        gbk_meta: dict[str, tuple[str, str]] = {}
+        if self._zip_path is not None and samples:
+            gbk_meta = self._batch_extract_gbk_meta(samples)
+        for s in samples:
+            name = s.get("name") or s.get("base") or "?"
+            gbk_member = s.get("gbk")
+            bp, feats = gbk_meta.get(gbk_member or "", ("—", "—"))
+            cov = s.get("perbase_coverage") or {}
+            cov_mean_val = cov.get("mean")
+            cov_mean = (
+                f"{cov_mean_val:.1f}×"
+                if isinstance(cov_mean_val, (int, float))
+                else "—"
+            )
+            summary_parsed = _parse_plasmidsaurus_summary(
+                s.get("summary_text", "") or "",
+            )
+            cp = summary_parsed.get("contamination_pct")
+            contam = f"{cp:.1f}%" if isinstance(cp, (int, float)) else "—"
+            ab1_count = len(s.get("ab1_files") or [])
+            t.add_row(
+                name, bp, feats, cov_mean, contam,
+                str(ab1_count) if ab1_count else "—",
+                # Row key: the gbk member name so `_on_member_selected`
+                # can look up the .gbk straight out of the zip without
+                # re-walking the parsed dict. Samples without a .gbk
+                # carry the NUL-anchored sentinel — guaranteed not to
+                # collide with any real zip member name (the safe-name
+                # check refuses NUL).
+                key=gbk_member or f"{self._NO_GBK_KEY_PREFIX}{name}",
+            )
+
+    def _batch_extract_gbk_meta(
+        self, samples: "list[dict]",
+    ) -> "dict[str, tuple[str, str]]":
+        """Return ``{gbk_member_name: (bp_str, feats_str)}`` for every
+        sample carrying a .gbk consensus, parsing each one inside a
+        single ``ZipFile`` open.
+
+        Failures (oversize member, decode error, bad GenBank) land in
+        the dict as ``("[red]err[/red]", "—")`` so the table still
+        gets a row per sample. Samples without a gbk member are
+        skipped — the caller's `.get()` falls back to ``("—", "—")``.
+        """
+        import zipfile
+        out: dict[str, tuple[str, str]] = {}
+        if self._zip_path is None:
+            return out
+        try:
+            zf = zipfile.ZipFile(str(self._zip_path), "r")
+        except (zipfile.BadZipFile, OSError):
+            _log.exception(
+                "Sequencing: could not reopen zip for batch gbk parse"
+            )
+            return out
+        try:
+            cap = _PLASMIDSAURUS_MEMBER_MAX_BYTES
+            for s in samples:
+                gbk_member = s.get("gbk")
+                if not gbk_member:
+                    continue
+                # Defense in depth — `_is_safe_zip_member_name` was
+                # checked during parse, but skipping again here means
+                # an in-process mutator of `_parsed_run` can't smuggle
+                # a traversal name back in between parse and render.
+                if not _is_safe_zip_member_name(gbk_member):
+                    out[gbk_member] = ("[red]err[/red]", "—")
+                    continue
+                try:
+                    info = zf.getinfo(gbk_member)
+                except KeyError:
+                    out[gbk_member] = ("[red]err[/red]", "—")
+                    continue
+                if info.file_size > cap:
+                    out[gbk_member] = ("[red]too big[/red]", "—")
+                    continue
+                try:
+                    with zf.open(info, "r") as fh:
+                        raw = fh.read(cap + 1)
+                    if len(raw) > cap:
+                        out[gbk_member] = ("[red]too big[/red]", "—")
+                        continue
+                    try:
+                        txt = raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        txt = raw.decode("latin-1", errors="replace")
+                    rec = _gb_text_to_record(txt)
+                    bp = f"{len(rec.seq):,}"
+                    feats = str(
+                        len([f for f in rec.features
+                             if f.type != "source"])
+                    )
+                    out[gbk_member] = (bp, feats)
+                except (ValueError, OSError, RuntimeError,
+                        zipfile.BadZipFile):
+                    _log.exception(
+                        "Sequencing: gbk parse failed for %s",
+                        gbk_member,
+                    )
+                    out[gbk_member] = ("[red]err[/red]", "—")
+        finally:
+            zf.close()
+        return out
+
+    def _populate_quality_tables(self, parsed: dict) -> None:
+        """Fill the Quality sub-tab with parsed summary metrics +
+        the run-level files block."""
+        try:
+            q = self.query_one(
+                "#plasmidsaurus-quality-table", DataTable,
+            )
+        except NoMatches:
+            q = None
+        if q is not None:
+            q.clear()
+            for s in parsed.get("samples") or []:
+                name = s.get("name") or s.get("base") or "?"
+                parsed_s = _parse_plasmidsaurus_summary(
+                    s.get("summary_text", "") or "",
+                )
+                def _fmt_pct(v):
+                    return (
+                        f"{v:.1f}%"
+                        if isinstance(v, (int, float)) else "—"
+                    )
+                cov = s.get("perbase_coverage") or {}
+                cov_mean_val = cov.get("mean")
+                cov_min_val  = cov.get("min")
+                n_pos        = cov.get("n_pos") or 0
+                above        = cov.get("above_20x") or 0
+                pct_20x = (
+                    f"{(100 * above / n_pos):.1f}%"
+                    if n_pos else "—"
+                )
+                q.add_row(
+                    name,
+                    _fmt_pct(parsed_s.get("kmer_moles_pct")),
+                    _fmt_pct(parsed_s.get("kmer_mass_pct")),
+                    _fmt_pct(parsed_s.get("contamination_pct")),
+                    parsed_s.get("contamination_source") or "—",
+                    (f"{cov_mean_val:.1f}×"
+                      if isinstance(cov_mean_val, (int, float))
+                      else "—"),
+                    (str(int(cov_min_val))
+                      if isinstance(cov_min_val, (int, float))
+                      else "—"),
+                    pct_20x,
+                    key=name,
+                )
+        try:
+            rf = self.query_one(
+                "#plasmidsaurus-runfiles-table", DataTable,
+            )
+        except NoMatches:
+            rf = None
+        if rf is not None:
+            rf.clear()
+            for entry in parsed.get("run_files") or []:
+                size = int(entry.get("size", 0))
+                if size >= 1024 * 1024:
+                    size_s = f"{size / (1024 * 1024):.2f} MB"
+                elif size >= 1024:
+                    size_s = f"{size / 1024:.1f} KB"
+                else:
+                    size_s = f"{size} B"
+                rf.add_row(
+                    entry.get("name", "?"),
+                    size_s,
+                    entry.get("category", "—"),
+                    key=entry.get("name", ""),
+                )
 
     @on(DataTable.RowSelected, "#align-members")
     def _on_member_selected(self, event: DataTable.RowSelected) -> None:
+        """User clicked a sample row. Mark that sample's .gbk as the
+        alignment query (read from the row key, which was set to the
+        gbk member name in `_populate_samples_table`). Updates the
+        Align tab's query indicator + enables the Align button."""
         try:
-            t = self.query_one("#align-members", DataTable)
-            row = t.get_row_at(event.cursor_row)
-            if not row:
-                return
-            self._selected_member = str(row[0])
-            self.query_one("#btn-align-go", Button).disabled = False
-            self.query_one("#align-status", Static).update(
-                f"[dim]Selected: {_esc_md(self._selected_member)}[/dim]"
+            row_key = (
+                event.row_key.value if event.row_key is not None else ""
             )
-        except (NoMatches, IndexError):
+        except AttributeError:
+            row_key = ""
+        # Rows for samples without a .gbk carry a NUL-anchored
+        # synthetic key; refuse to advance the workflow (an empty
+        # or synthetic key would crash `_extract_gbk_member`). NUL
+        # makes the prefix non-collidable with real member names
+        # (rejected by `_is_safe_zip_member_name`).
+        if not row_key or row_key.startswith(self._NO_GBK_KEY_PREFIX):
+            self._selected_member = None
+            try:
+                self.query_one("#btn-align-go", Button).disabled = True
+            except NoMatches:
+                pass
+            try:
+                self.query_one(
+                    "#plasmidsaurus-align-query", Static,
+                ).update(
+                    "[yellow]This sample has no .gbk consensus — "
+                    "pick another row.[/yellow]"
+                )
+            except NoMatches:
+                pass
+            return
+        self._selected_member = str(row_key)
+        try:
+            self.query_one("#btn-align-go", Button).disabled = False
+        except NoMatches:
+            pass
+        try:
+            self.query_one(
+                "#plasmidsaurus-align-query", Static,
+            ).update(
+                f"[bold]Query:[/bold] "
+                f"{_esc_md(self._selected_member)}"
+            )
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#align-status", Static).update(
+                f"[dim]Selected: {_esc_md(self._selected_member)}"
+                f" — open the Align tab to run the pairwise "
+                f"alignment.[/dim]"
+            )
+        except NoMatches:
             pass
 
     @on(Button.Pressed, "#btn-align-go")
@@ -36744,7 +37898,12 @@ class PlasmidsaurusAlignModal(ModalScreen):
             return
         sel = self.query_one("#align-target", Select)
         target_id = sel.value
-        if not target_id or target_id == "—":
+        # `_target_options` swaps to the NUL-anchored
+        # `_EMPTY_LIBRARY_SENTINEL` when no library entries are
+        # available; refuse to advance in that case. Empty-string
+        # check belt-and-braces against a future Select API quirk.
+        if (not target_id
+                or target_id == self._EMPTY_LIBRARY_SENTINEL):
             self.query_one("#align-status", Static).update(
                 "[red]Pick a target plasmid first.[/red]"
             )
@@ -36921,6 +38080,22 @@ class PlasmidsaurusAlignModal(ModalScreen):
                 _log.exception(
                     "PlasmidsaurusAlignModal: _register_alignment failed"
                 )
+            # Sequencing-aligned targets default to linear view on every
+            # subsequent reload. `_register_alignment` already pins
+            # linear on first overlay; persist explicitly here so the
+            # preference sticks even when the target was already linear
+            # (no auto-switch path) or when the user later clears the
+            # overlay band.
+            try:
+                persist = getattr(
+                    self.app, "_persist_map_mode_for_active", None,
+                )
+                if callable(persist):
+                    persist("linear")
+            except Exception:
+                _log.exception(
+                    "PlasmidsaurusAlignModal: persist map_mode failed"
+                )
             ident_total = result.get("identity_pct", 0.0)
             ident_ungap = result.get("ungapped_identity_pct", ident_total)
             try:
@@ -36940,14 +38115,23 @@ class PlasmidsaurusAlignModal(ModalScreen):
                 self.dismiss(result)
         self.app.call_from_thread(_show)
 
-    @on(Button.Pressed, "#btn-align-cancel")
-    def _cancel_btn(self, _) -> None:
+    @on(Button.Pressed, "#btn-sequencing-close")
+    def _close_btn(self, _) -> None:
+        self.action_cancel()
+
+    def action_cancel(self) -> None:
+        # Cooperative cancel: a running alignment worker checks this
+        # before registering its result so the user doesn't see a
+        # stale overlay paint after closing the screen.
         self._cancelled = True
         self.dismiss(None)
 
-    def action_cancel(self) -> None:
-        self._cancelled = True
-        self.dismiss(None)
+
+# Back-compat alias. `PlasmidsaurusAlignModal` is the legacy class name
+# from before the Sequencing toolbar refactor (2026-05-18). Tests and
+# agent-API call sites still reference it by name; aliasing here keeps
+# them working without churning the test fixtures.
+PlasmidsaurusAlignModal = SequencingScreen
 
 
 def _esc_md(s: str) -> str:
@@ -58084,10 +59268,56 @@ SpeciesPickerModal { align: center middle; }
             return
         # First overlay registration on a circular plasmid pins linear
         # topology. Subsequent registrations preserve whatever the user
-        # has since chosen (we don't keep snapping back).
+        # has since chosen (we don't keep snapping back). The pinned
+        # mode is also persisted to the library entry so that re-opening
+        # this plasmid later defaults to linear (the user's last
+        # intended view for it).
         if len(self._alignments) == 1 and pm._map_mode != "linear":
             pm._map_mode = "linear"
+            try:
+                self._persist_map_mode_for_active("linear")
+            except Exception:
+                _log.exception("_register_alignment: persist map_mode failed")
         pm.set_alignments(self._alignments)
+
+    def _persist_map_mode_for_active(self, mode: str) -> None:
+        """Save the user's map-view preference (linear/circular) onto
+        the currently-loaded library entry so a later reload re-applies
+        it. No-op when the loaded record isn't tracked in the library
+        or when the preference matches what's already stored.
+        Mirrors via `_save_library` so the active-collection snapshot
+        stays in sync (sacred invariant #10).
+        """
+        if mode not in ("linear", "circular"):
+            return
+        rec = getattr(self, "_current_record", None)
+        if rec is None:
+            return
+        rec_id = getattr(rec, "id", None)
+        if not rec_id:
+            return
+        try:
+            entries = _load_library()
+        except Exception:
+            _log.exception("_persist_map_mode_for_active: load failed")
+            return
+        idx = next(
+            (i for i, e in enumerate(entries) if e.get("id") == rec_id),
+            -1,
+        )
+        if idx < 0:
+            return
+        prev = (entries[idx].get("map_mode") or "").lower()
+        if prev == mode:
+            return
+        entries[idx]["map_mode"] = mode
+        try:
+            _save_library(entries, async_sync=True)
+        except (OSError, RuntimeError) as exc:
+            _log.exception(
+                "_persist_map_mode_for_active: save failed for %r", rec_id,
+            )
+            _notify_save_failure(self, "Plasmid library", exc)
 
     def _clear_alignments(self) -> None:
         """Drop every alignment from the overlay band and refresh the map.
@@ -58737,7 +59967,16 @@ SpeciesPickerModal { align: center middle; }
                 severity="warning", timeout=8,
             )
         topology = (record.annotations or {}).get("topology", "").lower()
-        if topology == "linear" and pm._map_mode != "linear":
+        # Only force linear when the user has no per-plasmid preference
+        # stashed on the record — otherwise their library-stored
+        # `map_mode` (read in `pm.load_record`) gets clobbered every
+        # time a true-linear record reloads.
+        stashed_mode = str(
+            getattr(record, "_tui_map_mode", "") or "",
+        ).lower()
+        if (topology == "linear"
+                and pm._map_mode != "linear"
+                and stashed_mode not in ("linear", "circular")):
             pm._map_mode = "linear"
             self.notify(
                 "File declares linear topology — switched to linear view "
@@ -59618,6 +60857,16 @@ SpeciesPickerModal { align: center middle; }
                     _log.debug(
                         "library_load: couldn't stash _tui_display_name",
                     )
+            stored_mode = event.entry.get("map_mode")
+            if isinstance(stored_mode, str) and stored_mode.lower() in (
+                "linear", "circular",
+            ):
+                try:
+                    record._tui_map_mode = stored_mode.lower()
+                except Exception:
+                    _log.debug(
+                        "library_load: couldn't stash _tui_map_mode",
+                    )
             self._apply_record(record)
         except Exception as exc:
             _log.exception("Library load failed for entry %r",
@@ -60248,6 +61497,9 @@ SpeciesPickerModal { align: center middle; }
         if name == "Simulator":
             self.action_open_simulator()
             return
+        if name == "Sequencing":
+            self.action_open_sequencing()
+            return
 
         # ── Multi-action menus (dropdown) ──────────────────────────────────
         ck = "\u2713"  # checkmark
@@ -60285,8 +61537,6 @@ SpeciesPickerModal { align: center middle; }
                 ("Export as .dna...", "export_commercialsaas"),
                 ("---",                          None),
                 ("Collections...",               "open_collections"),
-                ("Align sequencing run (Plasmidsaurus .zip)...",
-                                                 "open_align_zip"),
                 ("---",                          None),
                 ("What's New…",                  "show_whats_new"),
                 ("---",                          None),
@@ -60427,13 +61677,19 @@ SpeciesPickerModal { align: center middle; }
             pm.refresh()
         self.notify(f"Min primer binding: {nxt} bp")
 
-    @_action_log("app.open.align_zip")
-    def action_open_align_zip(self) -> None:
-        """File → Align sequencing run (Plasmidsaurus .zip)…
-        Opens the alignment ingestion modal. The modal handles the zip
-        listing, member selection, target plasmid pick, and pushes the
-        AlignmentScreen on submit."""
-        self.push_screen(PlasmidsaurusAlignModal())
+    @_action_log("app.open.sequencing")
+    def action_open_sequencing(self) -> None:
+        """Sequencing menu → opens the Sequencing toolbar screen on
+        the Plasmidsaurus tab. The screen handles zip listing, member
+        selection, target plasmid pick, and registers the alignment on
+        the main map's overlay band on submit."""
+        self.push_screen(SequencingScreen())
+
+    # Back-compat: the menu entry was previously File → "Align
+    # sequencing run…" wired to `action_open_align_zip`. The Sequencing
+    # toolbar (2026-05-18) supersedes it; keep the old action name so
+    # any persisted keybindings / agent callers still resolve.
+    action_open_align_zip = action_open_sequencing
 
     # ── Panel focus mode (Ctrl+1 .. Ctrl+5) ────────────────────────────
     # Each Ctrl+N collapses the 4-panel layout down to a single panel
@@ -61488,7 +62744,8 @@ def main():
             f"splicecraft {__version__}\n"
             "Usage: splicecraft [ACCESSION | FILE.gb | update | logs] [--no-splash] "
             "[--agent[-port=PORT]]\n\n"
-            "  splicecraft               # load 1 kb synthetic demo plasmid\n"
+            "  splicecraft               # open with a clean canvas\n"
+            "                            # (auto-loads the first library entry if any)\n"
             "  splicecraft L09137        # fetch pUC19 from NCBI\n"
             "  splicecraft my.gb         # open a local GenBank file\n"
             "  splicecraft update        # upgrade to the latest PyPI release\n"
@@ -61643,10 +62900,12 @@ def main():
     # network). The worker is also gated by the user's persisted
     # `check_updates` setting — both must be true for a fetch.
     app._skip_update_check = False
-    # Production launch also opts in to the first-run NCBI seed of
-    # pACYC184 so users see something on a fresh install. Tests leave
-    # this True (class default) so the suite never hits NCBI.
-    app._skip_seed = False
+    # First-run NCBI seed is suppressed in shipped releases — a fresh
+    # install starts with an empty library + clean canvas rather than
+    # silently pulling MW463917.1 from NCBI. Demo / dev builds that
+    # want the historical "auto-seed on empty library" behaviour can
+    # flip this attribute to False before `app.run()`.
+    app._skip_seed = True
     # Production launch also opts in to the daily JSON snapshot. Tests
     # leave this True so `_snapshot_data_files` doesn't fan out to disk
     # inside every async run; production users always have a 30-day
@@ -61689,17 +62948,15 @@ def main():
                 print(f"Fetch failed: {exc}", file=sys.stderr)
                 sys.exit(1)
         app._preload_record = record
-    else:
-        # No CLI arg → preload the 1 kb synthetic demo plasmid. Best-
-        # effort: if `_make_demo_record` ever raises (e.g. someone edits
-        # the literal and breaks the length invariant), log it and fall
-        # back to the historical "auto-load first library entry / NCBI
-        # seed" path so a launch never wedges on the demo helper.
-        try:
-            app._preload_demo_record = _make_demo_record()
-        except (RuntimeError, ValueError, ImportError) as exc:
-            _log.exception("Demo plasmid build failed; falling back: %s",
-                            exc)
+    # No CLI arg → leave `_preload_record` / `_preload_demo_record`
+    # both None. The PlasmidApp.on_mount fallback auto-loads the first
+    # library entry if the user has any saved plasmids; otherwise the
+    # canvas starts empty. The 1 kb synthetic demo plasmid that earlier
+    # builds preloaded here was internal-testing scaffolding — shipping
+    # it as the default-launch view confused users into thinking it was
+    # one of their plasmids. The `_make_demo_record` helper is kept
+    # for the test suite + ad-hoc development; nothing in main() calls
+    # it anymore.
 
     try:
         app.run()
