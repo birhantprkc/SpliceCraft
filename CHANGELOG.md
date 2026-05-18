@@ -14,6 +14,15 @@
 
 ---
 
+## [0.9.4] — 2026-05-18
+
+_(auto-generated from commits since v0.9.3)_
+
+* Sequencing toolbar refactor · per-plasmid map_mode · hardening sweep #8
+* Library/Simulator UX polish · natural-sort pickers · sticky delete cursor
+
+---
+
 ## [0.9.3] — 2026-05-17 — Professional-audit sweep + adversarial audit sweep #7
 
 Audit-pass sweep landing 17 of the 20 action items from a
