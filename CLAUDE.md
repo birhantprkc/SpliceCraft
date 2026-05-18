@@ -2,7 +2,7 @@
 
 Agent handoff. Read before touching the codebase.
 
-Developed by a human bioinformatician + Claude. **Near-single-file architecture** — the application lives in `splicecraft.py` (~61,000 lines) plus a small extracted biology module `splicecraft_biology.py` and the stdlib-only sidecar `splicecraft_cli.py`. The single-file constraint is intentional (keeps the codebase greppable); the biology extraction is the first deliberate exception, scoped to pure functions / constants with no `PlasmidApp` coupling. See the three-test rule in `CONTRIBUTING.md` for the criteria any future extraction must satisfy.
+Developed by a human bioinformatician + Claude. **Near-single-file architecture** — the application lives in `splicecraft.py` (~65,000 lines) plus a small extracted biology module `splicecraft_biology.py` and the stdlib-only sidecar `splicecraft_cli.py`. The single-file constraint is intentional (keeps the codebase greppable); the biology extraction is the first deliberate exception, scoped to pure functions / constants with no `PlasmidApp` coupling. See the three-test rule in `CONTRIBUTING.md` for the criteria any future extraction must satisfy.
 
 ## What is SpliceCraft?
 
@@ -158,6 +158,50 @@ Hardening sweep (0.9.4):
 * **NUL-anchored sentinels** — `_NO_GBK_KEY_PREFIX = "\x00no-gbk\x00"` and `_EMPTY_LIBRARY_SENTINEL = "\x00no-library\x00"` replace ambiguous `"_no_gbk_"` / `"—"` strings. NUL is rejected by `_is_safe_zip_member_name` and never appears in LOCUS-safe ids → collision-proof against any real row key.
 
 Future expansion (already designed for): a Plasmidsaurus API key tab in the same screen that downloads run zips directly. Same downstream parse + alignment pipeline; only the ingestion source changes.
+
+## Experiments lab-notebook (0.9.6+)
+
+Top-level toolbar entry (Menu → Experiments) for cloning runs / protocol notes / observations. Full-screen `ExperimentsScreen` with three sub-tabs:
+
+* **Entries** — `DataTable` of all notebook entries, natural-sort by `updated_at` desc. New / Open / Rename / Delete.
+* **Compose** — split horizontal: `TextArea` (markdown source, language="markdown") on the left, Textual `Markdown` widget (live preview) on the right. 250 ms debounced re-render on every body change.
+* **Attachments** — per-entry image grid with filename + size + "inserted in body?" flag. Attach via `ImageAttachModal` (DirectoryTree filtered to image extensions); on Win/Mac the modal also has a "Paste from clipboard" button that uses `Pillow.ImageGrab.grabclipboard()` (disabled on Linux/WSL — no pure-Python clipboard image API there per the 2026-05-18 design call).
+
+Persistence: `experiments.json` envelope-v1 with the full four-layer data-safety net (invariant #31). Per-entry attachments live as files under `<DATA_DIR>/experiments/<entry_id>/`. Schema:
+
+```
+{
+  "id":                   "exp-<8 hex>",     # filesystem-safe id
+  "title":                str,               # <= 200 chars
+  "body_md":              str,               # markdown source, <= 1 MB
+  "created_at":           ISO-8601 w/ tz,
+  "updated_at":           ISO-8601 w/ tz,
+  "tags":                 list[str],         # max 20, <= 60 chars each
+  "attached_plasmid_ids": list[str],         # denormalised xref
+  "image_paths":          list[str],         # relative to attach dir
+}
+```
+
+**Plasmid cross-refs.** `@plasmid:<id>` tokens inline anywhere in `body_md`. `_render_plasmid_refs` pre-processes them into markdown links with a `splicecraft://plasmid/<id>` href. The Markdown widget posts `LinkClicked` on click; `on_markdown_link_clicked` intercepts the custom scheme, resolves the id across every collection via `_search_collections_library`, auto-saves the dirty compose buffer, dismisses the screen, then routes through the same switch+load helper `action_find_plasmid` uses (`_apply_record`). Non-plasmid links are notified-but-not-followed (pure-TUI rule — no `webbrowser.open` shell-out).
+
+**Sacred sizing caps** (added 2026-05-18 — never bypass):
+* `_EXPERIMENT_BODY_MAX_BYTES = 1_000_000` per entry. Enforced in `_normalise_experiment_entry` via deterministic truncate (better than save-refusal-with-data-loss).
+* `_EXPERIMENT_IMAGE_MAX_BYTES = 10_000_000` per attached image. Enforced in `_save_experiment_image` + `_safe_file_size_check` on the source.
+* `_EXPERIMENT_DIR_MAX_BYTES = 100_000_000` cumulative per entry. Enforced via `_experiment_dir_size_bytes` precheck before write.
+
+**Filesystem invariants** mirror the .dna sidecar handling (sweep #5):
+* `_sanitize_experiment_id` rejects empty / NUL / `..` / `/` / `\` / `[shell metas]` / >64 chars. All path-joins go through it.
+* `_experiment_attach_dir` refuses both per-entry symlinks AND a `_EXPERIMENTS_DIR` itself that's a symlink (so a planted symlink can't redirect image writes).
+* `_save_experiment_image` writes via `_atomic_write_bytes` (tempfile + fsync + replace + parent fsync). Filename is `img-<ts>-<rand>.<ext>` so concurrent attaches can't collide.
+* `_save_experiments` takes `_cache_lock` for the save+cache-reassign pair (invariant #41 — concurrency).
+
+**Spellcheck** — pyspellchecker-backed (pure-Python English wordlist, no network). F7 or "Spellcheck" button → `_spellcheck_body(body_md)` masks non-prose markdown regions (fenced + inline code, image links, markdown links, raw URLs, `@plasmid:` xrefs) and tokenises with `_SPELLCHECK_WORD_RE` (alphabetic + apostrophe + hyphen, ≥ 2 chars). `SpellcheckModal` lists misspellings + suggestions; per-row Replace / Add-to-dict / Skip. Custom dictionary persists via the `experiments_custom_dict` settings key; `_clear_spellcheck_engine` invalidates the cached engine after add-to-dict.
+
+**Hard deps added 2026-05-18:** `Pillow>=10.0` (image bytes + Win/Mac clipboard grab), `pyspellchecker>=0.8.0` (English wordlist), `rich-pixels>=3.0.0` (Unicode half-block image render in any terminal — kitty/sixel/iTerm protocols NOT required). All pure-Python wheels, no external system shell-out.
+
+**Modal `_blocks_undo=True`** on `ExperimentsScreen` + `SpellcheckModal` so app-level Ctrl+Z can't unwind plasmid edits while the user is composing notes. App-level `on_key` early-return for `screen_stack > 1` (invariant #15) already prevents cursor / RE-highlight interactions firing underneath.
+
+**Logging events:** `experiments.new`, `experiments.save`, `experiments.delete`, `experiments.attach.image`, `experiments.remove.image`, `experiments.insert.plasmid_ref`, `experiments.spellcheck.applied`. Per invariant #42 — `_log_event` payload sanitises body content (200-char truncation) so notebook prose never leaks beyond the visible UI.
 
 ## Architecture pointers
 

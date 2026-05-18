@@ -53,6 +53,7 @@ def _protect_user_data(tmp_path, monkeypatch):
         ("_ENTRY_VECTORS_FILE",   "_entry_vectors_cache"),
         ("_SETTINGS_FILE",        "_settings_cache"),
         ("_COLLECTIONS_FILE",     "_collections_cache"),
+        ("_EXPERIMENTS_FILE",     "_experiments_cache"),
         ("_AGENT_TOKEN_FILE",     None),   # written when --agent-api is on
     ]
 
@@ -88,6 +89,12 @@ def _protect_user_data(tmp_path, monkeypatch):
     # redirect so tests of the snapshot system don't litter the
     # user's real ~/.local/share/splicecraft/ui_snapshots/.
     monkeypatch.setattr(sc, "_UI_SNAPSHOTS_DIR", tmp_path / "ui_snapshots")
+    # Experiments-notebook attachments directory: image files attached
+    # to experiment entries land in `<DATA_DIR>/experiments/<entry_id>/`,
+    # which would otherwise litter the user's real data dir during tests
+    # that exercise attach. Redirect to tmp_path so the whole experiments
+    # surface (entries JSON + per-entry attach dirs) is isolated.
+    monkeypatch.setattr(sc, "_EXPERIMENTS_DIR", tmp_path / "experiments")
 
     # Pre-update snapshot directory (`splicecraft update` data-safety net):
     # tests that exercise the `update` subcommand all the way through to

@@ -665,6 +665,7 @@ from textual.binding import Binding  # noqa: E402
 from textual.containers import (  # noqa: E402
     Horizontal, Vertical, ScrollableContainer, VerticalScroll,
 )
+from textual.coordinate import Coordinate as _Coordinate  # noqa: E402
 from textual.css.query import NoMatches  # noqa: E402
 from textual.events import Click, MouseDown, MouseMove, MouseUp, MouseScrollDown, MouseScrollUp  # noqa: E402
 from textual.message import Message  # noqa: E402
@@ -18485,6 +18486,7 @@ _USER_DATA_FILE_ATTRS: tuple = (
     "_ENTRY_VECTORS_FILE",    # entry_vectors.json — entry vectors
     "_CODON_TABLES_FILE",     # codon_tables.json — codon usage tables
     "_SETTINGS_FILE",         # settings.json — persisted user toggles
+    "_EXPERIMENTS_FILE",      # experiments.json — lab-notebook entries
 )
 
 # User-data sub-directories — autosaved unsaved-edits + .dna sidecars.
@@ -18492,6 +18494,7 @@ _USER_DATA_FILE_ATTRS: tuple = (
 _USER_DATA_DIR_ATTRS: tuple = (
     "_CRASH_RECOVERY_DIR",   # autosaved .gb files for unsaved records
     "_DNA_ORIGINALS_DIR",    # .dna sidecars (CommercialSaaS round-trip)
+    "_EXPERIMENTS_DIR",      # lab-notebook image attachments (per-entry)
     "_PLUGINS_DIR",          # reserved for future plugin storage (empty for now)
 )
 
@@ -21598,7 +21601,7 @@ class MenuBar(Widget):
 
     MENUS = ["File", "Settings", "Edit", "Enzymes", "Features", "Primers",
              "Mutagenize", "Parts", "Constructor", "Simulator", "Sequencing",
-             "History"]
+             "Experiments", "History"]
 
     def compose(self) -> ComposeResult:
         for name in self.MENUS:
@@ -21614,11 +21617,14 @@ class MenuBar(Widget):
             region = item.region
             if (region.x <= event.screen_x < region.x + region.width and
                     region.y <= event.screen_y < region.y + region.height):
-                # "Features" + "History" are direct-open screens (no
-                # dropdown). Every other menu surfaces items via
-                # DropdownScreen.
+                # "Features", "Experiments", and "History" are direct-
+                # open screens (no dropdown). Every other menu surfaces
+                # items via DropdownScreen.
                 if name == "Features":
                     self.app.push_screen(FeatureLibraryScreen())
+                    break
+                if name == "Experiments":
+                    self.app.action_open_experiments()  # type: ignore[attr-defined]
                     break
                 if name == "History":
                     self.app.action_show_history()  # type: ignore[attr-defined]
@@ -37087,6 +37093,476 @@ class _ZipAwareDirectoryTree(DirectoryTree):
         super()._populate_node(node, sorted_content)
 
 
+# ── Experiments lab-notebook persistence ─────────────────────────────────────
+#
+# `experiments.json` holds the user's lab-notebook entries: cloning
+# runs, protocol notes, observations, attached image references. Each
+# entry is a markdown-bodied document with title + tags + cross-
+# references to plasmids in the user's library via `@plasmid:<id>`
+# tokens.
+#
+# Attached images live as binary files under
+# `<DATA_DIR>/experiments/<entry_id>/`, NOT embedded in JSON, so the
+# entries file stays small (Markdown is text-only) and `_safe_load_json`
+# doesn't trip its 1 GB cap on a long-running notebook with hundreds of
+# microscope images.
+#
+# The full four-layer data-safety net of invariant #31 applies through
+# `_safe_save_json` (timestamped backups, daily snapshots, suspicious-
+# shrink guard, atomic writes). Cache-lock + deepcopy-on-read+write
+# per invariant #17.
+#
+# Entry schema (v1):
+#
+#     {
+#       "id":                   "exp-<8 hex>",   # filesystem-safe
+#       "title":                str,             # <= 200 chars
+#       "body_md":              str,             # markdown source
+#       "created_at":           ISO-8601 w/ tz,
+#       "updated_at":           ISO-8601 w/ tz,
+#       "tags":                 list[str],
+#       "attached_plasmid_ids": list[str],       # denormalised xref
+#       "image_paths":          list[str],       # relative to attach dir
+#     }
+#
+# `attached_plasmid_ids` is rebuilt on every save from
+# `_PLASMID_REF_RE`-matches in `body_md`, so callers can search entries
+# by referenced plasmid without re-parsing the body.
+
+_EXPERIMENTS_FILE = _DATA_DIR / "experiments.json"
+_EXPERIMENTS_DIR  = _DATA_DIR / "experiments"
+
+# Per-entry body cap. 1 MB of markdown is ~250 k words — far past any
+# realistic single-entry use. Larger entries stutter the live preview
+# anyway (Markdown re-renders on every debounce).
+_EXPERIMENT_BODY_MAX_BYTES = 1_000_000
+
+# Per-image cap (10 MB) covers screenshots, gel photos, microscope
+# captures. A multi-GB hostile attach would otherwise OOM the loader.
+_EXPERIMENT_IMAGE_MAX_BYTES = 10_000_000
+
+# Per-entry attachments-dir cumulative cap (100 MB) so 20 high-res
+# microscope images can't quietly fill the user's home dir.
+_EXPERIMENT_DIR_MAX_BYTES = 100_000_000
+
+_EXPERIMENT_TITLE_MAX_LEN = 200
+_EXPERIMENT_TAG_MAX_LEN   = 60
+_EXPERIMENT_TAGS_MAX      = 20
+
+# Plasmid cross-reference token: `@plasmid:<id>` inline anywhere in
+# the body. Pre-processed before Markdown render into a styled link
+# with a `splicecraft://plasmid/<id>` href that the screen's
+# `LinkClicked` handler intercepts to load the referenced plasmid.
+_PLASMID_REF_RE = re.compile(r"@plasmid:([A-Za-z0-9][\w.\-]{0,63})")
+_PLASMID_LINK_SCHEME = "splicecraft://plasmid/"
+
+# Filesystem-id constraint. Entry ids are mechanically generated as
+# `exp-<8 hex>` (see `_new_experiment_id`), but accept the wider
+# `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` form so a hand-edited JSON with a
+# sensible custom id still loads. Rejects empty, separators, `..`,
+# NUL, shell metacharacters so the id can be path-joined safely.
+# Mirrors the spirit of `_dna_sidecar_path`'s sanitisation.
+_EXPERIMENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{0,63}$")
+
+_experiments_cache: "list | None" = None
+
+
+def _sanitize_experiment_id(raw: object) -> "str | None":
+    """Return `raw` (str) if it passes `_EXPERIMENT_ID_RE`, else `None`.
+
+    Rejects non-strings, empty strings, NUL embeds, `..` traversal, and
+    any path separator (forward OR back slash). Used at every callsite
+    that joins an entry id under `_EXPERIMENTS_DIR`.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    if "\x00" in raw or ".." in raw or "/" in raw or "\\" in raw:
+        return None
+    if not _EXPERIMENT_ID_RE.match(raw):
+        return None
+    return raw
+
+
+def _new_experiment_id(existing: "set[str] | None" = None) -> str:
+    """Generate a fresh `exp-<8 hex>` id. `existing` (the current
+    entries' id set) is consulted to avoid collision; bounded retries
+    keep the loop deterministic for tests that monkeypatch `_uuid`."""
+    seen = existing or set()
+    for _ in range(64):
+        eid = f"exp-{_uuid.uuid4().hex[:8]}"
+        if eid not in seen:
+            return eid
+    return f"exp-{_uuid.uuid4().hex}"
+
+
+def _experiment_attach_dir(entry_id: str, *, create: bool = False
+                              ) -> "Path | None":
+    """Return `_EXPERIMENTS_DIR/<entry_id>` after id-sanitisation.
+
+    Returns `None` if `entry_id` fails sanitisation, if `_EXPERIMENTS_DIR`
+    itself is a symlink, or if the target dir is a symlink. Mirrors the
+    symlink refusal in `_safe_save_json` so a planted symlink can't
+    redirect image writes into arbitrary filesystem locations.
+
+    With `create=True`, ensures the directory exists (`mkdir parents`).
+    """
+    safe = _sanitize_experiment_id(entry_id)
+    if safe is None:
+        return None
+    if _EXPERIMENTS_DIR.is_symlink():
+        _log.warning("Refusing: _EXPERIMENTS_DIR is a symlink: %s",
+                     _EXPERIMENTS_DIR)
+        return None
+    target = _EXPERIMENTS_DIR / safe
+    if target.is_symlink():
+        _log.warning("Refusing experiment attach dir at symlink: %s",
+                     target)
+        return None
+    if create:
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            _log.warning("Could not create experiment dir %s: %s",
+                         target, exc)
+            return None
+    return target
+
+
+def _experiment_dir_size_bytes(entry_id: str) -> int:
+    """Sum total bytes used by all regular files in
+    `_EXPERIMENTS_DIR/<entry_id>`. Returns 0 if the dir doesn't exist or
+    the id fails sanitisation. Flat enumeration (no recursion) — attach
+    dirs are intentionally single-level."""
+    d = _experiment_attach_dir(entry_id, create=False)
+    if d is None or not d.is_dir():
+        return 0
+    total = 0
+    try:
+        for p in d.iterdir():
+            if p.is_file() and not p.is_symlink():
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    continue
+    except OSError:
+        return 0
+    return total
+
+
+def _load_experiments() -> "list[dict]":
+    """Load the experiments-notebook entries. Cached + deepcopy-on-read
+    per sacred invariant #17 so a caller mutating returned dicts can't
+    poison the cache for the next reader. Filters non-dict entries
+    defensively (hand-edited JSON / schema drift)."""
+    global _experiments_cache
+    if _experiments_cache is not None:
+        return _typed_clone(_experiments_cache)
+    entries, warning = _safe_load_json(_EXPERIMENTS_FILE, "Experiments")
+    if warning:
+        _log.warning(warning)
+    entries = [e for e in entries if isinstance(e, dict)]
+    _experiments_cache = entries
+    return _typed_clone(_experiments_cache)
+
+
+def _save_experiments(entries: "list[dict]") -> None:
+    """Persist the experiments-notebook entries through the full four-
+    layer data-safety net (invariant #31). Deep-clones into the cache
+    on save (invariant #17), under `_cache_lock` so concurrent saves
+    don't desync disk/cache ordering (invariant #41 — concurrency)."""
+    global _experiments_cache
+    with _cache_lock:
+        _safe_save_json(_EXPERIMENTS_FILE, entries, "Experiments")
+        _experiments_cache = _typed_clone(entries)
+
+
+def _delete_experiment_attach_dir(entry_id: str) -> None:
+    """Remove all attachment files for `entry_id` and the dir itself.
+    Used when an entry is deleted from the notebook. Refuses
+    transparently if the dir is a symlink (handled in
+    `_experiment_attach_dir`)."""
+    d = _experiment_attach_dir(entry_id, create=False)
+    if d is None or not d.exists():
+        return
+    try:
+        for p in d.iterdir():
+            if p.is_file() and not p.is_symlink():
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+        try:
+            d.rmdir()
+        except OSError:
+            pass
+    except OSError as exc:
+        _log.warning("Could not clean experiment attach dir %s: %s",
+                     d, exc)
+
+
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
+               ".tiff", ".tif")
+
+
+def _save_experiment_image(entry_id: str, data: bytes,
+                              suggested_name: "str | None" = None,
+                              ) -> "Path | None":
+    """Atomically write image bytes into `_EXPERIMENTS_DIR/<entry_id>/`.
+    Returns the saved Path on success, or `None` on cap-exceeded /
+    sanitisation-fail / write-fail.
+
+    Enforces both the per-image cap (`_EXPERIMENT_IMAGE_MAX_BYTES`) and
+    the per-entry cumulative cap (`_EXPERIMENT_DIR_MAX_BYTES`).
+
+    `suggested_name` provides the file extension hint only; the on-disk
+    name is `img-<ts>-<rand>.<ext>` so concurrent attaches can't
+    collide. Defaults to `.png` if no recognised extension is supplied.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        return None
+    if len(data) > _EXPERIMENT_IMAGE_MAX_BYTES:
+        _log.warning(
+            "Refusing image attach: %d bytes > %d byte cap",
+            len(data), _EXPERIMENT_IMAGE_MAX_BYTES,
+        )
+        return None
+    existing = _experiment_dir_size_bytes(entry_id)
+    if existing + len(data) > _EXPERIMENT_DIR_MAX_BYTES:
+        _log.warning(
+            "Refusing image attach: entry %s dir would exceed %d "
+            "(existing=%d + new=%d)",
+            entry_id, _EXPERIMENT_DIR_MAX_BYTES, existing, len(data),
+        )
+        return None
+    d = _experiment_attach_dir(entry_id, create=True)
+    if d is None:
+        return None
+    suffix = ".png"
+    if suggested_name:
+        try:
+            sn = Path(suggested_name).name
+            if sn and "." in sn:
+                cand = "." + sn.rsplit(".", 1)[1].lower()
+                if cand in _IMAGE_EXTS:
+                    suffix = cand
+        except (ValueError, IndexError):
+            pass
+    ts = _datetime.now().strftime("%Y%m%dT%H%M%S")
+    name = f"img-{ts}-{_uuid.uuid4().hex[:6]}{suffix}"
+    out = d / name
+    try:
+        _atomic_write_bytes(out, bytes(data))
+    except OSError as exc:
+        _log.warning("Image atomic-write failed for %s: %s", out, exc)
+        return None
+    return out
+
+
+def _extract_plasmid_refs(body_md: str) -> "list[str]":
+    """Return the unique plasmid ids referenced via `@plasmid:<id>` in
+    `body_md`, preserving first-appearance order. Used to maintain the
+    denormalised `attached_plasmid_ids` xref on save."""
+    if not body_md:
+        return []
+    seen: "list[str]" = []
+    seen_set: "set[str]" = set()
+    for m in _PLASMID_REF_RE.finditer(body_md):
+        ref = m.group(1)
+        if ref and ref not in seen_set:
+            seen.append(ref)
+            seen_set.add(ref)
+    return seen
+
+
+def _render_plasmid_refs(body_md: str) -> str:
+    """Pre-process `body_md` for Markdown rendering: replace
+    `@plasmid:<id>` tokens with markdown links carrying a custom
+    `splicecraft://plasmid/<id>` href. The `ExperimentsScreen`
+    `LinkClicked` handler intercepts that scheme to load the referenced
+    plasmid; unknown schemes fall through to Textual's default."""
+    if not body_md or "@plasmid:" not in body_md:
+        return body_md
+    return _PLASMID_REF_RE.sub(
+        lambda m: f"[`@{m.group(1)}`]({_PLASMID_LINK_SCHEME}{m.group(1)})",
+        body_md,
+    )
+
+
+# ── Spellcheck primitives (pyspellchecker-backed) ────────────────────────────
+#
+# Pure-Python English spellcheck for the Compose pane. `pyspellchecker`
+# bundles its wordlist so there's no per-launch network or external
+# corpus fetch. A user-maintained custom dictionary is persisted via
+# `_get_setting("experiments_custom_dict")` — words the user explicitly
+# "added to dictionary" survive across sessions and load alongside the
+# stock corpus.
+#
+# Non-prose markdown regions (code spans, fenced blocks, hyperlinks,
+# image refs, plasmid xrefs, raw URLs) are masked with spaces BEFORE
+# tokenisation so they don't pollute the misspelling list. Tokens are
+# alphabetic-and-apostrophe sequences ≥ 2 chars.
+
+_SPELLCHECK_WORD_RE = re.compile(r"\b[A-Za-z][A-Za-z'\-]{1,}\b")
+_SPELLCHECK_SKIP_PATTERNS = (
+    re.compile(r"```[\s\S]*?```"),      # fenced code blocks
+    re.compile(r"`[^`]+`"),               # inline code
+    re.compile(r"!\[[^\]]*\]\([^)]+\)"),  # image links
+    re.compile(r"\[[^\]]+\]\([^)]+\)"),   # markdown links
+    re.compile(r"https?://\S+"),          # raw URLs
+    re.compile(r"@plasmid:\S+"),          # plasmid cross-refs
+)
+
+_SPELLCHECK_ENGINE: "_Any | None" = None
+
+
+def _spellcheck_strip_code(text: str) -> str:
+    """Mask non-prose markdown regions with spaces (same length as
+    matched substring) so character offsets stay aligned but the
+    masked content doesn't tokenise. Cheap O(n) regex sweep."""
+    out = text
+    for pat in _SPELLCHECK_SKIP_PATTERNS:
+        out = pat.sub(lambda m: " " * len(m.group(0)), out)
+    return out
+
+
+def _get_spellcheck_engine():
+    """Return a cached pyspellchecker instance with the user's custom
+    dictionary loaded. Returns `None` if pyspellchecker is unavailable
+    so callers can degrade gracefully (the import is a hard dep but
+    defensive in case a user did a custom install)."""
+    global _SPELLCHECK_ENGINE
+    if _SPELLCHECK_ENGINE is not None:
+        return _SPELLCHECK_ENGINE
+    try:
+        from spellchecker import SpellChecker  # type: ignore
+    except ImportError:
+        return None
+    try:
+        spell = SpellChecker()
+    except Exception:
+        _log.exception("Spellcheck: SpellChecker() init failed")
+        return None
+    custom = _get_setting("experiments_custom_dict", []) or []
+    if isinstance(custom, list):
+        try:
+            spell.word_frequency.load_words(
+                [w for w in custom if isinstance(w, str)]
+            )
+        except Exception:
+            _log.exception("Spellcheck: custom-dict load_words failed")
+    _SPELLCHECK_ENGINE = spell
+    return spell
+
+
+def _clear_spellcheck_engine() -> None:
+    """Invalidate the cached engine so the next request reloads the
+    custom dictionary. Called after `add-to-dict` modifies settings."""
+    global _SPELLCHECK_ENGINE
+    _SPELLCHECK_ENGINE = None
+
+
+def _spellcheck_body(body_md: str) -> "list[tuple[str, list[str]]]":
+    """Return `[(word, top_suggestions), ...]` for misspellings in
+    `body_md`, preserving first-appearance order. Empty list if the
+    spellcheck engine isn't available OR the body has no prose tokens.
+    """
+    spell = _get_spellcheck_engine()
+    if spell is None:
+        return []
+    stripped = _spellcheck_strip_code(body_md or "")
+    words = _SPELLCHECK_WORD_RE.findall(stripped)
+    seen: "dict[str, str]" = {}
+    for w in words:
+        lw = w.lower()
+        if lw not in seen:
+            seen[lw] = w
+    if not seen:
+        return []
+    try:
+        misspelled = spell.unknown(seen.keys())
+    except Exception:
+        _log.exception("Spellcheck: unknown() lookup failed")
+        return []
+    out: "list[tuple[str, list[str]]]" = []
+    for lw in seen:
+        if lw in misspelled:
+            try:
+                cands = list(spell.candidates(lw) or [])[:5]
+            except Exception:
+                cands = []
+            out.append((seen[lw], cands))
+    return out
+
+
+def _now_iso() -> str:
+    """ISO-8601 timestamp with local-timezone offset, e.g.
+    `2026-05-18T14:30:00-07:00`. Used for entry `created_at` /
+    `updated_at`. Timezone-aware so a user roaming across timezones
+    still gets unambiguous timestamps."""
+    return _datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _normalise_experiment_entry(entry: dict, *, fresh: bool = False
+                                  ) -> dict:
+    """Normalise an entry dict in place-style (returns a new dict).
+
+    Caps title length, drops empty tags, deduplicates the
+    `attached_plasmid_ids` xref from the live body, bumps `updated_at`.
+    `fresh=True` also stamps `created_at` (used on new-entry create).
+
+    Truncates `body_md` to `_EXPERIMENT_BODY_MAX_BYTES`; over-cap input
+    is rare (1 MB markdown) but a deterministic truncate beats a save
+    refusal that loses the user's work outright.
+    """
+    out = dict(entry) if isinstance(entry, dict) else {}
+    eid = _sanitize_experiment_id(out.get("id"))
+    if eid is None:
+        # Caller bug: never persist an entry without a valid id.
+        # Fall back to a fresh id rather than crash a save batch.
+        eid = _new_experiment_id()
+    out["id"] = eid
+    title = out.get("title")
+    if not isinstance(title, str):
+        title = ""
+    out["title"] = title[:_EXPERIMENT_TITLE_MAX_LEN]
+    body = out.get("body_md")
+    if not isinstance(body, str):
+        body = ""
+    if len(body.encode("utf-8", errors="replace")) > _EXPERIMENT_BODY_MAX_BYTES:
+        # Truncate by byte budget — slice at chars and re-check until
+        # the encoded length fits. Cheap because the over-cap is rare.
+        body = body[: _EXPERIMENT_BODY_MAX_BYTES]
+        while len(body.encode("utf-8", errors="replace")
+                 ) > _EXPERIMENT_BODY_MAX_BYTES:
+            body = body[: max(0, len(body) - 1024)]
+    out["body_md"] = body
+    raw_tags = out.get("tags") or []
+    tags: list[str] = []
+    if isinstance(raw_tags, list):
+        for t in raw_tags:
+            if not isinstance(t, str):
+                continue
+            t = t.strip()
+            if not t:
+                continue
+            tags.append(t[:_EXPERIMENT_TAG_MAX_LEN])
+            if len(tags) >= _EXPERIMENT_TAGS_MAX:
+                break
+    out["tags"] = tags
+    out["attached_plasmid_ids"] = _extract_plasmid_refs(body)
+    image_paths = out.get("image_paths") or []
+    if not isinstance(image_paths, list):
+        image_paths = []
+    out["image_paths"] = [
+        p for p in image_paths if isinstance(p, str) and p
+    ]
+    now = _now_iso()
+    if fresh or not isinstance(out.get("created_at"), str):
+        out["created_at"] = now
+    out["updated_at"] = now
+    return out
+
+
 # ── Sequencing toolbar screen ────────────────────────────────────────────────
 #
 # `SequencingScreen` is the user-facing entry for sequencing-data
@@ -38140,6 +38616,1588 @@ def _esc_md(s: str) -> str:
     in this modal. Equivalent to `rich.markup.escape`."""
     from rich.markup import escape
     return escape(s)
+
+
+# ── Experiments lab-notebook screen ──────────────────────────────────────────
+#
+# `ExperimentsScreen` is the top-level toolbar entry for the lab-
+# notebook workbench. Full-screen, mirrors `SequencingScreen`'s shape:
+# outer TabbedContent with three sub-tabs (Entries / Compose /
+# Attachments). Compose + Attachments are gated until the user selects
+# or creates an entry — same gating pattern as Plasmidsaurus's
+# Samples / Quality / Align panes.
+#
+# Persistence is through `_load_experiments` / `_save_experiments`
+# (full data-safety net per invariant #31). Cross-references to
+# library plasmids are written as `@plasmid:<id>` tokens; the
+# Markdown preview pane renders them as styled links with a
+# `splicecraft://plasmid/<id>` href that `on_markdown_link_clicked`
+# intercepts to load the referenced plasmid through the main canvas.
+#
+# Pure-Python toolchain: Textual `TextArea` for the markdown source,
+# Textual `Markdown` widget for the live preview (debounced 250 ms on
+# every body change). Optional deps (`rich-pixels`, `Pillow`,
+# `pyspellchecker`) are try-imported so the screen degrades
+# gracefully if they're not installed.
+
+
+class ExperimentDeleteConfirmModal(ModalScreen):
+    """Yes / No confirmation for entry deletion. Defaults focus on No
+    so a stray Enter can't delete an entry. Esc → No."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next button", show=False),
+    ]
+
+    def __init__(self, title: str, body: str) -> None:
+        super().__init__()
+        self._title = title
+        self._body  = body
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="expdel-dlg"):
+            yield Static(f" {self._title} ", id="expdel-title")
+            yield Static(self._body, id="expdel-msg", markup=True)
+            with Horizontal(id="expdel-btns"):
+                yield Button("No", id="btn-expdel-no", variant="default")
+                yield Button("Yes, delete", id="btn-expdel-yes",
+                              variant="error")
+
+    DEFAULT_CSS = """
+    #expdel-dlg {
+        width: 60; height: auto;
+        background: $surface; border: solid $primary-darken-2;
+        padding: 1 2; layout: vertical;
+    }
+    #expdel-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; height: 1;
+    }
+    #expdel-msg { height: auto; margin-top: 1; color: $text; }
+    #expdel-btns { height: 3; margin-top: 1; align: center middle; }
+    #expdel-btns Button { margin: 0 1; min-width: 14; }
+    """
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#btn-expdel-no", Button).focus()
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-expdel-no")
+    def _no(self, _ev) -> None:
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#btn-expdel-yes")
+    def _yes(self, _ev) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+class ExperimentRenameModal(ModalScreen):
+    """Rename modal for the entry title. Wraps a single Input — used
+    by both the Entries sub-tab's Rename button and any future agent
+    path that wants to mutate the title without re-saving the body."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter",  "submit", "Save"),
+    ]
+
+    def __init__(self, current_title: str) -> None:
+        super().__init__()
+        self._current = current_title or ""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="exprn-dlg"):
+            yield Static(" Rename entry ", id="exprn-title")
+            yield Input(value=self._current,
+                         placeholder="entry title",
+                         id="exprn-input")
+            with Horizontal(id="exprn-btns"):
+                yield Button("Cancel", id="btn-exprn-cancel")
+                yield Button("Save", id="btn-exprn-save",
+                              variant="primary")
+
+    DEFAULT_CSS = """
+    #exprn-dlg {
+        width: 70; height: auto;
+        background: $surface; border: solid $primary-darken-2;
+        padding: 1 2; layout: vertical;
+    }
+    #exprn-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; height: 1;
+    }
+    #exprn-input { margin-top: 1; }
+    #exprn-btns { height: 3; margin-top: 1; align: center middle; }
+    #exprn-btns Button { margin: 0 1; min-width: 14; }
+    """
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#exprn-input", Input).focus()
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-exprn-cancel")
+    def _cancel(self, _ev) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn-exprn-save")
+    def _save(self, _ev) -> None:
+        self.action_submit()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_submit(self) -> None:
+        try:
+            val = self.query_one("#exprn-input", Input).value
+        except NoMatches:
+            self.dismiss(None)
+            return
+        self.dismiss((val or "").strip()
+                      [:_EXPERIMENT_TITLE_MAX_LEN] or None)
+
+
+# Image extensions the file picker exposes. Matches the writer's
+# accept-list (`_IMAGE_EXTS`) so a user picking through the tree only
+# sees what `_save_experiment_image` will actually accept.
+_IMAGE_FILE_FILTER = set(_IMAGE_EXTS)
+
+
+class _ImagePickerTree(DirectoryTree):
+    """DirectoryTree variant that hides non-image files. Inheriting
+    Textual's filter API (`filter_paths`) keeps the navigation native;
+    only the leaf filenames get filtered."""
+
+    def filter_paths(self, paths):
+        out = []
+        for p in paths:
+            try:
+                if p.is_dir():
+                    out.append(p)
+                    continue
+                if p.suffix.lower() in _IMAGE_FILE_FILTER:
+                    out.append(p)
+            except OSError:
+                continue
+        return out
+
+
+class ImageAttachModal(ModalScreen):
+    """Pick an image file off disk OR (on Win/Mac) opportunistically
+    grab from the system clipboard via Pillow's ImageGrab.
+
+    Dismiss payload:
+      None     — cancelled / nothing picked
+      str path — local file picked OR (on clipboard-paste) a tmp file
+                 the caller is responsible for treating as the source.
+
+    Linux/WSL: clipboard-image read shells out to xclip / wl-paste,
+    which our 'pure-Python' rule forbids. The Clipboard button is
+    disabled on Linux. File-picker route works everywhere.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    #imgatt-dlg {
+        width: 100; height: 40;
+        background: $surface; border: solid $primary-darken-2;
+        padding: 1 2; layout: vertical;
+    }
+    #imgatt-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; height: 1;
+    }
+    #imgatt-hint { height: 2; color: $text-muted; margin-top: 1; }
+    #imgatt-tree {
+        height: 1fr; min-height: 10;
+        border: solid $primary-darken-2; margin-top: 1;
+    }
+    #imgatt-selected { height: 1; color: $accent; margin-top: 1; }
+    #imgatt-btns { height: 3; margin-top: 1; align: left middle; }
+    #imgatt-btns Button { margin-right: 1; min-width: 14; }
+    """
+
+    def __init__(self, start_path: "str | None" = None) -> None:
+        super().__init__()
+        start = Path(start_path).expanduser() if start_path else Path.home()
+        try:
+            if not start.is_dir():
+                start = Path.home()
+        except OSError:
+            start = Path.home()
+        self._start = str(start)
+        self._picked: "str | None" = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="imgatt-dlg"):
+            yield Static(" Attach image ", id="imgatt-title")
+            yield Static(
+                "[dim]Pick an image (PNG / JPG / GIF / BMP / WebP / "
+                "TIFF). Cap: 10 MB per file, 100 MB per entry.[/dim]",
+                id="imgatt-hint", markup=True,
+            )
+            yield _ImagePickerTree(self._start, id="imgatt-tree")
+            yield Static("[dim]no file selected[/dim]",
+                          id="imgatt-selected", markup=True)
+            with Horizontal(id="imgatt-btns"):
+                yield Button("Attach", id="btn-imgatt-ok",
+                              variant="primary", disabled=True)
+                yield Button("Paste from clipboard",
+                              id="btn-imgatt-clip")
+                yield Button("Cancel", id="btn-imgatt-cancel")
+
+    def on_mount(self) -> None:
+        # Disable clipboard button on Linux/WSL — no pure-Python path
+        # for reading a bitmap off the system clipboard there.
+        if sys.platform not in ("win32", "darwin"):
+            try:
+                btn = self.query_one("#btn-imgatt-clip", Button)
+                btn.disabled = True
+                btn.tooltip = (
+                    "Clipboard images require Windows or macOS "
+                    "(Linux/WSL has no pure-Python clipboard image API). "
+                    "Save the screenshot to disk first, then pick it."
+                )
+            except NoMatches:
+                pass
+        try:
+            self.query_one("#imgatt-tree", _ImagePickerTree).focus()
+        except NoMatches:
+            pass
+
+    @on(DirectoryTree.FileSelected, "#imgatt-tree")
+    def _file_selected(self, event) -> None:
+        try:
+            p = Path(event.path)
+        except (TypeError, ValueError):
+            return
+        if p.suffix.lower() not in _IMAGE_FILE_FILTER:
+            return
+        self._picked = str(p)
+        try:
+            self.query_one("#imgatt-selected", Static).update(
+                f"[accent]Selected:[/] {p.name}",
+            )
+            self.query_one("#btn-imgatt-ok", Button).disabled = False
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-imgatt-ok")
+    def _ok(self, _ev) -> None:
+        if self._picked:
+            self.dismiss(self._picked)
+
+    @on(Button.Pressed, "#btn-imgatt-cancel")
+    def _cancel(self, _ev) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn-imgatt-clip")
+    def _clip(self, _ev) -> None:
+        """Opportunistic Pillow ImageGrab on Win/Mac. On Linux/WSL the
+        button is disabled, so this won't fire there."""
+        try:
+            from PIL import ImageGrab  # type: ignore
+        except ImportError:
+            self.app.notify(
+                "Pillow not installed — clipboard paste unavailable.",
+                severity="warning",
+            )
+            return
+        try:
+            img = ImageGrab.grabclipboard()
+        except Exception as exc:
+            self.app.notify(
+                f"Clipboard read failed: {exc}", severity="error",
+            )
+            return
+        if img is None or isinstance(img, list):
+            # `list` return = file paths in clipboard (Win/Mac). Treat
+            # the first entry as the file pick.
+            if isinstance(img, list) and img:
+                first = img[0]
+                try:
+                    p = Path(str(first))
+                    if p.is_file() and p.suffix.lower() in _IMAGE_FILE_FILTER:
+                        self.dismiss(str(p))
+                        return
+                except OSError:
+                    pass
+            self.app.notify(
+                "No image on clipboard. Copy a screenshot first.",
+                severity="warning",
+            )
+            return
+        # An actual PIL image — write to a tmp file in the SAME
+        # directory the modal can read back via the dismiss str path.
+        import tempfile
+        try:
+            fd, tmp = tempfile.mkstemp(suffix=".png", prefix="exp-clip-")
+            os.close(fd)
+            img.save(tmp, "PNG")
+            self.dismiss(tmp)
+        except Exception as exc:
+            self.app.notify(
+                f"Failed to save clipboard image: {exc}",
+                severity="error",
+            )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class SpellcheckModal(ModalScreen):
+    """Spellcheck sidebar for the active entry's body. Lists
+    misspellings + suggestions; per-row buttons replace, add-to-
+    dictionary, or skip.
+
+    Dismiss payload: ``(replacements, dict_additions)`` where
+    ``replacements`` is a ``{original_word: chosen_replacement}`` map
+    and ``dict_additions`` is a list of words to append to the user's
+    custom dictionary. The caller applies both — this modal is purely
+    UX, no persistence side-effects.
+    """
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "done",            "Done"),
+        Binding("tab",    "app.focus_next",  "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    #spell-dlg {
+        width: 100; height: 36;
+        background: $surface; border: solid $primary-darken-2;
+        padding: 1 2; layout: vertical;
+    }
+    #spell-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; height: 1;
+    }
+    #spell-hint   { height: 1; color: $text-muted; margin-top: 1; }
+    #spell-table  {
+        height: 1fr; min-height: 8; margin-top: 1;
+        border: solid $primary-darken-2;
+    }
+    #spell-suggestions { height: 1; color: $accent; margin-top: 1; }
+    #spell-btns { height: 3; margin-top: 1; align: left middle; }
+    #spell-btns Button { margin-right: 1; min-width: 14; }
+    """
+
+    def __init__(self,
+                  misspellings: "list[tuple[str, list[str]]]") -> None:
+        super().__init__()
+        self._misspellings = list(misspellings)
+        self._replacements: "dict[str, str]" = {}
+        self._dict_additions: "list[str]" = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="spell-dlg"):
+            yield Static(
+                f" Spellcheck — {len(self._misspellings)} "
+                f"unknown words ",
+                id="spell-title",
+            )
+            yield Static(
+                "[dim]Click a row to see suggestions. Replace applies "
+                "the first suggestion; Add-to-dictionary keeps the word "
+                "for future runs.[/]",
+                id="spell-hint", markup=True,
+            )
+            yield DataTable(id="spell-table",
+                              cursor_type="row",
+                              zebra_stripes=True)
+            yield Static(
+                "[dim]Pick a row to see suggestions.[/]",
+                id="spell-suggestions", markup=True,
+            )
+            with Horizontal(id="spell-btns"):
+                yield Button("Replace", id="btn-spell-replace",
+                              variant="primary", disabled=True)
+                yield Button("Add to dictionary",
+                              id="btn-spell-add", disabled=True)
+                yield Button("Skip", id="btn-spell-skip", disabled=True)
+                yield Button("Done", id="btn-spell-done")
+
+    def on_mount(self) -> None:
+        try:
+            t = self.query_one("#spell-table", DataTable)
+            t.add_columns("Word", "Suggestions", "Status")
+        except NoMatches:
+            return
+        for word, sugs in self._misspellings:
+            sug_str = ", ".join(sugs[:3]) if sugs else "—"
+            t.add_row(
+                word,
+                Text(sug_str, no_wrap=True, overflow="ellipsis"),
+                "",
+                key=word,
+            )
+        if t.row_count > 0:
+            try:
+                t.focus()
+            except Exception:
+                pass
+
+    @on(DataTable.RowSelected, "#spell-table")
+    def _on_row(self, event) -> None:
+        if event.row_key is None:
+            return
+        word = event.row_key.value or ""
+        sugs = next(
+            (s for w, s in self._misspellings if w == word), [],
+        )
+        try:
+            sug_widget = self.query_one("#spell-suggestions", Static)
+        except NoMatches:
+            return
+        if sugs:
+            sug_widget.update(
+                f"[accent]Suggestions for '{word}':[/] "
+                f"{', '.join(sugs[:5])}",
+            )
+        else:
+            sug_widget.update(
+                f"[dim]No suggestions for '{word}'.[/]",
+            )
+        for bid in ("btn-spell-replace", "btn-spell-add",
+                    "btn-spell-skip"):
+            try:
+                self.query_one(f"#{bid}", Button).disabled = False
+            except NoMatches:
+                pass
+
+    @on(Button.Pressed, "#btn-spell-replace")
+    def _replace(self, _ev) -> None:
+        word, sugs = self._get_selected()
+        if not word:
+            return
+        if not sugs:
+            self.app.notify(
+                "No suggestion to replace with.", severity="warning",
+            )
+            return
+        self._replacements[word] = sugs[0]
+        self._mark_done(word, f"→ {sugs[0]}")
+
+    @on(Button.Pressed, "#btn-spell-add")
+    def _add(self, _ev) -> None:
+        word, _sugs = self._get_selected()
+        if not word:
+            return
+        self._dict_additions.append(word.lower())
+        self._mark_done(word, "+ dict")
+
+    @on(Button.Pressed, "#btn-spell-skip")
+    def _skip(self, _ev) -> None:
+        word, _ = self._get_selected()
+        if not word:
+            return
+        self._mark_done(word, "skipped")
+
+    @on(Button.Pressed, "#btn-spell-done")
+    def _done(self, _ev) -> None:
+        self.action_done()
+
+    def action_done(self) -> None:
+        self.dismiss((self._replacements, self._dict_additions))
+
+    def _get_selected(self) -> "tuple[str, list[str]]":
+        try:
+            t = self.query_one("#spell-table", DataTable)
+        except NoMatches:
+            return ("", [])
+        if t.cursor_row < 0 or t.row_count == 0:
+            return ("", [])
+        try:
+            row_key = t.coordinate_to_cell_key(
+                _Coordinate(t.cursor_row, 0),
+            ).row_key
+            word = row_key.value or ""
+        except Exception:
+            return ("", [])
+        sugs = next(
+            (s for w, s in self._misspellings if w == word), [],
+        )
+        return (word, sugs)
+
+    def _mark_done(self, word: str, status: str) -> None:
+        try:
+            t = self.query_one("#spell-table", DataTable)
+            for i in range(t.row_count):
+                try:
+                    row_key = t.coordinate_to_cell_key(
+                        _Coordinate(i, 0),
+                    ).row_key
+                except Exception:
+                    continue
+                if row_key.value == word:
+                    try:
+                        t.update_cell_at(_Coordinate(i, 2), status)
+                    except Exception:
+                        pass
+                    if i + 1 < t.row_count:
+                        try:
+                            t.move_cursor(row=i + 1)
+                        except Exception:
+                            pass
+                    break
+        except NoMatches:
+            pass
+
+
+# ── ExperimentsScreen ────────────────────────────────────────────────────────
+
+class ExperimentsScreen(Screen):
+    """Full-screen Experiments toolbar — lab-notebook workbench.
+
+    Tabbed layout: Entries (CRUD) / Compose (markdown editor + live
+    preview, plasmid cross-refs, attach images) / Attachments (per-entry
+    image grid). Dismisses with ``None`` on Esc / Close; auto-saves the
+    dirty compose buffer first so an accidental close never loses
+    in-flight notes.
+    """
+
+    # App-level Ctrl+Z must not unwind plasmid edits while the user is
+    # composing notebook entries (invariant #41 — modal Ctrl+Z opts out).
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Close",        show=True),
+        Binding("tab",    "app.focus_next", "Next",         show=False),
+        Binding("ctrl+n", "new_entry",      "New",          show=True),
+        Binding("ctrl+s", "save_entry",     "Save",         show=True),
+        Binding("ctrl+i", "attach_image",   "Attach image", show=True),
+        Binding("ctrl+r", "insert_plasmid", "Plasmid ref",  show=True),
+        Binding("f7",     "spellcheck",     "Spellcheck",   show=True),
+    ]
+
+    DEFAULT_CSS = """
+    /* ── Frame ──────────────────────────────────────────────── */
+    #exp-box {
+        width: 100%; height: 1fr;
+        background: $surface; padding: 0 1;
+    }
+    #exp-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; height: 1;
+    }
+    #exp-tabs { width: 100%; height: 1fr; }
+    #exp-tabs > TabPane { padding: 0 1; }
+
+    /* ── Entries sub-tab ───────────────────────────────────── */
+    #exp-entries-pane { width: 100%; height: 1fr; }
+    #exp-entries-hint { height: 1; color: $text-muted; }
+    #exp-entries-table {
+        height: 1fr; min-height: 6;
+        border: solid $primary-darken-2; margin-top: 1;
+    }
+    #exp-entries-btns { height: 3; margin-top: 1; align: left middle; }
+    #exp-entries-btns Button { margin-right: 1; min-width: 14; }
+
+    /* ── Compose sub-tab ──────────────────────────────────────
+       Title + tags inputs above. Split horizontal below — TextArea
+       60% / Markdown 40%. Toolbar at the foot. */
+    #exp-compose-pane { width: 100%; height: 1fr; }
+    #exp-meta-row { height: 3; margin-top: 0; }
+    #exp-tags-row { height: 3; margin-top: 0; }
+    .exp-meta-label {
+        width: 8; height: 3; padding: 1 1 0 1;
+        color: $text-muted;
+    }
+    #exp-title-input { width: 1fr; }
+    #exp-tags-input  { width: 1fr; }
+    #exp-compose-hint { height: 1; color: $text-muted; margin-top: 1; }
+    #exp-compose-split {
+        width: 100%; height: 1fr; min-height: 10; margin-top: 1;
+    }
+    #exp-body {
+        width: 3fr; height: 1fr;
+        border: solid $primary-darken-2;
+    }
+    #exp-preview {
+        width: 2fr; height: 1fr;
+        border: solid $primary-darken-2; padding: 0 1;
+    }
+    #exp-compose-btns { height: 3; margin-top: 1; align: left middle; }
+    #exp-compose-btns Button { margin-right: 1; min-width: 14; }
+    #exp-dirty-flag {
+        width: auto; height: 3; padding: 1 1; color: $warning;
+    }
+
+    /* ── Attachments sub-tab ─────────────────────────────────── */
+    #exp-attach-pane { width: 100%; height: 1fr; }
+    #exp-attach-hint { height: 1; color: $text-muted; }
+    #exp-attach-table {
+        height: 1fr; min-height: 6;
+        border: solid $primary-darken-2; margin-top: 1;
+    }
+    #exp-attach-btns { height: 3; margin-top: 1; align: left middle; }
+    #exp-attach-btns Button { margin-right: 1; min-width: 14; }
+
+    /* ── Screen footer with the Close button ──────────────────── */
+    #exp-bottom {
+        height: 3; margin-top: 1; align: left middle;
+    }
+    #exp-bottom Button { margin-right: 1; min-width: 14; }
+    """
+
+    _DEPENDENT_SUBTABS = ("exp-sub-compose", "exp-sub-attachments")
+
+    def __init__(self, initial_entry_id: "str | None" = None) -> None:
+        super().__init__()
+        self._initial_entry_id = initial_entry_id
+        self._current_entry: "dict | None" = None
+        self._dirty: bool = False
+        self._preview_timer = None
+        self._preview_debounce_s = 0.25
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        return True
+
+    def compose(self) -> ComposeResult:
+        from textual.widgets import Markdown as _Markdown
+        yield Header()
+        with Vertical(id="exp-box"):
+            yield Static(
+                " Experiments — lab notebook ", id="exp-title",
+            )
+            with TabbedContent(initial="exp-sub-entries", id="exp-tabs"):
+                with TabPane("Entries", id="exp-sub-entries"):
+                    yield from self._compose_entries_pane()
+                with TabPane("Compose", id="exp-sub-compose",
+                              disabled=True):
+                    yield from self._compose_compose_pane(_Markdown)
+                with TabPane("Attachments", id="exp-sub-attachments",
+                              disabled=True):
+                    yield from self._compose_attachments_pane()
+            with Horizontal(id="exp-bottom"):
+                yield Button("Close  [Esc]", id="btn-exp-close")
+        yield Footer()
+
+    def _compose_entries_pane(self) -> ComposeResult:
+        with Vertical(id="exp-entries-pane"):
+            yield Static(
+                "[dim]Lab-notebook entries. Click [b]New[/b] to start a "
+                "fresh entry; click a row to open one for editing.[/]",
+                id="exp-entries-hint", markup=True,
+            )
+            yield DataTable(id="exp-entries-table",
+                              cursor_type="row",
+                              zebra_stripes=True)
+            with Horizontal(id="exp-entries-btns"):
+                yield Button("New  [^N]",
+                              id="btn-exp-new",
+                              variant="primary")
+                yield Button("Open", id="btn-exp-open")
+                yield Button("Rename…", id="btn-exp-rename")
+                yield Button("Delete…", id="btn-exp-delete",
+                              variant="error")
+
+    def _compose_compose_pane(self, _Markdown) -> ComposeResult:
+        with Vertical(id="exp-compose-pane"):
+            with Horizontal(id="exp-meta-row"):
+                yield Static("Title:", classes="exp-meta-label")
+                yield Input(placeholder="entry title",
+                             id="exp-title-input")
+            with Horizontal(id="exp-tags-row"):
+                yield Static("Tags:", classes="exp-meta-label")
+                yield Input(
+                    placeholder="comma-separated, e.g. cloning, gibson",
+                    id="exp-tags-input",
+                )
+            yield Static(
+                "[dim]Markdown source on the left, live preview on the "
+                "right. Use [b]`@plasmid:<id>`[/b] anywhere to cross-"
+                "reference a library plasmid — click it in the preview "
+                "to open that plasmid.[/]",
+                id="exp-compose-hint", markup=True,
+            )
+            with Horizontal(id="exp-compose-split"):
+                yield TextArea(
+                    "", language="markdown", id="exp-body",
+                )
+                yield _Markdown("", id="exp-preview")
+            with Horizontal(id="exp-compose-btns"):
+                yield Button("Save  [^S]", id="btn-exp-save",
+                              variant="primary")
+                yield Button("Attach image  [^I]",
+                              id="btn-exp-attach")
+                yield Button("Plasmid ref  [^R]",
+                              id="btn-exp-plasmid")
+                yield Button("Spellcheck  [F7]",
+                              id="btn-exp-spellcheck")
+                yield Static("", id="exp-dirty-flag")
+
+    def _compose_attachments_pane(self) -> ComposeResult:
+        with Vertical(id="exp-attach-pane"):
+            yield Static(
+                "[dim]Attached images for the selected entry. Cap: "
+                "10 MB per image, 100 MB per entry.[/]",
+                id="exp-attach-hint", markup=True,
+            )
+            yield DataTable(id="exp-attach-table",
+                              cursor_type="row",
+                              zebra_stripes=True)
+            with Horizontal(id="exp-attach-btns"):
+                yield Button("Attach…", id="btn-exp-attach-grid",
+                              variant="primary")
+                yield Button("Insert into body",
+                              id="btn-exp-insert-attach")
+                yield Button("Remove…", id="btn-exp-remove-attach",
+                              variant="error")
+
+    def on_mount(self) -> None:
+        try:
+            t = self.query_one("#exp-entries-table", DataTable)
+            t.add_columns("Title", "Updated", "Tags", "Imgs", "Refs")
+        except NoMatches:
+            return
+        try:
+            tat = self.query_one("#exp-attach-table", DataTable)
+            tat.add_columns("Filename", "Size", "Inserted?")
+        except NoMatches:
+            pass
+        self._refresh_entries_table()
+        if self._initial_entry_id:
+            entries = _load_experiments()
+            for e in entries:
+                if e.get("id") == self._initial_entry_id:
+                    self._load_into_compose(e)
+                    return
+
+    # ─── Sub-tab gating ──────────────────────────────────────────────────
+
+    def _apply_subtab_gating(self, *, enabled: bool) -> None:
+        for tab_id in self._DEPENDENT_SUBTABS:
+            try:
+                pane = self.query_one(f"#{tab_id}", TabPane)
+                pane.disabled = not enabled
+            except NoMatches:
+                continue
+        if not enabled:
+            try:
+                tabs = self.query_one("#exp-tabs", TabbedContent)
+                if tabs.active in self._DEPENDENT_SUBTABS:
+                    tabs.active = "exp-sub-entries"
+            except (NoMatches, LookupError, AttributeError):
+                pass
+
+    # ─── Entries population ──────────────────────────────────────────────
+
+    def _sorted_entries(self) -> "list[dict]":
+        """Newest-first by `updated_at`, with natural-sort by title as
+        tie-breaker. Mirrors the invariant #33 sort/lookup symmetry
+        pattern — `_on_entry_selected` resolves the row key against
+        the same sorted list."""
+        entries = _load_experiments()
+
+        def _key(e: dict) -> tuple:
+            updated = e.get("updated_at") or ""
+            title   = e.get("title") or ""
+            return (updated, _natural_sort_key(title))
+        return sorted(entries, key=_key, reverse=True)
+
+    def _refresh_entries_table(self) -> None:
+        try:
+            t = self.query_one("#exp-entries-table", DataTable)
+        except NoMatches:
+            return
+        t.clear()
+        entries = self._sorted_entries()
+        for e in entries:
+            eid = e.get("id") or ""
+            title = e.get("title") or "(untitled)"
+            updated = (e.get("updated_at") or "")[:19].replace("T", " ")
+            tags = ", ".join((e.get("tags") or [])[:3])
+            n_imgs = len(e.get("image_paths") or [])
+            n_refs = len(e.get("attached_plasmid_ids") or [])
+            t.add_row(
+                Text(title, no_wrap=True, overflow="ellipsis"),
+                updated,
+                Text(tags, no_wrap=True, overflow="ellipsis"),
+                str(n_imgs),
+                str(n_refs),
+                key=eid,
+            )
+
+    # ─── Compose loading / persistence ───────────────────────────────────
+
+    def _load_into_compose(self, entry: dict) -> None:
+        self._current_entry = dict(entry)
+        try:
+            self.query_one(
+                "#exp-title-input", Input,
+            ).value = entry.get("title", "")
+            self.query_one(
+                "#exp-tags-input", Input,
+            ).value = ", ".join(entry.get("tags") or [])
+            ta = self.query_one("#exp-body", TextArea)
+            ta.text = entry.get("body_md", "")
+        except NoMatches:
+            pass
+        self._apply_subtab_gating(enabled=True)
+        try:
+            tabs = self.query_one("#exp-tabs", TabbedContent)
+            tabs.active = "exp-sub-compose"
+        except (NoMatches, LookupError):
+            pass
+        self._refresh_preview()
+        self._refresh_attachments()
+        self._mark_dirty(False)
+        try:
+            self.query_one("#exp-body", TextArea).focus()
+        except NoMatches:
+            pass
+
+    def _mark_dirty(self, dirty: bool) -> None:
+        self._dirty = dirty
+        try:
+            flag = self.query_one("#exp-dirty-flag", Static)
+            flag.update(
+                "[yellow]● unsaved[/yellow]" if dirty else "",
+            )
+        except NoMatches:
+            pass
+
+    def _collect_compose_state(self) -> "dict | None":
+        if self._current_entry is None:
+            return None
+        try:
+            title = self.query_one("#exp-title-input", Input).value
+            tags_raw = self.query_one("#exp-tags-input", Input).value
+            body = self.query_one("#exp-body", TextArea).text
+        except NoMatches:
+            return None
+        tags = [t.strip() for t in (tags_raw or "").split(",")
+                if t.strip()]
+        entry = dict(self._current_entry)
+        entry["title"] = title
+        entry["body_md"] = body
+        entry["tags"] = tags
+        return _normalise_experiment_entry(entry, fresh=False)
+
+    def _persist_current(self) -> bool:
+        """Persist the live compose buffer back to disk. Returns True on
+        success. No-op (False) if nothing to save."""
+        if self._current_entry is None:
+            return False
+        upd = self._collect_compose_state()
+        if upd is None:
+            return False
+        entries = _load_experiments()
+        replaced = False
+        for i, e in enumerate(entries):
+            if e.get("id") == upd.get("id"):
+                entries[i] = upd
+                replaced = True
+                break
+        if not replaced:
+            entries.append(upd)
+        try:
+            _save_experiments(entries)
+        except OSError as exc:
+            _notify_save_failure(self.app, "Experiments", exc)
+            return False
+        self._current_entry = upd
+        _log_event(
+            "experiments.save",
+            eid=upd.get("id"),
+            title=upd.get("title"),
+            body_len=len(upd.get("body_md") or ""),
+            n_tags=len(upd.get("tags") or []),
+            n_refs=len(upd.get("attached_plasmid_ids") or []),
+        )
+        self._mark_dirty(False)
+        self._refresh_entries_table()
+        return True
+
+    # ─── Preview render ──────────────────────────────────────────────────
+
+    def _refresh_preview(self) -> None:
+        from textual.widgets import Markdown as _Markdown
+        try:
+            preview = self.query_one("#exp-preview", _Markdown)
+            ta = self.query_one("#exp-body", TextArea)
+        except NoMatches:
+            return
+        body = ta.text or ""
+        rendered = _render_plasmid_refs(body)
+        try:
+            preview.update(rendered)
+        except Exception:
+            _log.exception("ExperimentsScreen: preview update failed")
+
+    def _schedule_preview_refresh(self) -> None:
+        if self._preview_timer is not None:
+            try:
+                self._preview_timer.stop()
+            except Exception:
+                pass
+        self._preview_timer = self.set_timer(
+            self._preview_debounce_s, self._refresh_preview,
+        )
+
+    # ─── Attachments ─────────────────────────────────────────────────────
+
+    def _refresh_attachments(self) -> None:
+        if self._current_entry is None:
+            return
+        try:
+            t = self.query_one("#exp-attach-table", DataTable)
+        except NoMatches:
+            return
+        t.clear()
+        eid = self._current_entry.get("id") or ""
+        d = _experiment_attach_dir(eid, create=False)
+        if d is None or not d.is_dir():
+            return
+        body = ""
+        try:
+            body = self.query_one("#exp-body", TextArea).text or ""
+        except NoMatches:
+            pass
+        try:
+            files = sorted(
+                d.iterdir(),
+                key=lambda p: _natural_sort_key(p.name),
+            )
+        except OSError:
+            files = []
+        for p in files:
+            if not p.is_file() or p.is_symlink():
+                continue
+            try:
+                sz = p.stat().st_size
+            except OSError:
+                sz = 0
+            inserted = "yes" if (f"]({p.name})" in body) else "no"
+            t.add_row(p.name, f"{sz:,}", inserted, key=p.name)
+
+    # ─── Event handlers ──────────────────────────────────────────────────
+
+    @on(DataTable.RowSelected, "#exp-entries-table")
+    def _on_entry_selected(self, event) -> None:
+        eid = event.row_key.value if event.row_key else None
+        if eid is None:
+            return
+        entries = _load_experiments()
+        for e in entries:
+            if e.get("id") == eid:
+                if self._dirty and self._current_entry is not None:
+                    self._persist_current()
+                self._load_into_compose(e)
+                return
+
+    @on(Button.Pressed, "#btn-exp-new")
+    def _on_btn_new(self, _ev) -> None:
+        self.action_new_entry()
+
+    @on(Button.Pressed, "#btn-exp-open")
+    def _on_btn_open(self, _ev) -> None:
+        try:
+            t = self.query_one("#exp-entries-table", DataTable)
+        except NoMatches:
+            return
+        if t.cursor_row < 0 or t.row_count == 0:
+            self.app.notify("Pick a row first.", severity="warning")
+            return
+        # Same lookup as RowSelected
+        try:
+            row_key = t.coordinate_to_cell_key(_Coordinate(t.cursor_row, 0)).row_key
+            eid = row_key.value
+        except Exception:
+            return
+        if not eid:
+            return
+        for e in _load_experiments():
+            if e.get("id") == eid:
+                if self._dirty and self._current_entry is not None:
+                    self._persist_current()
+                self._load_into_compose(e)
+                return
+
+    @on(Button.Pressed, "#btn-exp-rename")
+    def _on_btn_rename(self, _ev) -> None:
+        self._rename_current()
+
+    @on(Button.Pressed, "#btn-exp-delete")
+    def _on_btn_delete(self, _ev) -> None:
+        self._confirm_delete()
+
+    @on(Button.Pressed, "#btn-exp-save")
+    def _on_btn_save(self, _ev) -> None:
+        self.action_save_entry()
+
+    @on(Button.Pressed, "#btn-exp-attach")
+    def _on_btn_attach(self, _ev) -> None:
+        self.action_attach_image()
+
+    @on(Button.Pressed, "#btn-exp-attach-grid")
+    def _on_btn_attach_grid(self, _ev) -> None:
+        self.action_attach_image()
+
+    @on(Button.Pressed, "#btn-exp-plasmid")
+    def _on_btn_plasmid(self, _ev) -> None:
+        self.action_insert_plasmid()
+
+    @on(Button.Pressed, "#btn-exp-spellcheck")
+    def _on_btn_spellcheck(self, _ev) -> None:
+        self.action_spellcheck()
+
+    @on(Button.Pressed, "#btn-exp-remove-attach")
+    def _on_btn_remove_attach(self, _ev) -> None:
+        self._remove_selected_attachment()
+
+    @on(Button.Pressed, "#btn-exp-insert-attach")
+    def _on_btn_insert_attach(self, _ev) -> None:
+        self._insert_selected_attachment_into_body()
+
+    @on(Button.Pressed, "#btn-exp-close")
+    def _on_btn_close(self, _ev) -> None:
+        self.action_cancel()
+
+    @on(TextArea.Changed, "#exp-body")
+    def _on_body_changed(self, _ev) -> None:
+        self._mark_dirty(True)
+        self._schedule_preview_refresh()
+
+    @on(Input.Changed, "#exp-title-input")
+    def _on_title_changed(self, _ev) -> None:
+        self._mark_dirty(True)
+
+    @on(Input.Changed, "#exp-tags-input")
+    def _on_tags_changed(self, _ev) -> None:
+        self._mark_dirty(True)
+
+    def on_markdown_link_clicked(self, event) -> None:
+        """Markdown widget link-click → intercept plasmid refs and
+        external URLs. The Markdown widget posts this for any
+        `[label](href)` click in the preview."""
+        href = getattr(event, "href", "") or ""
+        if href.startswith(_PLASMID_LINK_SCHEME):
+            target_id = href[len(_PLASMID_LINK_SCHEME):]
+            self._open_plasmid_ref(target_id)
+            return
+        if href.startswith(("http://", "https://")):
+            # Pure-TUI rule (user's call 2026-05-18): don't shell out
+            # to a browser. Show the URL so the user can copy it.
+            self.app.notify(
+                f"Link (copy from notify): {href}",
+                timeout=8,
+            )
+            return
+        if href:
+            self.app.notify(f"Link: {href}", timeout=4)
+
+    def _open_plasmid_ref(self, target_id: str) -> None:
+        """Resolve `target_id` against every collection on disk, switch
+        the active collection if needed, then load the plasmid through
+        the same `_apply_record` path that `action_find_plasmid` uses.
+        Auto-saves the current compose buffer first so a reference
+        click can't lose user notes."""
+        if not target_id:
+            return
+        matches = _search_collections_library(target_id, limit=10)
+        chosen = None
+        for m in matches:
+            if m.get("id") == target_id:
+                chosen = m
+                break
+        if chosen is None:
+            self.app.notify(
+                f"No plasmid `{target_id}` in any collection",
+                severity="warning",
+            )
+            return
+        if self._dirty and self._current_entry is not None:
+            self._persist_current()
+        coll_name = chosen.get("collection") or ""
+        entry_id = chosen.get("id") or ""
+        # Dismiss BEFORE the switch+load so the user sees the loaded
+        # plasmid behind the (now-gone) screen rather than us trying
+        # to redraw a half-disposed widget tree.
+        self.dismiss(None)
+        try:
+            self._switch_and_load(coll_name, entry_id)
+        except Exception:
+            _log.exception("ExperimentsScreen: switch_and_load failed")
+
+    def _switch_and_load(self, coll_name: str, entry_id: str) -> None:
+        """Shared with `PlasmidApp.action_find_plasmid` — small enough
+        to duplicate rather than refactor in this pass (~20 lines).
+        Switches active collection if needed, then loads the entry's
+        embedded `gb_text` onto the main canvas via `_apply_record`."""
+        if coll_name and coll_name != _get_active_collection_name():
+            coll = _find_collection(coll_name)
+            if coll is None:
+                self.app.notify(
+                    f"Collection '{coll_name}' is gone.",
+                    severity="warning",
+                )
+                return
+            _set_active_collection_name(coll_name)
+            plasmids = [dict(p) for p in (coll.get("plasmids") or [])
+                          if isinstance(p, dict)]
+            try:
+                _save_library(plasmids)
+            except (OSError, ValueError) as exc:
+                _notify_save_failure(
+                    self.app, "Plasmid library", exc,
+                )
+                return
+            try:
+                lib = self.app.query_one("#library", LibraryPanel)
+                lib._view_mode = "plasmids"
+                lib._apply_view_mode()
+                lib._repopulate_plasmids()
+            except NoMatches:
+                pass
+        for e in _load_library():
+            if e.get("id") == entry_id:
+                gb_text = e.get("gb_text", "")
+                if not gb_text:
+                    self.app.notify(
+                        "Library entry has no embedded sequence.",
+                        severity="warning",
+                    )
+                    return
+                try:
+                    record = _gb_text_to_record(gb_text)
+                except Exception as exc:
+                    _log.exception(
+                        "Plasmid-ref load: parse failed for %r",
+                        entry_id,
+                    )
+                    self.app.notify(
+                        f"Could not load plasmid: {exc}",
+                        severity="error",
+                    )
+                    return
+                self.app._apply_record(record)  # type: ignore[attr-defined]
+                return
+        self.app.notify(
+            f"Plasmid {entry_id} not found in {coll_name}.",
+            severity="warning",
+        )
+
+    # ─── Actions ─────────────────────────────────────────────────────────
+
+    def action_cancel(self) -> None:
+        if self._dirty and self._current_entry is not None:
+            self._persist_current()
+        self.dismiss(None)
+
+    def action_new_entry(self) -> None:
+        if self._dirty and self._current_entry is not None:
+            self._persist_current()
+        entries = _load_experiments()
+        existing_ids: set[str] = {
+            e.get("id") for e in entries if e.get("id")  # type: ignore[misc]
+        }
+        new_id = _new_experiment_id(existing_ids)
+        new_entry = _normalise_experiment_entry({
+            "id": new_id,
+            "title": "Untitled entry",
+            "body_md": "",
+            "tags": [],
+        }, fresh=True)
+        entries.append(new_entry)
+        try:
+            _save_experiments(entries)
+        except OSError as exc:
+            _notify_save_failure(self.app, "Experiments", exc)
+            return
+        _log_event("experiments.new", eid=new_id)
+        self._refresh_entries_table()
+        self._load_into_compose(new_entry)
+        try:
+            self.query_one("#exp-title-input", Input).focus()
+        except NoMatches:
+            pass
+
+    def action_save_entry(self) -> None:
+        if self._current_entry is None:
+            self.app.notify("No entry selected.", severity="warning")
+            return
+        if self._persist_current():
+            self.app.notify("Entry saved.", timeout=3)
+
+    def action_attach_image(self) -> None:
+        if self._current_entry is None:
+            self.app.notify(
+                "Select or create an entry first.", severity="warning",
+            )
+            return
+
+        def _on_picked(path) -> None:
+            if not path:
+                return
+            self._attach_image_from_path(str(path))
+        self.app.push_screen(ImageAttachModal(), callback=_on_picked)
+
+    def _attach_image_from_path(self, src_path: str) -> None:
+        if self._current_entry is None:
+            return
+        try:
+            p = Path(src_path).expanduser()
+        except (TypeError, ValueError):
+            self.app.notify("Bad image path.", severity="error")
+            return
+        ok, reason = _safe_file_size_check(
+            p, _EXPERIMENT_IMAGE_MAX_BYTES, "experiment image",
+        )
+        if not ok:
+            self.app.notify(
+                reason or "Image attach refused.", severity="error",
+            )
+            return
+        try:
+            data = p.read_bytes()
+        except OSError as exc:
+            self.app.notify(
+                f"Could not read image: {exc}", severity="error",
+            )
+            return
+        eid = self._current_entry.get("id")
+        if not eid:
+            return
+        saved = _save_experiment_image(eid, data, p.name)
+        if saved is None:
+            self.app.notify(
+                "Image attach failed — see logs.", severity="error",
+            )
+            return
+        rel = saved.name
+        try:
+            ta = self.query_one("#exp-body", TextArea)
+            current = ta.text
+            insert = f"\n\n![{rel}]({rel})\n"
+            ta.text = current + insert
+        except NoMatches:
+            pass
+        self._mark_dirty(True)
+        self._refresh_preview()
+        self._refresh_attachments()
+        _log_event(
+            "experiments.attach.image",
+            eid=eid, filename=rel, size=len(data),
+        )
+        self.app.notify(f"Attached {rel}.", timeout=4)
+
+    def action_insert_plasmid(self) -> None:
+        if self._current_entry is None:
+            self.app.notify("No entry selected.", severity="warning")
+            return
+
+        def _on_picked(payload) -> None:
+            if payload is None:
+                return
+            try:
+                _coll, entry_id = payload
+            except (TypeError, ValueError):
+                return
+            if not entry_id:
+                return
+            try:
+                ta = self.query_one("#exp-body", TextArea)
+            except NoMatches:
+                return
+            ta.insert(f"@plasmid:{entry_id}")
+            self._mark_dirty(True)
+            self._schedule_preview_refresh()
+            _log_event("experiments.insert.plasmid_ref",
+                         eid=self._current_entry.get("id")
+                              if self._current_entry else None,
+                         ref=entry_id)
+        self.app.push_screen(LibrarySearchModal(), callback=_on_picked)
+
+    def action_spellcheck(self) -> None:
+        """Pyspellchecker-backed spellcheck for the active body. Masks
+        non-prose markdown regions, tokenises, lists misspellings in a
+        side modal; user picks Replace / Add-to-dict / Skip per row.
+
+        Replacements are applied as whole-word substitutions; the user's
+        custom dictionary persists across sessions via the
+        `experiments_custom_dict` settings key."""
+        if self._current_entry is None:
+            self.app.notify("No entry selected.", severity="warning")
+            return
+        try:
+            body = self.query_one("#exp-body", TextArea).text or ""
+        except NoMatches:
+            return
+        if not body.strip():
+            self.app.notify("Nothing to spellcheck.", severity="warning")
+            return
+        misspellings = _spellcheck_body(body)
+        if _get_spellcheck_engine() is None:
+            self.app.notify(
+                "Spellcheck engine not available "
+                "(pyspellchecker missing?).",
+                severity="error",
+            )
+            return
+        if not misspellings:
+            self.app.notify("No misspellings found.", timeout=3)
+            return
+
+        def _on_done(payload) -> None:
+            if not payload:
+                return
+            try:
+                replacements, dict_additions = payload
+            except (TypeError, ValueError):
+                return
+            if replacements:
+                try:
+                    ta = self.query_one("#exp-body", TextArea)
+                except NoMatches:
+                    return
+                text = ta.text
+                for orig, new in replacements.items():
+                    if not orig or not new:
+                        continue
+                    text = re.sub(
+                        rf"\b{re.escape(orig)}\b", new, text,
+                    )
+                ta.text = text
+                self._mark_dirty(True)
+                self._schedule_preview_refresh()
+            if dict_additions:
+                cur = _get_setting("experiments_custom_dict", []) or []
+                if not isinstance(cur, list):
+                    cur = []
+                added = 0
+                for w in dict_additions:
+                    if isinstance(w, str) and w and w not in cur:
+                        cur.append(w)
+                        added += 1
+                if added:
+                    _set_setting("experiments_custom_dict", cur)
+                    _clear_spellcheck_engine()
+            n_repl = len(replacements or {})
+            n_add  = len(dict_additions or [])
+            if n_repl or n_add:
+                parts: "list[str]" = []
+                if n_repl:
+                    parts.append(f"{n_repl} replaced")
+                if n_add:
+                    parts.append(f"{n_add} added to dictionary")
+                _log_event(
+                    "experiments.spellcheck.applied",
+                    eid=self._current_entry.get("id")
+                          if self._current_entry else None,
+                    n_replaced=n_repl, n_added=n_add,
+                )
+                self.app.notify(", ".join(parts), timeout=4)
+        self.app.push_screen(
+            SpellcheckModal(misspellings), callback=_on_done,
+        )
+
+    # ─── Rename + delete + attachments helpers ───────────────────────────
+
+    def _rename_current(self) -> None:
+        if self._current_entry is None:
+            try:
+                t = self.query_one("#exp-entries-table", DataTable)
+            except NoMatches:
+                return
+            if t.cursor_row < 0 or t.row_count == 0:
+                self.app.notify(
+                    "Pick a row first.", severity="warning",
+                )
+                return
+            try:
+                row_key = t.coordinate_to_cell_key(_Coordinate(t.cursor_row, 0)).row_key
+                eid = row_key.value
+            except Exception:
+                return
+            for e in _load_experiments():
+                if e.get("id") == eid:
+                    self._current_entry = dict(e)
+                    break
+        if self._current_entry is None:
+            return
+        current_title = self._current_entry.get("title") or ""
+
+        def _on_new_title(new_title) -> None:
+            if not new_title:
+                return
+            if self._current_entry is None:
+                return
+            self._current_entry["title"] = new_title
+            # If the compose view is loaded, mirror the title input.
+            try:
+                self.query_one(
+                    "#exp-title-input", Input,
+                ).value = new_title
+            except NoMatches:
+                pass
+            self._persist_current()
+        self.app.push_screen(
+            ExperimentRenameModal(current_title),
+            callback=_on_new_title,
+        )
+
+    def _confirm_delete(self) -> None:
+        eid: "str | None" = None
+        title: str = "(untitled)"
+        if self._current_entry is not None:
+            eid = self._current_entry.get("id")
+            title = self._current_entry.get("title") or title
+        else:
+            # Pull from the entries table cursor if compose isn't active.
+            try:
+                t = self.query_one("#exp-entries-table", DataTable)
+                if t.row_count == 0 or t.cursor_row < 0:
+                    self.app.notify(
+                        "Pick a row first.", severity="warning",
+                    )
+                    return
+                row_key = t.coordinate_to_cell_key(_Coordinate(t.cursor_row, 0)).row_key
+                eid = row_key.value
+                for e in _load_experiments():
+                    if e.get("id") == eid:
+                        title = e.get("title") or title
+                        break
+            except (NoMatches, Exception):
+                return
+        if not eid:
+            return
+
+        def _on_confirmed(yes) -> None:
+            if not yes:
+                return
+            entries = [
+                e for e in _load_experiments() if e.get("id") != eid
+            ]
+            try:
+                _save_experiments(entries)
+            except OSError as exc:
+                _notify_save_failure(self.app, "Experiments", exc)
+                return
+            _delete_experiment_attach_dir(eid)
+            _log_event("experiments.delete", eid=eid)
+            if (self._current_entry is not None
+                    and self._current_entry.get("id") == eid):
+                self._current_entry = None
+                self._apply_subtab_gating(enabled=False)
+                self._mark_dirty(False)
+            self._refresh_entries_table()
+            self.app.notify(f"Deleted: {title}", timeout=4)
+        self.app.push_screen(
+            ExperimentDeleteConfirmModal(
+                title=f"Delete: {title}?",
+                body=(
+                    "  This removes the entry and all its attached "
+                    "images.\n\n"
+                    "  [dim]A backup of experiments.json is kept; "
+                    "image files are deleted from disk.[/dim]"
+                ),
+            ),
+            callback=_on_confirmed,
+        )
+
+    def _insert_selected_attachment_into_body(self) -> None:
+        if self._current_entry is None:
+            return
+        try:
+            t = self.query_one("#exp-attach-table", DataTable)
+        except NoMatches:
+            return
+        if t.row_count == 0 or t.cursor_row < 0:
+            self.app.notify("Pick an attachment.", severity="warning")
+            return
+        try:
+            row_key = t.coordinate_to_cell_key(_Coordinate(t.cursor_row, 0)).row_key
+            name = row_key.value
+        except Exception:
+            return
+        if not name:
+            return
+        try:
+            ta = self.query_one("#exp-body", TextArea)
+        except NoMatches:
+            return
+        ta.text = ta.text + f"\n\n![{name}]({name})\n"
+        self._mark_dirty(True)
+        self._refresh_preview()
+        self._refresh_attachments()
+        try:
+            tabs = self.query_one("#exp-tabs", TabbedContent)
+            tabs.active = "exp-sub-compose"
+        except (NoMatches, LookupError):
+            pass
+
+    def _remove_selected_attachment(self) -> None:
+        if self._current_entry is None:
+            return
+        try:
+            t = self.query_one("#exp-attach-table", DataTable)
+        except NoMatches:
+            return
+        if t.row_count == 0 or t.cursor_row < 0:
+            self.app.notify("Pick an attachment.", severity="warning")
+            return
+        try:
+            row_key = t.coordinate_to_cell_key(_Coordinate(t.cursor_row, 0)).row_key
+            name = row_key.value
+        except Exception:
+            return
+        if not name:
+            return
+        eid = self._current_entry.get("id") or ""
+        d = _experiment_attach_dir(eid, create=False)
+        if d is None:
+            return
+        p = d / name
+        # Symlink refusal: never follow a symlink to delete.
+        if p.is_symlink() or not p.is_file():
+            self.app.notify(
+                "Refused: attachment is missing or unsafe.",
+                severity="error",
+            )
+            return
+
+        def _on_confirmed(yes) -> None:
+            if not yes:
+                return
+            try:
+                p.unlink()
+            except OSError as exc:
+                self.app.notify(
+                    f"Could not remove {name}: {exc}",
+                    severity="error",
+                )
+                return
+            _log_event(
+                "experiments.remove.image", eid=eid, filename=name,
+            )
+            self._refresh_attachments()
+            self.app.notify(f"Removed {name}", timeout=3)
+        self.app.push_screen(
+            ExperimentDeleteConfirmModal(
+                title=f"Remove {name}?",
+                body=(
+                    "  Deletes the image file from disk.\n\n"
+                    "  [dim]Markdown references in the body are NOT "
+                    "auto-removed — clean them up manually.[/dim]"
+                ),
+            ),
+            callback=_on_confirmed,
+        )
 
 
 # ── Alignment visualisation screen ────────────────────────────────────────────
@@ -49146,7 +51204,7 @@ class FeatureSearchModal(ModalScreen):
     def _dismiss_with_cursor(self, t: DataTable) -> None:
         try:
             from textual.coordinate import Coordinate
-            row_key = t.coordinate_to_cell_key(Coordinate(t.cursor_row, 0)).row_key
+            row_key = t.coordinate_to_cell_key(_Coordinate(t.cursor_row, 0)).row_key
         except Exception:
             return
         if row_key and row_key.value:
@@ -61515,6 +63573,9 @@ SpeciesPickerModal { align: center middle; }
         if name == "Sequencing":
             self.action_open_sequencing()
             return
+        if name == "Experiments":
+            self.action_open_experiments()
+            return
 
         # ── Multi-action menus (dropdown) ──────────────────────────────────
         ck = "\u2713"  # checkmark
@@ -61705,6 +63766,14 @@ SpeciesPickerModal { align: center middle; }
     # toolbar (2026-05-18) supersedes it; keep the old action name so
     # any persisted keybindings / agent callers still resolve.
     action_open_align_zip = action_open_sequencing
+
+    @_action_log("app.open.experiments")
+    def action_open_experiments(self) -> None:
+        """Experiments menu → opens the lab-notebook toolbar screen.
+        Direct-open (no dropdown). The screen handles entry CRUD,
+        markdown compose, image attach, plasmid cross-refs, and
+        spellcheck."""
+        self.push_screen(ExperimentsScreen())
 
     # ── Panel focus mode (Ctrl+1 .. Ctrl+5) ────────────────────────────
     # Each Ctrl+N collapses the 4-panel layout down to a single panel

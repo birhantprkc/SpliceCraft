@@ -328,6 +328,23 @@ _MODAL_CASES = [
                                                 _make_feats(),
                                                 "test",
                                                 "circular")),
+    # Experiments lab-notebook modals (added 2026-05-18 with the
+    # Experiments toolbar feature). ExperimentsScreen itself is a
+    # full-screen Screen (like SimulatorScreen / SequencingScreen);
+    # it's covered by its own tests in `test_experiments.py`. These
+    # are the modal sidekicks that DO need the 160×48 fit guarantee.
+    ("ExperimentDeleteConfirmModal", lambda: sc.ExperimentDeleteConfirmModal(
+                                                  title="Delete: foo?",
+                                                  body="body text")),
+    ("ExperimentRenameModal",        lambda: sc.ExperimentRenameModal(
+                                                  "Old title")),
+    ("ImageAttachModal",             lambda: sc.ImageAttachModal()),
+    ("SpellcheckModal.empty",        lambda: sc.SpellcheckModal([])),
+    ("SpellcheckModal.populated",    lambda: sc.SpellcheckModal([
+                                                  ("teste",
+                                                   ["test", "tester"]),
+                                                  ("mispelt", ["misspelt"]),
+                                              ])),
 ]
 
 

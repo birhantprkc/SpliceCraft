@@ -57,6 +57,14 @@ installs and the user-data directory location.
   the pairwise alignment lands as a sequencing-read lane on the
   linear map right next to the rail, and the target's library entry
   auto-tags to linear view for future opens.
+- **Log experiments** from the Experiments toolbar — full-screen
+  lab-notebook workbench with a `TextArea` markdown editor + live
+  `Markdown` preview split-pane, persistent `experiments.json` entries
+  (CRUD: New / Rename / Delete), `@plasmid:<id>` cross-references that
+  click-through to load the referenced library plasmid, per-entry
+  image attachments (file picker on Linux/WSL · Pillow clipboard grab
+  on Win/Mac), and F7 spellcheck via `pyspellchecker` with a
+  user-maintained custom dictionary.
 - **Search** your library with in-process BLASTN / BLASTP / HMMscan
   (via `pyhmmer` — no external `blast+` install).
 - **Drive from outside** via a 60+ endpoint localhost JSON API

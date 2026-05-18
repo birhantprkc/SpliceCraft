@@ -44,6 +44,21 @@ dependencies = [
     # source compiled in). The pure-Python BLAST fallback also runs
     # without pyhmmer for very short queries.
     "pyhmmer>=0.12.1",
+    # Experiments lab-notebook deps (added 2026-05-18 with the
+    # Experiments toolbar). All three are pure-Python wheels with no
+    # external system shell-outs:
+    #   * Pillow — read attached image bytes, opportunistic clipboard
+    #     grab via `ImageGrab.grabclipboard()` on Win/Mac (Linux/WSL
+    #     falls back to the file picker).
+    #   * pyspellchecker — bundled English wordlist, no network at
+    #     runtime; powers the F7 / Spellcheck button's misspelling
+    #     detection in the Compose pane.
+    #   * rich-pixels — renders attached images as Unicode half-blocks
+    #     in any terminal (no kitty/sixel/iTerm graphics protocol
+    #     required), used in the Attachments grid preview.
+    "Pillow>=10.0",
+    "pyspellchecker>=0.8.0",
+    "rich-pixels>=3.0.0",
 ]
 
 [project.optional-dependencies]
