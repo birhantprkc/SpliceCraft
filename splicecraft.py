@@ -57044,7 +57044,22 @@ SpeciesPickerModal { align: center middle; }
                 # so the canvas isn't blank on startup. Falls through silently
                 # if the entry's gb_text is missing or unparsable; the user
                 # can still pick another row from the panel.
-                first = lib[0]
+                #
+                # Natural-sort BEFORE picking lib[0] so this matches what
+                # the LibraryPanel actually shows as row 1 (invariant #33
+                # — display sort and lookup sort must agree). Pre-fix
+                # `lib[0]` was insertion-order, so a user whose first-
+                # inserted plasmid sorted to the BOTTOM of the visible
+                # list (e.g. `X` in a library full of `pBin*` and NCBI-
+                # accession entries) would see the canvas load that
+                # bottom plasmid instead of the visually-first one.
+                sorted_lib = sorted(
+                    lib,
+                    key=lambda e: _natural_sort_key(
+                        e.get("name") or e.get("id") or ""
+                    ),
+                )
+                first = sorted_lib[0]
                 gb_text = first.get("gb_text", "")
                 if gb_text:
                     try:

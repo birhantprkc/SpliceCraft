@@ -10813,6 +10813,53 @@ class TestNoArgLaunchHasNoDemo:
         assert app._skip_seed is True
 
 
+class TestLibraryAutoLoadMatchesPanelSort:
+    """Regression guard for 2026-05-18: the no-arg launch auto-loads
+    the first plasmid in the library, but for the user it should be
+    the FIRST DISPLAYED plasmid (natural-sort by name/id), not the
+    first by insertion order. Pre-fix a library where the first-
+    inserted entry sorted to the bottom (e.g. `X` in a `pBin*`-heavy
+    library) would auto-load the bottom plasmid instead of the
+    visually-first one. Invariant #33 — display and lookup must
+    share one sort key."""
+
+    async def test_auto_load_picks_natural_sort_first(
+            self, isolated_library):
+        """Library with X inserted FIRST and AAA inserted LAST — the
+        on_mount auto-load must pick AAA (natural-sort first), not X
+        (insertion-order first)."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        # Build two records; insertion order puts X first, but
+        # natural-sort puts AAA first.
+        rec_x = SeqRecord(Seq("A" * 1000), id="X", name="X",
+                          annotations={"molecule_type": "DNA",
+                                       "topology": "circular"})
+        rec_aaa = SeqRecord(Seq("T" * 500), id="AAA", name="AAA",
+                            annotations={"molecule_type": "DNA",
+                                         "topology": "circular"})
+        sc._save_library([
+            {"id": "X", "name": "X", "size": 1000, "n_feats": 0,
+             "added": "2026-01-01",
+             "gb_text": sc._record_to_gb_text(rec_x)},
+            {"id": "AAA", "name": "AAA", "size": 500, "n_feats": 0,
+             "added": "2026-01-02",
+             "gb_text": sc._record_to_gb_text(rec_aaa)},
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 48)) as pilot:
+            # Two pauses for call_after_refresh to flush.
+            await pilot.pause()
+            await pilot.pause(0.1)
+            await pilot.pause(0.1)
+            # Canvas should hold AAA (natural-sort first), NOT X.
+            assert app._current_record is not None
+            assert app._current_record.id == "AAA", (
+                f"expected auto-load of natural-sort-first 'AAA', "
+                f"got {app._current_record.id!r}"
+            )
+
+
 class TestAgentFlagAlias:
     """Regression guard for 2026-05-17: `--agent` and `--agent-port`
     are friendly aliases for `--agent-api` / `--agent-api-port`. The
