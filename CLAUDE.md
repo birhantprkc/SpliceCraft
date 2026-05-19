@@ -159,13 +159,23 @@ Hardening sweep (0.9.4):
 
 Future expansion (already designed for): a Plasmidsaurus API key tab in the same screen that downloads run zips directly. Same downstream parse + alignment pipeline; only the ingestion source changes.
 
-## Experiments lab-notebook (0.9.6+)
+## Experiments lab-notebook (0.9.6+, projects refactor 0.9.7+)
 
-Top-level toolbar entry (Menu → Experiments) for cloning runs / protocol notes / observations. Full-screen `ExperimentsScreen` with three sub-tabs:
+Top-level toolbar entry (Menu → Experiments) → opens `ExperimentProjectsPickerModal` first (refactor 2026-05-18 — mirrors the parts-bin flow `PartsBinPickerModal` → `PartsBinModal`). Picking a project sets it active and pushes the full-screen `ExperimentsScreen` for that project's entries. Split-pane layout:
 
-* **Entries** — `DataTable` of all notebook entries, natural-sort by `updated_at` desc. New / Open / Rename / Delete.
-* **Compose** — split horizontal: `TextArea` (markdown source, language="markdown") on the left, Textual `Markdown` widget (live preview) on the right. 250 ms debounced re-render on every body change.
-* **Attachments** — per-entry image grid with filename + size + "inserted in body?" flag. Attach via `ImageAttachModal` (DirectoryTree filtered to image extensions); on Win/Mac the modal also has a "Paste from clipboard" button that uses `Pillow.ImageGrab.grabclipboard()` (disabled on Linux/WSL — no pure-Python clipboard image API there per the 2026-05-18 design call).
+* **Top row** — active project label + `Projects…  [^P]` button that opens `ExperimentProjectsPickerModal` (1:1 mirror of `PartsBinPickerModal` — Open / New / Rename / Duplicate / Delete / Close).
+* **Left pane (entries list)** — always-visible `DataTable` of entries in the active project, two columns: `Updated` + `Title`, natural-sort by `updated_at` desc. Long titles overflow into the table's horizontal scrollbar (no ellipsis truncation). Width: 1fr (~20%) with `min-width: 24` so the pane stays usable on narrow terminals. New / Open / Rename / Delete buttons below.
+* **Right pane** — `TabbedContent[Compose | Attachments]` for the selected entry. Both tabs disabled until an entry is loaded.
+  * **Compose** — full-width `TextArea` (markdown source, language="markdown"). The live Markdown preview was dropped 2026-05-18 because the narrow right pane made the side-by-side source/preview split too cramped — `_render_plasmid_refs` is preserved for future re-add (and for export paths). `@plasmid:<id>` cross-refs are inserted via the `Plasmid ref` button / `^R` (no preview click-through until preview returns).
+  * **Attachments** — per-entry image grid with filename + size + "inserted in body?" flag. Attach via `ImageAttachModal` (DirectoryTree filtered to image extensions); on Win/Mac the modal also has a "Paste from clipboard" button that uses `Pillow.ImageGrab.grabclipboard()` (disabled on Linux/WSL — no pure-Python clipboard image API there per the 2026-05-18 design call).
+
+**Projects layer (2026-05-18 — projects:experiments :: collections:plasmids):** `experiment_projects.json` holds all named projects, each carrying its own `experiments: list[dict]`. Mirrors the parts-bin pattern exactly:
+* `_load_experiment_projects` / `_save_experiment_projects` — cache + `_cache_lock` + deepcopy-on-read+save (invariants #17, #41).
+* `_get_active_project_name` / `_set_active_project_name` — `settings["active_project"]`.
+* `_ensure_default_project` — first-run migration: wraps existing `experiments.json` entries into `_DEFAULT_PROJECT_NAME = "Main Project"`. Called from `PlasmidApp.compose()` (NOT `on_mount`) per invariant #9.
+* `_sync_active_project_experiments` — `_save_experiments` calls this after every save so the multi-project record never drifts from `experiments.json` (sacred contract — analogous to invariant #10).
+
+**Sacred invariant — Experiments mirror:** every entry save MUST go through `_save_experiments`, which calls `_sync_active_project_experiments(entries)` to keep `experiment_projects.json`'s active-project `experiments` field in lockstep with `experiments.json`. Routing a write around `_save_experiments` bypasses the mirror — same threat model as invariant #10 (collections) and the parts-bin equivalent.
 
 Persistence: `experiments.json` envelope-v1 with the full four-layer data-safety net (invariant #31). Per-entry attachments live as files under `<DATA_DIR>/experiments/<entry_id>/`. Schema:
 
@@ -182,7 +192,23 @@ Persistence: `experiments.json` envelope-v1 with the full four-layer data-safety
 }
 ```
 
-**Plasmid cross-refs.** `@plasmid:<id>` tokens inline anywhere in `body_md`. `_render_plasmid_refs` pre-processes them into markdown links with a `splicecraft://plasmid/<id>` href. The Markdown widget posts `LinkClicked` on click; `on_markdown_link_clicked` intercepts the custom scheme, resolves the id across every collection via `_search_collections_library`, auto-saves the dirty compose buffer, dismisses the screen, then routes through the same switch+load helper `action_find_plasmid` uses (`_apply_record`). Non-plasmid links are notified-but-not-followed (pure-TUI rule — no `webbrowser.open` shell-out).
+**Plasmid cross-refs (single-sigil 2026-05-18).** `@<id>` tokens inline anywhere in `body_md` — clean editor display, no noisy prefix. The negative lookbehind `(?<![\w@])` rejects emails (`user@example.com`) and double-`@`; id must start with `[A-Za-z]` so prose like "rev 2 @ 5pm" doesn't tag. `_render_plasmid_refs` rewrites tokens into markdown links with `splicecraft://plasmid/<id>` href for any export / future-preview render path.
+
+**Action cross-refs (single-sigil 2026-05-18).** `!<id>` tokens — distinct sigil from plasmid so the two tag kinds stay visually separable in the editor. `(?<![\w!])` lookbehind blocks word-adjacent and double-`!` matches; the regex requires next char to be a letter so markdown image syntax `![alt](url)` doesn't false-match. `_EXPERIMENT_ACTIONS` is a curated catalog (Design / PCR / Restriction / Assembly / Purification / Biological / Validation buckets, 19 entries) surfaced via `ActionsPickerModal`; free-form ids accepted (catalog is convenience, not enforcement). `_extract_action_refs` denormalises into the entry's `attached_actions` list.
+
+**Gel cross-refs (2026-05-19).** `&<id>` tokens reference saved agarose-gel snapshots in `gels.json` (see Gels section below). Single-sigil format, orange chip (`_GEL_CHIP_COLOR = "#FFB347"`), `(?<![\w&])` lookbehind blocks word-adjacent / double-`&` matches. `_extract_gel_refs` denormalises into `attached_gel_ids`. Pick from saved gels via `Gel ref` button in the Compose pane (opens `GelLibraryModal`).
+
+**Click-to-open / Ctrl+G (2026-05-19).** Cursor-position-aware tag dispatch:
+* `Ctrl+G` (or `action_go_to_tag`) scans the cursor's line for `@<id>` / `!<id>` / `&<id>` tags spanning the cursor column.
+* Double-click in the TextArea posts `_ExperimentMarkdownTextArea.TagOpenRequested` which routes to the same handler.
+* Plasmid hit → auto-save dirty compose → search every collection → switch active + load via `_apply_record`. Dismiss the screen first so the user lands on the loaded plasmid.
+* Gel hit → push `GelLibraryModal(initial_gel_id=<id>)` scrolled to that entry.
+* Action hit → push `ActionsPickerModal(initial_action=<id>)` scrolled to that catalog row.
+* No-tag-under-cursor / unknown id → friendly notify, screen stays put.
+
+**Legacy tag migration.** The pre-2026-05-18 format `@plasmid:<id>` / `@actions:<id>` is rewritten to single-sigil on every `_load_experiments` call via `_migrate_legacy_tag_format`. One-way migration; once a body lands back on disk through `_save_experiments`, the old format is gone. `_render_plasmid_refs` also routes through the migration helper defensively so external callers (export paths) handle both formats.
+
+**In-editor token coloring (2026-05-18, extended 2026-05-19).** `_ExperimentMarkdownTextArea` subclasses Textual's `TextArea` and overrides `_build_highlight_map` to inject regex-based highlights for `@<id>` (lime `_PLASMID_CHIP_COLOR = "#9AFF80"`), `!<id>` (purple `_ACTIONS_CHIP_COLOR = "#C77FFF"`), and `&<id>` (orange `_GEL_CHIP_COLOR = "#FFB347"`). The three highlight names `splicecraft.plasmid_ref` / `splicecraft.action_ref` / `splicecraft.gel_ref` get Rich-style mappings injected (via `setdefault`) into the active theme's `syntax_styles` on every build, so a user-swapped theme retains the coloring. Two byte-offset paths: an **ASCII fast-path** (the common case — byte == char so we skip UTF-8 encoding entirely, O(K) per line with K tags) and a **non-ASCII path** that builds a codepoint→byte position table once per line then O(1) lookups (O(L+K) instead of O(K×L)). The subclass also overrides `action_delete_left` — when the cursor sits at the end of any tag (matched by tail-anchored regex), backspace deletes the entire tag instead of one char. Mid-tag and prose backspaces fall through to default behaviour. `on_click` overrides only intercept double-clicks (event.chain ≥ 2) to post `TagOpenRequested` — single-click cursor placement is untouched.
 
 **Sacred sizing caps** (added 2026-05-18 — never bypass):
 * `_EXPERIMENT_BODY_MAX_BYTES = 1_000_000` per entry. Enforced in `_normalise_experiment_entry` via deterministic truncate (better than save-refusal-with-data-loss).
@@ -191,9 +217,10 @@ Persistence: `experiments.json` envelope-v1 with the full four-layer data-safety
 
 **Filesystem invariants** mirror the .dna sidecar handling (sweep #5):
 * `_sanitize_experiment_id` rejects empty / NUL / `..` / `/` / `\` / `[shell metas]` / >64 chars. All path-joins go through it.
-* `_experiment_attach_dir` refuses both per-entry symlinks AND a `_EXPERIMENTS_DIR` itself that's a symlink (so a planted symlink can't redirect image writes).
-* `_save_experiment_image` writes via `_atomic_write_bytes` (tempfile + fsync + replace + parent fsync). Filename is `img-<ts>-<rand>.<ext>` so concurrent attaches can't collide.
-* `_save_experiments` takes `_cache_lock` for the save+cache-reassign pair (invariant #41 — concurrency).
+* `_experiment_attach_dir` walks the FULL ancestor chain via `is_symlink()` (audit sweep 2026-05-18; was 2-level pre-refactor). A symlink at any depth — `_EXPERIMENTS_DIR` itself, `_DATA_DIR`, or any ancestor up to root — refuses the path. No `resolve()` divergence check (would trip on macOS `/tmp` → `/private/tmp`).
+* `_save_experiment_image` writes via `_atomic_write_bytes` (tempfile + fsync + replace + parent fsync). Filename is `img-<ts>-<rand>.<ext>` so concurrent attaches can't collide. Clipboard-paste tmp files (prefix `_EXPERIMENT_CLIP_TMP_PREFIX = "exp-clip-"`) are unlinked after the bytes are copied — pre-fix the OS tmpdir slowly accumulated orphan PNGs.
+* `_save_experiments` takes `_cache_lock` for the save+cache-reassign pair (invariant #41 — concurrency), then calls `_sync_active_project_experiments` (Experiments mirror invariant).
+* `_persist_current` detects body-over-cap BEFORE save and notifies the user (audit sweep 2026-05-18; was silent truncate). Save path also dedup-by-id replaces ALL matches, not just the first — defensive against hand-edited JSON.
 
 **Spellcheck** — pyspellchecker-backed (pure-Python English wordlist, no network). F7 or "Spellcheck" button → `_spellcheck_body(body_md)` masks non-prose markdown regions (fenced + inline code, image links, markdown links, raw URLs, `@plasmid:` xrefs) and tokenises with `_SPELLCHECK_WORD_RE` (alphabetic + apostrophe + hyphen, ≥ 2 chars). `SpellcheckModal` lists misspellings + suggestions; per-row Replace / Add-to-dict / Skip. Custom dictionary persists via the `experiments_custom_dict` settings key; `_clear_spellcheck_engine` invalidates the cached engine after add-to-dict.
 
@@ -201,7 +228,38 @@ Persistence: `experiments.json` envelope-v1 with the full four-layer data-safety
 
 **Modal `_blocks_undo=True`** on `ExperimentsScreen` + `SpellcheckModal` so app-level Ctrl+Z can't unwind plasmid edits while the user is composing notes. App-level `on_key` early-return for `screen_stack > 1` (invariant #15) already prevents cursor / RE-highlight interactions firing underneath.
 
-**Logging events:** `experiments.new`, `experiments.save`, `experiments.delete`, `experiments.attach.image`, `experiments.remove.image`, `experiments.insert.plasmid_ref`, `experiments.spellcheck.applied`. Per invariant #42 — `_log_event` payload sanitises body content (200-char truncation) so notebook prose never leaks beyond the visible UI.
+**Unsaved-changes guard (2026-05-18).** `ExperimentsScreen.action_cancel` no longer silent-saves on Esc/Close when the compose buffer is dirty. Instead, `ExperimentUnsavedChangesModal` is pushed with three buttons (Save changes · Abandon and exit · Close); default focus on Close, Esc dismisses with `"cancel"`. The screen's callback stays on top if Save fails (`_persist_current` returns False after `_notify_save_failure`) so the user can retry without losing their buffer. Both delete paths (entry + project) use `ExperimentDeleteConfirmModal` with default focus on No (sacred — a stray Enter cannot delete data). `ExperimentProjectsPickerModal._do_delete` defensively re-checks the last-project guard inside the confirm callback so a concurrent shrink can't push the project list to empty.
+
+**Logging events:** `experiments.new`, `experiments.save`, `experiments.delete`, `experiments.attach.image`, `experiments.remove.image`, `experiments.insert.plasmid_ref`, `experiments.insert.action_ref`, `experiments.insert.gel_ref`, `experiments.spellcheck.applied`, `experiments.tag.migrated`, `project.switched`, `project.created`, `project.renamed`, `project.duplicated`, `project.deleted`, `gel.created`, `gel.renamed`, `gel.deleted`, `gel.loaded`, `gel.ref.opened`, `plasmid.ref.opened`, `action.ref.opened`. Per invariant #42 — `_log_event` payload sanitises body content (200-char truncation) so notebook prose never leaks beyond the visible UI.
+
+**Persistent toggles touched by the projects refactor (0.9.7):** `active_project` (mirrors `active_collection` / `active_parts_bin`). `experiments_custom_dict` (spellcheck add-to-dict words) is unchanged.
+
+## Gels (saved agarose-gel snapshots, 2026-05-19+)
+
+`gels.json` (`_GELS_FILE`) holds saved Simulator gel configurations — the user can name + save the current lane layout + agarose % from `SimulatorScreen.Gel` pane, then load it back later or reference it as `&<id>` in an Experiments entry.
+
+Schema (envelope v1):
+
+```
+{
+  "id":          "gel-<8 hex>",     # filesystem-safe id
+  "name":        str,               # <= 200 chars
+  "lanes":       list[dict],        # [{name, source, detail}, ...] cap 20
+  "agarose_pct": float,             # clamped 0.3–5.0; NaN/inf rejected
+  "notes":       str,               # <= 2000 chars
+  "created_at":  ISO-8601 w/ tz,
+  "updated_at":  ISO-8601 w/ tz,
+}
+```
+
+Helpers mirror experiments / projects: `_load_gels` / `_save_gels` with `_cache_lock` + deepcopy-on-read+save (invariant #17), `_safe_save_json` for the atomic write (invariant #31). `_sanitize_gel_id` rejects empty / NUL / `..` / `/` / `\` / >64 chars. `_normalise_gel_entry` caps every string field, drops non-dict lanes, clamps agarose to a sane envelope, and replaces invalid ids with a fresh `gel-<hex>`. `_find_gel(id)` returns None for unsanitisable ids (defensive against `&../etc` tag tokens). `_gel_name_taken(name)` is the dup-name guard (strip-compare, case-sensitive).
+
+`GelLibraryModal` is the dual-context picker:
+* From **`SimulatorScreen.Gel`** (Library button → opens with `current_lanes` + `current_agarose_pct`) — Save current is enabled; on dismiss-with-id, the simulator restores those lanes + agarose and re-renders.
+* From **`ExperimentsScreen`** (Gel ref button → opens with no current snapshot) — Save current is disabled; dismiss-with-id inserts `&<id>` into the body.
+* From the **click-to-open** path (`Ctrl+G` / double-click) — opens with `initial_gel_id` scrolled to that row.
+
+`SimulatorScreen` has no persistent state of its own — the live `self._lanes` + `self._agarose_pct` are in-memory, only written to disk through `_save_gels` when the user explicitly saves a snapshot. Delete-last-gel is allowed (unlike the active-project guard) because there's no "active gel" concept.
 
 ## Architecture pointers
 

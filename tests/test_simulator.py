@@ -241,6 +241,45 @@ class TestAgaroseMobility:
         m_snap  = sc._agarose_mobility(bp, 0.95)
         assert m_exact == pytest.approx(m_snap)
 
+    def test_below_window_still_orders_by_size(self):
+        """Refactor 2026-05-19 — pre-fix the boundary hard-clamped
+        to 0.97 so two below-window fragments stacked on the same
+        row regardless of size. The soft-asymptote now keeps them
+        ordered (smaller faster) while still piling near the dye
+        front."""
+        # 1% gel: window is 500..10000 bp. 50/100/200 are all below.
+        m_50  = sc._agarose_mobility(50,  1.0)
+        m_100 = sc._agarose_mobility(100, 1.0)
+        m_200 = sc._agarose_mobility(200, 1.0)
+        # All near the dye front
+        assert all(m > 0.9 for m in (m_50, m_100, m_200))
+        # Strict monotone — smaller bp runs further
+        assert m_50 > m_100 > m_200
+
+    def test_above_window_still_orders_by_size(self):
+        """Two above-window fragments must not collapse to the same
+        row either — larger sticks closer to the well."""
+        # 1% gel: 20000, 50000, 100000 all above window
+        m_20k  = sc._agarose_mobility(20_000,  1.0)
+        m_50k  = sc._agarose_mobility(50_000,  1.0)
+        m_100k = sc._agarose_mobility(100_000, 1.0)
+        assert all(m < 0.1 for m in (m_20k, m_50k, m_100k))
+        # Strict monotone — larger bp stays closer to the well
+        assert m_20k > m_50k > m_100k
+
+    def test_in_window_bounds_unchanged(self):
+        """Sanity: the in-window branch is unchanged by the
+        extrapolation refactor. A 1 kb band on a 1% gel still
+        returns the same Helling-Goodman-Boyer linear result it
+        always did."""
+        import math
+        m = sc._agarose_mobility(1000, 1.0)
+        # raw = (log10(10000) - log10(1000)) / (log10(10000) - log10(500))
+        log_lo = math.log10(500)
+        log_hi = math.log10(10000)
+        expected = (log_hi - math.log10(1000)) / (log_hi - log_lo)
+        assert m == pytest.approx(expected, abs=1e-6)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # _gel_bands_for_lane — source → bands resolution
@@ -436,6 +475,86 @@ class TestRenderGelImage:
         )
         # Taller gel has more lines
         assert str(rt_tall).count("\n") > str(rt_short).count("\n")
+
+    def test_sub_row_faint_band_appears(self):
+        """Refactor 2026-05-19 — bands whose fractional row offset
+        exceeds 0.25 render a LIGHT glyph (`─`) on the adjacent row
+        so the eye reads them as "between rows". Lets two bands
+        separated by less than a full row of mobility still resolve
+        visually instead of collapsing on rounding.
+
+        Construction: pick a band whose mobility lands at a row
+        boundary mid-cell. A 1 kb ladder on a 1% gel at height=22
+        always produces at least one sub-row offset because the
+        log10-spacing of ladder rungs doesn't align perfectly with
+        whole rows."""
+        lanes = [{"name": "L", "source": "ladder", "detail": "1 kb"}]
+        rt = sc._render_gel_image(
+            lanes, template_seq="", template_circular=False,
+            pcr_amplicon=None, agarose_pct=1.0, height=22,
+        )
+        text = str(rt)
+        # The faint glyph `─` (U+2500) must appear at least once in
+        # the body rows — most ladder bands will produce a faint
+        # tail on a 22-row render.
+        assert "─" in text, (
+            "expected at least one faint `─` glyph from a sub-row "
+            f"band tail; got:\n{text}"
+        )
+
+    def test_band_glyph_is_thin_line(self):
+        """User UX call 2026-05-19 — bands use the heavy horizontal
+        line glyph `━` (U+2501) rather than a full block. Solid
+        blocks read as a wall; thin lines read as proper gel bands.
+        Wells stay as `█` so the visual distinction between well
+        (where the DNA was loaded) and band (where it migrated to)
+        remains clear."""
+        lanes = [{"name": "L", "source": "ladder", "detail": "1 kb"}]
+        rt = sc._render_gel_image(
+            lanes, template_seq="", template_circular=False,
+            pcr_amplicon=None, agarose_pct=1.0,
+        )
+        text = str(rt)
+        # Single-band cells use `━`; wells use `█`.
+        assert "━" in text
+        assert "█" in text
+
+    def test_bands_align_to_well_columns(self):
+        """Each band must occupy the exact same column-range as its
+        lane's well row. Pre-fix (alignment bug 2026-05-19) the body
+        rows with a ladder bp label drifted one column left of
+        unlabelled rows because `f"{label} "` was 6 chars while
+        `label_col` was 7 — the labelled row's bands didn't align
+        with the wells. The `ljust(label_col)` fix made every row's
+        lane columns identical regardless of whether the row has a
+        ladder bp tick."""
+        lanes = [{"name": "L", "source": "ladder", "detail": "1 kb"}]
+        rt = sc._render_gel_image(
+            lanes, template_seq="", template_circular=False,
+            pcr_amplicon=None, agarose_pct=1.0,
+            height=20, lane_width=7, label_col=7,
+        )
+        lines = str(rt).splitlines()
+        # Wells row uses `█`. Find it (must start with whitespace
+        # then `█`, i.e. the lane-only well row, not a labelled
+        # band row).
+        well_row = next(
+            ln for ln in lines
+            if "█" in ln and ln.lstrip().startswith("█")
+        )
+        well_start = well_row.index("█")
+        # Body band rows use `━` (single band) or `▆` / `█` (multi-
+        # band) — find ones that contain `━`.
+        body_rows = [ln for ln in lines if "━" in ln]
+        assert body_rows, (
+            "expected at least one body band row with `━` from the "
+            "ladder lane"
+        )
+        for br in body_rows:
+            assert br.index("━") == well_start, (
+                f"band column {br.index('━')} != well column "
+                f"{well_start}: row={br!r}"
+            )
 
     def test_pcr_lane_with_no_amplicon_shows_hint(self):
         """Regression guard for 2026-05-17 audit fix: when a lane uses

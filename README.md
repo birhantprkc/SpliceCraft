@@ -58,13 +58,24 @@ installs and the user-data directory location.
   linear map right next to the rail, and the target's library entry
   auto-tags to linear view for future opens.
 - **Log experiments** from the Experiments toolbar — full-screen
-  lab-notebook workbench with a `TextArea` markdown editor + live
-  `Markdown` preview split-pane, persistent `experiments.json` entries
-  (CRUD: New / Rename / Delete), `@plasmid:<id>` cross-references that
-  click-through to load the referenced library plasmid, per-entry
-  image attachments (file picker on Linux/WSL · Pillow clipboard grab
-  on Win/Mac), and F7 spellcheck via `pyspellchecker` with a
-  user-maintained custom dictionary.
+  lab-notebook workbench with a split-pane layout: entries list on
+  the left (Updated · Title with horizontal scroll for long titles)
+  + full-width markdown `TextArea` editor on the right. Group
+  entries into named **projects** (Ctrl+P → Projects… picker:
+  Open / New / Rename / Duplicate / Delete) — projects are to
+  experiments what plasmid collections are to plasmids. In-editor
+  colored cross-references — `@<plasmid>` (lime), `!<action>`
+  (purple), `&<gel>` (orange) — backspace deletes the whole tag,
+  and **Ctrl+G or double-click on a tag opens its source modal
+  focused on that entry**. Persistent
+  `experiments.json` + `experiment_projects.json` + `gels.json`,
+  per-entry image attachments (file picker on Linux/WSL · Pillow
+  clipboard grab on Win/Mac), and F7 spellcheck via
+  `pyspellchecker` with a user-maintained custom dictionary.
+- **Save Simulator gels** from the `Simulator → Gel → Library`
+  button — name + save the current lane layout + agarose %, load
+  it back later, or reference it as `&<id>` in an Experiments
+  entry.
 - **Search** your library with in-process BLASTN / BLASTP / HMMscan
   (via `pyhmmer` — no external `blast+` install).
 - **Drive from outside** via a 60+ endpoint localhost JSON API

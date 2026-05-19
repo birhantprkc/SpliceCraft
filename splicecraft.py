@@ -18487,6 +18487,8 @@ _USER_DATA_FILE_ATTRS: tuple = (
     "_CODON_TABLES_FILE",     # codon_tables.json — codon usage tables
     "_SETTINGS_FILE",         # settings.json — persisted user toggles
     "_EXPERIMENTS_FILE",      # experiments.json — lab-notebook entries
+    "_EXPERIMENT_PROJECTS_FILE",  # experiment_projects.json — all projects
+    "_GELS_FILE",             # gels.json — saved agarose-gel snapshots
 )
 
 # User-data sub-directories — autosaved unsaved-edits + .dna sidecars.
@@ -37149,12 +37151,78 @@ _EXPERIMENT_TITLE_MAX_LEN = 200
 _EXPERIMENT_TAG_MAX_LEN   = 60
 _EXPERIMENT_TAGS_MAX      = 20
 
-# Plasmid cross-reference token: `@plasmid:<id>` inline anywhere in
-# the body. Pre-processed before Markdown render into a styled link
-# with a `splicecraft://plasmid/<id>` href that the screen's
-# `LinkClicked` handler intercepts to load the referenced plasmid.
-_PLASMID_REF_RE = re.compile(r"@plasmid:([A-Za-z0-9][\w.\-]{0,63})")
+# Prefix for clipboard-paste tmp files written by `ImageAttachModal._clip`.
+# The attach-callback `_attach_image_from_path` recognises this prefix
+# and unlinks the source tmp file after the bytes are copied into the
+# per-entry attach dir, otherwise the OS tmpdir would slowly accumulate
+# orphan PNGs on every clipboard paste (audit sweep 2026-05-18).
+_EXPERIMENT_CLIP_TMP_PREFIX = "exp-clip-"
+
+# Plasmid cross-reference token: `@<id>` inline anywhere in the body.
+# Single-sigil format (refactor 2026-05-18) so the editor displays
+# just the tag id without the noisy `@plasmid:` prefix. The negative
+# lookbehind rejects matches where `@` is preceded by a word char
+# (avoids email-like patterns: `user@example.com` doesn't tag
+# `example.com`). The first id char must be a letter so numeric
+# prose like "rev 2 @ 5pm" doesn't trigger.
+_PLASMID_REF_RE = re.compile(r"(?<![\w@])@([A-Za-z][\w.\-]{0,63})")
 _PLASMID_LINK_SCHEME = "splicecraft://plasmid/"
+
+# Action cross-reference token: `!<id>` inline anywhere in the body.
+# Same single-sigil rationale as `@<id>`. `!` doesn't conflict with
+# markdown image syntax `![alt](url)` because our regex requires the
+# next char to be a letter, while images require `[`.
+_ACTIONS_REF_RE = re.compile(r"(?<![\w!])!([A-Za-z][\w.\-]{0,63})")
+
+# Gel cross-reference token: `&<id>` inline anywhere in the body
+# (2026-05-19). Distinct sigil from plasmid + action so the three
+# object kinds stay visually separable in the editor. `&` doesn't
+# conflict with markdown — entities like `&amp;` always have a
+# trailing `;`, and the id pattern would only swallow the `amp`
+# leaving the `;` as prose; cosmetic at worst.
+_GEL_REF_RE = re.compile(r"(?<![\w&])&([A-Za-z][\w.\-]{0,63})")
+
+# Tail-anchored variants used by `_ExperimentMarkdownTextArea` to
+# detect "cursor sits at the end of a tag" for the whole-tag-delete
+# backspace behaviour.
+_PLASMID_REF_TAIL_RE = re.compile(r"(?<![\w@])@[A-Za-z][\w.\-]{0,63}$")
+_ACTIONS_REF_TAIL_RE = re.compile(r"(?<![\w!])![A-Za-z][\w.\-]{0,63}$")
+_GEL_REF_TAIL_RE     = re.compile(r"(?<![\w&])&[A-Za-z][\w.\-]{0,63}$")
+
+# Visual token-chip colors (rendered on the chip strip below the
+# TextArea — Textual's `TextArea` doesn't support regex-based syntax
+# highlights without a tree-sitter grammar, so the chips are the
+# practical visual cue rather than in-editor coloring).
+_PLASMID_CHIP_COLOR = "#9AFF80"   # lime
+_ACTIONS_CHIP_COLOR = "#C77FFF"   # purple
+_GEL_CHIP_COLOR     = "#FFB347"   # orange
+
+# Curated catalog of common molecular-cloning actions. Each entry:
+# (category, action_id, description). The id is what gets inserted
+# as `@actions:<id>` into the body; the description is shown in the
+# picker only. Free-form action ids are accepted in the body too —
+# the catalog is for convenience, not enforcement.
+_EXPERIMENT_ACTIONS: tuple = (
+    ("Design",       "design",         "Design primers / vector / insert"),
+    ("PCR",          "pcr",            "Standard PCR amplification"),
+    ("PCR",          "soe-pcr",        "Splicing by overlap extension"),
+    ("PCR",          "colony-pcr",     "Colony screen by PCR"),
+    ("Modification", "mutagenesis",    "Site-directed mutagenesis"),
+    ("Restriction",  "digest",         "Restriction digestion"),
+    ("Restriction",  "ligate",         "Ligation"),
+    ("Restriction",  "dephosphorylate", "Dephosphorylation (rSAP/CIP)"),
+    ("Assembly",     "gibson",         "Gibson / NEBuilder assembly"),
+    ("Assembly",     "golden-gate",    "Golden Gate assembly"),
+    ("Assembly",     "moclo",          "MoClo assembly"),
+    ("Assembly",     "in-fusion",      "In-Fusion assembly"),
+    ("Purification", "miniprep",       "Plasmid miniprep"),
+    ("Purification", "gel-extract",    "Gel extraction"),
+    ("Purification", "pcr-cleanup",    "PCR cleanup"),
+    ("Biological",   "transform",      "Bacterial transformation"),
+    ("Biological",   "colony-pick",    "Colony picking"),
+    ("Validation",   "gel-check",      "Analytical gel electrophoresis"),
+    ("Validation",   "sanger-seq",     "Sanger sequencing"),
+)
 
 # Filesystem-id constraint. Entry ids are mechanically generated as
 # `exp-<8 hex>` (see `_new_experiment_id`), but accept the wider
@@ -37199,20 +37267,41 @@ def _experiment_attach_dir(entry_id: str, *, create: bool = False
                               ) -> "Path | None":
     """Return `_EXPERIMENTS_DIR/<entry_id>` after id-sanitisation.
 
-    Returns `None` if `entry_id` fails sanitisation, if `_EXPERIMENTS_DIR`
-    itself is a symlink, or if the target dir is a symlink. Mirrors the
-    symlink refusal in `_safe_save_json` so a planted symlink can't
-    redirect image writes into arbitrary filesystem locations.
+    Returns `None` if `entry_id` fails sanitisation, if any segment of
+    the path from `_EXPERIMENTS_DIR` up through its ancestors is a
+    symlink, or if the per-entry target dir is a symlink. Walking the
+    full ancestor chain (audit sweep 2026-05-18; was two-level) closes
+    a theoretical redirect through a planted grandparent symlink —
+    same spirit as `_check_agent_write_path`'s per-segment walk, but
+    uses `is_symlink()` only (no `resolve()` divergence check) so a
+    system-level symlink like macOS `/tmp` → `/private/tmp` doesn't
+    trip the refusal in tests.
 
     With `create=True`, ensures the directory exists (`mkdir parents`).
     """
     safe = _sanitize_experiment_id(entry_id)
     if safe is None:
         return None
-    if _EXPERIMENTS_DIR.is_symlink():
-        _log.warning("Refusing: _EXPERIMENTS_DIR is a symlink: %s",
-                     _EXPERIMENTS_DIR)
-        return None
+    cur = _EXPERIMENTS_DIR
+    seen: set = set()
+    while True:
+        try:
+            if cur.is_symlink():
+                _log.warning(
+                    "Refusing: ancestor of _EXPERIMENTS_DIR is a "
+                    "symlink: %s", cur,
+                )
+                return None
+        except OSError as exc:
+            _log.warning(
+                "Could not stat ancestor %s of _EXPERIMENTS_DIR: %s",
+                cur, exc,
+            )
+            return None
+        if cur.parent == cur or str(cur) in seen:
+            break
+        seen.add(str(cur))
+        cur = cur.parent
     target = _EXPERIMENTS_DIR / safe
     if target.is_symlink():
         _log.warning("Refusing experiment attach dir at symlink: %s",
@@ -37249,19 +37338,52 @@ def _experiment_dir_size_bytes(entry_id: str) -> int:
     return total
 
 
+def _migrate_legacy_tag_format(body: str) -> str:
+    """Rewrite legacy `@plasmid:<id>` / `@actions:<id>` tokens to the
+    single-sigil format `@<id>` / `!<id>` (refactor 2026-05-18 — the
+    editor now shows the bare tag id without a noisy prefix). One-way
+    migration applied on load; once the migrated body lands back on
+    disk through `_save_experiments`, the old format is gone."""
+    if not body:
+        return body
+    if "@plasmid:" in body:
+        body = body.replace("@plasmid:", "@")
+    if "@actions:" in body:
+        body = body.replace("@actions:", "!")
+    return body
+
+
 def _load_experiments() -> "list[dict]":
     """Load the experiments-notebook entries. Cached + deepcopy-on-read
     per sacred invariant #17 so a caller mutating returned dicts can't
     poison the cache for the next reader. Filters non-dict entries
-    defensively (hand-edited JSON / schema drift)."""
+    defensively (hand-edited JSON / schema drift). Applies the
+    legacy-tag-format migration to every entry's body so the editor
+    only ever sees the new single-sigil tokens."""
     global _experiments_cache
     if _experiments_cache is not None:
         return _typed_clone(_experiments_cache)
     entries, warning = _safe_load_json(_EXPERIMENTS_FILE, "Experiments")
     if warning:
         _log.warning(warning)
-    entries = [e for e in entries if isinstance(e, dict)]
-    _experiments_cache = entries
+    cleaned: "list[dict]" = []
+    n_migrated = 0
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        body = e.get("body_md")
+        if isinstance(body, str):
+            migrated = _migrate_legacy_tag_format(body)
+            if migrated != body:
+                e["body_md"] = migrated
+                n_migrated += 1
+        cleaned.append(e)
+    if n_migrated:
+        _log_event(
+            "experiments.tag.migrated",
+            n_entries=n_migrated, n_loaded=len(cleaned),
+        )
+    _experiments_cache = cleaned
     return _typed_clone(_experiments_cache)
 
 
@@ -37269,11 +37391,172 @@ def _save_experiments(entries: "list[dict]") -> None:
     """Persist the experiments-notebook entries through the full four-
     layer data-safety net (invariant #31). Deep-clones into the cache
     on save (invariant #17), under `_cache_lock` so concurrent saves
-    don't desync disk/cache ordering (invariant #41 — concurrency)."""
+    don't desync disk/cache ordering (invariant #41 — concurrency).
+
+    After the primary save, mirrors the entries into the active
+    experiment project's `experiments` list — sacred contract: every
+    writeable experiments path goes through this helper. Silent no-op
+    if there's no active project (first-launch race; the migration in
+    `App.compose()` establishes one before any UI write).
+    """
     global _experiments_cache
     with _cache_lock:
         _safe_save_json(_EXPERIMENTS_FILE, entries, "Experiments")
         _experiments_cache = _typed_clone(entries)
+    _sync_active_project_experiments(entries)
+
+
+# ── Experiment projects (multi-project lab-notebook organisation) ────────────
+#
+# `experiment_projects.json` holds all named projects (groupings of
+# experiment entries). Mirrors the parts-bin architecture: each save
+# through `_save_experiments` mirrors into the active project's
+# `experiments` list, so the multi-project record never drifts from
+# `experiments.json`. See invariant #10 (the plasmid-side equivalent)
+# for the rationale.
+#
+# Schema (entry):
+#   {"name": str, "description": str,
+#    "experiments": list[dict], "saved": "YYYY-MM-DD"}
+#
+# `name` is the user-visible identifier (unique per the modal's dup-
+# name guard). Active-project pointer lives in `settings.json` under
+# `active_project` so it persists across launches.
+
+_EXPERIMENT_PROJECTS_FILE = _DATA_DIR / "experiment_projects.json"
+_experiment_projects_cache: "list | None" = None
+_DEFAULT_PROJECT_NAME = "Main Project"
+
+
+def _load_experiment_projects() -> "list[dict]":
+    """Return a deepcopy of the experiment-projects list so callers can
+    mutate entries (rename, edit experiments list) without poisoning
+    the in-memory cache. Mirrors the `_load_parts_bin_collections`
+    contract per invariant #17.
+    """
+    global _experiment_projects_cache
+    if _experiment_projects_cache is None:
+        entries, warning = _safe_load_json(
+            _EXPERIMENT_PROJECTS_FILE, "Experiment projects",
+        )
+        if warning:
+            _log.warning(warning)
+        _experiment_projects_cache = [
+            e for e in entries if isinstance(e, dict)
+        ]
+    return _typed_clone(_experiment_projects_cache)
+
+
+def _save_experiment_projects(entries: "list[dict]") -> None:
+    """Persist the full experiment-projects list through the four-layer
+    data-safety net (invariant #31). Deepcopies into the cache so
+    caller mutations after save can't poison subsequent loaders
+    (invariant #17), under `_cache_lock` (invariant #41 — concurrency).
+    """
+    global _experiment_projects_cache
+    with _cache_lock:
+        _safe_save_json(
+            _EXPERIMENT_PROJECTS_FILE, entries, "Experiment projects",
+        )
+        _experiment_projects_cache = _typed_clone(entries)
+
+
+def _get_active_project_name() -> "str | None":
+    val = _get_setting("active_project", None)
+    return val if isinstance(val, str) and val else None
+
+
+def _set_active_project_name(name: "str | None") -> None:
+    """Persist (or clear) the active-project pointer. Emits a
+    `project.switched` event on actual change so debug bundles
+    capture the switch context (mirrors `collection.switched`)."""
+    prev = _get_active_project_name()
+    target = name or ""
+    if prev != target:
+        _log_event("project.switched", prev=prev or "", new=target)
+    _set_setting("active_project", target)
+
+
+def _find_project(name: str) -> "dict | None":
+    for p in _load_experiment_projects():
+        if p.get("name") == name:
+            return p
+    return None
+
+
+def _project_name_taken(name: str) -> bool:
+    """Dup-name guard for create / rename. Pure check, no side effects."""
+    return _find_project(name) is not None
+
+
+def _ensure_default_project() -> None:
+    """Idempotent: guarantee at least one experiment project exists
+    AND that the active-project pointer names a real project.
+
+    First-run users have a (possibly empty) `experiments.json` but no
+    `experiment_projects.json` — migrate by wrapping their existing
+    entries in "Main Project" and marking it active. Empty entries on
+    first run still produces an empty Main Project so the screen
+    always has something to show.
+
+    Like `_ensure_default_collection` / `_ensure_default_parts_bin`,
+    this MUST run in `PlasmidApp.compose()` (NOT `on_mount`) —
+    Textual mounts leaves→root, so a child reading the active project
+    during mount sees stale state if the migration hasn't run.
+
+    Edge sweep 2026-05-18: also repairs an *orphaned* active pointer
+    — if `settings.json::active_project` names a project that no
+    longer exists (renamed/deleted by hand, or never existed), the
+    mirror in `_sync_active_project_experiments` would silently skip
+    on every save. Reset to the first existing project so the mirror
+    re-engages.
+    """
+    projs = _load_experiment_projects()
+    if projs:
+        active = _get_active_project_name()
+        names = {p.get("name") for p in projs if p.get("name")}
+        if not active or active not in names:
+            first = projs[0].get("name")
+            if first:
+                _set_active_project_name(first)
+        return
+    existing = _load_experiments()
+    _save_experiment_projects([{
+        "name":        _DEFAULT_PROJECT_NAME,
+        "description": "Default project",
+        "experiments": existing,
+        "saved":       _date.today().isoformat(),
+    }])
+    _set_active_project_name(_DEFAULT_PROJECT_NAME)
+
+
+def _sync_active_project_experiments(entries: "list[dict]") -> None:
+    """Mirror the live `experiments.json` contents into the active
+    project's `experiments` list inside `experiment_projects.json`.
+    Silent no-op if no active project (first-launch race) or if the
+    active name has been deleted by the user via the modal.
+
+    Synchronous: projects carry Markdown text (no plasmid feature
+    dicts), so the async coalescing pattern that
+    `_sync_active_collection_plasmids` uses for 100+ MB libraries
+    isn't worth the thread overhead. Revisit if a user surfaces a
+    project with thousands of long-body entries.
+    """
+    name = _get_active_project_name()
+    if not name:
+        return
+    snapshot = [_typed_clone(e) for e in entries if isinstance(e, dict)]
+    projs = _load_experiment_projects()
+    for p in projs:
+        if p.get("name") == name:
+            p["experiments"] = snapshot
+            try:
+                _save_experiment_projects(projs)
+            except (OSError, RuntimeError) as exc:
+                _bg_notify_save_failure(
+                    f"Active-project mirror ({name})", exc,
+                )
+            return
 
 
 def _delete_experiment_attach_dir(entry_id: str) -> None:
@@ -37359,10 +37642,10 @@ def _save_experiment_image(entry_id: str, data: bytes,
 
 
 def _extract_plasmid_refs(body_md: str) -> "list[str]":
-    """Return the unique plasmid ids referenced via `@plasmid:<id>` in
-    `body_md`, preserving first-appearance order. Used to maintain the
-    denormalised `attached_plasmid_ids` xref on save."""
-    if not body_md:
+    """Return the unique plasmid ids referenced via `@<id>` in
+    `body_md`, preserving first-appearance order. Used to maintain
+    the denormalised `attached_plasmid_ids` xref on save."""
+    if not body_md or "@" not in body_md:
         return []
     seen: "list[str]" = []
     seen_set: "set[str]" = set()
@@ -37374,18 +37657,216 @@ def _extract_plasmid_refs(body_md: str) -> "list[str]":
     return seen
 
 
+def _extract_action_refs(body_md: str) -> "list[str]":
+    """Return the unique action ids referenced via `!<id>` in
+    `body_md`, preserving first-appearance order. Mirrors
+    `_extract_plasmid_refs` — used to maintain the denormalised
+    `attached_actions` xref on save (2026-05-18)."""
+    if not body_md or "!" not in body_md:
+        return []
+    seen: "list[str]" = []
+    seen_set: "set[str]" = set()
+    for m in _ACTIONS_REF_RE.finditer(body_md):
+        ref = m.group(1)
+        if ref and ref not in seen_set:
+            seen.append(ref)
+            seen_set.add(ref)
+    return seen
+
+
+def _extract_gel_refs(body_md: str) -> "list[str]":
+    """Return the unique gel ids referenced via `&<id>` in
+    `body_md`, preserving first-appearance order. Mirrors
+    `_extract_plasmid_refs` — used to maintain the denormalised
+    `attached_gel_ids` xref on save (2026-05-19)."""
+    if not body_md or "&" not in body_md:
+        return []
+    seen: "list[str]" = []
+    seen_set: "set[str]" = set()
+    for m in _GEL_REF_RE.finditer(body_md):
+        ref = m.group(1)
+        if ref and ref not in seen_set:
+            seen.append(ref)
+            seen_set.add(ref)
+    return seen
+
+
 def _render_plasmid_refs(body_md: str) -> str:
     """Pre-process `body_md` for Markdown rendering: replace
-    `@plasmid:<id>` tokens with markdown links carrying a custom
+    `@<id>` plasmid tokens with markdown links carrying a custom
     `splicecraft://plasmid/<id>` href. The `ExperimentsScreen`
     `LinkClicked` handler intercepts that scheme to load the referenced
-    plasmid; unknown schemes fall through to Textual's default."""
-    if not body_md or "@plasmid:" not in body_md:
+    plasmid; unknown schemes fall through to Textual's default.
+
+    Accepts the legacy `@plasmid:<id>` format defensively by routing
+    through `_migrate_legacy_tag_format` first — callers reading from
+    disk normally hit the migration in `_load_experiments`, but
+    export paths and external callers may pass bodies that never
+    went through that loader."""
+    if not body_md or "@" not in body_md:
         return body_md
+    body_md = _migrate_legacy_tag_format(body_md)
     return _PLASMID_REF_RE.sub(
         lambda m: f"[`@{m.group(1)}`]({_PLASMID_LINK_SCHEME}{m.group(1)})",
         body_md,
     )
+
+
+# ── Gels persistence (saved agarose-gel snapshots) ────────────────────────────
+#
+# `gels.json` holds saved gel configurations from `SimulatorScreen` —
+# the user can name + save the current lane layout + agarose % so they
+# can return to it later, share it as an `&<id>` tag in their
+# Experiments notebook, etc. Mirrors the parts-bin / projects pattern
+# (single-file list of named records, RLock + deepcopy on load and
+# save per invariant #17, full four-layer data-safety net per
+# invariant #31 via `_safe_save_json`).
+#
+# Schema (entry, v1):
+#   {
+#     "id":          "gel-<8 hex>",
+#     "name":        str,           # user-visible (cap 200)
+#     "lanes":       list[dict],    # [{name, source, detail}, ...]
+#     "agarose_pct": float,         # clamped 0.3 – 5.0
+#     "notes":       str,           # free-form (cap 2000)
+#     "created_at":  ISO-8601 w/ tz,
+#     "updated_at":  ISO-8601 w/ tz,
+#   }
+
+_GELS_FILE = _DATA_DIR / "gels.json"
+_gels_cache: "list | None" = None
+
+_GEL_NAME_MAX_LEN = 200
+_GEL_NOTES_MAX_LEN = 2000
+_GEL_LANE_NAME_MAX_LEN = 60
+_GEL_LANE_DETAIL_MAX_LEN = 200
+_GEL_LANE_SOURCE_MAX_LEN = 64
+_GEL_LANES_MAX = 20            # mirrors SimulatorScreen._MAX_LANES
+_GEL_AGAROSE_MIN = 0.3
+_GEL_AGAROSE_MAX = 5.0
+_GEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{0,63}$")
+
+
+def _sanitize_gel_id(raw: object) -> "str | None":
+    """Mirror `_sanitize_experiment_id` — a gel id is filesystem-safe
+    (it shows up in tag tokens + JSON path keys + log events).
+    Rejects empty / NUL / `..` / `/` / `\\` / >64 chars."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    if "\x00" in raw or ".." in raw or "/" in raw or "\\" in raw:
+        return None
+    if not _GEL_ID_RE.match(raw):
+        return None
+    return raw
+
+
+def _new_gel_id(existing: "set[str] | None" = None) -> str:
+    seen = existing or set()
+    for _ in range(64):
+        gid = f"gel-{_uuid.uuid4().hex[:8]}"
+        if gid not in seen:
+            return gid
+    return f"gel-{_uuid.uuid4().hex}"
+
+
+def _load_gels() -> "list[dict]":
+    """Cached + deepcopy-on-read load (invariant #17). Filters non-
+    dict entries defensively (hand-edited JSON / schema drift)."""
+    global _gels_cache
+    if _gels_cache is not None:
+        return _typed_clone(_gels_cache)
+    entries, warning = _safe_load_json(_GELS_FILE, "Gels")
+    if warning:
+        _log.warning(warning)
+    _gels_cache = [e for e in entries if isinstance(e, dict)]
+    return _typed_clone(_gels_cache)
+
+
+def _save_gels(entries: "list[dict]") -> None:
+    """Persist through `_safe_save_json` (atomic + four-layer data-
+    safety). Takes `_cache_lock` so concurrent saves can't desync
+    cache vs disk (invariant #41)."""
+    global _gels_cache
+    with _cache_lock:
+        _safe_save_json(_GELS_FILE, entries, "Gels")
+        _gels_cache = _typed_clone(entries)
+
+
+def _find_gel(gel_id: str) -> "dict | None":
+    safe = _sanitize_gel_id(gel_id)
+    if safe is None:
+        return None
+    for g in _load_gels():
+        if g.get("id") == safe:
+            return g
+    return None
+
+
+def _gel_name_taken(name: str) -> bool:
+    """Dup-name guard. Trims + case-sensitive compare so 'Friday
+    digest' and 'Friday digest ' coexist gracefully but two identical
+    names won't (matches the user's intuition that names are visible
+    identifiers)."""
+    if not isinstance(name, str):
+        return False
+    needle = name.strip()
+    if not needle:
+        return False
+    for g in _load_gels():
+        if (g.get("name") or "").strip() == needle:
+            return True
+    return False
+
+
+def _normalise_gel_entry(entry: dict, *, fresh: bool = False) -> dict:
+    """Normalise: cap name + notes + lanes + lane-fields, stamp
+    timestamps, sanitise id, clamp agarose % to a sane range
+    (0.3 – 5.0 %). Mirrors `_normalise_experiment_entry`."""
+    out = dict(entry) if isinstance(entry, dict) else {}
+    gid = _sanitize_gel_id(out.get("id"))
+    if gid is None:
+        gid = _new_gel_id()
+    out["id"] = gid
+    raw_name = out.get("name")
+    name = raw_name if isinstance(raw_name, str) else ""
+    name = name.strip() or "Untitled gel"
+    out["name"] = name[:_GEL_NAME_MAX_LEN]
+    raw_notes = out.get("notes")
+    notes = raw_notes if isinstance(raw_notes, str) else ""
+    out["notes"] = notes[:_GEL_NOTES_MAX_LEN]
+    try:
+        agar = float(out.get("agarose_pct", 1.0))
+    except (TypeError, ValueError):
+        agar = 1.0
+    # NaN / inf rejection — `float("nan") < anything` is False so
+    # `max/min` would let them pass through.
+    if agar != agar or agar in (float("inf"), float("-inf")):
+        agar = 1.0
+    out["agarose_pct"] = max(_GEL_AGAROSE_MIN, min(_GEL_AGAROSE_MAX, agar))
+    raw_lanes = out.get("lanes") or []
+    if not isinstance(raw_lanes, list):
+        raw_lanes = []
+    lanes: "list[dict]" = []
+    for ln in raw_lanes[:_GEL_LANES_MAX]:
+        if not isinstance(ln, dict):
+            continue
+        raw_nm = ln.get("name")
+        raw_src = ln.get("source")
+        raw_det = ln.get("detail")
+        nm  = raw_nm  if isinstance(raw_nm,  str) else ""
+        src = raw_src if isinstance(raw_src, str) else "empty"
+        det = raw_det if isinstance(raw_det, str) else ""
+        lanes.append({
+            "name":   nm[:_GEL_LANE_NAME_MAX_LEN],
+            "source": src[:_GEL_LANE_SOURCE_MAX_LEN],
+            "detail": det[:_GEL_LANE_DETAIL_MAX_LEN],
+        })
+    out["lanes"] = lanes
+    now = _now_iso()
+    if fresh or not isinstance(out.get("created_at"), str):
+        out["created_at"] = now
+    out["updated_at"] = now
+    return out
 
 
 # ── Spellcheck primitives (pyspellchecker-backed) ────────────────────────────
@@ -37406,10 +37887,23 @@ _SPELLCHECK_WORD_RE = re.compile(r"\b[A-Za-z][A-Za-z'\-]{1,}\b")
 _SPELLCHECK_SKIP_PATTERNS = (
     re.compile(r"```[\s\S]*?```"),      # fenced code blocks
     re.compile(r"`[^`]+`"),               # inline code
-    re.compile(r"!\[[^\]]*\]\([^)]+\)"),  # image links
+    re.compile(r"!\[[^\]]*\]\([^)]+\)"),  # image links — must come
+                                          # before the `!<id>` action
+                                          # pattern so `![alt](url)`
+                                          # isn't mis-tagged.
     re.compile(r"\[[^\]]+\]\([^)]+\)"),   # markdown links
     re.compile(r"https?://\S+"),          # raw URLs
-    re.compile(r"@plasmid:\S+"),          # plasmid cross-refs
+    re.compile(r"@plasmid:\S+"),          # legacy plasmid cross-refs
+    re.compile(r"@actions:\S+"),          # legacy action cross-refs
+    re.compile(                            # new single-sigil plasmid
+        r"(?<![\w@])@[A-Za-z][\w.\-]{0,63}"
+    ),
+    re.compile(                            # new single-sigil action
+        r"(?<![\w!])![A-Za-z][\w.\-]{0,63}"
+    ),
+    re.compile(                            # new single-sigil gel
+        r"(?<![\w&])&[A-Za-z][\w.\-]{0,63}"
+    ),
 )
 
 _SPELLCHECK_ENGINE: "_Any | None" = None
@@ -37550,6 +38044,8 @@ def _normalise_experiment_entry(entry: dict, *, fresh: bool = False
                 break
     out["tags"] = tags
     out["attached_plasmid_ids"] = _extract_plasmid_refs(body)
+    out["attached_actions"] = _extract_action_refs(body)
+    out["attached_gel_ids"] = _extract_gel_refs(body)
     image_paths = out.get("image_paths") or []
     if not isinstance(image_paths, list):
         image_paths = []
@@ -38641,6 +39137,426 @@ def _esc_md(s: str) -> str:
 # gracefully if they're not installed.
 
 
+class ExperimentProjectsPickerModal(ModalScreen):
+    """Browse, create, rename, delete, and duplicate experiment projects.
+
+    Mirrors `PartsBinPickerModal` for the projects side of the multi-
+    project architecture. Each entry in the table is a named project
+    from `experiment_projects.json`; selecting one sets it active and
+    dismisses with the project name so the caller can refresh the
+    `ExperimentsScreen` entries list against the freshly-active
+    project's experiments.
+
+    Refuses to delete the last remaining project — empty experiments
+    state is fine, but a project-less state would orphan the
+    `_save_experiments` mirror and the migration would re-create
+    "Main Project" on next launch anyway. The cleaner UX is to nudge
+    the user to create another first.
+
+    Dismiss payload:
+      ``None``  — cancelled (Esc / Close / no selection on Open)
+      ``str``   — name of the project to open; caller refreshes the
+                  entries table after switching the active pointer.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Close"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="projpick-dlg"):
+            yield Static(
+                "  Experiment projects  ", id="projpick-title",
+            )
+            yield Label(
+                "Pick a project to open its lab-notebook entries. "
+                "[b]★[/b] marks the currently-active project.",
+                id="projpick-help", markup=True,
+            )
+            yield DataTable(id="projpick-table", cursor_type="row",
+                            zebra_stripes=True)
+            yield Static("", id="projpick-status", markup=True)
+            with Horizontal(id="projpick-btns"):
+                yield Button("Open", id="btn-projpick-open",
+                             variant="primary")
+                yield Button("New", id="btn-projpick-new")
+                yield Button("Rename", id="btn-projpick-rename")
+                yield Button("Duplicate", id="btn-projpick-dup")
+                yield Button("Delete", id="btn-projpick-del",
+                             variant="error")
+                yield Button("Close", id="btn-projpick-close")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#projpick-table", DataTable)
+        t.add_columns("", "Project", "Entries", "Last activity")
+        self._repopulate()
+        t.focus()
+
+    def _repopulate(self) -> None:
+        """Rebuild the project table from disk and cursor onto the
+        active project (so the user's most-recent context is
+        highlighted by default). Natural-sort by name so `Proj2`
+        lands before `Proj10`. The first column is an active-project
+        marker (★) so the user can see at a glance which project is
+        currently loaded.
+        """
+        t = self.query_one("#projpick-table", DataTable)
+        t.clear()
+        projs = sorted(
+            _load_experiment_projects(),
+            key=lambda p: _natural_sort_key(p.get("name") or ""),
+        )
+        active = _get_active_project_name()
+        cursor = 0
+        for i, p in enumerate(projs):
+            name = p.get("name") or "?"
+            n_entries = len(p.get("experiments", []) or [])
+            # Pick the freshest entry's updated_at — more useful than
+            # the project's `saved` field, which only updates on
+            # rename/duplicate/manual saves of the project list.
+            last_activity = ""
+            for e in (p.get("experiments") or []):
+                if not isinstance(e, dict):
+                    continue
+                up = e.get("updated_at") or ""
+                if up and up > last_activity:
+                    last_activity = up
+            last_activity = last_activity[:10] if last_activity else "—"
+            is_active = (active and name == active)
+            marker = "[b yellow]★[/b yellow]" if is_active else " "
+            t.add_row(
+                Text.from_markup(marker),
+                Text(name, no_wrap=True),
+                str(n_entries),
+                last_activity,
+                key=name,
+            )
+            if is_active:
+                cursor = i
+        if projs:
+            t.move_cursor(row=cursor)
+
+    def _selected_project_name(self) -> "str | None":
+        return _cursor_row_key(
+            self.query_one("#projpick-table", DataTable),
+        )
+
+    def _set_status(self, msg: str) -> None:
+        try:
+            self.query_one("#projpick-status", Static).update(msg)
+        except NoMatches:
+            pass
+
+    # ── Open ──────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-projpick-open")
+    def _open(self, _) -> None:
+        name = self._selected_project_name()
+        if not name:
+            self._set_status("[red]No project selected.[/red]")
+            return
+        if _find_project(name) is None:
+            self._set_status(f"[red]Project '{name}' not found.[/red]")
+            self._repopulate()
+            return
+        _set_active_project_name(name)
+        # Refresh `experiments.json` mirror to match the newly-active
+        # project so the next `_load_experiments()` returns the right
+        # entries. Bypass `_save_experiments` here because that would
+        # re-mirror back into the project we just switched to (the
+        # project IS the source of truth in this direction).
+        target = _find_project(name)
+        raw_entries = (target or {}).get("experiments", [])
+        if not isinstance(raw_entries, list):
+            raw_entries = []
+        target_entries = [e for e in raw_entries if isinstance(e, dict)]
+        try:
+            _safe_save_json(
+                _EXPERIMENTS_FILE, target_entries, "Experiments",
+            )
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(self.app, "Experiments", exc)
+            return
+        # Invalidate the experiments in-memory cache so the next
+        # reader sees the new project's entries (file just changed
+        # underneath).
+        globals()["_experiments_cache"] = None
+        self.dismiss(name)
+
+    @on(DataTable.RowSelected, "#projpick-table")
+    def _row_selected(self, event) -> None:
+        # Enter on a row = Open. Mirrors PartsBinPickerModal /
+        # PlasmidPickerModal so the picker behaves consistently
+        # across the app.
+        self._open(None)
+
+    # ── New ───────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-projpick-new")
+    def _new(self, _) -> None:
+        def _on_named(name):
+            if not name:
+                return
+            if _project_name_taken(name):
+                self._set_status(
+                    f"[red]A project named '{name}' already exists.[/red]"
+                )
+                return
+            projs = _load_experiment_projects()
+            projs.append({
+                "name":        name,
+                "description": "New project",
+                "experiments": [],
+                "saved":       _date.today().isoformat(),
+            })
+            try:
+                _save_experiment_projects(projs)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(
+                    self.app, "Experiment projects", exc,
+                )
+                return
+            _log_event("project.created", name=name)
+            self._set_status(f"[green]Created project '{name}'.[/green]")
+            self._repopulate()
+        self.app.push_screen(
+            CollectionNameModal(
+                title="New project",
+                placeholder="Project name",
+            ),
+            callback=_on_named,
+        )
+
+    # ── Rename ────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-projpick-rename")
+    def _rename(self, _) -> None:
+        old = self._selected_project_name()
+        if not old:
+            self._set_status("[red]No project selected.[/red]")
+            return
+
+        def _on_named(new_name):
+            if not new_name or new_name == old:
+                return
+            if _project_name_taken(new_name):
+                self._set_status(
+                    f"[red]A project named '{new_name}' already "
+                    f"exists.[/red]"
+                )
+                return
+            projs = _load_experiment_projects()
+            for p in projs:
+                if p.get("name") == old:
+                    p["name"] = new_name
+                    break
+            else:
+                self._set_status(
+                    f"[red]Project '{old}' has vanished — refresh.[/red]"
+                )
+                self._repopulate()
+                return
+            try:
+                _save_experiment_projects(projs)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(
+                    self.app, "Experiment projects", exc,
+                )
+                return
+            # Carry the active-project pointer if we just renamed it.
+            if _get_active_project_name() == old:
+                _set_active_project_name(new_name)
+            _log_event("project.renamed", old=old, new=new_name)
+            self._set_status(
+                f"[green]Renamed '{old}' → '{new_name}'.[/green]"
+            )
+            self._repopulate()
+        self.app.push_screen(
+            CollectionNameModal(
+                title=f"Rename project '{old}'",
+                current=old,
+                placeholder="New name",
+            ),
+            callback=_on_named,
+        )
+
+    # ── Duplicate ─────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-projpick-dup")
+    def _duplicate(self, _) -> None:
+        source = self._selected_project_name()
+        if not source:
+            self._set_status("[red]No project selected.[/red]")
+            return
+
+        def _on_named(new_name):
+            if not new_name or new_name == source:
+                return
+            if _project_name_taken(new_name):
+                self._set_status(
+                    f"[red]A project named '{new_name}' already "
+                    f"exists.[/red]"
+                )
+                return
+            src = _find_project(source)
+            if src is None:
+                self._set_status(
+                    f"[red]Source project '{source}' has vanished.[/red]"
+                )
+                self._repopulate()
+                return
+            projs = _load_experiment_projects()
+            projs.append({
+                "name":        new_name,
+                "description": f"Duplicated from '{source}'",
+                # Deep-copy via _typed_clone so subsequent edits to
+                # either project don't touch the other.
+                "experiments": _typed_clone(
+                    src.get("experiments", []) or []
+                ),
+                "saved":       _date.today().isoformat(),
+            })
+            try:
+                _save_experiment_projects(projs)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(
+                    self.app, "Experiment projects", exc,
+                )
+                return
+            _log_event(
+                "project.duplicated", source=source, new=new_name,
+                n_entries=len(src.get("experiments") or []),
+            )
+            self._set_status(
+                f"[green]Duplicated '{source}' → '{new_name}'.[/green]"
+            )
+            self._repopulate()
+        self.app.push_screen(
+            CollectionNameModal(
+                title=f"Duplicate project '{source}'",
+                current=f"{source} copy",
+                placeholder="New project name",
+            ),
+            callback=_on_named,
+        )
+
+    # ── Delete ────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-projpick-del")
+    def _delete(self, _) -> None:
+        """Open a warning modal before destroying a project + all its
+        entries. Default focus is on No (a stray Enter cannot delete).
+        Reuses `ExperimentDeleteConfirmModal` — same UX as entry
+        deletion so the user gets consistent behaviour across both
+        delete paths (2026-05-18)."""
+        name = self._selected_project_name()
+        if not name:
+            self._set_status("[red]No project selected.[/red]")
+            return
+        projs = _load_experiment_projects()
+        if len(projs) <= 1:
+            self._set_status(
+                "[red]Can't delete the last remaining project — "
+                "create another first.[/red]"
+            )
+            return
+        proj = _find_project(name)
+        n_entries = len(
+            (proj or {}).get("experiments") or []
+        )
+        body = (
+            f"Delete project [b]{name}[/b] and "
+            f"[b]{n_entries}[/b] entrie"
+            f"{'s' if n_entries != 1 else ''} it contains?\n\n"
+            "[dim]This cannot be undone. The on-disk JSON gets a "
+            "timestamped `.bak` rotation, but image attachments "
+            "for the deleted entries stay on disk until manually "
+            "removed.[/dim]"
+        )
+
+        def _on_confirm(yes) -> None:
+            if not yes:
+                return
+            self._do_delete(name)
+        self.app.push_screen(
+            ExperimentDeleteConfirmModal(
+                title="Delete project?", body=body,
+            ),
+            callback=_on_confirm,
+        )
+
+    def _do_delete(self, name: str) -> None:
+        """Actual project deletion + active-pointer promotion.
+        Factored out of `_delete` so the confirm modal can call it
+        on Yes. Re-checks the last-project guard (defence against a
+        concurrent delete shrinking the list between the modal open
+        and the user's confirm — single-user app + lock file makes
+        this rare but still worth catching)."""
+        projs = _load_experiment_projects()
+        if len(projs) <= 1:
+            self._set_status(
+                "[red]Project list shrank during confirm — "
+                "can't delete the last remaining project.[/red]"
+            )
+            self._repopulate()
+            return
+        if _find_project(name) is None:
+            self._set_status(
+                f"[red]Project '{name}' has vanished — refresh.[/red]"
+            )
+            self._repopulate()
+            return
+        remaining = [p for p in projs if p.get("name") != name]
+        try:
+            _save_experiment_projects(remaining)
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(
+                self.app, "Experiment projects", exc,
+            )
+            return
+        # If the user deleted the active project, promote the first
+        # remaining one to active so subsequent `_save_experiments`
+        # mirror writes land somewhere valid.
+        was_active = _get_active_project_name() == name
+        if was_active and remaining:
+            promoted = remaining[0].get("name")
+            if promoted:
+                _set_active_project_name(promoted)
+                promoted_proj = _find_project(promoted)
+                promoted_entries = (
+                    (promoted_proj or {}).get("experiments") or []
+                )
+                promoted_entries = [
+                    e for e in promoted_entries if isinstance(e, dict)
+                ]
+                try:
+                    _safe_save_json(
+                        _EXPERIMENTS_FILE, promoted_entries,
+                        "Experiments",
+                    )
+                    globals()["_experiments_cache"] = None
+                except (OSError, RuntimeError) as exc:
+                    _notify_save_failure(
+                        self.app, "Experiments", exc,
+                    )
+        _log_event(
+            "project.deleted", name=name,
+            was_active=bool(was_active),
+        )
+        self._set_status(f"[dim]Deleted project '{name}'.[/dim]")
+        self._repopulate()
+
+    # ── Cancel / Close ────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-projpick-close")
+    def _close(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class ExperimentDeleteConfirmModal(ModalScreen):
     """Yes / No confirmation for entry deletion. Defaults focus on No
     so a stray Enter can't delete an entry. Esc → No."""
@@ -38695,6 +39611,80 @@ class ExperimentDeleteConfirmModal(ModalScreen):
 
     def action_cancel(self) -> None:
         self.dismiss(False)
+
+
+class ExperimentUnsavedChangesModal(ModalScreen):
+    """Three-way prompt shown when the user tries to leave the
+    `ExperimentsScreen` with a dirty compose buffer.
+
+    Dismiss payload:
+      ``"save"``    — save then exit
+      ``"abandon"`` — exit without saving
+      ``"cancel"``  — stay on screen (default; Esc + initial focus)
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    #expunsaved-dlg {
+        width: 64; height: auto;
+        background: $surface; border: solid $warning;
+        padding: 1 2; layout: vertical;
+    }
+    #expunsaved-title {
+        background: $warning; color: $text;
+        padding: 0 1; height: 1; text-style: bold;
+    }
+    #expunsaved-msg { height: auto; margin-top: 1; color: $text; }
+    #expunsaved-btns { height: 3; margin-top: 1; align: center middle; }
+    #expunsaved-btns Button { margin: 0 1; min-width: 18; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="expunsaved-dlg"):
+            yield Static(" Unsaved changes ", id="expunsaved-title")
+            yield Static(
+                "The current entry has [b]unsaved changes[/b]. "
+                "What would you like to do?",
+                id="expunsaved-msg", markup=True,
+            )
+            with Horizontal(id="expunsaved-btns"):
+                yield Button("Close", id="btn-expunsaved-cancel",
+                             variant="default")
+                yield Button("Save changes",
+                             id="btn-expunsaved-save",
+                             variant="primary")
+                yield Button("Abandon and exit",
+                             id="btn-expunsaved-abandon",
+                             variant="error")
+
+    def on_mount(self) -> None:
+        # Default focus on Cancel/Close so a stray Enter can't
+        # discard work or auto-save unintended changes.
+        try:
+            self.query_one(
+                "#btn-expunsaved-cancel", Button,
+            ).focus()
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-expunsaved-cancel")
+    def _cancel_btn(self, _ev) -> None:
+        self.dismiss("cancel")
+
+    @on(Button.Pressed, "#btn-expunsaved-save")
+    def _save_btn(self, _ev) -> None:
+        self.dismiss("save")
+
+    @on(Button.Pressed, "#btn-expunsaved-abandon")
+    def _abandon_btn(self, _ev) -> None:
+        self.dismiss("abandon")
+
+    def action_cancel(self) -> None:
+        self.dismiss("cancel")
 
 
 class ExperimentRenameModal(ModalScreen):
@@ -38787,6 +39777,426 @@ class _ImagePickerTree(DirectoryTree):
             except OSError:
                 continue
         return out
+
+
+class GelLibraryModal(ModalScreen):
+    """Browse, save, rename, load, and delete agarose-gel snapshots.
+
+    Two-context modal — caller decides what the dismiss payload
+    means:
+      * `SimulatorScreen` opens it with `current_lanes` +
+        `current_agarose_pct` so the user can save the current gel.
+        On dismiss-with-id the caller restores those values into
+        the live simulator.
+      * `ExperimentsScreen` opens it WITHOUT a current snapshot
+        (Save button stays disabled). On dismiss-with-id the
+        caller inserts `&<id>` into the body.
+
+    Dismiss payload:
+      ``None``  — cancelled (Esc / Close / no selection)
+      ``str``   — gel id the user picked.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Close"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    def __init__(
+        self,
+        *,
+        current_lanes: "list[dict] | None" = None,
+        current_agarose_pct: "float | None" = None,
+        initial_gel_id: "str | None" = None,
+    ) -> None:
+        super().__init__()
+        # Defensive deepcopy of lanes — `SimulatorScreen._lanes` may
+        # carry widget-id `_suffix` fields the user doesn't want
+        # mirrored to disk. We strip them on save (`_take_snapshot`)
+        # rather than mutating the caller's list.
+        self._current_lanes = current_lanes
+        self._current_agarose_pct = current_agarose_pct
+        self._initial_gel_id = initial_gel_id
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="gellib-dlg"):
+            yield Static("  Gel library  ", id="gellib-title")
+            yield Label(
+                "Saved gel snapshots — load one back into the "
+                "Simulator, or pick one to insert as an "
+                "[b]&<id>[/b] tag in an experiment.",
+                id="gellib-help", markup=True,
+            )
+            yield DataTable(id="gellib-table", cursor_type="row",
+                            zebra_stripes=True)
+            yield Static("", id="gellib-status", markup=True)
+            with Horizontal(id="gellib-btns"):
+                yield Button("Load", id="btn-gellib-load",
+                             variant="primary")
+                yield Button("Save current",
+                             id="btn-gellib-save",
+                             disabled=(self._current_lanes is None))
+                yield Button("Rename", id="btn-gellib-rename")
+                yield Button("Delete", id="btn-gellib-del",
+                             variant="error")
+                yield Button("Close", id="btn-gellib-close")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#gellib-table", DataTable)
+        t.add_columns("Name", "Lanes", "Agarose %", "Last updated")
+        self._repopulate()
+        t.focus()
+
+    # ── Table population ──────────────────────────────────────────────
+
+    def _repopulate(self) -> None:
+        """Rebuild the gel table. Natural-sort by name so `Gel 2`
+        lands before `Gel 10`. Cursor onto `initial_gel_id` if
+        provided (used by the click-to-open path) so the user lands
+        directly on the gel they came from."""
+        t = self.query_one("#gellib-table", DataTable)
+        t.clear()
+        gels = sorted(
+            _load_gels(),
+            key=lambda g: _natural_sort_key(g.get("name") or ""),
+        )
+        cursor_row = 0
+        for i, g in enumerate(gels):
+            gid = g.get("id") or ""
+            name = g.get("name") or "?"
+            n_lanes = len(g.get("lanes") or [])
+            agar = g.get("agarose_pct")
+            if isinstance(agar, (int, float)) and not (
+                agar != agar or agar in (float("inf"), float("-inf"))
+            ):
+                agar_str = f"{float(agar):.1f}"
+            else:
+                agar_str = "—"
+            updated = (g.get("updated_at") or "")[:10] or "—"
+            t.add_row(
+                Text(name, no_wrap=True),
+                str(n_lanes),
+                agar_str,
+                updated,
+                key=gid,
+            )
+            if self._initial_gel_id and gid == self._initial_gel_id:
+                cursor_row = i
+        if gels:
+            t.move_cursor(row=cursor_row)
+
+    def _selected_gel_id(self) -> "str | None":
+        return _cursor_row_key(
+            self.query_one("#gellib-table", DataTable),
+        )
+
+    def _set_status(self, msg: str) -> None:
+        try:
+            self.query_one("#gellib-status", Static).update(msg)
+        except NoMatches:
+            pass
+
+    def _take_snapshot(self) -> "dict | None":
+        """Build a normalised entry from the caller's current state.
+        Returns None if no current state was passed (the
+        ExperimentsScreen tag-picker case)."""
+        if self._current_lanes is None:
+            return None
+        clean_lanes: "list[dict]" = []
+        for ln in self._current_lanes:
+            if not isinstance(ln, dict):
+                continue
+            # Strip widget-id `_suffix` and any other private fields
+            # so the on-disk snapshot is clean.
+            clean_lanes.append({
+                "name":   ln.get("name") or "",
+                "source": ln.get("source") or "empty",
+                "detail": ln.get("detail") or "",
+            })
+        return {
+            "lanes": clean_lanes,
+            "agarose_pct": (
+                self._current_agarose_pct
+                if self._current_agarose_pct is not None
+                else 1.0
+            ),
+            "notes": "",
+        }
+
+    # ── Load ──────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-gellib-load")
+    def _load(self, _) -> None:
+        gid = self._selected_gel_id()
+        if not gid:
+            self._set_status("[red]No gel selected.[/red]")
+            return
+        if _find_gel(gid) is None:
+            self._set_status(f"[red]Gel '{gid}' has vanished.[/red]")
+            self._repopulate()
+            return
+        self.dismiss(gid)
+
+    @on(DataTable.RowSelected, "#gellib-table")
+    def _row_selected(self, event) -> None:
+        # Enter on a row → Load. Same convention as the other
+        # pickers (parts-bin, experiment projects).
+        self._load(None)
+
+    # ── Save current ──────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-gellib-save")
+    def _save(self, _) -> None:
+        snap = self._take_snapshot()
+        if snap is None:
+            self._set_status(
+                "[red]No current gel to save — open this modal "
+                "from the Simulator to save.[/red]"
+            )
+            return
+        if not snap.get("lanes"):
+            self._set_status(
+                "[red]Current gel has no lanes — add at least one "
+                "lane in the Simulator before saving.[/red]"
+            )
+            return
+
+        def _on_named(name) -> None:
+            if not name:
+                return
+            if _gel_name_taken(name):
+                self._set_status(
+                    f"[red]A gel named '{name}' already exists.[/red]"
+                )
+                return
+            entry = dict(snap)
+            entry["name"] = name
+            entry = _normalise_gel_entry(entry, fresh=True)
+            gels = _load_gels()
+            gels.append(entry)
+            try:
+                _save_gels(gels)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Gels", exc)
+                return
+            _log_event(
+                "gel.created", gid=entry["id"], name=name,
+                n_lanes=len(entry["lanes"]),
+            )
+            self._set_status(
+                f"[green]Saved gel '{name}' "
+                f"({len(entry['lanes'])} lane"
+                f"{'s' if len(entry['lanes']) != 1 else ''}).[/green]"
+            )
+            self._repopulate()
+        self.app.push_screen(
+            CollectionNameModal(
+                title="Save gel",
+                placeholder="Gel name",
+            ),
+            callback=_on_named,
+        )
+
+    # ── Rename ────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-gellib-rename")
+    def _rename(self, _) -> None:
+        gid = self._selected_gel_id()
+        if not gid:
+            self._set_status("[red]No gel selected.[/red]")
+            return
+        target = _find_gel(gid)
+        if target is None:
+            self._set_status(f"[red]Gel '{gid}' has vanished.[/red]")
+            self._repopulate()
+            return
+        old_name = target.get("name") or ""
+
+        def _on_named(new_name) -> None:
+            if not new_name or new_name == old_name:
+                return
+            if _gel_name_taken(new_name):
+                self._set_status(
+                    f"[red]A gel named '{new_name}' already "
+                    f"exists.[/red]"
+                )
+                return
+            gels = _load_gels()
+            for g in gels:
+                if g.get("id") == gid:
+                    g["name"] = new_name[:_GEL_NAME_MAX_LEN]
+                    g["updated_at"] = _now_iso()
+                    break
+            else:
+                self._set_status(
+                    f"[red]Gel '{old_name}' has vanished "
+                    f"— refresh.[/red]"
+                )
+                self._repopulate()
+                return
+            try:
+                _save_gels(gels)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Gels", exc)
+                return
+            _log_event(
+                "gel.renamed", gid=gid,
+                old=old_name, new=new_name,
+            )
+            self._set_status(
+                f"[green]Renamed '{old_name}' → '{new_name}'.[/green]"
+            )
+            self._repopulate()
+        self.app.push_screen(
+            CollectionNameModal(
+                title=f"Rename gel '{old_name}'",
+                current=old_name,
+                placeholder="New name",
+            ),
+            callback=_on_named,
+        )
+
+    # ── Delete ────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-gellib-del")
+    def _delete(self, _) -> None:
+        """Confirm-then-delete via `ExperimentDeleteConfirmModal`
+        (default focus on No). Unlike projects, deleting the last
+        gel is allowed — there's no "active gel" concept that an
+        empty list would orphan."""
+        gid = self._selected_gel_id()
+        if not gid:
+            self._set_status("[red]No gel selected.[/red]")
+            return
+        target = _find_gel(gid)
+        if target is None:
+            self._set_status(f"[red]Gel '{gid}' has vanished.[/red]")
+            self._repopulate()
+            return
+        name = target.get("name") or gid
+        body = (
+            f"Delete gel [b]{name}[/b]?\n\n"
+            "[dim]This cannot be undone. The on-disk JSON gets a "
+            "timestamped `.bak` rotation, but the snapshot itself "
+            "is gone.[/dim]"
+        )
+
+        def _on_confirm(yes) -> None:
+            if not yes:
+                return
+            self._do_delete(gid, name)
+        self.app.push_screen(
+            ExperimentDeleteConfirmModal(
+                title="Delete gel?", body=body,
+            ),
+            callback=_on_confirm,
+        )
+
+    def _do_delete(self, gid: str, name: str) -> None:
+        gels = _load_gels()
+        if _find_gel(gid) is None:
+            # Vanished between confirm-open and confirm-yes.
+            self._set_status(
+                f"[red]Gel '{name}' has vanished — refresh.[/red]"
+            )
+            self._repopulate()
+            return
+        remaining = [g for g in gels if g.get("id") != gid]
+        try:
+            _save_gels(remaining)
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(self.app, "Gels", exc)
+            return
+        _log_event("gel.deleted", gid=gid, name=name)
+        self._set_status(f"[dim]Deleted gel '{name}'.[/dim]")
+        self._repopulate()
+
+    # ── Cancel / Close ────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-gellib-close")
+    def _close(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ActionsPickerModal(ModalScreen):
+    """Pick a common cloning / PCR / assembly action to insert as
+    `!<id>` into the experiment body.
+
+    The catalog (`_EXPERIMENT_ACTIONS`) is curated for typical
+    molecular-cloning workflows but is not enforced — users can also
+    type free-form `!my-custom` directly into the body.
+
+    `initial_action` (optional) — used by the click-through path:
+    when the user opens a `!<id>` tag, the picker scrolls to that
+    row so the relevant action is highlighted on open.
+
+    Dismiss payload:
+      ``None``  — cancelled (Esc / Cancel)
+      ``str``   — action id to insert into the body.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, initial_action: "str | None" = None) -> None:
+        super().__init__()
+        self._initial_action = initial_action
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="actpick-dlg"):
+            yield Static(
+                "  Insert action tag  ", id="actpick-title",
+            )
+            yield Label(
+                "Pick an action to insert as [b]!<id>[/b] into "
+                "the body.",
+                id="actpick-help", markup=True,
+            )
+            yield DataTable(id="actpick-table", cursor_type="row",
+                            zebra_stripes=True)
+            with Horizontal(id="actpick-btns"):
+                yield Button("Insert", id="btn-actpick-ok",
+                             variant="primary")
+                yield Button("Cancel", id="btn-actpick-cancel")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#actpick-table", DataTable)
+        t.add_columns("Category", "Action", "Description")
+        cursor_row = 0
+        for i, (category, action, desc) in enumerate(
+            _EXPERIMENT_ACTIONS,
+        ):
+            t.add_row(category, action, desc, key=action)
+            if self._initial_action and action == self._initial_action:
+                cursor_row = i
+        if t.row_count:
+            t.move_cursor(row=cursor_row)
+        t.focus()
+
+    @on(Button.Pressed, "#btn-actpick-ok")
+    def _ok(self, _) -> None:
+        action = _cursor_row_key(
+            self.query_one("#actpick-table", DataTable),
+        )
+        if not action:
+            return
+        self.dismiss(action)
+
+    @on(DataTable.RowSelected, "#actpick-table")
+    def _row_selected(self, event) -> None:
+        self._ok(None)
+
+    @on(Button.Pressed, "#btn-actpick-cancel")
+    def _cancel(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class ImageAttachModal(ModalScreen):
@@ -38942,7 +40352,9 @@ class ImageAttachModal(ModalScreen):
         # directory the modal can read back via the dismiss str path.
         import tempfile
         try:
-            fd, tmp = tempfile.mkstemp(suffix=".png", prefix="exp-clip-")
+            fd, tmp = tempfile.mkstemp(
+                suffix=".png", prefix=_EXPERIMENT_CLIP_TMP_PREFIX,
+            )
             os.close(fd)
             img.save(tmp, "PNG")
             self.dismiss(tmp)
@@ -39157,16 +40569,196 @@ class SpellcheckModal(ModalScreen):
             pass
 
 
+# ── Experiment body TextArea (regex-highlighted cross-refs) ──────────────────
+#
+# Textual's `TextArea` does syntax highlighting through tree-sitter
+# grammars; for SpliceCraft's two cross-ref tokens that's overkill, so
+# we subclass and hook `_build_highlight_map` to inject regex-based
+# highlights for `@plasmid:<id>` (lime) and `@actions:<id>` (purple).
+#
+# Mechanics:
+#   1. `_build_highlight_map` is called by Textual after every edit
+#      and after `language=` is set. We call super() to let the
+#      markdown tree-sitter grammar populate its highlights first,
+#      then append our own `(byte_start, byte_end, name)` tuples to
+#      `self._highlights[line_index]`.
+#   2. Highlight column indices in `self._highlights` are *byte*
+#      offsets (Textual encodes the line as UTF-8 in `render_line`,
+#      then maps byte→codepoint via `build_byte_to_codepoint_dict`).
+#      `re.finditer` returns codepoint offsets, so we convert via
+#      `len(line[:idx].encode("utf-8"))`. Pure-ASCII bodies skip the
+#      conversion cost; the encoding only runs when a non-ASCII char
+#      precedes a token.
+#   3. The Rich styles for our highlight names are injected into the
+#      live theme's `syntax_styles` on every build (idempotent via
+#      `setdefault`). Re-injection on every build handles user theme
+#      swaps gracefully.
+
+class _ExperimentMarkdownTextArea(TextArea):
+    """Markdown TextArea with regex-based in-editor highlighting for
+    SpliceCraft's `@<id>` (plasmid), `!<id>` (action), and `&<id>`
+    (gel) cross-ref tokens. Double-click on a tag posts a
+    `TagOpenRequested` message that the parent screen wires to the
+    relevant object-modal."""
+
+    _PLASMID_HL_NAME = "splicecraft.plasmid_ref"
+    _ACTIONS_HL_NAME = "splicecraft.action_ref"
+    _GEL_HL_NAME     = "splicecraft.gel_ref"
+
+    class TagOpenRequested(Message):
+        """Posted on double-click anywhere in the body. The parent
+        screen reads the cursor position to determine which tag (if
+        any) is under the cursor and opens the matching modal."""
+
+    def _ensure_splice_styles(self) -> None:
+        from rich.style import Style as _RichStyle
+        theme = getattr(self, "_theme", None)
+        if theme is None:
+            return
+        styles = theme.syntax_styles
+        styles.setdefault(
+            self._PLASMID_HL_NAME,
+            _RichStyle(color=_PLASMID_CHIP_COLOR, bold=True),
+        )
+        styles.setdefault(
+            self._ACTIONS_HL_NAME,
+            _RichStyle(color=_ACTIONS_CHIP_COLOR, bold=True),
+        )
+        styles.setdefault(
+            self._GEL_HL_NAME,
+            _RichStyle(color=_GEL_CHIP_COLOR, bold=True),
+        )
+
+    def _build_highlight_map(self) -> None:
+        super()._build_highlight_map()
+        self._ensure_splice_styles()
+        # `self.document` exists post-mount, but if `super()` is
+        # called via a tree-sitter refresh before the document
+        # attribute is wired (very rare in init order), bail out
+        # silently. Narrow exception types per the bare-except ban.
+        try:
+            doc = self.document
+            n_lines = doc.line_count
+        except (AttributeError, ValueError):
+            return
+        for line_index in range(n_lines):
+            try:
+                line_text = doc.get_line(line_index)
+            except (IndexError, ValueError):
+                continue
+            # Fast path: most lines have no sigil.
+            if (
+                "@" not in line_text
+                and "!" not in line_text
+                and "&" not in line_text
+            ):
+                continue
+            # ASCII fast path: byte offsets == character offsets, so
+            # we can skip the per-match UTF-8 encoding (which was
+            # O(K × L) for K matches with average prefix length L —
+            # the common case is many tags per line, all ASCII).
+            if line_text.isascii():
+                for m in _PLASMID_REF_RE.finditer(line_text):
+                    self._highlights[line_index].append((
+                        m.start(), m.end(), self._PLASMID_HL_NAME,
+                    ))
+                for m in _ACTIONS_REF_RE.finditer(line_text):
+                    self._highlights[line_index].append((
+                        m.start(), m.end(), self._ACTIONS_HL_NAME,
+                    ))
+                for m in _GEL_REF_RE.finditer(line_text):
+                    self._highlights[line_index].append((
+                        m.start(), m.end(), self._GEL_HL_NAME,
+                    ))
+                continue
+            # Non-ASCII path: build a codepoint→byte position table
+            # once for the whole line, then do O(1) lookups per
+            # match. Drops the per-match `len(prefix.encode())`
+            # cost from O(L) to O(1).
+            positions = [0]
+            cur = 0
+            for ch in line_text:
+                cur += len(ch.encode("utf-8"))
+                positions.append(cur)
+            for m in _PLASMID_REF_RE.finditer(line_text):
+                self._highlights[line_index].append((
+                    positions[m.start()],
+                    positions[m.end()],
+                    self._PLASMID_HL_NAME,
+                ))
+            for m in _ACTIONS_REF_RE.finditer(line_text):
+                self._highlights[line_index].append((
+                    positions[m.start()],
+                    positions[m.end()],
+                    self._ACTIONS_HL_NAME,
+                ))
+            for m in _GEL_REF_RE.finditer(line_text):
+                self._highlights[line_index].append((
+                    positions[m.start()],
+                    positions[m.end()],
+                    self._GEL_HL_NAME,
+                ))
+
+    def on_click(self, event) -> None:
+        """Double-click anywhere in the body posts `TagOpenRequested`
+        so the parent screen can open the modal for whichever tag
+        (if any) lives under the cursor. Single-click is left
+        untouched — Textual's default handler positions the cursor.
+        """
+        # `event.chain` is the consecutive-click count. Only fire on
+        # the second click of a double-click; otherwise leave alone.
+        if getattr(event, "chain", 1) >= 2:
+            self.post_message(self.TagOpenRequested())
+
+    def action_delete_left(self) -> None:
+        """Backspace handler with tag-aware behaviour (2026-05-18):
+        when the cursor sits at the end of a `@<id>` or `!<id>` token,
+        the whole tag is deleted instead of just the last character.
+        Anywhere else (mid-tag, prose, selection), default behaviour.
+        """
+        if self.read_only:
+            return
+        selection = self.selection
+        if not selection.is_empty:
+            super().action_delete_left()
+            return
+        try:
+            row, col = self.cursor_location
+            line_text = self.document.get_line(row)
+        except (AttributeError, IndexError, ValueError):
+            super().action_delete_left()
+            return
+        prefix = line_text[:col]
+        m = (
+            _PLASMID_REF_TAIL_RE.search(prefix)
+            or _ACTIONS_REF_TAIL_RE.search(prefix)
+            or _GEL_REF_TAIL_RE.search(prefix)
+        )
+        if m is None:
+            super().action_delete_left()
+            return
+        tag_start_col = m.start()
+        # Delete the entire matched tag span via the same underlying
+        # path that `action_delete_left` uses for selections.
+        self._delete_via_keyboard(
+            (row, tag_start_col), (row, col),
+        )
+
+
 # ── ExperimentsScreen ────────────────────────────────────────────────────────
 
 class ExperimentsScreen(Screen):
     """Full-screen Experiments toolbar — lab-notebook workbench.
 
-    Tabbed layout: Entries (CRUD) / Compose (markdown editor + live
-    preview, plasmid cross-refs, attach images) / Attachments (per-entry
-    image grid). Dismisses with ``None`` on Esc / Close; auto-saves the
-    dirty compose buffer first so an accidental close never loses
-    in-flight notes.
+    Split-pane layout: project switcher (top row) + always-visible
+    entries list on the left + TabbedContent[Compose | Attachments]
+    on the right. Each project (managed via
+    `ExperimentProjectsPickerModal`) groups its own set of entries —
+    projects are to experiments as collections are to plasmids
+    (refactor 2026-05-18).
+
+    Dismisses with ``None`` on Esc / Close; auto-saves the dirty
+    compose buffer first so an accidental close never loses notes.
     """
 
     # App-level Ctrl+Z must not unwind plasmid edits while the user is
@@ -39180,6 +40772,8 @@ class ExperimentsScreen(Screen):
         Binding("ctrl+s", "save_entry",     "Save",         show=True),
         Binding("ctrl+i", "attach_image",   "Attach image", show=True),
         Binding("ctrl+r", "insert_plasmid", "Plasmid ref",  show=True),
+        Binding("ctrl+p", "open_projects",  "Projects",     show=True),
+        Binding("ctrl+g", "go_to_tag",      "Open tag",     show=True),
         Binding("f7",     "spellcheck",     "Spellcheck",   show=True),
     ]
 
@@ -39193,22 +40787,50 @@ class ExperimentsScreen(Screen):
         background: $primary-darken-2; color: $text;
         padding: 0 1; height: 1;
     }
+
+    /* ── Project row (top) ──────────────────────────────────── */
+    #exp-project-row {
+        height: 3; margin-top: 0; align: left middle;
+    }
+    #exp-project-name {
+        width: 1fr; padding: 1 1; color: $accent;
+    }
+    #btn-exp-projects {
+        min-width: 18; margin: 0 1 0 0;
+    }
+
+    /* ── Body split (entries left, details right) ───────────── */
+    #exp-body-split {
+        width: 100%; height: 1fr; margin-top: 1;
+    }
+    #exp-entries-pane {
+        width: 1fr; min-width: 24; height: 1fr; padding: 0 1 0 0;
+    }
+    #exp-details-pane {
+        width: 4fr; height: 1fr;
+    }
+
     #exp-tabs { width: 100%; height: 1fr; }
     #exp-tabs > TabPane { padding: 0 1; }
 
-    /* ── Entries sub-tab ───────────────────────────────────── */
-    #exp-entries-pane { width: 100%; height: 1fr; }
-    #exp-entries-hint { height: 1; color: $text-muted; }
+    /* ── Entries pane (permanent left side) ─────────────────── */
     #exp-entries-table {
         height: 1fr; min-height: 6;
-        border: solid $primary-darken-2; margin-top: 1;
+        border: solid $primary-darken-2;
     }
-    #exp-entries-btns { height: 3; margin-top: 1; align: left middle; }
-    #exp-entries-btns Button { margin-right: 1; min-width: 14; }
+    #exp-entries-btns-row1, #exp-entries-btns-row2 {
+        height: 3; margin-top: 1; align: left middle;
+    }
+    #exp-entries-btns-row1 Button,
+    #exp-entries-btns-row2 Button {
+        margin-right: 1; min-width: 10; width: 1fr;
+    }
 
-    /* ── Compose sub-tab ──────────────────────────────────────
-       Title + tags inputs above. Split horizontal below — TextArea
-       60% / Markdown 40%. Toolbar at the foot. */
+    /* ── Compose tab (in right pane) ──────────────────────────
+       Title + tags inputs above, full-width TextArea below.
+       Preview pane was removed 2026-05-18 — the narrow right pane
+       made the side-by-side source/preview split too cramped. The
+       writing area now takes the full right-pane width. */
     #exp-compose-pane { width: 100%; height: 1fr; }
     #exp-meta-row { height: 3; margin-top: 0; }
     #exp-tags-row { height: 3; margin-top: 0; }
@@ -39219,16 +40841,9 @@ class ExperimentsScreen(Screen):
     #exp-title-input { width: 1fr; }
     #exp-tags-input  { width: 1fr; }
     #exp-compose-hint { height: 1; color: $text-muted; margin-top: 1; }
-    #exp-compose-split {
-        width: 100%; height: 1fr; min-height: 10; margin-top: 1;
-    }
     #exp-body {
-        width: 3fr; height: 1fr;
+        width: 100%; height: 1fr; min-height: 10; margin-top: 1;
         border: solid $primary-darken-2;
-    }
-    #exp-preview {
-        width: 2fr; height: 1fr;
-        border: solid $primary-darken-2; padding: 0 1;
     }
     #exp-compose-btns { height: 3; margin-top: 1; align: left middle; }
     #exp-compose-btns Button { margin-right: 1; min-width: 14; }
@@ -39236,7 +40851,7 @@ class ExperimentsScreen(Screen):
         width: auto; height: 3; padding: 1 1; color: $warning;
     }
 
-    /* ── Attachments sub-tab ─────────────────────────────────── */
+    /* ── Attachments tab (in right pane) ─────────────────────── */
     #exp-attach-pane { width: 100%; height: 1fr; }
     #exp-attach-hint { height: 1; color: $text-muted; }
     #exp-attach-table {
@@ -39260,52 +40875,70 @@ class ExperimentsScreen(Screen):
         self._initial_entry_id = initial_entry_id
         self._current_entry: "dict | None" = None
         self._dirty: bool = False
-        self._preview_timer = None
-        self._preview_debounce_s = 0.25
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         return True
 
     def compose(self) -> ComposeResult:
-        from textual.widgets import Markdown as _Markdown
         yield Header()
         with Vertical(id="exp-box"):
             yield Static(
                 " Experiments — lab notebook ", id="exp-title",
             )
-            with TabbedContent(initial="exp-sub-entries", id="exp-tabs"):
-                with TabPane("Entries", id="exp-sub-entries"):
-                    yield from self._compose_entries_pane()
-                with TabPane("Compose", id="exp-sub-compose",
-                              disabled=True):
-                    yield from self._compose_compose_pane(_Markdown)
-                with TabPane("Attachments", id="exp-sub-attachments",
-                              disabled=True):
-                    yield from self._compose_attachments_pane()
+            with Horizontal(id="exp-project-row"):
+                yield Static(
+                    self._format_project_label(),
+                    id="exp-project-name", markup=True,
+                )
+                yield Button(
+                    "Projects", id="btn-exp-projects",
+                )
+            with Horizontal(id="exp-body-split"):
+                yield from self._compose_entries_pane()
+                with Vertical(id="exp-details-pane"):
+                    with TabbedContent(
+                        initial="exp-sub-compose", id="exp-tabs",
+                    ):
+                        with TabPane("Compose", id="exp-sub-compose",
+                                      disabled=True):
+                            yield from self._compose_compose_pane()
+                        with TabPane("Attachments",
+                                      id="exp-sub-attachments",
+                                      disabled=True):
+                            yield from self._compose_attachments_pane()
             with Horizontal(id="exp-bottom"):
-                yield Button("Close  [Esc]", id="btn-exp-close")
+                yield Button("Close", id="btn-exp-close")
         yield Footer()
+
+    def _format_project_label(self) -> str:
+        """Human-readable header text showing the active project name.
+        Truncates the displayed name to 60 chars so a hand-edited
+        500-char project name can't push the Projects button
+        off-screen on narrow terminals (edge sweep 2026-05-18)."""
+        name = _get_active_project_name() or _DEFAULT_PROJECT_NAME
+        if len(name) > 60:
+            name = name[:57] + "…"
+        return f"[bold]Project:[/bold] [accent]{name}[/accent]"
 
     def _compose_entries_pane(self) -> ComposeResult:
         with Vertical(id="exp-entries-pane"):
-            yield Static(
-                "[dim]Lab-notebook entries. Click [b]New[/b] to start a "
-                "fresh entry; click a row to open one for editing.[/]",
-                id="exp-entries-hint", markup=True,
-            )
             yield DataTable(id="exp-entries-table",
                               cursor_type="row",
                               zebra_stripes=True)
-            with Horizontal(id="exp-entries-btns"):
-                yield Button("New  [^N]",
+            # 2 rows × 2 buttons so all four fit on a narrow left
+            # pane (min-width: 24 — a single row of 4 × min-width-10
+            # buttons overflowed and clipped Delete off-screen).
+            with Horizontal(id="exp-entries-btns-row1"):
+                yield Button("New",
                               id="btn-exp-new",
                               variant="primary")
                 yield Button("Open", id="btn-exp-open")
-                yield Button("Rename…", id="btn-exp-rename")
-                yield Button("Delete…", id="btn-exp-delete",
+            with Horizontal(id="exp-entries-btns-row2"):
+                yield Button("Rename", id="btn-exp-rename")
+                yield Button("Delete", id="btn-exp-delete",
                               variant="error")
 
-    def _compose_compose_pane(self, _Markdown) -> ComposeResult:
+    def _compose_compose_pane(self) -> ComposeResult:
         with Vertical(id="exp-compose-pane"):
             with Horizontal(id="exp-meta-row"):
                 yield Static("Title:", classes="exp-meta-label")
@@ -39318,25 +40951,27 @@ class ExperimentsScreen(Screen):
                     id="exp-tags-input",
                 )
             yield Static(
-                "[dim]Markdown source on the left, live preview on the "
-                "right. Use [b]`@plasmid:<id>`[/b] anywhere to cross-"
-                "reference a library plasmid — click it in the preview "
-                "to open that plasmid.[/]",
+                "[dim]Markdown source. Use [b]`@plasmid:<id>`[/b] "
+                "anywhere to cross-reference a library plasmid — "
+                "use the [b]Plasmid ref[/b] button or [b]^R[/b] to "
+                "insert one.[/]",
                 id="exp-compose-hint", markup=True,
             )
-            with Horizontal(id="exp-compose-split"):
-                yield TextArea(
-                    "", language="markdown", id="exp-body",
-                )
-                yield _Markdown("", id="exp-preview")
+            yield _ExperimentMarkdownTextArea(
+                "", language="markdown", id="exp-body",
+            )
             with Horizontal(id="exp-compose-btns"):
-                yield Button("Save  [^S]", id="btn-exp-save",
+                yield Button("Save", id="btn-exp-save",
                               variant="primary")
-                yield Button("Attach image  [^I]",
+                yield Button("Attach image",
                               id="btn-exp-attach")
-                yield Button("Plasmid ref  [^R]",
+                yield Button("Plasmid ref",
                               id="btn-exp-plasmid")
-                yield Button("Spellcheck  [F7]",
+                yield Button("Action ref",
+                              id="btn-exp-actions")
+                yield Button("Gel ref",
+                              id="btn-exp-gel")
+                yield Button("Spellcheck",
                               id="btn-exp-spellcheck")
                 yield Static("", id="exp-dirty-flag")
 
@@ -39361,7 +40996,7 @@ class ExperimentsScreen(Screen):
     def on_mount(self) -> None:
         try:
             t = self.query_one("#exp-entries-table", DataTable)
-            t.add_columns("Title", "Updated", "Tags", "Imgs", "Refs")
+            t.add_columns("Updated", "Title")
         except NoMatches:
             return
         try:
@@ -39380,19 +41015,20 @@ class ExperimentsScreen(Screen):
     # ─── Sub-tab gating ──────────────────────────────────────────────────
 
     def _apply_subtab_gating(self, *, enabled: bool) -> None:
+        """Enable / disable the Compose + Attachments tabs depending
+        on whether an entry is currently loaded. With the split-pane
+        layout (2026-05-18) the entries list is always visible — no
+        'Entries' tab to fall back to — so when disabling we leave
+        `tabs.active` alone; Textual renders disabled tabs greyed
+        out, which is the right visual cue that the user needs to
+        pick or create an entry from the left pane first.
+        """
         for tab_id in self._DEPENDENT_SUBTABS:
             try:
                 pane = self.query_one(f"#{tab_id}", TabPane)
                 pane.disabled = not enabled
             except NoMatches:
                 continue
-        if not enabled:
-            try:
-                tabs = self.query_one("#exp-tabs", TabbedContent)
-                if tabs.active in self._DEPENDENT_SUBTABS:
-                    tabs.active = "exp-sub-entries"
-            except (NoMatches, LookupError, AttributeError):
-                pass
 
     # ─── Entries population ──────────────────────────────────────────────
 
@@ -39410,6 +41046,10 @@ class ExperimentsScreen(Screen):
         return sorted(entries, key=_key, reverse=True)
 
     def _refresh_entries_table(self) -> None:
+        """Repopulate the entries list. Trimmed 2026-05-18 to two
+        columns (Updated, Title) so a narrow left pane stays readable;
+        long titles overflow into a horizontal scrollbar on the
+        DataTable rather than truncating with ellipsis."""
         try:
             t = self.query_one("#exp-entries-table", DataTable)
         except NoMatches:
@@ -39419,16 +41059,10 @@ class ExperimentsScreen(Screen):
         for e in entries:
             eid = e.get("id") or ""
             title = e.get("title") or "(untitled)"
-            updated = (e.get("updated_at") or "")[:19].replace("T", " ")
-            tags = ", ".join((e.get("tags") or [])[:3])
-            n_imgs = len(e.get("image_paths") or [])
-            n_refs = len(e.get("attached_plasmid_ids") or [])
+            updated = (e.get("updated_at") or "")[:10]
             t.add_row(
-                Text(title, no_wrap=True, overflow="ellipsis"),
                 updated,
-                Text(tags, no_wrap=True, overflow="ellipsis"),
-                str(n_imgs),
-                str(n_refs),
+                Text(title, no_wrap=True),
                 key=eid,
             )
 
@@ -39453,7 +41087,6 @@ class ExperimentsScreen(Screen):
             tabs.active = "exp-sub-compose"
         except (NoMatches, LookupError):
             pass
-        self._refresh_preview()
         self._refresh_attachments()
         self._mark_dirty(False)
         try:
@@ -39490,21 +41123,46 @@ class ExperimentsScreen(Screen):
 
     def _persist_current(self) -> bool:
         """Persist the live compose buffer back to disk. Returns True on
-        success. No-op (False) if nothing to save."""
+        success. No-op (False) if nothing to save.
+
+        Pre-save: detects body-over-cap (1 MB) and notifies the user so
+        a silent truncation in `_normalise_experiment_entry` isn't a
+        surprise data-loss. Audit sweep 2026-05-18.
+
+        Save path: dedup-by-id replaces ALL matches (not just the first
+        one) so a duplicate-id entry — theoretically impossible but
+        defensive against hand-edited JSON — can't survive a save.
+        """
         if self._current_entry is None:
             return False
+        try:
+            raw_body = self.query_one("#exp-body", TextArea).text or ""
+        except NoMatches:
+            raw_body = ""
+        if (len(raw_body.encode("utf-8", errors="replace"))
+                > _EXPERIMENT_BODY_MAX_BYTES):
+            try:
+                self.app.notify(
+                    f"Body exceeded {_EXPERIMENT_BODY_MAX_BYTES // 1000} "
+                    f"KB cap — truncated on save. Split long sections "
+                    f"into separate entries or move content to "
+                    f"attachments.",
+                    severity="warning", timeout=8,
+                )
+            except Exception:
+                pass
         upd = self._collect_compose_state()
         if upd is None:
             return False
         entries = _load_experiments()
-        replaced = False
-        for i, e in enumerate(entries):
-            if e.get("id") == upd.get("id"):
-                entries[i] = upd
-                replaced = True
-                break
-        if not replaced:
-            entries.append(upd)
+        target_id = upd.get("id")
+        # Dedup-by-id: filter out ALL entries matching the current id
+        # (defensive against a hand-edited JSON with duplicate ids;
+        # pre-fix `for i, e in enumerate(...): if matched: break`
+        # only replaced the first match, leaving stale duplicates on
+        # disk).
+        entries = [e for e in entries if e.get("id") != target_id]
+        entries.append(upd)
         try:
             _save_experiments(entries)
         except OSError as exc:
@@ -39524,31 +41182,12 @@ class ExperimentsScreen(Screen):
         return True
 
     # ─── Preview render ──────────────────────────────────────────────────
-
-    def _refresh_preview(self) -> None:
-        from textual.widgets import Markdown as _Markdown
-        try:
-            preview = self.query_one("#exp-preview", _Markdown)
-            ta = self.query_one("#exp-body", TextArea)
-        except NoMatches:
-            return
-        body = ta.text or ""
-        rendered = _render_plasmid_refs(body)
-        try:
-            preview.update(rendered)
-        except Exception:
-            _log.exception("ExperimentsScreen: preview update failed")
-
-    def _schedule_preview_refresh(self) -> None:
-        if self._preview_timer is not None:
-            try:
-                self._preview_timer.stop()
-            except Exception:
-                pass
-        self._preview_timer = self.set_timer(
-            self._preview_debounce_s, self._refresh_preview,
-        )
-
+    # Preview pane removed 2026-05-18 — the narrow right pane made the
+    # side-by-side source/preview split too cramped (`_render_plasmid_refs`
+    # is preserved for export / future re-add). Token coloring is now
+    # done in-editor via `_ExperimentMarkdownTextArea` (subclass that
+    # injects regex-based highlights into `_build_highlight_map`), so
+    # the previously-attempted chip-strip below the TextArea is gone.
     # ─── Attachments ─────────────────────────────────────────────────────
 
     def _refresh_attachments(self) -> None:
@@ -39652,6 +41291,14 @@ class ExperimentsScreen(Screen):
     def _on_btn_plasmid(self, _ev) -> None:
         self.action_insert_plasmid()
 
+    @on(Button.Pressed, "#btn-exp-actions")
+    def _on_btn_actions(self, _ev) -> None:
+        self.action_insert_action()
+
+    @on(Button.Pressed, "#btn-exp-gel")
+    def _on_btn_gel(self, _ev) -> None:
+        self.action_insert_gel()
+
     @on(Button.Pressed, "#btn-exp-spellcheck")
     def _on_btn_spellcheck(self, _ev) -> None:
         self.action_spellcheck()
@@ -39668,10 +41315,13 @@ class ExperimentsScreen(Screen):
     def _on_btn_close(self, _ev) -> None:
         self.action_cancel()
 
+    @on(Button.Pressed, "#btn-exp-projects")
+    def _on_btn_projects(self, _ev) -> None:
+        self.action_open_projects()
+
     @on(TextArea.Changed, "#exp-body")
     def _on_body_changed(self, _ev) -> None:
         self._mark_dirty(True)
-        self._schedule_preview_refresh()
 
     @on(Input.Changed, "#exp-title-input")
     def _on_title_changed(self, _ev) -> None:
@@ -39681,123 +41331,74 @@ class ExperimentsScreen(Screen):
     def _on_tags_changed(self, _ev) -> None:
         self._mark_dirty(True)
 
-    def on_markdown_link_clicked(self, event) -> None:
-        """Markdown widget link-click → intercept plasmid refs and
-        external URLs. The Markdown widget posts this for any
-        `[label](href)` click in the preview."""
-        href = getattr(event, "href", "") or ""
-        if href.startswith(_PLASMID_LINK_SCHEME):
-            target_id = href[len(_PLASMID_LINK_SCHEME):]
-            self._open_plasmid_ref(target_id)
-            return
-        if href.startswith(("http://", "https://")):
-            # Pure-TUI rule (user's call 2026-05-18): don't shell out
-            # to a browser. Show the URL so the user can copy it.
-            self.app.notify(
-                f"Link (copy from notify): {href}",
-                timeout=8,
-            )
-            return
-        if href:
-            self.app.notify(f"Link: {href}", timeout=4)
-
-    def _open_plasmid_ref(self, target_id: str) -> None:
-        """Resolve `target_id` against every collection on disk, switch
-        the active collection if needed, then load the plasmid through
-        the same `_apply_record` path that `action_find_plasmid` uses.
-        Auto-saves the current compose buffer first so a reference
-        click can't lose user notes."""
-        if not target_id:
-            return
-        matches = _search_collections_library(target_id, limit=10)
-        chosen = None
-        for m in matches:
-            if m.get("id") == target_id:
-                chosen = m
-                break
-        if chosen is None:
-            self.app.notify(
-                f"No plasmid `{target_id}` in any collection",
-                severity="warning",
-            )
-            return
-        if self._dirty and self._current_entry is not None:
-            self._persist_current()
-        coll_name = chosen.get("collection") or ""
-        entry_id = chosen.get("id") or ""
-        # Dismiss BEFORE the switch+load so the user sees the loaded
-        # plasmid behind the (now-gone) screen rather than us trying
-        # to redraw a half-disposed widget tree.
-        self.dismiss(None)
-        try:
-            self._switch_and_load(coll_name, entry_id)
-        except Exception:
-            _log.exception("ExperimentsScreen: switch_and_load failed")
-
-    def _switch_and_load(self, coll_name: str, entry_id: str) -> None:
-        """Shared with `PlasmidApp.action_find_plasmid` — small enough
-        to duplicate rather than refactor in this pass (~20 lines).
-        Switches active collection if needed, then loads the entry's
-        embedded `gb_text` onto the main canvas via `_apply_record`."""
-        if coll_name and coll_name != _get_active_collection_name():
-            coll = _find_collection(coll_name)
-            if coll is None:
-                self.app.notify(
-                    f"Collection '{coll_name}' is gone.",
-                    severity="warning",
-                )
-                return
-            _set_active_collection_name(coll_name)
-            plasmids = [dict(p) for p in (coll.get("plasmids") or [])
-                          if isinstance(p, dict)]
-            try:
-                _save_library(plasmids)
-            except (OSError, ValueError) as exc:
-                _notify_save_failure(
-                    self.app, "Plasmid library", exc,
-                )
-                return
-            try:
-                lib = self.app.query_one("#library", LibraryPanel)
-                lib._view_mode = "plasmids"
-                lib._apply_view_mode()
-                lib._repopulate_plasmids()
-            except NoMatches:
-                pass
-        for e in _load_library():
-            if e.get("id") == entry_id:
-                gb_text = e.get("gb_text", "")
-                if not gb_text:
-                    self.app.notify(
-                        "Library entry has no embedded sequence.",
-                        severity="warning",
-                    )
-                    return
-                try:
-                    record = _gb_text_to_record(gb_text)
-                except Exception as exc:
-                    _log.exception(
-                        "Plasmid-ref load: parse failed for %r",
-                        entry_id,
-                    )
-                    self.app.notify(
-                        f"Could not load plasmid: {exc}",
-                        severity="error",
-                    )
-                    return
-                self.app._apply_record(record)  # type: ignore[attr-defined]
-                return
-        self.app.notify(
-            f"Plasmid {entry_id} not found in {coll_name}.",
-            severity="warning",
-        )
-
     # ─── Actions ─────────────────────────────────────────────────────────
 
     def action_cancel(self) -> None:
+        """Esc / Close handler. When the compose buffer is dirty,
+        opens `ExperimentUnsavedChangesModal` and routes through the
+        user's choice (save / abandon / cancel). Default focus on
+        Cancel so a stray Enter cannot lose work. Pre-refactor this
+        auto-saved silently — surprising for users who hit Esc to
+        discard an edit (2026-05-18)."""
+        if not (self._dirty and self._current_entry is not None):
+            self.dismiss(None)
+            return
+
+        def _on_choice(choice) -> None:
+            if choice == "save":
+                # Stay on screen if the save itself fails so the user
+                # can fix the underlying disk error before losing
+                # their work. `_persist_current` already routed the
+                # OSError through `_notify_save_failure` (toast); the
+                # screen survives until they pick Save again, Abandon,
+                # or fix the disk.
+                if self._persist_current():
+                    self.dismiss(None)
+            elif choice == "abandon":
+                self.dismiss(None)
+            # "cancel" / None → stay on screen
+        self.app.push_screen(
+            ExperimentUnsavedChangesModal(), callback=_on_choice,
+        )
+
+    def action_open_projects(self) -> None:
+        """Open the experiment-projects picker. Auto-saves the dirty
+        compose buffer first so a project switch never loses notes.
+        On return: refreshes the entries list (the picker mirrored
+        the newly-active project's experiments into experiments.json
+        before dismissing) and the project label."""
         if self._dirty and self._current_entry is not None:
             self._persist_current()
-        self.dismiss(None)
+
+        def _on_picked(name) -> None:
+            if not name:
+                return
+            # Active project changed — drop the current compose entry
+            # (it belonged to the old project's set) and refresh the
+            # left-pane list against the new project.
+            self._current_entry = None
+            self._apply_subtab_gating(enabled=False)
+            try:
+                self.query_one(
+                    "#exp-title-input", Input,
+                ).value = ""
+                self.query_one(
+                    "#exp-tags-input", Input,
+                ).value = ""
+                self.query_one("#exp-body", TextArea).text = ""
+            except NoMatches:
+                pass
+            self._refresh_entries_table()
+            self._refresh_attachments()
+            try:
+                self.query_one(
+                    "#exp-project-name", Static,
+                ).update(self._format_project_label())
+            except NoMatches:
+                pass
+        self.app.push_screen(
+            ExperimentProjectsPickerModal(), callback=_on_picked,
+        )
 
     def action_new_entry(self) -> None:
         if self._dirty and self._current_entry is not None:
@@ -39879,6 +41480,22 @@ class ExperimentsScreen(Screen):
                 "Image attach failed — see logs.", severity="error",
             )
             return
+        # Clipboard-paste tmp cleanup (audit sweep 2026-05-18). The
+        # ImageAttachModal clipboard route writes via tempfile.mkstemp
+        # with prefix `_EXPERIMENT_CLIP_TMP_PREFIX`; once the bytes
+        # are copied into the entry dir the source tmp file is
+        # orphaned. Unlink it best-effort. Skipped for user-picked
+        # files (no prefix match), so a real file the user named
+        # "exp-clip-foo.png" outside /tmp survives untouched.
+        if p.name.startswith(_EXPERIMENT_CLIP_TMP_PREFIX):
+            import tempfile
+            try:
+                if (p.is_file()
+                        and str(p.parent.resolve())
+                        == str(Path(tempfile.gettempdir()).resolve())):
+                    p.unlink(missing_ok=True)
+            except OSError:
+                pass
         rel = saved.name
         try:
             ta = self.query_one("#exp-body", TextArea)
@@ -39888,7 +41505,6 @@ class ExperimentsScreen(Screen):
         except NoMatches:
             pass
         self._mark_dirty(True)
-        self._refresh_preview()
         self._refresh_attachments()
         _log_event(
             "experiments.attach.image",
@@ -39914,14 +41530,264 @@ class ExperimentsScreen(Screen):
                 ta = self.query_one("#exp-body", TextArea)
             except NoMatches:
                 return
-            ta.insert(f"@plasmid:{entry_id}")
+            # Single-sigil tag format (2026-05-18): `@<id>` not
+            # `@plasmid:<id>`. Trailing space + refocus so the user
+            # can keep typing without clicking back into the body.
+            ta.insert(f"@{entry_id} ")
+            ta.focus()
             self._mark_dirty(True)
-            self._schedule_preview_refresh()
             _log_event("experiments.insert.plasmid_ref",
                          eid=self._current_entry.get("id")
                               if self._current_entry else None,
                          ref=entry_id)
         self.app.push_screen(LibrarySearchModal(), callback=_on_picked)
+
+    def action_go_to_tag(self) -> None:
+        """Open the object modal for whichever tag lives under the
+        cursor. Plasmid → switch active collection + load plasmid
+        onto the main canvas. Gel → open `GelLibraryModal` scrolled
+        to that entry. Action → open `ActionsPickerModal` scrolled
+        to that catalog entry. No tag under cursor → notify.
+
+        Cursor placement is a "containing-or-touching" test: a
+        cursor immediately after the last char of a tag still
+        counts as being on that tag (so the user can finish typing
+        a tag, then hit Ctrl+G to inspect)."""
+        try:
+            ta = self.query_one(
+                "#exp-body", _ExperimentMarkdownTextArea,
+            )
+        except NoMatches:
+            return
+        try:
+            row, col = ta.cursor_location
+            line_text = ta.document.get_line(row)
+        except (AttributeError, IndexError, ValueError):
+            self.app.notify(
+                "No tag under cursor.", severity="warning", timeout=3,
+            )
+            return
+        for regex, kind in (
+            (_PLASMID_REF_RE, "plasmid"),
+            (_ACTIONS_REF_RE, "action"),
+            (_GEL_REF_RE,     "gel"),
+        ):
+            for m in regex.finditer(line_text):
+                # Touching-end inclusive so cursor immediately after
+                # the tag still counts.
+                if m.start() <= col <= m.end():
+                    self._open_tag(kind, m.group(1))
+                    return
+        self.app.notify(
+            "No tag under cursor.", severity="warning", timeout=3,
+        )
+
+    @on(_ExperimentMarkdownTextArea.TagOpenRequested)
+    def _on_tag_double_clicked(self, _ev) -> None:
+        """Double-click in the body → same handler as Ctrl+G."""
+        self.action_go_to_tag()
+
+    def _open_tag(self, kind: str, tag_id: str) -> None:
+        """Dispatch on tag kind. Auto-saves the dirty compose buffer
+        first so an open-tag click can't lose user notes."""
+        if not tag_id:
+            return
+        if self._dirty and self._current_entry is not None:
+            self._persist_current()
+        if kind == "plasmid":
+            self._open_plasmid_ref(tag_id)
+        elif kind == "gel":
+            self._open_gel_ref(tag_id)
+        elif kind == "action":
+            self._open_action_ref(tag_id)
+
+    def _open_plasmid_ref(self, target_id: str) -> None:
+        """Resolve `target_id` across every collection on disk,
+        switch the active collection if needed, dismiss the
+        Experiments screen, then load the plasmid onto the main
+        canvas via `_apply_record`. Notifies and stays put if the
+        plasmid isn't found anywhere."""
+        matches = _search_collections_library(target_id, limit=10)
+        chosen = None
+        for m in matches:
+            if m.get("id") == target_id:
+                chosen = m
+                break
+        if chosen is None:
+            self.app.notify(
+                f"No plasmid `{target_id}` in any collection.",
+                severity="warning",
+            )
+            return
+        coll_name = chosen.get("collection") or ""
+        entry_id = chosen.get("id") or ""
+        # Dismiss BEFORE switch+load so the user sees the loaded
+        # plasmid behind the (now-gone) screen rather than us trying
+        # to redraw a half-disposed widget tree.
+        self.dismiss(None)
+        try:
+            self._switch_and_load_plasmid(coll_name, entry_id)
+        except (OSError, ValueError, AttributeError):
+            _log.exception(
+                "ExperimentsScreen: switch_and_load failed for %r",
+                target_id,
+            )
+
+    def _switch_and_load_plasmid(
+        self, coll_name: str, entry_id: str,
+    ) -> None:
+        """Switch active collection if needed, then load the entry's
+        embedded `gb_text` onto the main canvas via `_apply_record`.
+        Mirrors the agent-API `set-active-collection` + `load-entry`
+        pair but stays inline for the click-through fast path."""
+        if (coll_name
+                and coll_name != _get_active_collection_name()):
+            coll = _find_collection(coll_name)
+            if coll is None:
+                self.app.notify(
+                    f"Collection '{coll_name}' is gone.",
+                    severity="warning",
+                )
+                return
+            _set_active_collection_name(coll_name)
+            plasmids = [
+                dict(p) for p in (coll.get("plasmids") or [])
+                if isinstance(p, dict)
+            ]
+            try:
+                _save_library(plasmids)
+            except (OSError, ValueError) as exc:
+                _notify_save_failure(
+                    self.app, "Plasmid library", exc,
+                )
+                return
+            try:
+                lib = self.app.query_one("#library", LibraryPanel)
+                lib._view_mode = "plasmids"
+                lib._apply_view_mode()
+                lib._repopulate_plasmids()
+            except NoMatches:
+                pass
+        for e in _load_library():
+            if e.get("id") == entry_id:
+                gb_text = e.get("gb_text", "")
+                if not gb_text:
+                    self.app.notify(
+                        "Library entry has no embedded sequence.",
+                        severity="warning",
+                    )
+                    return
+                try:
+                    record = _gb_text_to_record(gb_text)
+                except (ValueError, RuntimeError) as exc:
+                    _log.exception(
+                        "Plasmid-ref load: parse failed for %r",
+                        entry_id,
+                    )
+                    self.app.notify(
+                        f"Could not load plasmid: {exc}",
+                        severity="error",
+                    )
+                    return
+                self.app._apply_record(record)  # type: ignore[attr-defined]
+                _log_event("plasmid.ref.opened", id=entry_id)
+                return
+        self.app.notify(
+            f"Plasmid {entry_id} not found in {coll_name}.",
+            severity="warning",
+        )
+
+    def _open_gel_ref(self, gel_id: str) -> None:
+        """Open `GelLibraryModal` scrolled to `gel_id`. Refuses if
+        the id fails sanitisation or the gel doesn't exist."""
+        safe = _sanitize_gel_id(gel_id)
+        if safe is None:
+            self.app.notify(
+                f"`&{gel_id}` is not a valid gel id.",
+                severity="warning",
+            )
+            return
+        if _find_gel(safe) is None:
+            self.app.notify(
+                f"No gel with id `{safe}`. Save one from the "
+                "Simulator first.",
+                severity="warning",
+            )
+            return
+        _log_event("gel.ref.opened", id=safe)
+        self.app.push_screen(
+            GelLibraryModal(initial_gel_id=safe), callback=None,
+        )
+
+    def _open_action_ref(self, action_id: str) -> None:
+        """Open `ActionsPickerModal` scrolled to `action_id`. The
+        catalog accepts free-form ids so an action that isn't in
+        the curated catalog just lands cursor at row 0."""
+        _log_event("action.ref.opened", id=action_id)
+        self.app.push_screen(
+            ActionsPickerModal(initial_action=action_id),
+            callback=None,
+        )
+
+    def action_insert_gel(self) -> None:
+        """Open `GelLibraryModal` (no current snapshot — Save button
+        is disabled) and insert the picked gel as `&<id>` at the
+        cursor. Mirrors the plasmid / action insert pattern: trailing
+        space + refocus so the user keeps typing without clicking
+        back into the body."""
+        if self._current_entry is None:
+            self.app.notify("No entry selected.", severity="warning")
+            return
+
+        def _on_picked(gel_id) -> None:
+            if not gel_id:
+                return
+            try:
+                ta = self.query_one(
+                    "#exp-body", _ExperimentMarkdownTextArea,
+                )
+            except NoMatches:
+                return
+            ta.insert(f"&{gel_id} ")
+            ta.focus()
+            self._mark_dirty(True)
+            _log_event("experiments.insert.gel_ref",
+                         eid=self._current_entry.get("id")
+                              if self._current_entry else None,
+                         ref=gel_id)
+        # Pass NO `current_lanes` — that disables the Save button
+        # (the user opened from Experiments, not Simulator).
+        self.app.push_screen(GelLibraryModal(), callback=_on_picked)
+
+    def action_insert_action(self) -> None:
+        """Open `ActionsPickerModal` and insert the picked action as
+        `@actions:<id>` at the current cursor position. The catalog
+        is curated but not enforced — `@actions:<custom>` typed by
+        hand is just as valid (the regex `_ACTIONS_REF_RE` accepts
+        any matching id).
+        """
+        if self._current_entry is None:
+            self.app.notify("No entry selected.", severity="warning")
+            return
+
+        def _on_picked(action_id) -> None:
+            if not action_id:
+                return
+            try:
+                ta = self.query_one("#exp-body", TextArea)
+            except NoMatches:
+                return
+            # Single-sigil tag format `!<id>` — mirrors the plasmid
+            # `@<id>` flow but with `!` so the two tag kinds stay
+            # visually distinct in the editor (purple vs lime).
+            ta.insert(f"!{action_id} ")
+            ta.focus()
+            self._mark_dirty(True)
+            _log_event("experiments.insert.action_ref",
+                         eid=self._current_entry.get("id")
+                              if self._current_entry else None,
+                         ref=action_id)
+        self.app.push_screen(ActionsPickerModal(), callback=_on_picked)
 
     def action_spellcheck(self) -> None:
         """Pyspellchecker-backed spellcheck for the active body. Masks
@@ -39974,7 +41840,6 @@ class ExperimentsScreen(Screen):
                     )
                 ta.text = text
                 self._mark_dirty(True)
-                self._schedule_preview_refresh()
             if dict_additions:
                 cur = _get_setting("experiments_custom_dict", []) or []
                 if not isinstance(cur, list):
@@ -40133,7 +41998,6 @@ class ExperimentsScreen(Screen):
             return
         ta.text = ta.text + f"\n\n![{name}]({name})\n"
         self._mark_dirty(True)
-        self._refresh_preview()
         self._refresh_attachments()
         try:
             tabs = self.query_one("#exp-tabs", TabbedContent)
@@ -48709,9 +50573,21 @@ def _agarose_mobility(bp: int, gel_pct: float,
     = at the dye front. Distance migrated on a rendered gel of height
     H rows is `round(mobility * (H - 1))`.
 
-    Below the gel's lower resolution bound → mobility ≈ 1 (band at
-    dye front); above the upper bound → mobility ≈ 0 (band at well).
-    Within the window, mobility is linear in -log10(bp).
+    Within each gel's resolution window, mobility is linear in
+    `-log10(eff_bp)` — the Helling-Goodman-Boyer empirical observation
+    (Sambrook & Russell, "Molecular Cloning" 3e, Table 5-1).
+
+    Outside the resolution window (refactor 2026-05-19): mobility
+    continues to extrapolate linearly in log10 with the SAME slope,
+    but with a damped soft-asymptote so very small fragments
+    (`bp << bp_min`) stack near the dye front WITHOUT collapsing to
+    the same row, and very large fragments (`bp >> bp_max`) stack
+    near the well likewise without collapse. Two below-window
+    fragments will still order by size (smaller faster); the same
+    holds above-window (larger slower). Pre-fix the boundary hard-
+    clamped to 0.97 / 0.03 so multiple sub-resolution bands piled on
+    the same row regardless of relative size, which lost real
+    ordering information.
 
     `dna_form` ∈ {"linear", "supercoiled", "nicked", "relaxed"}. Unknown
     forms are treated as linear.
@@ -48723,14 +50599,33 @@ def _agarose_mobility(bp: int, gel_pct: float,
     # Snap to nearest configured gel %.
     gel_pct = min(_AGAROSE_CHOICES, key=lambda g: abs(g - gel_pct))
     bp_min, bp_max = _AGAROSE_RANGES[gel_pct]
-    if eff_bp <= bp_min:
-        return 0.97   # near dye front but distinguishable
-    if eff_bp >= bp_max:
-        return 0.03   # near well but distinguishable
     log_lo = math.log10(bp_min)
     log_hi = math.log10(bp_max)
     log_x  = math.log10(eff_bp)
-    return (log_hi - log_x) / (log_hi - log_lo)
+    # In-window raw mobility (0..1 maps to well..dye-front).
+    raw = (log_hi - log_x) / (log_hi - log_lo)
+    if 0.0 <= raw <= 1.0:
+        return raw
+    # Out-of-window: damped extrapolation so multiple below-window
+    # (or above-window) fragments retain size ordering.  Map the
+    # excess log-distance through a tanh-like squash so the result
+    # asymptotes toward 1.0 (or 0.0) without reaching it. Each
+    # additional log10 unit past the boundary halves the remaining
+    # gap to the asymptote — gives ~3 visually distinct rows of
+    # ordering even on a small render before the floor / ceiling
+    # binds.
+    if raw > 1.0:
+        excess = raw - 1.0       # > 0
+        damped = 1.0 - 0.5 ** (1.0 + excess)
+        # Anchor at the in-window edge (1.0) and stretch a small
+        # range past it. `0.97 + 0.025 * damped` keeps in [0.97, 0.995].
+        return 0.97 + 0.025 * damped
+    # raw < 0.0
+    deficit = -raw            # > 0
+    damped = 1.0 - 0.5 ** (1.0 + deficit)
+    # Anchor at the in-window edge (0.0). `0.03 - 0.025 * damped`
+    # keeps in [0.005, 0.03].
+    return 0.03 - 0.025 * damped
 
 
 # Standard agarose-gel size ladders. Each entry maps a ladder name to a
@@ -48865,17 +50760,46 @@ def _render_gel_image(
         if (lane.get("source") or "").lower() == "ladder" and ladder_lane_idx == -1:
             ladder_lane_idx = li
 
-    # Pre-compute row indices.
+    # Pre-compute row indices for each band. The position is a
+    # FLOATING-POINT row index — `mob * (height - 1)` — and we keep
+    # the fractional part so adjacent bands whose log10(bp) differ
+    # by less than 1 row can still resolve via a faint
+    # "anti-aliased" tail on the adjacent row.
+    #
+    # Two grids:
+    #   * `band_grid` — primary cells. `(row, lane) → count`. Heavy
+    #                   `━` (1) / `▆` (2) / `█` (3+) glyph chosen
+    #                   from count.
+    #   * `band_faint` — secondary cells where a single band's
+    #                   fractional position leans toward this row.
+    #                   `(row, lane) → True` (presence only — no
+    #                   pile-up logic). Renders as a light `─` glyph
+    #                   so the eye reads the band's true position
+    #                   as "between rows".
     band_grid: dict[tuple[int, int], int] = {}   # (row, lane) → band count
-    ladder_rows: dict[int, int] = {}             # row → bp size (for tick column)
+    band_faint: set[tuple[int, int]] = set()
+    ladder_rows: dict[int, int] = {}             # row → bp size
+    # Sub-row fractional rendering kicks in once the band's offset
+    # from row-center exceeds this threshold — below it the band
+    # sits squarely on its row and a faint tail would only add
+    # visual noise (refactor 2026-05-19).
+    _FAINT_FRAC_THRESHOLD = 0.25
     for li, bands in enumerate(lane_bands):
         for bp, form in bands:
             mob = _agarose_mobility(bp, agarose_pct, dna_form=form)
-            row = max(0, min(height - 1, int(round(mob * (height - 1)))))
+            row_float = mob * (height - 1)
+            row = max(0, min(height - 1, int(round(row_float))))
             band_grid[(row, li)] = band_grid.get((row, li), 0) + 1
             if li == ladder_lane_idx:
                 # The largest bp at this row wins the tick label.
                 ladder_rows[row] = max(ladder_rows.get(row, 0), bp)
+            # Fractional offset from the row's center.
+            frac = row_float - row
+            if abs(frac) > _FAINT_FRAC_THRESHOLD:
+                # Pull a faint tail toward the adjacent row.
+                row_sec = row + (1 if frac > 0 else -1)
+                if 0 <= row_sec < height:
+                    band_faint.add((row_sec, li))
 
     # Header row: lane numbers.
     head = " " * label_col
@@ -48901,15 +50825,33 @@ def _render_gel_image(
                 label = f"{bp/1000:>4.1f}k"
             else:
                 label = f"{bp:>5}"
-            line_left = f"{label} "
+            # Padded to exactly `label_col` chars so labelled rows
+            # don't shift the lane columns relative to unlabelled
+            # rows. Pre-fix `f"{label} "` was 6 chars and `label_col`
+            # was 7 — bands jumped one column left whenever a ladder
+            # label landed on the same row, breaking lane-to-well
+            # alignment (refactor 2026-05-19).
+            line_left = f"{label} ".ljust(label_col)
         else:
             line_left = " " * label_col
         line = line_left
         for li in range(n_lanes):
             count = band_grid.get((row, li), 0)
             if count == 0:
-                line += " " * lane_width + " "
+                # Empty cell — but if a band's fractional position
+                # leans toward this row, render a LIGHT glyph for
+                # sub-row resolution (refactor 2026-05-19). Adjacent
+                # bands separated by less than a full row would
+                # otherwise collapse on rounding; the faint tail
+                # surfaces the true position as "between rows".
+                if (row, li) in band_faint:
+                    line += "─" * lane_width + " "
+                else:
+                    line += " " * lane_width + " "
             elif count == 1:
+                # Thin horizontal-line glyph for a single band keeps
+                # the gel image readable — solid blocks read as a
+                # wall rather than a band (user UX call 2026-05-19).
                 line += "━" * lane_width + " "
             elif count == 2:
                 line += "▆" * lane_width + " "
@@ -49264,6 +51206,8 @@ class SimulatorScreen(Screen):
                         yield Button("− Lane", id="btn-sim-gel-rmlane")
                         yield Button("Run gel", id="btn-sim-gel-run",
                                       variant="primary")
+                        yield Button("Library",
+                                      id="btn-sim-gel-library")
                 with Vertical(id="sim-gel-right"):
                     yield Static("", id="sim-gel-image")
 
@@ -49602,6 +51546,81 @@ class SimulatorScreen(Screen):
             self._agarose_pct = float(str(event.value))
         except (TypeError, ValueError):
             return
+
+    @on(Button.Pressed, "#btn-sim-gel-library")
+    def _on_gel_library(self, _) -> None:
+        """Open `GelLibraryModal` with the current Simulator state.
+        On dismiss-with-id, restores the picked gel's lanes +
+        agarose % into the live screen and re-renders. Dismiss-with-
+        None is a no-op (Cancel / Esc)."""
+        self._read_lanes_from_widgets()
+
+        def _on_picked(gel_id) -> None:
+            if not gel_id:
+                return
+            gel = _find_gel(gel_id)
+            if gel is None:
+                self.app.notify(
+                    f"Gel '{gel_id}' has vanished.",
+                    severity="warning",
+                )
+                return
+            # Restore lanes — drop any stray non-dict items and
+            # private widget-id fields. Defensive against a hand-
+            # edited JSON.
+            raw_lanes = gel.get("lanes") or []
+            restored: "list[dict]" = []
+            for ln in raw_lanes:
+                if not isinstance(ln, dict):
+                    continue
+                restored.append({
+                    "name":   ln.get("name") or "",
+                    "source": ln.get("source") or "empty",
+                    "detail": ln.get("detail") or "",
+                })
+            if not restored:
+                self.app.notify(
+                    f"Gel '{gel.get('name', gel_id)}' has no lanes "
+                    "to load.",
+                    severity="warning",
+                )
+                return
+            self._lanes = restored
+            try:
+                agar = float(gel.get("agarose_pct", 1.0))
+                if agar == agar and agar not in (
+                    float("inf"), float("-inf"),
+                ):
+                    self._agarose_pct = max(
+                        _GEL_AGAROSE_MIN,
+                        min(_GEL_AGAROSE_MAX, agar),
+                    )
+            except (TypeError, ValueError):
+                pass
+            self._refresh_lane_rows()
+            # Bring the agarose Select in sync.
+            try:
+                ag = self.query_one("#sim-gel-agarose", Select)
+                ag.value = self._agarose_pct
+            except (NoMatches, ValueError):
+                pass
+            _log_event(
+                "gel.loaded", gid=gel_id,
+                name=gel.get("name", ""),
+                n_lanes=len(self._lanes),
+            )
+            self.app.notify(
+                f"Loaded gel '{gel.get('name', gel_id)}' "
+                f"({len(self._lanes)} lanes).",
+                timeout=4,
+            )
+        self.app.push_screen(
+            GelLibraryModal(
+                current_lanes=list(self._lanes),
+                current_agarose_pct=self._agarose_pct,
+            ),
+            callback=_on_picked,
+        )
 
     @on(Button.Pressed, "#btn-sim-gel-addlane")
     def _on_gel_add_lane(self, _) -> None:
@@ -57496,6 +59515,56 @@ PartsBinPickerModal { align: center middle; }
 #binpick-btns   { height: 3; margin-top: 1; }
 #binpick-btns Button { margin-right: 1; min-width: 10; }
 
+/* ── Experiment projects picker modal ────────────────────── */
+ExperimentProjectsPickerModal { align: center middle; }
+#projpick-dlg {
+    width: 110; height: 30;
+    background: $surface; border: solid $accent; padding: 1 2;
+}
+#projpick-title  {
+    background: $accent; color: $text;
+    padding: 0 1; margin-bottom: 1;
+    text-align: center; text-style: bold;
+}
+#projpick-help   { color: $text-muted; height: auto; margin-bottom: 1; }
+#projpick-table  { height: 1fr; border: solid $primary-darken-2; }
+#projpick-status { height: 1; margin-top: 1; }
+#projpick-btns   { height: 3; margin-top: 1; }
+#projpick-btns Button { margin-right: 1; min-width: 10; }
+
+/* ── Gel library modal ───────────────────────────────────── */
+GelLibraryModal { align: center middle; }
+#gellib-dlg {
+    width: 110; height: 30;
+    background: $surface; border: solid #FFB347; padding: 1 2;
+}
+#gellib-title {
+    background: #FFB347; color: $text;
+    padding: 0 1; margin-bottom: 1;
+    text-align: center; text-style: bold;
+}
+#gellib-help   { color: $text-muted; height: auto; margin-bottom: 1; }
+#gellib-table  { height: 1fr; border: solid $primary-darken-2; }
+#gellib-status { height: 1; margin-top: 1; }
+#gellib-btns   { height: 3; margin-top: 1; }
+#gellib-btns Button { margin-right: 1; min-width: 10; }
+
+/* ── Actions picker modal (insert @actions:<id> tag) ─────── */
+ActionsPickerModal { align: center middle; }
+#actpick-dlg {
+    width: 90; height: 30;
+    background: $surface; border: solid #C77FFF; padding: 1 2;
+}
+#actpick-title  {
+    background: #C77FFF; color: $text;
+    padding: 0 1; margin-bottom: 1;
+    text-align: center; text-style: bold;
+}
+#actpick-help   { color: $text-muted; height: auto; margin-bottom: 1; }
+#actpick-table  { height: 1fr; border: solid $primary-darken-2; }
+#actpick-btns   { height: 3; margin-top: 1; }
+#actpick-btns Button { margin-right: 1; min-width: 10; }
+
 /* ── Collection name prompt + delete confirm ───────────────── */
 CollectionNameModal { align: center middle; }
 #collname-dlg {
@@ -58389,6 +60458,12 @@ SpeciesPickerModal { align: center middle; }
         # children that read the active bin during mount would
         # otherwise see no active bin.
         _ensure_default_parts_bin()
+        # Same idempotent migration for experiment projects — wraps
+        # any pre-existing flat `experiments.json` entries into a
+        # "Main Project" wrapper on first 0.9.7 launch; no-op
+        # afterwards. Mount-ordering rationale same as above —
+        # `ExperimentsScreen` reads the active project during mount.
+        _ensure_default_project()
         # Per-instance alignment list — class-level [] would be shared
         # across instances. Test fixtures (and a hypothetical future
         # multi-app process) must not leak alignment state between
@@ -63769,11 +65844,19 @@ SpeciesPickerModal { align: center middle; }
 
     @_action_log("app.open.experiments")
     def action_open_experiments(self) -> None:
-        """Experiments menu → opens the lab-notebook toolbar screen.
-        Direct-open (no dropdown). The screen handles entry CRUD,
-        markdown compose, image attach, plasmid cross-refs, and
-        spellcheck."""
-        self.push_screen(ExperimentsScreen())
+        """Experiments menu → opens the project picker first; on
+        project pick, pushes the lab-notebook toolbar screen for the
+        newly-active project's entries. Mirrors the parts-bin flow
+        (`PartsBinPickerModal` → `PartsBinModal`) — keeps the user in
+        a project-aware context from the first click rather than
+        burying project switching inside the workbench."""
+        def _on_picked(name):
+            if not name:
+                return
+            self.push_screen(ExperimentsScreen())
+        self.push_screen(
+            ExperimentProjectsPickerModal(), callback=_on_picked,
+        )
 
     # ── Panel focus mode (Ctrl+1 .. Ctrl+5) ────────────────────────────
     # Each Ctrl+N collapses the 4-panel layout down to a single panel

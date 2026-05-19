@@ -98,7 +98,7 @@ class TestExperimentsPersistence:
         entry = {
             "id": "exp-test1234",
             "title": "Cloning round 1",
-            "body_md": "Today: cut with HindIII.\n@plasmid:pUC19",
+            "body_md": "Today: cut with HindIII.\n@pUC19",
             "tags": ["cloning", "round-1"],
         }
         normalised = sc._normalise_experiment_entry(entry, fresh=True)
@@ -232,7 +232,7 @@ class TestNormaliseEntry:
     def test_xref_rebuilt(self):
         e = sc._normalise_experiment_entry({
             "id": "exp-12345678", "title": "t",
-            "body_md": "@plasmid:pA and @plasmid:pB and @plasmid:pA",
+            "body_md": "@pA and @pB and @pA",
             "attached_plasmid_ids": ["stale-ignored"],
         })
         assert e["attached_plasmid_ids"] == ["pA", "pB"]
@@ -267,7 +267,7 @@ class TestNormaliseEntry:
 
 class TestPlasmidRefs:
     def test_extract_unique_in_order(self):
-        body = "See @plasmid:pUC19 and @plasmid:pACYC and @plasmid:pUC19"
+        body = "See @pUC19 and @pACYC and @pUC19"
         assert sc._extract_plasmid_refs(body) == ["pUC19", "pACYC"]
 
     def test_extract_empty(self):
@@ -275,7 +275,7 @@ class TestPlasmidRefs:
         assert sc._extract_plasmid_refs("no refs here") == []
 
     def test_render_produces_links(self):
-        out = sc._render_plasmid_refs("@plasmid:pUC19")
+        out = sc._render_plasmid_refs("@pUC19")
         assert sc._PLASMID_LINK_SCHEME in out
         assert "pUC19" in out
 
@@ -283,17 +283,33 @@ class TestPlasmidRefs:
         assert sc._render_plasmid_refs("plain text") == "plain text"
         assert sc._render_plasmid_refs("") == ""
 
-    def test_regex_rejects_invalid(self):
-        # `@plasmid:` followed by a separator should NOT match a path
-        # under the EXPERIMENTS_DIR (the regex uses a tight character
-        # class).
-        body = "@plasmid:../etc"
-        refs = sc._extract_plasmid_refs(body)
-        # The greedy `\w.\-` doesn't accept `/`, so the match stops
-        # before the separator.
-        for r in refs:
-            assert "/" not in r
-            assert ".." not in r
+    def test_regex_rejects_path_traversal(self):
+        # `@` followed by a separator or dot is rejected by the regex
+        # (id must START with `[A-Za-z]`).
+        assert sc._extract_plasmid_refs("@../etc") == []
+        assert sc._extract_plasmid_refs("@/etc") == []
+        assert sc._extract_plasmid_refs("@.hidden") == []
+
+    def test_regex_rejects_email_suffix(self):
+        # The `(?<![\w@])` lookbehind makes sure `user@example.com`
+        # doesn't tag `example.com` as a plasmid.
+        assert sc._extract_plasmid_refs("user@example.com") == []
+        assert sc._extract_plasmid_refs("@@double") == []
+
+    def test_legacy_format_migrated_on_load(self):
+        """Bodies stored with the pre-2026-05-18 `@plasmid:<id>` /
+        `@actions:<id>` format get rewritten to the single-sigil
+        format on load. The `_save_experiments` mirror persists the
+        migrated body to disk."""
+        # Hand-write a legacy body to disk (bypasses normalise).
+        sc._save_experiments([{
+            "id": "exp-legacy01",
+            "title": "Legacy",
+            "body_md": "Today: @plasmid:pUC19 and @actions:digest",
+        }])
+        sc._experiments_cache = None
+        out = sc._load_experiments()
+        assert out[0]["body_md"] == "Today: @pUC19 and !digest"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -447,8 +463,13 @@ class TestSpellcheckPrimitives:
         assert ms == []
 
     def test_masks_plasmid_ref(self):
-        ms = sc._spellcheck_body("@plasmid:clonded should be skipped.")
-        assert ms == []
+        # Both old `@plasmid:<id>` and new `@<id>` formats are masked.
+        assert sc._spellcheck_body("@plasmid:clonded should be skipped.") == []
+        assert sc._spellcheck_body("@clonded should be skipped.") == []
+
+    def test_masks_action_ref(self):
+        assert sc._spellcheck_body("@actions:clonded test.") == []
+        assert sc._spellcheck_body("!clonded test.") == []
 
     def test_masks_url(self):
         ms = sc._spellcheck_body(
@@ -479,41 +500,66 @@ _TERM = (160, 48)
 
 class TestScreenMount:
     async def test_open_via_action(self):
+        """Experiments menu opens the project picker first (refactor
+        2026-05-18 — mirrors parts-bin); picking a project then
+        pushes the ExperimentsScreen onto the stack."""
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
             await pilot.pause()
             app.action_open_experiments()
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(
+                app.screen, sc.ExperimentProjectsPickerModal,
+            )
+            # Pick the active project (the migration in App.compose
+            # created Main Project and set it active).
+            app.screen._open(None)
             await pilot.pause()
             await pilot.pause()
             assert isinstance(app.screen, sc.ExperimentsScreen)
 
     async def test_open_via_menu_string(self):
-        """`open_menu("Experiments", ...)` should direct-open the screen
-        (no dropdown)."""
+        """`open_menu("Experiments", ...)` routes through the same
+        `action_open_experiments` → picker → screen pipeline."""
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
             await pilot.pause()
-            # Mimic MenuBar.on_click's direct-open branch
             app.action_open_experiments()
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(
+                app.screen, sc.ExperimentProjectsPickerModal,
+            )
+            app.screen._open(None)
             await pilot.pause()
             await pilot.pause()
             assert isinstance(app.screen, sc.ExperimentsScreen)
 
     async def test_initial_state(self):
+        # Split-pane layout (2026-05-18): entries list is always
+        # visible on the left, Compose + Attachments are the two
+        # right-pane tabs. With no entry loaded both tabs are
+        # disabled; `tabs.active` defaults to "exp-sub-compose"
+        # (the `initial=` param on TabbedContent) and Textual
+        # renders it greyed out.
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
             await pilot.pause()
-            app.action_open_experiments()
+            # Bypass picker — these tests exercise screen behaviour,
+            # not the picker → screen pipeline (covered separately).
+            app.push_screen(sc.ExperimentsScreen())
             await pilot.pause()
             await pilot.pause()
             scr = app.screen
             from textual.widgets import TabbedContent, DataTable, TabPane
             tabs = scr.query_one("#exp-tabs", TabbedContent)
-            assert tabs.active == "exp-sub-entries"
-            # Compose + Attachments disabled until an entry exists
+            # Entries table is always-visible in the left pane.
+            scr.query_one("#exp-entries-table", DataTable)
+            # Compose + Attachments are disabled until an entry exists.
             compose = scr.query_one("#exp-sub-compose", TabPane)
             attach  = scr.query_one("#exp-sub-attachments", TabPane)
             assert compose.disabled
@@ -524,7 +570,9 @@ class TestScreenMount:
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
             await pilot.pause()
-            app.action_open_experiments()
+            # Bypass picker — these tests exercise screen behaviour,
+            # not the picker → screen pipeline (covered separately).
+            app.push_screen(sc.ExperimentsScreen())
             await pilot.pause()
             await pilot.pause()
             scr = app.screen
@@ -550,7 +598,9 @@ class TestScreenMount:
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
             await pilot.pause()
-            app.action_open_experiments()
+            # Bypass picker — these tests exercise screen behaviour,
+            # not the picker → screen pipeline (covered separately).
+            app.push_screen(sc.ExperimentsScreen())
             await pilot.pause()
             await pilot.pause()
             scr = app.screen
@@ -563,7 +613,9 @@ class TestScreenMount:
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
             await pilot.pause()
-            app.action_open_experiments()
+            # Bypass picker — these tests exercise screen behaviour,
+            # not the picker → screen pipeline (covered separately).
+            app.push_screen(sc.ExperimentsScreen())
             await pilot.pause()
             await pilot.pause()
             scr = app.screen
@@ -572,7 +624,7 @@ class TestScreenMount:
             await pilot.pause()
             from textual.widgets import TextArea
             ta = scr.query_one("#exp-body", TextArea)
-            ta.text = "Today: @plasmid:pUC19 cut with HindIII"
+            ta.text = "Today: @pUC19 cut with HindIII"
             await pilot.pause()
             scr.action_save_entry()
             await pilot.pause()
@@ -581,12 +633,16 @@ class TestScreenMount:
             assert len(entries) == 1
             assert "pUC19" in entries[0]["attached_plasmid_ids"]
 
-    async def test_close_auto_saves_dirty(self):
+    async def test_close_with_dirty_pops_save_modal(self):
+        """`action_cancel` no longer silent-saves (2026-05-18). When
+        the compose buffer is dirty, it opens
+        `ExperimentUnsavedChangesModal`; the user picks save / abandon
+        / cancel. This test drives the Save path."""
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
             await pilot.pause()
-            app.action_open_experiments()
+            app.push_screen(sc.ExperimentsScreen())
             await pilot.pause()
             await pilot.pause()
             scr = app.screen
@@ -597,25 +653,348 @@ class TestScreenMount:
             ta = scr.query_one("#exp-body", TextArea)
             ta.text = "unsaved body"
             await pilot.pause()
-            # Mark dirty explicitly via the path the screen uses
             scr._mark_dirty(True)
             scr.action_cancel()
             await pilot.pause()
+            await pilot.pause()
+            # Unsaved-changes modal is now on top.
+            assert isinstance(
+                app.screen, sc.ExperimentUnsavedChangesModal,
+            )
+            # Drive Save choice — modal dismisses with "save",
+            # screen's callback persists then dismisses itself.
+            app.screen.dismiss("save")
+            await pilot.pause()
+            await pilot.pause()
             sc._experiments_cache = None
             out = sc._load_experiments()
-            # The auto-save on close persisted the body
             assert any(
                 e.get("body_md") == "unsaved body" for e in out
             ), [e.get("body_md") for e in out]
+
+    async def test_close_dirty_abandon_discards_changes(self):
+        """Picking Abandon dismisses the screen without persisting
+        the dirty body."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.ExperimentsScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            scr.action_new_entry()
+            await pilot.pause()
+            await pilot.pause()
+            sc._experiments_cache = None
+            before = sc._load_experiments()
+            before_bodies = [e.get("body_md") for e in before]
+            from textual.widgets import TextArea
+            ta = scr.query_one("#exp-body", TextArea)
+            ta.text = "should-not-persist"
+            await pilot.pause()
+            scr._mark_dirty(True)
+            scr.action_cancel()
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(
+                app.screen, sc.ExperimentUnsavedChangesModal,
+            )
+            app.screen.dismiss("abandon")
+            await pilot.pause()
+            await pilot.pause()
+            sc._experiments_cache = None
+            after = sc._load_experiments()
+            after_bodies = [e.get("body_md") for e in after]
+            assert "should-not-persist" not in after_bodies
+            assert before_bodies == after_bodies
+
+    async def test_close_dirty_save_failure_keeps_screen(self):
+        """Edge sweep — if `_persist_current` fails inside the Save
+        path (disk full, RO mount), the screen must stay on top so
+        the user can retry. Pre-fix the dismiss happened regardless,
+        silently losing the dirty buffer."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.ExperimentsScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            scr.action_new_entry()
+            await pilot.pause()
+            await pilot.pause()
+            from textual.widgets import TextArea
+            ta = scr.query_one("#exp-body", TextArea)
+            ta.text = "save will fail"
+            await pilot.pause()
+            scr._mark_dirty(True)
+            # Force `_persist_current` to fail.
+            original = scr._persist_current
+            scr._persist_current = lambda: False  # type: ignore
+            scr.action_cancel()
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(
+                app.screen, sc.ExperimentUnsavedChangesModal,
+            )
+            app.screen.dismiss("save")
+            await pilot.pause()
+            await pilot.pause()
+            # ExperimentsScreen is STILL on top — save failed but
+            # we didn't lose the buffer.
+            scr._persist_current = original  # type: ignore
+            assert isinstance(app.screen, sc.ExperimentsScreen)
+            ta2 = app.screen.query_one("#exp-body", TextArea)
+            assert ta2.text == "save will fail"
+
+    async def test_close_dirty_cancel_keeps_screen(self):
+        """Picking Cancel dismisses the modal but keeps the
+        `ExperimentsScreen` on top so the user can keep editing."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.ExperimentsScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            scr.action_new_entry()
+            await pilot.pause()
+            await pilot.pause()
+            from textual.widgets import TextArea
+            ta = scr.query_one("#exp-body", TextArea)
+            ta.text = "still editing"
+            await pilot.pause()
+            scr._mark_dirty(True)
+            scr.action_cancel()
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(
+                app.screen, sc.ExperimentUnsavedChangesModal,
+            )
+            app.screen.dismiss("cancel")
+            await pilot.pause()
+            await pilot.pause()
+            # ExperimentsScreen is back on top, NOT dismissed.
+            assert isinstance(app.screen, sc.ExperimentsScreen)
+            ta2 = app.screen.query_one("#exp-body", TextArea)
+            assert ta2.text == "still editing"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Edge-case sweep — long project name in top-row label
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestProjectLabelTruncation:
+    """Edge sweep 2026-05-18 — a hand-edited `active_project` in
+    settings.json could be arbitrarily long. The header label must
+    truncate so it doesn't push the Projects button off-screen on a
+    narrow terminal."""
+
+    async def test_long_project_name_truncates(self):
+        sc._save_experiment_projects([{
+            "name": "X" * 500, "description": "",
+            "experiments": [], "saved": "",
+        }])
+        sc._set_active_project_name("X" * 500)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.ExperimentsScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            label = scr._format_project_label()
+            # `accent` markup adds ~30 chars; the visible name must
+            # be capped at 60 chars with an ellipsis indicator.
+            assert "…" in label
+            # 60-char name + markup overhead < 110 cols (modal min width)
+            # so the Projects button stays on-screen.
+            assert len(label) < 120
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Markdown link click handler
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class TestActionsTag:
+    """Single-sigil `!<id>` action token + catalog + picker modal."""
+
+    def test_extract_action_refs_basic(self):
+        refs = sc._extract_action_refs(
+            "Today: !digest then !ligate"
+        )
+        assert refs == ["digest", "ligate"]
+
+    def test_extract_action_refs_dedup_preserves_order(self):
+        refs = sc._extract_action_refs(
+            "!pcr first, !gibson, then !pcr again"
+        )
+        assert refs == ["pcr", "gibson"]
+
+    def test_extract_action_refs_accepts_free_form(self):
+        # Catalog is curated but not enforced.
+        refs = sc._extract_action_refs("!my-custom-step")
+        assert refs == ["my-custom-step"]
+
+    def test_extract_action_refs_rejects_invalid_chars(self):
+        # Space terminates the match; the part with space + after isn't
+        # captured.
+        refs = sc._extract_action_refs("!foo bar")
+        assert refs == ["foo"]
+
+    def test_action_regex_rejects_markdown_image(self):
+        # Markdown image syntax `![alt](url)` must not match — the
+        # regex requires the next char after `!` to be a letter,
+        # while images have `[`.
+        assert sc._extract_action_refs("![alt](image.png)") == []
+
+    def test_action_regex_rejects_word_prefix(self):
+        # `foo!bar` shouldn't tag `bar` as an action — the negative
+        # lookbehind `(?<![\w!])` blocks word-adjacent matches.
+        assert sc._extract_action_refs("foo!bar") == []
+        assert sc._extract_action_refs("!!double") == []
+
+    def test_normalise_extracts_action_xref(self):
+        e = sc._normalise_experiment_entry({
+            "id": "exp-aaaaaaaa", "title": "T",
+            "body_md": "@pUC19 then !digest and !transform",
+        }, fresh=True)
+        assert e["attached_plasmid_ids"] == ["pUC19"]
+        assert e["attached_actions"] == ["digest", "transform"]
+
+    def test_catalog_has_expected_categories(self):
+        cats = {cat for cat, _action, _desc in sc._EXPERIMENT_ACTIONS}
+        # Sanity-check the catalog covers the main workflow buckets
+        # so the picker shows something useful in each.
+        assert {"Design", "PCR", "Assembly", "Validation"} <= cats
+
+    def test_chip_color_constants_set(self):
+        assert sc._PLASMID_CHIP_COLOR == "#9AFF80"
+        assert sc._ACTIONS_CHIP_COLOR == "#C77FFF"
+
+    async def test_in_editor_highlights_get_injected(self):
+        """`_ExperimentMarkdownTextArea._build_highlight_map` must
+        inject regex-based highlight tuples for `@<id>` (plasmid)
+        and `!<id>` (action) tokens on top of the markdown tree-
+        sitter highlights. The Rich style mappings for our two
+        highlight names must land in the active theme's
+        `syntax_styles`."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.ExperimentsScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            scr.action_new_entry()
+            await pilot.pause()
+            await pilot.pause()
+            ta = scr.query_one(
+                "#exp-body", sc._ExperimentMarkdownTextArea,
+            )
+            ta.text = "Hello @pUC19 and !digest done."
+            await pilot.pause()
+            await pilot.pause()
+            # Theme has our two style mappings.
+            styles = ta._theme.syntax_styles
+            assert sc._ExperimentMarkdownTextArea._PLASMID_HL_NAME in styles
+            assert sc._ExperimentMarkdownTextArea._ACTIONS_HL_NAME in styles
+            # The single-line body has one plasmid + one action
+            # highlight tuple attached to line 0 (plus any markdown
+            # tree-sitter highlights that came from super()).
+            line0 = ta._highlights[0]
+            names = [name for _s, _e, name in line0]
+            assert (
+                sc._ExperimentMarkdownTextArea._PLASMID_HL_NAME
+                in names
+            )
+            assert (
+                sc._ExperimentMarkdownTextArea._ACTIONS_HL_NAME
+                in names
+            )
+
+    async def test_backspace_at_tag_end_deletes_whole_tag(self):
+        """Backspace at the end of a `@<id>` or `!<id>` token must
+        delete the entire tag, not just the last character. Inside
+        a tag or in normal prose, default behaviour."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.ExperimentsScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            scr.action_new_entry()
+            await pilot.pause()
+            await pilot.pause()
+            ta = scr.query_one(
+                "#exp-body", sc._ExperimentMarkdownTextArea,
+            )
+            ta.text = "hello @pUC19"
+            # Cursor at end (after the last `9`).
+            ta.cursor_location = (0, len(ta.text))
+            await pilot.pause()
+            ta.action_delete_left()
+            await pilot.pause()
+            # Whole tag gone — only the prose remains.
+            assert ta.text == "hello "
+
+    async def test_backspace_action_tag_end(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.ExperimentsScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            scr.action_new_entry()
+            await pilot.pause()
+            await pilot.pause()
+            ta = scr.query_one(
+                "#exp-body", sc._ExperimentMarkdownTextArea,
+            )
+            ta.text = "Today: !digest"
+            ta.cursor_location = (0, len(ta.text))
+            await pilot.pause()
+            ta.action_delete_left()
+            await pilot.pause()
+            assert ta.text == "Today: "
+
+    async def test_backspace_in_prose_is_normal(self):
+        """Sanity: backspace anywhere outside a tag still deletes
+        one character (no false positives from the tail regex)."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.ExperimentsScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            scr.action_new_entry()
+            await pilot.pause()
+            await pilot.pause()
+            ta = scr.query_one(
+                "#exp-body", sc._ExperimentMarkdownTextArea,
+            )
+            ta.text = "hello world"
+            ta.cursor_location = (0, len(ta.text))
+            await pilot.pause()
+            ta.action_delete_left()
+            await pilot.pause()
+            assert ta.text == "hello worl"
+
+
 class TestPlasmidLinkScheme:
     def test_render_link_uses_scheme(self):
-        out = sc._render_plasmid_refs("@plasmid:pTest")
+        out = sc._render_plasmid_refs("@pTest")
         assert "splicecraft://plasmid/pTest" in out
 
     def test_link_scheme_constant(self):
