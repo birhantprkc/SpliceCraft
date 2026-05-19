@@ -2088,6 +2088,46 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
+def _pid_is_splicecraft(pid: int) -> "bool | None":
+    """Return True if `pid`'s argv contains the substring
+    "splicecraft" (case-insensitive), False if argv doesn't match,
+    None if the check is not implementable on this platform / can't
+    be read (kernel restriction, /proc not mounted, etc.).
+
+    Sweep #9 (2026-05-19): used to disambiguate a stale lockfile
+    on a long-uptime system where the PID counter has wrapped and
+    the recorded PID has been reassigned to an unrelated process
+    (sshd, vim, etc.). The pre-fix check (`_pid_alive`) returned
+    True for any live PID, locking the user out of their own data
+    dir indefinitely with the misleading "another splicecraft
+    instance is already running (PID 1234)" error.
+
+    Linux `/proc/<pid>/cmdline` is the canonical source. macOS /
+    BSD don't ship `/proc/<pid>/cmdline`; we'd need `psutil` (not
+    a dep) or `ctypes` + `proc_pidinfo` (platform-specific). The
+    None return correctly preserves the existing pessimistic
+    behaviour on those platforms — caller treats unknown as live.
+    """
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        return None
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            raw = fh.read(4096)
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    except (PermissionError, OSError):
+        return None
+    if not raw:
+        # Kernel threads have empty cmdline. Treat as not-us so we
+        # don't refuse to take the lock when a kernel thread happens
+        # to grab the recorded PID number.
+        return False
+    needle = b"splicecraft"
+    return needle in raw.lower()
+
+
 def _acquire_data_dir_lock(
     data_dir: "Path | None" = None,
     lockfile_override: "Path | None" = None,
@@ -2195,16 +2235,33 @@ def _acquire_data_dir_lock(
                         held_by_pid = None
             except OSError:
                 pass
-            if (held_by_pid is not None
-                    and sys.platform != "win32"
-                    and not _pid_alive(held_by_pid)):
+            # Stale detection — two paths:
+            #   (a) PID is dead → unambiguously stale.
+            #   (b) PID is alive BUT argv doesn't contain "splicecraft"
+            #       → PID-wraparound to an unrelated process (sshd,
+            #       bash, etc.) on a long-uptime system. Without this
+            #       check (sweep #9, 2026-05-19) the user gets locked
+            #       out of their own data dir indefinitely with a
+            #       misleading "splicecraft is already running" error.
+            #       `_pid_is_splicecraft` returns None on platforms
+            #       where the check isn't implementable (macOS, etc.) —
+            #       we preserve the pessimistic "assume live" stance
+            #       there and skip the retake.
+            stale_reason: "str | None" = None
+            if held_by_pid is not None and sys.platform != "win32":
+                if not _pid_alive(held_by_pid):
+                    stale_reason = "no_live_process"
+                else:
+                    is_ours = _pid_is_splicecraft(held_by_pid)
+                    if is_ours is False:
+                        stale_reason = "pid_recycled_to_unrelated"
+            if stale_reason is not None:
                 _log.warning(
-                    "Lockfile %s holds stale PID %d (no live process); "
-                    "retaking the lock.",
-                    lockfile, held_by_pid,
+                    "Lockfile %s holds stale PID %d (%s); retaking the lock.",
+                    lockfile, held_by_pid, stale_reason,
                 )
                 _log_event("lock.stale", path=_scrub_path(str(lockfile)),
-                            stale_pid=held_by_pid)
+                            stale_pid=held_by_pid, reason=stale_reason)
                 try:
                     if sys.platform != "win32":
                         import fcntl  # type: ignore[import-not-found]
@@ -2338,6 +2395,24 @@ def _sweep_orphan_tmp_files(data_dir: "Path | None" = None) -> int:
                 data_dir / _LOST_ENTRIES_DIR_NAME):
         if sub.exists() and sub != data_dir:
             candidate_roots.append(sub)
+    # Sweep #9 (2026-05-19): the experiments attach dir is per-entry
+    # (`<DATA_DIR>/experiments/<entry_id>/img-*`), so a crash mid-
+    # `_atomic_write_bytes` leaves `.tmp` files under the per-entry
+    # subdir. Those count toward `_EXPERIMENT_DIR_MAX_BYTES` and
+    # would slowly squeeze legitimate attaches out. Walk one level
+    # deep so we collect orphans from every entry subdir without
+    # recursing the whole filesystem.
+    exp_root = _EXPERIMENTS_DIR
+    try:
+        if exp_root.exists():
+            for entry_dir in exp_root.iterdir():
+                try:
+                    if entry_dir.is_dir() and not entry_dir.is_symlink():
+                        candidate_roots.append(entry_dir)
+                except OSError:
+                    continue
+    except OSError:
+        pass
 
     for root in candidate_roots:
         try:
@@ -9100,7 +9175,11 @@ def _extract_gbk_member(zip_path: Path, member_name: str) -> str:
     try:
         with zipfile.ZipFile(str(zip_path), "r") as zf:
             try:
-                info = zf.getinfo(member_name)
+                # Sweep #9 (2026-05-19): route through the resolver
+                # so Windows-built zips with backslash separators in
+                # their central directory still match a member name
+                # we stored with forward slashes.
+                info = _zf_get_member_info(zf, member_name)
             except KeyError as exc:
                 raise ValueError(
                     f"member not in zip: {member_name!r}"
@@ -9181,6 +9260,34 @@ def _normalize_zip_member(name: str) -> str:
     Windows-built zips ship `category\\sample.ext` member names; the
     rest of this module assumes forward slashes."""
     return (name or "").replace("\\", "/")
+
+
+def _zf_get_member_info(zf, name: str):
+    """Resolve a zip member by name, transparently handling
+    Windows-built zips whose central directory stores `\\`
+    separators while our internal stored names use `/`.
+
+    Tries `getinfo(name)` first (the common case where the name
+    we stored is the same as the name in the zip). On KeyError,
+    falls back to looking the member up by its normalised form —
+    matches against `_normalize_zip_member(info.filename)` so we
+    catch backslash-stored entries whose normalised form equals
+    the requested name.
+
+    Raises KeyError if no match. Sacred robustness invariant added
+    in Sweep #9 (2026-05-19) — without this, a Windows-built
+    Plasmidsaurus zip on a POSIX host silently degraded the
+    Sequencing tab to error rows because every `zf.getinfo` call
+    KeyError'd against a stored-forward-slash name."""
+    try:
+        return zf.getinfo(name)
+    except KeyError:
+        pass
+    norm_target = _normalize_zip_member(name)
+    for info in zf.infolist():
+        if _normalize_zip_member(info.filename) == norm_target:
+            return info
+    raise KeyError(name)
 
 
 def _parse_plasmidsaurus_zip(zip_path: Path) -> dict:
@@ -9368,7 +9475,7 @@ def _parse_plasmidsaurus_zip(zip_path: Path) -> dict:
             sm = sample.get("summary")
             if sm:
                 try:
-                    info = zf.getinfo(sm)
+                    info = _zf_get_member_info(zf, sm)
                     if info.file_size <= _PLASMIDSAURUS_SUMMARY_MAX_BYTES:
                         with zf.open(info, "r") as fh:
                             data = fh.read(
@@ -9391,7 +9498,7 @@ def _parse_plasmidsaurus_zip(zip_path: Path) -> dict:
             pb = sample.get("perbase")
             if pb:
                 try:
-                    info = zf.getinfo(pb)
+                    info = _zf_get_member_info(zf, pb)
                     # Per-base TSV can run multi-MB on large plasmids;
                     # stream-decode rather than load fully into memory.
                     # Two-layer cap: refuse outright on a central-directory
@@ -9486,13 +9593,17 @@ def _summarize_perbase_tsv(fh, *, max_bytes: "int | None" = None) -> dict:
             return
         if not header_seen_box[0]:
             header_seen_box[0] = True
-            # Header: skip iff col 2 isn't numeric.
+            # Header probe: skip iff col 2 isn't numeric. Sweep #9
+            # (2026-05-19): use `float()` rather than `int()` for
+            # the numeric test so a TSV that ships fractional
+            # `reads_all` (e.g. a sub-sampled assay) doesn't
+            # silently discard its first data row.
             try:
-                int(cols[2])
+                float(cols[2])
             except ValueError:
                 return
         try:
-            v = int(cols[2])
+            v = int(float(cols[2]))
         except ValueError:
             return
         n += 1
@@ -9942,9 +10053,11 @@ def _rotate_seq_record(record, offset: int):
         # wrap case where the feature crosses the original origin.
         flen = _feat_len(s, e, n)
         new_s = (s - offset) % n
+        # Sweep #9 (2026-05-19): the ternary already covers the only
+        # path where the mod could equal 0 (i.e. `new_s + flen == n`).
+        # The follow-up `if new_e == 0 and new_s + flen == n: new_e = n`
+        # was unreachable — removed for clarity.
         new_e = (new_s + flen) % n if (new_s + flen) != n else n
-        if new_e == 0 and new_s + flen == n:
-            new_e = n
         if new_e > new_s and new_e <= n:
             # Linear span in the rotated frame.
             loc = FeatureLocation(new_s, new_e, strand=strand)
@@ -24734,6 +24847,17 @@ _SETTINGS_SCHEMA: "dict[str, tuple[tuple, object]]" = {
     # from Harley King). `None`-default is encoded as 0 so the schema
     # validator passes; hydrate logic treats <6 as "unset".
     "seq_panel_height":        ((int,),                0),
+    # Sweep #9 (2026-05-19): keys added through 0.8.x / 0.9.x that
+    # weren't registered in the schema. Without these entries a
+    # hand-edited or downgrade-round-tripped settings.json could
+    # carry wrong-typed values that bypass `_validate_settings`'
+    # strict-bool/strict-int guard. The unknown-key forward-compat
+    # passthrough catches them today, but the schema is the
+    # documented contract for "what's persisted" and the new keys
+    # belong there.
+    "active_parts_bin":        ((str,),                ""),
+    "active_project":          ((str,),                ""),
+    "experiments_custom_dict": ((list,),               []),
 }
 
 
@@ -24921,7 +25045,13 @@ def _set_setting(key: str, value) -> None:
             prev=_repr_for_log(prev),
         )
     settings[key] = value
-    _settings_cache = dict(settings)
+    # Sweep #9 (2026-05-19): use `_typed_clone` instead of `dict(...)`
+    # — `dict()` is a SHALLOW copy, so a nested-list value (e.g.
+    # `experiments_custom_dict: ["foo", ...]`) would share the
+    # caller's list reference. A subsequent caller-side mutation
+    # would leak into the cache. Mirrors `_save_settings` (line
+    # 24956) and the documented cache contract (invariant #17).
+    _settings_cache = _typed_clone(settings)
     if os.environ.get("SPLICECRAFT_SKIP_SETTINGS_FLUSH", "").strip().lower() in (
         "1", "true", "yes"
     ):
@@ -30960,6 +31090,13 @@ def _blast_db_summary(db: dict) -> str:
 # module top.
 _BLAST_DB_CACHE: "_OD" = _OD()
 _BLAST_DB_CACHE_MAX = 4
+# Sweep #9 (2026-05-19): protect the `_BLAST_DB_CACHE` OrderedDict
+# from concurrent get-or-build (UI thread runs `_blast_get_db`) and
+# `_blast_clear_cache` (collection-mutation paths). GIL prevents
+# corruption but does NOT prevent KeyError if a `clear()` lands
+# between the `in` check and the dict access. Belt-and-suspenders
+# lock removes that race entirely.
+_BLAST_CACHE_LOCK = threading.Lock()
 
 
 def _blast_get_db(program: str,
@@ -30973,13 +31110,20 @@ def _blast_get_db(program: str,
     """
     key = (program, frozenset(collection_names) if collection_names
            else frozenset(), bool(six_frame))
-    if key in _BLAST_DB_CACHE:
-        _BLAST_DB_CACHE.move_to_end(key)
-        return _BLAST_DB_CACHE[key]
+    with _BLAST_CACHE_LOCK:
+        if key in _BLAST_DB_CACHE:
+            _BLAST_DB_CACHE.move_to_end(key)
+            return _BLAST_DB_CACHE[key]
+    # Build OUTSIDE the lock — `_blast_build_db` can take seconds on
+    # a big collection; holding the lock would serialise all reads.
+    # The trade-off: two callers racing on the same uncached key may
+    # both build (wasted work, second build's result discarded).
+    # Acceptable given that BLAST runs are user-driven (rare).
     db = _blast_build_db(program, collection_names, six_frame=six_frame)
-    _BLAST_DB_CACHE[key] = db
-    while len(_BLAST_DB_CACHE) > _BLAST_DB_CACHE_MAX:
-        _BLAST_DB_CACHE.popitem(last=False)
+    with _BLAST_CACHE_LOCK:
+        _BLAST_DB_CACHE[key] = db
+        while len(_BLAST_DB_CACHE) > _BLAST_DB_CACHE_MAX:
+            _BLAST_DB_CACHE.popitem(last=False)
     return db
 
 
@@ -30996,8 +31140,9 @@ def _blast_clear_cache() -> None:
     collection set and refuse to apply it (audit fix 2026-05-14).
     """
     global _BLAST_CACHE_GENERATION
-    _BLAST_CACHE_GENERATION += 1
-    _BLAST_DB_CACHE.clear()
+    with _BLAST_CACHE_LOCK:
+        _BLAST_CACHE_GENERATION += 1
+        _BLAST_DB_CACHE.clear()
 
 
 # ── HMMscan engine (pyhmmer) ──────────────────────────────────────────────────
@@ -37143,6 +37288,16 @@ _EXPERIMENT_BODY_MAX_BYTES = 1_000_000
 # captures. A multi-GB hostile attach would otherwise OOM the loader.
 _EXPERIMENT_IMAGE_MAX_BYTES = 10_000_000
 
+# Megapixel cap for clipboard-paste images on Win/Mac. PIL's
+# `ImageGrab.grabclipboard()` decodes the full bitmap into memory
+# before our byte cap can check anything; without a pixel cap a
+# hostile clipboard (or accidental multi-monitor screenshot) could
+# saturate RAM and bloat `/tmp` with a multi-GB PNG before the byte
+# cap rejects it. 50 MP comfortably covers any realistic screenshot
+# (e.g. 16K monitor = ~88 MP would still be refused; typical
+# 4K = ~8 MP, two-monitor 4K = ~16 MP). Sweep #9 (2026-05-19).
+_EXPERIMENT_CLIP_MAX_PIXELS = 50_000_000
+
 # Per-entry attachments-dir cumulative cap (100 MB) so 20 high-res
 # microscope images can't quietly fill the user's home dir.
 _EXPERIMENT_DIR_MAX_BYTES = 100_000_000
@@ -37165,22 +37320,46 @@ _EXPERIMENT_CLIP_TMP_PREFIX = "exp-clip-"
 # (avoids email-like patterns: `user@example.com` doesn't tag
 # `example.com`). The first id char must be a letter so numeric
 # prose like "rev 2 @ 5pm" doesn't trigger.
-_PLASMID_REF_RE = re.compile(r"(?<![\w@])@([A-Za-z][\w.\-]{0,63})")
+#
+# Sweep #9 (2026-05-19) atomic-group pattern (`(?=(...))\1`):
+# the id captures inside a lookahead THEN is consumed via the
+# `\1` backreference, which prevents backtracking — without this
+# trick the trailing `(?![;=])` reject would just shorten the
+# match (e.g. `&amp;` would match `&am`). With it, any id
+# followed by `;` or `=` is rejected ENTIRELY (HTML entities
+# `&amp;`/`&nbsp;`/`&copy;`, URL params `?foo=bar`). Python 3.10
+# lacks possessive quantifiers (`{0,63}+`) and atomic groups
+# (`(?>...)`) so the lookahead+backref idiom is the portable
+# stand-in. The captured id is still `m.group(1)` and the full
+# match (sigil + id) is still `m.group(0)`.
+_PLASMID_REF_RE = re.compile(
+    r"(?<![\w@])@(?=([A-Za-z][\w.\-]{0,63}))\1(?![;=])"
+)
 _PLASMID_LINK_SCHEME = "splicecraft://plasmid/"
 
 # Action cross-reference token: `!<id>` inline anywhere in the body.
 # Same single-sigil rationale as `@<id>`. `!` doesn't conflict with
 # markdown image syntax `![alt](url)` because our regex requires the
-# next char to be a letter, while images require `[`.
-_ACTIONS_REF_RE = re.compile(r"(?<![\w!])!([A-Za-z][\w.\-]{0,63})")
+# next char to be a letter, while images require `[`. Same atomic-
+# group + trailing-reject hardening as the plasmid pattern (sweep #9).
+_ACTIONS_REF_RE = re.compile(
+    r"(?<![\w!])!(?=([A-Za-z][\w.\-]{0,63}))\1(?![;=])"
+)
 
 # Gel cross-reference token: `&<id>` inline anywhere in the body
 # (2026-05-19). Distinct sigil from plasmid + action so the three
-# object kinds stay visually separable in the editor. `&` doesn't
-# conflict with markdown — entities like `&amp;` always have a
-# trailing `;`, and the id pattern would only swallow the `amp`
-# leaving the `;` as prose; cosmetic at worst.
-_GEL_REF_RE = re.compile(r"(?<![\w&])&([A-Za-z][\w.\-]{0,63})")
+# object kinds stay visually separable in the editor.
+#
+# The sweep #9 atomic-group + trailing-reject hardening was a real
+# bug fix here (not "cosmetic at worst" as the original comment
+# said): the pre-fix regex matched the entity name inside any
+# pasted HTML or markdown export (`&amp;`, `&nbsp;`, `&copy;`...),
+# polluting `attached_gel_ids` on save, false-highlighting in the
+# editor, and surfacing a misleading "no such gel" notify on
+# Ctrl+G click-through.
+_GEL_REF_RE = re.compile(
+    r"(?<![\w&])&(?=([A-Za-z][\w.\-]{0,63}))\1(?![;=])"
+)
 
 # Tail-anchored variants used by `_ExperimentMarkdownTextArea` to
 # detect "cursor sits at the end of a tag" for the whole-tag-delete
@@ -37403,7 +37582,14 @@ def _save_experiments(entries: "list[dict]") -> None:
     with _cache_lock:
         _safe_save_json(_EXPERIMENTS_FILE, entries, "Experiments")
         _experiments_cache = _typed_clone(entries)
-    _sync_active_project_experiments(entries)
+        # Mirror inside the lock so a concurrent reader between the
+        # write and the mirror can't observe a moment where
+        # `experiments.json` reflects the new state but
+        # `experiment_projects.json`'s active-project field still
+        # holds the prior state. RLock allows re-entry; the
+        # `_save_experiment_projects` call inside `_sync_*` re-
+        # acquires safely. Sweep #9 (2026-05-19).
+        _sync_active_project_experiments(entries)
 
 
 # ── Experiment projects (multi-project lab-notebook organisation) ────────────
@@ -38022,13 +38208,28 @@ def _normalise_experiment_entry(entry: dict, *, fresh: bool = False
     body = out.get("body_md")
     if not isinstance(body, str):
         body = ""
-    if len(body.encode("utf-8", errors="replace")) > _EXPERIMENT_BODY_MAX_BYTES:
-        # Truncate by byte budget — slice at chars and re-check until
-        # the encoded length fits. Cheap because the over-cap is rare.
-        body = body[: _EXPERIMENT_BODY_MAX_BYTES]
-        while len(body.encode("utf-8", errors="replace")
-                 ) > _EXPERIMENT_BODY_MAX_BYTES:
-            body = body[: max(0, len(body) - 1024)]
+    # Sweep #9 (2026-05-19): re-apply legacy `@plasmid:` / `@actions:`
+    # tag migration on every save, not only on load. Without this,
+    # a body that arrived into in-memory state via paste / import
+    # AFTER the initial load (when `_migrate_legacy_tag_format`
+    # already ran) would persist back to disk with the old format
+    # and remain unhighlighted / unclickable until the next launch.
+    if "@plasmid:" in body or "@actions:" in body:
+        body = _migrate_legacy_tag_format(body)
+    encoded = body.encode("utf-8", errors="replace")
+    if len(encoded) > _EXPERIMENT_BODY_MAX_BYTES:
+        # Sweep #9 (2026-05-19): byte-cap truncation in one pass.
+        # Pre-fix iterated 1024-char shrinks re-encoding the whole
+        # body each pass — quadratic on multi-MB non-ASCII bodies
+        # (e.g. 3 MB-encoded Chinese / emoji-heavy markdown
+        # triggered seconds of UI freeze on save). New approach:
+        # slice the encoded bytes to the cap, decode with
+        # `errors="ignore"` so a truncation mid-multibyte-sequence
+        # drops the partial sequence cleanly. Single encode +
+        # single decode regardless of body size.
+        body = encoded[:_EXPERIMENT_BODY_MAX_BYTES].decode(
+            "utf-8", errors="ignore",
+        )
     out["body_md"] = body
     raw_tags = out.get("tags") or []
     tags: list[str] = []
@@ -38214,6 +38415,11 @@ class SequencingScreen(Screen):
             start = Path.home()
         self._tree_start: str = str(start)
         self._zip_path: "Path | None" = None
+        # Sweep #9 (2026-05-19): mtime+size of the loaded zip so the
+        # same-path short-circuit invalidates on content drift (user
+        # re-runs Plasmidsaurus and overwrites the local zip with
+        # new data). `None` means no zip loaded yet.
+        self._zip_signature: "tuple[int, int] | None" = None
         # `_members` retained for back-compat with tests / agent paths
         # that scrape the flat .gbk member list off the screen state.
         # New code reads `_parsed_run["samples"]` instead.
@@ -38436,14 +38642,28 @@ class SequencingScreen(Screen):
         without disabling anything that's already in a good state.
 
         Skips re-parse when the same path is clicked twice in a row
-        — a Plasmidsaurus zip parse takes ~50-300 ms per sample
-        (zip seeks + .gbk + per-base TSV scan), so the user double-
-        clicking shouldn't pay the cost twice."""
+        AND the file content hasn't changed — a Plasmidsaurus zip
+        parse takes ~50-300 ms per sample (zip seeks + .gbk +
+        per-base TSV scan), so the user double-clicking shouldn't
+        pay the cost twice. Sweep #9 (2026-05-19): the short-
+        circuit ALSO compares `(mtime_ns, size)` so a re-run that
+        overwrites the same path with new data invalidates the
+        cached parse instead of silently showing stale samples."""
         path = Path(str(event.path))
-        # Same-path short-circuit: nothing to re-do if state is intact.
+        # Same-path short-circuit: nothing to re-do if state is intact
+        # AND the file's mtime+size matches the cached signature.
+        try:
+            st = path.stat()
+            cur_sig: "tuple[int, int] | None" = (
+                int(st.st_mtime_ns), int(st.st_size),
+            )
+        except OSError:
+            cur_sig = None
         if (self._zip_path is not None
                 and Path(self._zip_path) == path
-                and self._parsed_run):
+                and self._parsed_run
+                and cur_sig is not None
+                and self._zip_signature == cur_sig):
             return
         try:
             sel  = self.query_one("#align-selected-zip", Static)
@@ -38485,6 +38705,7 @@ class SequencingScreen(Screen):
             )
             return
         self._zip_path = path
+        self._zip_signature = cur_sig
         self._parsed_run = parsed
         # Flat back-compat list of .gbk members for any caller still
         # reading `_members` (currently only legacy tests).
@@ -38504,6 +38725,7 @@ class SequencingScreen(Screen):
         zip so a fresh pick can't show stale rows. Called from
         `_on_zip_picked` at the top of every pick attempt."""
         self._zip_path = None
+        self._zip_signature = None
         self._parsed_run = {}
         self._members = []
         self._selected_member = None
@@ -38705,7 +38927,7 @@ class SequencingScreen(Screen):
                     out[gbk_member] = ("[red]err[/red]", "—")
                     continue
                 try:
-                    info = zf.getinfo(gbk_member)
+                    info = _zf_get_member_info(zf, gbk_member)
                 except KeyError:
                     out[gbk_member] = ("[red]err[/red]", "—")
                     continue
@@ -39159,6 +39381,11 @@ class ExperimentProjectsPickerModal(ModalScreen):
                   entries table after switching the active pointer.
     """
 
+    # Sweep #9 (2026-05-19): block app-level Ctrl+Z while the picker
+    # is open so a user fat-fingering the shortcut can't unwind plasmid
+    # edits underneath. Attr must come AFTER docstring per invariant #41.
+    _blocks_undo: bool = True
+
     BINDINGS = [
         Binding("escape", "cancel",         "Close"),
         Binding("tab",    "app.focus_next", "Next", show=False),
@@ -39260,18 +39487,35 @@ class ExperimentProjectsPickerModal(ModalScreen):
             self._set_status(f"[red]Project '{name}' not found.[/red]")
             self._repopulate()
             return
-        _set_active_project_name(name)
-        # Refresh `experiments.json` mirror to match the newly-active
-        # project so the next `_load_experiments()` returns the right
-        # entries. Bypass `_save_experiments` here because that would
-        # re-mirror back into the project we just switched to (the
-        # project IS the source of truth in this direction).
+        # Sweep #9 (2026-05-19): atomic project switch. Pre-fix
+        # ordering was `_set_active_project_name` (async daemon
+        # flush) THEN sync `_safe_save_json(_EXPERIMENTS_FILE)` —
+        # power loss in the window between the two writes left
+        # settings.json saying OLD project + experiments.json
+        # holding NEW project's entries. The next UI save would
+        # then mirror NEW entries into OLD project, silently
+        # overwriting OLD's data.
+        #
+        # New ordering: update active-pointer in memory, FORCE
+        # synchronous flush so disk-settings reflects the new
+        # active project, then write experiments. Any crash
+        # between the flush and the experiments write recovers
+        # cleanly because the next launch sees consistent
+        # "active=NEW" + experiments.json still=OLD, then
+        # `_save_experiments` on first mutation correctly mirrors
+        # into NEW (matching the active pointer).
         target = _find_project(name)
         raw_entries = (target or {}).get("experiments", [])
         if not isinstance(raw_entries, list):
             raw_entries = []
         target_entries = [e for e in raw_entries if isinstance(e, dict)]
+        _set_active_project_name(name)
+        _settings_flush_sync()
         try:
+            # Bypass `_save_experiments` here because that would
+            # re-mirror back into the project we just switched to
+            # (the project IS the source of truth in this
+            # direction).
             _safe_save_json(
                 _EXPERIMENTS_FILE, target_entries, "Experiments",
             )
@@ -39517,12 +39761,15 @@ class ExperimentProjectsPickerModal(ModalScreen):
             return
         # If the user deleted the active project, promote the first
         # remaining one to active so subsequent `_save_experiments`
-        # mirror writes land somewhere valid.
+        # mirror writes land somewhere valid. Sweep #9 (2026-05-19):
+        # the active-pointer flip MUST land on disk via
+        # `_settings_flush_sync` BEFORE writing the promoted
+        # project's entries to experiments.json — see the matching
+        # comment in `_open` for the corruption window this closes.
         was_active = _get_active_project_name() == name
         if was_active and remaining:
             promoted = remaining[0].get("name")
             if promoted:
-                _set_active_project_name(promoted)
                 promoted_proj = _find_project(promoted)
                 promoted_entries = (
                     (promoted_proj or {}).get("experiments") or []
@@ -39530,6 +39777,8 @@ class ExperimentProjectsPickerModal(ModalScreen):
                 promoted_entries = [
                     e for e in promoted_entries if isinstance(e, dict)
                 ]
+                _set_active_project_name(promoted)
+                _settings_flush_sync()
                 try:
                     _safe_save_json(
                         _EXPERIMENTS_FILE, promoted_entries,
@@ -39560,6 +39809,8 @@ class ExperimentProjectsPickerModal(ModalScreen):
 class ExperimentDeleteConfirmModal(ModalScreen):
     """Yes / No confirmation for entry deletion. Defaults focus on No
     so a stray Enter can't delete an entry. Esc → No."""
+
+    _blocks_undo: bool = True
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
@@ -39622,6 +39873,8 @@ class ExperimentUnsavedChangesModal(ModalScreen):
       ``"abandon"`` — exit without saving
       ``"cancel"``  — stay on screen (default; Esc + initial focus)
     """
+
+    _blocks_undo: bool = True
 
     BINDINGS = [
         Binding("escape", "cancel",         "Cancel"),
@@ -39691,6 +39944,8 @@ class ExperimentRenameModal(ModalScreen):
     """Rename modal for the entry title. Wraps a single Input — used
     by both the Entries sub-tab's Rename button and any future agent
     path that wants to mutate the title without re-saving the body."""
+
+    _blocks_undo: bool = True
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
@@ -39797,6 +40052,8 @@ class GelLibraryModal(ModalScreen):
       ``str``   — gel id the user picked.
     """
 
+    _blocks_undo: bool = True
+
     BINDINGS = [
         Binding("escape", "cancel",         "Close"),
         Binding("tab",    "app.focus_next", "Next", show=False),
@@ -39808,6 +40065,7 @@ class GelLibraryModal(ModalScreen):
         current_lanes: "list[dict] | None" = None,
         current_agarose_pct: "float | None" = None,
         initial_gel_id: "str | None" = None,
+        inspect_only: bool = False,
     ) -> None:
         super().__init__()
         # Defensive deepcopy of lanes — `SimulatorScreen._lanes` may
@@ -39817,25 +40075,44 @@ class GelLibraryModal(ModalScreen):
         self._current_lanes = current_lanes
         self._current_agarose_pct = current_agarose_pct
         self._initial_gel_id = initial_gel_id
+        # Sweep #9 (2026-05-19): inspect_only flag for the click-through
+        # path (`Ctrl+G` on a `&<id>` tag). In that mode the modal has
+        # no callback target for Load — pre-fix Load was a silent
+        # no-op. Now Load + Save are disabled (Rename / Delete still
+        # work — they mutate gels.json directly without needing a
+        # caller-side restore).
+        self._inspect_only = inspect_only
 
     def compose(self) -> ComposeResult:
         with Vertical(id="gellib-dlg"):
             yield Static("  Gel library  ", id="gellib-title")
-            yield Label(
-                "Saved gel snapshots — load one back into the "
-                "Simulator, or pick one to insert as an "
-                "[b]&<id>[/b] tag in an experiment.",
-                id="gellib-help", markup=True,
-            )
+            if self._inspect_only:
+                yield Label(
+                    "[dim]Inspect-only view — opened from a "
+                    "[b]&<id>[/b] tag click. Use [b]Rename[/b] / "
+                    "[b]Delete[/b] to manage the gel; to load it "
+                    "back into the Simulator, close this modal and "
+                    "open the Simulator's Gel pane → Library.[/]",
+                    id="gellib-help", markup=True,
+                )
+            else:
+                yield Label(
+                    "Saved gel snapshots — load one back into the "
+                    "Simulator, or pick one to insert as an "
+                    "[b]&<id>[/b] tag in an experiment.",
+                    id="gellib-help", markup=True,
+                )
             yield DataTable(id="gellib-table", cursor_type="row",
                             zebra_stripes=True)
             yield Static("", id="gellib-status", markup=True)
             with Horizontal(id="gellib-btns"):
                 yield Button("Load", id="btn-gellib-load",
-                             variant="primary")
+                             variant="primary",
+                             disabled=self._inspect_only)
                 yield Button("Save current",
                              id="btn-gellib-save",
-                             disabled=(self._current_lanes is None))
+                             disabled=(self._current_lanes is None
+                                       or self._inspect_only))
                 yield Button("Rename", id="btn-gellib-rename")
                 yield Button("Delete", id="btn-gellib-del",
                              variant="error")
@@ -40138,30 +40415,48 @@ class ActionsPickerModal(ModalScreen):
       ``str``   — action id to insert into the body.
     """
 
+    _blocks_undo: bool = True
+
     BINDINGS = [
         Binding("escape", "cancel",         "Cancel"),
         Binding("tab",    "app.focus_next", "Next", show=False),
     ]
 
-    def __init__(self, initial_action: "str | None" = None) -> None:
+    def __init__(self, initial_action: "str | None" = None,
+                  *, inspect_only: bool = False) -> None:
         super().__init__()
         self._initial_action = initial_action
+        # Sweep #9 (2026-05-19): inspect_only flag for click-through
+        # path. Same rationale as `GelLibraryModal._inspect_only` —
+        # pre-fix the Insert button was a silent no-op because no
+        # callback was wired.
+        self._inspect_only = inspect_only
 
     def compose(self) -> ComposeResult:
         with Vertical(id="actpick-dlg"):
             yield Static(
                 "  Insert action tag  ", id="actpick-title",
             )
-            yield Label(
-                "Pick an action to insert as [b]!<id>[/b] into "
-                "the body.",
-                id="actpick-help", markup=True,
-            )
+            if self._inspect_only:
+                yield Label(
+                    "[dim]Inspect-only view — opened from a "
+                    "[b]!<id>[/b] tag click. Close and use the "
+                    "[b]Action ref[/b] button in an experiment to "
+                    "insert a tag.[/]",
+                    id="actpick-help", markup=True,
+                )
+            else:
+                yield Label(
+                    "Pick an action to insert as [b]!<id>[/b] into "
+                    "the body.",
+                    id="actpick-help", markup=True,
+                )
             yield DataTable(id="actpick-table", cursor_type="row",
                             zebra_stripes=True)
             with Horizontal(id="actpick-btns"):
                 yield Button("Insert", id="btn-actpick-ok",
-                             variant="primary")
+                             variant="primary",
+                             disabled=self._inspect_only)
                 yield Button("Cancel", id="btn-actpick-cancel")
 
     def on_mount(self) -> None:
@@ -40212,6 +40507,8 @@ class ImageAttachModal(ModalScreen):
     which our 'pure-Python' rule forbids. The Clipboard button is
     disabled on Linux. File-picker route works everywhere.
     """
+
+    _blocks_undo: bool = True
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
@@ -40348,21 +40645,47 @@ class ImageAttachModal(ModalScreen):
                 severity="warning",
             )
             return
-        # An actual PIL image — write to a tmp file in the SAME
-        # directory the modal can read back via the dismiss str path.
-        import tempfile
+        # An actual PIL image — sanity-check dimensions BEFORE save
+        # so a hostile / accidental multi-monitor screenshot can't
+        # bloat /tmp with a multi-GB PNG (sweep #9, 2026-05-19).
         try:
-            fd, tmp = tempfile.mkstemp(
-                suffix=".png", prefix=_EXPERIMENT_CLIP_TMP_PREFIX,
+            w, h = int(img.width), int(img.height)
+        except (AttributeError, TypeError, ValueError):
+            w, h = 0, 0
+        if w <= 0 or h <= 0 or w * h > _EXPERIMENT_CLIP_MAX_PIXELS:
+            self.app.notify(
+                f"Clipboard image too large "
+                f"({w}×{h} = {w * h:,} pixels; cap "
+                f"{_EXPERIMENT_CLIP_MAX_PIXELS:,}). Resize first.",
+                severity="warning",
             )
-            os.close(fd)
+            return
+        # Write to a tmp file the modal returns via the dismiss str
+        # path. Sweep #9 (2026-05-19): the prior `img.save` was bare
+        # — on a failed write (disk-full, permission, decoder error)
+        # the empty tmpfile leaked forever. Wrap in try/finally to
+        # unlink on failure.
+        import tempfile
+        fd, tmp = tempfile.mkstemp(
+            suffix=".png", prefix=_EXPERIMENT_CLIP_TMP_PREFIX,
+        )
+        os.close(fd)
+        save_ok = False
+        try:
             img.save(tmp, "PNG")
+            save_ok = True
             self.dismiss(tmp)
         except Exception as exc:
             self.app.notify(
                 f"Failed to save clipboard image: {exc}",
                 severity="error",
             )
+        finally:
+            if not save_ok:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -40605,6 +40928,17 @@ class _ExperimentMarkdownTextArea(TextArea):
     _ACTIONS_HL_NAME = "splicecraft.action_ref"
     _GEL_HL_NAME     = "splicecraft.gel_ref"
 
+    # Sweep #9 (2026-05-19) — per-line caps for the highlight
+    # builder. Pasted tag-dense content (a 1 MB body of
+    # `@a @a @a ...`) would otherwise rebuild ~750k regex
+    # matches per keystroke and saturate the editor. Lines
+    # longer than the length cap skip highlight injection
+    # entirely; lines within length cap stop at the tag cap.
+    # Body cap of 1 MB still applies — these only affect the
+    # visual coloring on pathological lines.
+    _HIGHLIGHT_LINE_LEN_CAP = 50_000
+    _HIGHLIGHT_PER_LINE_TAG_CAP = 500
+
     class TagOpenRequested(Message):
         """Posted on double-click anywhere in the body. The parent
         screen reads the cursor position to determine which tag (if
@@ -40653,51 +40987,81 @@ class _ExperimentMarkdownTextArea(TextArea):
                 and "&" not in line_text
             ):
                 continue
+            # Sweep #9 (2026-05-19): line-length cap. Pasted tag-dense
+            # content (a 1 MB body of `@a @a @a ...`) would otherwise
+            # rebuild ~750k regex matches per keystroke and saturate
+            # the editor. Lines longer than this skip highlight
+            # injection entirely (the body cap of 1 MB still applies;
+            # this only loses the visual coloring on the abusive line).
+            if len(line_text) > self._HIGHLIGHT_LINE_LEN_CAP:
+                continue
             # ASCII fast path: byte offsets == character offsets, so
             # we can skip the per-match UTF-8 encoding (which was
             # O(K × L) for K matches with average prefix length L —
             # the common case is many tags per line, all ASCII).
+            line_tag_cap = self._HIGHLIGHT_PER_LINE_TAG_CAP
             if line_text.isascii():
+                added = 0
                 for m in _PLASMID_REF_RE.finditer(line_text):
+                    if added >= line_tag_cap:
+                        break
                     self._highlights[line_index].append((
                         m.start(), m.end(), self._PLASMID_HL_NAME,
                     ))
+                    added += 1
                 for m in _ACTIONS_REF_RE.finditer(line_text):
+                    if added >= line_tag_cap:
+                        break
                     self._highlights[line_index].append((
                         m.start(), m.end(), self._ACTIONS_HL_NAME,
                     ))
+                    added += 1
                 for m in _GEL_REF_RE.finditer(line_text):
+                    if added >= line_tag_cap:
+                        break
                     self._highlights[line_index].append((
                         m.start(), m.end(), self._GEL_HL_NAME,
                     ))
+                    added += 1
                 continue
             # Non-ASCII path: build a codepoint→byte position table
             # once for the whole line, then do O(1) lookups per
             # match. Drops the per-match `len(prefix.encode())`
-            # cost from O(L) to O(1).
+            # cost from O(L) to O(1). Same per-line cap as the
+            # ASCII fast path (sweep #9).
             positions = [0]
             cur = 0
             for ch in line_text:
                 cur += len(ch.encode("utf-8"))
                 positions.append(cur)
+            added = 0
             for m in _PLASMID_REF_RE.finditer(line_text):
+                if added >= line_tag_cap:
+                    break
                 self._highlights[line_index].append((
                     positions[m.start()],
                     positions[m.end()],
                     self._PLASMID_HL_NAME,
                 ))
+                added += 1
             for m in _ACTIONS_REF_RE.finditer(line_text):
+                if added >= line_tag_cap:
+                    break
                 self._highlights[line_index].append((
                     positions[m.start()],
                     positions[m.end()],
                     self._ACTIONS_HL_NAME,
                 ))
+                added += 1
             for m in _GEL_REF_RE.finditer(line_text):
+                if added >= line_tag_cap:
+                    break
                 self._highlights[line_index].append((
                     positions[m.start()],
                     positions[m.end()],
                     self._GEL_HL_NAME,
                 ))
+                added += 1
 
     def on_click(self, event) -> None:
         """Double-click anywhere in the body posts `TagOpenRequested`
@@ -40951,10 +41315,12 @@ class ExperimentsScreen(Screen):
                     id="exp-tags-input",
                 )
             yield Static(
-                "[dim]Markdown source. Use [b]`@plasmid:<id>`[/b] "
-                "anywhere to cross-reference a library plasmid — "
-                "use the [b]Plasmid ref[/b] button or [b]^R[/b] to "
-                "insert one.[/]",
+                "[dim]Markdown source. Cross-refs: "
+                "[b]`@<id>`[/b] plasmid, [b]`!<id>`[/b] action, "
+                "[b]`&<id>`[/b] gel. Insert via the "
+                "[b]Plasmid ref[/b] / [b]Action ref[/b] / "
+                "[b]Gel ref[/b] buttons or [b]^R[/b]. "
+                "[b]^G[/b] (or double-click) jumps to the tag's source.[/]",
                 id="exp-compose-hint", markup=True,
             )
             yield _ExperimentMarkdownTextArea(
@@ -41177,6 +41543,23 @@ class ExperimentsScreen(Screen):
             n_tags=len(upd.get("tags") or []),
             n_refs=len(upd.get("attached_plasmid_ids") or []),
         )
+        # Sweep #9 (2026-05-19): re-sync the TextArea to the
+        # normalised body. If the save path truncated the body
+        # (>1 MB cap), the on-screen text would otherwise still
+        # show the pre-truncation content while the disk holds
+        # the truncated version — every next keystroke marks
+        # "dirty" and the user thinks save didn't work. Comparing
+        # `raw_body` vs the normalised `body_md` tells us if a
+        # mutation happened; if so, replace the TextArea contents
+        # and (since `load_text` will fire an edit event) reset
+        # the dirty flag.
+        normalised_body = upd.get("body_md") or ""
+        if normalised_body != raw_body:
+            try:
+                ta = self.query_one("#exp-body", TextArea)
+                ta.load_text(normalised_body)
+            except (NoMatches, Exception):
+                pass
         self._mark_dirty(False)
         self._refresh_entries_table()
         return True
@@ -41606,7 +41989,15 @@ class ExperimentsScreen(Screen):
         switch the active collection if needed, dismiss the
         Experiments screen, then load the plasmid onto the main
         canvas via `_apply_record`. Notifies and stays put if the
-        plasmid isn't found anywhere."""
+        plasmid isn't found anywhere.
+
+        Sweep #9 (2026-05-19): if the main canvas has unsaved
+        edits, prompt before navigating away. Without this guard
+        a click-through tag silently discarded the user's
+        in-progress plasmid work (data loss). Same
+        `UnsavedNavigateModal` pattern the `LibraryPanel._btn_back`
+        path uses (line 13900).
+        """
         matches = _search_collections_library(target_id, limit=10)
         chosen = None
         for m in matches:
@@ -41621,17 +42012,42 @@ class ExperimentsScreen(Screen):
             return
         coll_name = chosen.get("collection") or ""
         entry_id = chosen.get("id") or ""
-        # Dismiss BEFORE switch+load so the user sees the loaded
-        # plasmid behind the (now-gone) screen rather than us trying
-        # to redraw a half-disposed widget tree.
-        self.dismiss(None)
-        try:
-            self._switch_and_load_plasmid(coll_name, entry_id)
-        except (OSError, ValueError, AttributeError):
-            _log.exception(
-                "ExperimentsScreen: switch_and_load failed for %r",
-                target_id,
-            )
+
+        def _do_switch_and_load() -> None:
+            # Dismiss BEFORE switch+load so the user sees the loaded
+            # plasmid behind the (now-gone) screen rather than us
+            # trying to redraw a half-disposed widget tree.
+            self.dismiss(None)
+            try:
+                self._switch_and_load_plasmid(coll_name, entry_id)
+            except (OSError, ValueError, AttributeError):
+                _log.exception(
+                    "ExperimentsScreen: switch_and_load failed for %r",
+                    target_id,
+                )
+
+        app = self.app
+        if not getattr(app, "_unsaved", False):
+            _do_switch_and_load()
+            return
+
+        def _on_unsaved_response(result: "str | None") -> None:
+            if result == "save":
+                do_save = getattr(app, "_do_save", None)
+                if callable(do_save) and do_save():
+                    _do_switch_and_load()
+                # Save failed → user stays in Experiments to retry.
+            elif result == "discard":
+                discard = getattr(app, "_discard_changes", None)
+                if callable(discard):
+                    discard()
+                _do_switch_and_load()
+            # None → cancel; user stays in Experiments.
+
+        app.push_screen(
+            UnsavedNavigateModal(f"open plasmid `{target_id}`"),
+            callback=_on_unsaved_response,
+        )
 
     def _switch_and_load_plasmid(
         self, coll_name: str, entry_id: str,
@@ -41715,8 +42131,13 @@ class ExperimentsScreen(Screen):
             )
             return
         _log_event("gel.ref.opened", id=safe)
+        # Sweep #9 (2026-05-19): inspect_only=True so the Load /
+        # Save buttons are disabled — pre-fix Load was a silent
+        # no-op because no callback was wired to consume the
+        # dismiss payload.
         self.app.push_screen(
-            GelLibraryModal(initial_gel_id=safe), callback=None,
+            GelLibraryModal(initial_gel_id=safe, inspect_only=True),
+            callback=None,
         )
 
     def _open_action_ref(self, action_id: str) -> None:
@@ -41724,8 +42145,12 @@ class ExperimentsScreen(Screen):
         catalog accepts free-form ids so an action that isn't in
         the curated catalog just lands cursor at row 0."""
         _log_event("action.ref.opened", id=action_id)
+        # Sweep #9 (2026-05-19): inspect_only=True so Insert is
+        # disabled — pre-fix Insert was a silent no-op.
         self.app.push_screen(
-            ActionsPickerModal(initial_action=action_id),
+            ActionsPickerModal(
+                initial_action=action_id, inspect_only=True,
+            ),
             callback=None,
         )
 
@@ -41917,30 +42342,63 @@ class ExperimentsScreen(Screen):
         )
 
     def _confirm_delete(self) -> None:
+        # Sweep #9 (2026-05-19): cursor-first resolution. Pre-fix this
+        # preferred `_current_entry` (= loaded into compose) over the
+        # entries-table cursor, which surfaced a user-visible bug:
+        # cursor on row A, loaded B, click Delete → deleted B.
+        # Arrow-key cursor moves don't fire `_on_entry_selected`
+        # (that's RowSelected = Enter), so the two states drift
+        # apart. Now the cursor wins; only when there's no cursor
+        # at all do we fall back to the loaded entry.
         eid: "str | None" = None
         title: str = "(untitled)"
-        if self._current_entry is not None:
-            eid = self._current_entry.get("id")
-            title = self._current_entry.get("title") or title
-        else:
-            # Pull from the entries table cursor if compose isn't active.
-            try:
-                t = self.query_one("#exp-entries-table", DataTable)
-                if t.row_count == 0 or t.cursor_row < 0:
-                    self.app.notify(
-                        "Pick a row first.", severity="warning",
-                    )
-                    return
-                row_key = t.coordinate_to_cell_key(_Coordinate(t.cursor_row, 0)).row_key
-                eid = row_key.value
+        try:
+            t = self.query_one("#exp-entries-table", DataTable)
+            cur_eid: "str | None" = None
+            if t.row_count > 0 and t.cursor_row >= 0:
+                try:
+                    row_key = t.coordinate_to_cell_key(
+                        _Coordinate(t.cursor_row, 0),
+                    ).row_key
+                    cur_eid = row_key.value
+                except Exception:
+                    cur_eid = None
+            if cur_eid:
+                eid = cur_eid
                 for e in _load_experiments():
                     if e.get("id") == eid:
                         title = e.get("title") or title
                         break
-            except (NoMatches, Exception):
+            elif self._current_entry is not None:
+                eid = self._current_entry.get("id")
+                title = self._current_entry.get("title") or title
+            else:
+                self.app.notify(
+                    "Pick a row first.", severity="warning",
+                )
+                return
+        except NoMatches:
+            # No entries table visible (shouldn't happen on this
+            # screen, but fall through to loaded-entry just in case).
+            if self._current_entry is not None:
+                eid = self._current_entry.get("id")
+                title = self._current_entry.get("title") or title
+            else:
                 return
         if not eid:
             return
+        # Sweep #9 (2026-05-19): capture cursor row BEFORE the confirm
+        # modal pushes (similar pattern to LibraryPanel's sticky delete
+        # cursor, line ~13997). The confirm modal holds focus, so this
+        # row index is still authoritative when the callback fires.
+        cur_row_before = -1
+        try:
+            t = self.query_one("#exp-entries-table", DataTable)
+            cur_row_before = (
+                t.cursor_row if t.cursor_row is not None else -1
+            )
+        except (NoMatches, Exception):
+            pass
 
         def _on_confirmed(yes) -> None:
             if not yes:
@@ -41961,6 +42419,18 @@ class ExperimentsScreen(Screen):
                 self._apply_subtab_gating(enabled=False)
                 self._mark_dirty(False)
             self._refresh_entries_table()
+            # Restore cursor onto the row just below the deleted one
+            # (or the new last row if we deleted from the bottom).
+            # Pre-fix the table re-populate jumped cursor to row 0.
+            try:
+                t = self.query_one("#exp-entries-table", DataTable)
+                if t.row_count > 0:
+                    new_row = max(0, min(
+                        cur_row_before, t.row_count - 1,
+                    ))
+                    t.move_cursor(row=new_row)
+            except (NoMatches, Exception):
+                pass
             self.app.notify(f"Deleted: {title}", timeout=4)
         self.app.push_screen(
             ExperimentDeleteConfirmModal(
@@ -52525,6 +52995,15 @@ class LibrarySearchModal(ModalScreen):
     def _on_query_submitted(self, _event: Input.Submitted) -> None:
         # Enter in the input == press Open if there's a match.
         if not self._matches:
+            # Sweep #9 (2026-05-19): notify on empty result so the
+            # user gets feedback instead of silent no-op.
+            try:
+                self.app.notify(
+                    "No matches — try a different query.",
+                    severity="warning", timeout=4,
+                )
+            except Exception:
+                pass
             return
         try:
             t = self.query_one("#libsearch-table", DataTable)
@@ -53291,6 +53770,12 @@ class RestoreFromBackupModal(ModalScreen):
         ("Collections",          "_COLLECTIONS_FILE"),
         ("Parts bin",            "_PARTS_BIN_FILE"),
         ("Primers",              "_PRIMERS_FILE"),
+        # Sweep #9 (2026-05-19): 0.9.6 added these persisted files
+        # but the in-app restore UI was never extended; users had
+        # backups on disk with no UI to reach them.
+        ("Experiments",          "_EXPERIMENTS_FILE"),
+        ("Experiment projects",  "_EXPERIMENT_PROJECTS_FILE"),
+        ("Gels",                 "_GELS_FILE"),
     ]
 
     def __init__(self, initial_target: str = "_LIBRARY_FILE") -> None:
@@ -57450,6 +57935,15 @@ def _settings_validator_bool(value):
 
 def _settings_validator_int_range(lo: int, hi: int):
     def _v(value):
+        # Sweep #9 (2026-05-19): reject bool BEFORE coercing.
+        # `_coerce_int(True)` returns 1 (Python truthiness), but
+        # invariant #41 documents strict bool-vs-int separation
+        # for settings — `_validate_settings` enforces it on the
+        # disk-load path, this validator now does the same for
+        # the agent-API path. Without this, `set-setting
+        # min_primer_binding=true` silently succeeded with value 1.
+        if isinstance(value, bool):
+            return None, "must be int (got bool)"
         result = _coerce_int(value, name="value")
         if isinstance(result, str):
             return None, result
@@ -58170,7 +58664,11 @@ def _h_restore_pre_update_snapshot(app, payload):
         _log.exception("agent restore-pre-update-snapshot: write failed")
         return ({"error": f"restore write failed: {exc}"}, 500)
     # Bust every cached user-data so post-restore reads see the
-    # restored state.
+    # restored state. Sweep #9 (2026-05-19): added experiments /
+    # experiment_projects / gels caches that landed in 0.9.6;
+    # without these, the next UI mutation would silently overwrite
+    # the freshly-restored disk state from the stale in-memory
+    # cache.
     for cache_attr in (
             "_library_cache", "_collections_cache",
             "_parts_bin_cache", "_parts_bin_collections_cache",
@@ -58178,6 +58676,8 @@ def _h_restore_pre_update_snapshot(app, payload):
             "_feature_colors_cache", "_grammars_cache",
             "_entry_vectors_cache", "_codon_tables_cache",
             "_settings_cache",
+            "_experiments_cache", "_experiment_projects_cache",
+            "_gels_cache",
     ):
         globals()[cache_attr] = None
     return {"ok": True, "report": report}
@@ -61231,12 +61731,24 @@ SpeciesPickerModal { align: center middle; }
         # generation counter (library, parts_bin, primers, collections,
         # entry_vectors, settings) need the reset.
         for path, label, cache_attr in [
-            (_LIBRARY_FILE,        "Plasmid library",     "_library_cache"),
-            (_PARTS_BIN_FILE,      "Parts bin",           "_parts_bin_cache"),
-            (_PRIMERS_FILE,        "Primer library",      "_primers_cache"),
-            (_COLLECTIONS_FILE,    "Plasmid collections", "_collections_cache"),
-            (_ENTRY_VECTORS_FILE,  "Entry vectors",       "_entry_vectors_cache"),
-            (_SETTINGS_FILE,       "Settings",            "_settings_cache"),
+            (_LIBRARY_FILE,            "Plasmid library",     "_library_cache"),
+            (_PARTS_BIN_FILE,          "Parts bin",           "_parts_bin_cache"),
+            (_PARTS_BIN_COLLECTIONS_FILE,
+                                       "Parts-bin collections",
+                                       "_parts_bin_collections_cache"),
+            (_PRIMERS_FILE,            "Primer library",      "_primers_cache"),
+            (_COLLECTIONS_FILE,        "Plasmid collections", "_collections_cache"),
+            (_ENTRY_VECTORS_FILE,      "Entry vectors",       "_entry_vectors_cache"),
+            (_SETTINGS_FILE,           "Settings",            "_settings_cache"),
+            # Sweep #9 (2026-05-19): 0.9.6's new persisted files.
+            # Without launch-time validation, corruption only
+            # surfaces on lazy first-load (warning lands in log,
+            # not always reaching the user via notify).
+            (_EXPERIMENTS_FILE,        "Experiments",         "_experiments_cache"),
+            (_EXPERIMENT_PROJECTS_FILE,
+                                       "Experiment projects",
+                                       "_experiment_projects_cache"),
+            (_GELS_FILE,               "Gels",                "_gels_cache"),
         ]:
             globals()[cache_attr] = None
             _, warning = _safe_load_json(path, label)
@@ -61958,14 +62470,20 @@ SpeciesPickerModal { align: center middle; }
         sp = self.query_one("#seq-panel", SequencePanel)
 
         # ── Ctrl+Z: undo ──────────────────────────────────────────────────────
+        # Route through the PUBLIC `action_undo` (NOT the private
+        # `_action_undo`) so the `_undo_blocked_by_modal()` guard
+        # fires. Sweep #9 (2026-05-19) — previously the keyboard
+        # shortcut bypassed the guard, making modal `_blocks_undo`
+        # dead code via Ctrl+Z (menu-Undo respected it, keyboard
+        # did not).
         if event.key == "ctrl+z":
-            self._action_undo()
+            self.action_undo()
             event.stop()
             return
 
         # ── Ctrl+Shift+Z / Ctrl+Y: redo ───────────────────────────────────────
         if event.key in ("ctrl+shift+z", "ctrl+Z", "ctrl+y"):
-            self._action_redo()
+            self.action_redo()
             event.stop()
             return
 
@@ -67125,13 +67643,38 @@ def main():
     # for the test suite + ad-hoc development; nothing in main() calls
     # it anymore.
 
+    # Sweep #9 (2026-05-19): install SIGTERM + SIGHUP handlers so
+    # systemd shutdown / container stop / `kill -15 <pid>` runs the
+    # teardown `finally` block (lockfile release, settings flush,
+    # worker drain, log shutdown). Python's default SIGTERM handler
+    # is an immediate silent exit, which skips `finally` entirely.
+    # Translating to `KeyboardInterrupt` lets the same Ctrl+C cleanup
+    # path handle both signals. POSIX-only; Windows has no SIGTERM
+    # equivalent in this sense (CTRL_BREAK_EVENT on Windows already
+    # raises KeyboardInterrupt).
+    import signal as _signal
+    def _signal_to_interrupt(signum, _frame):  # pragma: no cover - signal cb
+        raise KeyboardInterrupt(f"signal {signum}")
+    for _sig_name in ("SIGTERM", "SIGHUP"):
+        _sig = getattr(_signal, _sig_name, None)
+        if _sig is not None:
+            try:
+                _signal.signal(_sig, _signal_to_interrupt)
+            except (ValueError, OSError):
+                # ValueError: not main thread (won't happen here, but
+                # defensive). OSError: signal not assignable on this
+                # platform.
+                pass
+
     try:
         app.run()
     except KeyboardInterrupt:
-        # Ctrl+C at the terminal — the Textual app may have already
-        # shut itself down; surface as a normal exit, not a stack
-        # trace. The `finally` below still runs.
-        _log.info("SpliceCraft session %s interrupted by user", _SESSION_ID)
+        # Ctrl+C at the terminal OR a SIGTERM/SIGHUP translated to
+        # KeyboardInterrupt by our signal handlers above. Either way
+        # surface as a normal exit, not a stack trace; the `finally`
+        # below still runs.
+        _log.info("SpliceCraft session %s interrupted (signal/Ctrl+C)",
+                  _SESSION_ID)
     except Exception:
         _log.exception("App terminated with unhandled exception")
         raise

@@ -46,8 +46,11 @@ def _data_dir() -> Path:
     a hand-rolled fallback so the CLI doesn't pull in `platformdirs`
     just for one path lookup (keeps imports stdlib-only)."""
     override = os.environ.get("SPLICECRAFT_DATA_DIR")
-    if override:
-        return Path(override).expanduser()
+    # Sweep #9 (2026-05-19): strip + truthiness check so a stray
+    # `SPLICECRAFT_DATA_DIR=" "` (shell scripting bug) doesn't land
+    # us on a literal whitespace-named relative dir.
+    if override and override.strip():
+        return Path(override.strip()).expanduser()
     try:
         from platformdirs import user_data_dir   # noqa: WPS433 (lazy)
         return Path(user_data_dir("splicecraft", appauthor=False,

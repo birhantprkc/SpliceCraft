@@ -14,29 +14,280 @@
 
 ---
 
-## [0.9.6] — 2026-05-19
+## [0.9.6] — 2026-05-19 — Experiments lab notebook · projects layer · gels library
 
-_(auto-generated from commits since v0.9.5)_
+Builds the Experiments toolbar entry from scratch (markdown editor,
+image attach, spellcheck) and follows it with a same-day refactor
+turning Experiments into a multi-project workspace mirroring the
+parts-bin / collections pattern. Promotes saved agarose gels to a
+first-class persisted object via `gels.json`. Tag system overhauled
+to single-sigil syntax (`@` plasmid, `!` action, `&` gel) with
+in-editor coloring and cursor-position click-to-open dispatch.
 
-* Experiments projects + gels library · sigil tags · click-to-open
-* Experiments lab-notebook toolbar · markdown editor + spellcheck + image attach
+### Experiments lab notebook (new)
+
+- **`Menu → Experiments`** opens the full-screen `ExperimentsScreen`
+  for cloning runs, protocol notes, and observations. Split-pane
+  layout: always-visible entries list on the left, `TabbedContent`
+  with `Compose` (markdown `TextArea`) and `Attachments` (image
+  grid) on the right.
+- **Image attach** via `ImageAttachModal` — `DirectoryTree` filtered
+  to image extensions. On Win/Mac the modal also exposes a "Paste
+  from clipboard" button via `Pillow.ImageGrab.grabclipboard()`; on
+  Linux/WSL the button is disabled (no pure-Python clipboard image
+  API on those platforms).
+- **Spellcheck** via pyspellchecker (bundled English wordlist, no
+  network). `F7` or "Spellcheck" button → `SpellcheckModal` lists
+  misspellings + suggestions with per-row Replace / Add-to-dict /
+  Skip. Custom dictionary persists via the `experiments_custom_dict`
+  setting. Code spans, URLs, markdown links, and plasmid xrefs are
+  masked before tokenisation so non-prose regions don't pollute the
+  list.
+- **Persistence**: `experiments.json` envelope-v1 with the full
+  four-layer data-safety net (invariant #31). Sized caps: 1 MB body,
+  10 MB image, 100 MB per-entry attach dir. Registered with
+  `_USER_DATA_FILE_ATTRS` / `_USER_DATA_DIR_ATTRS` so
+  `splicecraft update` snapshots them before any install subprocess.
+
+### Experiments projects (refactor)
+
+- **`experiment_projects.json`** holds all named projects, each
+  carrying its own `experiments: list[dict]`. Mirrors the parts-bin
+  pattern — cache + `_cache_lock` + deepcopy-on-read+save.
+- **`Menu → Experiments`** now opens `ExperimentProjectsPickerModal`
+  first (1:1 mirror of `PartsBinPickerModal` — Open / New / Rename /
+  Duplicate / Delete / Close). Picking a project sets it active and
+  pushes `ExperimentsScreen` for that project's entries.
+- **First-run migration** wraps existing `experiments.json` entries
+  into `_DEFAULT_PROJECT_NAME = "Main Project"`. Called from
+  `compose()` (not `on_mount`) per invariant #9.
+- **New sacred invariant — Experiments mirror**: every entry save
+  MUST go through `_save_experiments`, which calls
+  `_sync_active_project_experiments` so `experiment_projects.json`'s
+  active-project field stays in lockstep with `experiments.json`.
+  Same threat model as invariant #10 (collections mirror).
+
+### Gels library (new)
+
+- **`gels.json`** holds named Simulator gel snapshots. The
+  Save / Load / Rename / Delete flow lives in the Gel pane's new
+  `Library` button. `GelLibraryModal` is dual-context (Simulator
+  save+load OR Experiments tag-insert OR click-to-open
+  scroll-to-entry).
+- **Schema**: `{id, name, lanes, agarose_pct, notes, created_at,
+  updated_at}` with envelope v1. Agarose clamped to 0.3–5.0 %
+  (NaN / inf rejected); lane list capped at 20.
+
+### Tag system — single sigils
+
+- **`@<id>`** — plasmid xref (lime `#9AFF80`).
+- **`!<id>`** — action xref (purple `#C77FFF`), curated catalog of
+  19 actions across Design / PCR / Restriction / Assembly /
+  Purification / Biological / Validation buckets.
+- **`&<id>`** — gel xref (orange `#FFB347`).
+- **In-editor coloring** via `_ExperimentMarkdownTextArea` — subclass
+  overrides `_build_highlight_map` to inject regex-based highlights
+  into the active theme's `syntax_styles`. ASCII fast-path skips
+  per-match UTF-8 encoding; non-ASCII path builds a codepoint→byte
+  table once per line.
+- **Backspace at tag end** deletes the entire tag instead of one
+  char. Mid-tag and prose backspaces fall through to default.
+- **Lookbehinds** reject email (`user@example.com`), double-sigil
+  (`@@`, `!!`, `&&`), and word-prefix false positives. The
+  next-char-must-be-letter rule keeps markdown image syntax
+  (`![alt](url)`) safe.
+- **Legacy migration**: the pre-2026-05-18 `@plasmid:<id>` /
+  `@actions:<id>` format is rewritten to single-sigil on every
+  `_load_experiments` call. One-way migration; once a body lands
+  back on disk through `_save_experiments`, the old format is gone.
+
+### Click-to-open
+
+- **`Ctrl+G`** scans the cursor's line for any tag spanning the
+  cursor column and dispatches to the matching modal.
+- **Double-click** in the `TextArea` posts a `TagOpenRequested`
+  event that routes to the same handler (single-click cursor
+  placement is untouched).
+- Plasmid hit → auto-save dirty compose → search every collection
+  via `_search_collections_library` → switch active + load via
+  `_apply_record`. Gel hit → `GelLibraryModal(initial_gel_id)`
+  scrolled to that entry. Action hit → `ActionsPickerModal` scrolled
+  to that catalog row. No-tag / unknown id → friendly notify, screen
+  stays put.
+
+### Gel renderer polish
+
+- **Lane bands align column-for-column with wells**
+  (`line_left.ljust(label_col)`) — pre-fix, labelled rows shifted
+  bands one column left.
+- **Out-of-window fragments extrapolate via soft-asymptote** so
+  multiple sub-resolution bands retain size ordering (pre-fix, two
+  below-window fragments hard-clamped to the same row).
+- **Sub-row fractional rendering** paints a faint `─` tail on the
+  adjacent row for bands whose mobility falls between row centers —
+  visible granularity below integer-row resolution.
+
+### Hardening
+
+- **Full-ancestor symlink walk** in `_experiment_attach_dir` (was
+  2-level pre-refactor). A symlink at any depth — `_EXPERIMENTS_DIR`
+  itself, `_DATA_DIR`, or any ancestor up to root — refuses the
+  path.
+- **Body-over-cap detection BEFORE save** with user notify (was
+  silent truncate).
+- **Dedup-by-id save** replaces ALL matches, not just the first —
+  defensive against hand-edited JSON.
+- **Clipboard tmp file cleanup** — `_EXPERIMENT_CLIP_TMP_PREFIX`
+  files are unlinked after the bytes are copied (pre-fix the OS
+  tmpdir slowly accumulated orphan PNGs).
+- **Unsaved-changes guard** — `ExperimentsScreen.action_cancel` no
+  longer silent-saves on Esc/Close when the compose buffer is dirty.
+  `ExperimentUnsavedChangesModal` (Save / Abandon / Cancel) pops
+  with default-Cancel; save failure keeps the screen alive so the
+  user can retry without losing their buffer.
+
+### Hard deps added
+
+- `Pillow>=10.0` — image bytes + Win/Mac clipboard grab.
+- `pyspellchecker>=0.8.0` — English wordlist.
+- `rich-pixels>=3.0.0` — Unicode half-block image render in any
+  terminal (kitty / sixel / iTerm protocols NOT required).
+- All three are pure-Python wheels; no system shell-out.
+
+### Tests
+
+- **+260** across new `test_gels.py` + `test_experiment_projects.py`
+  plus additions to `test_experiments.py`, `test_simulator.py`, and
+  `test_modal_boundaries.py`. **2,841 passing.**
 
 ---
 
-## [0.9.5] — 2026-05-18
+## [0.9.5] — 2026-05-18 — Auto-load picks natural-sort-first entry
 
-_(auto-generated from commits since v0.9.4)_
+`PlasmidApp.on_mount` was picking `_load_library()[0]` (insertion
+order) on no-arg launch, but `LibraryPanel` sorts entries by
+`_natural_sort_key` for display. A user whose first-inserted plasmid
+sorted to the bottom of the visible list (e.g. a stray 1 kb `X`
+record at the top of insertion order in a library full of `pBin*`
+and NCBI-accession entries) would see the canvas load that bottom
+plasmid instead of the visually-first one.
 
-* Auto-load picks natural-sort-first library entry (was insertion-order)
+Fix: natural-sort the library BEFORE picking `[0]`. Sacred invariant
+#33 (display sort and lookup sort must agree) — same class of bug
+that landed in 0.7.4.5 for the Constructor / Parts Bin / Primer
+pickers. Regression test in
+`test_smoke.py::TestLibraryAutoLoadMatchesPanelSort`.
 
 ---
 
-## [0.9.4] — 2026-05-18
+## [0.9.4] — 2026-05-18 — Sequencing toolbar · per-plasmid map mode · hardening sweep #8
 
-_(auto-generated from commits since v0.9.3)_
+Reshapes the Sequencing pane from a single-purpose Plasmidsaurus
+alignment modal into a full-screen toolbar designed to absorb future
+sequencing-ingest sources without rewriting the alignment path.
+`map_mode` becomes per-plasmid (was per-app). Sweeps the rest of the
+codebase for natural-sort consistency and narrow-terminal CSS
+issues. Hardens the Plasmidsaurus zip ingester against a per-base
+TSV zip-bomb path.
 
-* Sequencing toolbar refactor · per-plasmid map_mode · hardening sweep #8
-* Library/Simulator UX polish · natural-sort pickers · sticky delete cursor
+### Sequencing toolbar
+
+- **`SequencingScreen` replaces `PlasmidsaurusAlignModal`** —
+  full-screen with 4 nested sub-tabs (`General` / `Samples` /
+  `Quality` / `Align`). `PlasmidsaurusAlignModal` is kept as a
+  module-level alias for test + agent-API back-compat.
+- **Structured Plasmidsaurus parser** (`_parse_plasmidsaurus_zip`)
+  walks the zip and groups files per sample (`gbk`, `fasta`,
+  `summary`, `perbase`, `histogram`, `coverage_plot`,
+  `interactive_map`, `ab1_files`, summary text, per-base coverage
+  stats). Run-level extras (`<run>_gel.png`, `README`) land in
+  `run_files`. Summary bodies stream inline so the QC tab parses
+  k-mer + contamination without re-opening the zip.
+- **Sub-tab gating** runs through `_apply_subtab_gating(enabled)` —
+  Samples / Quality / Align panes are disabled until a zip is
+  loaded, and `tabs.active` is redirected back to General when
+  disabling so the user can't be stranded on a disabled-now-empty
+  pane.
+
+### Per-plasmid map mode
+
+- Library entries now carry a `map_mode` field; the active value is
+  loaded via `_tui_map_mode` stash + `pm.load_record` honour, and
+  persists across reloads via `_persist_map_mode_for_active`.
+- **Sequencing-aligned plasmids auto-tag `linear`** so re-opens
+  default to the diff-friendly view.
+
+### Restriction scanner
+
+- **Placement key change**: now `(start, end, recognition)` instead
+  of `(start, end)`. HF / iso variants of the SAME enzyme still
+  collapse, but two genuinely-different enzymes with accidental
+  position overlap stay independent on the map.
+
+### No-arg launch defaults
+
+- **Removed the 1 kb synthetic demo preload** from `main()` — the
+  demo plasmid used to fire on every empty-canvas launch, confusing
+  users into thinking it was one of their saved plasmids. Still in
+  source (`_make_demo_record` / `_DEMO_PLASMID_SEQ`) for tests + ad
+  hoc dev.
+- **Suppressed the first-run NCBI seed** of `MW463917.1` —
+  `main()` now sets `_skip_seed = True`. Dev / demo builds wanting
+  the historical auto-seed-on-empty-library behaviour can flip
+  `_skip_seed = False` before `app.run()`.
+
+### Library UX polish
+
+- **Sticky delete cursor** — `LibraryPanel` captures `cursor_row`
+  BEFORE library mutation (`LibraryDeleteConfirmModal` holds focus
+  so the row index is still authoritative) and parks the cursor on
+  `deleted - 1` after repopulate. Top-row delete clamps to 0;
+  last-row delete skips restore cleanly. Locked in by 4 new
+  `TestDeleteFocusRouting` cases (regression guard 2026-05-18).
+- **Natural-sort sweep across remaining pickers** —
+  `_list_gbk_members_in_zip` used case-folded lex sort and the
+  Plasmidsaurus + Domesticator modals iterated load order; all
+  three now route through `_natural_sort_key` so picker ordering
+  matches `LibraryPanel` (`pA1, pA2, pA10` not
+  `pA1, pA10, pA2`).
+
+### Simulator CSS — narrow / short terminals
+
+- PCR pane wrapped in `VerticalScroll`; primer + params rows bumped
+  to `height: 3` so Input borders render (Textual clips Inputs
+  below `height: 3`).
+- Gel hint pulled out to its own row so the dot-separator stops
+  wrapping.
+- Lane `source` Select widened to 24 cols to fit "Plasmid
+  (uncut)".
+- Left / right gel split moved from fixed 64 to `1fr min 56 max
+  72` so the lane config + gel image both adapt to width.
+
+### Hardening sweep #8
+
+- **Per-base TSV zip-bomb defence** —
+  `_PLASMIDSAURUS_PERBASE_MAX_BYTES = 100 MB` two-layer cap:
+  refuses upfront when central-directory `file_size` overshoots,
+  and `_summarize_perbase_tsv` chunked-reads (64 KB) via
+  `codecs.getincrementaldecoder` so a hostile zip decompressing
+  into a single multi-GB line without newlines can't OOM
+  `io.TextIOWrapper`'s line buffer.
+- **`_batch_extract_gbk_meta`** reads every sample's gbk inside one
+  `ZipFile` open instead of 50× re-opens. Test asserts the open
+  count via `monkeypatch` on `zipfile.ZipFile.__init__`.
+- **Narrowed bare `except Exception`** in `_target_options` and
+  `_on_zip_picked` to typed surfaces per invariant #1.
+- **NUL-anchored sentinels** —
+  `_NO_GBK_KEY_PREFIX = "\x00no-gbk\x00"` and
+  `_EMPTY_LIBRARY_SENTINEL = "\x00no-library\x00"` replace
+  ambiguous string sentinels. NUL is rejected by
+  `_is_safe_zip_member_name` and never appears in LOCUS-safe ids →
+  collision-proof against any real row key.
+
+### Tests
+
+- 79 alignment-overlay (10 new hardening cases), 519 smoke (2 new
+  no-arg-launch cases). **2,681 passing.**
 
 ---
 
