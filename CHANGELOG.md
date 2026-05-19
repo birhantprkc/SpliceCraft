@@ -14,6 +14,15 @@
 
 ---
 
+## [0.9.6] — 2026-05-19
+
+_(auto-generated from commits since v0.9.5)_
+
+* Experiments projects + gels library · sigil tags · click-to-open
+* Experiments lab-notebook toolbar · markdown editor + spellcheck + image attach
+
+---
+
 ## [0.9.5] — 2026-05-18
 
 _(auto-generated from commits since v0.9.4)_
