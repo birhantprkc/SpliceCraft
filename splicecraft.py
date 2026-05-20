@@ -35,7 +35,7 @@ import sys
 import threading
 import uuid as _uuid
 import warnings as _warnings
-from collections import OrderedDict as _OD
+from collections import Counter, OrderedDict as _OD
 from copy import copy as _shallow_copy, deepcopy
 from datetime import date as _date, datetime as _datetime
 from io import StringIO
@@ -3529,6 +3529,47 @@ def _load_library() -> list[dict]:
     _library_cache = entries
     return _typed_clone(_library_cache)
 
+
+def _find_library_entry_by_id(entry_id: str) -> "dict | None":
+    """Return a deep-clone of the library entry whose ``id`` matches,
+    or ``None`` if no match.
+
+    Sweep #11 (2026-05-20): pre-fix ~80 callsites did
+    ``next((e for e in _load_library() if e.get("id") == X), None)``,
+    which clones the ENTIRE library on every lookup. On a 100+ MB
+    library this is multi-second per click for status changes,
+    history-viewer opens, picker dismisses. This helper takes
+    ``_cache_lock``, walks ``_library_cache`` directly, and clones
+    only the matched entry — O(N) walk with O(1) cloned bytes
+    instead of O(N) cloned bytes.
+
+    Returns a deep copy of the entry so callers can mutate freely
+    without poisoning the cache (same contract as ``_load_library``
+    per invariant #17). Returns ``None`` for empty/non-string
+    ``entry_id``; the empty-string skip prevents accidental
+    aliasing against id-less library rows (defensive against
+    hand-edited JSON).
+    """
+    if not isinstance(entry_id, str) or not entry_id:
+        return None
+    global _library_cache
+    with _cache_lock:
+        if _library_cache is None:
+            # Cache miss — trigger a load (under the lock so concurrent
+            # callers don't race the file read).
+            entries, warning = _safe_load_json(
+                _LIBRARY_FILE, "Plasmid library",
+            )
+            if warning:
+                _log.warning(warning)
+            _library_cache = [
+                e for e in entries if isinstance(e, dict)
+            ]
+        for e in _library_cache:
+            if e.get("id") == entry_id:
+                return _typed_clone(e)
+    return None
+
 def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
     """Persist the live library and mirror it into the active
     collection. ``async_sync=True`` (used by the LibraryPanel's delete
@@ -3538,6 +3579,14 @@ def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
     read back collection state right after save (Constructor's
     cascade-into-active-collection, tests) keep working unchanged."""
     global _library_cache
+    # Sweep #10 (2026-05-20): mirror call moved INSIDE the cache lock.
+    # Pre-fix the lock was released between `_save_library`'s body and
+    # the `_sync_active_collection_plasmids` call below, so Thread A
+    # writing library, releasing lock, then Thread B writing library +
+    # mirroring B's snapshot, then Thread A mirroring A's stale
+    # snapshot left `collections.json` holding A but library.json
+    # holding B. RLock allows nested re-entry from the mirror's own
+    # `_save_collections` chain.
     with _cache_lock:
         _safe_save_json(_LIBRARY_FILE, entries, "Plasmid library")
         # Deep-copy the post-save state into the cache so the cache is
@@ -3546,19 +3595,19 @@ def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
         # poison the in-memory cache with their staged-but-not-yet-saved
         # mutations — and the next `_load_library` would surface them.
         _library_cache = _typed_clone(entries)
+        # Keep the active collection's plasmids in sync with the library — every
+        # add / remove / rename on the panel feeds through here, so a single
+        # mirror call covers all CRUD without changing call sites.
+        _sync_active_collection_plasmids(entries, async_write=async_sync)
     # Invalidate the primer-usage cache: every library write potentially
     # changes the set of plasmids whose `primer_bind` features are
     # counted by `_index_primer_usage_in_collections`. The cache is
     # rebuilt lazily on the next PrimerDesignScreen open. Guarded
     # because the helper is defined later in this file (module import
-    # order).
+    # order). OK to run outside the lock — pure invalidation.
     _clear_primer_cache = globals().get("_primer_usage_clear_cache")
     if _clear_primer_cache is not None:
         _clear_primer_cache()
-    # Keep the active collection's plasmids in sync with the library — every
-    # add / remove / rename on the panel feeds through here, so a single
-    # mirror call covers all CRUD without changing call sites.
-    _sync_active_collection_plasmids(entries, async_write=async_sync)
 
 
 # ── Plasmid collections ────────────────────────────────────────────────────────
@@ -8140,7 +8189,23 @@ def _build_commercialsaas_features_packet_from_record(record) -> bytes:
                 elif isinstance(v, int):
                     _ET.SubElement(q_el, "V", {"int": str(v)})
                 else:
-                    _ET.SubElement(q_el, "V", {"text": str(v)})
+                    # Sweep #11 (2026-05-20): strip control chars from
+                    # the text attribute before serialising. Pre-fix
+                    # hostile qualifier values containing `\x01`,
+                    # `\x02`, etc. produced XML that BioPython
+                    # accepted on write but `_safe_xml_parse` would
+                    # choke on during round-trip — the file's
+                    # `_augment_dna_record_from_packets` then silently
+                    # dropped the colour + label overrides, losing
+                    # the user's feature-styling work. Mirrors
+                    # `_commercialsaas_feat_name` (line ~8230) which
+                    # already strips controls from the feature label.
+                    sanitised = "".join(
+                        c if (c >= " " or c in "\t\n")
+                        else " "
+                        for c in str(v)
+                    )
+                    _ET.SubElement(q_el, "V", {"text": sanitised})
     body = _ET.tostring(root, encoding="unicode")
     xml = '<?xml version="1.0"?>' + body
     return _build_commercialsaas_packet(_COMMERCIALSAAS_PACKET_FEATURES,
@@ -8970,11 +9035,23 @@ def _bulk_import_folder(
     # failures but don't pollute the progress denominator.
     importable: list[Path] = []
     for path in children:
+        # Sweep #10 (2026-05-20): `lstat` + `S_ISREG` refuses symlinks
+        # outright. Pre-fix `path.is_file()` and `path.stat()` both
+        # FOLLOW symlinks, so a hostile `.gb` symlinked to `/dev/zero`
+        # passed the size check (target lstat reports 0 for a char
+        # device) and `load_genbank` then read until OOM. Symlinks
+        # to `~/.ssh/id_rsa` or similar would also expose private
+        # data in any subsequent agent fetch of the imported entry.
         try:
-            if not path.is_file():
-                continue
+            st = path.lstat()
         except OSError as exc:
-            failures.append((path, f"stat failed: {exc}"))
+            failures.append((path, f"lstat failed: {exc}"))
+            continue
+        from stat import S_ISREG as _S_ISREG
+        if not _S_ISREG(st.st_mode):
+            # Could be a symlink, device, fifo, dir, socket — none
+            # is acceptable. Symlinks specifically would be a
+            # security boundary violation.
             continue
         if path.suffix.lower() not in _BULK_IMPORT_EXTS:
             continue
@@ -8985,10 +9062,21 @@ def _bulk_import_folder(
         ok = False
         try:
             try:
-                size = path.stat().st_size
+                # Use lstat again (cheap; refuses race-swapped symlinks
+                # between the importable enumeration and per-file
+                # load). Defence-in-depth: prevents TOCTOU between
+                # the children scan and the load.
+                st = path.lstat()
             except OSError as exc:
-                failures.append((path, f"stat failed: {exc}"))
+                failures.append((path, f"lstat failed: {exc}"))
                 continue
+            from stat import S_ISREG as _S_ISREG
+            if not _S_ISREG(st.st_mode):
+                failures.append(
+                    (path, "not a regular file (refused)"),
+                )
+                continue
+            size = st.st_size
             if size > _BULK_IMPORT_MAX_BYTES:
                 failures.append((
                     path,
@@ -13242,6 +13330,281 @@ def _natural_sort_key(s: str) -> tuple:
     return result
 
 
+# ── Name-collision helpers (load-time dedupe across subsystems) ───────────────
+#
+# Two collision categories, surfaced consistently across every load path
+# (parts bin, plasmid library, primers, experiments, collections, gels,
+# projects):
+#
+#   1. **Exact copy** — same display name AND same content. User chose
+#      to load a literal duplicate (e.g. re-importing the same .gb file
+#      twice, or a bulk-import folder containing two identical entries).
+#      Prompt → ``ExactCopyConfirmModal``: keep all as " COPY" / skip all.
+#      Default: skip (handslip protection — silently double-adding is the
+#      pre-fix bug).
+#
+#   2. **Name collision (different content)** — same display name but
+#      different content. The user may be intentionally loading a newer
+#      / different version, OR may have hit an unintended collision.
+#      Prompt → ``NameCollisionModal``: overwrite / keep original / cancel.
+#      Default: keep original (safest — preserves existing data; mirrors
+#      the existing primer-dup "keep by default" pattern).
+#
+# Both modals are routed through ``_classify_collisions`` (pure function,
+# no UI) so each subsystem can call the classifier off-thread and only
+# pay the modal cost when collisions exist.
+
+def _ensure_unique_copy_name(
+    base: str,
+    existing_names: "set[str]",
+    suffix: str = "COPY",
+) -> str:
+    """Return ``"{base} {suffix}"`` (or `" {suffix} 2"`, `" 3"`, …) until
+    the result is not in ``existing_names``. Used to rename exact-copy
+    entries so they can coexist alongside their twin in a library.
+
+    ``base`` itself is returned only when it is somehow already unique —
+    callers should not rely on this branch (the helper is meant to be
+    called *after* a collision is detected). Keeping the guard means a
+    bug in the caller doesn't infinite-loop on an empty ``existing_names``
+    set.
+    """
+    if base not in existing_names:
+        return base
+    candidate = f"{base} {suffix}"
+    if candidate not in existing_names:
+        return candidate
+    n = 2
+    # Cap the search so a pathological library can't pin the UI thread.
+    # 9999 copies of the same name is well past the "library has lost
+    # the plot" threshold.
+    while n < 10_000:
+        candidate = f"{base} {suffix} {n}"
+        if candidate not in existing_names:
+            return candidate
+        n += 1
+    # Fall-through: append a short random tag so the load never aborts
+    # purely because the suffix counter ran away.
+    import secrets as _secrets
+    return f"{base} {suffix} {_secrets.token_hex(3)}"
+
+
+def _classify_collisions(
+    new_items: "list[dict]",
+    existing_items: "list[dict]",
+    *,
+    name_key: str = "name",
+    content_fn=None,
+) -> dict:
+    """Pure classifier for load-time name/content collisions.
+
+    Returns a dict with three lists keyed by the new-item index:
+      * ``"new"``         — indices safe to add as-is
+      * ``"exact_copy"``  — indices whose (name, content) matches an
+                            existing entry exactly
+      * ``"collision"``   — indices whose name matches an existing entry
+                            but content differs
+
+    ``content_fn`` extracts the content identity from an entry dict.
+    Defaults to a JSON-serialisable hash of every field except ``name`` /
+    ``id`` / timestamps / ephemeral metadata, so subsystems can override
+    with a cheaper / more semantically meaningful key (e.g. the GenBank
+    sequence for plasmids, the DNA sequence + grammar for parts).
+
+    Cross-batch awareness: items earlier in ``new_items`` count as
+    "existing" for items later in the batch. So a load of [A, A] gets
+    classified as [new, exact_copy] rather than [new, new] — the user
+    sees the second copy as a duplicate of the first.
+
+    Empty ``name`` is treated as non-colliding (no rational dedupe key);
+    those items always classify as ``"new"``.
+    """
+    if content_fn is None:
+        def _default_content_fn(item: dict) -> str:
+            return repr(sorted(
+                (k, v) for k, v in item.items()
+                if k not in {"name", "id", "added", "updated_at",
+                             "created_at"}
+            ))
+        content_fn = _default_content_fn
+    # Index existing entries by name → list of content keys. ``list``
+    # rather than ``set`` so a library legitimately carrying two
+    # entries with the same name but different content (legacy data)
+    # is still detectable as "no collision" if any one matches.
+    by_name: "dict[str, list[str]]" = {}
+    for e in existing_items:
+        if not isinstance(e, dict):
+            continue
+        name = e.get(name_key) or ""
+        if not name:
+            continue
+        by_name.setdefault(name, []).append(content_fn(e))
+    out: "dict[str, list[int]]" = {
+        "new": [], "exact_copy": [], "collision": [],
+    }
+    for idx, item in enumerate(new_items):
+        name = (item.get(name_key) or "") if isinstance(item, dict) else ""
+        if not name:
+            out["new"].append(idx)
+            continue
+        ckey = content_fn(item) if isinstance(item, dict) else repr(item)
+        existing_keys = by_name.get(name)
+        if existing_keys is None:
+            out["new"].append(idx)
+            # Allow same-batch dedupe: register this item as existing
+            # for subsequent items in the loop.
+            by_name[name] = [ckey]
+            continue
+        if ckey in existing_keys:
+            out["exact_copy"].append(idx)
+        else:
+            out["collision"].append(idx)
+            existing_keys.append(ckey)
+    return out
+
+
+def _resolve_load_collisions(
+    app,
+    entity: str,
+    new_items: "list[dict]",
+    existing_items: "list[dict]",
+    *,
+    name_key: str = "name",
+    content_fn=None,
+    on_resolved,
+    on_cancelled=None,
+) -> None:
+    """Generic collision-resolution flow shared by every load path
+    (parts bin, plasmid library, primer library, experiments,
+    collections, gels, projects).
+
+    Pipeline:
+      1. Classify ``new_items`` against ``existing_items`` via
+         ``_classify_collisions``.
+      2. If exact copies exist → push ``ExactCopyConfirmModal``:
+         keep (rename with " COPY" suffix) or skip duplicates.
+      3. If name collisions (different content) exist → push
+         ``NameCollisionModal``: keep original / overwrite / cancel.
+      4. Once user decisions resolved, fire ``on_resolved(
+            items_to_save, replace_names)``.
+
+    ``on_resolved`` receives:
+      * ``items_to_save`` — concrete list of new items the caller
+        should persist (with any " COPY"-renamed names already
+        applied).
+      * ``replace_names`` — set of existing-entry names the caller
+        should REMOVE from ``existing_items`` before appending
+        ``items_to_save`` (i.e. overwrite targets). Empty set when
+        no overwrites are requested.
+
+    ``on_cancelled`` is fired (when provided) if the user picks Cancel
+    on the name-collision modal. Callers should NOT save anything in
+    that case — the load is fully aborted.
+
+    Both callbacks run on the UI thread. Workers calling this helper
+    must marshal back through ``call_from_thread`` first.
+
+    ``content_fn`` defaults to a JSON-style hash over every field
+    except ``name``/``id``/timestamps — usually too strict for
+    semantic dedupe. Callers should pass a domain-specific extractor
+    (the part's DNA sequence, the plasmid's gb_text, etc.) so a
+    primer-Tm round-off doesn't flag a real exact-copy as a name
+    collision.
+    """
+    collisions = _classify_collisions(
+        new_items, existing_items,
+        name_key=name_key,
+        content_fn=content_fn,
+    )
+    exact_copy_idxs = list(collisions["exact_copy"])
+    coll_idxs       = list(collisions["collision"])
+    new_only_idxs   = list(collisions["new"])
+
+    if not exact_copy_idxs and not coll_idxs:
+        on_resolved(list(new_items), set())
+        return
+
+    def _proceed_to_collisions(items_kept_after_copy: "list[dict]") -> None:
+        if not coll_idxs:
+            on_resolved(items_kept_after_copy, set())
+            return
+        names = [
+            (new_items[i].get(name_key, "?") if isinstance(new_items[i], dict) else "?")
+            for i in coll_idxs
+        ]
+
+        def _on_decision(decision):
+            if decision in (None, "cancel"):
+                if on_cancelled is not None:
+                    on_cancelled()
+                return
+            if decision == "keep":
+                on_resolved(items_kept_after_copy, set())
+                return
+            # "overwrite" — append collision items + flag the colliding
+            # names for removal from existing.
+            replace_names = {
+                (new_items[i].get(name_key, "") if isinstance(new_items[i], dict) else "")
+                for i in coll_idxs
+            }
+            replace_names.discard("")
+            items_with_coll = items_kept_after_copy + [
+                new_items[i] for i in coll_idxs
+            ]
+            on_resolved(items_with_coll, replace_names)
+
+        app.push_screen(
+            NameCollisionModal(entity, names),
+            callback=_on_decision,
+        )
+
+    if exact_copy_idxs:
+        copy_names = [
+            (new_items[i].get(name_key, "?") if isinstance(new_items[i], dict) else "?")
+            for i in exact_copy_idxs
+        ]
+
+        def _on_copy(keep_copies):
+            keep_copies = bool(keep_copies)
+            if not keep_copies:
+                items_kept = [new_items[i] for i in new_only_idxs]
+                _proceed_to_collisions(items_kept)
+                return
+            existing_names: "set[str]" = {
+                e.get(name_key, "") for e in existing_items
+                if isinstance(e, dict)
+            }
+            existing_names.discard("")
+            # Reserve names that other items in THIS batch will use so
+            # the COPY suffix doesn't clash with a non-duplicate sibling.
+            for i in new_only_idxs + coll_idxs:
+                if isinstance(new_items[i], dict):
+                    nm = new_items[i].get(name_key, "")
+                    if nm:
+                        existing_names.add(nm)
+            items_kept = [new_items[i] for i in new_only_idxs]
+            for i in exact_copy_idxs:
+                if not isinstance(new_items[i], dict):
+                    continue
+                base = new_items[i].get(name_key, "") or ""
+                renamed = _ensure_unique_copy_name(base, existing_names)
+                # Mutate in place so the caller's reference reflects the
+                # new name (mirrors the existing pattern of mutating
+                # part_entry dicts inside the bulk worker).
+                new_items[i][name_key] = renamed
+                existing_names.add(renamed)
+                items_kept.append(new_items[i])
+            _proceed_to_collisions(items_kept)
+
+        app.push_screen(
+            ExactCopyConfirmModal(entity, copy_names),
+            callback=_on_copy,
+        )
+        return
+
+    _proceed_to_collisions([new_items[i] for i in new_only_idxs])
+
+
 class _SearchInput(Input):
     """Reusable search-bar Input.
 
@@ -13880,16 +14243,27 @@ class LibraryPanel(Widget):
     def add_entry(self, record) -> bool:
         """Serialize record and persist into the active collection.
 
-        Returns True on a successful save, False on disk failure
-        (the caller can use this to gate a "saved" notification —
-        without it, callers fire success toasts on top of the error
-        toast `_notify_save_failure` already emits).
+        Returns True on a successful save (cache updated, disk write
+        dispatched), False on disk failure. The caller can use this
+        to gate a "saved" notification.
 
         Preserves any existing workflow `status` on the entry —
         re-saving a plasmid that was already marked VERIFIED keeps
-        the green badge instead of resetting to "no status". Status
-        is reset only when the user explicitly clears it via the
-        picker."""
+        the green badge instead of resetting to "no status".
+
+        Collision contract (added 2026-05-20):
+          * Same ``id`` as an existing entry → silent replace
+            (treated as "editing the same record", NOT a collision).
+          * Same name as an existing entry, same gb_text → push
+            ``ExactCopyConfirmModal``: keep as " COPY" or skip.
+          * Same name, different gb_text → push ``NameCollisionModal``:
+            keep original / overwrite / cancel.
+
+        When a modal fires, this method returns True optimistically
+        (cache will update once the user picks; if they cancel, the
+        library is unchanged). Callers should NOT rely on the cache
+        being updated before this returns — that's the modal's job.
+        """
         gb_text = _record_to_gb_text(record)
         entries = _load_library()
         prev_status = ""
@@ -13897,19 +14271,13 @@ class LibraryPanel(Widget):
             if e.get("id") == record.id:
                 prev_status = _sanitize_plasmid_status(e.get("status"))
                 break
-        entries = [e for e in entries if e.get("id") != record.id]
-        # Prefer the user-typed display name (stashed by `_library_load`
-        # / Constructor save) so re-saving an already-loaded entry
-        # doesn't downgrade "MAV 32 + Test" to the sanitised LOCUS form.
-        # Fresh records (never opened via library) fall back to
-        # `record.name` which is the LOCUS — only ever underscored when
-        # the source file's LOCUS was underscored, so this preserves
-        # GenBank-format names that happen to be space-free.
+        # Pre-build the new entry dict so collision detection can
+        # compare against it directly.
         display_name = (
             getattr(record, "_tui_display_name", None)
             or record.name or record.id
         )
-        entries.insert(0, {
+        new_entry = {
             "name":    display_name,
             "id":      record.id,
             "size":    len(record.seq),
@@ -13918,15 +14286,105 @@ class LibraryPanel(Widget):
             "added":   _date.today().isoformat(),
             "gb_text": gb_text,
             "status":  prev_status,
-        })
-        # Sync-cache + async-disk pattern (mirrors `_delete_save_to_disk`
-        # added in 0.7.15.1 for delete; HIGH-1 audit finding 2026-05-14
-        # extends it to add). Updating `_library_cache` synchronously
-        # means the panel repopulate immediately below sees the new
-        # entry; the disk write fires off-thread so a 100+ MB
-        # plasmid_library.json save doesn't freeze the UI for 5–8 s.
+        }
+        # ID match takes precedence over name match — re-saving an
+        # already-loaded record (same id) is the "editing in place"
+        # case, never a collision. Strip every same-id entry then add
+        # the new one at the top, same contract as before.
+        has_id_match = any(e.get("id") == record.id for e in entries)
+        if has_id_match:
+            entries = [e for e in entries if e.get("id") != record.id]
+            entries.insert(0, new_entry)
+            self._commit_library_entries(entries)
+            return True
+        # No id match: check for name collisions against entries whose
+        # id differs. ``_resolve_load_collisions`` handles the modal
+        # routing and fires our save callback once the user decides.
+        same_name_entries = [
+            e for e in entries
+            if (e.get("name") or "") == display_name
+            and e.get("id") != record.id
+        ]
+        if not same_name_entries:
+            entries.insert(0, new_entry)
+            self._commit_library_entries(entries)
+            return True
+
+        def _content_fn(e: dict) -> str:
+            return e.get("gb_text", "") or ""
+
+        def _on_cancelled() -> None:
+            self.app.notify(
+                f"Plasmid save cancelled. Library unchanged.",
+                severity="warning",
+            )
+            _log_event(
+                "library.add.cancelled",
+                name=display_name, id=record.id,
+            )
+
+        def _on_resolved(items_to_save: "list[dict]",
+                         replace_names: "set[str]") -> None:
+            if not items_to_save and not replace_names:
+                self.app.notify(
+                    f"Skipped duplicate plasmid. Library unchanged.",
+                    severity="warning",
+                )
+                _log_event(
+                    "library.add.skipped",
+                    name=display_name, id=record.id,
+                )
+                return
+            current = _load_library()
+            if replace_names:
+                current = [
+                    e for e in current
+                    if (e.get("name") or "") not in replace_names
+                ]
+            # ``items_to_save`` may have a renamed entry (COPY suffix
+            # added during exact-copy resolution); mutate the original
+            # record's display name to match so re-saves stay coherent.
+            for it in items_to_save:
+                if it is new_entry:
+                    final_name = it.get("name") or display_name
+                    if final_name != display_name:
+                        try:
+                            record._tui_display_name = final_name  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+            current = list(items_to_save) + current
+            self._commit_library_entries(current)
+            _log_event(
+                "library.add.ok",
+                name=display_name, id=record.id,
+                n_overwritten=len(replace_names),
+            )
+
+        _resolve_load_collisions(
+            self.app, "plasmid", [new_entry], entries,
+            name_key="name",
+            content_fn=_content_fn,
+            on_resolved=_on_resolved,
+            on_cancelled=_on_cancelled,
+        )
+        return True
+
+    def _commit_library_entries(self, entries: "list[dict]") -> None:
+        """Sync cache + repopulate + async disk write. Shared exit
+        path for both the id-replace branch and the post-modal
+        callback in ``add_entry`` so cache hygiene + dependent-cache
+        invalidation can't drift between the two.
+
+        Sweep #10 (2026-05-20): takes ``_cache_lock`` around the cache
+        reseat so a concurrent ``_save_library`` (constructor save,
+        agent endpoint, etc.) can't race the reassignment. The cache
+        and disk update are still split (sync cache, async disk) for
+        UI responsiveness — the lock just prevents the reassignment
+        from interleaving with another save's reassignment.
+        """
         global _library_cache
-        _library_cache = _typed_clone(entries)
+        with _cache_lock:
+            _library_cache = _typed_clone(entries)
         _clear_primer_cache = globals().get("_primer_usage_clear_cache")
         if _clear_primer_cache is not None:
             _clear_primer_cache()
@@ -13934,11 +14392,214 @@ class LibraryPanel(Widget):
             self._apply_panel_width()
             self._repopulate_plasmids()
         # Disk write off-thread. Failure surfaces via
-        # `_notify_save_failure` from inside the worker — the caller's
-        # `True` return now means "cache updated + disk dispatched",
-        # matching the delete path's contract.
+        # ``_notify_save_failure`` from inside the worker.
         self._add_save_to_disk(entries)
-        return True
+
+    def add_entries_batch(
+        self,
+        records: "list",
+        *,
+        on_done,
+    ) -> None:
+        """Batch counterpart to ``add_entry`` for paths that need to
+        load N records and surface ONE collision flow + ONE final toast.
+
+        Single-call collision resolution: the loop pre-classifies every
+        record against the current library, then routes the WHOLE batch
+        through ``_resolve_load_collisions`` once. The user sees at most
+        one exact-copy modal + one name-collision modal, regardless of
+        batch size, instead of N stacked modals that would blow past
+        ``_MODAL_STACK_SOFT_CAP`` and silently default-resolve.
+
+        Cancel on the name-collision modal aborts the entire batch (no
+        records saved); ``on_done`` fires with empty saved/replaced sets.
+
+        Sweep #10 (2026-05-20): closes the ``_save_to_collection`` bug
+        where the loop fired N `add_entry` calls and the post-loop toast
+        claimed success before any modal resolved.
+
+        ``records`` — SeqRecord-shaped objects (must have
+            ``id``/``name``/``seq``/``features``).
+        ``on_done(saved_names: list[str], replaced_names: set[str], cancelled: bool)``
+            — fires exactly once when the batch resolves (or is
+            cancelled). Caller emits the summary toast from here.
+        """
+        if not records:
+            on_done([], set(), False)
+            return
+
+        # Build the prospective entry-dicts so collision detection can
+        # operate on the same shape `add_entry` produces.
+        existing = _load_library()
+        existing_ids = {e.get("id") for e in existing if isinstance(e, dict)}
+        prospective: list[dict] = []
+        # Records whose id matches an existing entry use the silent
+        # replace-by-id path (mirrors `add_entry`'s id-match branch);
+        # they aren't routed through the modal flow.
+        silent_replace_ids: set[str] = set()
+        for record in records:
+            try:
+                gb_text = _record_to_gb_text(record)
+            except Exception:
+                _log.exception("add_entries_batch: gb serialise failed")
+                continue
+            prev_status = ""
+            # `record.id` is typically a non-empty string from
+            # BioPython but defensively coerce — `add()` rejects None
+            # and we'd surface a TypeError if a hostile / partially-
+            # constructed record reached this loop.
+            rec_id = str(record.id) if record.id else ""
+            if rec_id and rec_id in existing_ids:
+                for e in existing:
+                    if e.get("id") == rec_id:
+                        prev_status = _sanitize_plasmid_status(
+                            e.get("status"),
+                        )
+                        silent_replace_ids.add(rec_id)
+                        break
+            display_name = (
+                getattr(record, "_tui_display_name", None)
+                or record.name or record.id
+            )
+            prospective.append({
+                "name":    display_name,
+                "id":      record.id,
+                "size":    len(record.seq),
+                "n_feats": len([
+                    f for f in record.features if f.type != "source"
+                ]),
+                "source":  getattr(
+                    record, "_tui_source", f"id:{record.id}",
+                ),
+                "added":   _date.today().isoformat(),
+                "gb_text": gb_text,
+                "status":  prev_status,
+                # Pin the originating record so the post-resolve commit
+                # can re-stamp its ``_tui_display_name`` if the user
+                # picked the COPY-rename branch.
+                "_record": record,
+            })
+
+        # Strip the temporary _record key from the persistence-shape
+        # dict before saving (we need it for the on_resolved callback
+        # but it's not part of the persisted schema).
+        def _strip_record_ref(entry: dict) -> dict:
+            return {k: v for k, v in entry.items() if k != "_record"}
+
+        def _content_fn(e: dict) -> str:
+            return e.get("gb_text", "") or ""
+
+        # Collisions are only checked for records WITHOUT an id match.
+        # Same-id is "editing the same record" not "collision".
+        new_for_collision = [
+            p for p in prospective
+            if p.get("id") not in silent_replace_ids
+        ]
+        # Filter out the silent-replace ones from `existing` for the
+        # collision check so they don't double-count as name collisions
+        # against their own pre-state.
+        existing_for_collision = [
+            e for e in existing
+            if e.get("id") not in silent_replace_ids
+        ]
+
+        def _on_cancelled() -> None:
+            on_done([], set(), True)
+
+        def _on_resolved(items_kept: "list[dict]",
+                         replace_names: "set[str]") -> None:
+            current = _load_library()
+            # Drop silent-replace ids first.
+            if silent_replace_ids:
+                current = [
+                    e for e in current
+                    if e.get("id") not in silent_replace_ids
+                ]
+            # Then drop name-replace targets from the overwrite branch.
+            if replace_names:
+                current = [
+                    e for e in current
+                    if (e.get("name") or "") not in replace_names
+                ]
+            # Prepend the silent-replace items AND the resolved items at
+            # the top. Persist the (possibly COPY-renamed) display name
+            # back onto the source record so a later re-save stays
+            # coherent.
+            id_replace_items = [
+                _strip_record_ref(p) for p in prospective
+                if p.get("id") in silent_replace_ids
+            ]
+            keep_items = []
+            for it in items_kept:
+                rec = it.get("_record")
+                final_name = it.get("name") or ""
+                if rec is not None and final_name:
+                    try:
+                        rec._tui_display_name = final_name  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                keep_items.append(_strip_record_ref(it))
+            final = keep_items + id_replace_items + current
+            self._commit_library_entries(final)
+            saved_names = [it.get("name", "?") for it in keep_items]
+            saved_names += [it.get("name", "?") for it in id_replace_items]
+            on_done(saved_names, replace_names, False)
+
+        _resolve_load_collisions(
+            self.app, "plasmid",
+            new_for_collision, existing_for_collision,
+            name_key="name",
+            content_fn=_content_fn,
+            on_resolved=_on_resolved,
+            on_cancelled=_on_cancelled,
+        )
+
+    @work(thread=True, exclusive=True, group="auto_bind_evs")
+    def _auto_bind_worker(
+        self, entries: "list[dict]", collection_name: str,
+    ) -> None:
+        """Worker: off-thread entry-vector auto-bind after a bulk
+        folder import.
+
+        Sweep #11 (2026-05-20): pre-fix the auto-bind ran on the UI
+        thread immediately after `_bulk_import_folder` returned, so a
+        100-entry × 3-grammar import froze the UI for several seconds
+        between the import progress bar finishing and the success
+        toast appearing. Now the import-success toast fires
+        immediately and this worker emits a follow-up notify when the
+        detect + persist completes.
+
+        Exclusive group `auto_bind_evs` coalesces back-to-back imports
+        so two rapid clicks on Import don't race the same
+        `entry_vectors.json` write.
+        """
+        try:
+            autodetect_msg = _auto_bind_entry_vectors_from_entries(
+                entries
+            )
+        except Exception as exc:
+            _log.exception("auto-bind worker: detection failed")
+            self.app.call_from_thread(
+                self.app.notify,
+                f"Entry-vector auto-detect failed for '{collection_name}'"
+                f" — see log. Bindings unchanged.",
+                severity="warning", markup=False,
+            )
+            return
+        if autodetect_msg:
+            self.app.call_from_thread(
+                self.app.notify,
+                f"'{collection_name}': {autodetect_msg}",
+                severity="information", markup=False, timeout=8,
+            )
+        else:
+            # No new bindings — silent. Pre-fix the inline path also
+            # didn't notify in this case.
+            _log_event(
+                "entry_vector.auto_bound.empty",
+                collection=collection_name,
+                n_entries=len(entries),
+            )
 
     @work(thread=True, exclusive=True, group="library_add_save")
     def _add_save_to_disk(self, entries: "list[dict]") -> None:
@@ -14153,10 +14814,10 @@ class LibraryPanel(Widget):
             t = self.query_one("#lib-table", DataTable)
         except NoMatches:
             return
-        active_entry = next(
-            (e for e in _load_library() if e.get("id") == self._active_id),
-            None,
-        )
+        # Sweep #11 (2026-05-20): single-entry lookup via the helper
+        # avoids a full library deepcopy (~100 MB on the largest
+        # users' setups) per status refresh.
+        active_entry = _find_library_entry_by_id(self._active_id or "")
         if active_entry is None:
             return
         nm = active_entry.get("name", "?")
@@ -14190,10 +14851,9 @@ class LibraryPanel(Widget):
         entry_id = _cursor_row_key(self.query_one("#lib-table", DataTable))
         if entry_id is None:
             return
-        entry = next(
-            (e for e in _load_library() if e.get("id") == entry_id),
-            None,
-        )
+        # Sweep #11 (2026-05-20): single-entry lookup avoids the
+        # whole-library deepcopy on delete (every click).
+        entry = _find_library_entry_by_id(entry_id)
         if entry is None:
             return
         name = entry.get("name") or entry_id
@@ -14452,7 +15112,19 @@ class LibraryPanel(Widget):
             return
         # Set active BEFORE writing the library so the mirror writes
         # back to the correct collection.
+        #
+        # Sweep #11 (2026-05-20): force-flush the settings-pointer
+        # write BEFORE the async-cache-then-disk library write so a
+        # power loss between the two can't leave `settings.json`
+        # saying OLD while the library says NEW. Same fix sweep #9
+        # applied to project switch (line 41977). Without the
+        # explicit sync flush, `_set_active_collection_name` schedules
+        # the settings write via the daemon thread; the disk-side
+        # pointer might still say OLD when the library mirror lands,
+        # and the next mutation mirrors NEW data into OLD — silently
+        # overwriting OLD's plasmids.
         _set_active_collection_name(name)
+        _settings_flush_sync()
         plasmids = [dict(p) for p in (coll.get("plasmids") or [])
                     if isinstance(p, dict)]
         # Update the in-memory cache synchronously so the panel
@@ -14546,36 +15218,33 @@ class LibraryPanel(Widget):
                 # injecting style. _record_to_library_entry already
                 # sanitises display names, but the notify summary below
                 # still echoes raw filename paths from the failures list.
+                # Sweep #11 (2026-05-20): auto-bind moved off the UI
+                # thread. Pre-fix `_auto_bind_entry_vectors_from_entries`
+                # parsed N × M (entries × grammars) GenBank texts AND
+                # issued N synchronous JSON writes ON the UI thread,
+                # freezing the bulk-import success flow for several
+                # seconds on a 100-entry × 3-grammar import. Now we
+                # emit the import-success toast immediately and
+                # dispatch the auto-bind to a worker that fires a
+                # FOLLOW-UP toast on completion.
                 if n_ok and not n_fail:
-                    autodetect_msg = _auto_bind_entry_vectors_from_entries(
-                        entries
+                    self.app.notify(
+                        f"Imported {n_ok} plasmid(s) into '{name}'. "
+                        f"Auto-detecting entry vectors…",
+                        severity="information", markup=False,
+                        timeout=4,
                     )
-                    if autodetect_msg:
-                        self.app.notify(
-                            f"Imported {n_ok} plasmid(s) into '{name}'. "
-                            f"{autodetect_msg}",
-                            severity="information", markup=False,
-                            timeout=8,
-                        )
-                    else:
-                        self.app.notify(
-                            f"Imported {n_ok} plasmid(s) into '{name}'.",
-                            severity="information", markup=False,
-                        )
+                    self._auto_bind_worker(list(entries), name)
                 elif n_ok and n_fail:
-                    autodetect_msg = _auto_bind_entry_vectors_from_entries(
-                        entries
-                    )
                     tail = ", ".join(p.name for p, _ in failures[:3])
                     if n_fail > 3:
                         tail += f", … (+{n_fail - 3} more)"
                     summary = f"Imported {n_ok}, failed {n_fail}: {tail}"
-                    if autodetect_msg:
-                        summary = f"{summary}. {autodetect_msg}"
                     self.app.notify(
-                        summary,
-                        severity="warning", timeout=8, markup=False,
+                        f"{summary}. Auto-detecting entry vectors…",
+                        severity="warning", timeout=4, markup=False,
                     )
+                    self._auto_bind_worker(list(entries), name)
                 elif n_fail:
                     # Folder-level failure (single tuple keyed on the
                     # folder itself) shows up here. Surface the reason
@@ -14657,7 +15326,14 @@ class LibraryPanel(Widget):
                 if was_active:
                     new_active = (remaining[0].get("name")
                                    if remaining else None)
+                    # Sweep #11 (2026-05-20): force-flush the settings
+                    # pointer before the library write so a power loss
+                    # between the two can't leave settings.json saying
+                    # OLD while the library holds the new collection's
+                    # plasmids. Same fix sweep #9 landed on project
+                    # delete-promote (line 42246).
                     _set_active_collection_name(new_active)
+                    _settings_flush_sync()
                     fallback_plasmids = [
                         p for p in (
                             (remaining[0].get("plasmids") if remaining
@@ -15605,7 +16281,17 @@ class SequencePanel(Widget):
         o = (int(self._view_origin_bp) % n) if n > 0 else 0
         if o <= 0 or n == 0:
             return self._seq, self._feats
-        key = (id(self._seq), id(self._feats), o)
+        # Sweep #10 (2026-05-20): seq part of the key uses `hash` not
+        # `id` — Python's small-string interning + allocator reuse
+        # means two distinct sequence strings can share the same id
+        # after one is GC'd. Pre-fix this could surface a stale
+        # rotated cache after an in-place sequence edit happened to
+        # reuse the previous string's address. Matches the same fix
+        # in `_build_seq_inputs` (line 6564) that switched from
+        # `id(seq)` to `hash(seq)` for this exact reason. Feature
+        # list id is safe because the list itself is reassigned on
+        # load (per invariant #4), never mutated in place.
+        key = (hash(self._seq), id(self._feats), o)
         if (self._rotated_cache_key == key
                 and self._rotated_seq is not None
                 and self._rotated_feats is not None):
@@ -17064,6 +17750,8 @@ class EditSeqDialog(ModalScreen):
     mode="replace" — replaces seq[start:end] with new_seq
     Dismisses with (new_seq, mode, start, end) on OK, or None on cancel.
     """
+
+    _blocks_undo: bool = True   # sweep #10: app-level Ctrl+Z would race the insert
 
     _VALID = frozenset("ATCGNRYSWKMBDHV")   # IUPAC DNA codes
 
@@ -19270,15 +19958,48 @@ def _perform_master_delete(app, *, sentinel) -> "dict[str, int | bool]":
     except Exception:
         _log.exception("masterdelete: blast cache clear failed")
 
-    # 4. Cancel pending settings flush BEFORE acquiring the cache
-    #    lock — otherwise the daemon would write a stale settings
-    #    dict immediately after we wipe the file.
+    # 4. Cancel pending settings flush AND wait for an in-flight
+    #    daemon flush to drain before acquiring the cache lock.
+    #
+    #    Sweep #11 (2026-05-20): pre-fix `_settings_flush_pending`
+    #    was cleared under `_settings_flush_lock` BUT the daemon
+    #    worker doesn't hold that lock while inside `_safe_save_json`
+    #    — it only holds the lock long enough to swap out the
+    #    pending payload, then releases. So when Master Delete:
+    #      1. Clears `_settings_flush_pending = None`
+    #      2. Holds `_cache_lock` for file unlinks
+    #    a daemon worker that already grabbed the payload BEFORE
+    #    step 1 (but not yet finished its `os.replace`) finishes
+    #    its write to settings.json AFTER our unlink, resurrecting
+    #    settings data the user explicitly asked to wipe.
+    #    Fix: clear pending under the flush lock, then BUSY-WAIT
+    #    until `_settings_flush_running == False` (with a sane
+    #    timeout so a hung worker doesn't wedge Master Delete).
     global _settings_flush_pending
     try:
         with _settings_flush_lock:
             _settings_flush_pending = None
     except NameError:
         pass
+    # Drain handshake. The daemon's exit path sets
+    # `_settings_flush_running = False` inside `_settings_flush_lock`,
+    # so polling under the same lock guarantees we see the flag
+    # only after the worker's `_safe_save_json` has completed.
+    import time as _time
+    _drain_deadline = _time.time() + 2.0
+    while _time.time() < _drain_deadline:
+        try:
+            with _settings_flush_lock:
+                if not _settings_flush_running:
+                    break
+        except NameError:
+            break
+        _time.sleep(0.01)
+    else:
+        _log.warning(
+            "masterdelete: settings flush worker did not drain in 2s; "
+            "proceeding (may need to re-wipe settings.json after restart)"
+        )
 
     # 5. Hold the cache lock across file deletion + cache reset.
     #    Every `_save_*` helper takes this same lock, so a save
@@ -19420,17 +20141,24 @@ def _reset_app_state_after_master_delete(app) -> None:
     for attr in ("_undo_stack", "_redo_stack",
                   "_stashed_undo_stacks", "_stashed_redo_stacks",
                   "_stash_order"):
+        # Sweep #10 (2026-05-20): `except (AttributeError, Exception)`
+        # collapses to just `except Exception:` because Exception
+        # subsumes AttributeError — the tuple form was misleading and
+        # tripped the invariant #1 "no bare except" sweep. `getattr`
+        # with default already handles AttributeError; the remaining
+        # surface is `.clear()` raising on read-only mappings, which
+        # is genuinely defensive.
         try:
             value = getattr(app, attr, None)
             if isinstance(value, list):
                 value.clear()
             elif isinstance(value, dict):
                 value.clear()
-        except (AttributeError, Exception):
+        except (TypeError, AttributeError):
             pass
     try:
         app._current_undo_key = None
-    except (AttributeError, Exception):
+    except AttributeError:
         pass
     # LibraryPanel is now empty on disk; refresh table so the UI
     # reflects that without waiting for a manual click.
@@ -24877,23 +25605,81 @@ def _set_entry_vector(
     Only the matching ``(grammar_id, role)`` entry is replaced —
     other roles for the same grammar (e.g. Alpha2 / Omega1 / Omega2
     when setting Alpha1) survive untouched.
+
+    Sweep #10 (2026-05-20): full load-modify-save sequence runs under
+    `_cache_lock` so concurrent rapid clicks across grammar tabs (or
+    `_auto_bind_entry_vectors_from_entries` looping per-role) can't
+    lose updates via classic RMW racing. RLock allows re-entry from
+    the nested `_save_entry_vectors` lock acquisition.
     """
     if not isinstance(grammar_id, str) or not grammar_id:
         return
     role = role or ""
-    entries = [
-        e for e in _load_entry_vectors()
-        if not (
-            e.get("grammar_id") == grammar_id
-            and (e.get("role") or "") == role
-        )
-    ]
-    if vector is not None:
-        v = dict(vector)
-        v["grammar_id"] = grammar_id
-        v["role"]       = role
-        entries.append(v)
-    _save_entry_vectors(entries)
+    with _cache_lock:
+        entries = [
+            e for e in _load_entry_vectors()
+            if not (
+                e.get("grammar_id") == grammar_id
+                and (e.get("role") or "") == role
+            )
+        ]
+        if vector is not None:
+            v = dict(vector)
+            v["grammar_id"] = grammar_id
+            v["role"]       = role
+            entries.append(v)
+        _save_entry_vectors(entries)
+
+
+def _set_entry_vectors_batch(
+    updates: "list[tuple[str, str, dict | None]]",
+) -> int:
+    """Apply N entry-vector bindings under a SINGLE `_cache_lock`
+    acquire + single `_save_entry_vectors` call.
+
+    Sweep #11 (2026-05-20): the per-role auto-bind loop in
+    `_auto_bind_entry_vectors_from_entries` previously called
+    `_set_entry_vector` N times, each acquiring `_cache_lock`,
+    re-reading the file, mutating, and writing — N round-trips
+    through `_safe_save_json` (each with `.bak` + fsync). A 5-role
+    × 3-grammar bulk import yielded 15 separate disk writes,
+    contending against any concurrent save.
+
+    Each update tuple is `(grammar_id, role, payload)`; passing
+    ``payload=None`` removes the binding. Returns the number of
+    bindings that actually changed (added / removed / replaced).
+    Invalid `grammar_id` tuples are silently skipped — matches the
+    no-op contract of `_set_entry_vector`.
+    """
+    if not updates:
+        return 0
+    with _cache_lock:
+        entries = _load_entry_vectors()
+        changed = 0
+        for gid, role, vector in updates:
+            if not isinstance(gid, str) or not gid:
+                continue
+            role = role or ""
+            before = len(entries)
+            entries = [
+                e for e in entries
+                if not (
+                    e.get("grammar_id") == gid
+                    and (e.get("role") or "") == role
+                )
+            ]
+            removed_one = (len(entries) < before)
+            if vector is not None:
+                v = dict(vector)
+                v["grammar_id"] = gid
+                v["role"]       = role
+                entries.append(v)
+                changed += 1
+            elif removed_one:
+                changed += 1
+        if changed:
+            _save_entry_vectors(entries)
+    return changed
 
 
 def _clear_entry_vectors_for_grammar(grammar_id: str) -> int:
@@ -24905,14 +25691,18 @@ def _clear_entry_vectors_for_grammar(grammar_id: str) -> int:
 
     Returns the number of bindings removed; 0 when nothing matched.
     No-op for empty grammar_id (defensive — callers can pass a
-    user-typed value without pre-checking)."""
+    user-typed value without pre-checking).
+
+    Sweep #10 (2026-05-20): RMW under `_cache_lock`.
+    """
     if not isinstance(grammar_id, str) or not grammar_id:
         return 0
-    entries = _load_entry_vectors()
-    kept = [e for e in entries if e.get("grammar_id") != grammar_id]
-    n_dropped = len(entries) - len(kept)
-    if n_dropped > 0:
-        _save_entry_vectors(kept)
+    with _cache_lock:
+        entries = _load_entry_vectors()
+        kept = [e for e in entries if e.get("grammar_id") != grammar_id]
+        n_dropped = len(entries) - len(kept)
+        if n_dropped > 0:
+            _save_entry_vectors(kept)
     return n_dropped
 
 
@@ -25812,21 +26602,33 @@ def _auto_bind_entry_vectors_from_entries(
         return ""
     target_grammars = grammar_ids or list(_all_grammars().keys())
     bound_by_grammar: dict[str, list[str]] = {}
+    # Sweep #11 (2026-05-20): parse each gb_text ONCE up-front
+    # instead of N × M (entries × grammars) times. A 100-entry,
+    # 3-grammar import previously paid 300 BioPython parses on the
+    # UI thread; now it pays 100. Parse failures are silently
+    # skipped (same behaviour as pre-fix per-grammar loop).
+    parsed_records: list[tuple[dict, object]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        gb_text = entry.get("gb_text") or ""
+        if not gb_text:
+            continue
+        try:
+            rec = _gb_text_to_record(gb_text)
+        except Exception:
+            continue
+        parsed_records.append((entry, rec))
+    # Accumulate every binding into one batch and apply with ONE
+    # _save_entry_vectors call at the end. Pre-fix: N × _set_entry_vector
+    # → N × _safe_save_json + .bak + fsync round-trips. Now: ONE round-trip.
+    pending_updates: "list[tuple[str, str, dict | None]]" = []
     for gid in target_grammars:
         grammar = _all_grammars().get(gid)
         if not isinstance(grammar, dict):
             continue
         proposals: dict[str, tuple[dict, str]] = {}
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            gb_text = entry.get("gb_text") or ""
-            if not gb_text:
-                continue
-            try:
-                rec = _gb_text_to_record(gb_text)
-            except Exception:
-                continue
+        for entry, rec in parsed_records:
             result = _detect_entry_vector_role(rec, grammar)
             if not result:
                 continue
@@ -25850,13 +26652,7 @@ def _auto_bind_entry_vectors_from_entries(
                 "id":      entry.get("id", ""),
                 "gb_text": entry.get("gb_text") or "",
             }
-            try:
-                _set_entry_vector(gid, payload, role_key)
-            except Exception:
-                _log.exception(
-                    "auto-bind: persist %s/%s failed", gid, role_key,
-                )
-                continue
+            pending_updates.append((gid, role_key, payload))
             _log_event(
                 "entry_vector.auto_bound",
                 grammar=gid, role=role_key,
@@ -25867,6 +26663,15 @@ def _auto_bind_entry_vectors_from_entries(
             bound_by_grammar.setdefault(gid, []).append(
                 role_key or "UPD"
             )
+    if pending_updates:
+        try:
+            _set_entry_vectors_batch(pending_updates)
+        except Exception:
+            _log.exception(
+                "auto-bind: batch persist failed (%d updates)",
+                len(pending_updates),
+            )
+            return ""
     if not bound_by_grammar:
         return ""
     # Compact message: "Auto-configured 5 entry vector(s) for gb_l0:
@@ -26620,6 +27425,11 @@ def _load_parts_bin() -> list[dict]:
 
 def _save_parts_bin(entries: list[dict]) -> None:
     global _parts_bin_cache
+    # Sweep #10 (2026-05-20): mirror moved INSIDE the lock — same fix
+    # as `_save_library`. Pre-fix: Thread A wrote parts_bin.json,
+    # released lock, Thread B wrote + mirrored B; Thread A then
+    # mirrored A's stale snapshot. RLock allows nesting via the
+    # mirror's `_save_parts_bin_collections` chain.
     with _cache_lock:
         _safe_save_json(_PARTS_BIN_FILE, entries, "Parts bin")
         # Deep-copy on save so the cache is independent of the caller's
@@ -26627,17 +27437,18 @@ def _save_parts_bin(entries: list[dict]) -> None:
         # caller, so subsequent caller mutations (e.g. modal Cancel that
         # didn't actually save) leaked back into the next `_load_parts_bin`.
         _parts_bin_cache = _typed_clone(entries)
+        # Mirror into the active parts-bin collection so multi-bin users
+        # don't lose state. Same contract as `_save_library` invariant #10:
+        # every writeable parts-bin path goes through this helper. Silent
+        # no-op if there's no active bin (first-launch race; the migration
+        # in App.compose() establishes one before any UI write).
+        _sync_active_parts_bin_parts(entries)
     # Invalidate the assembly-fragment digest cache: a part edit
     # (re-domestication, gb_text rewrite, deleted entry) shifts what
     # `_assembly_fragment_from_source` yields, so stale digests
-    # would surface old overhangs in the constructor palette.
+    # would surface old overhangs in the constructor palette. OK to
+    # run outside the lock — pure invalidation.
     _clear_assembly_fragment_cache()
-    # Mirror into the active parts-bin collection so multi-bin users
-    # don't lose state. Same contract as `_save_library` invariant #10:
-    # every writeable parts-bin path goes through this helper. Silent
-    # no-op if there's no active bin (first-launch race; the migration
-    # in App.compose() establishes one before any UI write).
-    _sync_active_parts_bin_parts(entries)
 
 
 # ── Parts-bin collections (multi-bin storage) ───────────────────────────────
@@ -29077,6 +29888,8 @@ class AddFeatureModal(ModalScreen):
     lives on the app side; the modal just surfaces the error strings.
     """
 
+    _blocks_undo: bool = True   # sweep #10: Save / Insert mutates record
+
     BINDINGS = [
         Binding("escape", "cancel",     "Cancel"),
         Binding("tab",    "app.focus_next", "Next", show=False),
@@ -29495,6 +30308,8 @@ class FeatureEditModal(ModalScreen):
       * Enter or double-click on a feature row in the FeatureSidebar.
       * Enter on a highlighted feature in the SequencePanel.
     """
+
+    _blocks_undo: bool = True   # sweep #10: Save mutates feature on canvas
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
@@ -30931,6 +31746,8 @@ class NewPlasmidModal(ModalScreen):
     ``_import_and_persist`` so the record lands in the active library
     collection like any fetched / opened plasmid.
     """
+
+    _blocks_undo: bool = True   # sweep #10: TextArea + record import
 
     BINDINGS = [
         Binding("escape", "cancel",        "Cancel"),
@@ -34262,6 +35079,8 @@ class GrammarEditorModal(ModalScreen):
       - ``None`` — user cancelled, no changes.
     """
 
+    _blocks_undo: bool = True   # sweep #10: grammars file mutation
+
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("tab",    "app.focus_next", "Next", show=False),
@@ -36203,7 +37022,12 @@ class PartsBinPickerModal(ModalScreen):
             self._set_status(f"[red]Bin '{name}' not found.[/red]")
             self._repopulate()
             return
+        # Sweep #11 (2026-05-20): force-flush the settings pointer
+        # before mirroring parts_bin.json so a power loss can't leave
+        # settings.json saying OLD while parts_bin.json holds NEW
+        # data. Same fix sweep #9 landed on project switch.
         _set_active_parts_bin_name(name)
+        _settings_flush_sync()
         # Refresh `parts_bin.json` mirror to match the newly-active bin
         # so the next `_load_parts_bin()` returns the right parts. We
         # bypass `_save_parts_bin` here because that would re-mirror
@@ -36405,7 +37229,14 @@ class PartsBinPickerModal(ModalScreen):
         if _get_active_parts_bin_name() == name:
             promoted = remaining[0].get("name")
             if promoted:
+                # Sweep #11 (2026-05-20): force-flush settings pointer
+                # before the parts_bin.json re-seed so a power loss
+                # between the two writes can't leave settings.json
+                # saying OLD while parts_bin.json holds the promoted
+                # bin's parts. Same fix sweep #9 applied to project
+                # delete-promote.
                 _set_active_parts_bin_name(promoted)
+                _settings_flush_sync()
                 # Re-seed `parts_bin.json` with the promoted bin's
                 # parts so the next `_load_parts_bin` doesn't return
                 # the deleted bin's contents.
@@ -37347,33 +38178,78 @@ class PartsBinModal(Screen):
             # Domesticator only ever produces single-part L0 entries.
             part_dict.setdefault("grammar", self._active_grammar_id())
             part_dict.setdefault("level", 0)
-            entries = _load_parts_bin()
-            entries.insert(0, part_dict)
-            try:
-                _save_parts_bin(entries)
-            except (OSError, RuntimeError) as exc:
-                _notify_save_failure(self.app, "Parts bin", exc)
-                return
-            self._populate()
+
+            # Route through collision resolution so a Domesticator
+            # save that lands on an existing part name (re-domesticating
+            # the same fragment with tweaked overhangs, or an honest
+            # name clash) surfaces the same exact-copy / name-collision
+            # prompt the bulk Load path uses. Pre-2026-05-20 fix this
+            # appended silently and tripped the (name, sequence) delete
+            # bug when the user later removed the original.
+            existing = _load_parts_bin()
+
+            def _content_fn(p: dict) -> str:
+                return (
+                    f"{(p.get('sequence') or '').upper()}|"
+                    f"{(p.get('oh5') or '').upper()}|"
+                    f"{(p.get('oh3') or '').upper()}"
+                )
+
             display_name = part_dict.get("name") or "(unnamed)"
-            self.app.notify(
-                f"Saved '{display_name}' to Parts Bin "
-                f"({len(part_dict.get('sequence', ''))} bp). "
-                f"Mirroring to library…",
-            )
-            # Library mirror: clone the part into the configured entry
-            # vector and save the resulting full plasmid as a library
-            # entry. Off-thread so a 100+ MB library doesn't freeze
-            # the UI between bin save and the success notify. Best-
-            # effort: a build / save failure here doesn't roll back
-            # the parts-bin save (the bin row is the primary
-            # persistence target; the library entry is the visual /
-            # collection-facing twin). Worker fires a follow-up notify
-            # on completion (success or failure) so the user sees
-            # what landed.
-            from copy import deepcopy as _deepcopy
-            self._domesticator_library_mirror_worker(
-                _deepcopy(part_dict),
+
+            def _on_cancelled() -> None:
+                self.app.notify(
+                    f"Save cancelled. '{display_name}' not added to Parts Bin.",
+                    severity="warning",
+                )
+
+            def _on_resolved(items_to_save: "list[dict]",
+                             replace_names: "set[str]") -> None:
+                if not items_to_save and not replace_names:
+                    self.app.notify(
+                        f"Skipped duplicate. '{display_name}' already in "
+                        f"the Parts Bin.",
+                        severity="warning",
+                    )
+                    return
+                try:
+                    entries = _load_parts_bin()
+                    if replace_names:
+                        entries = [
+                            e for e in entries
+                            if (e.get("name") or "") not in replace_names
+                        ]
+                    entries = items_to_save + entries
+                    _save_parts_bin(entries)
+                except (OSError, RuntimeError) as exc:
+                    _notify_save_failure(self.app, "Parts bin", exc)
+                    return
+                self._populate()
+                # `items_to_save[0]` carries the (possibly COPY-renamed)
+                # name; the library mirror downstream should see the
+                # final value so the mirrored plasmid matches the bin.
+                final_part = items_to_save[0] if items_to_save else part_dict
+                final_name = final_part.get("name") or "(unnamed)"
+                self.app.notify(
+                    f"Saved '{final_name}' to Parts Bin "
+                    f"({len(final_part.get('sequence', ''))} bp). "
+                    f"Mirroring to library…",
+                )
+                # Library mirror: clone the part into the configured
+                # entry vector and save as a library entry. Off-thread
+                # to keep the UI snappy on big libraries. Best-effort:
+                # mirror failure doesn't roll back the bin save.
+                from copy import deepcopy as _deepcopy
+                self._domesticator_library_mirror_worker(
+                    _deepcopy(final_part),
+                )
+
+            _resolve_load_collisions(
+                self.app, "part", [part_dict], existing,
+                name_key="name",
+                content_fn=_content_fn,
+                on_resolved=_on_resolved,
+                on_cancelled=_on_cancelled,
             )
 
         self.app.push_screen(
@@ -37416,26 +38292,38 @@ class PartsBinModal(Screen):
             )
             return
         try:
-            lib_entries = _load_library()
-            raw_id = lib_rec.id or display_name
-            safe_id = re.sub(r"[^A-Za-z0-9_]+", "_", raw_id) or "part"
-            existing_ids = {e.get("id") or "" for e in lib_entries}
-            unique_id = safe_id
-            bump = 2
-            while unique_id in existing_ids:
-                unique_id = f"{safe_id}_{bump}"
-                bump += 1
-            lib_entry = {
-                "id":      unique_id,
-                "name":    display_name,
-                "size":    _seq_len(lib_rec),
-                "n_feats": len(lib_rec.features or []),
-                "source":  "domesticator:l0",
-                "added":   _date.today().isoformat(),
-                "gb_text": _record_to_gb_text(lib_rec),
-            }
-            lib_entries.insert(0, lib_entry)
-            _save_library(lib_entries)
+            # Sweep #11 (2026-05-20): load-modify-save under
+            # `_cache_lock`. Pre-fix the Domesticator mirror, the
+            # Constructor save, Traditional cloning save, Gibson
+            # save, and Ctrl+S all ran load → mutate → save without
+            # a global lock. `exclusive=True` only serialises within
+            # one group; two workers from DIFFERENT groups could
+            # both read the same pre-state, both insert, both save
+            # — the second save's entries list didn't include the
+            # first save's new entry, so the first entry vanished
+            # silently. RLock allows re-entry from `_save_library`'s
+            # own lock.
+            with _cache_lock:
+                lib_entries = _load_library()
+                raw_id = lib_rec.id or display_name
+                safe_id = re.sub(r"[^A-Za-z0-9_]+", "_", raw_id) or "part"
+                existing_ids = {e.get("id") or "" for e in lib_entries}
+                unique_id = safe_id
+                bump = 2
+                while unique_id in existing_ids:
+                    unique_id = f"{safe_id}_{bump}"
+                    bump += 1
+                lib_entry = {
+                    "id":      unique_id,
+                    "name":    display_name,
+                    "size":    _seq_len(lib_rec),
+                    "n_feats": len(lib_rec.features or []),
+                    "source":  "domesticator:l0",
+                    "added":   _date.today().isoformat(),
+                    "gb_text": _record_to_gb_text(lib_rec),
+                }
+                lib_entries.insert(0, lib_entry)
+                _save_library(lib_entries)
         except (OSError, RuntimeError) as exc:
             _log.exception(
                 "Domesticator: library-mirror save failed for %r",
@@ -37627,76 +38515,196 @@ class PartsBinModal(Screen):
             if level_int >= 1 and gb_text:
                 part_entry["gb_text"] = gb_text
             new_parts.append(part_entry)
-        if new_parts:
-            try:
-                entries = _load_parts_bin()
-                # Insert newest-first at the top so the user sees them
-                # at the head of the table after the modal refreshes.
-                entries = new_parts + entries
-                _save_parts_bin(entries)
-            except OSError as exc:
-                _log.exception(
-                    "Load Parts (bulk): parts bin save failed",
-                )
-                self.app.call_from_thread(
-                    self.app.notify,
-                    f"Load Parts: couldn't save parts bin ({exc}).",
-                    severity="error",
+        # Resolution + save runs on the UI thread because the collision
+        # modals push screens (only safe from the UI thread). The
+        # finalizer also handles unclassified / failed tallies so the
+        # user always sees a single coherent summary toast.
+        self.app.call_from_thread(
+            self._finalize_parts_load,
+            new_parts, unclassified, failed, last_grammar,
+            "Load Parts (batch)",
+        )
+
+    def _finalize_parts_load(
+        self,
+        new_parts: "list[dict]",
+        unclassified: "list[str]",
+        failed: "list[str]",
+        last_grammar: str,
+        title: str,
+        extra_info: str = "",
+    ) -> None:
+        """UI-thread continuation for the Load Parts workers.
+
+        Resolves any (name, sequence + overhangs) collisions against the
+        existing parts bin via ``_resolve_load_collisions``. The user
+        sees an ``ExactCopyConfirmModal`` if any new parts duplicate
+        existing entries exactly, then a ``NameCollisionModal`` if any
+        new parts share a name with existing entries but the body
+        differs. After the user resolves both prompts (or cancels), the
+        final list is written via ``_save_parts_bin``; a single
+        summary toast surfaces the counts (loaded / overwritten /
+        skipped / unclassified / failed).
+
+        Regression guard for 2026-05-20 — pre-fix the load path saved
+        verbatim, so a repeated import double-added parts silently and
+        a later delete-one nuked both copies via the (name, sequence)
+        set-based filter in ``_delete_selected``.
+        """
+        n_unc  = len(unclassified)
+        n_fail = len(failed)
+        if not new_parts:
+            self._emit_parts_load_summary(
+                0, n_unc, n_fail, 0, 0, title,
+                unclassified, failed,
+            )
+            return
+
+        existing = _load_parts_bin()
+
+        def _content_fn(p: dict) -> str:
+            # Identity: sequence body + both overhangs. Two parts with
+            # the same name but different overhangs (e.g. a B3a vs B3b
+            # variant) classify as "name collision (different content)"
+            # rather than "exact copy", so the user gets the overwrite /
+            # keep-original / cancel prompt instead of the silent
+            # COPY-rename. Upper-cased so case quirks in legacy data
+            # don't surface false collisions.
+            return (
+                f"{(p.get('sequence') or '').upper()}|"
+                f"{(p.get('oh5') or '').upper()}|"
+                f"{(p.get('oh3') or '').upper()}"
+            )
+
+        def _on_cancelled() -> None:
+            self.app.notify(
+                f"{title}: load cancelled. Existing parts unchanged.",
+                severity="warning",
+            )
+            _log_event(
+                "parts_bin.load.cancelled",
+                title=title, n_new=len(new_parts),
+            )
+
+        def _on_resolved(items_to_save: "list[dict]",
+                         replace_names: "set[str]") -> None:
+            n_skipped = len(new_parts) - len(items_to_save)
+            if not items_to_save and not replace_names:
+                self._emit_parts_load_summary(
+                    0, n_unc, n_fail, 0, n_skipped, title,
+                    unclassified, failed,
                 )
                 return
-            # Adopt the most-recently-classified grammar as active —
-            # mirrors the single-pick worker so the user lands on the
-            # tab where their new parts live. Best-effort; persist
-            # failure isn't fatal.
+            n_overwritten = 0
+            try:
+                entries = _load_parts_bin()
+                if replace_names:
+                    before = len(entries)
+                    entries = [
+                        e for e in entries
+                        if (e.get("name") or "") not in replace_names
+                    ]
+                    n_overwritten = before - len(entries)
+                # Insert newest-first at the top so the user sees them
+                # at the head of the table after the modal refreshes.
+                entries = items_to_save + entries
+                _save_parts_bin(entries)
+            except (OSError, RuntimeError) as exc:
+                _log.exception("Load Parts: parts bin save failed")
+                _notify_save_failure(self.app, "Parts bin", exc)
+                return
             if last_grammar:
                 try:
                     _set_setting("active_grammar", last_grammar)
                 except OSError:
                     _log.debug(
-                        "Load Parts (bulk): active_grammar persist failed",
+                        "Load Parts: active_grammar persist failed",
                     )
-        # Compose summary toast on the UI thread. Bounce table
-        # repopulate through the same path the single worker uses
-        # (the parts table is owned by the PartsBinModal screen).
-        n_added = len(new_parts)
-        n_unc   = len(unclassified)
-        n_fail  = len(failed)
+            if self.is_mounted:
+                try:
+                    self._populate()
+                except Exception:
+                    _log.debug("Load Parts: repopulate failed")
+            n_added = len(items_to_save) - n_overwritten
+            _log_event(
+                "parts_bin.load.ok",
+                title=title, n_added=n_added,
+                n_overwritten=n_overwritten, n_skipped=n_skipped,
+                n_unclassified=n_unc, n_failed=n_fail,
+            )
+            self._emit_parts_load_summary(
+                n_added, n_unc, n_fail, n_overwritten, n_skipped,
+                title, unclassified, failed, extra_info,
+            )
 
-        def _summary():
-            if not self.is_mounted:
-                return
-            try:
-                self._populate()   # type: ignore[attr-defined]
-            except Exception:
-                _log.debug(
-                    "Load Parts (bulk): repopulate failed",
-                )
-            sev = (
-                "information" if n_added and not (n_unc or n_fail)
-                else "warning" if n_added
-                else "error"
+        _resolve_load_collisions(
+            self.app, "part", new_parts, existing,
+            name_key="name",
+            content_fn=_content_fn,
+            on_resolved=_on_resolved,
+            on_cancelled=_on_cancelled,
+        )
+
+    def _emit_parts_load_summary(
+        self,
+        n_added: int,
+        n_unc: int,
+        n_fail: int,
+        n_overwritten: int,
+        n_skipped: int,
+        title: str,
+        unclassified: "list[str]",
+        failed: "list[str]",
+        extra_info: str = "",
+    ) -> None:
+        """Compose + fire the single post-load summary toast and log
+        per-record fallout from unclassified / failed payloads. Always
+        called once per load via ``_finalize_parts_load`` so the user
+        sees one coherent message regardless of which collision path
+        the modals routed through.
+        """
+        sev = (
+            "information"
+            if (n_added or n_overwritten) and not (n_unc or n_fail)
+            else "warning" if (n_added or n_overwritten or n_skipped)
+            else "error" if n_fail
+            else "warning"
+        )
+        bits: list[str] = []
+        if n_added:
+            bits.append(
+                f"Loaded {n_added} part{'s' if n_added != 1 else ''}"
             )
-            parts_word = "part" if n_added == 1 else "parts"
-            msg = f"Loaded {n_added} {parts_word}."
-            if n_unc:
-                msg += (
-                    f" {n_unc} couldn't classify "
-                    "(overhangs didn't match a grammar position)."
-                )
-            if n_fail:
-                msg += f" {n_fail} failed (see log)."
-            self.app.notify(
-                msg, title="Load Parts (batch)",
-                severity=sev, timeout=8,
+        if n_overwritten:
+            bits.append(
+                f"overwrote {n_overwritten} existing"
             )
-            for name in unclassified:
-                _log.info(
-                    "Load Parts (bulk): unclassified plasmid %r",
-                    name,
-                )
-            for entry in failed:
-                _log.warning("Load Parts (bulk): %s", entry)
-        self.app.call_from_thread(_summary)
+        if n_skipped:
+            bits.append(
+                f"skipped {n_skipped} duplicate"
+                f"{'s' if n_skipped != 1 else ''}"
+            )
+        if not bits:
+            bits.append("No parts added")
+        msg = ". ".join(bits) + "."
+        if n_unc:
+            msg += (
+                f" {n_unc} couldn't classify "
+                f"(overhangs didn't match a grammar position)."
+            )
+        if n_fail:
+            msg += f" {n_fail} failed (see log)."
+        if extra_info and (n_added or n_overwritten):
+            # Append the single-load classifier detail (grammar, level,
+            # marker, entry-vector match) only when something actually
+            # landed. Suppressing on skip / cancel keeps the toast
+            # honest — no stale "Loaded as X" copy when nothing did.
+            msg += " " + extra_info
+        self.app.notify(msg, title=title, severity=sev, timeout=8)
+        for name in unclassified:
+            _log.info("Load Parts: unclassified plasmid %r", name)
+        for entry in failed:
+            _log.warning("Load Parts: %s", entry)
 
     @work(thread=True, exclusive=True, group="parts_bin_load")
     def _load_part_worker(self, seq: str, feats: list,
@@ -37792,29 +38800,11 @@ class PartsBinModal(Screen):
         # rejections, 2026-05-13.)
         if level_int >= 1 and gb_text:
             part["gb_text"] = gb_text
-        try:
-            entries = _load_parts_bin()
-            entries.insert(0, part)
-            _save_parts_bin(entries)
-        except OSError as exc:
-            _log.exception("Load Part: parts bin save failed")
-            self.app.call_from_thread(
-                self.app.notify,
-                f"Load Part: couldn't save parts bin ({exc}).",
-                severity="error",
-            )
-            return
-        try:
-            _set_setting("active_grammar", grammar_id)
-        except OSError:
-            # Settings persist failure isn't fatal — the part already
-            # saved. The user just won't have the active-grammar tab
-            # auto-flip on next launch.
-            _log.exception("Load Part: persist active_grammar failed")
-        # Surface the entry-vector match in the toast so the user sees
-        # whether their plasmid actually fits a configured destination.
-        # Stays silent when no entry vector is configured for the
-        # grammar — most users haven't bound one yet.
+        # Compose the classifier detail string the single-load toast
+        # used to carry verbatim. `_finalize_parts_load` appends it
+        # only when the save actually lands (so a user-cancelled or
+        # skipped-duplicate run doesn't show a misleading "Loaded as
+        # X" trailer).
         ev = match.get("entry_vector") or {}
         ev_msg = ""
         if ev.get("matches"):
@@ -37822,17 +38812,20 @@ class PartsBinModal(Screen):
             role_str = f" / {role}" if role else ""
             ev_msg = f" Vector: {ev.get('name', '?')}{role_str}."
         level_label = _part_level_label(int(match.get("level", 0) or 0))
-        # Skip the modal-side repopulate if the user closed the Parts Bin
-        # while the digest was running — the part is already on disk, so a
-        # future open will see it. Notify still fires (app-level, safe even
-        # after dismissal).
-        if self.is_mounted:
-            self.app.call_from_thread(self._populate)
-        self.app.call_from_thread(
-            self.app.notify,
-            f"Loaded '{plasmid_name}' as {match['grammar_name']} → "
+        extra_info = (
+            f"'{plasmid_name}' classified as {match['grammar_name']} → "
             f"{position.get('name')} ({position.get('type')}). "
-            f"Level: {level_label}. Marker: {marker}.{ev_msg}",
+            f"Level: {level_label}. Marker: {marker}.{ev_msg}"
+        )
+        # Route through `_finalize_parts_load` so exact-copy and name-
+        # collision prompts fire for single loads the same way they do
+        # for bulk. The single-load contract used to save unconditionally;
+        # post-2026-05-20 fix it now prompts the user when an existing
+        # part matches by name (regression guard in test_parts_bin_dedupe).
+        self.app.call_from_thread(
+            self._finalize_parts_load,
+            [part], [], [], grammar_id,
+            "Load Part", extra_info,
         )
 
     @on(Button.Pressed, "#btn-parts-export-fasta")
@@ -38063,27 +39056,24 @@ class PartsBinModal(Screen):
             )
             return
 
-        saved_names: list[str] = []
+        # Build the records up-front so collision detection runs once
+        # for the whole batch rather than N times via N stacked modals.
+        # Sweep #10 (2026-05-20): pre-fix the loop called
+        # `lib.add_entry(rec)` per part, each colliding rec queueing a
+        # modal, while the post-loop toast claimed success before any
+        # modal resolved. Now the batch routes through a single
+        # `add_entries_batch` collision flow and the toast fires from
+        # the resolved callback.
+        records: list = []
+        record_to_diag: dict[str, str] = {}
         failed: list[str] = []
-        # (part_name, reason) pairs surfaced when cloning falls back
-        # to a stub backbone because the user's entry vector + part
-        # overhangs are incompatible. Without this the user sees a
-        # pUPD2-stub plasmid land in their collection and has no idea
-        # the IIS digest didn't actually use their configured vector.
-        diagnostics: list[tuple[str, str]] = []
         for r in valid:
             try:
                 reason = _diagnose_part_cloning(r)
                 rec = _part_to_cloned_seqrecord(r)
-                if not lib.add_entry(rec):
-                    # add_entry handled the user-facing error notify
-                    # internally; just track it as a failure so the
-                    # toast count doesn't claim it succeeded.
-                    failed.append(r.get("name", "?"))
-                    continue
-                saved_names.append(rec.name)
+                records.append(rec)
                 if reason:
-                    diagnostics.append((r.get("name", "?"), reason))
+                    record_to_diag[r.get("name", "?")] = reason
             except Exception as exc:
                 _log.exception(
                     "parts-bin: save-to-collection failed for %r: %s",
@@ -38091,43 +39081,73 @@ class PartsBinModal(Screen):
                 )
                 failed.append(r.get("name", "?"))
 
-        # Compose a single result toast with the headline number + a
-        # tail listing up to three names so the user can verify
-        # without leaving the modal.
-        tail = ", ".join(saved_names[:3])
-        if len(saved_names) > 3:
-            tail += f" (+{len(saved_names) - 3} more)"
-        extras: list[str] = []
-        if skipped:
-            extras.append(f"{skipped} catalog row(s) skipped")
-        if failed:
-            extras.append(f"{len(failed)} failed")
-        suffix = f" ({'; '.join(extras)})" if extras else ""
-        n = len(saved_names)
-        if n:
-            self.app.notify(
-                f"Saved {n} part(s) to '{coll_name}': {tail}{suffix}",
-                severity="success",  # type: ignore[arg-type]
-                markup=False,
-            )
-        else:
+        if not records:
+            extras: list[str] = []
+            if skipped:
+                extras.append(f"{skipped} catalog row(s) skipped")
+            if failed:
+                extras.append(f"{len(failed)} failed")
+            suffix = f" ({'; '.join(extras)})" if extras else ""
             self.app.notify(
                 f"Save to '{coll_name}' failed — see log{suffix}",
                 severity="error", markup=False,
             )
+            return
 
-        # Surface a separate, persistent warning per part that fell
-        # back to the stub backbone. Long timeout because the
-        # diagnostic message is the user's only clue that their saved
-        # plasmid is not in their configured entry vector — they need
-        # time to read it and decide whether to redesign the part
-        # or pick a different vector.
-        for nm, reason in diagnostics:
-            self.app.notify(
-                f"'{nm}': {reason}",
-                title="Part saved with stub backbone",
-                severity="warning", markup=False, timeout=12,
-            )
+        def _on_done(
+            saved_names: "list[str]",
+            replaced_names: "set[str]",
+            cancelled: bool,
+        ) -> None:
+            if cancelled:
+                self.app.notify(
+                    f"Save to '{coll_name}' cancelled. "
+                    f"Library unchanged.",
+                    severity="warning", markup=False,
+                )
+                return
+            tail = ", ".join(saved_names[:3])
+            if len(saved_names) > 3:
+                tail += f" (+{len(saved_names) - 3} more)"
+            extras: list[str] = []
+            if skipped:
+                extras.append(f"{skipped} catalog row(s) skipped")
+            if failed:
+                extras.append(f"{len(failed)} failed")
+            if replaced_names:
+                extras.append(
+                    f"{len(replaced_names)} overwritten"
+                )
+            suffix = f" ({'; '.join(extras)})" if extras else ""
+            n = len(saved_names)
+            if n:
+                self.app.notify(
+                    f"Saved {n} part(s) to '{coll_name}': "
+                    f"{tail}{suffix}",
+                    severity="success",  # type: ignore[arg-type]
+                    markup=False,
+                )
+            else:
+                self.app.notify(
+                    f"No parts saved to '{coll_name}'{suffix}",
+                    severity="warning", markup=False,
+                )
+            # Surface a separate, persistent warning per part that
+            # fell back to the stub backbone. Long timeout because
+            # the diagnostic is the user's only clue their saved
+            # plasmid isn't in their configured entry vector. Only
+            # fires for parts that actually landed (the on-cancel /
+            # all-skipped branches short-circuit above).
+            for nm in saved_names:
+                reason = record_to_diag.get(nm)
+                if reason:
+                    self.app.notify(
+                        f"'{nm}': {reason}",
+                        title="Part saved with stub backbone",
+                        severity="warning", markup=False, timeout=12,
+                    )
+
+        lib.add_entries_batch(records, on_done=_on_done)
 
         # Clear the multi-select so the next Ctrl+click sequence
         # starts fresh. Repopulating refreshes the "Feat Lib" column
@@ -38218,12 +39238,15 @@ class PartsBinModal(Screen):
             return
 
         names = [r.get("name", "?") for r in valid]
-        # Snapshot the (name, sequence) tuples now: a `_populate`
-        # could otherwise re-shuffle row indices between confirmation
-        # and delete and we'd nuke the wrong rows.
-        targets = {
+        # Snapshot the (name, sequence) tuples NOW with a count, not a
+        # set: legacy duplicates (same name + sequence × N) used to
+        # collapse into one set element and delete ALL N entries on a
+        # single-row delete. Switching to ``Counter`` makes the delete
+        # count-aware — selecting one of two duplicates removes one,
+        # not both. Regression guard for 2026-05-20 fix.
+        targets: "Counter[tuple[str, str]]" = Counter(
             (r.get("name", ""), r.get("sequence", "")) for r in valid
-        }
+        )
         # Track skipped count for the post-delete toast (closure capture).
         skipped_for_toast = skipped
 
@@ -38231,10 +39254,17 @@ class PartsBinModal(Screen):
             if not ok:
                 return
             entries = _load_parts_bin()
-            kept = [
-                e for e in entries
-                if (e.get("name", ""), e.get("sequence", "")) not in targets
-            ]
+            # Counter-driven removal: each entry consumes one unit of
+            # the matching key; once depleted, subsequent entries with
+            # the same key are KEPT. Preserves entry order.
+            remaining = targets.copy()
+            kept: list[dict] = []
+            for e in entries:
+                key = (e.get("name", ""), e.get("sequence", ""))
+                if remaining.get(key, 0) > 0:
+                    remaining[key] -= 1
+                else:
+                    kept.append(e)
             n_removed = len(entries) - len(kept)
             try:
                 _save_parts_bin(kept)
@@ -40791,9 +41821,8 @@ class SequencingScreen(Screen):
             )
             return
         # Resolve the target plasmid from the library.
-        target_entry = next(
-            (e for e in _load_library() if e.get("id") == target_id),
-            None,
+        target_entry = _find_library_entry_by_id(
+            str(target_id) if target_id else "",
         )
         if target_entry is None:
             self.query_one("#align-status", Static).update(
@@ -46345,15 +47374,31 @@ class TraditionalCloningPane(Vertical):
             # History recording is best-effort — never block the save.
             _log.exception("trad-cloning: failed to record history "
                               "for %s", name)
-        entries = _load_library()
-        entries.append(entry)
-        # Sync cache update so the source/vector tables below see the
-        # new entry instantly. Disk write is dispatched to a worker
-        # so a 156 MB library + mirror doesn't freeze the UI for
-        # 5-10 s after the Save Forward / Save Reverse click. Same
-        # pattern as the 0.7.15.1 rename fix.
+        # Sweep #11 (2026-05-20): RMW under `_cache_lock` so a
+        # concurrent worker save from a different group (Constructor,
+        # Gibson, Domesticator mirror) can't read the same pre-state
+        # and silently drop our entry on its save. The id-uniqueness
+        # disambiguation above ran outside the lock; re-check inside
+        # the lock so a worker that took our `name` between the check
+        # and the save bumps us to the next free slot.
         global _library_cache
-        _library_cache = _typed_clone(entries)
+        with _cache_lock:
+            entries = _load_library()
+            existing_names = {
+                e.get("name") for e in entries if isinstance(e, dict)
+            }
+            if name in existing_names:
+                bump = n + 1 if 'n' in locals() else 2
+                while True:
+                    candidate = f"{base}-{bump}"
+                    if candidate not in existing_names:
+                        name = candidate
+                        entry["id"] = candidate
+                        entry["name"] = candidate
+                        break
+                    bump += 1
+            entries.append(entry)
+            _library_cache = _typed_clone(entries)
         _clear_primer_cache = globals().get("_primer_usage_clear_cache")
         if _clear_primer_cache is not None:
             _clear_primer_cache()
@@ -47230,6 +48275,13 @@ class GibsonAssemblyPane(Vertical):
         off-thread; UI updates (notify / panel reveal / re-populate)
         bounce back via ``call_from_thread``.
         """
+        # Sweep #11 (2026-05-20): Gibson load-modify-save runs under
+        # `_cache_lock` to keep id-uniqueness honest against
+        # concurrent Constructor / Traditional / Domesticator mirror
+        # saves. Without this, two workers could both pick the same
+        # "gibson-N" name and the second save would silently drop
+        # the first save's entry. Lock is held across the
+        # disambiguation + insert + save so the gap is closed.
         try:
             entries = _load_library()
         except Exception as exc:
@@ -47292,9 +48344,27 @@ class GibsonAssemblyPane(Vertical):
         if entry_counter != getattr(self.app, "_record_load_counter",
                                        entry_counter):
             entry["source"] = "constructor:gibson:stale-canvas"
-        entries.insert(0, entry)
         try:
-            _save_library(entries)
+            # Re-disambiguate inside the lock to defend against a
+            # racing worker that landed a "gibson-N" between our
+            # check above and this point.
+            with _cache_lock:
+                fresh = _load_library()
+                fresh_names = {
+                    e.get("name") for e in fresh if isinstance(e, dict)
+                }
+                if name in fresh_names:
+                    bump = n + 1
+                    while True:
+                        candidate = f"{base}-{bump}"
+                        if candidate not in fresh_names:
+                            name = candidate
+                            entry["id"] = candidate
+                            entry["name"] = candidate
+                            break
+                        bump += 1
+                fresh.insert(0, entry)
+                _save_library(fresh)
         except (OSError, RuntimeError) as exc:
             _log_event(
                 "gibson.save.failed",
@@ -48872,7 +49942,11 @@ class ConstructorModal(ModalScreen):
             r"[^A-Za-z0-9_]+", "_",
             new_rec.id or new_rec.name or "assembly",
         ) or "assembly"
-        # Disambiguate vs existing library entries.
+        # Disambiguate vs existing library entries. Sweep #11
+        # (2026-05-20): the id-uniqueness check + insert + save all
+        # run under `_cache_lock` further down so a concurrent
+        # Domesticator mirror / Gibson save can't take the same
+        # `unique_id` between our check and our save.
         existing = {e.get("id") or "" for e in _load_library()}
         unique_id = plasmid_id
         suffix = 2
@@ -48928,10 +50002,33 @@ class ConstructorModal(ModalScreen):
         except Exception:
             _log.exception("constructor: failed to record history "
                             "for %s", unique_id)
-        lib_entries = _load_library()
-        lib_entries.insert(0, lib_entry)
         try:
-            _save_library(lib_entries)
+            # Sweep #11 (2026-05-20): RMW under `_cache_lock` so a
+            # concurrent worker save from a different group (Gibson,
+            # Traditional, Domesticator mirror) can't read the same
+            # pre-state and then have its save overwrite this one
+            # (or vice versa). The check above for `unique_id`
+            # collision against `existing` is also covered — we
+            # re-read inside the lock to defend against a race that
+            # added an entry between the disambiguation loop and the
+            # save. RLock allows the nested `_save_library` lock.
+            with _cache_lock:
+                lib_entries = _load_library()
+                # Re-disambiguate inside the lock so a concurrent
+                # save that took our originally-unique id is
+                # detected and we pick the next free slot.
+                existing_now = {e.get("id") or "" for e in lib_entries}
+                if unique_id in existing_now:
+                    bump = suffix
+                    while True:
+                        candidate = f"{plasmid_id}_{bump}"
+                        if candidate not in existing_now:
+                            unique_id = candidate
+                            lib_entry["id"] = unique_id
+                            break
+                        bump += 1
+                lib_entries.insert(0, lib_entry)
+                _save_library(lib_entries)
         except (OSError, RuntimeError) as exc:
             # Library save is the first commit. Re-raise — nothing
             # has landed on disk yet, so the outer worker's failure
@@ -52280,12 +53377,12 @@ class PrimerDesignScreen(Screen):
 
         today = _date.today().isoformat()
 
+        new_primers: list[dict] = []
         for pname, seq, tm, pos in [
             (fwd_name, fwd_seq, result["fwd_tm"], result["fwd_pos"]),
             (rev_name, rev_seq, result["rev_tm"], result["rev_pos"]),
         ]:
-            entries = [e for e in entries if e.get("name") != pname]
-            entries.insert(0, {
+            new_primers.append({
                 "name":        pname,
                 "sequence":    seq,
                 "tm":          tm,
@@ -52297,16 +53394,59 @@ class PrimerDesignScreen(Screen):
                 "date":        today,
                 "status":      "Designed",
             })
-        try:
-            _save_primers(entries)
-        except (OSError, RuntimeError) as exc:
-            _notify_save_failure(self.app, "Primer library", exc)
-            return
-        self._refresh_library_table()
-        self.app.notify(f"Saved {fwd_name} + {rev_name} to primer library.",
-                        severity="success",  # type: ignore[arg-type]
-                        markup=False)
-        self._reset_for_new_design()
+
+        # Route through collision resolution so a name match (e.g. the
+        # user saving a redesigned "FOO-F" over an older "FOO-F" with a
+        # different sequence) prompts overwrite / keep / cancel instead
+        # of silently clobbering. The pre-existing sequence-dup check
+        # above already rejects exact-sequence duplicates regardless of
+        # name; this layer only fires on name collisions with different
+        # sequences. Regression guard for 2026-05-20.
+        def _content_fn(p: dict) -> str:
+            return (p.get("sequence") or "").upper()
+
+        def _on_cancelled() -> None:
+            self.app.notify(
+                "Primer save cancelled. Library unchanged.",
+                severity="warning",
+            )
+
+        def _on_resolved(items_to_save: "list[dict]",
+                         replace_names: "set[str]") -> None:
+            if not items_to_save and not replace_names:
+                self.app.notify(
+                    "Skipped duplicate primer(s). Library unchanged.",
+                    severity="warning",
+                )
+                return
+            current = _load_primers()
+            if replace_names:
+                current = [
+                    e for e in current
+                    if (e.get("name") or "") not in replace_names
+                ]
+            current = items_to_save + current
+            try:
+                _save_primers(current)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Primer library", exc)
+                return
+            self._refresh_library_table()
+            saved_names = [p.get("name", "?") for p in items_to_save]
+            self.app.notify(
+                f"Saved {' + '.join(saved_names)} to primer library.",
+                severity="success",  # type: ignore[arg-type]
+                markup=False,
+            )
+            self._reset_for_new_design()
+
+        _resolve_load_collisions(
+            self.app, "primer", new_primers, entries,
+            name_key="name",
+            content_fn=_content_fn,
+            on_resolved=_on_resolved,
+            on_cancelled=_on_cancelled,
+        )
 
     # ── Add selected library primers as features ──────────────────────────
 
@@ -55473,6 +56613,8 @@ class RestoreFromBackupModal(ModalScreen):
                     the caller can refresh panels and notify.
     """
 
+    _blocks_undo: bool = True   # sweep #10: full-file restore mutation
+
     BINDINGS = [
         Binding("escape", "cancel",         "Cancel"),
         Binding("tab",    "app.focus_next", "Next",   show=False),
@@ -55613,16 +56755,38 @@ class RestoreFromBackupModal(ModalScreen):
                 f"[red]Restore failed: {exc}[/red]"
             )
             return
-        # Bust the in-memory caches so the next read picks up the
-        # restored state. The actual cache invalidation hooks live
-        # alongside each loader; mirror them here so an agent-driven
-        # restore picks up the new state without an app restart.
+        # Bust EVERY persisted-state cache so the next read picks up
+        # the restored state. Sweep #10 (2026-05-20) — mirrors the
+        # 14-entry enumeration in `_h_restore_pre_update_snapshot` /
+        # `_MASTER_DELETE_CACHE_ATTRS`. Pre-fix this only reset the
+        # original 4 caches (library / collections / parts bin /
+        # primers); sweep #9 added experiments / experiment projects
+        # / gels persisted files but the restore modal was never
+        # extended, so restoring `experiments.json` from .bak left
+        # the in-memory `_experiments_cache` stale + the next UI
+        # mutation silently overwrote the freshly-restored disk
+        # state. `_settings_cache` deliberately NOT reset — restoring
+        # settings would clobber the live app's pointer state mid-
+        # session; the user can restart to pick up a settings restore.
         try:
             _sc = __import__("splicecraft")
-            _sc._library_cache     = None
-            _sc._collections_cache = None
-            _sc._parts_bin_cache   = None
-            _sc._primers_cache     = None
+            for attr in (
+                "_library_cache",
+                "_collections_cache",
+                "_parts_bin_cache",
+                "_parts_bin_collections_cache",
+                "_primers_cache",
+                "_features_cache",
+                "_feature_colors_cache",
+                "_grammars_cache",
+                "_entry_vectors_cache",
+                "_codon_tables_cache",
+                "_experiments_cache",
+                "_experiment_projects_cache",
+                "_gels_cache",
+            ):
+                if hasattr(_sc, attr):
+                    setattr(_sc, attr, None)
         except (AttributeError, ImportError):
             pass
         self.dismiss({
@@ -57619,6 +58783,249 @@ class PartsBinDeleteConfirmModal(ModalScreen):
         self.dismiss(False)
 
 
+class ExactCopyConfirmModal(ModalScreen):
+    """Prompt the user when a load batch contains exact duplicates of
+    existing entries (same name AND same content). Two-way choice:
+
+      * "Skip duplicates" — drop the duplicates from the load; existing
+        entries unchanged. Default focus.
+      * "Keep as COPY"    — append " COPY" (or " COPY 2", etc.) to each
+        duplicate's name so it lands alongside the existing entry.
+
+    Default focus on Skip so a stray Enter on splash dismiss doesn't
+    silently double-add data. Generic across subsystems — used by parts
+    bin, plasmid library, primers, experiments, collections.
+
+    Dismiss payload:
+      True  — Keep as COPY (caller renames + saves)
+      False — Skip duplicates (caller drops them from the batch)
+      None  — Escape (treated as skip, same as False)
+
+    See ``_classify_collisions`` for the upstream pure classifier and
+    ``_ensure_unique_copy_name`` for the rename helper.
+    """
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    ExactCopyConfirmModal { align: center middle; }
+    #copydlg-dlg {
+        width: 80; max-width: 95%; min-width: 60;
+        height: auto; max-height: 90%;
+        background: $surface; border: solid $warning; padding: 1 2;
+    }
+    #copydlg-title { background: $warning-darken-2; color: $text;
+                     padding: 0 1; margin-bottom: 1; }
+    #copydlg-msg   { height: auto; margin-bottom: 1; }
+    #copydlg-btns  { height: 3; margin-top: 1; align: right middle; }
+    #copydlg-btns Button { margin-left: 1; min-width: 18; }
+    """
+
+    def __init__(self, entity: str, names: "list[str]") -> None:
+        """``entity`` — singular noun for the modal copy ("part",
+        "plasmid", "primer", "experiment", "collection"). ``names`` —
+        list of duplicate entry names; first three are previewed.
+        """
+        super().__init__()
+        self._entity = entity
+        self._names  = list(names)
+        # Sweep #10 (2026-05-20): rapid double-click between
+        # button-press and the async pop_screen completing can fire
+        # the same handler twice with a stale `dismiss` call slipping
+        # through. `_dismissed` gates every exit path so the modal
+        # callback is invoked exactly once.
+        self._dismissed: bool = False
+
+    def compose(self) -> ComposeResult:
+        from rich.markup import escape as _esc
+        n = len(self._names)
+        preview = ", ".join(_esc(name) for name in self._names[:3])
+        if n > 3:
+            preview += f" (+{n - 3} more)"
+        ent = _esc(self._entity)
+        plural = "" if n == 1 else "s"
+        body = (
+            f"  [bold red]{n}[/bold red] {ent}{plural} in this load "
+            f"match {'an existing entry' if n == 1 else 'existing entries'} "
+            f"by both name AND content (exact duplicate"
+            f"{plural}).\n"
+            f"  [dim]({preview})[/dim]\n\n"
+            f"  • [b]Skip[/b] — drop the duplicate"
+            f"{plural} from the load (default).\n"
+            f"  • [b]Keep as COPY[/b] — append [b]“COPY”[/b] "
+            f"to the name so {'it' if n == 1 else 'they'} can coexist "
+            f"alongside the original{plural}.\n"
+        )
+        with Vertical(id="copydlg-dlg"):
+            yield Static(
+                f" Exact duplicate{plural} detected ", id="copydlg-title",
+            )
+            yield Static(body, id="copydlg-msg", markup=True)
+            with Horizontal(id="copydlg-btns"):
+                yield Button(
+                    f"Skip duplicate{plural}",
+                    id="btn-copydlg-skip", variant="default",
+                )
+                yield Button(
+                    f"Keep as COPY",
+                    id="btn-copydlg-keep", variant="warning",
+                )
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#btn-copydlg-skip", Button).focus()
+        except NoMatches:
+            pass
+
+    def _dismiss_once(self, payload) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
+
+    @on(Button.Pressed, "#btn-copydlg-skip")
+    def _skip(self, _) -> None:
+        self._dismiss_once(False)
+
+    @on(Button.Pressed, "#btn-copydlg-keep")
+    def _keep(self, _) -> None:
+        self._dismiss_once(True)
+
+    def action_cancel(self) -> None:
+        self._dismiss_once(False)
+
+
+class NameCollisionModal(ModalScreen):
+    """Prompt the user when a load batch contains entries whose name
+    matches an existing entry but whose CONTENT differs. Three-way
+    choice:
+
+      * "Keep original"  — drop the new entries; existing entries
+        unchanged. Default focus (safest — preserves user data).
+      * "Overwrite"      — replace existing entries with the new content
+        (matched by name).
+      * "Cancel load"    — abort the entire load; nothing saved on
+        either side.
+
+    Used across subsystems (parts bin, plasmid library, primers,
+    experiments, collections, gels) so a "load with a familiar name but
+    different bytes" never silently clobbers or silently drops data.
+
+    Dismiss payload (str):
+      "keep"      — keep originals; new entries dropped
+      "overwrite" — replace existing with new
+      "cancel"    — abort the whole load (caller does NOTHING)
+      None        — Escape (treated as cancel)
+
+    See ``_classify_collisions`` for the upstream pure classifier.
+    """
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    NameCollisionModal { align: center middle; }
+    #namecoll-dlg {
+        width: 84; max-width: 95%; min-width: 64;
+        height: auto; max-height: 90%;
+        background: $surface; border: solid $warning; padding: 1 2;
+    }
+    #namecoll-title { background: $warning-darken-2; color: $text;
+                      padding: 0 1; margin-bottom: 1; }
+    #namecoll-msg   { height: auto; margin-bottom: 1; }
+    #namecoll-btns  { height: 3; margin-top: 1; align: right middle; }
+    #namecoll-btns Button { margin-left: 1; min-width: 18; }
+    """
+
+    def __init__(self, entity: str, names: "list[str]") -> None:
+        """``entity`` — singular noun for the modal copy ("part",
+        "plasmid", "primer", "experiment", "collection"). ``names`` —
+        list of colliding entry names; first three are previewed.
+        """
+        super().__init__()
+        self._entity = entity
+        self._names  = list(names)
+        # Sweep #10 (2026-05-20): double-fire guard — see
+        # ExactCopyConfirmModal for rationale.
+        self._dismissed: bool = False
+
+    def compose(self) -> ComposeResult:
+        from rich.markup import escape as _esc
+        n = len(self._names)
+        preview = ", ".join(_esc(name) for name in self._names[:3])
+        if n > 3:
+            preview += f" (+{n - 3} more)"
+        ent = _esc(self._entity)
+        plural = "" if n == 1 else "s"
+        body = (
+            f"  [bold red]{n}[/bold red] {ent}{plural} in this load "
+            f"share a name with {'an existing entry' if n == 1 else 'existing entries'} "
+            f"but the [b]content is different[/b].\n"
+            f"  [dim]({preview})[/dim]\n\n"
+            f"  • [b]Keep original[/b] — drop the new "
+            f"{'entry' if n == 1 else 'entries'}; existing data unchanged "
+            f"(default).\n"
+            f"  • [b]Overwrite[/b] — replace the existing "
+            f"{'entry' if n == 1 else 'entries'} with the new content.\n"
+            f"  • [b]Cancel[/b] — abort the entire load; nothing saved.\n"
+        )
+        with Vertical(id="namecoll-dlg"):
+            yield Static(
+                f" Name collision{plural} (different content) ",
+                id="namecoll-title",
+            )
+            yield Static(body, id="namecoll-msg", markup=True)
+            with Horizontal(id="namecoll-btns"):
+                yield Button(
+                    "Keep original",
+                    id="btn-namecoll-keep", variant="default",
+                )
+                yield Button(
+                    "Overwrite",
+                    id="btn-namecoll-overwrite", variant="warning",
+                )
+                yield Button(
+                    "Cancel load",
+                    id="btn-namecoll-cancel", variant="error",
+                )
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#btn-namecoll-keep", Button).focus()
+        except NoMatches:
+            pass
+
+    def _dismiss_once(self, payload: str) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
+
+    @on(Button.Pressed, "#btn-namecoll-keep")
+    def _keep(self, _) -> None:
+        self._dismiss_once("keep")
+
+    @on(Button.Pressed, "#btn-namecoll-overwrite")
+    def _overwrite(self, _) -> None:
+        self._dismiss_once("overwrite")
+
+    @on(Button.Pressed, "#btn-namecoll-cancel")
+    def _cancel_btn(self, _) -> None:
+        self._dismiss_once("cancel")
+
+    def action_cancel(self) -> None:
+        self._dismiss_once("cancel")
+
+
 class LibraryDeleteConfirmModal(ModalScreen):
     """Generic delete-confirmation modal. Used by the plasmid library,
     primer library, and any future list that needs handslip protection.
@@ -59572,6 +60979,9 @@ def _h_create_collection(app, payload):
     name = _normalize_collection_name(payload.get("name"))
     if name is None:
         return ({"error": "missing or invalid 'name'"}, 400)
+    # Initial name-taken check (early-out before the potentially-slow
+    # bulk import). The atomic re-check inside the save lock below
+    # closes the race window.
     if _collection_name_taken(name):
         return ({"error": f"collection {name!r} already exists"}, 409)
 
@@ -59594,16 +61004,31 @@ def _h_create_collection(app, payload):
         failures_summary = [{"path": p.name, "reason": r}
                               for p, r in failures[:25]]
 
-    colls = _load_collections()
-    colls.append({
-        "name":        name,
-        "description": description,
-        "plasmids":    plasmids,
-        "saved":       _date.today().isoformat(),
-    })
-    if (err := _agent_save_or_500(
-            lambda: _save_collections(colls), "collections")) is not None:
-        return err
+    # Sweep #11 (2026-05-20): atomic check-then-save under
+    # `_cache_lock`. Pre-fix a GUI user (or a second agent client)
+    # creating a same-named collection during the multi-second
+    # `_bulk_import_folder` window would land first; this handler's
+    # save would silently clobber that collection's plasmids (last
+    # writer wins). Now the re-check inside the lock surfaces the
+    # collision as 409 even when it appeared after the early-out
+    # check above.
+    with _cache_lock:
+        if _collection_name_taken(name):
+            return (
+                {"error":
+                 f"collection {name!r} created concurrently — retry"},
+                409,
+            )
+        colls = _load_collections()
+        colls.append({
+            "name":        name,
+            "description": description,
+            "plasmids":    plasmids,
+            "saved":       _date.today().isoformat(),
+        })
+        if (err := _agent_save_or_500(
+                lambda: _save_collections(colls), "collections")) is not None:
+            return err
     app.call_from_thread(_agent_refresh_library_panel, app)
     return {
         "ok":          True,
@@ -59863,19 +61288,33 @@ def _h_hmmscan(app, payload):
     hmm_path = _sanitize_path(payload.get("hmm_path"))
     if hmm_path is None:
         return ({"error": "missing 'hmm_path'"}, 400)
+    # Sweep #11 (2026-05-20): collapse "file-not-acceptable" responses
+    # to a generic 400 so an unauthenticated caller can't probe
+    # filesystem state via the error differential (pre-fix the
+    # responses for "not found" / "not a regular file" / "too large"
+    # were distinguishable, letting a local attacker enumerate which
+    # paths exist + what kind). The detail still lands in the log
+    # for the SpliceCraft user's own diagnostic bundle.
+    _HMMSCAN_HMM_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
+    _generic_rejection = (
+        {"error": "hmm file not acceptable (see splicecraft log)"}, 400,
+    )
     if not hmm_path.exists():
-        return ({"error": f"hmm file not found: {hmm_path}"}, 404)
+        _log.info("hmmscan: refused path (not found): %s", hmm_path)
+        return _generic_rejection
     # Symlink + size + regular-file check. Asymmetric vs
     # `_h_load_file` which already routes through `_safe_file_size_check`;
     # without this, `pyhmmer.HMMFile(/dev/zero)` streams forever and an
     # agent caller can DoS the worker. Cap at 2 GB — real Pfam-A.hmm
     # bundles weigh in around 1.3 GB so this is generous but bounded.
-    _HMMSCAN_HMM_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
     ok, reason = _safe_file_size_check(
         hmm_path, _HMMSCAN_HMM_MAX_BYTES, "hmm file",
     )
     if not ok:
-        return ({"error": reason or "hmm file rejected"}, 400)
+        _log.info(
+            "hmmscan: refused path %s — %s", hmm_path, reason,
+        )
+        return _generic_rejection
     max_hits = _coerce_int(payload.get("max_hits", 25),
                              name="max_hits")
     if isinstance(max_hits, str):
@@ -60555,31 +61994,67 @@ def _h_delete_codon_table(app, payload):
 # ── Utility endpoints (history viewer, primer-dup, UI snapshot) ───────────────
 
 
+_HISTORY_NODE_MAX_DEPTH = 500
+_HISTORY_NODE_MAX_NODES = 100_000
+
+
 def _history_node_to_dict(node) -> "dict | None":
     """Convert a `_CommercialSaaSHistoryNode` tree to a plain-dict JSON
     shape. Mirrors the viewer's per-node fields so an agent gets the
     same surface the UI sees without driving a TUI.
+
+    Sweep #10 (2026-05-20): iterative DFS with explicit depth + node
+    caps. Pre-fix this recursed through `node.parents`, blowing the
+    Python recursion limit (~1000) on hostile `.dna` imports carrying
+    deeply-nested `<HistoryTree>` blocks (32 MB cap can yield 3M+
+    nodes). Sibling helpers `walk`, `_history_node_count`,
+    `HistoryScreen.populate` were already iterative for this exact
+    reason; this one was overlooked.
     """
     if node is None:
         return None
-    out: dict = {
-        "name":       getattr(node, "name", "") or "",
-        "operation":  getattr(node, "operation", "") or "",
-        "seq_len":    int(getattr(node, "seq_len", 0) or 0),
-        "circular":   bool(getattr(node, "circular", False)),
-        "regenerated_sites": list(
-            getattr(node, "regenerated_sites", []) or []
-        ),
-        "input_summaries":   list(
-            getattr(node, "input_summaries", []) or []
-        ),
-        "parents":    [],
-    }
-    for p in (getattr(node, "parents", []) or []):
-        cd = _history_node_to_dict(p)
-        if cd is not None:
-            out["parents"].append(cd)
-    return out
+
+    def _shell(n) -> dict:
+        return {
+            "name":       getattr(n, "name", "") or "",
+            "operation":  getattr(n, "operation", "") or "",
+            "seq_len":    int(getattr(n, "seq_len", 0) or 0),
+            "circular":   bool(getattr(n, "circular", False)),
+            "regenerated_sites": list(
+                getattr(n, "regenerated_sites", []) or []
+            ),
+            "input_summaries":   list(
+                getattr(n, "input_summaries", []) or []
+            ),
+            "parents":    [],
+        }
+
+    root_dict = _shell(node)
+    # Stack frame: (source_node, target_dict_under_construction, depth).
+    stack: list = [(node, root_dict, 0)]
+    n_seen = 1
+    truncated = False
+    while stack:
+        src, dst, depth = stack.pop()
+        if depth >= _HISTORY_NODE_MAX_DEPTH:
+            # Bail out the parents-walk at this branch — root_dict
+            # still carries the upstream shape. Mark on dst so the
+            # caller surfaces a "history truncated" hint.
+            dst["_truncated"] = "depth_cap"
+            truncated = True
+            continue
+        for p in (getattr(src, "parents", []) or []):
+            if n_seen >= _HISTORY_NODE_MAX_NODES:
+                dst["_truncated"] = "node_cap"
+                truncated = True
+                break
+            child_dict = _shell(p)
+            dst["parents"].append(child_dict)
+            n_seen += 1
+            stack.append((p, child_dict, depth + 1))
+    if truncated:
+        root_dict["_truncated_at_node"] = n_seen
+    return root_dict
 
 
 @_agent_endpoint("get-history")
@@ -65105,10 +66580,11 @@ SpeciesPickerModal { align: center middle; }
         if self._current_record is None:
             return
         record_id = getattr(self._current_record, "id", None)
-        match = next(
-            (e for e in _load_library() if e.get("id") == record_id),
-            None,
-        ) if record_id else None
+        # Sweep #11 (2026-05-20): discard-changes hot path — `_find_*`
+        # avoids the whole-library deepcopy on every Esc.
+        match = (
+            _find_library_entry_by_id(record_id) if record_id else None
+        )
         if match is None or not match.get("gb_text"):
             self._mark_clean()
             return

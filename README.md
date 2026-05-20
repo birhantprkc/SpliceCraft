@@ -90,6 +90,12 @@ Full feature reference: [`docs/features.md`](docs/features.md).
 
 ## Robustness is a feature
 
+- **Load-time collision detection** across parts bin, plasmid library,
+  and primer library. An exact duplicate (same name + same content)
+  prompts *skip* (default) or *keep as " COPY"* so duplicates can
+  coexist with their twin. A name-match with different content prompts
+  three-way *keep original* (default) / *overwrite* / *cancel the load*
+  — never silently clobbers existing data.
 - **Four-layer JSON safety net** per save: atomic write + `.bak` +
   rotating timestamped backups + daily snapshots + suspicious-shrink
   guard.

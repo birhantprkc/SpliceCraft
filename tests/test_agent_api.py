@@ -1575,7 +1575,13 @@ class TestNewSearchEndpoints:
         )
         assert status == 400
 
-    def test_hmmscan_404_on_missing_path(self, http_server):
+    def test_hmmscan_400_on_missing_path(self, http_server):
+        # Sweep #11 (2026-05-20): hmmscan no longer surfaces a 404
+        # distinct from 400 — that error differential was a
+        # filesystem-state oracle for unauthenticated local
+        # processes. All file-not-acceptable responses (not found,
+        # symlink, not a regular file, oversize) collapse to a
+        # single generic 400 with detail logged for the user.
         base, token, _ = http_server
         status, payload = _http(
             f"{base}/hmmscan", method="POST",
@@ -1583,7 +1589,8 @@ class TestNewSearchEndpoints:
                   "hmm_path": "/no/such/file.hmm"},
             token=token,
         )
-        assert status == 404
+        assert status == 400
+        assert "not acceptable" in (payload.get("error") or "").lower()
 
     def test_hmmscan_400_on_short_query(self, http_server, tmp_path):
         # Build a tiny .hmm so the path-exists check passes; the
