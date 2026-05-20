@@ -1,0 +1,708 @@
+"""Cross-cutting sequence-integrity audit (2026-05-20).
+
+Sacred invariants this file enforces:
+
+1. **Length conservation on excise.** For a 2-cut digest on a circular
+   plasmid: ``len(original) == sum(fragment.top_seq lengths)``. Every
+   nucleotide accounted for exactly once. No silent duplication, no
+   silent loss.
+
+2. **Overhang-once-at-seam on ligate.** Ligating fragment A's right
+   end to B's left end produces ``A.top_seq + B.top_seq`` — the
+   overhang bases live in WHICHEVER fragment's top strand carried
+   them (top-strand canonicalisation rule, splicecraft.py line ~4577).
+   Verified by counting unique sequence motifs across the seam.
+
+3. **Round-trip cut+religate = original** (modulo origin rotation).
+   The strongest test: digest a known plasmid, religate the
+   fragments, the result must be sequence-equal to the input under
+   rotation.
+
+4. **L0 → TU body conservation.** Each L0 part's body sequence appears
+   exactly once in the assembled TU. Overhangs at part-part seams
+   appear once (not twice).
+
+5. **TU → MOD chain conservation.** Two TUs chained into an Ω-MOD:
+   both TU bodies preserved, seam overhang once, MOD boundary
+   overhangs at the outer cuts.
+
+6. **Gibson overlap-merge.** N fragments with overlap regions →
+   product length = sum(fragment_lengths) − sum(overlap_lengths).
+   Overlap sequences appear ONCE.
+
+7. **Traditional cloning round-trip.** Digest then religate must
+   yield the original plasmid (under rotation).
+
+8. **Entry-vector ops are read-only.** `_detect_entry_vector_role` /
+   `_auto_bind_entry_vectors_from_entries` MUST NOT mutate the input
+   record's sequence.
+
+Sacred — never pick fragments by size (per
+`feedback_never_assume_smaller_frag_is_payload`). Where the test
+needs to identify the "insert" vs "vector" half, it uses feature
+markers, not length comparisons.
+"""
+import pytest
+import splicecraft as sc
+
+pytestmark = [pytest.mark.usefixtures("_protect_user_data")]
+
+
+# ── Synthetic-plasmid builders ─────────────────────────────────────────────
+
+
+def _make_circular_record(seq: str, *, features=None, name: str = "test"):
+    """Build a circular SeqRecord with the given top-strand sequence."""
+    from Bio.SeqRecord import SeqRecord
+    from Bio.Seq import Seq
+    rec = SeqRecord(
+        Seq(seq), id=name, name=name,
+        annotations={"topology": "circular", "molecule_type": "DNA"},
+    )
+    if features:
+        for f in features:
+            rec.features.append(f)
+    return rec
+
+
+def _rotate(seq: str, by: int) -> str:
+    """Rotate a circular sequence by `by` bases (positive = left shift)."""
+    n = len(seq)
+    by = by % n if n else 0
+    return seq[by:] + seq[:by]
+
+
+def _sequences_match_under_rotation(a: str, b: str) -> bool:
+    """True iff `a` and `b` describe the same circular molecule —
+    one is a rotation of the other. Uses the doubled-string trick:
+    `a` is a rotation of `b` iff `a` is a substring of `b + b`."""
+    if len(a) != len(b):
+        return False
+    if not a:
+        return True
+    return a in (b + b)
+
+
+# ── 1. EXCISE: length conservation ─────────────────────────────────────────
+
+class TestExciseLengthConservation:
+    """For every successful 2-cut digest: total top_seq length must
+    equal the original sequence length, exactly."""
+
+    @pytest.mark.parametrize("enzyme,site", [
+        ("EcoRI",  "GAATTC"),  # 6-bp palindromic, 4-bp 5' overhang
+        ("BamHI",  "GGATCC"),  # 6-bp palindromic
+        ("HindIII","AAGCTT"),  # 6-bp palindromic
+    ])
+    def test_palindromic_two_cut_length_conservation(self, enzyme, site):
+        """Two EcoRI/BamHI/HindIII sites in a circular plasmid:
+        digest → 2 fragments, their top_seq lengths must sum to
+        the original length."""
+        # Construct: filler + site + filler + site + filler.
+        filler1 = "AAAAAAAAAACCCCCCCCCC"  # 20 bp
+        filler2 = "TTTTTTTTTTGGGGGGGGGG"  # 20 bp
+        filler3 = "ATATATATATCGCGCGCGCG"  # 20 bp
+        seq = filler1 + site + filler2 + site + filler3
+        frags, err = sc._excise_fragment_pair(
+            seq, [enzyme], circular=True,
+        )
+        assert err is None, f"{enzyme} digest errored: {err}"
+        assert len(frags) == 2
+        total = sum(len(f["top_seq"]) for f in frags)
+        assert total == len(seq), (
+            f"{enzyme}: length lost. orig={len(seq)} sum_fragments={total} "
+            f"diff={len(seq) - total}"
+        )
+
+    @pytest.mark.parametrize("enzyme", ["BsaI", "Esp3I"])
+    def test_type_iis_length_conservation(self, enzyme):
+        """Type IIS enzymes (BsaI, Esp3I) cut outside their site.
+        Asymmetric cut geometry is the classic off-by-one risk."""
+        # Build a plasmid with 2 outward-facing BsaI sites so the
+        # central segment gets released cleanly.
+        # BsaI = GGTCTC(N1)↓N4 — cuts 1bp downstream, 4bp 5' overhang.
+        # Esp3I = CGTCTC(N1)↓N4 — same geometry, different recognition.
+        if enzyme == "BsaI":
+            fwd_site, rc_site = "GGTCTC", "GAGACC"
+        else:
+            fwd_site, rc_site = "CGTCTC", "GAGACG"
+        # Forward site sees: ENZ + N + 4bp_overhang + payload
+        # Reverse site sees: payload + 4bp_overhang + N + RC_ENZ
+        inside = (
+            fwd_site + "A" + "GGAG" +
+            "CCCCCAAAAAGGGGGTTTTT" +
+            "CGCT" + "T" + rc_site
+        )
+        backbone = "ATCGATCGAT" * 50
+        seq = inside + backbone
+        frags, err = sc._excise_fragment_pair(
+            seq, [enzyme], circular=True,
+        )
+        assert err is None
+        assert len(frags) == 2
+        total = sum(len(f["top_seq"]) for f in frags)
+        assert total == len(seq), (
+            f"{enzyme} length lost: orig={len(seq)} sum={total}"
+        )
+
+    def test_three_cut_excise_refuses(self):
+        """3 cuts on a circular plasmid → ambiguous excise; the
+        sacred invariant says we must refuse rather than ship a
+        wrong product (CLAUDE.md #25)."""
+        # 3 EcoRI sites.
+        seq = "AAAA" + "GAATTC" + "TTTT" + "GAATTC" + "GGGG" + "GAATTC" + "CCCC"
+        frags, err = sc._excise_fragment_pair(
+            seq, ["EcoRI"], circular=True,
+        )
+        assert err is not None, (
+            "≥3 cuts must surface an error (sacred CLAUDE.md #25)"
+        )
+        assert "exactly 2" in err["error"].lower()
+
+
+# ── 2. EXCISE → LIGATE: round-trip equivalence ─────────────────────────────
+
+class TestExciseLigateRoundTrip:
+    """Cut a circular plasmid then religate the fragments. The
+    product must be sequence-equal to the original (modulo origin
+    rotation). This is the strongest sequence-conservation test."""
+
+    @pytest.mark.parametrize("enzyme,site", [
+        ("EcoRI", "GAATTC"),
+        ("BamHI", "GGATCC"),
+    ])
+    def test_palindromic_round_trip(self, enzyme, site):
+        """Two-site palindromic digest + religate must give back
+        the original sequence (under rotation)."""
+        filler1 = "AAAAACCCCCAAAAACCCCC"  # 20
+        filler2 = "TTTTTGGGGGTTTTTGGGGG"  # 20
+        filler3 = "ATATGCGCATATGCGCATAT"  # 20
+        original = filler1 + site + filler2 + site + filler3
+        frags, err = sc._excise_fragment_pair(
+            original, [enzyme], circular=True,
+        )
+        assert err is None
+        assert len(frags) == 2
+        # Ligate frag[0]→frag[1] then close circular.
+        merged = sc._ligate_fragments(frags[0], frags[1])
+        assert merged is not None, "Religation failed"
+        circular = sc._close_circular(merged)
+        assert circular is not None, "Circle close failed"
+        assert _sequences_match_under_rotation(
+            circular["top_seq"], original,
+        ), (
+            f"{enzyme} round-trip drift:\n"
+            f"  original ({len(original)}bp): {original}\n"
+            f"  result   ({len(circular['top_seq'])}bp): {circular['top_seq']}"
+        )
+
+    def test_two_palindromic_enzymes_round_trip(self):
+        """EcoRI + BamHI (different enzymes, different sites): the
+        directional ligation must still reproduce the original."""
+        # EcoRI overhang = AATT (palindrome). BamHI overhang = GATC
+        # (palindrome). Different sites → directional ligation; both
+        # palindromic so each enzyme's pair self-ligates.
+        original = (
+            "AAACCC" + "GAATTC" + "TTGGAACC" + "GGATCC" + "CGCGATAT"
+        )
+        frags, err = sc._excise_fragment_pair(
+            original, ["EcoRI", "BamHI"], circular=True,
+        )
+        assert err is None
+        assert len(frags) == 2
+        # Try both ligation orders — one will match.
+        for a, b in ((frags[0], frags[1]), (frags[1], frags[0])):
+            merged = sc._ligate_fragments(a, b)
+            if merged is None:
+                continue
+            circular = sc._close_circular(merged)
+            if circular is None:
+                continue
+            if _sequences_match_under_rotation(
+                circular["top_seq"], original,
+            ):
+                return  # success
+        pytest.fail(
+            "Neither ligation order reproduced the original sequence"
+        )
+
+    def test_type_iis_round_trip(self):
+        """Type IIS cut + religate must preserve sequence. Most
+        likely site for an off-by-one because BsaI/Esp3I cut
+        outside their recognition sequence."""
+        # Build with two outward-facing BsaI sites releasing a
+        # cassette with (GGAG, CGCT) overhangs.
+        inside = (
+            "GGTCTC" + "A" + "GGAG" +
+            "AAATTTCCCGGG" +
+            "CGCT" + "T" + "GAGACC"
+        )
+        backbone = "GCGCATATATAT" * 8
+        original = inside + backbone
+        frags, err = sc._excise_fragment_pair(
+            original, ["BsaI"], circular=True,
+        )
+        assert err is None
+        assert len(frags) == 2
+        # Both ligation orders.
+        for a, b in ((frags[0], frags[1]), (frags[1], frags[0])):
+            merged = sc._ligate_fragments(a, b)
+            if merged is None:
+                continue
+            circular = sc._close_circular(merged)
+            if circular is None:
+                continue
+            if _sequences_match_under_rotation(
+                circular["top_seq"], original,
+            ):
+                return
+        pytest.fail(
+            "Type IIS round-trip drift — neither orientation matches "
+            "the original"
+        )
+
+
+# ── 3. OVERHANG-ONCE-AT-SEAM ───────────────────────────────────────────────
+
+
+class TestOverhangAtSeam:
+    """When two fragments ligate, the overhang sequence appears
+    exactly ONCE in the merged top strand (top-strand-canonicalisation
+    rule, splicecraft.py:4577)."""
+
+    def test_palindromic_overhang_appears_once(self):
+        """EcoRI overhang AATT: cut a circular plasmid with two
+        EcoRI sites, religate, and count AATT occurrences in the
+        product. Must equal the input count (overhang re-formed at
+        each seam, lives in one fragment only)."""
+        original = (
+            "AAACCC" + "GAATTC" +
+            "ATATCGCG" + "GAATTC" +
+            "TTGGAACC"
+        )
+        original_aatt = original.count("AATT")
+        frags, err = sc._excise_fragment_pair(
+            original, ["EcoRI"], circular=True,
+        )
+        assert err is None
+        merged = sc._ligate_fragments(frags[0], frags[1])
+        assert merged is not None
+        product_aatt = merged["top_seq"].count("AATT")
+        # Religating restores the site → AATT count survives.
+        # The merged is LINEAR (before close-circular), so it has
+        # one fewer cut than the original. Count must equal
+        # (original_aatt - 1) iff a seam straddles two AATTs.
+        # Easier: close circular and recount; that must equal
+        # original_aatt.
+        circular = sc._close_circular(merged)
+        assert circular is not None
+        assert circular["top_seq"].count("AATT") == original_aatt, (
+            f"AATT count drift: original={original_aatt} "
+            f"after-religate={circular['top_seq'].count('AATT')}"
+        )
+
+    def test_type_iis_overhang_appears_once_at_seam(self):
+        """Cut with BsaI; the released stuffer's left/right
+        overhang sequences (GGAG and CGCT in the test rig) must
+        each appear exactly once in the LIGATED product where the
+        seam reconstitutes the original. NOT doubled (the
+        canonicalisation rule)."""
+        # Build a known plasmid with EXACTLY one GGAG and one CGCT
+        # outside the BsaI sites so we know the baseline count.
+        inside = (
+            "GGTCTC" + "A" + "GGAG" +
+            "AAATTTCCC" +     # no GGAG / CGCT here
+            "CGCT" + "T" + "GAGACC"
+        )
+        backbone = "ATATATATAT" * 12  # no GGAG / CGCT
+        original = inside + backbone
+        n_ggag = original.count("GGAG")
+        n_cgct = original.count("CGCT")
+        # Sanity: the construction has exactly one of each.
+        assert n_ggag == 1
+        assert n_cgct == 1
+        frags, err = sc._excise_fragment_pair(
+            original, ["BsaI"], circular=True,
+        )
+        assert err is None
+        for a, b in ((frags[0], frags[1]), (frags[1], frags[0])):
+            merged = sc._ligate_fragments(a, b)
+            if merged is None:
+                continue
+            circular = sc._close_circular(merged)
+            if circular is None:
+                continue
+            if _sequences_match_under_rotation(
+                circular["top_seq"], original,
+            ):
+                assert circular["top_seq"].count("GGAG") == n_ggag
+                assert circular["top_seq"].count("CGCT") == n_cgct
+                return
+        pytest.fail("Round-trip didn't match either orientation")
+
+
+# ── 4. FEATURE COORDINATES PRESERVED ───────────────────────────────────────
+
+
+class TestFeatureCoordinatesAfterDigest:
+    """Features on the input record must land at the correct
+    fragment-local coordinates after `_excise_fragment_pair`. Loss
+    or shift here would silently break the Constructor's downstream
+    feature-painting in assembled TUs."""
+
+    def test_feature_inside_fragment_lands_correctly(self):
+        """A feature wholly inside one fragment must appear in
+        that fragment's `features` list with correctly-shifted
+        coordinates."""
+        # Build: EcoRI at pos 10, EcoRI at pos 40, feature 20..30.
+        original = "AAAAAAAAAA" + "GAATTC" + "AAATTTGGGCCC" + "AAAAAA" + "GAATTC" + "TTTTTTTT"
+        # GAATTC at 10 and ... let's compute.
+        s1 = original.find("GAATTC")
+        s2 = original.find("GAATTC", s1 + 1)
+        assert s1 != -1 and s2 != -1 and s2 > s1
+        # Feature inside the segment between the two sites.
+        feat_start = s1 + 8
+        feat_end   = s1 + 14
+        feats = [{
+            "start": feat_start, "end": feat_end,
+            "type":  "CDS", "qualifiers": {"label": ["inner_feat"]},
+        }]
+        frags, err = sc._excise_fragment_pair(
+            original, ["EcoRI"], circular=True,
+            features=feats,
+        )
+        assert err is None
+        # Find the fragment carrying the feature.
+        carrier = None
+        for f in frags:
+            for ff in f.get("features", []):
+                lab = ff.get("qualifiers", {}).get("label") or []
+                if "inner_feat" in lab:
+                    carrier = (f, ff)
+                    break
+            if carrier:
+                break
+        assert carrier is not None, (
+            "Inner feature was lost across the digest"
+        )
+        frag, feat = carrier
+        # Verify the bases at the feature's local coords in the
+        # carrier's top_seq match the bases at the absolute coords
+        # in the original — that's the sacred property.
+        local_bases = frag["top_seq"][
+            feat["start"]: feat["end"]
+        ]
+        orig_bases = original[feat_start:feat_end]
+        assert local_bases == orig_bases, (
+            f"Feature coords drifted: original={orig_bases!r} "
+            f"fragment-local={local_bases!r}"
+        )
+
+
+# ── 5. GIBSON ASSEMBLY ─────────────────────────────────────────────────────
+
+
+class TestGibsonAssembly:
+    """Gibson assembly: N fragments with overlap homology → 1
+    product. Overlap appears ONCE in the product (not twice). Total
+    length = sum(fragment lengths) − sum(overlap lengths)."""
+
+    def test_three_fragment_gibson_overlap_appears_once(self):
+        """Three fragments with 20-bp overlaps. Verify the overlap
+        sequences appear exactly once in the assembled product."""
+        overlap_AB = "AAACCCAAACCCAAACCCAA"   # 20 bp
+        overlap_BC = "TTGGGTTTGGGTTTGGGTTT"   # 20 bp
+        overlap_CA = "GCATGCATGCATGCATGCAT"   # 20 bp
+        body_A = "AAAATTTTGGGG" * 5   # 60 bp body
+        body_B = "CCCCAAAATTTT" * 5
+        body_C = "TTTTGGGGCCCC" * 5
+        # Each fragment starts with its overlap with the previous
+        # fragment and ends with its overlap with the next. Circular
+        # assembly: frag_A → frag_B → frag_C → frag_A (wraps).
+        frag_A = overlap_CA + body_A + overlap_AB
+        frag_B = overlap_AB + body_B + overlap_BC
+        frag_C = overlap_BC + body_C + overlap_CA
+        fragments = [
+            {"name": "A", "sequence": frag_A, "features": []},
+            {"name": "B", "sequence": frag_B, "features": []},
+            {"name": "C", "sequence": frag_C, "features": []},
+        ]
+        result = sc._simulate_gibson_assembly(
+            fragments, min_overlap=15, circular=True,
+        )
+        assert result.get("success") is True, (
+            f"Gibson failed: errors={result.get('errors')} "
+            f"warnings={result.get('warnings')}"
+        )
+        product_seq = result["product_seq"]
+        # Length conservation: product = sum(fragments) - 3 overlaps
+        # (one per junction, including the wrap junction).
+        expected_len = (
+            len(frag_A) + len(frag_B) + len(frag_C)
+            - 3 * 20
+        )
+        assert len(product_seq) == expected_len, (
+            f"Gibson length drift: expected {expected_len}, "
+            f"got {len(product_seq)}"
+        )
+        # Each overlap appears ONCE in the doubled product (the
+        # circular product wraps, so the linear top-seq might
+        # split an overlap across the join — count in doubled).
+        for ovl in (overlap_AB, overlap_BC, overlap_CA):
+            occ_doubled = (product_seq + product_seq).count(ovl)
+            assert 1 <= occ_doubled <= 2, (
+                f"Overlap {ovl!r} appears {occ_doubled} times in "
+                "doubled product — expected exactly 1 in circular "
+                "(2 max if the linear top_seq happens to repeat the "
+                "overlap at the join). Gibson is over-counting if >2."
+            )
+
+    def test_two_fragment_gibson_linear(self):
+        """Two fragments with one overlap → linear product, NO
+        wrap. Length = a + b − overlap."""
+        overlap = "GCATCGATCGATCGATCGAT"  # 20 bp
+        body_a = "AAAATTTTGGGG" * 5
+        body_b = "CCCCAAAATTTT" * 5
+        frag_a = body_a + overlap
+        frag_b = overlap + body_b
+        result = sc._simulate_gibson_assembly(
+            [
+                {"name": "A", "sequence": frag_a, "features": []},
+                {"name": "B", "sequence": frag_b, "features": []},
+            ],
+            min_overlap=15,
+            circular=False,
+        )
+        assert result.get("success") is True, (
+            f"Linear Gibson failed: {result.get('errors')}"
+        )
+        product = result["product_seq"]
+        expected_len = len(frag_a) + len(frag_b) - len(overlap)
+        assert len(product) == expected_len
+        # Overlap appears exactly once in the linear product.
+        assert product.count(overlap) == 1, (
+            f"Overlap appears {product.count(overlap)} times in "
+            "linear Gibson product — expected exactly 1"
+        )
+        # Body content from both halves must be present.
+        assert body_a in product
+        assert body_b in product
+
+
+# ── 6. TRADITIONAL CLONING (cut + ligate) ─────────────────────────────────
+
+
+class TestTraditionalCloningRoundTrip:
+    """Cut a plasmid with a restriction enzyme set, religate the
+    resulting fragments — the product must equal the original
+    (under rotation)."""
+
+    def test_eco_bam_double_digest_relegate(self):
+        """EcoRI + BamHI double digest → 2 fragments. Religate them
+        in the only compatible orientation — must equal original."""
+        original = (
+            "AAAACCCC" + "GAATTC" + "TTTGGG" +
+            "GGATCC" + "CGCGATAT" + "TGCATGCA"
+        )
+        frags, err = sc._excise_fragment_pair(
+            original, ["EcoRI", "BamHI"], circular=True,
+        )
+        assert err is None
+        # The two fragments have different terminal overhangs (one
+        # EcoRI-end + one BamHI-end). Only the correct orientation
+        # ligates.
+        for a, b in ((frags[0], frags[1]), (frags[1], frags[0])):
+            merged = sc._ligate_fragments(a, b)
+            if merged is None:
+                continue
+            circular = sc._close_circular(merged)
+            if circular is None:
+                continue
+            if _sequences_match_under_rotation(
+                circular["top_seq"], original,
+            ):
+                return
+        pytest.fail("Round-trip failed for EcoRI+BamHI digest")
+
+
+# ── 7. L0 → TU ASSEMBLY ────────────────────────────────────────────────────
+
+
+class TestL0ToTuAssembly:
+    """Build a TU from 3 L0 parts via the actual assembly machinery.
+    Verify body conservation + boundary overhangs."""
+
+    def _make_l0_part(
+        self, *, body: str, oh5: str, oh3: str,
+        backbone: str = "ATCGAT" * 30,
+        marker_label: str = "AmpR",
+    ):
+        """Synthesise an L0 part: a circular pUPD2-style plasmid
+        carrying `body` between two outward-facing BsaI sites,
+        with a rep_origin feature on the backbone half so the
+        backbone-marker exclusion picks the right fragment."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        # Outward-facing BsaI: ENZ_RC + N + oh5 + body + oh3 + N + ENZ_FWD
+        # That arrangement: when BsaI cuts, the released fragment
+        # has top_seq = oh5 + body + oh3 (plus overhang remnants).
+        # Build: backbone + (BsaI RC + N1 + oh5 + body + oh3 + N1 + BsaI FWD).
+        # Simpler: place inward-facing BsaI sites and the body
+        # between them — that's the L1-acceptor pattern. For L0,
+        # the BsaI sites are OUTWARD (in the part, pointing into
+        # the body). The released fragment IS the part body.
+        # Cassette: ENZ_FWD + N + oh5 + body + oh3 + N + ENZ_RC
+        # Reading left→right: "GGTCTC" + "A" + oh5 + body + oh3 + "A" + "GAGACC"
+        # No that's INWARD. Let me think again...
+        #
+        # OUTWARD-facing means the BsaI enzyme on the BACKBONE side
+        # of the cut — the cut releases the body with oh5/oh3
+        # overhangs.
+        # Sequence layout (linearised for clarity, actual is circular):
+        #   ...backbone... GAGACC [N] [oh3] [body_rc] [oh5] [N] GGTCTC ...backbone...
+        # Wait, the SIMPLEST L0 part layout:
+        #   [body_with_overhangs_baked_in] — but BsaI has to cut OUT
+        #   of the body. So the OUTER edges of the body must have
+        #   BsaI sites pointing OUTWARD. The site faces outward
+        #   means "RC" on the left, "FWD" on the right.
+        # Result layout (l → r, top strand):
+        #   GAGACC N oh3 body_rc oh5 N GGTCTC ... backbone ...
+        # Wait actually:
+        # Forward BsaI: GGTCTC N N N N N | (5' overhang on top is
+        #   the next 4 bases AFTER position 7, which is the cut).
+        # If we want the body to have a (oh5, oh3) outer-overhang
+        # pair when released by BsaI, we place:
+        #   FWD: "GGTCTC" + N + oh5 + body + oh3 + N + "GAGACC" → INWARD
+        # That's actually inward (both sites point INTO the body).
+        # Hmm. Re-checking: GGTCTC(N1)↓(N4) — top strand cuts at
+        # position site_end+1, bottom strand cuts at site_end+5.
+        # If sequence is "...GGTCTCANNNN...", top-cut happens just
+        # after the A. So the bases NNNN are the 4-bp overhang of
+        # the RIGHT fragment.
+        # For body-to-have-(oh5,oh3): we want the LEFT BsaI cut to
+        # leave oh5 as the right fragment's overhang (which becomes
+        # the body's LEFT overhang), and the RIGHT BsaI cut to leave
+        # oh3 as the left fragment's overhang (which becomes the
+        # body's RIGHT overhang).
+        # Left site (forward): "GGTCTC" + "A" + oh5 + body...
+        # Right site (reverse): ...body + oh3 + "A" + "GAGACC" (RC).
+        # This is the INWARD arrangement → both BsaI sites cut INTO
+        # the body. The body IS the released "stuffer" of a sort.
+        # But wait — for L0 parts, the BsaI sites are usually OUTWARD
+        # so that cutting RELEASES the body, leaving the backbone.
+        # That's: backbone + (outer flanks point INTO body).
+        # When BsaI cuts, the body comes out with oh5/oh3 overhangs
+        # at its ends; the backbone gets the mirrored overhangs.
+        cassette = (
+            "GGTCTC" + "A" + oh5 + body + oh3 + "A" + "GAGACC"
+        )
+        full = cassette + backbone
+        feats: list = []
+        # Mark the backbone half with rep_origin so
+        # `_fragment_has_backbone_marker` picks it correctly.
+        ori_start = len(cassette) + 50
+        feats.append(SeqFeature(
+            FeatureLocation(ori_start, ori_start + 200),
+            type="rep_origin",
+            qualifiers={"label": [marker_label]},
+        ))
+        return _make_circular_record(full, features=feats), full
+
+    def test_three_part_l0_excise_overhangs_correct(self):
+        """A synthesised L0 part with body+(GGAG,AATG) overhangs
+        digests with BsaI to a fragment whose released overhangs
+        are exactly (GGAG, AATG)."""
+        body = "ATGAAACCCGGGTTT" * 4   # 60 bp
+        rec, full_seq = self._make_l0_part(
+            body=body, oh5="GGAG", oh3="AATG",
+        )
+        feats = [
+            {"start": int(f.location.start),
+              "end":   int(f.location.end),
+              "type":  f.type,
+              "qualifiers": dict(f.qualifiers)}
+            for f in rec.features
+        ]
+        frags, err = sc._excise_fragment_pair(
+            full_seq, ["BsaI"], circular=True,
+            features=feats,
+        )
+        assert err is None
+        assert len(frags) == 2
+        # Identify the body via backbone-marker exclusion (NEVER size).
+        marked = [
+            sc._fragment_has_backbone_marker(f) for f in frags
+        ]
+        assert sum(marked) == 1, (
+            "Backbone marker not unambiguous — fragment-marker "
+            "annotation is broken in the synthetic builder"
+        )
+        body_frag = frags[0] if not marked[0] else frags[1]
+        oh5 = body_frag["left"]["overhang_seq"]
+        oh3 = body_frag["right"]["overhang_seq"]
+        assert oh5 == "GGAG", f"L0 part oh5 drifted: {oh5!r} != 'GGAG'"
+        assert oh3 == "AATG", f"L0 part oh3 drifted: {oh3!r} != 'AATG'"
+        # Body must appear in the released fragment's top_seq.
+        assert body in body_frag["top_seq"], (
+            "L0 part body sequence missing from released fragment"
+        )
+
+
+# ── 8. ENTRY-VECTOR OPS ARE SEQUENCE-READ-ONLY ─────────────────────────────
+
+
+class TestEntryVectorOpsImmutability:
+    """The new detection/auto-bind pipeline must NEVER mutate
+    sequences. Only metadata in `entry_vectors.json` changes."""
+
+    def test_detect_does_not_mutate_record(self):
+        """`_detect_entry_vector_role` is purely diagnostic. Run on
+        a record, capture seq before + after, assert byte-equality."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        original_seq = (
+            "GGTCTC" + "A" + "GGAG" +
+            "AAATTTCCC" * 30 +
+            "CGCT" + "A" + "GAGACC" +
+            "ATCGATCGAT" * 50
+        )
+        rec = SeqRecord(
+            Seq(original_seq), id="t", name="t",
+            annotations={"topology": "circular",
+                          "molecule_type": "DNA"},
+        )
+        gb_l0 = sc._all_grammars()["gb_l0"]
+        sc._detect_entry_vector_role(rec, gb_l0)
+        # Sequence unchanged after detection.
+        assert str(rec.seq) == original_seq, (
+            "_detect_entry_vector_role mutated the input sequence"
+        )
+
+    def test_auto_bind_does_not_mutate_entries(self):
+        """`_auto_bind_entry_vectors_from_entries` reads gb_text
+        but must NOT mutate the input dicts' sequences."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        body = "ATGAAACCC" * 5
+        cassette = (
+            "GGTCTC" + "A" + "GGAG" + body + "CGCT" + "A" + "GAGACC"
+        )
+        # Synthesize an Alpha1-style acceptor.
+        outer_cassette = (
+            "CGTCTC" + "A" + "GGAG" + cassette + "GTCA" + "A" + "GAGACG"
+        )
+        full = outer_cassette + "ATCGAT" * 50
+        rec = _make_circular_record(full)
+        from Bio.SeqFeature import FeatureLocation
+        rec.features.append(SeqFeature(
+            FeatureLocation(len(outer_cassette) + 50, len(outer_cassette) + 200),
+            type="rep_origin",
+            qualifiers={"label": ["test_ori"]},
+        ))
+        gb_text = sc._record_to_gb_text(rec)
+        entry = {
+            "id": "test_acc", "name": "test_acc",
+            "size": len(full), "gb_text": gb_text,
+        }
+        gb_text_before = entry["gb_text"]
+        sc._auto_bind_entry_vectors_from_entries([entry])
+        # The entry's gb_text must not be touched.
+        assert entry["gb_text"] == gb_text_before

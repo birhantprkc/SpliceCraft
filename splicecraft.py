@@ -14547,16 +14547,33 @@ class LibraryPanel(Widget):
                 # sanitises display names, but the notify summary below
                 # still echoes raw filename paths from the failures list.
                 if n_ok and not n_fail:
-                    self.app.notify(
-                        f"Imported {n_ok} plasmid(s) into '{name}'.",
-                        severity="information", markup=False,
+                    autodetect_msg = _auto_bind_entry_vectors_from_entries(
+                        entries
                     )
+                    if autodetect_msg:
+                        self.app.notify(
+                            f"Imported {n_ok} plasmid(s) into '{name}'. "
+                            f"{autodetect_msg}",
+                            severity="information", markup=False,
+                            timeout=8,
+                        )
+                    else:
+                        self.app.notify(
+                            f"Imported {n_ok} plasmid(s) into '{name}'.",
+                            severity="information", markup=False,
+                        )
                 elif n_ok and n_fail:
+                    autodetect_msg = _auto_bind_entry_vectors_from_entries(
+                        entries
+                    )
                     tail = ", ".join(p.name for p, _ in failures[:3])
                     if n_fail > 3:
                         tail += f", … (+{n_fail - 3} more)"
+                    summary = f"Imported {n_ok}, failed {n_fail}: {tail}"
+                    if autodetect_msg:
+                        summary = f"{summary}. {autodetect_msg}"
                     self.app.notify(
-                        f"Imported {n_ok}, failed {n_fail}: {tail}",
+                        summary,
                         severity="warning", timeout=8, markup=False,
                     )
                 elif n_fail:
@@ -25415,7 +25432,455 @@ def _classify_part_from_plasmid(
                                 gid, enzyme, vector,
                             ),
                         }
+            # Pass 4 (2026-05-20): lenient TU detection for L1
+            # acceptors that release outside the canonical (Pos 1
+            # oh5, Pos N oh3) pair but use overhangs from the
+            # grammar's own canonical alphabet. Caught by user
+            # report on the EDEN collection MAV 25-31 (TUA1/TUA2
+            # acceptors) — TUA1 releases the TU with (GGAG, GTCA);
+            # TUA2 with (GTCA, CGCT). Both pairs are valid GB 2.0
+            # overhangs (GTCA = RC(TGAC), a Pos 1b operator
+            # overhang in the GB 2.0 expanded grammar) but neither
+            # matches the strict TU boundary and neither lab has
+            # entry vectors configured in `entry_vectors.json`.
+            #
+            # Pick the TU candidate via `_pick_insert_fragment`'s
+            # backbone-marker exclusion — NEVER by fragment size.
+            # Size is unreliable for L1+ TUs (an assembled cassette
+            # commonly outgrows the alpha-vector backbone), and
+            # the user has explicitly called out this assumption
+            # as a class of bugs (2026-05-20).
+            #
+            # Skip pass-4 when no fragment carries a clear backbone
+            # marker — pass-4 cannot safely commit to one fragment
+            # being the TU without that biology signal, and a
+            # wrong-tag is worse than the existing "no detectable
+            # grammar" outcome.
+            backbone_marked = [
+                _fragment_has_backbone_marker(f) for f in frags
+            ]
+            if sum(backbone_marked) != 1:
+                # Either both have markers (annotation noise) or
+                # neither does (un-annotated entry). Either way,
+                # pass-4 can't safely commit. Fall through to the
+                # next grammar/enzyme.
+                continue
+            tu_idx = 0 if not backbone_marked[0] else 1
+            tu_candidate = frags[tu_idx]
+            vector_candidate = frags[1 - tu_idx]
+            oh5 = (tu_candidate.get("left") or {}).get(
+                "overhang_seq", "",
+            ).upper()
+            oh3 = (tu_candidate.get("right") or {}).get(
+                "overhang_seq", "",
+            ).upper()
+            if not oh5 or not oh3:
+                continue
+            canonical = _grammar_canonical_overhangs(grammar)
+            if oh5 not in canonical or oh3 not in canonical:
+                continue
+            position = {
+                "name":  f"TU ({oh5}→{oh3})",
+                "type":  _part_level_label(1),
+                "oh5":   oh5,
+                "oh3":   oh3,
+                "color": "white",
+            }
+            _log_event(
+                "classify.lenient_tu",
+                grammar=gid, enzyme=enzyme,
+                oh5=oh5, oh3=oh3,
+            )
+            return {
+                "grammar_id":     gid,
+                "grammar_name":   grammar.get("name", gid),
+                "level":          1,
+                "position":       position,
+                "insert":         tu_candidate,
+                "vector":         vector_candidate,
+                "release_enzyme": enzyme,
+                "entry_vector":   _check_vector_match(
+                    gid, enzyme, vector_candidate,
+                ),
+                "lenient":        True,
+            }
     return None
+
+
+def _grammar_canonical_overhangs(grammar: dict) -> "set[str]":
+    """Set of every 4-bp overhang the grammar's position table knows,
+    plus each one's reverse complement.
+
+    Pre-2026-05-20 the classifier hard-coded the canonical TU
+    boundary as ``(positions[0].oh5, positions[-1].oh3)`` — for
+    `gb_l0` that's ``(GGAG, CGCT)``. Real Golden Braid α/Ω
+    acceptors release TUs with NON-canonical pairs drawn from the
+    same overhang alphabet (e.g. pDGB3 α1 releases with
+    ``(GGAG, GTCA)`` — the second overhang is RC of TGAC, a Pos 1b
+    operator from the GB 2.0 expanded grammar). This helper
+    exposes the full alphabet so the lenient pass-4 of
+    `_classify_part_from_plasmid` can recognise these without
+    requiring the user to pre-configure entry vectors.
+
+    Includes reverse complements because Type IIS overhangs read
+    differently depending on which strand the cut surface is being
+    described from — a released fragment whose 5' overhang on the
+    top strand is ``GTCA`` has ``TGAC`` on the bottom strand, and
+    both are equally "this overhang".
+    """
+    out: "set[str]" = set()
+    for pos in (grammar.get("positions") or []):
+        if not isinstance(pos, dict):
+            continue
+        for key in ("oh5", "oh3"):
+            v = str(pos.get(key, "") or "").upper()
+            if v and len(v) == 4 and all(c in "ACGT" for c in v):
+                out.add(v)
+                out.add(_rc(v))
+    return out
+
+
+# ── Entry-vector role auto-detection (2026-05-20) ─────────────────────────
+#
+# Given a candidate plasmid + a grammar, identify which entry-vector
+# role the plasmid fills:
+#   * `""` (singleton) — L0 acceptor / UPD-style donor
+#   * `"Alpha1"` / `"Alpha2"` — Golden Braid L1 forward / reverse acceptors
+#   * `"Omega1"` / `"Omega2"` — Golden Braid L2 forward / reverse acceptors
+#   * `"Acceptor1"` / `"Acceptor2"` — MoClo L1 acceptors (when mapping
+#     extended)
+#
+# Strategy: digest with BOTH the grammar's primary and level-up enzymes.
+# The stuffer (no backbone marker — identified via
+# `_pick_insert_fragment`'s feature-based exclusion, NEVER size) carries
+# specific overhangs depending on the acceptor's role:
+#
+# Golden Braid binary-assembly architecture (gb_l0 with primary=Esp3I,
+# level_up=BsaI, per Sarrion-Perdigones 2013 / pDGB3):
+#
+#   α-vectors (L1):  BsaI = INNER (assembly), Esp3I = OUTER (release)
+#                    BsaI stuffer  = (GGAG, CGCT)  (canonical TU boundary)
+#                    Esp3I stuffer = (GGAG, GTCA)  → Alpha1
+#                                  = (GTCA, CGCT)  → Alpha2
+#
+#   Ω-vectors (L2):  Esp3I = INNER, BsaI = OUTER
+#                    Esp3I stuffer = (GGAG, CGCT)  (canonical TU boundary)
+#                    BsaI stuffer  = (GGAG, GTCA)  → Omega1
+#                                  = (GTCA, CGCT)  → Omega2
+#
+# The canonical TU boundary on the INNER enzyme distinguishes α from Ω
+# (the OUTER enzyme is the one whose stuffer pair encodes the role).
+#
+# UPD detection: neither digest gives the canonical TU boundary, but
+# at least one cuts cleanly into 2 fragments. Returns ("", "weak")
+# meaning "looks like a singleton L0 acceptor — bind to the empty role".
+#
+# Sacred — backbone-marker exclusion, NEVER size, per
+# `feedback_never_assume_smaller_frag_is_payload`. Two markers or zero
+# markers in a single digest → that enzyme's digest is ambiguous; the
+# detector tries the other enzyme but never picks by size.
+
+
+def _resolve_acceptor_role(
+    grammar: dict, inner_enz: str, outer_pair: "tuple[str, str]",
+) -> "str | None":
+    """Map (inner enzyme, outer overhang pair) to a role name.
+
+    Golden Braid binary assembly: the level-up enzyme is the INNER
+    cutter for the α (L1) family; the primary enzyme is the INNER
+    cutter for the Ω (L2) family. The outer pair encodes the
+    forward/reverse "1/2" suffix.
+
+    Returns the role name (matching `_CONSTRUCTOR_BACKBONES`) or
+    None for grammars whose acceptor layout we don't know.
+    """
+    gid = grammar.get("id", "")
+    primary = grammar.get("enzyme", "") or ""
+    secondary = grammar.get("level_up_enzyme", "") or ""
+
+    # GB 2.0 binary assembly — gb_l0 only. The outer-pair encoding
+    # (`GGAG → 1`, `GTCA → 2`) reflects the standard pDGB3 design.
+    if gid == "gb_l0" and secondary:
+        if inner_enz == secondary:
+            # α-family: level-up enzyme is the inner cutter.
+            if outer_pair == ("GGAG", "GTCA"):
+                return "Alpha1"
+            if outer_pair == ("GTCA", "CGCT"):
+                return "Alpha2"
+        elif inner_enz == primary:
+            # Ω-family: primary enzyme is the inner cutter.
+            if outer_pair == ("GGAG", "GTCA"):
+                return "Omega1"
+            if outer_pair == ("GTCA", "CGCT"):
+                return "Omega2"
+    # Other grammars (moclo_plant + custom): we don't ship a canonical
+    # role mapping. The user must bind manually via the EntryVectorsModal
+    # UI. Returning None tells the caller "I can't auto-tag this one".
+    return None
+
+
+def _detect_entry_vector_role(
+    record,
+    grammar: dict,
+) -> "tuple[str, str] | None":
+    """Identify which entry-vector role a candidate plasmid fills.
+
+    Returns ``(role_name, confidence)`` or ``None``. ``role_name`` is
+    the key into ``_CONSTRUCTOR_BACKBONES[grammar_id]`` for L1+
+    acceptors, or the empty string ``""`` for an L0 / UPD-style
+    singleton donor. ``confidence`` is one of:
+
+      * ``"strict"`` — both grammar enzymes digest cleanly to 2
+        fragments with the stuffer identified via backbone-marker
+        exclusion, AND one digest's stuffer is the canonical TU
+        boundary, AND the other digest's outer pair maps to a known
+        role.
+      * ``"weak"`` — at least one digest produces 2 fragments with a
+        clean stuffer, but neither matches the canonical TU boundary
+        and the outer pair can't be mapped. Used for UPD-style L0
+        donors (singleton role).
+
+    Returns ``None`` when:
+      * The record isn't circular (linear records can't be acceptors).
+      * No grammar enzyme cuts the record cleanly into 2 fragments.
+      * Backbone-marker exclusion can't identify a single stuffer
+        (zero or two markers per digest).
+      * Detection produces a recognised α/Ω pattern in BOTH families
+        simultaneously (would only happen for a synthetic chimera —
+        return None to let the user disambiguate manually).
+
+    Sacred — uses `_fragment_has_backbone_marker` to pick the stuffer
+    fragment, NEVER size. See `feedback_never_assume_smaller_frag_is_payload`.
+    """
+    # Extract sequence + features from a SeqRecord, a plain str, or a
+    # library-entry dict (gb_text). The classifier needs both.
+    if hasattr(record, "seq") and hasattr(record, "features"):
+        seq = str(record.seq).upper()
+        circular = (
+            (record.annotations or {}).get("topology") == "circular"
+        )
+        feats = [
+            {
+                "start": int(f.location.start),
+                "end":   int(f.location.end),
+                "type":  f.type,
+                "qualifiers": dict(f.qualifiers),
+            }
+            for f in record.features
+        ]
+    elif isinstance(record, str):
+        seq = record.upper()
+        circular = True
+        feats = []
+    elif isinstance(record, dict) and isinstance(record.get("gb_text"), str):
+        try:
+            rec = _gb_text_to_record(record["gb_text"])
+        except Exception:
+            return None
+        return _detect_entry_vector_role(rec, grammar)
+    else:
+        return None
+
+    if not circular or not seq:
+        return None
+
+    primary = grammar.get("enzyme") or ""
+    secondary = grammar.get("level_up_enzyme") or primary
+    if not primary:
+        return None
+
+    # Digest with both enzymes. Skip the second pass if it's the same
+    # as the primary (single-enzyme grammars don't need a second look).
+    enzymes = [primary]
+    if secondary and secondary != primary:
+        enzymes.append(secondary)
+
+    digests: "dict[str, tuple[str, str]]" = {}
+    for enz in enzymes:
+        try:
+            frags, err = _excise_fragment_pair(
+                seq, [enz], circular=True, features=feats,
+            )
+        except Exception:
+            _log.exception(
+                "_detect_entry_vector_role: %s digest raised", enz,
+            )
+            continue
+        if err is not None or len(frags) != 2:
+            continue
+        # Stuffer = the fragment without a backbone marker. Two markers
+        # or zero markers → ambiguous, skip this enzyme.
+        marked = [
+            _fragment_has_backbone_marker(f) for f in frags
+        ]
+        if sum(marked) != 1:
+            continue
+        stuffer = frags[0] if not marked[0] else frags[1]
+        oh5 = (stuffer.get("left") or {}).get(
+            "overhang_seq", "",
+        ).upper()
+        oh3 = (stuffer.get("right") or {}).get(
+            "overhang_seq", "",
+        ).upper()
+        if oh5 and oh3 and len(oh5) == 4 and len(oh3) == 4:
+            digests[enz] = (oh5, oh3)
+
+    if not digests:
+        return None
+
+    tu_start, tu_end = _grammar_tu_overhangs(grammar)
+
+    # Strict: one digest matches canonical TU boundary (inner), the
+    # other gives an outer pair we can map to a role.
+    if len(digests) == 2 and tu_start and tu_end:
+        canonical = (tu_start.upper(), tu_end.upper())
+        inner_enz = None
+        outer_enz = None
+        outer_pair = None
+        for enz, pair in digests.items():
+            if pair == canonical:
+                inner_enz = enz
+            else:
+                outer_enz = enz
+                outer_pair = pair
+        if inner_enz and outer_pair:
+            role = _resolve_acceptor_role(grammar, inner_enz, outer_pair)
+            if role:
+                return (role, "strict")
+
+    # Weak: a 2-fragment digest fired but no role mapping. Now
+    # discriminate UPD-style singletons from L0 parts / TUs / MODs
+    # that ALSO digest cleanly but aren't acceptors.
+    #
+    # An L0 PART's stuffer overhangs match a canonical L0 position
+    # (e.g. (GGAG, AATG) for a Promoter). If any digest matches an
+    # L0 position table entry, the plasmid is a part — not an
+    # acceptor. Reject.
+    positions = grammar.get("positions") or []
+    for _enz, (oh5, oh3) in digests.items():
+        for pos in positions:
+            p_oh5 = str(pos.get("oh5", "")).upper()
+            p_oh3 = str(pos.get("oh3", "")).upper()
+            if (p_oh5, p_oh3) == (oh5, oh3):
+                return None
+            # Mirror orientation: a part with reversed insertion still
+            # exposes a recognised pair, just swapped.
+            if (p_oh3, p_oh5) == (oh5, oh3):
+                return None
+
+    # A TU/MOD plasmid's stuffer overhangs come from the grammar's
+    # canonical alphabet (matches `_classify_part_from_plasmid`'s
+    # pass-4 lenient rule). If both overhangs of any digest are in
+    # the canonical set, the plasmid is a TU/MOD — not an empty
+    # acceptor. Reject.
+    canonical = _grammar_canonical_overhangs(grammar)
+    for _enz, (oh5, oh3) in digests.items():
+        if oh5 in canonical and oh3 in canonical:
+            return None
+
+    # Everything else: NO position match, NO canonical-alphabet match,
+    # but the plasmid digests cleanly. The stuffer's non-canonical
+    # overhangs are the fingerprint of an L0 / UPD-style donor whose
+    # internal stuffer is intentionally NOT a part-boundary pair.
+    return ("", "weak")
+
+
+def _auto_bind_entry_vectors_from_entries(
+    entries: "list[dict]",
+    *,
+    grammar_ids: "list[str] | None" = None,
+) -> str:
+    """Run `_detect_entry_vector_role` on every library entry across
+    every grammar (or `grammar_ids` if specified) and bind newly
+    detected acceptors to their roles in `entry_vectors.json`.
+
+    Sacred — existing user bindings take precedence. The auto-bind
+    NEVER clobbers a role already bound by the user (or by a previous
+    auto-detect). This means re-running after a partial manual
+    configuration just fills in the gaps.
+
+    Conflict resolution within the input: if two entries are detected
+    as the same role, the first STRICT match wins; "weak" loses to
+    "strict".
+
+    Returns a human-readable summary string suitable for a
+    `notify(...)` call, or an empty string if nothing was bound.
+    Designed to slot into the post-import notification chain so the
+    user gets one consolidated toast instead of one per binding.
+    """
+    if not entries:
+        return ""
+    target_grammars = grammar_ids or list(_all_grammars().keys())
+    bound_by_grammar: dict[str, list[str]] = {}
+    for gid in target_grammars:
+        grammar = _all_grammars().get(gid)
+        if not isinstance(grammar, dict):
+            continue
+        proposals: dict[str, tuple[dict, str]] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            gb_text = entry.get("gb_text") or ""
+            if not gb_text:
+                continue
+            try:
+                rec = _gb_text_to_record(gb_text)
+            except Exception:
+                continue
+            result = _detect_entry_vector_role(rec, grammar)
+            if not result:
+                continue
+            role, conf = result
+            existing = proposals.get(role)
+            # Strict beats weak. Within the same confidence level,
+            # first match wins (stable + deterministic given input
+            # order from `_bulk_import_folder`).
+            if existing is None or (
+                existing[1] == "weak" and conf == "strict"
+            ):
+                proposals[role] = (entry, conf)
+        for role_key, (entry, conf) in proposals.items():
+            # Don't clobber an existing user-set binding.
+            if _get_entry_vector(gid, role_key) is not None:
+                continue
+            payload = {
+                "name":    entry.get("name") or entry.get("id", "?"),
+                "size":    entry.get("size") or 0,
+                "source":  "auto-detect (import)",
+                "id":      entry.get("id", ""),
+                "gb_text": entry.get("gb_text") or "",
+            }
+            try:
+                _set_entry_vector(gid, payload, role_key)
+            except Exception:
+                _log.exception(
+                    "auto-bind: persist %s/%s failed", gid, role_key,
+                )
+                continue
+            _log_event(
+                "entry_vector.auto_bound",
+                grammar=gid, role=role_key,
+                confidence=conf,
+                entry_id=entry.get("id", ""),
+                trigger="import",
+            )
+            bound_by_grammar.setdefault(gid, []).append(
+                role_key or "UPD"
+            )
+    if not bound_by_grammar:
+        return ""
+    # Compact message: "Auto-configured 5 entry vector(s) for gb_l0:
+    # UPD, Alpha1, Alpha2, Omega1, Omega2".
+    bits: list[str] = []
+    for gid, roles in bound_by_grammar.items():
+        bits.append(
+            f"{gid}: {', '.join(roles)}"
+        )
+    total = sum(len(r) for r in bound_by_grammar.values())
+    return (
+        f"Auto-configured {total} entry vector role(s) "
+        f"({'; '.join(bits)})."
+    )
 
 
 def _grammar_position_by_type(grammar: dict, ptype: str) -> "dict | None":
@@ -34768,6 +35233,362 @@ class GrammarManagerModal(ModalScreen):
         self.dismiss(None)
 
     def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class EntryVectorsModal(ModalScreen):
+    """All-roles entry-vector configuration screen.
+
+    Replaces the single-slot widget that used to live inside
+    `GrammarEditorModal`. Shows every role for the active grammar
+    (UPD/Alpha1/Alpha2/Omega1/Omega2 for gb_l0; Acceptor1/Acceptor2
+    for moclo_plant; user-defined for custom grammars) in one table.
+
+    Two ways to fill the slots:
+
+      * **Per-row Pick** — click a row's "Pick…" button to launch
+        `PlasmidPickerModal` filtered to library entries that
+        plausibly fit this role. Persists via `_set_entry_vector`
+        immediately.
+      * **Auto-detect from active collection** — runs
+        `_detect_entry_vector_role` on every plasmid in the active
+        collection and proposes role bindings. User confirms once
+        to apply all.
+
+    `_blocks_undo = True` because the modal mutates persistent
+    state (entry_vectors.json) and the Constructor / Parts Bin
+    / classifier all read from that file — a stray Ctrl+Z firing
+    on the canvas underneath would race the save.
+
+    Dismisses ``None`` always. The persistent state changes are
+    saved on each interaction (Pick / Auto-detect / Clear), so the
+    dismiss payload doesn't carry data.
+    """
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "close",         "Close"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    EntryVectorsModal { align: center middle; }
+    #ev-dlg {
+        width: 96; height: auto; max-height: 92%;
+        background: #1c1c1c; border: solid $primary; padding: 1 2;
+    }
+    #ev-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; margin-bottom: 1;
+    }
+    #ev-grammar-row { height: 3; margin-bottom: 1; }
+    #ev-grammar-row Label { padding: 1 1 0 0; }
+    #ev-grammar-select { width: 60; }
+    #ev-table { height: 14; margin-bottom: 1; }
+    #ev-status { margin-bottom: 1; min-height: 1; }
+    #ev-btns { height: 3; margin-top: 1; }
+    #ev-btns Button { margin-right: 1; }
+    """
+
+    def __init__(self, grammar_id: "str | None" = None) -> None:
+        super().__init__()
+        # Empty / None defaults to the active grammar from settings —
+        # the most common path is "user is configuring the grammar
+        # they're actively assembling with".
+        self._grammar_id = grammar_id or _get_setting(
+            "active_grammar", "gb_l0",
+        ) or "gb_l0"
+
+    # Per-grammar role list + display labels. For `gb_l0` we surface
+    # all five canonical roles. For other grammars we fall back to
+    # whatever's in `_CONSTRUCTOR_BACKBONES` plus the empty "" role
+    # (singleton L0 donor) so the user can always bind a UPD-style
+    # vector even on a custom grammar.
+    @staticmethod
+    def _roles_for_grammar(gid: str) -> "list[tuple[str, str, str]]":
+        """Return ``[(role_key, display_label, hint), ...]`` for the
+        given grammar. ``role_key`` matches the persisted ``role``
+        field; ``hint`` is a short user-facing description (e.g.
+        "L0 acceptor / donor")."""
+        out: list[tuple[str, str, str]] = [
+            ("", "UPD / L0 donor", "Singleton L0 acceptor")
+        ]
+        backbones = _CONSTRUCTOR_BACKBONES.get(gid, {})
+        for role_key, meta in backbones.items():
+            note = (meta.get("note") or "").strip()
+            sel = (meta.get("selection") or "").strip()
+            hint = note
+            if sel:
+                hint = f"{note} · {sel}" if note else sel
+            display = role_key
+            # Pretty Greek letter display for the canonical pDGB3 roles.
+            if role_key == "Alpha1":  display = "α1 — L1 forward"
+            elif role_key == "Alpha2":  display = "α2 — L1 reverse"
+            elif role_key == "Omega1":  display = "Ω1 — L2 forward"
+            elif role_key == "Omega2":  display = "Ω2 — L2 reverse"
+            out.append((role_key, display, hint))
+        return out
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ev-dlg"):
+            yield Static(" Entry Vectors ", id="ev-title")
+            with Horizontal(id="ev-grammar-row"):
+                yield Label("Grammar:")
+                opts = [
+                    (g.get("name", gid), gid)
+                    for gid, g in _all_grammars().items()
+                ]
+                yield Select(
+                    options=opts, value=self._grammar_id,
+                    id="ev-grammar-select",
+                    allow_blank=False,
+                )
+            yield DataTable(
+                id="ev-table",
+                cursor_type="row",
+                zebra_stripes=True,
+            )
+            yield Static("", id="ev-status", markup=True)
+            with Horizontal(id="ev-btns"):
+                yield Button(
+                    "Pick / Change…", id="btn-ev-pick",
+                    variant="primary",
+                )
+                yield Button("Clear row", id="btn-ev-clear")
+                yield Button(
+                    "Auto-detect from active collection",
+                    id="btn-ev-auto",
+                    variant="success",
+                )
+                yield Button("Close", id="btn-ev-close")
+
+    def on_mount(self) -> None:
+        try:
+            t = self.query_one("#ev-table", DataTable)
+        except NoMatches:
+            return
+        t.add_columns("Role", "Vector", "Hint")
+        self._refresh_table()
+        # Focus on the table so arrow keys + Enter drive the picks.
+        try:
+            t.focus()
+        except Exception:
+            pass
+
+    def _refresh_table(self) -> None:
+        try:
+            t = self.query_one("#ev-table", DataTable)
+            status = self.query_one("#ev-status", Static)
+        except NoMatches:
+            return
+        t.clear()
+        roles = self._roles_for_grammar(self._grammar_id)
+        n_bound = 0
+        for role_key, display, hint in roles:
+            ev = _get_entry_vector(self._grammar_id, role_key)
+            if ev:
+                n_bound += 1
+                name = ev.get("name") or "(unnamed)"
+                size = ev.get("size") or 0
+                vector_text = Text(
+                    f"{name}  ·  {size:,} bp", style="bold green",
+                )
+            else:
+                vector_text = Text("(not set)", style="dim italic")
+            t.add_row(
+                Text(display, style="bold"),
+                vector_text,
+                Text(hint, style="dim"),
+                key=role_key or "_upd_",
+            )
+        grammar_name = _all_grammars().get(
+            self._grammar_id, {},
+        ).get("name", self._grammar_id)
+        status.update(
+            f"  [dim]{grammar_name}: {n_bound}/{len(roles)} "
+            f"role(s) bound.[/dim]"
+        )
+
+    def _selected_role(self) -> "str | None":
+        try:
+            t = self.query_one("#ev-table", DataTable)
+        except NoMatches:
+            return None
+        if t.cursor_row is None:
+            return None
+        roles = self._roles_for_grammar(self._grammar_id)
+        if not (0 <= t.cursor_row < len(roles)):
+            return None
+        return roles[t.cursor_row][0]
+
+    @on(Select.Changed, "#ev-grammar-select")
+    def _on_grammar_changed(self, event: Select.Changed) -> None:
+        if isinstance(event.value, str) and event.value:
+            self._grammar_id = event.value
+            self._refresh_table()
+
+    @on(Button.Pressed, "#btn-ev-pick")
+    def _pick_btn(self, _) -> None:
+        role = self._selected_role()
+        if role is None:
+            try:
+                self.query_one("#ev-status", Static).update(
+                    "[yellow]Select a role row first.[/yellow]"
+                )
+            except NoMatches:
+                pass
+            return
+        current = _get_entry_vector(self._grammar_id, role)
+        current_id = (current or {}).get("id")
+
+        def _on_picked(picked_id) -> None:
+            if not picked_id:
+                return
+            # Locate the library entry by id.
+            entry = next(
+                (
+                    e for e in _load_library()
+                    if e.get("id") == picked_id
+                ),
+                None,
+            )
+            if entry is None:
+                try:
+                    self.query_one("#ev-status", Static).update(
+                        "[red]Picked entry not found in library.[/red]"
+                    )
+                except NoMatches:
+                    pass
+                return
+            ev_payload = {
+                "name":     entry.get("name") or picked_id,
+                "size":     entry.get("size") or 0,
+                "source":   "library",
+                "id":       picked_id,
+                "gb_text":  entry.get("gb_text") or "",
+            }
+            _set_entry_vector(self._grammar_id, ev_payload, role)
+            _log_event(
+                "entry_vector.bound",
+                grammar=self._grammar_id, role=role,
+                source="library", entry_id=picked_id,
+            )
+            self._refresh_table()
+
+        self.app.push_screen(
+            PlasmidPickerModal(current_id=current_id), _on_picked,
+        )
+
+    @on(Button.Pressed, "#btn-ev-clear")
+    def _clear_btn(self, _) -> None:
+        role = self._selected_role()
+        if role is None:
+            return
+        if _get_entry_vector(self._grammar_id, role) is None:
+            return
+        _set_entry_vector(self._grammar_id, None, role)
+        _log_event(
+            "entry_vector.cleared",
+            grammar=self._grammar_id, role=role,
+        )
+        self._refresh_table()
+
+    @on(Button.Pressed, "#btn-ev-auto")
+    def _auto_btn(self, _) -> None:
+        try:
+            status = self.query_one("#ev-status", Static)
+        except NoMatches:
+            return
+        active = _get_active_collection_name()
+        if not active:
+            status.update(
+                "[yellow]No active collection — set one via "
+                "Library panel first.[/yellow]"
+            )
+            return
+        grammar = _all_grammars().get(self._grammar_id)
+        if not isinstance(grammar, dict):
+            status.update("[red]Grammar not found.[/red]")
+            return
+        # Pull every plasmid out of the active collection, detect
+        # roles. Collisions (two plasmids both detected as Alpha1):
+        # prefer the first STRICT hit; "weak" loses to "strict".
+        coll = _find_collection(active) or {}
+        coll_entries = [
+            e for e in (coll.get("plasmids") or [])
+            if isinstance(e, dict)
+        ]
+        if not coll_entries:
+            status.update(
+                "[yellow]Active collection is empty.[/yellow]"
+            )
+            return
+        proposals: dict[str, tuple[dict, str]] = {}
+        for entry in coll_entries:
+            gb_text = entry.get("gb_text") or ""
+            if not gb_text:
+                continue
+            try:
+                rec = _gb_text_to_record(gb_text)
+            except Exception:
+                continue
+            result = _detect_entry_vector_role(rec, grammar)
+            if not result:
+                continue
+            role, conf = result
+            existing = proposals.get(role)
+            if existing is None or (
+                existing[1] == "weak" and conf == "strict"
+            ):
+                proposals[role] = (entry, conf)
+        if not proposals:
+            status.update(
+                "[yellow]No acceptors detected in active "
+                "collection.[/yellow]"
+            )
+            return
+        # Apply each proposal that doesn't already have a binding.
+        # Existing bindings survive — user-set bindings take precedence
+        # over auto-detection so a manual pick doesn't get clobbered.
+        applied: list[str] = []
+        skipped: list[str] = []
+        for role_key, (entry, conf) in proposals.items():
+            if _get_entry_vector(self._grammar_id, role_key) is not None:
+                skipped.append(role_key or "UPD")
+                continue
+            payload = {
+                "name":    entry.get("name") or entry.get("id", "?"),
+                "size":    entry.get("size") or 0,
+                "source":  "auto-detect",
+                "id":      entry.get("id", ""),
+                "gb_text": entry.get("gb_text") or "",
+            }
+            _set_entry_vector(self._grammar_id, payload, role_key)
+            applied.append(role_key or "UPD")
+            _log_event(
+                "entry_vector.auto_bound",
+                grammar=self._grammar_id, role=role_key,
+                confidence=conf,
+                entry_id=entry.get("id", ""),
+            )
+        msg = (
+            f"[green]Auto-detected {len(applied)} role(s):[/green] "
+            f"{', '.join(applied) if applied else '(none new)'}"
+        )
+        if skipped:
+            msg += (
+                f"  [dim](skipped {len(skipped)}: "
+                f"{', '.join(skipped)} — already bound)[/dim]"
+            )
+        status.update(msg)
+        self._refresh_table()
+
+    @on(Button.Pressed, "#btn-ev-close")
+    def _close_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_close(self) -> None:
         self.dismiss(None)
 
 
@@ -67794,6 +68615,7 @@ SpeciesPickerModal { align: center middle; }
                                                           "set_min_primer_binding"),
                 ("---",                                   None),
                 ("Cloning grammars…",                     "open_grammars"),
+                ("Entry Vectors…",                        "open_entry_vectors"),
                 ("---",                                   None),
                 ("Restore library / collections from backup…",
                                                           "restore_from_backup"),
@@ -68622,6 +69444,16 @@ SpeciesPickerModal { align: center middle; }
         appear automatically in every grammar dropdown
         (`_grammar_dropdown_options`) once saved."""
         self.push_screen(GrammarManagerModal())
+
+    @_action_log("app.open.entry_vectors")
+    def action_open_entry_vectors(self) -> None:
+        """Settings → Entry Vectors… opens `EntryVectorsModal` for the
+        active grammar. Shows every role slot (UPD / α1 / α2 / Ω1 / Ω2
+        for gb_l0) in one table; lets the user pick per row or bulk
+        auto-detect from the active collection. Replaces the
+        single-slot widget in `GrammarEditorModal` (which only ever
+        exposed the empty-role binding)."""
+        self.push_screen(EntryVectorsModal())
 
     @_action_log("app.find.annotation")
     def action_find_annotation(self) -> None:

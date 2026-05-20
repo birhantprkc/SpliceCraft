@@ -338,6 +338,7 @@ _MODAL_CASES = [
     # title, mandatory level-up enzyme input).
     ("GrammarEditorModal.new",     lambda: sc.GrammarEditorModal("")),
     ("GrammarManagerModal",        lambda: sc.GrammarManagerModal()),
+    ("EntryVectorsModal",          lambda: sc.EntryVectorsModal("gb_l0")),
     ("EditGrammarConfirmModal",    lambda: sc.EditGrammarConfirmModal(
                                                 "MyCustomGrammar",
                                                 n_dependents=3)),

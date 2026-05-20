@@ -111,6 +111,13 @@ Full feature reference: [`docs/features.md`](docs/features.md).
   slate. Triple-gated: typed `YES` (case-sensitive) to enable the
   Delete button, then a default-No confirm with a 3-second cool-down
   on the destructive button. No keyboard shortcut. No agent endpoint.
+- **Entry-vector auto-detection.** When you import a folder via
+  Collections → New Collection, SpliceCraft scans every plasmid,
+  identifies acceptors (UPD / α1 / α2 / Ω1 / Ω2 for Golden Braid),
+  and auto-binds them to their roles. Manual review + override via
+  Settings → Entry Vectors…. Configured acceptors flip TU
+  classification from the lenient fallback to strict per-acceptor
+  matching with explicit role labels.
 
 Full data-safety writeup: [`docs/data-safety.md`](docs/data-safety.md).
 Security policy: [`SECURITY.md`](SECURITY.md).
