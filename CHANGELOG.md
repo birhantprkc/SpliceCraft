@@ -14,6 +14,14 @@
 
 ---
 
+## [0.9.10] — 2026-05-20
+
+_(auto-generated from commits since v0.9.9)_
+
+* Entry-vector UX + lenient TU classifier + sequence integrity audit · invariants #46-#47
+
+---
+
 ## [0.9.9] — 2026-05-20
 
 _(auto-generated from commits since v0.9.8)_
