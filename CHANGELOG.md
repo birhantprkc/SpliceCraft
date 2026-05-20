@@ -14,6 +14,15 @@
 
 ---
 
+## [0.9.13] — 2026-05-20
+
+_(auto-generated from commits since v0.9.10)_
+
+* Load-time collision modals + adversarial sweeps #10/#11 · invariants #49-#51
+* UI audit sweep #12 — aspect-key notify spam fix · `_blocks_undo` retrofit on 12 input-bearing modals · invariant #52
+
+---
+
 ## [0.9.10] — 2026-05-20
 
 _(auto-generated from commits since v0.9.9)_

@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "0.9.10"
+__version__ = "0.9.13"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -11607,12 +11607,18 @@ class PlasmidMap(Widget):
         return (offset, offset + visible)
 
     def action_aspect_inc(self):
-        self._aspect = round(min(5.0, self._aspect + 0.05), 3)
-        self.notify(f"Aspect {self._aspect:.2f}  (press , to widen)", timeout=1.5)
+        new = round(min(5.0, self._aspect + 0.05), 3)
+        if new == self._aspect:
+            return
+        self._aspect = new
+        self.notify(f"Aspect {new:.2f}  (press , to widen)", timeout=1.5)
 
     def action_aspect_dec(self):
-        self._aspect = round(max(0.5, self._aspect - 0.05), 3)
-        self.notify(f"Aspect {self._aspect:.2f}  (press . to heighten)", timeout=1.5)
+        new = round(max(0.5, self._aspect - 0.05), 3)
+        if new == self._aspect:
+            return
+        self._aspect = new
+        self.notify(f"Aspect {new:.2f}  (press . to heighten)", timeout=1.5)
 
     def action_toggle_map_view(self):
         # Linear-view alignment overlay can't be rendered on a circle —
@@ -21963,6 +21969,8 @@ class MultiRecordFastaModal(ModalScreen):
     `_create_fasta_collection` once the modal returns a name.
     """
 
+    _blocks_undo: bool = True   # Input editing; Ctrl+Z = input undo, not app
+
     BINDINGS = [
         Binding("escape", "cancel",         "Cancel"),
         Binding("tab",    "app.focus_next", "Next",   show=False),
@@ -22710,6 +22718,8 @@ class CustomEnzymeListModal(ModalScreen):
       ``True``  — saved.
       ``None``  — cancelled (no setting change).
     """
+
+    _blocks_undo: bool = True   # TextArea editing + settings save
 
     BINDINGS = [
         Binding("escape", "cancel",         "Cancel"),
@@ -31019,6 +31029,8 @@ class PrimerEditModal(ModalScreen):
     Or `None` on cancel.
     """
 
+    _blocks_undo: bool = True   # Input editing; Save mutates primer feature
+
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("tab",    "app.focus_next", "Next", show=False),
@@ -34055,6 +34067,8 @@ class ColorPickerModal(ModalScreen):
     visually distinguish similar hex colors on that terminal.
     """
 
+    _blocks_undo: bool = True   # Hex Input editing; Ctrl+Z = input undo
+
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
     ]
@@ -36434,6 +36448,8 @@ class PartEditModal(ModalScreen):
     the primer3 Tm calc (or fall back to 0.0 when primer3 is
     unavailable).
     """
+
+    _blocks_undo: bool = True   # Input editing; Save mutates parts bin
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
@@ -50525,6 +50541,8 @@ class SpeciesPickerModal(ModalScreen):
     sessions.
     """
 
+    _blocks_undo: bool = True   # Fetch mutates codon registry
+
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
     ]
@@ -56817,6 +56835,8 @@ class CollectionsModal(ModalScreen):
     collection was loaded, else None.
     """
 
+    _blocks_undo: bool = True   # Input editing + collections file mutation
+
     BINDINGS = [
         Binding("escape", "cancel",     "Close"),
         Binding("tab",    "app.focus_next", "Next", show=False),
@@ -56946,6 +56966,8 @@ class CollectionNameModal(ModalScreen):
     Caller is responsible for collision-checking before persisting.
     """
 
+    _blocks_undo: bool = True   # Input editing; result mutates collections
+
     BINDINGS = [
         Binding("escape", "cancel",     "Cancel"),
         Binding("tab",    "app.focus_next", "Next", show=False),
@@ -57016,6 +57038,8 @@ class NewCollectionModal(ModalScreen):
     The caller is responsible for collection-name collision checking
     and for running `_bulk_import_folder` when a folder is supplied.
     """
+
+    _blocks_undo: bool = True   # Input editing; result mutates collections
 
     BINDINGS = [
         Binding("escape", "cancel",          "Cancel"),
@@ -58118,6 +58142,8 @@ class NamePlasmidModal(ModalScreen):
       ``None`` — user cancelled; caller should NOT save.
     """
 
+    _blocks_undo: bool = True   # Input editing; result becomes library entry name
+
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("tab",    "app.focus_next", "Next", show=False),
@@ -58407,6 +58433,8 @@ class RenamePlasmidModal(ModalScreen):
     app-side handler — the modal just collects a value.
     """
 
+    _blocks_undo: bool = True   # Input editing; result mutates library entry
+
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("tab",    "app.focus_next", "Next", show=False),
@@ -58485,6 +58513,8 @@ class MinPrimerBindingModal(ModalScreen):
     with the chosen integer (1–60) on submit, or `None` on cancel /
     no-change.
     """
+
+    _blocks_undo: bool = True   # Input editing; result becomes settings value
 
     BINDINGS = [
         Binding("escape", "cancel",         "Cancel"),
