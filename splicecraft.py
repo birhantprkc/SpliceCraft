@@ -74686,6 +74686,14 @@ SpeciesPickerModal { align: center middle; }
         result for seq-panel clicks) so a feature stack opens the
         editor only for the topmost visible / clicked feature, never
         for the underlying overlap.
+
+        Sweep #21: dismiss callback wrapped via `_guard_callback`
+        so the edit is dropped if the canvas paged to a different
+        plasmid mid-edit (the agent API can mutate `_current_record`
+        via `_h_load_entry` / `_h_fetch` / `_h_load_file` while the
+        modal is open). Same guard pattern the agent-API write
+        endpoints already use per invariant #28; mirrors
+        `action_edit_seq`'s use of `_guard_callback`.
         """
         try:
             pm = self.query_one("#plasmid-map", PlasmidMap)
@@ -74745,6 +74753,11 @@ SpeciesPickerModal { align: center middle; }
                 _log.exception("feature edit failed")
                 self.notify("Failed to apply feature edits.",
                              severity="error")
+        # Sweep #21: wrap via `_guard_callback` so a canvas reload
+        # (agent API `_h_load_entry` etc.) between modal open and
+        # dismiss drops the edit instead of applying the user's
+        # save to the WRONG molecule at the WRONG idx.
+        guarded = self._guard_callback(_on_dismiss, "Feature edit")
 
         # Type-aware modal dispatch. Primer features get the
         # primer-specific editor (sequence + Tm/GC stats); other
@@ -74761,13 +74774,13 @@ SpeciesPickerModal { align: center middle; }
                                   primer_seq=primer_seq_str,
                                   notes=notes_str,
                                   template=full_template),
-                _on_dismiss,
+                guarded,
             )
         else:
             self.push_screen(
                 FeatureEditModal(idx, feat, total,
                                   sequence=seq_str, notes=notes_str),
-                _on_dismiss,
+                guarded,
             )
 
     def _apply_feature_edit(self, payload: dict) -> None:
@@ -76299,9 +76312,17 @@ SpeciesPickerModal { align: center middle; }
                         highlighted = sp._seq[s:] + sp._seq[:e]
                     prefill = {"sequence": highlighted.upper()}
                     sel_range = (s, e)
+        # Sweep #21: guard against canvas reload mid-modal. The
+        # "annotate" path embeds (start, end) coords from the
+        # selection captured at modal-open time — applying those
+        # to a NEW record's bases would silently corrupt the
+        # annotation. Same rationale as `action_edit_seq` and
+        # `_open_feature_editor`.
         self.push_screen(
             AddFeatureModal(prefill=prefill, selection_range=sel_range),
-            callback=self._add_feature_result,
+            callback=self._guard_callback(
+                self._add_feature_result, "Add feature",
+            ),
         )
 
     def _persist_feature_entry(self, entry: dict) -> bool:
