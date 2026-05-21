@@ -115,7 +115,12 @@ installs and the user-data directory location.
   available from the toolbar. 50 kb cap per DNA fragment;
   protein cap derived as 50 kb ÷ 3 ≈ 16.6k aa. Save flow
   guarded by an RLock so concurrent DNA + protein saves can't
-  interleave SeqRecord construction.
+  interleave SeqRecord construction. **Clone Fragment** button
+  hands the composed fragment off to the **Domesticator** in
+  one click — auto-saves, loads the saved entry onto the canvas,
+  closes Synthesis, and opens the Parts Bin pre-armed with
+  **New Part**, so the L0 part lands in the bin without
+  re-selecting anything.
 - **Search** your library with in-process BLASTN / BLASTP / HMMscan
   (via `pyhmmer` — no external `blast+` install).
 - **Drive from outside** via a 60+ endpoint localhost JSON API

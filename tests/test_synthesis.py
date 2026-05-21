@@ -1685,3 +1685,476 @@ class TestAddFeatureModalTotalLen:
         # divisibility-by-3 check works even without #seq-panel.
         m2 = sc.AddFeatureModal(total_len=123)
         assert m2._total_len == 123
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sweep #14 — Save As double-prompt + silent-overwrite fixes
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestUniqueEntryIdHelper:
+    """Regression guard for 2026-05-20 fix.
+
+    ``_make_unique_entry_id`` must suffix-disambiguate against current
+    library ids so a fresh save / Save As never silently overwrites an
+    unrelated library entry whose sanitised name happens to collide.
+    """
+
+    async def test_returns_base_when_no_collision(self, isolated_library):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            assert scr._make_unique_entry_id("fresh_name") == "fresh_name"
+
+    async def test_disambiguates_against_existing_ids(self, isolated_library):
+        # Seed the library with an entry whose id is "my_fragment".
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ATGC"), id="my_fragment", name="my_fragment")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"]      = "linear"
+        sc._save_library([{
+            "id": "my_fragment", "name": "My fragment",
+            "size": 4, "n_feats": 0,
+            "source": "test", "added": "2026-05-20",
+            "gb_text": sc._record_to_gb_text(rec),
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            # Sanitised name "my fragment" → base "my_fragment" already
+            # taken → suffix-disambiguate to "my_fragment_2".
+            uid = scr._make_unique_entry_id("my fragment")
+            assert uid != "my_fragment"
+            assert uid.startswith("my_fragment_")
+
+    async def test_exclude_id_skips_own_entry(self, isolated_library):
+        # Re-save case: the loaded_id is already in the library but we
+        # don't want to bump past our own slot.
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ATGC"), id="my_fragment", name="my_fragment")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"]      = "linear"
+        sc._save_library([{
+            "id": "my_fragment", "name": "My fragment",
+            "size": 4, "n_feats": 0,
+            "source": "test", "added": "2026-05-20",
+            "gb_text": sc._record_to_gb_text(rec),
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            # Excluding our own id should return the base without bump.
+            uid = scr._make_unique_entry_id(
+                "my fragment", exclude_id="my_fragment",
+            )
+            assert uid == "my_fragment"
+
+
+class TestSaveAsDoublePromptFix:
+    """Regression guard for 2026-05-20 fix.
+
+    Pre-fix ``_save_as._on_named`` set ``loaded_id=None`` then called
+    ``_do_save``, which saw ``loaded_id is None`` and prompted for the
+    name AGAIN. Post-fix the inner callback hands a unique id straight
+    to ``_commit_save``; only one ``NamePlasmidModal`` ever appears.
+    """
+
+    async def test_save_as_commits_without_second_prompt(
+        self, isolated_library,
+    ):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCATGC", [])
+            scr._dirty = True
+            # Stub NamePlasmidModal push so we can count invocations.
+            push_count = [0]
+            orig_push = app.push_screen
+            def _counting_push(modal, callback=None):
+                if isinstance(modal, sc.NamePlasmidModal):
+                    push_count[0] += 1
+                    # Simulate user typing a name and confirming.
+                    if callback is not None:
+                        callback("brand_new_name")
+                    return None
+                return orig_push(modal, callback=callback)
+            app.push_screen = _counting_push  # type: ignore[method-assign]
+            try:
+                scr._save_as()
+            finally:
+                app.push_screen = orig_push  # type: ignore[method-assign]
+            await pilot.pause()
+            await pilot.pause()
+            # Exactly one prompt — the pre-fix bug would have stacked
+            # a second NamePlasmidModal on top.
+            assert push_count[0] == 1, (
+                f"Save As should prompt once, prompted {push_count[0]}"
+            )
+            # Entry landed in the library under the (sanitised, unique) id.
+            entries = sc._load_library()
+            ids = {e.get("id") for e in entries}
+            assert "brand_new_name" in ids
+
+    async def test_protein_save_as_commits_without_second_prompt(
+        self, isolated_library,
+    ):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            pe = scr.query_one("#syn-protein-editor", sc.ProteinEditor)
+            pe.load("MASHHH")
+            scr._protein_dirty = True
+            push_count = [0]
+            orig_push = app.push_screen
+            def _counting_push(modal, callback=None):
+                if isinstance(modal, sc.NamePlasmidModal):
+                    push_count[0] += 1
+                    if callback is not None:
+                        callback("brand_new_protein")
+                    return None
+                return orig_push(modal, callback=callback)
+            app.push_screen = _counting_push  # type: ignore[method-assign]
+            try:
+                scr._protein_save_as()
+            finally:
+                app.push_screen = orig_push  # type: ignore[method-assign]
+            await pilot.pause()
+            await pilot.pause()
+            assert push_count[0] == 1, (
+                f"Protein Save As should prompt once, prompted {push_count[0]}"
+            )
+
+    async def test_fresh_save_uses_unique_id_against_library(
+        self, isolated_library,
+    ):
+        # Bug scenario: library already has an entry whose id is
+        # "my_fragment_v2" with a DIFFERENT name ("Pre-existing
+        # entry"). User types Save As "my fragment v2" → sanitises to
+        # id "my_fragment_v2". Pre-fix `_make_entry_id` returned the
+        # raw sanitised id and `LibraryPanel.add_entry` took the
+        # id-match silent-replace branch — the unrelated entry got
+        # overwritten silently. Post-fix `_make_unique_entry_id`
+        # suffix-disambiguates so the new save lands under a fresh
+        # id and the original entry survives.
+        #
+        # Names deliberately differ so the NameCollisionModal path
+        # doesn't preempt the bug class we're guarding.
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        prior = SeqRecord(Seq("CCCC"), id="my_fragment_v2",
+                            name="my_fragment_v2")
+        prior.annotations["molecule_type"] = "DNA"
+        prior.annotations["topology"]      = "linear"
+        prior_gb = sc._record_to_gb_text(prior)
+        sc._save_library([{
+            "id": "my_fragment_v2",
+            "name": "Pre-existing entry",
+            "size": 4, "n_feats": 0,
+            "source": "test", "added": "2026-05-20",
+            "gb_text": prior_gb,
+        }])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("AAAA", [])
+            scr._dirty = True
+            orig_push = app.push_screen
+            def _stub_push(modal, callback=None):
+                if isinstance(modal, sc.NamePlasmidModal):
+                    # User types a name that sanitises to the existing
+                    # entry's id but is a DIFFERENT human-readable name
+                    # (so no NameCollisionModal fires).
+                    if callback is not None:
+                        callback("my fragment v2")
+                    return None
+                return orig_push(modal, callback=callback)
+            app.push_screen = _stub_push  # type: ignore[method-assign]
+            try:
+                scr._do_save()
+            finally:
+                app.push_screen = orig_push  # type: ignore[method-assign]
+            await pilot.pause()
+            await pilot.pause()
+            entries = sc._load_library()
+            ids = [e.get("id") for e in entries]
+            # Original "my_fragment_v2" entry must survive (pre-fix it
+            # would have been clobbered by the new save's id match).
+            assert "my_fragment_v2" in ids, (
+                f"original entry overwritten — ids: {ids}"
+            )
+            # New save lands under a disambiguated id.
+            assert any(
+                i and i.startswith("my_fragment_v2_") for i in ids
+            ), f"expected disambiguated id, got {ids}"
+            # The original gb_text must NOT be overwritten.
+            prior_entry = next(
+                e for e in entries if e.get("id") == "my_fragment_v2"
+            )
+            assert prior_entry.get("gb_text") == prior_gb
+            assert prior_entry.get("name") == "Pre-existing entry"
+
+
+class TestPartsBinAutoTriggerNewPart:
+    """Sweep #14 — ``PartsBinModal(auto_trigger_new_part=True)`` fires
+    ``_new_part(None)`` on mount so Synthesis → Clone Fragment hands off
+    cleanly to the Domesticator without an extra click."""
+
+    def test_init_accepts_flag(self):
+        modal = sc.PartsBinModal(auto_trigger_new_part=True)
+        assert modal._auto_trigger_new_part is True
+
+    def test_init_defaults_false(self):
+        modal = sc.PartsBinModal()
+        assert modal._auto_trigger_new_part is False
+
+
+class TestSynthesisCloneFragmentButton:
+    """Sweep #14 — Clone Fragment button on Synthesis toolbar."""
+
+    async def test_clone_button_present_on_toolbar(self):
+        from textual.widgets import Button
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            btn = scr.query_one("#btn-syn-clone", Button)
+            assert "clone fragment" in str(btn.label).lower()
+
+    async def test_clone_action_method_exists(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            assert callable(getattr(scr, "action_clone_fragment", None))
+
+    async def test_clone_on_protein_tab_notifies(self):
+        from textual.widgets import TabbedContent
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            tabs = scr.query_one("#syn-tabs", TabbedContent)
+            tabs.active = "syn-tab-protein"
+            await pilot.pause()
+            await pilot.pause()
+            notes: list[tuple[str, str]] = []
+            orig_notify = app.notify
+            def _capture(msg, *, severity="information", **kw):
+                notes.append((severity, str(msg)))
+                return orig_notify(msg, severity=severity, **kw)
+            app.notify = _capture  # type: ignore[method-assign]
+            try:
+                scr.action_clone_fragment()
+                await pilot.pause()
+            finally:
+                app.notify = orig_notify  # type: ignore[method-assign]
+            assert any("DNA-tab only" in m for _, m in notes), (
+                f"expected DNA-tab-only notify, got {notes}"
+            )
+
+    async def test_clone_empty_fragment_notifies(self, isolated_library):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            notes: list[tuple[str, str]] = []
+            orig_notify = app.notify
+            def _capture(msg, *, severity="information", **kw):
+                notes.append((severity, str(msg)))
+                return orig_notify(msg, severity=severity, **kw)
+            app.notify = _capture  # type: ignore[method-assign]
+            try:
+                scr.action_clone_fragment()
+                await pilot.pause()
+            finally:
+                app.notify = orig_notify  # type: ignore[method-assign]
+            assert any("empty" in m.lower() for _, m in notes), (
+                f"expected empty-fragment notify, got {notes}"
+            )
+
+
+class TestSynthesisCloneFragmentFlow:
+    """End-to-end integration guard for the Clone Fragment handoff."""
+
+    async def test_clone_saves_and_opens_parts_bin(self, isolated_library):
+        from Bio.Seq import Seq
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGAAACCCGGGTTT", [])
+            scr._dirty = True
+            # Stub NamePlasmidModal — user types name once during the
+            # auto-save inside Clone Fragment.
+            orig_push = app.push_screen
+            def _stub_push(modal, callback=None):
+                if isinstance(modal, sc.NamePlasmidModal):
+                    if callback is not None:
+                        callback("clone_test_fragment")
+                    return None
+                return orig_push(modal, callback=callback)
+            app.push_screen = _stub_push  # type: ignore[method-assign]
+            try:
+                scr.action_clone_fragment()
+            finally:
+                app.push_screen = orig_push  # type: ignore[method-assign]
+            # Settle the async push of PartsBinModal.
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.pause()
+            # 1. Synthesis fragment landed in the library.
+            entries = sc._load_library()
+            ids = {e.get("id") for e in entries}
+            assert "clone_test_fragment" in ids, (
+                f"Synthesis save didn't land — ids: {ids}"
+            )
+            # 2. The current record is now the synthesis fragment
+            #    (so PartsBinModal._new_part picks it up).
+            rec = app._current_record
+            assert rec is not None
+            assert str(rec.seq).upper() == "ATGAAACCCGGGTTT"
+            # 3. The full handoff chain fired:
+            #    Synthesis dismissed → PartsBinModal mounted →
+            #    auto_trigger_new_part fired _new_part(None) →
+            #    DomesticatorModal stacked on top. So the topmost
+            #    screen should be DomesticatorModal, and the parts
+            #    bin should sit below it in the screen stack.
+            assert isinstance(app.screen, sc.DomesticatorModal), (
+                f"expected DomesticatorModal on top after handoff, "
+                f"got {type(app.screen).__name__}"
+            )
+            stack_types = [type(s).__name__ for s in app.screen_stack]
+            assert "PartsBinModal" in stack_types, (
+                f"PartsBinModal should sit under the Domesticator; "
+                f"stack: {stack_types}"
+            )
+            assert "SynthesisScreen" not in stack_types, (
+                f"SynthesisScreen should have dismissed; "
+                f"stack: {stack_types}"
+            )
+
+    async def test_clone_aborted_when_save_fails(self, isolated_library):
+        # If the user cancels the NamePlasmidModal (callback fires
+        # with an empty string), Clone Fragment must NOT proceed to
+        # the handoff — no canvas swap, no parts-bin push.
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGAAA", [])
+            scr._dirty = True
+            orig_push = app.push_screen
+            def _stub_push(modal, callback=None):
+                if isinstance(modal, sc.NamePlasmidModal):
+                    if callback is not None:
+                        callback("")  # cancel — empty name
+                    return None
+                return orig_push(modal, callback=callback)
+            app.push_screen = _stub_push  # type: ignore[method-assign]
+            try:
+                scr.action_clone_fragment()
+            finally:
+                app.push_screen = orig_push  # type: ignore[method-assign]
+            await pilot.pause()
+            await pilot.pause()
+            # Synthesis screen still on top — no handoff happened.
+            assert isinstance(app.screen, sc.SynthesisScreen), (
+                f"Clone Fragment must abort on save cancel; "
+                f"screen is {type(app.screen).__name__}"
+            )
+            # Library still empty.
+            assert sc._load_library() == []
+
+
+class TestSynthesisRenderExceptNarrowed:
+    """Sweep #14 — three ``except Exception`` clauses on the render
+    path narrowed to ``(AttributeError, TypeError)`` per invariant #1.
+    White-box source check so the regression can't drift back to bare-
+    ish exception handling."""
+
+    def test_no_bare_exception_in_synth_editors(self):
+        with open(sc.__file__, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        # Look at the lines around the three known render-path sites.
+        # Pre-fix used ``except Exception:``; post-fix uses
+        # ``except (AttributeError, TypeError):``.
+        lines = src.split("\n")
+        # The render-path sites are inside SynthesisEditor +
+        # ProteinEditor. Walk the file and assert that within those
+        # class bodies, no plain ``except Exception:`` lurks at the
+        # known column depth.
+        synth_start = src.find("class SynthesisEditor(")
+        protein_start = src.find("class ProteinEditor(")
+        protein_end = src.find("class RestrictionInsertModal(")
+        assert synth_start > 0 and protein_start > 0 and protein_end > 0
+        synth_body = src[synth_start:protein_start]
+        protein_body = src[protein_start:protein_end]
+        # No bare ``except Exception:`` (with optional whitespace+colon)
+        # in the render path bodies — narrow types only.
+        import re
+        for body, name in ((synth_body, "SynthesisEditor"),
+                            (protein_body, "ProteinEditor")):
+            bare = re.findall(r"except Exception\s*:", body)
+            assert not bare, (
+                f"{name} body carries bare 'except Exception:' — "
+                "narrow to specific types per invariant #1"
+            )

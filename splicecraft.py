@@ -37370,7 +37370,7 @@ class PartsBinModal(Screen):
         "#btn-parts-export-fasta",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, *, auto_trigger_new_part: bool = False) -> None:
         super().__init__()
         # Pre-built feature-library index for the "Feat Lib" column.
         # Re-derived only when `_features_generation` differs from the
@@ -37379,6 +37379,13 @@ class PartsBinModal(Screen):
         # whole scan.
         self._feat_lib_index: dict[tuple[str, str], str] = {}
         self._feat_lib_gen_seen: int = -1
+        # Sweep #14 (2026-05-20) — Synthesis "Clone Fragment" entry
+        # point. The Synthesis screen pushes ``PartsBinModal(
+        # auto_trigger_new_part=True)`` after auto-saving + loading
+        # its fragment as the canvas record; on_mount fires
+        # ``_new_part(None)`` after the first paint so the user
+        # lands directly in the Domesticator with no extra clicks.
+        self._auto_trigger_new_part: bool = bool(auto_trigger_new_part)
         # Multi-select state for bulk save-to-collection / delete.
         # Set of row indices into `self._rows`. A non-empty set dims
         # the non-bulk action buttons so Save-to-Collection + Delete
@@ -37549,6 +37556,14 @@ class PartsBinModal(Screen):
             "Feat Lib", "Grammar",
         )
         self._populate()
+        if self._auto_trigger_new_part:
+            # Drop the flag immediately so a screen-resume can't fire
+            # the modal twice. ``call_after_refresh`` waits for the
+            # first paint so the user sees the bin briefly before the
+            # Domesticator stacks on top — keeps the workflow legible
+            # ("you're here now, here's the next step").
+            self._auto_trigger_new_part = False
+            self.call_after_refresh(lambda: self._new_part(None))
 
     def on_screen_resume(self) -> None:
         """Re-populate when the screen comes back to focus so agent
@@ -45620,7 +45635,7 @@ class SynthesisEditor(Widget):
         bot_row = dna_row + 1
         try:
             lines = txt.split("\n")
-        except Exception:
+        except (AttributeError, TypeError):
             return txt
         if dna_row >= len(lines):
             return txt
@@ -45699,7 +45714,7 @@ class SynthesisEditor(Widget):
             return txt
         try:
             lines = txt.split("\n")
-        except Exception:
+        except (AttributeError, TypeError):
             return txt
         pad_text = Text(" " * pad, no_wrap=True)
         return Text("\n", no_wrap=True).join(
@@ -46534,7 +46549,7 @@ class ProteinEditor(Widget):
             pad_text = Text(" " * pad_left, no_wrap=True)
             try:
                 lines = txt.split("\n")
-            except Exception:
+            except (AttributeError, TypeError):
                 lines = [txt]
             txt = Text("\n", no_wrap=True).join(
                 pad_text + ln for ln in lines
@@ -47434,6 +47449,8 @@ class SynthesisScreen(Screen):
                 yield Button("Rename",    id="btn-syn-rename")
                 yield Button("Insert site", id="btn-syn-insertsite")
                 yield Button("Add feature", id="btn-syn-addfeat")
+                yield Button("Clone Fragment", id="btn-syn-clone",
+                              variant="warning")
             yield Static("", id="syn-status", markup=True)
             with TabbedContent(initial="syn-tab-dna", id="syn-tabs"):
                 with TabPane("DNA", id="syn-tab-dna"):
@@ -47969,6 +47986,10 @@ class SynthesisScreen(Screen):
     def _btn_addfeat(self, _) -> None:
         self.action_add_feature()
 
+    @on(Button.Pressed, "#btn-syn-clone")
+    def _btn_clone(self, _) -> None:
+        self.action_clone_fragment()
+
     def action_select_all(self) -> None:
         """Ctrl+A — select the entire active-tab buffer AND focus the
         editor so subsequent Backspace / Delete keystrokes reach its
@@ -48260,11 +48281,10 @@ class SynthesisScreen(Screen):
                               callback=_on_resolved)
 
     def _load_entry_by_id(self, eid: str) -> None:
-        entry = None
-        for e in _load_library():
-            if isinstance(e, dict) and e.get("id") == eid:
-                entry = e
-                break
+        # Sweep #14 (2026-05-20): swap full ``_load_library()`` walk for
+        # the targeted ``_find_library_entry_by_id`` helper (invariant
+        # #51) so single-entry lookups don't pay an O(N) deepcopy.
+        entry = _find_library_entry_by_id(eid) if eid else None
         if entry is None:
             self.app.notify(f"Fragment '{eid}' no longer in library.",
                              severity="warning")
@@ -48334,8 +48354,9 @@ class SynthesisScreen(Screen):
         self._do_save()
 
     def _save_as(self) -> None:
-        """Save As — always prompt for a fresh name and reset the
-        loaded id so the next Save targets the new entry."""
+        """Save As — always prompt for a fresh name and re-target a
+        unique entry id so the new save can't silently overwrite an
+        unrelated library entry whose id happens to match."""
         if self._active_tab_id() == "protein":
             self._protein_save_as()
             return
@@ -48352,9 +48373,14 @@ class SynthesisScreen(Screen):
         def _on_named(name):
             if not name:
                 return
-            self._loaded_id   = None
+            # Sweep #14 (2026-05-20): hand a unique id to ``_commit_save``
+            # directly so the inner ``_do_save`` fallback doesn't fire a
+            # second NamePlasmidModal. Pre-fix ``_on_named`` set
+            # ``_loaded_id = None`` and called ``_do_save``, which saw
+            # the cleared id and prompted again.
             self._loaded_name = name
-            self._do_save()
+            self._loaded_id   = self._make_unique_entry_id(name)
+            self._commit_save(seq, feats, after=None)
         self.app.push_screen(
             NamePlasmidModal(default, target_label="fragment"),
             callback=_on_named,
@@ -48425,7 +48451,11 @@ class SynthesisScreen(Screen):
                         after(False)
                     return
                 self._loaded_name = name
-                self._loaded_id = self._make_entry_id(name)
+                # Sweep #14 (2026-05-20): unique id so a fresh save
+                # whose sanitised name collides with an existing
+                # library id can't trip ``LibraryPanel.add_entry``'s
+                # silent-replace branch and clobber an unrelated entry.
+                self._loaded_id = self._make_unique_entry_id(name)
                 self._commit_save(seq, feats, after)
             self.app.push_screen(
                 NamePlasmidModal(default, target_label="fragment"),
@@ -48441,6 +48471,42 @@ class SynthesisScreen(Screen):
         base = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") \
             or "fragment"
         return base[:32]
+
+    def _make_unique_entry_id(self, name: str,
+                              *, exclude_id: "str | None" = None) -> str:
+        """Sanitise ``name`` to an entry id and suffix-disambiguate it
+        against current library ids so a fresh save / Save As never
+        silently overwrites an unrelated entry.
+
+        ``exclude_id`` lets a re-save pass its current id and skip the
+        bump — only the new-save / Save-As paths need disambiguation.
+        Mirrors the suffix loop ``_domesticator_library_mirror_worker``
+        uses for the same problem (`bump = 2; while in existing: bump
+        += 1`)."""
+        base = self._make_entry_id(name)
+        try:
+            existing_ids = {
+                e.get("id") or "" for e in _load_library()
+                if isinstance(e, dict)
+            }
+        except Exception:
+            existing_ids = set()
+        if exclude_id:
+            existing_ids.discard(exclude_id)
+        if base not in existing_ids:
+            return base
+        # Suffix-disambiguate. Cap at the same 32-char ceiling
+        # ``_make_entry_id`` enforces so the suffixed result stays
+        # GenBank-LOCUS-safe.
+        bump = 2
+        while bump < 10_000:
+            candidate = f"{base[:28]}_{bump}"
+            if candidate not in existing_ids:
+                return candidate
+            bump += 1
+        # Pathological fall-through — append a short random tag.
+        import secrets as _secrets
+        return f"{base[:24]}_{_secrets.token_hex(3)}"
 
     def _commit_save(self, seq: str, feats: list[dict],
                        after) -> None:
@@ -48458,7 +48524,12 @@ class SynthesisScreen(Screen):
                 after(False)
             return
         with self._save_lock:
-            eid  = self._loaded_id or self._make_entry_id(
+            # Sweep #14 (2026-05-20): defensive fallback uses unique-id
+            # too. Callers (_save_as, _do_save) set ``_loaded_id``
+            # before reaching here, but if a future caller forgets we
+            # don't want the silent-replace branch in LibraryPanel.
+            # add_entry to clobber an unrelated entry.
+            eid  = self._loaded_id or self._make_unique_entry_id(
                 self._loaded_name or "fragment",
             )
             name = self._loaded_name or eid
@@ -48634,6 +48705,121 @@ class SynthesisScreen(Screen):
         self.app.push_screen(RestrictionInsertModal(),
                               callback=_on_picked)
 
+    @_action_log("synthesis.clone_fragment")
+    def action_clone_fragment(self) -> None:
+        """Clone Fragment button — auto-save the synthesis fragment,
+        load it onto the main canvas as the current record, close the
+        Synthesis screen, and open the Parts Bin pre-armed to fire
+        the Domesticator on the just-saved fragment. Closes the loop
+        from "compose a synthesis order" → "domesticated L0 part in
+        the parts bin" in one click.
+
+        DNA tab only — protein tabs notify (domestication is a
+        DNA-fragment operation; back-translated proteins should be
+        loaded onto the DNA tab first if the user wants to clone)."""
+        if self._active_tab_id() == "protein":
+            self.app.notify(
+                "Clone Fragment is DNA-tab only. Save the protein "
+                "first, then switch to the DNA tab to clone.",
+                severity="information",
+            )
+            return
+        try:
+            ed = self.query_one("#syn-editor", SynthesisEditor)
+        except NoMatches:
+            return
+        seq, feats = ed.get_state()
+        if not seq:
+            self.app.notify(
+                "Nothing to clone — fragment is empty.",
+                severity="warning",
+            )
+            return
+        def _do_handoff() -> None:
+            # Re-read the just-saved entry by id and load it onto the
+            # canvas so PartsBinModal._new_part picks up its seq +
+            # features as the source. ``_find_library_entry_by_id``
+            # (invariant #51) keeps the lookup cheap.
+            entry = _find_library_entry_by_id(self._loaded_id or "") \
+                if self._loaded_id else None
+            if entry is None:
+                self.app.notify(
+                    "Couldn't reload the saved fragment.",
+                    severity="error",
+                )
+                return
+            try:
+                rec = _gb_text_to_record(entry.get("gb_text", "") or "")
+            except ValueError as exc:
+                self.app.notify(
+                    f"Couldn't parse saved fragment: {exc}",
+                    severity="error",
+                )
+                _log.exception(
+                    "Synthesis.clone_fragment: parse failed for %s",
+                    self._loaded_id,
+                )
+                return
+            if rec is None:
+                self.app.notify(
+                    "Saved fragment parsed as empty.",
+                    severity="error",
+                )
+                return
+            self.app._apply_record(rec)
+            _log_event(
+                "synthesis.clone_fragment.handoff",
+                id=self._loaded_id,
+                bp=len(seq), n_feats=len(feats),
+            )
+            # Close synthesis, then open Parts Bin in auto-trigger
+            # mode. ``call_after_refresh`` lets the dismiss settle
+            # before the push so the screen-stack transition stays
+            # legible.
+            self.dismiss(None)
+            self.app.call_after_refresh(
+                lambda: self.app.push_screen(
+                    PartsBinModal(auto_trigger_new_part=True),
+                ),
+            )
+        def _continue(ok: bool) -> None:
+            if not ok:
+                return
+            # Defend the main canvas: ``_apply_record`` would silently
+            # overwrite an unsaved canvas plasmid otherwise. Mirror
+            # ExperimentsScreen's UnsavedNavigateModal pattern so the
+            # user can save / discard / cancel before we hand off.
+            if getattr(self.app, "_unsaved", False):
+                def _on_unsaved(result):
+                    if result == "save":
+                        do_save = getattr(self.app, "_do_save", None)
+                        if callable(do_save) and do_save():
+                            _do_handoff()
+                    elif result == "discard":
+                        discard = getattr(
+                            self.app, "_discard_changes", None,
+                        )
+                        if callable(discard):
+                            discard()
+                        _do_handoff()
+                    # None → cancel; user stays in Synthesis with
+                    # their saved fragment.
+                self.app.push_screen(
+                    UnsavedNavigateModal(
+                        "clone this fragment onto the canvas",
+                    ),
+                    callback=_on_unsaved,
+                )
+                return
+            _do_handoff()
+        # Save first so the cloned fragment lands in the library
+        # before the Domesticator opens. Re-saves take the silent
+        # id-replace branch; new buffers prompt for a name once.
+        if self._dirty or self._loaded_id is None:
+            self._do_save(after=_continue)
+        else:
+            _continue(True)
+
     # ── Protein-tab actions ────────────────────────────────────────────────
 
     def _new_protein_fragment(self) -> None:
@@ -48691,11 +48877,10 @@ class SynthesisScreen(Screen):
         feature carrying a ``translation`` qualifier, load that AA
         sequence into the protein editor. Falls back to translating
         the whole DNA sequence (frame 1) when no CDS is found."""
-        entry = None
-        for e in _load_library():
-            if isinstance(e, dict) and e.get("id") == eid:
-                entry = e
-                break
+        # Sweep #14 (2026-05-20): targeted lookup via
+        # ``_find_library_entry_by_id`` (invariant #51) avoids the
+        # O(N) full-library deepcopy this used to incur.
+        entry = _find_library_entry_by_id(eid) if eid else None
         if entry is None:
             self.app.notify(
                 f"Fragment '{eid}' no longer in library.",
@@ -48787,9 +48972,12 @@ class SynthesisScreen(Screen):
         def _on_named(name):
             if not name:
                 return
-            self._protein_loaded_id   = None
+            # Sweep #14 (2026-05-20): mirror DNA-tab Save As fix —
+            # hand a unique id straight to ``_commit_protein_save`` so
+            # the inner ``_do_protein_save`` fallback can't prompt twice.
             self._protein_loaded_name = name
-            self._do_protein_save()
+            self._protein_loaded_id   = self._make_unique_entry_id(name)
+            self._commit_protein_save(aa_seq, after=None)
         self.app.push_screen(
             NamePlasmidModal(default, target_label="protein"),
             callback=_on_named,
@@ -48821,7 +49009,10 @@ class SynthesisScreen(Screen):
                         after(False)
                     return
                 self._protein_loaded_name = name
-                self._protein_loaded_id = self._make_entry_id(name)
+                # Sweep #14 (2026-05-20): unique id so a fresh protein
+                # save can't silent-overwrite an unrelated library
+                # entry whose id matches the sanitised name.
+                self._protein_loaded_id = self._make_unique_entry_id(name)
                 self._commit_protein_save(aa_seq, after)
             self.app.push_screen(
                 NamePlasmidModal(default, target_label="protein"),
@@ -48848,7 +49039,10 @@ class SynthesisScreen(Screen):
         # library hand-off so a concurrent _commit_save (DNA tab) or
         # another _commit_protein_save can't interleave construction.
         with self._save_lock:
-            eid = self._protein_loaded_id or self._make_entry_id(
+            # Sweep #14 (2026-05-20): unique-id fallback mirrors the
+            # DNA-tab _commit_save fix — defensive against any future
+            # caller that forgets to set _protein_loaded_id.
+            eid = self._protein_loaded_id or self._make_unique_entry_id(
                 self._protein_loaded_name or "protein",
             )
             name = self._protein_loaded_name or eid
