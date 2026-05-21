@@ -19419,6 +19419,7 @@ _USER_DATA_FILE_ATTRS: tuple = (
     "_EXPERIMENTS_FILE",      # experiments.json — lab-notebook entries
     "_EXPERIMENT_PROJECTS_FILE",  # experiment_projects.json — all projects
     "_GELS_FILE",             # gels.json — saved agarose-gel snapshots
+    "_PROTEIN_MOTIFS_FILE",   # protein_motifs.json — user motif overrides (sweep #15)
 )
 
 # User-data sub-directories — autosaved unsaved-edits + .dna sidecars.
@@ -19676,6 +19677,7 @@ _MASTER_DELETE_CACHE_ATTRS: tuple = (
     "_experiments_cache",
     "_experiment_projects_cache",
     "_gels_cache",
+    "_protein_motifs_cache",   # sweep #15: protein-motif user overrides
 )
 
 
@@ -28198,6 +28200,63 @@ def _save_features(entries: list[dict]) -> None:
         _safe_save_json(_FEATURES_FILE, entries, "Feature library")
         _features_cache = _typed_clone(entries)
         _features_generation += 1
+
+
+# Sweep #15 (2026-05-20) — protein-motif library persistence.
+# `_PROTEIN_MOTIFS` ships built-in motifs; user edits land in
+# `protein_motifs.json` as a sidecar so the built-ins stay in code
+# and a `master_delete` wipe doesn't need to know about the motif
+# names. Built-ins override happens by NAME — a user-edited entry
+# whose name matches a built-in replaces it in the merged list.
+# User-added entries with novel names append to the end.
+_PROTEIN_MOTIFS_FILE = _DATA_DIR / "protein_motifs.json"
+_protein_motifs_cache: "list | None" = None
+
+
+def _load_protein_motifs() -> list[dict]:
+    """Return the merged protein-motif library: built-in entries
+    overridden by user edits stored in `protein_motifs.json`. Deep-
+    copied so callers can mutate freely.
+    """
+    global _protein_motifs_cache
+    if _protein_motifs_cache is not None:
+        return _typed_clone(_protein_motifs_cache)
+    user_entries, warning = _safe_load_json(
+        _PROTEIN_MOTIFS_FILE, "Protein motifs",
+    )
+    if warning:
+        _log.warning(warning)
+    user_entries = [e for e in user_entries if isinstance(e, dict)]
+    user_by_name: dict[str, dict] = {
+        str(e.get("name") or ""): e for e in user_entries if e.get("name")
+    }
+    merged: list[dict] = []
+    builtin_names: set[str] = set()
+    for builtin in _PROTEIN_MOTIFS:
+        name = str(builtin.get("name") or "")
+        builtin_names.add(name)
+        merged.append(user_by_name.get(name, dict(builtin)))
+    # User-added novel motifs (name NOT in builtins) append in
+    # insertion order so user-defined items land predictably.
+    for e in user_entries:
+        name = str(e.get("name") or "")
+        if name and name not in builtin_names:
+            merged.append(dict(e))
+    _protein_motifs_cache = merged
+    return _typed_clone(_protein_motifs_cache)
+
+
+def _save_protein_motifs(entries: list[dict]) -> None:
+    """Persist `entries` (user-modified motifs only — not the full
+    merged list) to `protein_motifs.json`. Caller passes the list of
+    entries to STORE; the merge with built-ins happens on read."""
+    global _protein_motifs_cache
+    with _cache_lock:
+        _safe_save_json(_PROTEIN_MOTIFS_FILE, entries, "Protein motifs")
+        # Invalidate the cache; next _load_protein_motifs rebuilds
+        # the merged list. Reseating with the user-only list would
+        # leave the merged form stale.
+        _protein_motifs_cache = None
 
 
 # Generation-keyed cache of the (name, feature_type) → sequence index.
@@ -45349,6 +45408,22 @@ _PROTEIN_AA_ALPHABET: frozenset[str] = frozenset("ACDEFGHIKLMNPQRSTVWY*")
 # elsewhere, so divide by 3.
 _PROTEIN_MAX_AA: int = _SYNTHESIS_MAX_BP // 3
 
+# Sweep #15 (2026-05-20) — color palette for protein motif feature
+# types. The DNA feature library uses `_GB_TYPE_COLORS` keyed on the
+# GenBank type vocabulary; protein motifs have their own type
+# ontology (Tag, Signal, Linker, …) that wouldn't match GenBank, so
+# they get a dedicated map. Colors picked to be distinguishable on
+# the muted-grey AA-row background and read OK against the bold-
+# white AA letters above.
+_PROTEIN_FEATURE_TYPE_COLORS: dict[str, str] = {
+    "Tag":        "#3B82F6",  # blue — affinity / epitope tags
+    "Signal":     "#F59E0B",  # amber — NLS / NES / signal peptides
+    "Linker":     "#6B7280",  # grey — flexible / rigid linkers
+    "Cleavage":   "#DC2626",  # red — protease sites
+    "2A peptide": "#10B981",  # green — self-cleaving 2A
+    "Motif":      "#A855F7",  # purple — start codon / stop / other
+}
+
 # Builtin protein-motif / domain library — common tags + linkers +
 # protease sites a synthetic-biology user reaches for when composing
 # a recombinant protein. Stored as a module-level list so it's
@@ -46393,6 +46468,13 @@ class ProteinEditor(Widget):
         # click math has a single offset to subtract.
         self._pad_above_rows: int = 0
         self._pad_left_cols: int = 0
+        # Sweep #15 (2026-05-20) — feature tracking in AA coords.
+        # Each entry: {"start": int, "end": int, "label": str,
+        #              "type": str, "color": str, "qualifiers": dict}
+        # half-open AA coords. Render paints feature cells with the
+        # `color` as the background style; selection + cursor stack
+        # on top so feature backgrounds never obscure the cursor.
+        self._aa_feats: list[dict] = []
 
     def compose(self) -> ComposeResult:
         with ScrollableContainer(id="pe-scroll"):
@@ -46407,8 +46489,11 @@ class ProteinEditor(Widget):
 
     # ── Public API ─────────────────────────────────────────────────────────
 
-    def load(self, aa_seq: str) -> None:
-        """Replace the buffer. Resets cursor + selection."""
+    def load(self, aa_seq: str,
+             feats: "list[dict] | None" = None) -> None:
+        """Replace the buffer. Resets cursor + selection. Optional
+        ``feats`` arg seeds the feature list — used by the protein-
+        save round-trip so motif annotations survive load/save."""
         self._aa_seq = "".join(
             c for c in str(aa_seq or "").upper()
             if c in _PROTEIN_AA_ALPHABET
@@ -46416,11 +46501,45 @@ class ProteinEditor(Widget):
         self._cursor_pos = 0
         self._user_sel = None
         self._sel_anchor = -1
+        n = len(self._aa_seq)
+        clean: list[dict] = []
+        for f in (feats or []):
+            try:
+                s = int(f.get("start", 0))
+                e = int(f.get("end", 0))
+            except (TypeError, ValueError):
+                continue
+            if s < 0 or e > n or e <= s:
+                continue
+            clean.append(dict(f))
+        self._aa_feats = clean
         self._refresh_view()
 
     def get_state(self) -> "tuple[str, bool]":
         """Return (aa_seq, codon_mode) snapshot for dirty / save flow."""
         return self._aa_seq, self._codon_mode
+
+    def get_feats(self) -> list[dict]:
+        """Return a deepcopy of the AA-coord feature list. Used by the
+        save flow so the persisted SeqRecord can't share mutable state
+        with the live editor."""
+        return [dict(f) for f in self._aa_feats]
+
+    def add_feature(self, feat: dict) -> None:
+        """Append a feature in AA coords. Caller is responsible for
+        building the dict (start/end/label/type/color/qualifiers).
+        Triggers a re-render so the colored band appears immediately."""
+        try:
+            s = int(feat.get("start", 0))
+            e = int(feat.get("end", 0))
+        except (TypeError, ValueError):
+            return
+        n = len(self._aa_seq)
+        if s < 0 or e > n or e <= s:
+            return
+        self._aa_feats.append(dict(feat))
+        self._refresh_view()
+        self.post_message(self.Changed())
 
     def set_codon_mode(self, on: bool) -> None:
         if bool(on) == self._codon_mode:
@@ -46605,13 +46724,35 @@ class ProteinEditor(Widget):
         blank_marker = Text(" " * self._FLANK_MARKER_WIDTH, no_wrap=True)
         aa_row.append_text(n_marker)
         dna_row.append_text(blank_marker)
+        # Sweep #15: feature backgrounds. Build a per-AA color array
+        # ONCE so the inner loop is O(1) per cell instead of O(F) per
+        # cell. Last-feature-wins on overlap (mirrors the DNA tab's
+        # `_build_seq_text` overlay rule).
+        feat_bg: list[str] = [""] * n_aa
+        for f in self._aa_feats:
+            try:
+                fs = max(0, int(f.get("start", 0)))
+                fe = min(n_aa, int(f.get("end", 0)))
+            except (TypeError, ValueError):
+                continue
+            color = str(f.get("color") or "").strip()
+            if not color or fs >= fe:
+                continue
+            for k in range(fs, fe):
+                feat_bg[k] = color
         for i, aa in enumerate(self._aa_seq):
             on_cursor = (i == cursor)
             in_sel    = (sel_lo <= i < sel_hi)
             aa_style = self._AA_DEFAULT_STYLE
             cell_style = ""
+            # Priority: cursor (reverse) > selection > feature bg.
+            # Cursor + selection don't combine with feature bg —
+            # they fully replace the cell paint so the cursor / sel
+            # stays visually loud.
             if in_sel:
                 cell_style = "on #003366"
+            elif feat_bg[i]:
+                cell_style = f"on {feat_bg[i]}"
             if on_cursor:
                 cell_style = "reverse"
             # AA row: 3 cells (leading space, letter, trailing space).
@@ -46649,12 +46790,29 @@ class ProteinEditor(Widget):
         c_marker = Text(self._FLANK_MARKER_C,
                          style=self._FLANK_MARKER_STYLE, no_wrap=True)
         row.append_text(n_marker)
+        # Feature background overlay — mirrors the codon-mode build
+        # so AA-only and codon-translated views render identical
+        # feature stripes (just without the codon row below).
+        feat_bg: list[str] = [""] * n_aa
+        for f in self._aa_feats:
+            try:
+                fs = max(0, int(f.get("start", 0)))
+                fe = min(n_aa, int(f.get("end", 0)))
+            except (TypeError, ValueError):
+                continue
+            color = str(f.get("color") or "").strip()
+            if not color or fs >= fe:
+                continue
+            for k in range(fs, fe):
+                feat_bg[k] = color
         for i, aa in enumerate(self._aa_seq):
             on_cursor = (i == cursor)
             in_sel    = (sel_lo <= i < sel_hi)
             style = self._AA_DEFAULT_STYLE
             if in_sel:
                 style = f"{style} on #003366"
+            elif feat_bg[i]:
+                style = f"{style} on {feat_bg[i]}"
             if on_cursor:
                 style = "reverse"
             row.append(aa, style=style)
@@ -46856,6 +47014,20 @@ class ProteinEditor(Widget):
         cur = self._cursor_pos
         n_ins = len(clean)
         self._aa_seq = self._aa_seq[:cur] + clean + self._aa_seq[cur:]
+        # Sweep #15: shift AA-coord features. Mirrors SynthesisEditor:
+        # features whose start >= cur shift; features whose end >= cur
+        # extend, with the carve-out that a zero-length feature parked
+        # at the cursor (end == cur && start == cur) doesn't extend.
+        for f in self._aa_feats:
+            try:
+                fs = int(f.get("start", 0))
+                fe = int(f.get("end", 0))
+            except (TypeError, ValueError):
+                continue
+            if fs >= cur:
+                f["start"] = fs + n_ins
+            if fe >= cur and not (fe == cur and fs == cur):
+                f["end"] = fe + n_ins
         self._cursor_pos = cur + n_ins
         self._user_sel = None
         self._sel_anchor = -1
@@ -46868,6 +47040,42 @@ class ProteinEditor(Widget):
         if start >= end:
             return
         self._aa_seq = self._aa_seq[:start] + self._aa_seq[end:]
+        # Sweep #15: clip + shift AA-coord features on delete. Same
+        # rules as SynthesisEditor._delete_range — fully-left untouched,
+        # fully-right shifted, overlapping clipped, zero-survival
+        # dropped.
+        n_del = end - start
+        new_feats: list[dict] = []
+        for f in self._aa_feats:
+            try:
+                fs = int(f.get("start", 0))
+                fe = int(f.get("end", 0))
+            except (TypeError, ValueError):
+                continue
+            if fe <= start:
+                # Entirely left of cut — untouched.
+                new_feats.append(f)
+                continue
+            if fs >= end:
+                # Entirely right of cut — shift left by n_del.
+                f["start"] = fs - n_del
+                f["end"]   = fe - n_del
+                new_feats.append(f)
+                continue
+            # Overlapping the cut. Map the surviving span to the
+            # post-delete coordinate system: the deleted window
+            # [start, end) becomes a single point at `start`. Cells
+            # past `end` shift left by n_del.
+            #   new_start = min(fs, start)          # left of cut keeps its position
+            #   new_end   = max(fe - n_del, start)  # right of cut shifts; clipped at start
+            new_start = min(fs, start)
+            new_end   = max(fe - n_del, start)
+            if new_end <= new_start:
+                continue   # zero-survival drop
+            f["start"] = new_start
+            f["end"]   = new_end
+            new_feats.append(f)
+        self._aa_feats = new_feats
         self._cursor_pos = start
         self._user_sel = None
         self._sel_anchor = -1
@@ -47513,6 +47721,13 @@ class SynthesisScreen(Screen):
                         ),
                     )
                     yield Button(
+                        "Edit", id="btn-syn-featlib-edit",
+                        tooltip=(
+                            "Edit the selected library entry — "
+                            "opens the same modal Features menu uses."
+                        ),
+                    )
+                    yield Button(
                         "↻", id="btn-syn-featlib-refresh",
                         tooltip="Reload from the feature library "
                                  "(picks up entries added since opening "
@@ -47561,6 +47776,14 @@ class SynthesisScreen(Screen):
                         variant="primary",
                         tooltip="Insert this motif's amino acid "
                                  "sequence at the cursor.",
+                    )
+                    yield Button(
+                        "Edit", id="btn-syn-motif-edit",
+                        tooltip=(
+                            "Edit the selected motif. Built-in motifs "
+                            "are copied to your local library on first "
+                            "edit so changes persist."
+                        ),
                     )
                 yield Static(
                     "[dim]Tags, linkers, protease sites, NLS, 2A "
@@ -47706,6 +47929,78 @@ class SynthesisScreen(Screen):
     @on(Button.Pressed, "#btn-syn-featlib-annotate")
     def _on_featlib_annotate(self, _) -> None:
         self._featlib_insert_selected(mode="annotate")
+
+    @on(Button.Pressed, "#btn-syn-featlib-edit")
+    def _on_featlib_edit(self, _) -> None:
+        """Open AddFeatureModal pre-filled with the selected library
+        entry; on save, update features.json. Mirrors
+        FeatureLibraryScreen.action_edit so the two screens stay
+        coherent — edits made here surface there immediately."""
+        entry = self._featlib_selected_entry()
+        if entry is None:
+            self.app.notify(
+                "Pick an entry in the feature library first.",
+                severity="information",
+            )
+            return
+        # Find the entry's index in the persistent library by
+        # (name, feature_type) — same key FeatureLibraryScreen uses.
+        all_entries = _load_features()
+        target_key = (
+            entry.get("name"), entry.get("feature_type"),
+        )
+        target_idx = next(
+            (i for i, e in enumerate(all_entries)
+             if (e.get("name"), e.get("feature_type")) == target_key),
+            -1,
+        )
+        if target_idx < 0:
+            self.app.notify(
+                "Entry no longer in the feature library.",
+                severity="warning",
+            )
+            return
+        def _cb(result):
+            if not result:
+                return
+            new_entry = (
+                result.get("entry")
+                if isinstance(result, dict) else None
+            )
+            if not new_entry:
+                return
+            # Replace at target_idx and dedup if rename collides.
+            current = _load_features()
+            if target_idx >= len(current):
+                return
+            new_key = (
+                new_entry.get("name"),
+                new_entry.get("feature_type"),
+            )
+            for i in range(len(current) - 1, -1, -1):
+                if i == target_idx:
+                    continue
+                e = current[i]
+                if (e.get("name"), e.get("feature_type")) == new_key:
+                    del current[i]
+            current[target_idx if target_idx < len(current)
+                    else len(current) - 1] = new_entry
+            _save_features(current)
+            self._refresh_featlib_table()
+            _log_event(
+                "synthesis.featlib.edit",
+                name=new_entry.get("name"),
+                type=new_entry.get("feature_type"),
+            )
+            self.app.notify(
+                f"Updated '{new_entry.get('name')}' in the "
+                "feature library.",
+                severity="information",
+            )
+        self.app.push_screen(
+            AddFeatureModal(prefill=entry),
+            callback=_cb,
+        )
 
     def _featlib_selected_entry(self) -> "dict | None":
         """Resolve the highlighted feature-library row → entry dict."""
@@ -48156,7 +48451,9 @@ class SynthesisScreen(Screen):
             return
         rows: list[tuple[str, dict]] = []
         needle = filter_str.strip().lower()
-        for m in _PROTEIN_MOTIFS:
+        # Sweep #15: pull through `_load_protein_motifs()` so user
+        # edits from `protein_motifs.json` override the built-ins.
+        for m in _load_protein_motifs():
             name = str(m.get("name", "") or "")
             ftype = str(m.get("feature_type", "") or "")
             seq = str(m.get("sequence", "") or "")
@@ -48182,6 +48479,71 @@ class SynthesisScreen(Screen):
     @on(Button.Pressed, "#btn-syn-motif-insert")
     def _on_motif_insert(self, _) -> None:
         self._motif_insert_selected()
+
+    @on(Button.Pressed, "#btn-syn-motif-edit")
+    def _on_motif_edit(self, _) -> None:
+        """Open AddFeatureModal pre-filled with the selected motif;
+        on save, persist to ``protein_motifs.json``. Built-in motifs
+        are copy-on-write — the first edit lands in the user file
+        and shadows the built-in on next load. The built-in stays in
+        code as a fallback."""
+        motif = self._motif_selected_entry()
+        if motif is None:
+            self.app.notify(
+                "Pick a motif from the library list first.",
+                severity="information",
+            )
+            return
+        def _cb(result):
+            if not result:
+                return
+            new_motif = (
+                result.get("entry")
+                if isinstance(result, dict) else None
+            )
+            if not new_motif:
+                return
+            # Load only the USER-modified entries (not the merged
+            # list), upsert by name, save back. _load_protein_motifs
+            # will re-merge with the built-ins on next read.
+            user_entries, _w = _safe_load_json(
+                _PROTEIN_MOTIFS_FILE, "Protein motifs",
+            )
+            user_entries = [
+                e for e in user_entries if isinstance(e, dict)
+            ]
+            new_name = str(new_motif.get("name") or "")
+            replaced = False
+            for i, e in enumerate(user_entries):
+                if str(e.get("name") or "") == new_name:
+                    user_entries[i] = new_motif
+                    replaced = True
+                    break
+            if not replaced:
+                user_entries.append(new_motif)
+            try:
+                _save_protein_motifs(user_entries)
+            except (OSError, RuntimeError) as exc:
+                _log.exception("Protein motifs save failed")
+                self.app.notify(
+                    f"Failed to save motif edit: {exc}",
+                    severity="error",
+                )
+                return
+            self._refresh_motif_table()
+            _log_event(
+                "synthesis.protein.motif_edit",
+                name=new_motif.get("name"),
+                type=new_motif.get("feature_type"),
+            )
+            self.app.notify(
+                f"Updated '{new_name}' in your motif library.",
+                severity="information",
+            )
+        self.app.push_screen(
+            AddFeatureModal(prefill=motif),
+            callback=_cb,
+        )
 
     def _motif_selected_entry(self) -> "dict | None":
         try:
@@ -48224,18 +48586,48 @@ class SynthesisScreen(Screen):
                 severity="warning",
             )
             return
+        # Sweep #15 (2026-05-20): capture insert position BEFORE the
+        # splice so we can annotate the spliced region with a colored
+        # feature. The cursor advances past the inserted span by
+        # ``insert_at_cursor``, so reading ``pe._cursor_pos`` after
+        # the splice would give the END not the START.
+        start_aa = pe._cursor_pos
         ok = pe.insert_at_cursor(aa_seq)
-        if ok:
-            _log_event(
-                "synthesis.protein.motif_insert",
-                name=motif.get("name"),
-                type=motif.get("feature_type"),
-                aa_len=len(aa_seq),
-            )
-            self.app.notify(
-                f"Inserted '{motif.get('name')}' ({len(aa_seq)} aa).",
-                severity="information",
-            )
+        if not ok:
+            return
+        # Build the feature — color from the motif's stored color
+        # (user edits land here once protein_motifs.json carries the
+        # user-edited entry), falling back to the type→color map.
+        name = str(motif.get("name") or "motif")
+        ftype = str(motif.get("feature_type") or "Motif")
+        color = motif.get("color") or _PROTEIN_FEATURE_TYPE_COLORS.get(
+            ftype, "#A855F7",
+        )
+        quals = dict(motif.get("qualifiers") or {})
+        if motif.get("description") and "note" not in quals:
+            quals["note"] = [str(motif.get("description"))]
+        if "label" not in quals:
+            quals["label"] = [name]
+        pe.add_feature({
+            "start": start_aa,
+            "end":   start_aa + len(aa_seq),
+            "label": name,
+            "type":  ftype,
+            "color": str(color),
+            "strand": 1,
+            "qualifiers": quals,
+        })
+        _log_event(
+            "synthesis.protein.motif_insert",
+            name=name,
+            type=ftype,
+            aa_len=len(aa_seq),
+            color=str(color),
+        )
+        self.app.notify(
+            f"Inserted '{name}' ({len(aa_seq)} aa, {ftype}).",
+            severity="information",
+        )
 
     def _is_active_dirty(self) -> bool:
         return (self._protein_dirty
@@ -48935,18 +49327,105 @@ class SynthesisScreen(Screen):
                 severity="warning",
             )
             return
+        # Sweep #15: read motif sub-features out of the saved CDS.
+        # Each sub-feature's DNA coords are AA-coords × 3; we divide
+        # back here. Filter to misc_feature so we don't accidentally
+        # pull primer_bind or other DNA-only feature types into the
+        # protein editor.
+        aa_feats = self._extract_aa_feats_from_record(record)
         try:
             pe = self.query_one("#syn-protein-editor", ProteinEditor)
         except NoMatches:
             return
-        pe.load(aa_seq)
+        pe.load(aa_seq, feats=aa_feats)
         self._protein_loaded_id = entry.get("id") or eid
         self._protein_loaded_name = entry.get("name") or self._protein_loaded_id
         self._protein_saved_snapshot = aa_seq
         self._protein_dirty = False
         self._refresh_status()
         _log_event("synthesis.protein.load",
-                   id=self._protein_loaded_id, aa=len(aa_seq))
+                   id=self._protein_loaded_id, aa=len(aa_seq),
+                   n_feats=len(aa_feats))
+
+    @staticmethod
+    def _extract_aa_feats_from_record(record) -> list[dict]:
+        """Scan ``record`` for protein-tab motif sub-features (written
+        by ``_commit_protein_save``) and convert their DNA coords back
+        to AA coords (bp // 3). Only ``misc_feature`` entries inside
+        the CDS region are picked up; the CDS itself is excluded.
+
+        Each returned dict carries the same shape the editor's
+        ``_aa_feats`` expects (start / end / label / type / color /
+        strand / qualifiers).
+        """
+        out: list[dict] = []
+        try:
+            cds_starts_ends: list[tuple[int, int]] = []
+            for sf in (record.features or []):
+                if sf.type != "CDS":
+                    continue
+                try:
+                    s = int(sf.location.start)
+                    e = int(sf.location.end)
+                except (TypeError, AttributeError, ValueError):
+                    continue
+                cds_starts_ends.append((s, e))
+            if not cds_starts_ends:
+                return out
+            # First CDS is the protein's CDS — the save flow writes
+            # exactly one. Sub-features must lie INSIDE this span.
+            cds_s, cds_e = cds_starts_ends[0]
+            for sf in record.features:
+                if sf.type == "CDS":
+                    continue
+                try:
+                    fs = int(sf.location.start)
+                    fe = int(sf.location.end)
+                except (TypeError, AttributeError, ValueError):
+                    continue
+                if fs < cds_s or fe > cds_e:
+                    continue
+                # DNA coords back to AA. Save wrote AA × 3, so /3.
+                aa_s = (fs - cds_s) // 3
+                aa_e = (fe - cds_s) // 3
+                if aa_e <= aa_s:
+                    continue
+                quals = dict(sf.qualifiers or {})
+                label = (
+                    (quals.get("label") or [None])[0]
+                    or sf.type
+                )
+                color = (quals.get("ApEinfo_fwdcolor") or [None])[0] or ""
+                # The qualifier `note` carries the original feature_type
+                # marker we stored on save (since GenBank's vocabulary
+                # doesn't include Tag/Signal/Linker etc.). Recover it.
+                ftype = ""
+                for note in (quals.get("note") or []):
+                    if isinstance(note, str) and note.startswith(
+                        "splicecraft-aa-feature-type=",
+                    ):
+                        ftype = note.split("=", 1)[1]
+                        break
+                if not ftype:
+                    ftype = "Motif"
+                if not color:
+                    color = _PROTEIN_FEATURE_TYPE_COLORS.get(
+                        ftype, "#A855F7",
+                    )
+                strand = sf.location.strand or 1
+                out.append({
+                    "start": aa_s, "end": aa_e,
+                    "label": str(label),
+                    "type":  ftype,
+                    "color": str(color),
+                    "strand": int(strand),
+                    "qualifiers": quals,
+                })
+        except (AttributeError, TypeError):
+            _log.exception(
+                "SynthesisScreen: AA feature extraction failed",
+            )
+        return out
 
     @staticmethod
     def _extract_protein_from_record(record) -> str:
@@ -49138,6 +49617,71 @@ class SynthesisScreen(Screen):
                 _log.exception(
                     "Synthesis: protein-save CDS feature build failed",
                 )
+            # Sweep #15 (2026-05-20): write motif sub-features inside
+            # the CDS. AA coords × 3 → DNA coords. Pull the live
+            # feature list from the editor INSIDE the lock so it
+            # can't mutate mid-build. Feature type goes into a `note`
+            # marker so the round-trip load can recover the original
+            # Tag/Signal/Linker/etc. label (GenBank's vocabulary
+            # doesn't include those names).
+            try:
+                pe = self.query_one(
+                    "#syn-protein-editor", ProteinEditor,
+                )
+                aa_feats = pe.get_feats()
+            except NoMatches:
+                aa_feats = []
+            n_feats_written = 0
+            for f in aa_feats:
+                try:
+                    fs_aa = int(f.get("start", 0))
+                    fe_aa = int(f.get("end", 0))
+                except (TypeError, ValueError):
+                    continue
+                if fs_aa < 0 or fe_aa > len(aa_seq) or fe_aa <= fs_aa:
+                    continue
+                fs_bp = fs_aa * 3
+                fe_bp = fe_aa * 3
+                if fe_bp > len(dna):
+                    continue
+                f_label = str(f.get("label") or f.get("type") or "motif")
+                f_type  = str(f.get("type") or "Motif")
+                f_color = str(f.get("color") or "")
+                f_strand = int(f.get("strand") or 1)
+                f_quals = dict(f.get("qualifiers") or {})
+                # Preserve / set the label qualifier.
+                f_quals.setdefault("label", [f_label])
+                # Stash the AA feature type so the round-trip load can
+                # recover it. Prepend our marker so older readers that
+                # see this note line just treat it as informational
+                # rather than collide with their own note semantics.
+                notes_in = list(f_quals.get("note") or [])
+                type_note = f"splicecraft-aa-feature-type={f_type}"
+                if type_note not in notes_in:
+                    notes_in.insert(0, type_note)
+                f_quals["note"] = notes_in
+                # Color via ApEinfo qualifiers so map renderers
+                # outside SpliceCraft (CommercialSaaS / ApE) also
+                # show the motif color.
+                if f_color and "white" not in f_color.lower():
+                    f_quals.setdefault("ApEinfo_fwdcolor", [f_color])
+                    f_quals.setdefault("ApEinfo_revcolor", [f_color])
+                try:
+                    f_loc = FeatureLocation(
+                        fs_bp, fe_bp, strand=f_strand or None,
+                    )
+                    rec.features.append(
+                        SeqFeature(
+                            f_loc, type="misc_feature",
+                            qualifiers=f_quals,
+                        ),
+                    )
+                    n_feats_written += 1
+                except (TypeError, ValueError):
+                    _log.exception(
+                        "Synthesis: protein-save motif feature "
+                        "build failed for %r", f_label,
+                    )
             try:
                 lib = self.app.query_one("#library", LibraryPanel)
             except NoMatches:
@@ -49157,7 +49701,8 @@ class SynthesisScreen(Screen):
         self._refresh_status()
         _log_event("synthesis.protein.save",
                    id=eid, name=name, aa=len(aa_seq), bp=len(dna),
-                   codon_table=self._codon_table_choice)
+                   codon_table=self._codon_table_choice,
+                   n_feats=n_feats_written)
         self.app.notify(
             f"Saved '{name}' ({len(aa_seq):,} aa = {len(dna):,} bp).",
             severity="information",
@@ -60590,6 +61135,8 @@ class RestoreFromBackupModal(ModalScreen):
         ("Experiments",          "_EXPERIMENTS_FILE"),
         ("Experiment projects",  "_EXPERIMENT_PROJECTS_FILE"),
         ("Gels",                 "_GELS_FILE"),
+        # Sweep #15 (2026-05-20): user-edited protein motifs.
+        ("Protein motifs",       "_PROTEIN_MOTIFS_FILE"),
     ]
 
     def __init__(self, initial_target: str = "_LIBRARY_FILE") -> None:
@@ -60740,6 +61287,8 @@ class RestoreFromBackupModal(ModalScreen):
                 "_experiments_cache",
                 "_experiment_projects_cache",
                 "_gels_cache",
+                # Sweep #15 (2026-05-20): protein-motif user overrides.
+                "_protein_motifs_cache",
             ):
                 if hasattr(_sc, attr):
                     setattr(_sc, attr, None)
@@ -66336,6 +66885,8 @@ def _h_restore_pre_update_snapshot(app, payload):
             "_settings_cache",
             "_experiments_cache", "_experiment_projects_cache",
             "_gels_cache",
+            # Sweep #15 (2026-05-20): protein-motif user overrides.
+            "_protein_motifs_cache",
     ):
         globals()[cache_attr] = None
     return {"ok": True, "report": report}
@@ -69430,6 +69981,9 @@ SpeciesPickerModal { align: center middle; }
                                        "Experiment projects",
                                        "_experiment_projects_cache"),
             (_GELS_FILE,               "Gels",                "_gels_cache"),
+            # Sweep #15 (2026-05-20): protein-motif user overrides.
+            (_PROTEIN_MOTIFS_FILE,     "Protein motifs",
+                                       "_protein_motifs_cache"),
         ]:
             globals()[cache_attr] = None
             _, warning = _safe_load_json(path, label)

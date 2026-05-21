@@ -2250,3 +2250,356 @@ class TestSynthesisRenderExceptNarrowed:
                 f"{name} body carries bare 'except Exception:' — "
                 "narrow to specific types per invariant #1"
             )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sweep #15 — feature pre-coloring + Edit buttons
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestProteinEditorFeatures:
+    """ProteinEditor gains AA-coord feature tracking — features render
+    as colored bands in both render modes and survive insert/delete."""
+
+    def test_load_accepts_feats_kwarg(self):
+        pe = sc.ProteinEditor()
+        pe.load("MASGGGSGGGS", feats=[
+            {"start": 0, "end": 1, "label": "M",
+             "type": "Motif", "color": "#A855F7"},
+            {"start": 3, "end": 8, "label": "linker",
+             "type": "Linker", "color": "#6B7280"},
+        ])
+        assert len(pe._aa_feats) == 2
+        assert pe._aa_feats[0]["start"] == 0
+        assert pe._aa_feats[1]["color"] == "#6B7280"
+
+    def test_load_drops_out_of_bounds_feats(self):
+        pe = sc.ProteinEditor()
+        pe.load("MAS", feats=[
+            {"start": 0, "end": 2, "label": "valid"},
+            {"start": 0, "end": 99, "label": "end-out-of-range"},
+            {"start": 5, "end": 6, "label": "start-out-of-range"},
+            {"start": 2, "end": 2, "label": "zero-length"},
+        ])
+        assert len(pe._aa_feats) == 1
+        assert pe._aa_feats[0]["label"] == "valid"
+
+    def test_get_feats_returns_deepcopy(self):
+        pe = sc.ProteinEditor()
+        pe.load("MAS", feats=[
+            {"start": 0, "end": 2, "label": "x", "color": "#FF0000"},
+        ])
+        snap = pe.get_feats()
+        snap[0]["color"] = "#00FF00"
+        # Mutating the snapshot must NOT touch the editor's stored
+        # feature.
+        assert pe._aa_feats[0]["color"] == "#FF0000"
+
+    def test_add_feature_appends_and_clips(self):
+        pe = sc.ProteinEditor()
+        pe.load("MASGGGS")
+        pe.add_feature({
+            "start": 1, "end": 4, "label": "blue",
+            "type": "Tag", "color": "#3B82F6",
+        })
+        assert len(pe._aa_feats) == 1
+        # Out-of-bounds: silently rejected (defensive).
+        pe.add_feature({"start": -1, "end": 2})
+        pe.add_feature({"start": 0, "end": 99})
+        pe.add_feature({"start": 3, "end": 3})  # zero-length
+        assert len(pe._aa_feats) == 1
+
+    async def test_insert_at_cursor_shifts_feats_right_of_cursor(self):
+        # insert_at_cursor posts a Changed message, which needs an
+        # active app context. Mount through SynthesisScreen so the
+        # editor lands inside a real screen stack.
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            pe = app.screen.query_one(
+                "#syn-protein-editor", sc.ProteinEditor,
+            )
+            pe.load("MASGGGS")
+            pe.add_feature({"start": 4, "end": 7,
+                             "label": "right", "color": "#FFAA00"})
+            pe._cursor_pos = 2
+            # Use "KK" not "XX" — X isn't in _PROTEIN_AA_ALPHABET
+            # (20 standard + stop only); the filter would drop it.
+            pe.insert_at_cursor("KK")
+            await pilot.pause()
+            assert pe._aa_feats[0]["start"] == 6
+            assert pe._aa_feats[0]["end"] == 9
+
+    async def test_insert_does_not_extend_feat_strictly_left_of_cursor(
+        self,
+    ):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            pe = app.screen.query_one(
+                "#syn-protein-editor", sc.ProteinEditor,
+            )
+            pe.load("MASGGGS")
+            pe.add_feature({"start": 0, "end": 2,
+                             "label": "left", "color": "#FFAA00"})
+            pe._cursor_pos = 4   # past the feature
+            pe.insert_at_cursor("KK")
+            await pilot.pause()
+            # Feature strictly left of cursor: untouched.
+            assert pe._aa_feats[0]["start"] == 0
+            assert pe._aa_feats[0]["end"] == 2
+
+    def test_delete_range_clips_overlapping_feature(self):
+        pe = sc.ProteinEditor()
+        pe.load("MASGGGSXYZ")
+        pe.add_feature({"start": 2, "end": 7,
+                         "label": "overlap", "color": "#FFAA00"})
+        # Delete bp 4..6 — overlaps feature.
+        pe._delete_range(4, 6)
+        assert len(pe._aa_feats) == 1
+        # Surviving region clipped + shifted.
+        assert pe._aa_feats[0]["start"] == 2
+        assert pe._aa_feats[0]["end"] == 5
+
+    def test_delete_drops_zero_survival_feature(self):
+        pe = sc.ProteinEditor()
+        pe.load("MASGGGSXYZ")
+        pe.add_feature({"start": 3, "end": 5,
+                         "label": "doomed", "color": "#FFAA00"})
+        # Delete the entire feature span.
+        pe._delete_range(3, 5)
+        assert pe._aa_feats == []
+
+
+class TestProteinMotifInsertColored:
+    """Motif insert produces a feature with a color sourced from the
+    type→color palette (or the motif's own ``color`` field if set)."""
+
+    async def test_motif_insert_adds_colored_feature(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            pe = scr.query_one(
+                "#syn-protein-editor", sc.ProteinEditor,
+            )
+            pe.load("MM")
+            pe._cursor_pos = 1
+            scr._motif_selected_entry = lambda: {
+                "name": "His6", "feature_type": "Tag",
+                "sequence": "HHHHHH",
+            }
+            scr._motif_insert_selected()
+            await pilot.pause()
+            assert pe._aa_seq == "MHHHHHHM"
+            # Feature landed covering the inserted span.
+            assert len(pe._aa_feats) == 1
+            feat = pe._aa_feats[0]
+            assert feat["start"] == 1
+            assert feat["end"] == 7
+            assert feat["label"] == "His6"
+            # Tag → blue from the type→color map.
+            assert feat["color"] == sc._PROTEIN_FEATURE_TYPE_COLORS["Tag"]
+
+    async def test_motif_with_explicit_color_wins(self):
+        # A motif whose entry carries its own `color` field overrides
+        # the type→palette default — same precedence the DNA feature
+        # library uses.
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            pe = scr.query_one(
+                "#syn-protein-editor", sc.ProteinEditor,
+            )
+            pe.load("M")
+            pe._cursor_pos = 1
+            scr._motif_selected_entry = lambda: {
+                "name": "Custom",
+                "feature_type": "Tag",
+                "sequence": "GGG",
+                "color": "#123456",
+            }
+            scr._motif_insert_selected()
+            await pilot.pause()
+            assert pe._aa_feats[0]["color"] == "#123456"
+
+
+class TestProteinSaveLoadRoundTrip:
+    """Motif features written on save survive a save + reload cycle
+    via the CDS sub-feature encoding."""
+
+    async def test_aa_features_survive_save_and_load(
+        self, isolated_library,
+    ):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            pe = scr.query_one(
+                "#syn-protein-editor", sc.ProteinEditor,
+            )
+            pe.load("MASGGGSHHHHHH")
+            pe.add_feature({
+                "start": 7, "end": 13,
+                "label": "His6", "type": "Tag",
+                "color": "#3B82F6", "strand": 1,
+            })
+            scr._protein_loaded_id   = "round_trip_test"
+            scr._protein_loaded_name = "round_trip_test"
+            scr._protein_dirty = True
+            # Skip the unique-id helper's name prompt — load the
+            # entry directly to verify reload picks up the motif.
+            scr._commit_protein_save("MASGGGSHHHHHH", after=None)
+            await pilot.pause()
+            # Reset editor state and reload from library.
+            pe.load("")
+            assert pe._aa_feats == []
+            scr._load_protein_entry_by_id("round_trip_test")
+            await pilot.pause()
+            assert pe._aa_seq == "MASGGGSHHHHHH"
+            # Motif feature restored.
+            assert len(pe._aa_feats) == 1
+            f = pe._aa_feats[0]
+            assert f["start"] == 7
+            assert f["end"] == 13
+            assert f["label"] == "His6"
+            assert f["type"] == "Tag"
+            assert f["color"] == "#3B82F6"
+
+
+class TestProteinMotifsPersistence:
+    """`_load_protein_motifs` merges built-ins with user overrides;
+    `_save_protein_motifs` writes only the user-modified entries."""
+
+    def test_load_returns_builtins_when_no_user_file(self):
+        # Cold cache + no user file → all built-ins surface.
+        sc._protein_motifs_cache = None
+        merged = sc._load_protein_motifs()
+        builtin_names = {m["name"] for m in sc._PROTEIN_MOTIFS}
+        merged_names = {m["name"] for m in merged}
+        assert builtin_names.issubset(merged_names)
+
+    def test_user_override_replaces_builtin_by_name(self):
+        sc._save_protein_motifs([{
+            "name": "His6", "feature_type": "Tag",
+            "sequence": "HHHHHHHH",  # user-edited (now 8 H's)
+            "description": "Modified by user",
+            "color": "#FF00FF",
+        }])
+        # Read back through the merged loader.
+        merged = sc._load_protein_motifs()
+        his6 = next(m for m in merged if m["name"] == "His6")
+        assert his6["sequence"] == "HHHHHHHH"
+        assert his6["color"] == "#FF00FF"
+        # All other built-ins still present.
+        names = {m["name"] for m in merged}
+        for builtin in sc._PROTEIN_MOTIFS:
+            assert builtin["name"] in names
+
+    def test_user_added_novel_motif_appends(self):
+        sc._save_protein_motifs([{
+            "name": "MyCustomMotif",
+            "feature_type": "Tag",
+            "sequence": "KGGKGG",
+            "description": "My personal sequence",
+        }])
+        merged = sc._load_protein_motifs()
+        assert any(m["name"] == "MyCustomMotif" for m in merged)
+
+
+class TestSynthesisEditButtons:
+    """Edit buttons on DNA feature library + Protein motif library."""
+
+    async def test_dna_featlib_edit_button_present(self):
+        from textual.widgets import Button
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            btn = scr.query_one("#btn-syn-featlib-edit", Button)
+            assert "edit" in str(btn.label).lower()
+
+    async def test_protein_motif_edit_button_present(self):
+        from textual.widgets import Button, TabbedContent
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            tabs = scr.query_one("#syn-tabs", TabbedContent)
+            tabs.active = "syn-tab-protein"
+            await pilot.pause()
+            await pilot.pause()
+            btn = scr.query_one("#btn-syn-motif-edit", Button)
+            assert "edit" in str(btn.label).lower()
+
+    async def test_protein_motif_edit_writes_to_user_file(self):
+        # Editing a built-in motif lands the edited entry in the
+        # user file via _save_protein_motifs. The original built-in
+        # stays in code; the merge layer surfaces the user copy.
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            # Stub the selector + the modal so we don't depend on
+            # focus + row state.
+            scr._motif_selected_entry = lambda: {
+                "name": "His6", "feature_type": "Tag",
+                "sequence": "HHHHHH",
+            }
+            orig_push = app.push_screen
+            def _stub(modal, callback=None):
+                if isinstance(modal, sc.AddFeatureModal):
+                    if callback is not None:
+                        callback({
+                            "entry": {
+                                "name": "His6",
+                                "feature_type": "Tag",
+                                "sequence": "HHHHHHHHHH",
+                                "color": "#FF00FF",
+                            },
+                        })
+                    return None
+                return orig_push(modal, callback=callback)
+            app.push_screen = _stub  # type: ignore[method-assign]
+            try:
+                scr._on_motif_edit(None)
+            finally:
+                app.push_screen = orig_push  # type: ignore[method-assign]
+            await pilot.pause()
+            # Merged read picks up the user edit.
+            merged = sc._load_protein_motifs()
+            his6 = next(m for m in merged if m["name"] == "His6")
+            assert his6["sequence"] == "HHHHHHHHHH"
+            assert his6.get("color") == "#FF00FF"

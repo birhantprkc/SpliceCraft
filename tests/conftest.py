@@ -56,6 +56,7 @@ def _protect_user_data(tmp_path, monkeypatch):
         ("_EXPERIMENTS_FILE",     "_experiments_cache"),
         ("_EXPERIMENT_PROJECTS_FILE", "_experiment_projects_cache"),
         ("_GELS_FILE",            "_gels_cache"),
+        ("_PROTEIN_MOTIFS_FILE",  "_protein_motifs_cache"),
         ("_AGENT_TOKEN_FILE",     None),   # written when --agent-api is on
     ]
 

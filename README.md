@@ -120,7 +120,14 @@ installs and the user-data directory location.
   one click — auto-saves, loads the saved entry onto the canvas,
   closes Synthesis, and opens the Parts Bin pre-armed with
   **New Part**, so the L0 part lands in the bin without
-  re-selecting anything.
+  re-selecting anything. Both side panels carry an **Edit**
+  button: the DNA tab edits the persistent feature library (same
+  store the Features menu uses); the Protein tab edits motifs
+  with copy-on-write so built-in motifs are preserved in code
+  while your changes land in `protein_motifs.json`. Motif inserts
+  on the protein tab arrive as **pre-colored AA features** (band
+  painted under the residues) and round-trip through save as CDS
+  sub-features.
 - **Search** your library with in-process BLASTN / BLASTP / HMMscan
   (via `pyhmmer` — no external `blast+` install).
 - **Drive from outside** via a 60+ endpoint localhost JSON API
