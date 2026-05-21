@@ -131,9 +131,22 @@ class TestDesignGBPrimers:
         assert 18 <= len(result["rev_binding"]) <= 25
 
     def test_fwd_binding_matches_insert_start(self, random_template):
-        result = sc._design_gb_primers(random_template, 100, 600, "CDS")
+        # 2026-05-21: GB CDS with AATG oh5 skips the first 3 bp
+        # (the literal ATG) so the binding starts at codon 2.
+        # Use a Promoter (oh5 GGAG) which has no codon-skip rule
+        # so the binding matches the bare insert start.
+        result = sc._design_gb_primers(random_template, 100, 600, "Promoter")
         insert = random_template[100:600].upper()
         assert insert.startswith(result["fwd_binding"])
+
+    def test_cds_fwd_binding_skips_atg(self, random_template):
+        # Sacred regression guard for the GB CDS ATG-fusion fix.
+        # AATG overhang carries the start codon → forward primer
+        # must start at codon 2 (bp+3), not at the insert's own
+        # ATG.
+        result = sc._design_gb_primers(random_template, 100, 600, "CDS")
+        insert = random_template[100:600].upper()
+        assert insert[3:].startswith(result["fwd_binding"])
 
     def test_rev_binding_matches_insert_end_rc(self, random_template):
         result = sc._design_gb_primers(random_template, 100, 600, "CDS")
@@ -245,12 +258,17 @@ class TestDomesticatorSilentMutation:
         """The forward primer's binding region is picked from the START of
         the (possibly-mutated) insert. If the mutation lands inside the
         binding window the binding should still match the mutated insert,
-        not the original template."""
+        not the original template.
+
+        Note: GB CDS (oh5 = AATG) skips the literal ATG start
+        codon — the forward binding starts at codon 2 (insert[3:]).
+        Sacred per 2026-05-21 ATG-fusion fix.
+        """
         cds = self._cds_with_bsai()
         r = sc._design_gb_primers(cds, 0, len(cds), "CDS",
                                   codon_raw=self._k12_raw())
         insert = r["insert_seq"]
-        assert insert.startswith(r["fwd_binding"])
+        assert insert[3:].startswith(r["fwd_binding"])
 
     @pytest.mark.parametrize("part_type", ["CDS", "CDS-NS", "C-tag"])
     def test_all_coding_part_types_get_silent_repair(self, part_type):

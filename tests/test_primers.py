@@ -276,7 +276,10 @@ class TestDesignerUniformShape:
     def test_goldenbraid_has_required_keys(self):
         """Regression guard for 2026-04-12 KeyError on save."""
         seq = self._valid_template()
-        r = sc._design_gb_primers(seq, 50, 300, "CDS")
+        # Use Promoter (oh5 = GGAG) — no codon-skip applies, so
+        # fwd_pos starts at the bare insert start. CDS would
+        # shift fwd_pos by +3 to skip the ATG-fusion overhang.
+        r = sc._design_gb_primers(seq, 50, 300, "Promoter")
         assert "error" not in r, r
         assert self._REQUIRED_KEYS <= set(r.keys()), (
             f"Golden Braid designer missing keys: "
@@ -287,6 +290,16 @@ class TestDesignerUniformShape:
         # Reverse primer binds the end of the insert (on the bottom strand,
         # but positions are reported in forward coords)
         assert r["rev_pos"] == (300 - len(r["rev_binding"]), 300)
+
+    def test_goldenbraid_cds_fwd_pos_skips_atg(self):
+        """Sacred regression guard for the GB CDS ATG-fusion fix
+        (2026-05-21). CDS oh5 = AATG carries the start codon, so
+        fwd_pos starts at insert_start + 3 (codon 2), not the
+        bare insert start."""
+        seq = self._valid_template()
+        r = sc._design_gb_primers(seq, 50, 300, "CDS")
+        assert "error" not in r, r
+        assert r["fwd_pos"] == (50 + 3, 50 + 3 + len(r["fwd_binding"]))
 
     def test_goldenbraid_flags_internal_esp3i(self):
         """Regression guard: a CGTCTC inside the insert is self-domesticating
@@ -329,35 +342,38 @@ class TestPrimerDesignScreenLayout:
     followed by Design button, Results, Library)."""
 
     async def test_mounts_with_detection_initial_mode(self):
-        from textual.widgets import RadioSet
+        """2026-05-21 refactor: RadioSet replaced by Tabs widget.
+        Default-active tab is Detection."""
+        from textual.widgets import Tabs
         app = sc.PlasmidApp()
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             screen = sc.PrimerDesignScreen("ACGT" * 200, [], "test")
             app.push_screen(screen)
             await pilot.pause()
-            rs = app.screen.query_one("#pd-mode-radio", RadioSet)
-            assert rs.pressed_button is not None
-            assert rs.pressed_button.id == "rb-detection"
+            tabs = app.screen.query_one("#pd-mode-tabs", Tabs)
+            assert tabs.active_tab is not None
+            assert tabs.active_tab.id == "tab-detection"
             assert screen._current_mode() == "detection"
 
-    async def test_all_four_modes_have_radio_buttons(self):
-        from textual.widgets import RadioButton
+    async def test_all_four_modes_have_tabs(self):
+        """2026-05-21 refactor: 4 Tab widgets in the mode tab bar
+        (was RadioButtons)."""
+        from textual.widgets import Tab
         app = sc.PlasmidApp()
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             app.push_screen(sc.PrimerDesignScreen("ACGT" * 200, [], "test"))
             await pilot.pause()
-            rb_ids = {rb.id for rb in app.screen.query(RadioButton)}
+            tab_ids = {t.id for t in app.screen.query(Tab)}
             assert {
-                "rb-detection", "rb-cloning",
-                "rb-goldenbraid", "rb-generic",
-            } <= rb_ids
+                "tab-detection", "tab-cloning",
+                "tab-goldenbraid", "tab-generic",
+            } <= tab_ids
 
     async def test_switching_mode_changes_current_mode(self):
-        """Selecting a different RadioButton changes _current_mode() and
-        swaps the visible parameter panel."""
-        from textual.widgets import RadioSet
+        """`_switch_mode` swaps which mode-panel is visible AND
+        keeps the tab bar's active tab in sync."""
         app = sc.PlasmidApp()
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
@@ -369,12 +385,12 @@ class TestPrimerDesignScreenLayout:
             # Cloning panel visible, detection hidden
             assert screen.query_one("#pd-panel-clo").display is True
             assert screen.query_one("#pd-panel-det").display is False
+            assert screen._current_mode() == "cloning"
 
     async def test_book_layout_split(self):
-        """Open-book split: left page owns input (template / mode /
-        parameters); right page owns output (results + primer library).
-        Results sits above Library so freshly-designed primers appear
-        next to where you'll save them."""
+        """Open-book split (2026-05-21 refactor): left page owns
+        template / mode-tabs / params / results / bottom buttons;
+        right page is the full-height primer library."""
         app = sc.PlasmidApp()
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
@@ -384,36 +400,53 @@ class TestPrimerDesignScreenLayout:
             page_ids = [c.id for c in book.children]
             assert page_ids == ["pd-left-page", "pd-right-page"]
 
-            # Left page: three input sections in order (no results).
+            # Left page: tabs, template, params, results, buttons.
             left = app.screen.query_one("#pd-left-page")
             left_ids = [c.id for c in left.children]
-            assert "pd-results-section" not in left_ids
-            idx_t = left_ids.index("pd-template-section")
-            idx_m = left_ids.index("pd-mode-section")
-            idx_p = left_ids.index("pd-params-section")
-            assert idx_t < idx_m < idx_p
+            assert "pd-mode-tabs" in left_ids
+            assert "pd-template-section" in left_ids
+            assert "pd-params-section" in left_ids
+            assert "pd-results-section" in left_ids
+            idx_tabs = left_ids.index("pd-mode-tabs")
+            idx_tpl  = left_ids.index("pd-template-section")
+            idx_par  = left_ids.index("pd-params-section")
+            idx_res  = left_ids.index("pd-results-section")
+            assert idx_tabs < idx_tpl < idx_par < idx_res
 
-            # Right page: results above library.
+            # Right page: just the library header + table.
             right = app.screen.query_one("#pd-right-page")
             right_ids = [c.id for c in right.children]
-            idx_r  = right_ids.index("pd-results-section")
-            idx_lh = right_ids.index("pd-lib-hdr-row")
-            idx_lt = right_ids.index("pd-lib-table")
-            assert idx_r < idx_lh < idx_lt
+            assert "pd-lib-hdr-row" in right_ids
+            assert "pd-lib-table" in right_ids
+            assert right_ids.index("pd-lib-hdr-row") \
+                < right_ids.index("pd-lib-table")
 
-    async def test_results_section_has_name_and_save(self):
-        """Regression guard: primer-name Inputs + Save button live
-        INSIDE the results section, not as a separate row above it."""
+    async def test_name_inputs_and_save_button_present(self):
+        """2026-05-21 refactor: primer-name Inputs migrated UP to
+        the TEMPLATE section (compact form-fill before design),
+        Save button migrated DOWN to the bottom-of-page action row
+        next to Design / Add to Map / Clear. Both still queryable
+        from anywhere on the screen via `#pd-fwd-name` etc."""
         app = sc.PlasmidApp()
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             app.push_screen(sc.PrimerDesignScreen("ACGT" * 200, [], "test"))
             await pilot.pause()
-            results_section = app.screen.query_one("#pd-results-section")
-            ids_inside = {w.id for w in results_section.walk_children()}
-            assert "pd-fwd-name" in ids_inside
-            assert "pd-rev-name" in ids_inside
-            assert "btn-pd-save" in ids_inside
+            # All three queryable from the screen root.
+            assert app.screen.query_one("#pd-fwd-name") is not None
+            assert app.screen.query_one("#pd-rev-name") is not None
+            assert app.screen.query_one("#btn-pd-save") is not None
+            # Names sit in TEMPLATE section now.
+            tpl = app.screen.query_one("#pd-template-section")
+            tpl_ids = {w.id for w in tpl.walk_children()}
+            assert "pd-fwd-name" in tpl_ids
+            assert "pd-rev-name" in tpl_ids
+            # Save button sits in the bottom actions row.
+            bottom = app.screen.query_one("#pd-bottom-actions")
+            bot_ids = {w.id for w in bottom.walk_children()}
+            assert "btn-pd-save" in bot_ids
+            assert "btn-pd-design" in bot_ids
+            assert "btn-pd-clear" in bot_ids
 
     async def test_library_header_row_has_rename_delete(self):
         app = sc.PlasmidApp()
@@ -681,20 +714,27 @@ class TestLinearRegionStillWorks:
 TERMINAL_SIZE = (200, 60)
 
 class TestWrapRegionUI:
-    async def test_wrap_hint_present_on_mount(self):
-        """The hint telling users they can enter start > end for wrap
-        regions should always be visible on mount."""
-        from textual.widgets import Static
+    async def test_wrap_start_greater_than_end_supported(self):
+        """The Tip label was removed 2026-05-21 (the wrap-origin
+        affordance is undocumented but still works). This test
+        confirms the supporting Inputs accept Start > End values
+        without complaint, so the underlying capability stays
+        regression-guarded even without the visible hint."""
+        from textual.widgets import Input
         app = sc.PlasmidApp()
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             screen = sc.PrimerDesignScreen("ACGT" * 800, [], "test")
             app.push_screen(screen)
             await pilot.pause()
-            hint = app.screen.query_one("#pd-wrap-hint", Static)
-            rendered = str(hint.render())
-            assert "Start > End" in rendered
-            assert "origin" in rendered
+            # Both Inputs accept integer values; user can enter
+            # Start > End to trigger the wrap-around design path.
+            s = app.screen.query_one("#pd-start", Input)
+            e = app.screen.query_one("#pd-end", Input)
+            s.value = "2900"
+            e.value = "200"
+            assert s.value == "2900"
+            assert e.value == "200"
 
     async def test_feat_selected_on_wrap_feature_fills_inputs(self):
         """Selecting a wrap feature should populate start/end correctly

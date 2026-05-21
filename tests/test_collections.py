@@ -446,11 +446,11 @@ class TestLibraryPanelModes:
             assert t.row_count == 2
             app.exit()
 
-    async def test_clicking_collection_requires_double_activation(self):
-        """Loading a collection swaps the entire library, so a stray
-        RowSelected must NOT fire the load. The first activation arms
-        the collection and a second activation on the same row commits.
-        """
+    async def test_clicking_collection_loads_on_single_click(self):
+        """Sweep 2026-05-21: the prior double-click arm/disarm was
+        dropped; single-click commits the collection switch. The
+        unsaved-edits modal is the only safety belt now (and it's
+        not triggered here — clean canvas, no dirty record)."""
         sc._save_collections([
             {"name": "A", "plasmids": [
                 {"id": "p1", "name": "p1", "size": 1, "gb_text": "GB"}]},
@@ -467,22 +467,16 @@ class TestLibraryPanelModes:
             lib._repopulate_collections()
             t = lib.query_one("#lib-coll-table")
             t.move_cursor(row=0)  # "A"
-            t.action_select_cursor()  # arm
-            await pilot.pause(0.1)
-            # Still in collections view — first click only armed.
-            assert lib._view_mode == "collections"
-            assert lib._coll_armed_name == "A"
-            # Second activation on the same row commits.
-            t.action_select_cursor()
+            t.action_select_cursor()  # single-click commits
             await pilot.pause(0.2)
             assert lib._view_mode == "plasmids"
             assert sc._get_active_collection_name() == "A"
             assert [e["id"] for e in sc._load_library()] == ["p1"]
             app.exit()
 
-    async def test_switching_row_disarms_previous_collection(self):
-        """Arming row A then activating row B should NOT load either —
-        the arm transfers to B and one more activation on B is needed."""
+    async def test_clicking_different_collection_switches_immediately(self):
+        """Single-click on B (when A is active) commits the swap
+        directly — there is no longer an arm/disarm dance."""
         sc._save_collections([
             {"name": "A", "plasmids": [
                 {"id": "pA", "name": "pA", "size": 1, "gb_text": "GB"}]},
@@ -499,16 +493,8 @@ class TestLibraryPanelModes:
             lib._apply_view_mode()
             lib._repopulate_collections()
             t = lib.query_one("#lib-coll-table")
-            t.move_cursor(row=0)
-            t.action_select_cursor()  # arm A
-            await pilot.pause(0.1)
             t.move_cursor(row=1)
-            t.action_select_cursor()  # arm B (disarms A)
-            await pilot.pause(0.1)
-            # Still in collections view; B is now armed.
-            assert lib._view_mode == "collections"
-            assert lib._coll_armed_name == "B"
-            t.action_select_cursor()  # commit B
+            t.action_select_cursor()  # commit B directly
             await pilot.pause(0.2)
             assert sc._get_active_collection_name() == "B"
             app.exit()

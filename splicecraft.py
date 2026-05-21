@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "0.9.12"
+__version__ = "0.9.14"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -2794,6 +2794,55 @@ def _collect_ui_snapshot(app=None) -> dict:
             snap["active_grammar"] = getattr(app, "_active_grammar", None)
         except Exception:  # noqa: BLE001 — broken-app survival
             pass
+        # Widget tree of the TOP screen — class + id + region (x,y,w,h)
+        # so a reader can reconstruct the visual layout without a
+        # screenshot. Capped at 200 widgets to keep the snapshot
+        # bounded; deeply-nested layouts are rare.
+        try:
+            top_screen = None
+            try:
+                top_screen = app.screen
+            except Exception:  # noqa: BLE001
+                stack = list(getattr(app, "screen_stack", []) or [])
+                top_screen = stack[-1] if stack else None
+            if top_screen is not None:
+                widget_tree: list[dict] = []
+                seen = 0
+
+                def _walk(node, depth: int) -> None:
+                    nonlocal seen
+                    if seen >= 200:
+                        return
+                    try:
+                        region = getattr(node, "region", None)
+                        info = {
+                            "depth":   depth,
+                            "class":   type(node).__name__,
+                            "id":      getattr(node, "id", None),
+                            "classes": list(getattr(node, "classes", []) or []),
+                        }
+                        if region is not None:
+                            info["region"] = {
+                                "x": int(getattr(region, "x", 0)),
+                                "y": int(getattr(region, "y", 0)),
+                                "w": int(getattr(region, "width", 0)),
+                                "h": int(getattr(region, "height", 0)),
+                            }
+                        widget_tree.append(info)
+                        seen += 1
+                    except Exception:  # noqa: BLE001
+                        return
+                    try:
+                        kids = list(getattr(node, "children", []) or [])
+                    except Exception:  # noqa: BLE001
+                        kids = []
+                    for child in kids:
+                        _walk(child, depth + 1)
+                _walk(top_screen, 0)
+                snap["widget_tree"] = widget_tree
+                snap["widget_tree_screen"] = type(top_screen).__name__
+        except Exception:  # noqa: BLE001 — broken-app survival
+            pass
     # Settings from disk — same view a fresh launch would see.
     try:
         snap["settings"] = dict(_load_settings() or {})
@@ -2875,6 +2924,29 @@ def _format_ui_snapshot(snap: dict) -> str:
     lines.append("")
     lines.append("## Persisted settings")
     lines.append(_kv_block(snap.get("settings") or {}))
+    # Widget tree of the top screen — class, id, classes, and
+    # rendered region (x,y,w,h) so a reader can reconstruct the
+    # visual layout without a screenshot. Tree is depth-indented.
+    wt = snap.get("widget_tree") or []
+    if wt:
+        lines.append("## Widget tree (top screen: %s)" %
+                      snap.get("widget_tree_screen", "?"))
+        lines.append("```")
+        for w in wt:
+            indent = "  " * int(w.get("depth", 0))
+            ident = ""
+            if w.get("id"):
+                ident = f"#{w['id']}"
+            cls_list = w.get("classes") or []
+            cls = ("." + ".".join(cls_list)) if cls_list else ""
+            r = w.get("region") or {}
+            region = ""
+            if r:
+                region = (f"  [x={r.get('x', '?')}, y={r.get('y', '?')}, "
+                          f"w={r.get('w', '?')}, h={r.get('h', '?')}]")
+            lines.append(f"{indent}{w.get('class', '?')}{ident}{cls}{region}")
+        lines.append("```")
+        lines.append("")
     lines.append("## Log tail (last %d lines, paths scrubbed)" %
                   _UI_SNAPSHOT_LOG_TAIL_LINES)
     lines.append("```")
@@ -7926,13 +7998,25 @@ def load_genbank(path: str):
     # leave id/name as Biopython sentinels. Fall back to the filename
     # so the UI has something meaningful to display.
     stem = _P(path).stem or "plasmid"
-    # Sanitize: GenBank LOCUS names can't contain spaces; replace them
-    # so round-tripping through _record_to_gb_text doesn't explode.
+    # Sanitize: GenBank LOCUS names can't contain spaces (INSDC spec)
+    # so the rec.id / rec.name fall back to an underscored, truncated
+    # form. SACRED (2026-05-21): preserve the ORIGINAL stem with
+    # spaces as `_tui_display_name` so panels show "my plasmid" while
+    # GenBank serialisation still gets the LOCUS-safe "my_plasmid".
+    # See feedback_no_underscores_in_names: file-being-imported wins.
     safe_stem = stem.replace(" ", "_")[:16] or "plasmid"
     if not rec.id or rec.id.startswith("<unknown"):
         rec.id = safe_stem
     if not rec.name or rec.name.startswith("<unknown"):
         rec.name = safe_stem
+    # Display-name override: when the on-disk filename carried
+    # spaces, keep them visible in the UI even though LOCUS got
+    # underscored. _apply_record / library_load both read this attr.
+    if stem != safe_stem and " " in stem:
+        try:
+            rec._tui_display_name = stem
+        except Exception:
+            pass
 
     # `.dna` augmentation: re-read the file bytes to recover per-feature
     # colours + primer-bind sequence stamps + 0x05 primer-DB entries that
@@ -15102,13 +15186,11 @@ class LibraryPanel(Widget):
 
     @on(DataTable.RowSelected, "#lib-coll-table")
     def _coll_row_selected(self, event: DataTable.RowSelected):
-        """Loading a collection swaps the entire library + active pointer,
-        so we require an explicit double-activation: the first
-        RowSelected on a row arms a confirmation hint, and only a second
-        activation on the same row inside the timeout actually loads.
-        Mirrors the "click twice to commit" pattern users get on the
-        plasmid table (where the first click moves the cursor and the
-        second activates).
+        """Single-click commits the collection switch (sweep
+        follow-up 2026-05-21: the prior 1.5 s arm/disarm window
+        felt sluggish — the canvas-mutation safety belt now lives
+        in the unsaved-edits modal below, which is the only place
+        an irreversible action could land).
         """
         if self._view_mode != "collections":
             return
@@ -15116,39 +15198,6 @@ class LibraryPanel(Widget):
         name = rk.value if rk else None
         if not name:
             return
-
-        # Cancel any prior arm-timer; only the most recent click matters.
-        prior_timer = getattr(self, "_coll_arm_timer", None)
-        if prior_timer is not None:
-            try:
-                prior_timer.stop()
-            except Exception:
-                pass
-            self._coll_arm_timer = None
-
-        if getattr(self, "_coll_armed_name", None) != name:
-            # First activation on this row — arm a 1.5 s window during
-            # which a second activation will actually load.
-            self._coll_armed_name = name
-            self.app.notify(
-                f"Click '{name}' again to load it.",
-                timeout=2,
-            )
-
-            def _disarm() -> None:
-                self._coll_armed_name = None
-                self._coll_arm_timer = None
-
-            try:
-                self._coll_arm_timer = self.set_timer(1.5, _disarm)
-            except Exception:
-                # Timer setup can fail during teardown; fall back to a
-                # single-shot arm with no auto-disarm.
-                self._coll_arm_timer = None
-            return
-
-        # Second activation within the window — load it.
-        self._coll_armed_name = None
         coll = _find_collection(name)
         if coll is None:
             return
@@ -15161,6 +15210,37 @@ class LibraryPanel(Widget):
             self._apply_view_mode()
             self._repopulate_plasmids()
             return
+        # Unsaved-edits guard (2026-05-21): if the canvas has dirty
+        # edits, switching collections would silently swap the library
+        # and load a different plasmid, losing the user's work without
+        # a prompt. Mirror the back-button pattern (above, _btn_back):
+        # push the same UnsavedNavigateModal and route on the result.
+        app = self.app
+        if getattr(app, "_unsaved", False):
+            def _on_unsaved(result: "str | None") -> None:
+                if result == "save":
+                    do_save = getattr(app, "_do_save", None)
+                    if callable(do_save) and do_save():
+                        self._commit_collection_switch(name, coll)
+                elif result == "discard":
+                    discard = getattr(app, "_discard_changes", None)
+                    if callable(discard):
+                        discard()
+                    self._commit_collection_switch(name, coll)
+                # None → cancel; stay in collections view.
+            app.push_screen(
+                UnsavedNavigateModal(f"switch to '{name}'"),
+                callback=_on_unsaved,
+            )
+            return
+        self._commit_collection_switch(name, coll)
+
+    def _commit_collection_switch(self, name: str, coll: dict) -> None:
+        """Commit the active-collection swap + repopulate panel + load
+        the first plasmid of the new collection (or blank canvas if
+        empty). Factored out of `_coll_row_selected` so the unsaved-
+        prompt callback can call it after the user resolves the modal.
+        """
         # Set active BEFORE writing the library so the mirror writes
         # back to the correct collection.
         #
@@ -15195,6 +15275,21 @@ class LibraryPanel(Widget):
         self._view_mode = "plasmids"
         self._apply_view_mode()
         self._repopulate_plasmids()
+        # Load the first plasmid of the new collection onto the canvas
+        # (or blank the canvas if the collection is empty). Pre-fix
+        # 2026-05-21 the canvas kept showing the prior collection's
+        # plasmid — stale panel data after a collection switch.
+        first = plasmids[0] if plasmids else None
+        app = self.app
+        if first and first.get("gb_text"):
+            # Reuse the existing PlasmidLoad path so `_apply_record` +
+            # `_tui_display_name` / `_tui_map_mode` stashing all flow
+            # through one handler (line 75181).
+            self.post_message(self.PlasmidLoad(first))
+        else:
+            clear = getattr(app, "_clear_canvas", None)
+            if callable(clear):
+                clear()
         self.post_message(self.CollectionSwitched(name))
         self._collection_switch_save_to_disk(plasmids)
 
@@ -19457,6 +19552,7 @@ _USER_DATA_FILE_ATTRS: tuple = (
     "_PARTS_BIN_FILE",        # parts_bin.json — active bin's parts (mirror)
     "_PARTS_BIN_COLLECTIONS_FILE",   # parts_bin_collections.json — all bins
     "_PRIMERS_FILE",          # primers.json — primer designs
+    "_PRIMER_COLLECTIONS_FILE",  # primer_collections.json — named primer collections
     "_FEATURES_FILE",         # features.json — feature library
     "_FEATURE_COLORS_FILE",   # feature_colors.json — feature colours
     "_GRAMMARS_FILE",         # cloning_grammars.json — custom grammars
@@ -19715,6 +19811,7 @@ _MASTER_DELETE_CACHE_ATTRS: tuple = (
     "_parts_bin_cache",
     "_parts_bin_collections_cache",
     "_primers_cache",
+    "_primer_collections_cache",
     "_primer_usage_cache",            # sweep #20: was missed, primer use-count map
     "_features_cache",
     "_feature_colors_cache",
@@ -23409,7 +23506,23 @@ def _atg_offset_for_part(part_oh5: str, part_type: str) -> int:
     """
     if not isinstance(part_oh5, str) or not isinstance(part_type, str):
         return 0
-    if part_oh5.upper() == "AATG" and part_type in _GB_CODING_PART_TYPES:
+    oh = part_oh5.upper()
+    # Coding types: known GB types + the MoClo-equivalent
+    # ("CDS" / "C-tag") declared in the MoClo Plant grammar.
+    # Custom grammars that introduce new translational part type
+    # names should add them to `_GB_CODING_PART_TYPES` (the name
+    # is historical — the set covers BOTH GB and MoClo by union).
+    if part_type not in _GB_CODING_PART_TYPES:
+        return 0
+    # Detect ATG-fusion: any 4+ nt 5' overhang whose LAST 3 nt
+    # are "ATG" carries the start codon (GB: AATG; hypothetical
+    # NATG variants in custom grammars also qualify). MoClo
+    # Plant's CDS oh5 is "AGGT" — last 3 = "GGT" ≠ ATG, so this
+    # naturally returns 0 there. The `>= 4` guard enforces the
+    # standard Type IIS overhang width (4 nt) and rejects a
+    # degenerate 3-nt "ATG" overhang which isn't biologically
+    # standard and would otherwise erroneously trigger the skip.
+    if oh.endswith("ATG") and len(oh) >= 4:
         return 3
     return 0
 
@@ -26919,6 +27032,7 @@ _SETTINGS_SCHEMA: "dict[str, tuple[tuple, object]]" = {
     "show_connectors":         ((bool,),               False),
     "linear_layout":           ((bool,),               False),
     "active_collection":       ((str,),                ""),
+    "active_primer_collection": ((str,),               ""),
     "active_grammar":          ((str,),                ""),
     "constructor_filter_by_grammar": ((bool,),         True),
     "last_seen_version":       ((str,),                ""),
@@ -27412,12 +27526,30 @@ def _design_gb_primers(
                 "mutations": [],
             }
 
-    # Forward binding: first 18-25 bp of the insert
-    fwd_bind, fwd_tm = _pick_binding_region(insert, target_tm)
-
-    # Reverse binding: first 18-25 bp of the reverse-complement of the insert
-    # (i.e. the last 18-25 bp of the insert, reverse-complemented)
+    # CDS ATG-fusion rule (regression guard 2026-05-21):
+    # When the 5' overhang carries the CDS start codon (e.g.
+    # AATG = 'A' spacer + 'ATG' start codon in GB L0), the
+    # forward primer must NOT re-include the CDS's own first
+    # 3 bp or the assembled L1 reads `...AATG ATG codon2...` —
+    # duplicated start codon that frameshifts the rest of the
+    # ORF. `_atg_offset_for_part` is the canonical helper that
+    # encodes which (overhang, part_type) pairs trigger this
+    # skip; it returns 3 for GB AATG+coding and 0 for MoClo
+    # Plant AGGT (no embedded ATG) or any other custom grammar
+    # whose CDS overhang doesn't carry the start codon. Extend
+    # `_atg_offset_for_part` to cover new ATG-carrying
+    # overhangs introduced by future grammars rather than
+    # hard-coding the rule here.
+    # NOTE: NO symmetric `oh3` skip. The GCTT (GB) / GCTT
+    # (MoClo Plant C-tag) 3' overhang does NOT embed a stop
+    # codon — the stop codon lives in the user's CDS body OR
+    # in the downstream LINK's body. Stripping the last 3 bp
+    # of the insert would silently drop the user's real stop.
+    fwd_skip = _atg_offset_for_part(oh5, part_type)
+    fwd_insert = insert[fwd_skip:] if fwd_skip else insert
+    fwd_bind, fwd_tm = _pick_binding_region(fwd_insert, target_tm)
     rev_bind, rev_tm = _pick_binding_region(_rc(insert), target_tm)
+    rev_skip = 0   # kept as a binding so the pos calc below works
 
     # Assemble full primers using the grammar's enzyme/pad/spacer.
     fwd_tail = enzyme_pad + enzyme_site + enzyme_spacer + oh5
@@ -27437,12 +27569,20 @@ def _design_gb_primers(
     # coordinates). Save-to-library needs these to add primer_bind
     # features to the map. For wrap regions, compute positions with
     # modular arithmetic so they land on the real plasmid coordinates.
+    # AATG/GCTT skips shift the binding start/end by the skipped
+    # codon so the primer_bind features land on the actual primed
+    # bases (codon 2 .. last-but-one codon), not the duplicated
+    # start/stop.
     if wraps:
-        fwd_pos = (start, (start + len(fwd_bind)) % total)
-        rev_pos = ((end - len(rev_bind)) % total, end)
+        fwd_pos = ((start + fwd_skip) % total,
+                   (start + fwd_skip + len(fwd_bind)) % total)
+        rev_pos = ((end - rev_skip - len(rev_bind)) % total,
+                   (end - rev_skip) % total)
     else:
-        fwd_pos = (start, start + len(fwd_bind))
-        rev_pos = (end - len(rev_bind), end)
+        fwd_pos = (start + fwd_skip,
+                   start + fwd_skip + len(fwd_bind))
+        rev_pos = (end - rev_skip - len(rev_bind),
+                   end - rev_skip)
 
     pair = {
         "fwd_full":     fwd_full,
@@ -27471,6 +27611,14 @@ def _design_gb_primers(
         "mutations":    mutations,
         "binding_region_mutations": binding_region_mutations,
         "pairs":        [pair],
+        # Segment lengths for the results painter: GB primers
+        # assemble as `pad + enzyme_site + spacer + overhang +
+        # binding`. Exposed so `_show_result` can highlight the
+        # RE recognition seq in blue and the overhang/spacer as
+        # padding rather than leaving the whole tail gray.
+        "enzyme_site":   enzyme_site,
+        "enzyme_pad":    enzyme_pad,
+        "enzyme_spacer": enzyme_spacer,
         # Legacy top-level mirror of pairs[0] for callers (cloning simulator,
         # PrimerDesignScreen) that don't iterate the list yet.
         **pair,
@@ -28117,6 +28265,152 @@ def _save_primers(entries: list[dict]) -> None:
         # caller, so subsequent caller mutations (e.g. an aborted modal)
         # leaked back into the next `_load_primers`.
         _primers_cache = _typed_clone(deduped)
+        # Mirror into the active primer collection (collections layer
+        # for primers, same pattern as plasmid library →
+        # collections.json mirror, pitfall #10). Inside the lock so
+        # the mirror file can't drift from the live file (sweep #10,
+        # [INV-50]). _save_primer_collections re-acquires the RLock.
+        _sync_active_primer_collection_primers(deduped)
+
+
+# ── Primer collections persistence ────────────────────────────────────────────
+#
+# Mirror of the plasmid collections layer (collections.json → plasmids),
+# applied to the primer library. Each collection is a user-curated set
+# of primers — e.g., one collection per project, or per organism.
+#
+# Schema (envelope-v1):
+#
+#     {
+#       "name":        "Main",                  # user-facing display
+#       "description": "first-launch wrap",
+#       "primers":     [<primer dict>, ...],    # same shape as primers.json
+#       "saved":       "2026-05-21",            # ISO date
+#     }
+#
+# `primers.json` is the live working set for the ACTIVE collection;
+# `primer_collections.json` carries every named collection. Every
+# `_save_primers` mirrors to active via `_sync_active_primer_collection_primers`
+# (called inside the same `_cache_lock` block).
+
+_PRIMER_COLLECTIONS_FILE = _DATA_DIR / "primer_collections.json"
+_primer_collections_cache: "list | None" = None
+
+_DEFAULT_PRIMER_COLLECTION_NAME = "Main"
+
+
+def _load_primer_collections() -> list[dict]:
+    """Deep-copy on read so callers can mutate freely; pitfall #17."""
+    global _primer_collections_cache
+    if _primer_collections_cache is None:
+        entries, warning = _safe_load_json(
+            _PRIMER_COLLECTIONS_FILE, "Primer collections",
+        )
+        if warning:
+            _log.warning(warning)
+        _primer_collections_cache = [e for e in entries if isinstance(e, dict)]
+    return _typed_clone(_primer_collections_cache)
+
+
+def _save_primer_collections(entries: list[dict]) -> None:
+    global _primer_collections_cache
+    with _cache_lock:
+        _safe_save_json(
+            _PRIMER_COLLECTIONS_FILE, entries, "Primer collections",
+        )
+        _primer_collections_cache = _typed_clone(entries)
+
+
+def _get_active_primer_collection_name() -> "str | None":
+    val = _get_setting("active_primer_collection", None)
+    return val if isinstance(val, str) and val else None
+
+
+def _set_active_primer_collection_name(name: "str | None") -> None:
+    prev = _get_active_primer_collection_name()
+    target = name or ""
+    if prev != target:
+        _log_event(
+            "primer_collection.switched",
+            prev=prev or "", new=target,
+        )
+    _set_setting("active_primer_collection", target)
+
+
+def _find_primer_collection(name: str) -> "dict | None":
+    for c in _load_primer_collections():
+        if c.get("name") == name:
+            return c
+    return None
+
+
+def _primer_collection_name_taken(name: str) -> bool:
+    return _find_primer_collection(name) is not None
+
+
+def _ensure_default_primer_collection() -> None:
+    """Idempotent: guarantee at least one primer collection exists.
+
+    First-run users have a non-empty `primers.json` but no
+    `primer_collections.json` — wrap their existing primers into a
+    "Main" collection and mark it active. Empty first-runs get an
+    empty Main collection so the picker always has something to show.
+    Mirrors `_ensure_default_collection` for plasmids and
+    `_ensure_default_project` for experiments.
+    """
+    colls = _load_primer_collections()
+    if colls:
+        if not _get_active_primer_collection_name():
+            first = colls[0].get("name")
+            if first:
+                _set_active_primer_collection_name(first)
+        return
+    primers = _load_primers()
+    _save_primer_collections([{
+        "name":        _DEFAULT_PRIMER_COLLECTION_NAME,
+        "description": "Default collection",
+        "primers":     primers,
+        "saved":       _date.today().isoformat(),
+    }])
+    _set_active_primer_collection_name(_DEFAULT_PRIMER_COLLECTION_NAME)
+
+
+def _sync_active_primer_collection_primers(entries: list[dict]) -> None:
+    """Mirror the live primer library into the active collection so the
+    on-disk record never drifts from `primers.json`. Silent no-op if no
+    collection is active or the active name has been deleted. Caller
+    MUST already hold `_cache_lock` (this re-acquires via RLock for
+    `_save_primer_collections`). See `[INV-50]` for the save-chain
+    lock-release gap that this design avoids.
+    """
+    name = _get_active_primer_collection_name()
+    if not name:
+        return
+    snapshot = [_typed_clone(e) for e in entries if isinstance(e, dict)]
+    colls = _load_primer_collections()
+    for c in colls:
+        if c.get("name") == name:
+            c["primers"] = snapshot
+            _save_primer_collections(colls)
+            return
+
+
+def _restore_primers_from_active_primer_collection() -> None:
+    """Refresh `primers.json` with the active primer collection's
+    primers on startup. Bypasses `_save_primers`'s mirror (the
+    collection IS the source). Silent no-op when no active collection.
+    """
+    global _primers_cache
+    name = _get_active_primer_collection_name()
+    if not name:
+        return
+    coll = _find_primer_collection(name)
+    if coll is None:
+        return
+    primers = [dict(p) for p in (coll.get("primers") or [])
+               if isinstance(p, dict)]
+    _safe_save_json(_PRIMERS_FILE, primers, "Primer library")
+    _primers_cache = _typed_clone(primers)
 
 
 # ── Feature library persistence ───────────────────────────────────────────────
@@ -56956,6 +57250,423 @@ class MutagenizeModal(ModalScreen):
         self.dismiss(None)
 
 
+# ── Primer save modal (per-oligo naming + collection picker) ──────────────────
+
+class PrimerSaveModal(ModalScreen):
+    """Prompt for per-oligo names + target primer collection after a
+    Primer3 design run produces results.
+
+    2026-05-21: replaces the two-step "fill name inputs then click
+    Save to Library" flow. Pressing Design now auto-opens this modal
+    so naming + collection routing happens in one place.
+
+    Each oligo in ``oligos`` gets its own name `Input` (scrollable
+    when N > visible rows, so a 6-primer mutagenesis set still fits).
+    The collection `Select` lists every existing primer collection
+    plus a "+ New collection…" sentinel that prompts the user for a
+    fresh name. Defaults to the currently-active primer collection.
+
+    Sacred — preserves user-typed names verbatim (no underscore-for-
+    space substitution). See feedback_no_underscores_in_names.
+
+    Dismiss payload:
+      ``dict`` with keys ``names: list[str]`` and ``collection: str`` on Save.
+      ``None`` on Cancel.
+    """
+
+    _blocks_undo: bool = True   # carries Inputs; pitfall #41 / [INV-41]
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    _NEW_COLLECTION_SENTINEL = "__new__"
+
+    def __init__(self, oligos: "list[dict]",
+                 *, default_collection: str = "") -> None:
+        super().__init__()
+        # Each oligo dict carries at minimum: default_name (str), label
+        # (e.g. "Forward", "Reverse", "Inner Fwd"). Optional: sequence,
+        # tm — shown in the right-hand hint column so the user knows
+        # which oligo they're naming.
+        self._oligos = oligos
+        self._default_collection = default_collection or ""
+        self._dismissed = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="primer-save-dlg"):
+            yield Static(" Save primers to library ",
+                         id="primer-save-title")
+            yield Label(
+                f"Name each of the {len(self._oligos)} oligo"
+                f"{'s' if len(self._oligos) != 1 else ''} below, "
+                "then pick the primer collection. Spaces in names "
+                "are preserved.",
+                id="primer-save-help",
+            )
+            with VerticalScroll(id="primer-save-list"):
+                for i, ol in enumerate(self._oligos):
+                    label = str(ol.get("label") or f"Oligo {i+1}")
+                    default = str(ol.get("default_name") or label)
+                    tm = ol.get("tm")
+                    seq = ol.get("sequence") or ""
+                    hint_parts = []
+                    if isinstance(tm, (int, float)):
+                        hint_parts.append(f"Tm {tm:.1f}°C")
+                    if seq:
+                        hint_parts.append(f"{len(seq)} nt")
+                    hint = " · ".join(hint_parts)
+                    with Vertical(classes="primer-save-row"):
+                        yield Label(f"[bold]{label}[/]"
+                                    + (f"  [dim]{hint}[/]" if hint else ""),
+                                    classes="primer-save-row-label",
+                                    markup=True)
+                        yield Input(
+                            value=default,
+                            placeholder=label,
+                            id=f"primer-save-name-{i}",
+                            classes="primer-save-name-input",
+                        )
+            yield Label("Save to primer collection:",
+                        id="primer-save-coll-label")
+            yield Select(
+                options=self._collection_options(),
+                value=self._default_collection
+                      or Select.BLANK,
+                id="primer-save-collection",
+                allow_blank=True,
+            )
+            with Horizontal(id="primer-save-buttons"):
+                yield Button("Save", id="primer-save-ok",
+                             variant="primary")
+                yield Button("Cancel", id="primer-save-cancel",
+                             variant="default")
+
+    def _collection_options(self) -> "list[tuple[str, str]]":
+        """Build Select options: every existing primer collection +
+        a "+ New collection…" sentinel that triggers a fresh-name
+        sub-prompt on Save."""
+        opts: list[tuple[str, str]] = []
+        for c in _load_primer_collections():
+            name = c.get("name")
+            if isinstance(name, str) and name:
+                opts.append((name, name))
+        opts.append(("+ New collection…", self._NEW_COLLECTION_SENTINEL))
+        return opts
+
+    def _gather_names(self) -> "list[str] | None":
+        names: list[str] = []
+        for i in range(len(self._oligos)):
+            try:
+                inp = self.query_one(f"#primer-save-name-{i}", Input)
+            except NoMatches:
+                return None
+            # SACRED: do NOT strip() or replace internal whitespace —
+            # the user gets exactly what they typed. Leading/trailing
+            # spaces are still trimmed via .strip() at the boundary
+            # because they're almost always typos, not intent.
+            val = inp.value.strip()
+            if not val:
+                self.app.notify(
+                    f"Oligo {i+1}: name cannot be empty.",
+                    severity="warning",
+                )
+                inp.focus()
+                return None
+            names.append(val)
+        # Duplicate-name check within THIS batch — saving "F" + "F"
+        # would collide downstream; surface here so the user can fix
+        # it before the collision resolver fires.
+        seen: set[str] = set()
+        for n in names:
+            if n in seen:
+                self.app.notify(
+                    f"Duplicate name '{n}' in this batch — "
+                    "give each oligo a unique name.",
+                    severity="warning",
+                )
+                return None
+            seen.add(n)
+        return names
+
+    def _resolve_collection(self) -> "str | None":
+        """Return the chosen primer-collection name, or None if the
+        user cancelled the new-collection sub-prompt. Sentinel value
+        triggers an inline NewCollectionNameModal."""
+        try:
+            sel = self.query_one("#primer-save-collection", Select)
+        except NoMatches:
+            return None
+        val = sel.value
+        if val == Select.BLANK or val is None:
+            self.app.notify("Pick a primer collection.", severity="warning")
+            return None
+        if isinstance(val, str):
+            return val
+        return None
+
+    @on(Button.Pressed, "#primer-save-ok")
+    def _save_btn(self, _) -> None:
+        names = self._gather_names()
+        if names is None:
+            return
+        coll = self._resolve_collection()
+        if coll is None:
+            return
+        if coll == self._NEW_COLLECTION_SENTINEL:
+            # Inline sub-prompt: ask for a new collection name, then
+            # commit. The new collection is created at commit time
+            # (not now) so a cancel here doesn't litter empty
+            # collections.
+            def _on_new_name(new_name) -> None:
+                if not isinstance(new_name, str) or not new_name.strip():
+                    return
+                self._commit(names, new_name.strip(), create=True)
+            self.app.push_screen(
+                _PrimerCollectionNameModal(taken=self._existing_coll_names()),
+                callback=_on_new_name,
+            )
+            return
+        self._commit(names, coll, create=False)
+
+    def _existing_coll_names(self) -> "set[str]":
+        out: set[str] = set()
+        for c in _load_primer_collections():
+            name = c.get("name")
+            if isinstance(name, str):
+                out.add(name)
+        return out
+
+    def _commit(self, names: "list[str]", collection: str,
+                *, create: bool) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss({
+            "names":      names,
+            "collection": collection,
+            "create":     create,
+        })
+
+    @on(Button.Pressed, "#primer-save-cancel")
+    def _cancel_btn(self, _) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(None)
+
+
+class _PrimerCollectionNameModal(ModalScreen):
+    """Sub-prompt: ask the user for a new primer-collection name when
+    they pick "+ New collection…" in the save modal. Light-weight
+    inline prompt — full collection-management lives elsewhere."""
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, *, taken: "set[str]") -> None:
+        super().__init__()
+        self._taken = taken
+        self._dismissed = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="primer-coll-name-dlg"):
+            yield Static(" New primer collection ",
+                         id="primer-coll-name-title")
+            yield Label("Name (spaces allowed):")
+            yield Input(placeholder="e.g. 'PCR validation primers'",
+                        id="primer-coll-name-input")
+            yield Static("", id="primer-coll-name-status", markup=True)
+            with Horizontal(id="primer-coll-name-buttons"):
+                yield Button("Create", id="primer-coll-name-ok",
+                             variant="primary")
+                yield Button("Cancel", id="primer-coll-name-cancel",
+                             variant="default")
+
+    @on(Input.Changed, "#primer-coll-name-input")
+    def _on_changed(self, event: Input.Changed) -> None:
+        val = (event.value or "").strip()
+        try:
+            status = self.query_one("#primer-coll-name-status", Static)
+        except NoMatches:
+            return
+        if not val:
+            status.update("")
+        elif val in self._taken:
+            status.update("[yellow]Name already in use.[/]")
+        else:
+            status.update("[green]OK[/]")
+
+    @on(Button.Pressed, "#primer-coll-name-ok")
+    def _ok(self, _) -> None:
+        if self._dismissed:
+            return
+        try:
+            val = self.query_one("#primer-coll-name-input", Input).value.strip()
+        except NoMatches:
+            val = ""
+        if not val:
+            self.app.notify("Enter a name.", severity="warning")
+            return
+        if val in self._taken:
+            self.app.notify("Name already in use.", severity="warning")
+            return
+        self._dismissed = True
+        self.dismiss(val)
+
+    @on(Button.Pressed, "#primer-coll-name-cancel")
+    def _cancel_btn(self, _) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(None)
+
+
+class PrimerTypePickerModal(ModalScreen):
+    """Pick which mode the Primer Designer should open in.
+
+    Pushed from `action_open_primer_design`; on dismiss with one
+    of `{"detection", "cloning", "goldenbraid", "generic"}`, the
+    designer opens with that tab active. None on Cancel.
+    """
+
+    _blocks_undo: bool = True
+
+    DEFAULT_CSS = """
+    PrimerTypePickerModal { align: center middle; }
+    #primer-type-dlg {
+        width: 64;
+        height: auto;
+        max-height: 90%;
+        background: $surface;
+        border: round $accent;
+        padding: 1 2;
+    }
+    #primer-type-title {
+        width: 100%;
+        height: 1;
+        background: $accent;
+        color: $surface;
+        text-style: bold;
+        content-align: center middle;
+        padding: 0 1;
+    }
+    #primer-type-help {
+        width: 100%;
+        margin: 1 0;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    #primer-type-buttons {
+        width: 100%;
+        height: auto;
+        align: center middle;
+    }
+    #primer-type-buttons Button {
+        width: 100%;
+        margin: 0 0 1 0;
+    }
+    /* Mode-specific accents — green = create / start (Detection),
+       cyan = cloning, orange = Golden Braid (matches the GB
+       overhang block in the results legend), gray = Generic /
+       Cancel = panel-lighten so it sits below the primaries. */
+    #primer-type-detection { background: $success; }
+    #primer-type-detection:hover { background: $success-lighten-1; }
+    #primer-type-cloning { background: #4CC4FF; color: $surface; }
+    #primer-type-cloning:hover { background: #80D8FF; }
+    #primer-type-goldenbraid { background: #FFB347; color: $surface; }
+    #primer-type-goldenbraid:hover { background: #FFCB80; }
+    #primer-type-generic { background: $primary; }
+    #primer-type-generic:hover { background: $primary-lighten-1; }
+    #primer-type-cancel {
+        background: $panel-lighten-2;
+        margin-top: 1;
+    }
+    #primer-type-cancel:hover { background: $panel-lighten-3; }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._dismissed = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="primer-type-dlg"):
+            yield Static(" What kind of primers? ",
+                         id="primer-type-title")
+            yield Label(
+                "Pick the workflow. The Primer Designer opens "
+                "on the matching tab; your selection (if any) "
+                "auto-fills the Start/End coordinates — and if "
+                "it spans a full feature, the Feature dropdown "
+                "is selected so you can press Design directly.",
+                id="primer-type-help",
+            )
+            with Vertical(id="primer-type-buttons"):
+                yield Button("Detection  —  diagnostic PCR",
+                             id="primer-type-detection",
+                             variant="primary")
+                yield Button("Cloning  —  RE tails + GCGC flap",
+                             id="primer-type-cloning")
+                yield Button("Golden Braid  —  L0 domestication",
+                             id="primer-type-goldenbraid")
+                yield Button("Generic  —  binding only",
+                             id="primer-type-generic")
+                yield Button("Cancel", id="primer-type-cancel",
+                             variant="default")
+
+    @on(Button.Pressed, "#primer-type-detection")
+    def _pick_det(self, _) -> None:
+        self._commit("detection")
+
+    @on(Button.Pressed, "#primer-type-cloning")
+    def _pick_clo(self, _) -> None:
+        self._commit("cloning")
+
+    @on(Button.Pressed, "#primer-type-goldenbraid")
+    def _pick_gb(self, _) -> None:
+        self._commit("goldenbraid")
+
+    @on(Button.Pressed, "#primer-type-generic")
+    def _pick_gen(self, _) -> None:
+        self._commit("generic")
+
+    @on(Button.Pressed, "#primer-type-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.action_cancel()
+
+    def _commit(self, mode: str) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(mode)
+
+    def action_cancel(self) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(None)
+
+
 # ── Primer design screen (full-screen) ─────────────────────────────────────────
 
 class PrimerDesignScreen(Screen):
@@ -56973,10 +57684,18 @@ class PrimerDesignScreen(Screen):
 
     BINDINGS = [
         Binding("escape",  "cancel",     "Close",         show=True),
-        Binding("m",       "noop",       "Mark (★)",      show=True, key_display="m"),
+        Binding("space",   "noop",       "Mark (★)",      show=True, key_display="space"),
         Binding("shift+m", "noop",       "Mark All",      show=True, key_display="M"),
         Binding("shift+s", "noop",       "Change Status", show=True, key_display="S"),
         Binding("tab",     "app.focus_next", "",               show=False),
+        # UI snapshot — screen-level bindings beat App-level even
+        # with priority=True, so redeclare here so the snapshot
+        # keys work from inside the Primer Designer. PlasmidApp.
+        # on_key also fires as a fallback.
+        Binding("ctrl+u",  "app.capture_ui_snapshot",
+                "UI snapshot", show=False, priority=True),
+        Binding("f9",      "app.capture_ui_snapshot",
+                "UI snapshot", show=False, priority=True),
     ]
 
     def action_noop(self) -> None:
@@ -56991,11 +57710,26 @@ class PrimerDesignScreen(Screen):
         return True
 
     def __init__(self, template_seq: str, feats: list[dict],
-                 plasmid_name: str = ""):
+                 plasmid_name: str = "",
+                 *,
+                 selection_range: "tuple[int, int] | None" = None,
+                 initial_mode: "str | None" = None):
         super().__init__()
         self._template     = template_seq.upper()
         self._feats        = feats
         self._plasmid_name = plasmid_name
+        # Optional (start, end) half-open range captured from the
+        # seq-panel highlight at open time. When set, on_mount
+        # writes these into the Start/End Inputs so the user can
+        # press Design without re-typing coords.
+        self._prefill_range = selection_range
+        # Optional initial mode ("detection" | "cloning" |
+        # "goldenbraid" | "generic"). Set by the type picker
+        # modal so the screen opens directly on the user's
+        # chosen workflow tab. Defaults to "detection".
+        self._initial_mode = (initial_mode
+                              if initial_mode in self._TAB_TO_MODE.values()
+                              else None)
         # Default part name = first non-RE feature label, NOT the plasmid name.
         # Users expect to design primers for a specific feature, not the whole
         # plasmid. Falls back to plasmid name if no features exist.
@@ -57014,6 +57748,29 @@ class PrimerDesignScreen(Screen):
         # stale every time the table re-sorts.
         self._lib_selected: set[int] = set()
         self._row_to_primer_idx: list[int] = []
+        # Two-mode primer library panel (2026-05-21). "primers" shows
+        # the active collection's primer rows; "collections" shows
+        # the primer-collection picker. Same DataTable swaps content.
+        self._lib_view_mode: str = "primers"
+        # Single-click commit on collection rows (sweep follow-up
+        # 2026-05-21: the arm/disarm double-click felt sluggish and
+        # introduced a window where a stale handler could mis-fire).
+        # Suppression flag set by `_apply_lib_view_mode` during a
+        # programmatic table repopulate — Textual fires a synthetic
+        # RowSelected on row 0 after the rebuild that would
+        # otherwise open the primer-plasmids modal for the new
+        # collection's first primer; we swallow it.
+        # Counter (not a bool) so overlapping repopulates from
+        # rapid tab swaps each balance their own arm/release —
+        # the suppression only lifts when every nested call has
+        # called `_release`. Pre-fix a bool could be released by
+        # the inner call while the outer arm still needed it.
+        self._pd_suppress_row_selected: int = 0
+        # Track which tabs have been activated at least once so
+        # the auto-Source-flip on Generic only fires the FIRST
+        # time the user lands there — subsequent flips preserve
+        # whatever Source the user manually picked.
+        self._tabs_seen: set[str] = set()
 
     def compose(self) -> ComposeResult:
         # Feature dropdown options
@@ -57044,10 +57801,26 @@ class PrimerDesignScreen(Screen):
                 # ╔════════════════════════ LEFT PAGE ════════════════════╗
                 with Vertical(id="pd-left-page"):
 
+                    # ─── Mode tabs (very top of the left page) ──────────
+                    # Tab BAR only — no separate tab content area;
+                    # the workflow sections (Template / Params /
+                    # Results) sit below and the active tab just
+                    # toggles which params panel is visible. Lets
+                    # us keep all 63 `query_one("#pd-...")` calls
+                    # in the codebase pointing at single shared
+                    # widget instances (no per-tab ID suffixing).
+                    yield Tabs(
+                        Tab("Detection",   id="tab-detection"),
+                        Tab("Cloning",     id="tab-cloning"),
+                        Tab("Golden Braid", id="tab-goldenbraid"),
+                        Tab("Generic",     id="tab-generic"),
+                        id="pd-mode-tabs",
+                    )
+
                     # ─── 1. TEMPLATE ────────────────────────────────────
                     with Vertical(classes="pd-section",
                                   id="pd-template-section"):
-                        yield Static("1. TEMPLATE", classes="pd-section-hdr")
+                        yield Static("TEMPLATE", classes="pd-section-hdr")
 
                         # Source toggle + plasmid chooser
                         with Horizontal(id="pd-src-row"):
@@ -57063,8 +57836,22 @@ class PrimerDesignScreen(Screen):
                             yield Button("Change",
                                          id="btn-pd-pickplasmid",
                                          variant="default")
+                            # Part name now lives on the same row
+                            # as the plasmid Change button so it
+                            # aligns with the other source-row
+                            # controls.
+                            yield Label("Part name:",
+                                        id="pd-part-name-lbl",
+                                        classes="pd-fld-lbl")
+                            yield Input(
+                                value="", id="pd-part-name",
+                                placeholder=self._default_part_name)
 
-                        # Feature-from-map row
+                        # Feature-from-map row: Feature picker on
+                        # the left, Start..End position group on
+                        # the right. The `..` separator mirrors
+                        # traditional GenBank position notation
+                        # (e.g. "100..550").
                         with Horizontal(id="pd-src-feature",
                                         classes="pd-source-panel"):
                             with Vertical(id="pd-feat-col"):
@@ -57072,20 +57859,16 @@ class PrimerDesignScreen(Screen):
                                 yield Select(feat_opts, id="pd-feat",
                                              prompt="(select feature)")
                             with Vertical(id="pd-start-col"):
-                                yield Label("Start")
+                                yield Label("Start pos")
                                 yield Input(placeholder="1", id="pd-start",
                                             type="integer")
+                            yield Static("..", id="pd-pos-sep")
                             with Vertical(id="pd-end-col"):
-                                yield Label("End")
+                                yield Label("End pos")
                                 yield Input(
                                     placeholder=str(len(self._template))
                                     if self._template else "",
                                     id="pd-end", type="integer")
-                            with Vertical(id="pd-name-col"):
-                                yield Label("Part name")
-                                yield Input(
-                                    value="", id="pd-part-name",
-                                    placeholder=self._default_part_name)
 
                         # Custom sequence row
                         with Vertical(id="pd-src-custom",
@@ -57095,59 +57878,60 @@ class PrimerDesignScreen(Screen):
                                         "entry will be used:")
                             yield TextArea("", id="pd-custom-seq")
 
-                        yield Static(
-                            "[dim]Tip: enter Start > End to design primers "
-                            "across the origin (e.g. 2900..200 on a 3 kb "
-                            "plasmid).[/dim]",
-                            id="pd-wrap-hint", markup=True,
-                        )
+                        # Tip label removed 2026-05-21 — origin-spanning
+                        # primers are an edge case; the user can still
+                        # type Start > End and the worker handles it.
                         yield Static("", id="pd-feat-info", markup=True)
+                        # Primer-pair name inputs moved here from
+                        # the RESULTS section (2026-05-21) so the
+                        # results preview gets more vertical room.
+                        # Always visible — user can pre-name before
+                        # running Design, or fill after.
+                        with Horizontal(id="pd-result-names"):
+                            yield Input(id="pd-fwd-name",
+                                        placeholder="fwd primer name")
+                            yield Input(id="pd-rev-name",
+                                        placeholder="rev primer name")
 
-                    # ─── 2. MODE ────────────────────────────────────────
-                    with Vertical(classes="pd-section",
-                                  id="pd-mode-section"):
-                        yield Static("2. MODE", classes="pd-section-hdr")
-                        with RadioSet(id="pd-mode-radio"):
-                            yield RadioButton(
-                                "Detection  [dim](diagnostic PCR)[/dim]",
-                                id="rb-detection", value=True)
-                            yield RadioButton(
-                                "Cloning  [dim](RE tails + GCGC)[/dim]",
-                                id="rb-cloning")
-                            yield RadioButton(
-                                "Golden Braid  [dim](L0 domestication)[/dim]",
-                                id="rb-goldenbraid")
-                            yield RadioButton(
-                                "Generic  [dim](binding only)[/dim]",
-                                id="rb-generic")
-
-                    # ─── 3. PARAMETERS (+ Design button) ────────────────
-                    # Cloning / GB are restacked to 2-3 internal rows so
-                    # the whole panel fits inside the narrower left page.
-                    with Vertical(classes="pd-section",
-                                  id="pd-params-section"):
-                        yield Static("3. PARAMETERS",
-                                     classes="pd-section-hdr")
-
-                        # Detection — still one row
+                    # ─── 3. PARAMETERS — one Vertical shared across
+                    # all 4 modes; the active Tabs tab toggles which
+                    # mode-specific panel is visible (mirrors the
+                    # original RadioSet pattern with `_switch_mode`).
+                    # No section border — visually flows directly
+                    # under the active tab to feel like one
+                    # continuous tab content area.
+                    # ─── PARAMETERS — shared Vertical; active
+                    # tab toggles which mode-panel shows via
+                    # `_switch_mode`. Design button moved to
+                    # the bottom actions row.
+                    with Vertical(id="pd-params-section"):
                         with Horizontal(id="pd-panel-det",
                                         classes="pd-mode-panel"):
-                            yield Label("Product")
-                            yield Input(value="450", id="pd-det-min",
-                                        type="integer")
-                            yield Label("–")
-                            yield Input(value="550", id="pd-det-max",
-                                        type="integer")
-                            yield Label("bp")
-                            yield Label(" Tm")
-                            yield Input(value="60", id="pd-det-tm",
-                                        type="integer")
-                            yield Label("°C")
-                            yield Label(" Len")
-                            yield Input(value="25", id="pd-det-len",
-                                        type="integer")
-
-                        # Cloning — stacked in 3 rows (fits half-width)
+                            with Vertical(classes="pd-fld-group"):
+                                yield Static("Amplicon\nSize (bp)",
+                                             classes="pd-fld-stacked-lbl")
+                                with Horizontal(
+                                        classes="pd-fld-inline"):
+                                    yield Input(value="450",
+                                                id="pd-det-min",
+                                                type="integer")
+                                    yield Static("–",
+                                                 classes="pd-fld-sep")
+                                    yield Input(value="550",
+                                                id="pd-det-max",
+                                                type="integer")
+                            with Vertical(classes="pd-fld-group"):
+                                yield Static("Annealing\nTm (°C)",
+                                             classes="pd-fld-stacked-lbl")
+                                yield Input(value="60",
+                                            id="pd-det-tm",
+                                            type="integer")
+                            with Vertical(classes="pd-fld-group"):
+                                yield Static("Primer\nLen (nt)",
+                                             classes="pd-fld-stacked-lbl")
+                                yield Input(value="25",
+                                            id="pd-det-len",
+                                            type="integer")
                         with Vertical(id="pd-panel-clo",
                                       classes="pd-mode-panel"):
                             with Horizontal(classes="pd-mode-row"):
@@ -57169,8 +57953,6 @@ class PrimerDesignScreen(Screen):
                                 yield Input(value="60", id="pd-clo-tm",
                                             type="integer")
                                 yield Label(" °C")
-
-                        # Golden Braid — stacked in 2 rows
                         with Vertical(id="pd-panel-gb",
                                       classes="pd-mode-panel"):
                             with Horizontal(classes="pd-mode-row"):
@@ -57179,8 +57961,6 @@ class PrimerDesignScreen(Screen):
                                              value="CDS")
                             yield Static("", id="pd-gb-oh-info",
                                          markup=True)
-
-                        # Generic — still one row
                         with Horizontal(id="pd-panel-gen",
                                         classes="pd-mode-panel"):
                             yield Label("Tm")
@@ -57188,64 +57968,109 @@ class PrimerDesignScreen(Screen):
                                         type="integer")
                             yield Label("°C")
                             yield Label(" Source ID")
-                            yield Input(placeholder="e.g. synthetic frag",
-                                        id="pd-gen-source")
+                            yield Input(
+                                placeholder="e.g. synthetic frag",
+                                id="pd-gen-source")
 
-                        # Design button — docked at the bottom of section 3
-                        with Horizontal(id="pd-design-row"):
-                            yield Button("Design primers",
-                                         id="btn-pd-design",
-                                         variant="primary")
-
-                # ╔═══════════════════════ RIGHT PAGE ════════════════════╗
-                with Vertical(id="pd-right-page"):
-
-                    # ─── RESULTS — sits above the library so newly-
-                    # designed primers appear next to where you'll save them
+                    # ─── RESULTS — primer-pair name inputs at top
+                    # (the things the user fills in right after a
+                    # design completes), then the Primer3 preview
+                    # below. Action buttons live in
+                    # `#pd-bottom-actions` docked at the very
+                    # bottom of the left page so they stay
+                    # consistently reachable.
                     with Vertical(classes="pd-section",
                                   id="pd-results-section"):
-                        yield Static("RESULTS", classes="pd-section-hdr")
+                        yield Static("RESULTS",
+                                     classes="pd-section-hdr")
                         yield Static(
                             self._RESULTS_EMPTY_HINT,
                             id="pd-results", markup=True,
                         )
-                        # Names on their own row so inputs fill the full
-                        # right-page width (~2× longer than when they
-                        # shared a row with the buttons).
-                        with Horizontal(id="pd-result-names"):
-                            yield Input(id="pd-fwd-name",
-                                        placeholder="fwd primer name")
-                            yield Input(id="pd-rev-name",
-                                        placeholder="rev primer name")
-                        with Horizontal(id="pd-result-actions"):
-                            yield Button("Save to Library",
-                                         id="btn-pd-save",
-                                         variant="primary", disabled=True)
-                            yield Button("Add to Map",
-                                         id="btn-pdlib-addmap",
-                                         variant="default")
+                    # Action buttons row — docked at the bottom of
+                    # the left page, centered with even spacing.
+                    # Design Primers sits alongside Save to Library
+                    # + Add to Map so all three workflow actions
+                    # share one row.
+                    with Horizontal(id="pd-bottom-actions"):
+                        yield Button("Design primers",
+                                     id="btn-pd-design",
+                                     variant="primary")
+                        yield Button("Save to Library",
+                                     id="btn-pd-save",
+                                     variant="primary", disabled=True)
+                        yield Button("Add to Map",
+                                     id="btn-pdlib-addmap",
+                                     variant="default")
+                        # Clear sits at the rightmost spot so the
+                        # user doesn't fat-finger it while reaching
+                        # for the primary Design / Save buttons.
+                        yield Button("Clear",
+                                     id="btn-pd-clear",
+                                     variant="default",
+                                     tooltip="Reset the active tab to defaults")
+
+                # ╔═══════════════════════ RIGHT PAGE ════════════════════╗
+                with Vertical(id="pd-right-page"):
 
                     # ─── PRIMER LIBRARY ─────────────────────────────────
+                    # Two-mode panel: "primers" view shows the
+                    # primer rows of the active primer collection;
+                    # "collections" view shows the primer-collection
+                    # picker. Mirrors LibraryPanel's plasmids ↔
+                    # collections toggle for primers. The same
+                    # DataTable swaps contents (cf. LibraryPanel.
+                    # _apply_view_mode).
                     with Horizontal(id="pd-lib-hdr-row"):
-                        yield Static("PRIMER LIBRARY", id="pd-lib-hdr")
-                        yield Button("Rename", id="btn-pdlib-rename",
-                                     variant="default")
-                        yield Button("Delete", id="btn-pdlib-del",
-                                     variant="error")
+                        with Vertical(id="pd-lib-hdr"):
+                            yield Static(self._lib_title_text(),
+                                         id="pd-lib-hdr-title")
+                            yield Static(self._lib_subtitle_text(),
+                                         id="pd-lib-hdr-sub")
+                        # ← button is the toggle — pressed in primers
+                        # view, opens the collection picker; pressed
+                        # in collections view, returns to the primers
+                        # list of the active collection.
+                        yield Button("←",
+                                     id="btn-pdlib-collections",
+                                     variant="default",
+                                     tooltip="Browse primer collections")
+                        # Primers-view-only actions.
+                        with Horizontal(id="pd-lib-primers-btns"):
+                            yield Button("LOAD", id="btn-pdlib-load",
+                                         variant="default",
+                                         tooltip="Load primers from a plasmid")
+                            yield Button("RENAME", id="btn-pdlib-rename",
+                                         variant="default",
+                                         tooltip="Rename selected primer")
+                            yield Button("DELETE", id="btn-pdlib-del",
+                                         variant="default",
+                                         tooltip="Delete selected primer(s)")
+                        # Collections-view-only action.
+                        with Horizontal(id="pd-lib-coll-btns"):
+                            yield Button("NEW", id="btn-pdlib-coll-add",
+                                         variant="default",
+                                         tooltip="New primer collection")
                         yield Button("Close", id="btn-pd-close",
-                                     variant="default")
+                                     variant="default",
+                                     tooltip="Close primer designer")
                     yield DataTable(id="pd-lib-table", cursor_type="row",
                                     zebra_stripes=True)
         yield Footer()
 
-    # RadioButton id → internal mode name. Each mode has a matching
-    # parameter panel in the 3. PARAMETERS section; only one is shown.
-    _RB_TO_MODE = {
-        "rb-detection":   "detection",
-        "rb-cloning":     "cloning",
-        "rb-goldenbraid": "goldenbraid",
-        "rb-generic":     "generic",
+    # Tab id ↔ internal mode name. 2026-05-21 refactor: tabs at
+    # the top of the left page replace the RadioSet; mode
+    # selection = active tab. Parameter panels are still mounted
+    # as siblings (only one displayed at a time via _switch_mode),
+    # so all 63 existing `query_one("#pd-...")` lookups keep
+    # working unchanged.
+    _TAB_TO_MODE = {
+        "tab-detection":   "detection",
+        "tab-cloning":     "cloning",
+        "tab-goldenbraid": "goldenbraid",
+        "tab-generic":     "generic",
     }
+    _MODE_TO_TAB = {v: k for k, v in _TAB_TO_MODE.items()}
     _MODE_PANELS = {
         "detection":   "#pd-panel-det",
         "cloning":     "#pd-panel-clo",
@@ -57259,29 +58084,141 @@ class PrimerDesignScreen(Screen):
     }
 
     def _current_mode(self) -> str:
-        """Resolve the active RadioButton → mode name."""
+        """Resolve the active tab → mode name."""
         try:
-            rs = self.query_one("#pd-mode-radio", RadioSet)
-            # RadioSet's pressed_button is the currently-selected button
-            pressed = rs.pressed_button
-            if pressed is not None:
-                return self._RB_TO_MODE.get(pressed.id or "", "detection")
-        except Exception:
-            pass
-        return "detection"
+            tabs = self.query_one("#pd-mode-tabs", Tabs)
+        except NoMatches:
+            return "detection"
+        active = tabs.active_tab
+        tid = active.id if active else ""
+        return self._TAB_TO_MODE.get(tid or "", "detection")
 
     def _switch_mode(self, mode: str) -> None:
-        """Show the parameter panel for `mode`, hide the others."""
+        """Show the parameter panel for `mode`, hide the others.
+        Mirrors the original RadioSet implementation; the new
+        `Tabs` widget just chooses which one is active."""
         for m, sel in self._MODE_PANELS.items():
             try:
                 self.query_one(sel).display = (m == mode)
             except NoMatches:
                 pass
+        # Keep the tab bar's active tab in sync (e.g. for
+        # programmatic mode flips). Best-effort.
+        try:
+            tabs = self.query_one("#pd-mode-tabs", Tabs)
+            target = self._MODE_TO_TAB.get(mode, "tab-detection")
+            cur = tabs.active_tab.id if tabs.active_tab else None
+            if cur != target:
+                tabs.active = target
+        except (NoMatches, AttributeError):
+            pass
         if mode == "goldenbraid":
             try:
                 self._update_gb_oh()
             except Exception:
                 _log.exception("goldenbraid overhang refresh failed")
+
+    @on(Tabs.TabActivated, "#pd-mode-tabs")
+    def _on_pd_tab_activated(self, event: Tabs.TabActivated) -> None:
+        """Tab swap on the mode tab bar → switch params + clear any
+        stale per-design state from the previous tab so the user
+        doesn't see leftover results / primer names that belonged
+        to a different mode."""
+        tid = event.tab.id if event.tab else ""
+        mode = self._TAB_TO_MODE.get(tid or "", "detection")
+        self._switch_mode(mode)
+        self._clear_design_state()
+        # Generic mode is the "arbitrary sequence" workflow —
+        # default Source → Custom sequence ONLY on the first
+        # activation of the Generic tab in this session, so a
+        # user who manually switches Source back to Feature
+        # keeps that choice when toggling away and back.
+        if mode == "generic" and mode not in self._tabs_seen:
+            try:
+                src_sel = self.query_one("#pd-source", Select)
+                if src_sel.value != "custom":
+                    src_sel.value = "custom"
+                self._switch_source("custom")
+            except NoMatches:
+                pass
+        self._tabs_seen.add(mode)
+
+    def _clear_design_state(self) -> None:
+        """Wipe per-design carryover: cached results, primer-pair
+        name inputs, RESULTS preview, Save button. Does NOT touch
+        the params (Tm / RE / etc.) — those live inside the active
+        tab and the user often wants them to persist across tab
+        flips. Use `_action_clear_tab` for a full tab reset."""
+        self._det_result = None
+        self._clo_result = None
+        try:
+            self.query_one("#pd-fwd-name", Input).value = ""
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#pd-rev-name", Input).value = ""
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#btn-pd-save", Button).disabled = True
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#pd-results", Static).update(
+                self._RESULTS_EMPTY_HINT,
+            )
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-pd-clear")
+    def _action_clear_tab(self, _=None) -> None:
+        """Hard-reset the active tab: clears the per-design state
+        AND resets the mode-specific params to their factory
+        defaults (Tm 60°C, sizes 450-550, RE EcoRI/BamHI, etc.).
+        Wired to the `Clear` button left of `Design primers`."""
+        self._clear_design_state()
+        mode = self._current_mode()
+        # Per-mode factory defaults — mirror the values used in
+        # compose() so a Clear puts the tab back to its initial
+        # state. Wrapped in try/except per-widget because some
+        # modes don't mount certain widgets.
+        if mode == "detection":
+            self._reset_input("#pd-det-min",  "450")
+            self._reset_input("#pd-det-max",  "550")
+            self._reset_input("#pd-det-tm",   "60")
+            self._reset_input("#pd-det-len",  "25")
+        elif mode == "cloning":
+            self._reset_input("#pd-cust5",    "")
+            self._reset_input("#pd-cust3",    "")
+            self._reset_input("#pd-clo-tm",   "60")
+        elif mode == "generic":
+            self._reset_input("#pd-gen-tm",   "60")
+            self._reset_input("#pd-gen-source", "")
+        # Common to every mode: clear the feature/region pickers
+        # so the user re-picks a target for the next design.
+        try:
+            self.query_one("#pd-feat", Select).clear()
+        except NoMatches:
+            pass
+        self._reset_input("#pd-start", "")
+        self._reset_input("#pd-end",   "")
+        self._reset_input("#pd-part-name", "")
+        try:
+            self.query_one("#pd-feat-info", Static).update("")
+        except NoMatches:
+            pass
+        self.app.notify(
+            f"Cleared {mode.title()} tab.",
+            severity="information",
+        )
+
+    def _reset_input(self, sel: str, value: str) -> None:
+        """Set an Input's value to `value`, silently no-op if the
+        widget isn't mounted (e.g. params for a different mode)."""
+        try:
+            self.query_one(sel, Input).value = value
+        except NoMatches:
+            pass
 
     def _switch_source(self, src: str) -> None:
         for s, sel in self._SOURCE_PANELS.items():
@@ -57302,13 +58239,6 @@ class PrimerDesignScreen(Screen):
         val = event.value
         if isinstance(val, str) and val in self._SOURCE_PANELS:
             self._switch_source(val)
-
-    @on(RadioSet.Changed, "#pd-mode-radio")
-    def _mode_changed(self, event: RadioSet.Changed) -> None:
-        """User clicked a different mode in the wizard."""
-        rb_id = (event.pressed.id or "") if event.pressed else ""
-        mode = self._RB_TO_MODE.get(rb_id, "detection")
-        self._switch_mode(mode)
 
     @on(Button.Pressed, "#btn-pd-pickplasmid")
     def _pick_plasmid(self, _) -> None:
@@ -57410,10 +58340,46 @@ class PrimerDesignScreen(Screen):
         # some Textual versions; `call_after_refresh` is the canonical
         # post-mount-init hook.
         self.call_after_refresh(self._index_usage_worker)
-        # Source defaults to Feature from map; mode defaults to Detection
-        # (the Detection RadioButton has value=True).
+        # Source defaults to Feature from map; mode defaults to
+        # Detection unless the caller (PrimerTypePickerModal)
+        # picked a different starting tab.
         self._switch_source("feature")
-        self._switch_mode("detection")
+        start_mode = self._initial_mode or "detection"
+        self._switch_mode(start_mode)
+        # Smart prefill: if the seq-panel selection EXACTLY
+        # matches a feature, set Source = "feature" and pick
+        # that feature in the dropdown — the `Select.Changed`
+        # handler then auto-fills Start, End, Part name + the
+        # feat-info line. User can press Design directly.
+        # Otherwise fall back to writing the raw Start/End
+        # coords so the user still gets a head-start.
+        if self._prefill_range is not None:
+            s, e = self._prefill_range
+            matched_feat = None
+            for f in self._feats:
+                if f.get("type") in ("resite", "recut", "source"):
+                    continue
+                if f.get("start") == s and f.get("end") == e:
+                    matched_feat = f
+                    break
+            if matched_feat is not None:
+                try:
+                    self._switch_source("feature")
+                    self.query_one("#pd-source", Select).value = "feature"
+                    feat_sel = self.query_one("#pd-feat", Select)
+                    feat_sel.value = (
+                        f"{matched_feat['start']}-{matched_feat['end']}"
+                    )
+                    # _feat_selected handler fires on the Select.Changed
+                    # event and writes Start / End / Part name.
+                except NoMatches:
+                    pass
+            else:
+                try:
+                    self.query_one("#pd-start", Input).value = str(s + 1)
+                    self.query_one("#pd-end",   Input).value = str(e)
+                except NoMatches:
+                    pass
 
     def on_screen_resume(self) -> None:
         """Re-fetch the primer library on resume so agent
@@ -57477,6 +58443,193 @@ class PrimerDesignScreen(Screen):
             # Widgets may not exist if the screen is being dismissed
             # concurrently; ignore silently.
             pass
+
+    def _lib_title_text(self) -> str:
+        """Top line of the header — adapts to the active view mode."""
+        if getattr(self, "_lib_view_mode", "primers") == "collections":
+            return "PRIMER COLLECTIONS"
+        return "PRIMER LIBRARY"
+
+    def _lib_subtitle_text(self) -> str:
+        """Bottom line of the header — active primer collection name
+        (primers view) or empty (collections view)."""
+        if getattr(self, "_lib_view_mode", "primers") == "collections":
+            return ""
+        return _get_active_primer_collection_name() or ""
+
+    def _refresh_lib_header(self) -> None:
+        try:
+            self.query_one("#pd-lib-hdr-title", Static).update(
+                self._lib_title_text())
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#pd-lib-hdr-sub", Static).update(
+                self._lib_subtitle_text())
+        except NoMatches:
+            pass
+
+    def _apply_lib_view_mode(self) -> None:
+        """Repopulate the DataTable for whichever view-mode is
+        active. Also adjusts button labels / visibility so the same
+        buttons make sense in either context.
+
+        Arms `_pd_suppress_row_selected` for the duration of the
+        rebuild + a follow-up call_after_refresh, because Textual
+        fires a synthetic `RowSelected` on the new row 0 once the
+        table re-populates — without the flag, switching to a new
+        primer collection would open the PrimerPlasmidsModal for
+        the first primer of the new collection.
+        """
+        try:
+            tbl = self.query_one("#pd-lib-table", DataTable)
+        except NoMatches:
+            return
+        self._pd_suppress_row_selected += 1
+
+        def _release() -> None:
+            if self._pd_suppress_row_selected > 0:
+                self._pd_suppress_row_selected -= 1
+        try:
+            self.call_after_refresh(_release)
+        except Exception:
+            # call_after_refresh can fail during teardown; the
+            # synthetic event would have fired by now if it was
+            # going to. Counter-decrement still applies.
+            if self._pd_suppress_row_selected > 0:
+                self._pd_suppress_row_selected -= 1
+        tbl.clear(columns=True)
+        if self._lib_view_mode == "collections":
+            tbl.add_column("Name")
+            tbl.add_column("# primers")
+            tbl.add_column("Saved")
+            tbl.add_column("Active")
+            self._refresh_primer_collections_table()
+        else:
+            # Match the columns the existing _refresh_library_table
+            # writes (no add_column calls there — it relies on the
+            # composer's default columns). Re-init defaults.
+            tbl.add_column("Name")
+            tbl.add_column("Sequence")
+            tbl.add_column("Len")
+            tbl.add_column("Tm")
+            tbl.add_column("Used")
+            tbl.add_column("Type")
+            tbl.add_column("Source")
+            tbl.add_column("Date")
+            tbl.add_column("Status")
+            self._refresh_library_table()
+        self._refresh_lib_header()
+        # Swap button rows (mirror LibraryPanel._apply_view_mode).
+        # Primers view: Collections / Rename / Delete / Close.
+        # Collections view: ← Back / + New Collection / Close.
+        is_coll = (self._lib_view_mode == "collections")
+        for sel, visible in (
+            ("#pd-lib-primers-btns", not is_coll),
+            ("#pd-lib-coll-btns",    is_coll),
+        ):
+            try:
+                self.query_one(sel).display = visible
+            except NoMatches:
+                pass
+
+    def _refresh_primer_collections_table(self) -> None:
+        """Populate the DataTable in collections view with one row per
+        primer collection. Row key = collection name (so the row-
+        selected handler can recover it without an index map)."""
+        try:
+            tbl = self.query_one("#pd-lib-table", DataTable)
+        except NoMatches:
+            return
+        active = _get_active_primer_collection_name() or ""
+        for c in _load_primer_collections():
+            name = c.get("name") or ""
+            if not name:
+                continue
+            n_primers = len(c.get("primers") or [])
+            saved = c.get("saved") or ""
+            is_active = "✓" if name == active else ""
+            tbl.add_row(name, str(n_primers), saved, is_active,
+                        key=name)
+
+    @on(Button.Pressed, "#btn-pdlib-collections")
+    def _toggle_lib_view_mode(self, _) -> None:
+        """Folder button is the toggle: primers ↔ collections view.
+        No dedicated back button — the primer designer screen IS the
+        primers context, so "back to primers" was a misleading label.
+        Pressing the folder again from collections view returns to
+        the primers list of the active collection."""
+        self._lib_view_mode = (
+            "primers" if self._lib_view_mode == "collections"
+            else "collections"
+        )
+        self._apply_lib_view_mode()
+
+    @on(Button.Pressed, "#btn-pdlib-coll-add")
+    def _new_primer_collection(self, _) -> None:
+        """Prompt for a new primer-collection name and create it
+        empty. Doesn't switch active (user can pick the row to
+        activate). Refreshes the collections table on success."""
+        def _on_named(name) -> None:
+            if not isinstance(name, str) or not name.strip():
+                return
+            name = name.strip()
+            try:
+                colls = _load_primer_collections()
+                colls.append({
+                    "name":        name,
+                    "description": "",
+                    "primers":     [],
+                    "saved":       _date.today().isoformat(),
+                })
+                _save_primer_collections(colls)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Primer collections", exc)
+                return
+            self.app.notify(
+                f"Created primer collection '{name}'.",
+                severity="information",
+            )
+            self._apply_lib_view_mode()
+        existing = {c.get("name") or "" for c in _load_primer_collections()}
+        self.app.push_screen(
+            _PrimerCollectionNameModal(taken=existing),
+            callback=_on_named,
+        )
+
+    @on(DataTable.RowSelected, "#pd-lib-table")
+    def _pd_lib_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Route row-selected based on the active view mode.
+
+        Primers view: existing select/mark handlers downstream do
+        their thing — early-return here (no-op so we don't intercept).
+
+        Collections view: single click commits the collection switch
+        (no double-click arm/disarm — the row-key carries the name
+        directly, so the previous 1.5s arm timer was unnecessary
+        friction).
+        """
+        if self._lib_view_mode != "collections":
+            return   # primers view → existing handlers handle it
+        rk = event.row_key
+        name = rk.value if rk else None
+        if not isinstance(name, str) or not name:
+            return
+        if name == (_get_active_primer_collection_name() or ""):
+            # Already active — just flip back to primers view.
+            self._lib_view_mode = "primers"
+            self._apply_lib_view_mode()
+            return
+        _set_active_primer_collection_name(name)
+        _settings_flush_sync()
+        _restore_primers_from_active_primer_collection()
+        # Invalidate the primer-usage index so the new collection's
+        # primers re-scan against the active plasmid library.
+        _clear = globals().get("_primer_usage_clear_cache")
+        if _clear is not None:
+            _clear()
+        self._lib_view_mode = "primers"
+        self._apply_lib_view_mode()
 
     def _refresh_library_table(self) -> None:
         t = self.query_one("#pd-lib-table", DataTable)
@@ -57641,6 +58794,23 @@ class PrimerDesignScreen(Screen):
         Toast confirms the search kicked off so the user knows
         something is happening during the 1–5 s gap.
         """
+        # Two-mode panel (2026-05-21): in collections view the table
+        # carries collection rows, NOT primer rows. The peer handler
+        # `_pd_lib_row_selected` handles the collection-switch flow;
+        # this one MUST bail or it'd index `_row_to_primer_idx` with a
+        # stale primers-view mapping and silently open the wrong
+        # plasmid lookup modal.
+        if getattr(self, "_lib_view_mode", "primers") != "primers":
+            return
+        # Synthetic post-repopulate RowSelected suppression: Textual
+        # fires a phantom selection on row 0 right after a
+        # `clear()` + `add_row(...)` rebuild. Without this guard a
+        # primer-collection switch would auto-open the
+        # PrimerPlasmidsModal for the new collection's first primer
+        # — the user's "modal of first primer triggers before load"
+        # complaint from 2026-05-21.
+        if getattr(self, "_pd_suppress_row_selected", 0) > 0:
+            return
         row = event.cursor_row
         if not (0 <= row < len(self._row_to_primer_idx)):
             return
@@ -57729,10 +58899,14 @@ class PrimerDesignScreen(Screen):
         if not isinstance(val, str) or val not in _GB_POSITIONS:
             return
         pos, oh5, oh3 = _GB_POSITIONS[val]
+        # Overhang sequences shown in the same orange as the
+        # `overhang` block in the results-section legend so the
+        # user can map the displayed nucleotides to where they
+        # land in the designed primer.
         self.query_one("#pd-gb-oh-info", Static).update(
             f"  [dim]{pos}[/dim]   "
-            f"5′: [bold cyan]{oh5}[/bold cyan]  →  "
-            f"3′: [bold cyan]{oh3}[/bold cyan]"
+            f"5′: [bold #FFB347]{oh5}[/bold #FFB347]  →  "
+            f"3′: [bold #FFB347]{oh3}[/bold #FFB347]"
         )
 
     # ── Custom sequence → override template ────────────────────────────
@@ -57832,7 +59006,11 @@ class PrimerDesignScreen(Screen):
                 return mp[row]
             return row
 
-        if event.key == "m":
+        if event.key == "space":
+            # `space` toggles the ★ mark — natural gesture on a
+            # row-cursor DataTable, consistent with checkbox lists
+            # in other Textual apps. (The legacy `m` binding was
+            # dropped 2026-05-21.)
             row = t.cursor_row
             if 0 <= row < len(primers):
                 pidx = _row_to_primer(row)
@@ -57961,26 +59139,158 @@ class PrimerDesignScreen(Screen):
 
     def _show_result(self, design: dict, primer_type: str,
                      fwd_key: str, rev_key: str) -> None:
-        """Display a primer pair in the results panel and fill the name
-        inputs with the default naming scheme."""
+        """Display a primer pair in the results panel with per-region
+        color coding (padding / RE site / binding) and fill the name
+        inputs with the default naming scheme.
+
+        Color scheme (2026-05-21):
+          * padding (5' GCGC flap)    → gray  ($text-muted)
+          * restriction site          → pink  (#FF80BF)
+          * forward binding region    → green
+          * reverse binding region    → red
+        A 4-block legend at the top of the panel keys the colors so
+        users can read each primer's anatomy at a glance.
+        """
         status = self.query_one("#pd-results", Static)
         t = Text()
-        t.append("Forward (5'→3'):\n", style="bold green")
-        t.append(f"  {design[fwd_key]}\n", style="green")
-        t.append(f"  Tm {design['fwd_tm']:.1f}°C   "
-                 f"{len(design[fwd_key])} nt\n", style="dim")
-        t.append("Reverse (5'→3'):\n", style="bold red")
-        t.append(f"  {design[rev_key]}\n", style="red")
-        t.append(f"  Tm {design['rev_tm']:.1f}°C   "
-                 f"{len(design[rev_key])} nt\n", style="dim")
-        if "product_size" in design:
-            t.append(f"Product: {design['product_size']} bp\n", style="white")
+
+        # Color constants — kept here so the legend below matches the
+        # actual paint without drift.
+        PAD_STYLE  = "grey50"
+        SITE_STYLE = "#80C8FF"   # light blue — RE recognition seq
+        OH_STYLE   = "#FFB347"   # orange — 4-nt fusion overhang
+        FWD_STYLE  = "green"
+        REV_STYLE  = "red"
+
+        # Legend — only the segments that actually appear in the
+        # rendered primer. Detection / Generic mode skip padding +
+        # RE site (no flap, no recognition seq). Golden Braid
+        # additionally has the 4-nt fusion overhang (orange) that
+        # creates the part's sticky ends post-digestion.
+        has_pad_or_site = primer_type in ("cloning", "goldenbraid")
+        is_gb = primer_type == "goldenbraid"
+        if has_pad_or_site:
+            t.append("█", style=PAD_STYLE)
+            t.append(" padding   ", style="dim")
+            t.append("█", style=SITE_STYLE)
+            t.append(" RE site   ", style="dim")
+        if is_gb:
+            t.append("█", style=OH_STYLE)
+            t.append(" overhang   ", style="dim")
+        t.append("█", style=FWD_STYLE)
+        t.append(" fwd bind   ", style="dim")
+        t.append("█", style=REV_STYLE)
+        t.append(" rev bind\n", style="dim")
+        # Blank row between the legend and the primer pair so the
+        # color blocks have visual breathing room.
+        t.append("\n")
+
+        # Generic segment painter — takes an ordered list of
+        # (length, style) tuples and paints `seq` accordingly.
+        # Handles both cloning (`pad / site / binding`) AND Golden
+        # Braid (`pad / site / spacer / overhang / binding`)
+        # without hard-coding either layout.
+        def _paint_segments(seq: str,
+                            segments: "list[tuple[int, str]]") -> Text:
+            buf = Text()
+            i = 0
+            for seg_len, style in segments:
+                if seg_len <= 0:
+                    continue
+                buf.append(seq[i:i + seg_len], style=style)
+                i += seg_len
+            # Anything left (defensive — shouldn't happen): default.
+            if i < len(seq):
+                buf.append(seq[i:])
+            return buf
+
+        def _segments_for(seq: str, bind_seq: str,
+                          strand_style: str) -> "list[tuple[int, str]]":
+            n_bind = len(bind_seq or "")
+            n_site = len(gb_site) if gb_site else 0
+            if n_site == 0:
+                # Cloning path: use `site_5`/`site_3` length (the
+                # site sits right before the binding region).
+                n_site = (len(design.get("site_5", ""))
+                          if strand_style == FWD_STYLE
+                          else len(design.get("site_3", "")))
+            n_spacer = len(design.get("enzyme_spacer", "")) \
+                if gb_site else 0
+            # Overhang: GB-only. Forward uses `oh5`, reverse uses
+            # `oh3` (RC'd in the actual bytes, but length matches).
+            if gb_site:
+                oh = (design.get("oh5", "")
+                      if strand_style == FWD_STYLE
+                      else design.get("oh3", ""))
+                n_oh = len(oh)
+            else:
+                n_oh = 0
+            n_pad = max(0,
+                        len(seq) - n_site - n_spacer - n_oh - n_bind)
+            return [
+                (n_pad,    PAD_STYLE),
+                (n_site,   SITE_STYLE),
+                (n_spacer, PAD_STYLE),
+                # GB overhang colored distinctly so the user can see
+                # where in the primer the 4-nt fusion overhang
+                # sits. On the reverse primer the displayed bases
+                # are _rc(oh3) (e.g. AAGC for the GCTT CDS-stop
+                # overhang); the orange highlight makes that
+                # mapping obvious.
+                (n_oh,     OH_STYLE),
+                (n_bind,   strand_style),
+            ]
+
+        def _paint(seq: str, strand_style: str,
+                   _site_unused: str, bind_seq: str) -> Text:
+            return _paint_segments(
+                seq, _segments_for(seq, bind_seq, strand_style),
+            )
+
+        # Cloning mode uses `site_5` / `site_3`; Golden Braid uses
+        # `enzyme_site` (single seq for both fwd + rev). Falling
+        # back to enzyme_site lets the painter highlight the RE
+        # recognition seq in GB primers too — pre-fix the whole
+        # GB tail was just gray padding.
+        gb_site = design.get("enzyme_site", "")
+        site_5 = design.get("site_5", "") or gb_site
+        site_3 = design.get("site_3", "") or gb_site
+        fwd_bind = design.get("fwd_binding") or design.get("fwd_seq") or ""
+        rev_bind = design.get("rev_binding") or design.get("rev_seq") or ""
+
+        # 5' RE / 3' RE label moved ABOVE the primer-pair block so
+        # the user sees the enzyme context before the sequences.
         if "re_5prime" in design:
             t.append(
                 f"5' RE: {design['re_5prime']} ({design['site_5']})   "
                 f"3' RE: {design['re_3prime']} ({design['site_3']})\n",
                 style="cyan",
             )
+            # Blank row between RE label and the primer pair so the
+            # enzyme context has visual breathing room.
+            t.append("\n")
+
+        t.append("Forward (5'→3'):\n", style=f"bold {FWD_STYLE}")
+        t.append("  ")
+        t.append(_paint(design[fwd_key], FWD_STYLE, site_5, fwd_bind))
+        t.append("\n")
+        t.append(f"  Tm {design['fwd_tm']:.1f}°C   "
+                 f"{len(design[fwd_key])} nt\n", style="dim")
+
+        t.append("Reverse (5'→3'):\n", style=f"bold {REV_STYLE}")
+        t.append("  ")
+        t.append(_paint(design[rev_key], REV_STYLE, site_3, rev_bind))
+        t.append("\n")
+        t.append(f"  Tm {design['rev_tm']:.1f}°C   "
+                 f"{len(design[rev_key])} nt\n", style="dim")
+
+        if "product_size" in design:
+            t.append(f"Product: {design['product_size']} bp\n",
+                     style="white")
+        # Trailing blank row so the docked button row at the
+        # bottom of the page has visual breathing space below the
+        # reverse primer / product line.
+        t.append("\n")
         # Design-time duplicate hint: surface the conflict BEFORE the user
         # bothers naming and clicking Save. The library-policy is one
         # entry per unique sequence (`_dedupe_primers_by_sequence`), so
@@ -58217,7 +59527,14 @@ class PrimerDesignScreen(Screen):
     def _apply_design_result(self, kind: str, result: dict) -> None:
         """UI-thread callback for `_design_worker`. Routes the result
         into the correct result slot + invokes `_show_result` with the
-        per-kind fwd/rev qualifier names."""
+        per-kind fwd/rev qualifier names.
+
+        2026-05-21 (revised): the results land in the inline
+        RESULTS section under the active tab. The fwd/rev name
+        Inputs + primer-collection Select + "Save to Library"
+        button all live next to the preview so the user names and
+        commits without a separate modal popping up.
+        """
         try:
             results_widget = self.query_one("#pd-results", Static)
         except NoMatches:
@@ -58225,47 +59542,145 @@ class PrimerDesignScreen(Screen):
         if "error" in result:
             results_widget.update(f"[red]{result['error']}[/red]")
             return
+        # Tab-mismatch guard (audit 2026-05-21): the worker may
+        # finish after the user has already swapped to a
+        # different tab. Cache the result regardless (so a
+        # tab-flip BACK shows it) but skip the UI paint if the
+        # user is no longer on the originating tab — pasting
+        # cloning bases into the Detection results pane would
+        # be confusing.
+        cur_mode = self._current_mode()
+        skip_ui = (kind != cur_mode and not (
+            kind in ("cloning", "goldenbraid")
+            and cur_mode in ("cloning", "goldenbraid")
+        ))
         if kind in ("detection", "generic"):
             self._det_result = result
             self._det_result["_type"] = kind
-            self._show_result(result, kind, "fwd_seq", "rev_seq")
+            if not skip_ui:
+                self._show_result(result, kind, "fwd_seq", "rev_seq")
         elif kind in ("cloning", "goldenbraid"):
             self._clo_result = result
             self._clo_result["_type"] = kind
-            self._show_result(result, kind, "fwd_full", "rev_full")
+            if not skip_ui:
+                self._show_result(result, kind, "fwd_full", "rev_full")
 
-    # ── Save to primer library ─────────────────────────────────────────────
-
-    @on(Button.Pressed, "#btn-pd-save")
-    def _save_primers_btn(self, _) -> None:
+    def _open_save_modal_for_current_result(self) -> None:
+        """Build the oligo-spec list from the active design result and
+        push `PrimerSaveModal`. Reusable: invoked auto from
+        `_apply_design_result` AND manually via `_save_primers_btn`
+        (fallback path)."""
         result = self._det_result or self._clo_result
         if result is None:
-            self.app.notify("Design primers first.", severity="warning")
             return
-        fwd_name = self.query_one("#pd-fwd-name", Input).value.strip()
-        rev_name = self.query_one("#pd-rev-name", Input).value.strip()
-        if not fwd_name or not rev_name:
-            self.app.notify("Enter primer names before saving.", severity="error")
-            return
-
         ptype = result.get("_type", "?")
-        fwd_key = "fwd_seq" if ptype in ("detection", "generic") else "fwd_full"
-        rev_key = "rev_seq" if ptype in ("detection", "generic") else "rev_full"
+        fwd_key = ("fwd_seq" if ptype in ("detection", "generic")
+                   else "fwd_full")
+        rev_key = ("rev_seq" if ptype in ("detection", "generic")
+                   else "rev_full")
+        # Prefill names from the existing Input widgets so a user who
+        # tweaked them before re-running design keeps their typed
+        # values. Fall back to a sensible default if blank.
+        try:
+            prefill_fwd = self.query_one("#pd-fwd-name", Input).value.strip()
+            prefill_rev = self.query_one("#pd-rev-name", Input).value.strip()
+        except NoMatches:
+            prefill_fwd = prefill_rev = ""
+        base = self._default_part_name or self._plasmid_name or "primer"
+        oligos: list[dict] = [
+            {
+                "label":        "Forward",
+                "default_name": prefill_fwd or f"{base}-F",
+                "sequence":     result.get(fwd_key, ""),
+                "tm":           result.get("fwd_tm"),
+                "_role":        "fwd",
+            },
+            {
+                "label":        "Reverse",
+                "default_name": prefill_rev or f"{base}-R",
+                "sequence":     result.get(rev_key, ""),
+                "tm":           result.get("rev_tm"),
+                "_role":        "rev",
+            },
+        ]
+        active_coll = _get_active_primer_collection_name() or ""
 
-        # Source = plasmid name (not feature name). For generic mode,
-        # use the source-ID input if filled.
+        def _on_save(payload) -> None:
+            if not isinstance(payload, dict):
+                return
+            names = payload.get("names") or []
+            collection = payload.get("collection") or ""
+            create = bool(payload.get("create"))
+            if not names or not collection:
+                return
+            # Push typed names back into the always-visible Inputs so
+            # the user sees what they picked, AND so a follow-up
+            # manual Save-to-Library re-uses them.
+            try:
+                self.query_one("#pd-fwd-name", Input).value = names[0]
+                if len(names) > 1:
+                    self.query_one("#pd-rev-name", Input).value = names[1]
+            except NoMatches:
+                pass
+            if create:
+                # Create the collection first; defer activation until
+                # AFTER the primers land so the mirror catches them.
+                try:
+                    colls = _load_primer_collections()
+                    colls.append({
+                        "name":        collection,
+                        "description": "",
+                        "primers":     [],
+                        "saved":       _date.today().isoformat(),
+                    })
+                    _save_primer_collections(colls)
+                except (OSError, RuntimeError) as exc:
+                    _notify_save_failure(
+                        self.app, "Primer collections", exc,
+                    )
+                    return
+                # Activate the new collection so the upcoming
+                # `_save_primers` mirror lands in it.
+                _set_active_primer_collection_name(collection)
+                _settings_flush_sync()
+            elif collection != active_coll:
+                # User picked an existing non-active collection.
+                # Switch active so the mirror writes there.
+                _set_active_primer_collection_name(collection)
+                _settings_flush_sync()
+            # Delegate to the canonical save path (does dup-sequence
+            # check + collision resolution + `_save_primers`).
+            self._commit_designed_primers_with_names(names)
+
+        self.app.push_screen(
+            PrimerSaveModal(oligos, default_collection=active_coll),
+            callback=_on_save,
+        )
+
+    def _commit_designed_primers_with_names(
+            self, names: "list[str]") -> None:
+        """Run the per-design-result commit flow with the names the
+        user typed in `PrimerSaveModal`. Re-implements the body of
+        `_save_primers_btn` but reads names from the parameter list
+        instead of the Input widgets, so the modal can drive it."""
+        result = self._det_result or self._clo_result
+        if result is None:
+            return
+        ptype = result.get("_type", "?")
+        fwd_key = ("fwd_seq" if ptype in ("detection", "generic")
+                   else "fwd_full")
+        rev_key = ("rev_seq" if ptype in ("detection", "generic")
+                   else "rev_full")
         if ptype == "generic":
-            source = self.query_one("#pd-gen-source", Input).value.strip()
+            try:
+                source = self.query_one(
+                    "#pd-gen-source", Input).value.strip()
+            except NoMatches:
+                source = ""
             if not source:
                 source = self._plasmid_name or "custom"
         else:
             source = self._plasmid_name or "custom"
-
-        # Check for duplicate SEQUENCES (not names) already in the library.
-        # Surface WHICH existing primer the designed sequence collides with
-        # so the user knows what to rename / discard — a bare "duplicate"
-        # warning forced them to scroll through the library table to find
-        # the offending row.
         entries = _load_primers()
         fwd_seq = result[fwd_key]
         rev_seq = result[rev_key]
@@ -58273,17 +59688,26 @@ class PrimerDesignScreen(Screen):
             (e.get("sequence") or "").upper(): e for e in entries
             if isinstance(e, dict) and isinstance(e.get("sequence"), str)
         }
+        # Per-position pairing of typed names with sequences. The
+        # modal already validated that exactly len(oligos) names came
+        # back, but defensively cap to what we have sequences for.
+        pairs = [
+            (names[0] if len(names) > 0 else "fwd", fwd_seq,
+             result.get("fwd_tm"), result.get("fwd_pos"), 1),
+            (names[1] if len(names) > 1 else "rev", rev_seq,
+             result.get("rev_tm"), result.get("rev_pos"), -1),
+        ]
         dupes: list[tuple[str, dict]] = []
-        if fwd_seq.upper() in existing_by_seq:
-            dupes.append((fwd_name, existing_by_seq[fwd_seq.upper()]))
-        if rev_seq.upper() in existing_by_seq:
-            dupes.append((rev_name, existing_by_seq[rev_seq.upper()]))
+        for pname, seq, *_ in pairs:
+            if seq and seq.upper() in existing_by_seq:
+                dupes.append((pname, existing_by_seq[seq.upper()]))
         if dupes:
             def _fmt(new_name: str, old: dict) -> str:
                 old_name = old.get("name", "?")
                 date = old.get("date")
                 date_part = f", saved {date}" if date else ""
-                return f"'{new_name}' matches existing '{old_name}'{date_part}"
+                return (f"'{new_name}' matches existing "
+                        f"'{old_name}'{date_part}")
             self.app.notify(
                 "Duplicate sequence already in library: "
                 + "; ".join(_fmt(n, o) for n, o in dupes)
@@ -58291,34 +59715,22 @@ class PrimerDesignScreen(Screen):
                 severity="warning", timeout=10, markup=False,
             )
             return
-
         today = _date.today().isoformat()
-
         new_primers: list[dict] = []
-        for pname, seq, tm, pos in [
-            (fwd_name, fwd_seq, result["fwd_tm"], result["fwd_pos"]),
-            (rev_name, rev_seq, result["rev_tm"], result["rev_pos"]),
-        ]:
+        for pname, seq, tm, pos, strand in pairs:
             new_primers.append({
                 "name":        pname,
                 "sequence":    seq,
                 "tm":          tm,
                 "primer_type": ptype,
                 "source":      source,
-                "pos_start":   pos[0],
-                "pos_end":     pos[1],
-                "strand":      1 if pname.endswith("-F") else -1,
+                "pos_start":   pos[0] if pos else 0,
+                "pos_end":     pos[1] if pos else 0,
+                "strand":      strand,
                 "date":        today,
                 "status":      "Designed",
             })
 
-        # Route through collision resolution so a name match (e.g. the
-        # user saving a redesigned "FOO-F" over an older "FOO-F" with a
-        # different sequence) prompts overwrite / keep / cancel instead
-        # of silently clobbering. The pre-existing sequence-dup check
-        # above already rejects exact-sequence duplicates regardless of
-        # name; this layer only fires on name collisions with different
-        # sequences. Regression guard for 2026-05-20.
         def _content_fn(p: dict) -> str:
             return (p.get("sequence") or "").upper()
 
@@ -58347,14 +59759,52 @@ class PrimerDesignScreen(Screen):
                 _save_primers(current)
             except (OSError, RuntimeError) as exc:
                 _notify_save_failure(self.app, "Primer library", exc)
+                _log_event(
+                    "primers.save.failed",
+                    n=len(items_to_save),
+                    collection=_get_active_primer_collection_name()
+                                or "",
+                    error=str(exc),
+                )
                 return
             self._refresh_library_table()
             saved_names = [p.get("name", "?") for p in items_to_save]
+            _log_event(
+                "primers.save.ok",
+                n=len(items_to_save),
+                replaced=len(replace_names or set()),
+                collection=_get_active_primer_collection_name() or "",
+            )
             self.app.notify(
                 f"Saved {' + '.join(saved_names)} to primer library.",
                 severity="success",  # type: ignore[arg-type]
                 markup=False,
             )
+            # Focus the primer library + scroll to the first
+            # just-saved primer so the user sees their landing
+            # location. `_refresh_library_table` prepends new
+            # entries, so they're at the top of the natural-sort
+            # order ONLY if their names sort first; safer to
+            # lookup by name in the new row map.
+            try:
+                tbl = self.query_one("#pd-lib-table", DataTable)
+                tbl.focus()
+                if saved_names:
+                    target = saved_names[0]
+                    primers_now = _load_primers()
+                    name_to_orig = {
+                        p.get("name") or "": i
+                        for i, p in enumerate(primers_now)
+                    }
+                    orig_idx = name_to_orig.get(target)
+                    if orig_idx is not None:
+                        try:
+                            row = self._row_to_primer_idx.index(orig_idx)
+                            tbl.move_cursor(row=row, scroll=True)
+                        except ValueError:
+                            pass
+            except NoMatches:
+                pass
             self._reset_for_new_design()
 
         _resolve_load_collisions(
@@ -58364,6 +59814,36 @@ class PrimerDesignScreen(Screen):
             on_resolved=_on_resolved,
             on_cancelled=_on_cancelled,
         )
+
+    # ── Save to primer library ─────────────────────────────────────────────
+
+    @on(Button.Pressed, "#btn-pd-save")
+    def _save_primers_btn(self, _) -> None:
+        """Inline save — reads fwd/rev name Inputs from the RESULTS
+        section and saves to whichever primer collection the right-
+        panel primer library is currently showing as ACTIVE. To
+        change destination, the user uses the 📁 collection picker
+        in the primer library panel (right side) first."""
+        result = self._det_result or self._clo_result
+        if result is None:
+            self.app.notify("Design primers first.", severity="warning")
+            return
+        try:
+            fwd_name = self.query_one(
+                "#pd-fwd-name", Input).value.strip()
+            rev_name = self.query_one(
+                "#pd-rev-name", Input).value.strip()
+        except NoMatches:
+            self.app.notify("Couldn't read primer name inputs.",
+                            severity="error")
+            return
+        if not fwd_name or not rev_name:
+            self.app.notify(
+                "Enter a name for both primers before saving.",
+                severity="warning",
+            )
+            return
+        self._commit_designed_primers_with_names([fwd_name, rev_name])
 
     # ── Add selected library primers as features ──────────────────────────
 
@@ -58496,6 +59976,177 @@ class PrimerDesignScreen(Screen):
         if pidx >= len(primers):
             return None
         return primers[pidx].get("name")
+
+    @on(Button.Pressed, "#btn-pdlib-load")
+    def _load_primers_from_plasmid(self, _) -> None:
+        """Browse plasmids across collections (via the existing
+        cross-collection LibrarySearchModal — type to filter,
+        Esc to cancel) and import every `primer_bind` feature of
+        the chosen plasmid as a primer-library entry. Saves
+        through `_save_primers` so the active primer collection
+        mirror catches the additions."""
+
+        def _on_picked(payload) -> None:
+            if not isinstance(payload, tuple) or len(payload) != 2:
+                return
+            coll_name, entry_id = payload
+            if not isinstance(entry_id, str) or not entry_id:
+                return
+            # Resolve the plasmid record. The search modal returns
+            # the cross-collection (collection, id) tuple; we look
+            # it up in the originating collection's plasmid list.
+            coll = _find_collection(coll_name) if coll_name else None
+            entry: "dict | None" = None
+            if coll is not None:
+                for p in (coll.get("plasmids") or []):
+                    if p.get("id") == entry_id:
+                        entry = p
+                        break
+            if entry is None:
+                # Fallback: try the live library.
+                entry = _find_library_entry_by_id(entry_id)
+            if entry is None:
+                self.app.notify("Couldn't locate that plasmid.",
+                                severity="warning")
+                return
+            gb_text = entry.get("gb_text") or ""
+            if not gb_text:
+                self.app.notify(
+                    "Plasmid has no stored sequence.",
+                    severity="warning",
+                )
+                return
+            try:
+                rec = _gb_text_to_record(gb_text)
+            except Exception as exc:
+                _log.exception("Load primers: parse failed")
+                self.app.notify(f"Couldn't parse plasmid: {exc}",
+                                severity="error")
+                return
+            new_primers = self._primer_entries_from_record(
+                rec, source=(entry.get("name") or entry_id),
+            )
+            if not new_primers:
+                self.app.notify(
+                    "No primer_bind features on that plasmid.",
+                    severity="information",
+                )
+                return
+            existing = _load_primers()
+            existing_seqs = {
+                (e.get("sequence") or "").upper()
+                for e in existing
+                if isinstance(e, dict)
+            }
+            fresh = [p for p in new_primers
+                     if (p.get("sequence") or "").upper()
+                     not in existing_seqs]
+            n_dup = len(new_primers) - len(fresh)
+            if not fresh:
+                self.app.notify(
+                    f"All {len(new_primers)} primer_bind feature(s) "
+                    "already in the library.",
+                    severity="information",
+                )
+                return
+            try:
+                _save_primers(fresh + existing)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(
+                    self.app, "Primer library", exc)
+                _log_event(
+                    "primers.import.failed",
+                    n=len(fresh),
+                    source=entry.get("name", entry_id),
+                    collection=(_get_active_primer_collection_name()
+                                or ""),
+                    error=str(exc),
+                )
+                return
+            _log_event(
+                "primers.import.ok",
+                n=len(fresh),
+                skipped=n_dup,
+                source=entry.get("name", entry_id),
+                collection=_get_active_primer_collection_name() or "",
+            )
+            self._refresh_library_table()
+            msg = (f"Imported {len(fresh)} primer(s) from "
+                   f"'{entry.get('name', entry_id)}'.")
+            if n_dup:
+                msg += f" Skipped {n_dup} duplicate(s)."
+            self.app.notify(msg, severity="information")
+
+        self.app.push_screen(LibrarySearchModal(), callback=_on_picked)
+
+    def _primer_entries_from_record(
+            self, rec, *, source: str = "") -> "list[dict]":
+        """Extract every primer_bind feature from `rec` as a
+        primer-library entry. Mirrors the extraction logic the
+        `.dna` import path uses but standalone so it can be called
+        from the Load Primers button as well."""
+        out: list[dict] = []
+        seq_str = str(getattr(rec, "seq", "") or "").upper()
+        n = len(seq_str)
+        if n == 0:
+            return out
+        today = _date.today().isoformat()
+        seen_seqs: set[str] = set()
+        for f in (getattr(rec, "features", None) or []):
+            if getattr(f, "type", "") != "primer_bind":
+                continue
+            try:
+                bounds = _feat_bounds(f, n)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if bounds is None:
+                continue
+            start, end, strand = bounds
+            strand = strand or 1
+            # Wrap-aware slice.
+            if end < start:
+                if not (0 <= start < n and 0 <= end <= n):
+                    continue
+                sliced_top = seq_str[start:] + seq_str[:end]
+            else:
+                if not (0 <= start < end <= n):
+                    continue
+                sliced_top = seq_str[start:end]
+            # Prefer the stamped `/primer_seq` qualifier (which
+            # preserves 5' flaps); else derive from the bound region.
+            existing_pseq = f.qualifiers.get("primer_seq", []) \
+                if hasattr(f, "qualifiers") else []
+            if existing_pseq and isinstance(existing_pseq, list):
+                bound_seq = str(existing_pseq[0]).strip().upper()
+                if not bound_seq:
+                    bound_seq = sliced_top
+                    if strand < 0:
+                        bound_seq = _rc(bound_seq)
+            else:
+                bound_seq = sliced_top
+                if strand < 0:
+                    bound_seq = _rc(bound_seq)
+            if not bound_seq or bound_seq in seen_seqs:
+                continue
+            seen_seqs.add(bound_seq)
+            label = ""
+            if hasattr(f, "qualifiers"):
+                lbl = f.qualifiers.get("label", [])
+                if isinstance(lbl, list) and lbl:
+                    label = str(lbl[0])
+            out.append({
+                "name":        label or f"primer_{len(out)+1}",
+                "sequence":    bound_seq,
+                "tm":          None,
+                "primer_type": "imported",
+                "source":      source,
+                "pos_start":   start,
+                "pos_end":     end,
+                "strand":      1 if strand >= 0 else -1,
+                "date":        today,
+                "status":      "Designed",
+            })
+        return out
 
     @on(Button.Pressed, "#btn-pdlib-rename")
     def _rename_primer(self, _) -> None:
@@ -61546,6 +63197,7 @@ class RestoreFromBackupModal(ModalScreen):
         ("Collections",          "_COLLECTIONS_FILE"),
         ("Parts bin",            "_PARTS_BIN_FILE"),
         ("Primers",              "_PRIMERS_FILE"),
+        ("Primer collections",   "_PRIMER_COLLECTIONS_FILE"),
         # Sweep #9 (2026-05-19): 0.9.6 added these persisted files
         # but the in-app restore UI was never extended; users had
         # backups on disk with no UI to reach them.
@@ -69988,34 +71640,41 @@ SpeciesPickerModal { align: center middle; }
 }
 #pd-title { background: $primary-darken-2; color: $text; padding: 0 1; }
 
-/* Section wrapper: titled box around each logical group. Height hugs
-   content (no flex-grow) so sections stack tightly without leftover rows. */
+/* Section wrapper — borders removed 2026-05-21 for space-efficient
+   tabbed layout. Sections stack as flat regions; the active tab at
+   the top of the left page is the only visible boundary. */
 .pd-section {
     width: 100%;
     height: auto;
-    border: round $primary-darken-2;
-    padding: 0 1;
+    border: none;
+    padding: 0;
     margin: 1 0 0 0;
 }
 .pd-section-hdr {
     width: 100%; height: 1;
-    color: $text;
-    background: $primary-darken-2;
+    color: $text-muted;
     text-style: bold;
     padding: 0 1;
-    margin: 0 0 0 0;
+    margin: 0;
 }
 
 /* ── Open-book split: workflow (left page) + library (right page).
-   Left gets 3fr because it has more content (template + mode + params +
-   results); right gets 2fr (library datatable). Mins keep each page
-   usable on narrow terminals. ── */
+   Layout (2026-05-21): TEMPLATE full-width on top, MODE +
+   PARAMETERS side-by-side, RESULTS full-width below — frees the
+   entire right page for the primer library to span full height.
+   Left page gets a bit more flex (3fr) because it carries 4 sections;
+   right page gets 2fr but uses the WHOLE column for the table. ── */
 #pd-book { width: 100%; height: 1fr; }
 #pd-left-page {
     width: 3fr;
     min-width: 60;
     height: 1fr;
     padding-right: 1;
+    /* Scroll vertically if the active tab's content exceeds the
+       page height (e.g. Cloning mode's 3-row params panel + a
+       long Primer3 result preview). Avoids the previous clipping
+       where RESULTS could fall below the footer. */
+    overflow-y: auto;
 }
 #pd-right-page {
     width: 2fr;
@@ -70023,40 +71682,118 @@ SpeciesPickerModal { align: center middle; }
     height: 1fr;
 }
 
-/* Sections stack vertically inside the left page, all full-width.
-   Template and Mode get margin-top: 0 so the page starts compactly:
-   Panel 1 moves up 1 row (closes the title→panel-1 gap), Panel 2 moves
-   up 2 rows (same gap closed plus cascade from Panel 1 moving up),
-   Panel 3 stays on its margin-top:1 and cascades up 2 rows too. */
-#pd-template-section,
-#pd-mode-section,
-#pd-params-section { width: 100%; height: auto; }
-#pd-template-section { margin-top: 0; }
-#pd-mode-section     { margin-top: 0; }
+/* Sections stack vertically inside the left page. Uniform 0
+   margin-top between every pair so title→panel gap is consistent.
+   `height: auto` everywhere so each panel sizes to its content —
+   no clipping when a mode swap shows the tallest panel (Cloning:
+   3 inner rows, Detection: 5 rows incl. stacked labels). */
+#pd-template-section { width: 100%; height: auto; margin-top: 0; }
+/* MODE / PARAMS / RESULTS sit tight against the panel above
+   (margin-top: 0) so the column closes up vertically — RESULTS
+   doesn't fall off the bottom of a 24-row terminal. PARAMS and
+   RESULTS auto-size to content; MODE gets `height: 100%` below
+   to stretch its border down to PARAMETERS' bottom edge. */
+#pd-results-section { width: 100%; height: auto; margin-top: 0; }
 
-/* Results section (right page, above library). Gets more height for
-   the roomy 2-row name/button layout. */
-#pd-results-section { width: 100%; height: auto; margin: 0 0 1 0; }
+/* Mode tab BAR at top of left page. Muted inactive tabs, bold
+   accent on the active tab, primary underline color. No bg fill
+   (the dark bar was just `$panel` showing through). */
+#pd-mode-tabs {
+    width: 100%;
+    height: 2;
+    margin: 0;
+    padding: 0;
+}
+#pd-mode-tabs Tab {
+    padding: 0 2;
+    margin: 0;
+    color: $text-muted;
+}
+#pd-mode-tabs Tab.-active {
+    color: $text;
+    text-style: bold;
+}
+#pd-mode-tabs Underline { color: $primary; }
+
+/* Params section: shared Vertical; the active tab toggles which
+   mode-specific panel is visible (via _switch_mode). */
+#pd-params-section { width: 100%; height: auto; margin-top: 0; }
 
 /* TEMPLATE */
 #pd-src-row { height: 3; align: left middle; }
-#pd-src-row Label { width: auto; padding: 0 1 0 0; content-align: center middle; }
+/* Labels in the source row are 3 rows tall so their text centers
+   vertically on the same baseline as the Select dropdown +
+   change Button (both 3 rows). Without the explicit height the
+   single-line Label sat on the top row of the box. */
+#pd-src-row Label {
+    width: auto;
+    height: 3;
+    padding: 0 1 0 0;
+    content-align: center middle;
+}
 #pd-src-row #pd-source { width: 22; }
 #pd-plasmid-lbl { margin-left: 2; }
 #pd-plasmid-name {
     width: auto; max-width: 40;
+    height: 3;
     padding: 0 1;
     content-align: left middle;
-    color: $accent;
+    /* Green = active / loaded plasmid name. `$success` tracks the
+       theme; mirrors the `+ NEW` button accent on the primer
+       library panel. */
+    color: $success;
+    text-style: bold;
 }
 #pd-src-row #btn-pd-pickplasmid { min-width: 10; margin-left: 1; }
 
 .pd-source-panel { height: auto; }
+/* Feature row needs height: 4 to fit the Select + Inputs' 3-row
+   border boxes plus their interior label row above — height: 3
+   was clipping the bottom border (the "gray bar" the user saw). */
 #pd-src-feature { height: 4; margin-top: 1; }
-#pd-feat-col  { width: 3fr; padding-right: 1; }
-#pd-start-col { width: 9;  padding-right: 1; }
-#pd-end-col   { width: 9;  padding-right: 1; }
-#pd-name-col  { width: 2fr; min-width: 18; }
+#pd-feat-col  { width: 1fr; padding-right: 1; }
+/* Start/End inputs widened to width 11 (9 cols content inside
+   the border) so 5-digit positions like "12345" fit comfortably. */
+#pd-start-col { width: 13; padding-right: 0; }
+#pd-end-col   { width: 13; padding-left: 0; }
+/* Suppress Textual's auto-validation border on the position
+   Inputs — `type="integer"` flips the border green (-valid) or
+   red (-invalid) as soon as a value is present. The user found
+   the post-Design color flash distracting; force the default
+   border in every state. */
+#pd-start.-valid,
+#pd-start.-invalid,
+#pd-end.-valid,
+#pd-end.-invalid {
+    border: tall $primary-background;
+}
+/* `..` separator between start/end. The neighboring columns
+   stack a 1-row Label above a 3-row Input, so the Input's
+   content (middle row) sits at offset_y=2 within the 4-row
+   row. `padding-top: 1` shifts the Static text down one row
+   to land on that same baseline; `content-align: center middle`
+   then centers the `..` glyph horizontally + vertically within
+   the remaining 3 rows. */
+#pd-pos-sep {
+    width: 3;
+    height: 4;
+    padding-top: 1;
+    content-align: center middle;
+    color: $text-muted;
+    text-style: bold;
+    offset: 1 0;
+}
+/* Labels above the Select / Input boxes get padding-left: 1 so
+   their text starts at the same column as the value INSIDE the
+   widget's border, not at the border itself. */
+#pd-feat-col > Label,
+#pd-start-col > Label,
+#pd-end-col > Label {
+    padding-left: 1;
+}
+/* Part name moved to the source row (next to Change button). */
+#pd-part-name-lbl { margin-left: 2; }
+#pd-src-row #pd-part-name { width: 1fr; min-width: 16; }
 #pd-feat      { width: 100%; }
 #pd-start, #pd-end { width: 100%; }
 #pd-part-name { width: 100%; }
@@ -70065,11 +71802,12 @@ SpeciesPickerModal { align: center middle; }
 #pd-custom-seq { height: 6; min-height: 4; }
 
 #pd-feat-info { height: 1; margin-top: 1; }
-#pd-wrap-hint { height: 1; margin-top: 1; }
+/* #pd-wrap-hint removed 2026-05-21 along with the Tip label. */
 
 /* MODE — stacked radio set (all 4 options visible) */
-#pd-mode-radio { height: auto; padding: 0 1; background: transparent; border: none; }
-#pd-mode-radio RadioButton { padding: 0 1; margin: 0; background: transparent; }
+/* MODE radio buttons removed 2026-05-21 — replaced by
+   TabbedContent. Tab styling inherits from the global Textual
+   theme; no extra CSS needed. */
 
 /* PARAMETERS — mode panels + docked Design button, one active at a time.
    height: auto so single-row panels (Detection, Generic) stay 3 rows and
@@ -70077,17 +71815,61 @@ SpeciesPickerModal { align: center middle; }
 .pd-mode-panel { height: auto; padding: 0; }
 /* Each inner row inside a multi-row panel. */
 .pd-mode-row { height: 3; align: left middle; padding: 0; }
-/* Labels & inputs uniform across all rows. */
+/* Labels & inputs uniform across all rows.
+   Label height matches Input height (3) so `content-align: center
+   middle` lands the label text on the same baseline as the Input's
+   value — clean vertical alignment across the whole panel.
+   Symmetric horizontal padding gives each label equal breathing
+   room on either side so it sits centered between the text boxes. */
 .pd-mode-panel Label, .pd-mode-row Label {
-    width: auto; padding: 0 0 0 1; content-align: center middle;
+    width: auto;
+    height: 3;
+    padding: 0 1;
+    content-align: center middle;
 }
-.pd-mode-panel Input { width: 10; margin: 0 0; }
+.pd-mode-panel Input { width: 10; height: 3; margin: 0 0; }
 /* Single-row (Horizontal) panels also need an align rule. */
-#pd-panel-det, #pd-panel-gen { height: 3; align: left middle; }
+#pd-panel-gen { height: 3; align: left middle; }
+/* Detection panel uses the grouped layout below — taller to fit
+   the 2-line stacked labels + Input row underneath. */
+#pd-panel-det { height: 5; align: left top; }
 
-/* Detection: product min/max (3-4 digit bp); Tm, Len (2-3 digit). */
+/* Grouped-field pattern: stacked 2-line label on top, input(s)
+   below. Total height = label(2) + input(3) = 5. Uniform
+   `margin-right: 2` between groups gives even horizontal spacing
+   across the panel. */
+.pd-fld-group {
+    width: auto;
+    height: 5;
+    margin-right: 2;
+    align: left top;
+}
+.pd-fld-stacked-lbl {
+    width: auto;
+    height: 2;
+    color: $text-muted;
+    text-style: bold;
+    content-align: left top;
+    padding: 0 1 0 0;
+}
+.pd-fld-inline {
+    width: auto;
+    height: 3;
+    align: left middle;
+}
+.pd-fld-sep {
+    width: 3;
+    height: 3;
+    content-align: center middle;
+    color: $text-muted;
+}
+
+/* Detection: amplicon size min/max — width 10 (8 cols of content
+   inside the border) so 4-digit values like "9999" sit
+   comfortably without clipping. Tm, Len stay narrow (2-3 digit
+   values). */
 #pd-det-min, #pd-det-max { width: 10; }
-#pd-det-tm, #pd-det-len  { width: 10; }
+#pd-det-tm, #pd-det-len  { width: 8; }
 
 /* Cloning: RE Select fits longest label (~21 chars) + chrome;
    custom-RE Input roomy for 6-12 bp recognition sites + padding. */
@@ -70109,32 +71891,101 @@ SpeciesPickerModal { align: center middle; }
 #pd-design-row Button { min-width: 26; }
 
 /* ── RESULTS section ── */
-#pd-results { height: auto; min-height: 4; max-height: 14; padding: 0 1; }
+/* Trimmed min-height 4 → 3 to claw back a row so the RESULTS
+   section (header + preview + names + action buttons) fits in
+   ~12 rows total — TEMPLATE(16) + MODE/PARAMS(12) + RESULTS(12)
+   = 40, equal to the 40-row left page. Preview can still grow
+   to 14 when long primer pairs come back from Primer3. */
+#pd-results { height: auto; min-height: 3; max-height: 14; padding: 0 1; }
 /* Name inputs: full-width row so each fwd/rev box is ~2× longer than
    when it shared a row with the Save/Add-to-Map buttons. */
-#pd-result-names { height: 3; align: left middle; margin-top: 1; }
+/* margin-top: 0 (was 1) — closes the empty row between the
+   primer preview and the name inputs. Saves 1 row so RESULTS
+   fits within the left page without colliding with the footer. */
+/* `offset-y: -1` pulls the primer-name row up one row from where
+   it would naturally sit (right after #pd-feat-info), without
+   shifting any other widget. */
+#pd-result-names {
+    height: 3;
+    align: left middle;
+    margin-top: 0;
+    offset: 0 -1;
+}
 #pd-result-names Input { width: 1fr; margin-right: 1; }
-/* Action buttons now sit on their own row below the name inputs. */
-#pd-result-actions { height: 3; align: right middle; margin-top: 0; }
-#pd-result-actions Button { min-width: 18; margin-left: 1; }
+/* Action buttons docked at the bottom of the left page — always
+   reachable regardless of how tall the RESULTS preview grows.
+   Centered horizontally with even spacing between buttons; no
+   background fill (the dark bar was just `$panel` showing). */
+#pd-bottom-actions {
+    dock: bottom;
+    width: 100%;
+    height: 3;
+    align: center middle;
+    padding: 0 1;
+}
+#pd-bottom-actions Button {
+    width: auto;
+    min-width: 22;
+    margin: 0 2;
+}
 
 /* ── PRIMER LIBRARY (right page) — header bar + DataTable ── */
 /* Sits at the top of pd-right-page, no outer margin (the book's own gap
    between left and right pages is pd-left-page's padding-right). */
 #pd-lib-hdr-row {
-    height: 3;
+    height: 4;
     align: left middle;
-    background: $accent-darken-2;
+    background: $panel;
     padding: 0 1;
     margin-top: 0;
 }
 #pd-lib-hdr {
+    /* Two-line header: title on top, active-collection name below.
+       Claims all remaining row width so long collection names get
+       breathing room. */
     width: 1fr;
+    height: auto;
+    padding-right: 1;
+}
+#pd-lib-hdr-title {
+    width: 1fr;
+    height: 1;
     color: $text;
     text-style: bold;
     content-align: left middle;
 }
-#pd-lib-hdr-row Button { min-width: 10; margin-left: 1; }
+#pd-lib-hdr-sub {
+    width: 1fr;
+    height: 1;
+    color: $text-muted;
+    content-align: left middle;
+}
+/* Header-row buttons size to their label (width: auto). Margin-
+   left provides even spacing. Per-button overrides below set the
+   semantic colors (NEW / DELETE / Close). */
+#pd-lib-hdr-row Button {
+    width: auto;
+    min-width: 5;
+    margin-left: 1;
+}
+/* Group containers size to their children (sum of buttons +
+   margins), no flex. */
+#pd-lib-primers-btns, #pd-lib-coll-btns {
+    width: auto;
+    height: auto;
+}
+/* Semantic colors:
+     `NEW`    → blue ($primary) — matches LibraryPanel's `+` style
+     `DELETE` → red   = destructive
+     `Close`  → gray  = neutral, distinct from delete
+   `$primary` / `$error` / `$panel` come from the active Textual
+   theme so they track theme switches. */
+#btn-pdlib-coll-add { background: $primary; }
+#btn-pdlib-coll-add:hover { background: $primary-lighten-1; }
+#btn-pdlib-del { background: $error; }
+#btn-pdlib-del:hover { background: $error-lighten-1; }
+#btn-pd-close { background: $panel-lighten-2; }
+#btn-pd-close:hover { background: $panel-lighten-3; }
 #pd-lib-table { width: 100%; height: 1fr; min-height: 6; }
 
 .pd-fld-lbl { width: auto; padding: 0 1 0 0; }
@@ -70178,11 +72029,20 @@ SpeciesPickerModal { align: center middle; }
         Binding("alt+shift+a", "clear_alignments", "Clear aligns",  show=False, priority=True),
         Binding("ctrl+e",      "edit_seq",         "Edit seq",      show=False),
         Binding("ctrl+shift+f","capture_to_features", "→ Feat lib", show=False, priority=True),
-        # Alt+D — capture a Markdown UI snapshot to <DATA_DIR>/
-        # ui_snapshots/. Always available (priority=True so it fires
-        # even from inside modals where the user is most likely to
-        # hit a bug worth reporting). Existing seq-panel debug-mode
-        # toggle moved to alt+shift+d. See `action_capture_ui_snapshot`.
+        # UI snapshot — capture a Markdown dump to <DATA_DIR>/
+        # ui_snapshots/ AND copy to clipboard via the 4-tier
+        # fallback. F9 and Ctrl+U cover the cross-platform
+        # capture-key problem (Steam grabs F12, IBus grabs
+        # Ctrl+Shift+U, Windows Terminal grabs Alt+letter — these
+        # two arrive cleanly on every tested platform).
+        # PlasmidApp.on_key also dispatches as belt-and-braces.
+        Binding("ctrl+u",      "capture_ui_snapshot",
+                "UI snapshot", show=False, priority=True),
+        Binding("f9",          "capture_ui_snapshot",
+                "UI snapshot", show=False, priority=True),
+        # Alt+D kept as legacy alias — Windows Terminal swallows
+        # it, but Linux / macOS terminals + the regression test
+        # suite expect it. Belt + braces.
         Binding("alt+d",       "capture_ui_snapshot",
                 "UI snapshot", show=False, priority=True),
         # Panel focus shortcuts: each F-key collapses the multi-panel
@@ -70305,6 +72165,12 @@ SpeciesPickerModal { align: center middle; }
         # Both helpers are idempotent.
         _ensure_default_collection()
         _restore_library_from_active_collection()
+        # Same idempotent migration for primer collections — wraps any
+        # pre-existing flat `primers.json` entries into a "Main"
+        # collection on first launch; no-op afterwards. Same
+        # leaves→root mount-ordering rationale as plasmid collections.
+        _ensure_default_primer_collection()
+        _restore_primers_from_active_primer_collection()
         # Same idempotent migration for parts bins — wraps legacy
         # `parts_bin.json` into "Main Parts Bin" on first run; no-op
         # afterwards. MUST run here (not on_mount) for the same
@@ -71091,6 +72957,7 @@ SpeciesPickerModal { align: center middle; }
                                        "Parts-bin collections",
                                        "_parts_bin_collections_cache"),
             (_PRIMERS_FILE,            "Primer library",      "_primers_cache"),
+            (_PRIMER_COLLECTIONS_FILE, "Primer collections",  "_primer_collections_cache"),
             (_COLLECTIONS_FILE,        "Plasmid collections", "_collections_cache"),
             (_ENTRY_VECTORS_FILE,      "Entry vectors",       "_entry_vectors_cache"),
             (_SETTINGS_FILE,           "Settings",            "_settings_cache"),
@@ -71713,7 +73580,7 @@ SpeciesPickerModal { align: center middle; }
             text = top
             label = "top strand"
         mode, detail = _copy_to_clipboard_with_fallback(
-            self, text, label=label.replace(" ", "_"),
+            self, text, label=label,
         )
         self._notify_copy_outcome(len(text), f"bp ({label})", mode, detail)
 
@@ -71824,6 +73691,24 @@ SpeciesPickerModal { align: center middle; }
         self._clear_all_highlights()
 
     def on_key(self, event) -> None:
+        # UI snapshot fallback: route through on_key directly so the
+        # capture works even when a focused widget (Input, DataTable,
+        # Select) or a nested Screen swallows the binding system's
+        # dispatch before priority=True can fire. Verified on WSL
+        # Ubuntu / Windows Terminal 2026-05-21 where the binding-
+        # based route silently failed but on_key arrival was clean.
+        #
+        # Note: terminals collapse `ctrl+shift+<letter>` to plain
+        # `ctrl+<letter>` (same control byte), so only `ctrl+u`
+        # arrives — there's no way to distinguish Shift held.
+        if getattr(event, "key", "") in ("f9", "ctrl+u"):
+            try:
+                self.action_capture_ui_snapshot()
+                event.stop()
+                return
+            except Exception:
+                _log.exception("UI snapshot fallback failed")
+
         sp = self.query_one("#seq-panel", SequencePanel)
 
         # ── Ctrl+Z: undo ──────────────────────────────────────────────────────
@@ -72271,12 +74156,23 @@ SpeciesPickerModal { align: center middle; }
         kwargs.setdefault("severity", "success")
         self.notify(message, **kwargs)
 
+    #: Universal toast linger (seconds). Applied to every
+    #: `self.notify(...)` call that doesn't pass `timeout=` explicitly,
+    #: overriding Textual's 5-second default. Per-call overrides still
+    #: win (e.g. UI-snapshot toast uses 10, save-failed uses 8-12).
+    _NOTIFY_DEFAULT_TIMEOUT_S = 3.0
+
     def notify(self, message, **kwargs) -> None:
         """Suppress toast notifications while the splash is up so they
         don't render on top of the helix; queue them (capped at 16) and
         replay on splash dismiss in `_on_splash_dismissed`. Errors and
         warnings are still logged via the call sites' `_log.exception`,
-        so nothing is silently lost even if the queue overflows."""
+        so nothing is silently lost even if the queue overflows.
+
+        Also sets a universal `timeout` default of
+        `_NOTIFY_DEFAULT_TIMEOUT_S` when the caller didn't specify
+        one — pre-fix Textual defaulted to 5 s which felt sluggish."""
+        kwargs.setdefault("timeout", self._NOTIFY_DEFAULT_TIMEOUT_S)
         if isinstance(self.screen, SplashScreen):
             if len(getattr(self, "_splash_notify_queue", [])) < 16:
                 self._splash_notify_queue.append((message, kwargs))
@@ -75685,7 +77581,10 @@ SpeciesPickerModal { align: center middle; }
             self.action_open_constructor()
             return
         if name == "Primers":
-            self.action_open_primer_design()
+            # Menubar entry always opens the designer directly —
+            # never the workflow picker (the picker is reserved
+            # for Ctrl+P with a seq-panel selection).
+            self._open_primer_design_impl(show_picker=False)
             return
         if name == "Mutagenize":
             self.action_open_mutagenize()
@@ -76694,17 +78593,85 @@ SpeciesPickerModal { align: center middle; }
 
     @_action_log("app.open.primer_design")
     def action_open_primer_design(self) -> None:
-        """Open the full-screen Primer Design workbench. Passes the current
-        plasmid's sequence and features so the user can select regions."""
+        """Ctrl+P entry point. Behaviour (2026-05-21):
+          * If the seq panel has a non-trivial highlight, push
+            `PrimerTypePickerModal` first so the user picks the
+            workflow; the designer opens with that tab AND the
+            selection pre-filled (exact-match feature auto-picks
+            the Feature dropdown).
+          * Otherwise, open the designer directly on Detection.
+        """
+        self._open_primer_design_impl(show_picker=True)
+
+    def _open_primer_design_impl(
+            self, *, show_picker: bool) -> None:
+        """Shared implementation. `show_picker=True` honors the
+        Ctrl+P contract (picker only when there's a selection);
+        `show_picker=False` (called from the menubar) always
+        opens the designer directly."""
         rec = self._current_record
+        if rec is None or not getattr(rec, "seq", None):
+            self.notify(
+                "Load a plasmid first to design primers.",
+                severity="warning",
+            )
+            return
         seq   = str(rec.seq) if rec else ""
-        name  = rec.name if rec else ""
+        # Prefer the spaces-preserved display name when the record
+        # carries one (set on .dna/.gb imports whose filename had
+        # spaces, and on every save through `_apply_record`). Falls
+        # back to the GenBank LOCUS only when no display name was
+        # stashed — LOCUS is space-stripped per INSDC spec so it
+        # shows underscores. Sacred per the no-add-underscores rule.
+        name = ""
+        if rec is not None:
+            display = getattr(rec, "_tui_display_name", None)
+            if isinstance(display, str) and display.strip():
+                name = display.strip()
+            else:
+                name = rec.name or ""
         feats = []
         try:
             feats = self.query_one("#plasmid-map", PlasmidMap)._feats
         except NoMatches:
             pass
-        self.push_screen(PrimerDesignScreen(seq, feats, name))
+        sel_range: "tuple[int, int] | None" = None
+        try:
+            sp = self.query_one("#seq-panel", SequencePanel)
+            sel = sp._user_sel or sp._sel_range
+            if sel is not None:
+                s, e = sel
+                n = len(sp._seq) if sp._seq else 0
+                if n:
+                    span = _feat_len(s, e, n)
+                    if span > 1:
+                        sel_range = (s, e)
+        except NoMatches:
+            pass
+
+        # Show the workflow picker ONLY when called from Ctrl+P
+        # AND the user has a non-trivial seq-panel selection.
+        # Menubar invocation (`show_picker=False`) and Ctrl+P with
+        # no selection both open the designer directly on
+        # Detection so the user can pick the workflow inside.
+        if show_picker and sel_range is not None:
+            def _on_type_picked(mode) -> None:
+                if not isinstance(mode, str):
+                    return
+                self.push_screen(
+                    PrimerDesignScreen(seq, feats, name,
+                                       selection_range=sel_range,
+                                       initial_mode=mode),
+                )
+            self.push_screen(
+                PrimerTypePickerModal(),
+                callback=_on_type_picked,
+            )
+            return
+        self.push_screen(
+            PrimerDesignScreen(seq, feats, name,
+                               selection_range=sel_range),
+        )
 
     @_action_log("app.open.mutagenize")
     def action_open_mutagenize(self) -> None:
@@ -76809,23 +78776,41 @@ SpeciesPickerModal { align: center middle; }
         return super().push_screen(screen, *args, **kwargs)
 
     def action_capture_ui_snapshot(self) -> None:
-        """Alt+D — write a Markdown dump of the current UI state to
-        `<DATA_DIR>/ui_snapshots/`. The user can attach the file to
-        a bug report or paste it into a chat with an AI assistant.
+        """F12 / Alt+D — write a Markdown dump of the current UI
+        state to `<DATA_DIR>/ui_snapshots/` AND copy the contents to
+        the system clipboard (via the 4-tier fallback) so the user
+        can paste directly into a bug report / AI chat without
+        hunting for the file.
 
         Defensive: every accessor in `_collect_ui_snapshot` is wrapped
         in try/except so a half-mounted app can still capture. Disk
-        failures are notified, never raised — alt+d should NEVER be
-        a way to crash the app.
+        failures are notified, never raised — the snapshot key
+        should NEVER be a way to crash the app.
         """
         try:
             snap = _collect_ui_snapshot(self)
             text = _format_ui_snapshot(snap)
             path = _save_ui_snapshot(text)
             _log.info("UI snapshot captured: %s", path)
+            # Best-effort clipboard copy. Tier-2 (OSC 52) works
+            # over SSH / WSL where tier-1 (Textual native) often
+            # fails; tier-3 spills to a fallback file. Failure
+            # here doesn't block — the user always has the saved
+            # snapshot file as backup.
+            clip_mode = "saved"
+            try:
+                mode, _detail = _copy_to_clipboard_with_fallback(
+                    self, text, label="ui-snapshot",
+                )
+                if mode in ("textual", "osc52"):
+                    clip_mode = "saved + copied to clipboard"
+            except Exception:
+                _log.exception(
+                    "UI snapshot clipboard copy failed (non-fatal)"
+                )
             self.notify(
-                f"UI snapshot saved to:\n{path}\n"
-                "Email this file to your bug report.",
+                f"UI snapshot {clip_mode}:\n{path}\n"
+                "Paste into your bug report or AI chat.",
                 title="Snapshot captured",
                 severity="information",
                 timeout=10,
@@ -77165,7 +79150,20 @@ def main():
     # (test conftest leaves this True so the suite never hits the
     # network). The worker is also gated by the user's persisted
     # `check_updates` setting — both must be true for a fetch.
-    app._skip_update_check = False
+    #
+    # Dev-tree detection (2026-05-21): when splicecraft.py is run
+    # directly from a source checkout (sibling pyproject.toml + .git
+    # dir), `__version__` reflects the in-progress branch and is
+    # almost always BEHIND the latest PyPI release — the update modal
+    # nags the dev to "update to X" when they're actively writing
+    # the X+1 release. Skip the check entirely in that case. A
+    # pipx / pip-installed `splicecraft` binary lives outside the
+    # repo and falls through to the normal opt-in.
+    _here = Path(__file__).resolve().parent
+    _is_dev_checkout = (
+        (_here / "pyproject.toml").exists() and (_here / ".git").exists()
+    )
+    app._skip_update_check = bool(_is_dev_checkout)
     # First-run NCBI seed is suppressed in shipped releases — a fresh
     # install starts with an empty library + clean canvas rather than
     # silently pulling MW463917.1 from NCBI. Demo / dev builds that

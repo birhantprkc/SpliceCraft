@@ -14,6 +14,22 @@
 
 ---
 
+## [0.9.14] — 2026-05-21
+
+_(auto-generated from commits since v0.9.13)_
+
+* Sweep #22 — load-bearing function audit + file-migration coverage · invariant #63
+* Sweep #21 — modal-staleness audit · invariant #62
+* Sweep #20 — agent-API gaps + event logger + invariant retrofit · invariant #61
+* Sweep #17 — insert-at-cursor boundary-extend kwarg · invariant #58
+* Sweep #16 — dithered protein lane art + distinct motif colors + CI lint gate · invariant #57
+* Sweep #15 — pre-colored AA features + Edit buttons · invariant #56
+* Clone Fragment prefills Domesticator direct-input atomically · invariant #55
+* Synthesis audit sweep #14 — Save As / unique-id / Clone Fragment · invariant #55
+* Synthesis composer (DNA + Protein tabs) · modal centering · invariants #53–#54
+
+---
+
 ## [0.9.12] — 2026-05-21
 
 _(auto-generated from commits since v0.9.13)_

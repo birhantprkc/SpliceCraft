@@ -46,6 +46,7 @@ def _protect_user_data(tmp_path, monkeypatch):
         ("_PARTS_BIN_FILE",       "_parts_bin_cache"),
         ("_PARTS_BIN_COLLECTIONS_FILE", "_parts_bin_collections_cache"),
         ("_PRIMERS_FILE",         "_primers_cache"),
+        ("_PRIMER_COLLECTIONS_FILE", "_primer_collections_cache"),
         ("_CODON_TABLES_FILE",    "_codon_tables_cache"),
         ("_FEATURES_FILE",        "_features_cache"),
         ("_FEATURE_COLORS_FILE",  "_feature_colors_cache"),
