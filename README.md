@@ -134,7 +134,7 @@ installs and the user-data directory location.
   through save as CDS sub-features.
 - **Search** your library with in-process BLASTN / BLASTP / HMMscan
   (via `pyhmmer` — no external `blast+` install).
-- **Drive from outside** via a 60+ endpoint localhost JSON API
+- **Drive from outside** via an 80+ endpoint localhost JSON API
   (`splicecraft --agent`) and a stdlib-only CLI sidecar
   (`splicecraft-cli`).
 

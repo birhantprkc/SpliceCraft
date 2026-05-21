@@ -2689,10 +2689,18 @@ def _collect_ui_snapshot(app=None) -> dict:
         "log_tail": "",
     }
     if app is not None:
+        # Broad `except Exception` is INTENTIONAL inside `_collect_ui_snapshot`:
+        # the test `test_collect_ui_snapshot_handles_broken_app` constructs a
+        # pathological `__getattr__`-raising stub and asserts the snapshot
+        # survives without exception. Narrowing to `(AttributeError, TypeError)`
+        # broke that contract — `RuntimeError` from a bad app got through.
+        # Diagnostic capture must NEVER crash the app the user is trying to
+        # diagnose. Sweep #20 tried to narrow these and got bitten; reverted
+        # with this comment to lock in the rationale.
         try:
             stack = list(getattr(app, "screen_stack", []) or [])
             snap["screen_stack"] = [type(s).__name__ for s in stack]
-        except Exception:
+        except Exception:  # noqa: BLE001 — broken-app survival; see comment above
             pass
         try:
             focused = getattr(app, "focused", None)
@@ -2702,13 +2710,13 @@ def _collect_ui_snapshot(app=None) -> dict:
                     "id": getattr(focused, "id", None),
                     "classes": list(getattr(focused, "classes", []) or []),
                 }
-        except Exception:
+        except Exception:  # noqa: BLE001 — broken-app survival
             pass
         try:
             xy = getattr(app, "_last_mouse_xy", None)
             if xy is not None and len(xy) == 2:
                 snap["mouse_position"] = {"x": int(xy[0]), "y": int(xy[1])}
-        except Exception:
+        except Exception:  # noqa: BLE001 — broken-app survival
             pass
         try:
             size = getattr(app, "size", None)
@@ -2717,7 +2725,7 @@ def _collect_ui_snapshot(app=None) -> dict:
                     "cols": int(getattr(size, "width", 0)),
                     "rows": int(getattr(size, "height", 0)),
                 }
-        except Exception:
+        except Exception:  # noqa: BLE001 — broken-app survival
             pass
         # Current record summary — NO sequence content.
         try:
@@ -2741,23 +2749,23 @@ def _collect_ui_snapshot(app=None) -> dict:
                     "map_mode": getattr(app, "map_mode", None),
                     "selected_idx": getattr(app, "_selected_idx", None),
                 }
-        except Exception:
+        except Exception:  # noqa: BLE001 — broken-app survival
             pass
         # App-level user-toggleable settings.
         try:
             snap["active_collection"] = getattr(app, "_active_collection", None)
             snap["active_grammar"] = getattr(app, "_active_grammar", None)
-        except Exception:
+        except Exception:  # noqa: BLE001 — broken-app survival
             pass
     # Settings from disk — same view a fresh launch would see.
     try:
         snap["settings"] = dict(_load_settings() or {})
-    except Exception:
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
         pass
     # Log tail — scrubbed of home directory paths.
     try:
         snap["log_tail"] = _scrub_path(_read_log_tail())
-    except Exception:
+    except (OSError, UnicodeDecodeError):
         snap["log_tail"] = ""
     return snap
 
@@ -3038,7 +3046,7 @@ def _build_system_info() -> dict:
                 info["operational_files_present"].append({
                     "attr": attr, "name": p.name,
                 })
-    except Exception:
+    except (AttributeError, TypeError, OSError):
         pass
     return info
 
@@ -3135,7 +3143,7 @@ def _create_diagnostic_bundle(out_path: "Path | None" = None) -> Path:
                 info = _build_system_info()
                 zf.writestr("system_info.json",
                               json.dumps(info, indent=2))
-            except Exception:
+            except (OSError, TypeError, ValueError):
                 pass
 
             # 5. README pointing at how to use the bundle.
@@ -11487,7 +11495,7 @@ class PlasmidMap(Widget):
                     "(press 'v' to switch).",
                     severity="information", timeout=3,
                 )
-            except Exception:
+            except (AttributeError, RuntimeError):
                 pass
             return
         idx = self.selected_idx
@@ -11498,7 +11506,7 @@ class PlasmidMap(Widget):
                     "origin at the highlighted feature's start.",
                     severity="information", timeout=3,
                 )
-            except Exception:
+            except (AttributeError, RuntimeError):
                 pass
             return
         f = self._feats[idx]
@@ -11523,7 +11531,7 @@ class PlasmidMap(Widget):
             return
         try:
             self.post_message(self.OriginChanged(int(new), int(self._total)))
-        except Exception:
+        except (AttributeError, RuntimeError):
             pass
 
     # ── Linear-view zoom + pan ─────────────────────────────────────────────
@@ -11632,7 +11640,7 @@ class PlasmidMap(Widget):
                     "circular view.",
                     severity="warning", timeout=4,
                 )
-            except Exception:
+            except (AttributeError, RuntimeError):
                 pass
             return
         self._map_mode = "linear" if self._map_mode == "circular" else "circular"
@@ -11643,7 +11651,7 @@ class PlasmidMap(Widget):
             persist = getattr(self.app, "_persist_map_mode_for_active", None)
             if callable(persist):
                 persist(self._map_mode)
-        except Exception:
+        except (AttributeError, OSError, RuntimeError):
             _log.exception("toggle_map_view: persist failed")
         self.refresh()
 
@@ -13140,6 +13148,7 @@ class FeatureSidebar(Widget):
         self.post_message(self.RowActivated(feat_idx,
                                               shift=self._consume_shift()))
 
+    @_action_log("app.feature_sidebar.open_at_cursor")
     def action_open_feature_at_cursor(self) -> None:
         """Open the FeatureEditModal for the row the table cursor is
         currently on. Bound to Enter at the sidebar level (with
@@ -15653,6 +15662,7 @@ class SequencePanel(Widget):
     #seq-scroll { height: 1fr; }
     """
 
+    @_action_log("app.sequence.open_feature")
     def action_open_selected_feature(self) -> None:
         """Enter on the seq panel — open the FeatureEditModal for the
         currently-selected feature on the plasmid map. No-op if
@@ -16139,7 +16149,7 @@ class SequencePanel(Widget):
         def _on_scroll_y_changed(new_y: float) -> None:
             try:
                 vp_h = max(1, int(scroll.size.height))
-            except Exception:
+            except (AttributeError, TypeError, ValueError):
                 vp_h = 12
             new_int = int(new_y)
             if abs(new_int - self._last_refreshed_scroll_y) < vp_h // 2:
@@ -18537,6 +18547,7 @@ class HistoryScreen(Screen):
     def _on_close(self, _: Button.Pressed) -> None:
         self.dismiss(None)
 
+    @_action_log("app.history.close")
     def action_close(self) -> None:
         self.dismiss(None)
 
@@ -19667,8 +19678,10 @@ _MASTER_DELETE_CACHE_ATTRS: tuple = (
     "_parts_bin_cache",
     "_parts_bin_collections_cache",
     "_primers_cache",
+    "_primer_usage_cache",            # sweep #20: was missed, primer use-count map
     "_features_cache",
     "_feature_colors_cache",
+    "_feature_library_index_cache",   # sweep #20: was missed, feature-library lookup index
     "_grammars_cache",
     "_entry_vectors_cache",
     "_codon_tables_cache",
@@ -21506,6 +21519,10 @@ def _run_update_subcommand(argv: "list[str]") -> int:
 # ── Fetch modal ────────────────────────────────────────────────────────────────
 
 class FetchModal(ModalScreen):
+    """NCBI Entrez fetch dialog — accession + email Inputs."""
+
+    _blocks_undo: bool = True   # Input editing; Ctrl+Z = input undo, not app
+
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("tab",    "app.focus_next", "Next", show=False),
@@ -21615,6 +21632,8 @@ class OpenFileModal(ModalScreen):
     unchanged from the previous typed-path version — only the path-
     selection UI was swapped.
     """
+
+    _blocks_undo: bool = True   # filename Input + record import
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
@@ -22236,6 +22255,8 @@ class ExportGenBankModal(ModalScreen):
     (keys: path, bp, features) or None if cancelled. The caller is
     expected to show a notification on success.
     """
+
+    _blocks_undo: bool = True   # filename Input editing
 
     BINDINGS = [
         Binding("escape", "cancel",      "Cancel"),
@@ -26882,6 +26903,12 @@ _SETTINGS_SCHEMA: "dict[str, tuple[tuple, object]]" = {
     "active_parts_bin":        ((str,),                ""),
     "active_project":          ((str,),                ""),
     "experiments_custom_dict": ((list,),               []),
+    # Sweep #20 (2026-05-21): codon-table preference for the Synthesis
+    # protein tab. Stores the taxid string (e.g. "83333" for E. coli
+    # K12); empty defaults to the first registry entry per
+    # `_init_codon_table`. Agent endpoint
+    # `set-active-codon-table` writes this; Synthesis honors on open.
+    "active_codon_table":      ((str,),                ""),
 }
 
 
@@ -34798,6 +34825,7 @@ class FeatureLibraryScreen(Screen):
     @on(Button.Pressed, "#btn-flib-export-fasta")
     def _export_fasta_btn(self, _) -> None: self.action_export_fasta()
 
+    @_action_log("app.feature_library.export_fasta")
     def action_export_fasta(self) -> None:
         """Export the highlighted library entry as single-record FASTA."""
         entry = self._current()
@@ -34838,6 +34866,7 @@ class FeatureLibraryScreen(Screen):
     def _close_btn(self, _) -> None:
         self.action_close()
 
+    @_action_log("app.feature_library.close")
     def action_close(self) -> None:
         """Pop back to the main app, prompting on unsaved changes.
 
@@ -34864,6 +34893,7 @@ class FeatureLibraryScreen(Screen):
     @on(Button.Pressed, "#btn-flib-save")
     def _save_btn(self, _) -> None: self.action_save()
 
+    @_action_log("app.feature_library.save")
     def action_save(self) -> None:
         """Persist self._entries → features.json. No-op if nothing pending."""
         if not self._has_pending_changes:
@@ -34922,6 +34952,7 @@ class FeatureLibraryScreen(Screen):
     @on(Button.Pressed, "#btn-flib-add")
     def _add_btn(self, _) -> None: self.action_add()
 
+    @_action_log("app.feature_library.add")
     def action_add(self) -> None:
         def _cb(result):
             if not result:
@@ -34935,6 +34966,7 @@ class FeatureLibraryScreen(Screen):
     @on(Button.Pressed, "#btn-flib-edit")
     def _edit_btn(self, _) -> None: self.action_edit()
 
+    @_action_log("app.feature_library.edit")
     def action_edit(self) -> None:
         """Open AddFeatureModal pre-filled with the current entry. The
         modal already round-trips its prefill (`_apply_prefill` mirrors
@@ -35015,6 +35047,7 @@ class FeatureLibraryScreen(Screen):
     @on(Button.Pressed, "#btn-flib-rename")
     def _rename_btn(self, _) -> None: self.action_rename()
 
+    @_action_log("app.feature_library.rename")
     def action_rename(self) -> None:
         entry = self._current()
         if entry is None:
@@ -35065,6 +35098,7 @@ class FeatureLibraryScreen(Screen):
     @on(Button.Pressed, "#btn-flib-remove")
     def _remove_btn(self, _) -> None: self.action_remove()
 
+    @_action_log("app.feature_library.remove")
     def action_remove(self) -> None:
         entry = self._current()
         if entry is None:
@@ -36492,6 +36526,7 @@ class EntryVectorsModal(ModalScreen):
     def _close_btn(self, _) -> None:
         self.dismiss(None)
 
+    @_action_log("app.entry_vectors.close")
     def action_close(self) -> None:
         self.dismiss(None)
 
@@ -39272,6 +39307,7 @@ class PartsBinModal(Screen):
         # too in case any part is now also a feature-library entry.
         self._clear_multi_select()
 
+    @_action_log("app.parts_bin.delete")
     def action_delete_selected_parts(self) -> None:
         """Keyboard binding entry point for Delete — forwards to the
         same handler the Delete button uses so the keypress and the
@@ -42823,6 +42859,7 @@ class ExperimentRenameModal(ModalScreen):
     def action_cancel(self) -> None:
         self.dismiss(None)
 
+    @_action_log("app.experiments.rename.submit")
     def action_submit(self) -> None:
         try:
             val = self.query_one("#exprn-input", Input).value
@@ -44568,6 +44605,7 @@ class ExperimentsScreen(Screen):
             ExperimentUnsavedChangesModal(), callback=_on_choice,
         )
 
+    @_action_log("app.experiments.open_projects")
     def action_open_projects(self) -> None:
         """Open the experiment-projects picker. Auto-saves the dirty
         compose buffer first so a project switch never loses notes.
@@ -44607,6 +44645,7 @@ class ExperimentsScreen(Screen):
             ExperimentProjectsPickerModal(), callback=_on_picked,
         )
 
+    @_action_log("app.experiments.new_entry")
     def action_new_entry(self) -> None:
         if self._dirty and self._current_entry is not None:
             self._persist_current()
@@ -44635,6 +44674,7 @@ class ExperimentsScreen(Screen):
         except NoMatches:
             pass
 
+    @_action_log("app.experiments.save_entry")
     def action_save_entry(self) -> None:
         if self._current_entry is None:
             self.app.notify("No entry selected.", severity="warning")
@@ -48113,8 +48153,9 @@ class SynthesisScreen(Screen):
 
     def _init_codon_table(self) -> None:
         """Seed the codon-table cache + push it to the ProteinEditor.
-        Picks the first registry entry (K12 by convention — the
-        seeded builtin per `_codon_tables_load`)."""
+        Honors the persisted `active_codon_table` setting (sweep #20)
+        — if set, picks the table whose taxid matches; otherwise falls
+        back to the first registry entry (K12 by convention)."""
         try:
             tables = _codon_tables_load()
         except (OSError, ValueError, json.JSONDecodeError):
@@ -48122,12 +48163,23 @@ class SynthesisScreen(Screen):
         if not tables:
             _log.warning("SynthesisScreen: no codon tables available")
             return
-        first = tables[0]
-        name = str(first.get("name", "?") or "?")
-        taxid = str(first.get("taxid", "") or "")
+        # Sweep #20: honor the persisted `active_codon_table` setting.
+        # Empty/missing/unknown taxid falls back to tables[0].
+        preferred_taxid = str(_get_setting("active_codon_table", "") or "")
+        picked = None
+        if preferred_taxid:
+            picked = next(
+                (t for t in tables
+                  if str(t.get("taxid", "") or "") == preferred_taxid),
+                None,
+            )
+        if picked is None:
+            picked = tables[0]
+        name = str(picked.get("name", "?") or "?")
+        taxid = str(picked.get("taxid", "") or "")
         choice = f"{name}|{taxid}"
         self._codon_table_choice = choice
-        self._codon_table_raw = dict(first.get("raw") or {})
+        self._codon_table_raw = dict(picked.get("raw") or {})
         try:
             sel = self.query_one("#syn-codon-table-select", Select)
             # Force the Select to the same choice so the Select.Changed
@@ -48652,6 +48704,7 @@ class SynthesisScreen(Screen):
         """Mirror of action_delete_selection_backward for Delete."""
         self._delete_active_editor_selection(forward=True)
 
+    @_action_log("app.synthesis.toggle_codon_mode")
     def action_toggle_codon_mode(self) -> None:
         """Alt+T — toggle ProteinEditor's codon-translated mode vs
         AA-only mode. No-op when the DNA tab is active. Updates the
@@ -48720,6 +48773,10 @@ class SynthesisScreen(Screen):
                     pe.set_codon_table(self._codon_table_raw)
                 except NoMatches:
                     pass
+                # Sweep #20: persist the active-codon-table taxid so a
+                # subsequent SynthesisScreen open honors the user's
+                # choice (and agent reads of `get-settings` reflect it).
+                _set_setting("active_codon_table", taxid)
                 _log_event("synthesis.protein.codon_table_changed",
                            choice=choice, n_codons=len(self._codon_table_raw))
                 self._refresh_status()
@@ -48806,11 +48863,10 @@ class SynthesisScreen(Screen):
             try:
                 _save_protein_motifs(user_entries)
             except (OSError, RuntimeError) as exc:
-                _log.exception("Protein motifs save failed")
-                self.app.notify(
-                    f"Failed to save motif edit: {exc}",
-                    severity="error",
-                )
+                # Route through _notify_save_failure so the
+                # `save.failed` structured event fires (parity with
+                # every other GUI save path; sweep #20).
+                _notify_save_failure(self.app, "Protein motifs", exc)
                 return
             self._refresh_motif_table()
             _log_event(
@@ -48923,6 +48979,7 @@ class SynthesisScreen(Screen):
                  if self._active_tab_id() == "protein"
                  else self._dirty)
 
+    @_action_log("app.synthesis.new_fragment")
     def action_new_fragment(self) -> None:
         """Reset the active tab's buffer. Prompts via unsaved-changes
         modal when dirty."""
@@ -48952,6 +49009,7 @@ class SynthesisScreen(Screen):
         self.app.push_screen(SynthesisUnsavedChangesModal(),
                               callback=_on_resolved)
 
+    @_action_log("app.synthesis.load_fragment")
     def action_load_fragment(self) -> None:
         """Open the library picker, then load the selected entry into
         the active tab's editor. Prompts via unsaved-changes modal
@@ -49044,6 +49102,7 @@ class SynthesisScreen(Screen):
         _log_event("synthesis.load", id=self._loaded_id,
                    bp=len(seq), n_feats=len(feats))
 
+    @_action_log("app.synthesis.save")
     def action_save(self) -> None:
         if self._active_tab_id() == "protein":
             self._do_protein_save()
@@ -49296,6 +49355,7 @@ class SynthesisScreen(Screen):
         if after:
             after(True)
 
+    @_action_log("app.synthesis.add_feature")
     def action_add_feature(self) -> None:
         """Ctrl+F — open AddFeatureModal with the current selection as
         the feature span. The modal's standard ``insert`` payload feeds
@@ -50242,6 +50302,7 @@ class AlignmentScreen(Screen):
             out.append("\n\n")
         return out
 
+    @_action_log("app.alignment.close")
     def action_close(self) -> None:
         self.app.pop_screen()
 
@@ -55226,6 +55287,8 @@ class NcbiTaxonPickerModal(ModalScreen):
     None on cancel. The parent (SpeciesPickerModal) then drives the actual
     Kazusa fetch.
     """
+
+    _blocks_undo: bool = True   # search-query Input editing
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
@@ -61231,6 +61294,8 @@ class FeatureSearchModal(ModalScreen):
       int  — index into the feature list the caller passed in
     """
 
+    _blocks_undo: bool = True   # search-query Input editing
+
     BINDINGS = [
         Binding("escape",       "cancel",         "Cancel"),
         Binding("tab",          "app.focus_next", "Next", show=False),
@@ -63722,13 +63787,25 @@ class ExactCopyConfirmModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-copydlg-skip")
     def _skip(self, _) -> None:
+        _log_event(
+            "collision.exact_copy.dismiss",
+            entity=self._entity, n=len(self._names), choice="skip",
+        )
         self._dismiss_once(False)
 
     @on(Button.Pressed, "#btn-copydlg-keep")
     def _keep(self, _) -> None:
+        _log_event(
+            "collision.exact_copy.dismiss",
+            entity=self._entity, n=len(self._names), choice="keep",
+        )
         self._dismiss_once(True)
 
     def action_cancel(self) -> None:
+        _log_event(
+            "collision.exact_copy.dismiss",
+            entity=self._entity, n=len(self._names), choice="esc",
+        )
         self._dismiss_once(False)
 
 
@@ -63844,17 +63921,34 @@ class NameCollisionModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-namecoll-keep")
     def _keep(self, _) -> None:
+        _log_event(
+            "collision.name_collision.dismiss",
+            entity=self._entity, n=len(self._names), choice="keep",
+        )
         self._dismiss_once("keep")
 
     @on(Button.Pressed, "#btn-namecoll-overwrite")
     def _overwrite(self, _) -> None:
+        _log_event(
+            "collision.name_collision.dismiss",
+            entity=self._entity, n=len(self._names),
+            choice="overwrite",
+        )
         self._dismiss_once("overwrite")
 
     @on(Button.Pressed, "#btn-namecoll-cancel")
     def _cancel_btn(self, _) -> None:
+        _log_event(
+            "collision.name_collision.dismiss",
+            entity=self._entity, n=len(self._names), choice="cancel",
+        )
         self._dismiss_once("cancel")
 
     def action_cancel(self) -> None:
+        _log_event(
+            "collision.name_collision.dismiss",
+            entity=self._entity, n=len(self._names), choice="esc",
+        )
         self._dismiss_once("cancel")
 
 
@@ -65704,15 +65798,56 @@ def _h_find_orfs(app, payload):
 @_agent_endpoint("list-codon-tables")
 def _h_list_codon_tables(app, payload):
     """Available codon usage tables. Returns name, taxid, source
-    (builtin/kazusa/user) and date added for each entry. Use the
-    taxid as the `table` arg to ``optimize-protein``."""
-    return {"tables": [
-        {"name":   e.get("name", "?"),
-         "taxid":  e.get("taxid", ""),
-         "source": e.get("source", "user"),
-         "added":  e.get("added", "")}
-        for e in _codon_tables_load()
-    ]}
+    (builtin/kazusa/user) and date added for each entry, plus the
+    `active_taxid` field showing which is currently the persisted
+    default (read by SynthesisScreen's `_init_codon_table`). Use
+    the taxid as the `table` arg to ``optimize-protein``."""
+    return {
+        "tables": [
+            {"name":   e.get("name", "?"),
+             "taxid":  e.get("taxid", ""),
+             "source": e.get("source", "user"),
+             "added":  e.get("added", "")}
+            for e in _codon_tables_load()
+        ],
+        "active_taxid": str(
+            _get_setting("active_codon_table", "") or "",
+        ),
+    }
+
+
+@_agent_endpoint("set-active-codon-table", write=True)
+def _h_set_active_codon_table(app, payload):
+    """Persist the active codon-table preference. Body:
+    ``{taxid: str}`` — pass empty string to clear (Synthesis then
+    falls back to the first registry entry, K12 by convention).
+
+    Sweep #20: the Synthesis protein tab honors this setting on
+    open via `_init_codon_table`, so an agent pre-setting the
+    user's preferred organism (e.g. "83333" for E. coli K12,
+    "559292" for S. cerevisiae) means the next time the user
+    opens Synthesis they're already in the right table. Unknown
+    taxids are rejected 404; empty string is accepted (clears)."""
+    taxid_raw = payload.get("taxid")
+    if taxid_raw is None:
+        return ({"error": "missing 'taxid'"}, 400)
+    if not isinstance(taxid_raw, str):
+        return ({"error": "'taxid' must be a string"}, 400)
+    taxid = taxid_raw.strip()
+    if taxid:
+        # Verify the taxid resolves to a real registry entry —
+        # otherwise the setting is dead weight.
+        if _codon_tables_get(taxid) is None:
+            return ({"error":
+                      f"no codon table with taxid {taxid!r}; "
+                      f"see list-codon-tables"}, 404)
+    _set_setting("active_codon_table", taxid)
+    _log_event(
+        "settings.changed",
+        key="active_codon_table",
+        value=taxid, via="agent",
+    )
+    return {"ok": True, "active_taxid": taxid}
 
 
 @_agent_endpoint("optimize-protein")
@@ -67787,6 +67922,641 @@ def _h_design_primers(app, payload):
     if isinstance(result, dict) and result.get("error"):
         return ({"error": result["error"]}, 422)
     return {"ok": True, "mode": mode, "result": result}
+
+
+# ── Experiments lab notebook (sweep #20) ──────────────────────────────────────
+#
+# Sweep #20 (2026-05-21): four data systems shipped in sweeps #9-#15 had
+# zero agent endpoints — experiments + experiment_projects + gels +
+# protein_motifs. Closes the side-door gap so external agents can drive
+# the lab-notebook layer the way they already drive plasmid library /
+# parts / primers / codon tables. Every mutating endpoint routes through
+# the same `_save_*` helpers the GUI uses, so the four-layer data-safety
+# net (invariant #31) + cache-lock concurrency (invariant #41) apply
+# automatically.
+
+
+@_agent_endpoint("list-experiments")
+def _h_list_experiments(app, payload):
+    """List entries in the active experiment project's notebook.
+    Returns id, title, tag list, timestamps + body byte length per
+    entry (omits `body_md` itself to keep responses small — fetch
+    via ``get-experiment``)."""
+    out: "list[dict]" = []
+    for e in _load_experiments():
+        body = e.get("body_md") or ""
+        body_bytes = len(body.encode("utf-8", errors="replace")) \
+            if isinstance(body, str) else 0
+        out.append({
+            "id":          e.get("id", ""),
+            "title":       e.get("title", ""),
+            "tags":        list(e.get("tags") or []),
+            "created_at":  e.get("created_at", ""),
+            "updated_at":  e.get("updated_at", ""),
+            "body_bytes":  body_bytes,
+            "attached_plasmid_ids": list(
+                e.get("attached_plasmid_ids") or [],
+            ),
+            "attached_gel_ids":     list(e.get("attached_gel_ids") or []),
+            "attached_actions":     list(e.get("attached_actions") or []),
+            "image_paths":          list(e.get("image_paths") or []),
+        })
+    return {"experiments": out,
+            "active_project": _get_active_project_name() or ""}
+
+
+@_agent_endpoint("get-experiment")
+def _h_get_experiment(app, payload):
+    """Fetch one notebook entry (full body + metadata) by id.
+    Body: ``{id: str}``."""
+    eid = _sanitize_experiment_id(payload.get("id"))
+    if eid is None:
+        return ({"error": "missing or invalid 'id'"}, 400)
+    for e in _load_experiments():
+        if e.get("id") == eid:
+            return {"experiment": _typed_clone(e)}
+    return ({"error": f"no experiment with id {eid!r}"}, 404)
+
+
+@_agent_endpoint("create-experiment", write=True)
+def _h_create_experiment(app, payload):
+    """Create a new notebook entry in the active project. Body:
+    ``{title?: str = "Untitled entry",
+        body_md?: str = "",
+        tags?: list[str] = []}``.
+
+    Routes through `_normalise_experiment_entry` so size caps + tag
+    dedup + plasmid/action/gel xref extraction apply automatically.
+    Returns the freshly-stamped entry id."""
+    entries = _load_experiments()
+    existing_ids: set[str] = {
+        e.get("id") for e in entries if e.get("id")  # type: ignore[misc]
+    }
+    new_id = _new_experiment_id(existing_ids)
+    title = payload.get("title") or "Untitled entry"
+    body  = payload.get("body_md") or ""
+    tags  = payload.get("tags") or []
+    if not isinstance(tags, list):
+        return ({"error": "'tags' must be a list of strings"}, 400)
+    entry = _normalise_experiment_entry({
+        "id":      new_id,
+        "title":   title if isinstance(title, str) else "",
+        "body_md": body  if isinstance(body, str)  else "",
+        "tags":    tags,
+    }, fresh=True)
+    entries.append(entry)
+    err = _agent_save_or_500(
+        lambda: _save_experiments(entries), "Experiments",
+    )
+    if err:
+        return err
+    _log_event("experiments.new", eid=new_id, via="agent")
+    return {"ok": True, "id": new_id, "experiment": _typed_clone(entry)}
+
+
+@_agent_endpoint("update-experiment", write=True)
+def _h_update_experiment(app, payload):
+    """Update an existing notebook entry. Body:
+    ``{id: str, title?: str, body_md?: str, tags?: list[str]}``.
+    Fields not supplied keep their prior value. Re-normalises so
+    body-byte cap / tag dedup / xref extraction stay consistent."""
+    eid = _sanitize_experiment_id(payload.get("id"))
+    if eid is None:
+        return ({"error": "missing or invalid 'id'"}, 400)
+    entries = _load_experiments()
+    for i, e in enumerate(entries):
+        if e.get("id") != eid:
+            continue
+        merged = dict(e)
+        if "title" in payload:
+            t = payload["title"]
+            merged["title"] = t if isinstance(t, str) else ""
+        if "body_md" in payload:
+            b = payload["body_md"]
+            merged["body_md"] = b if isinstance(b, str) else ""
+        if "tags" in payload:
+            tg = payload["tags"]
+            if not isinstance(tg, list):
+                return ({"error": "'tags' must be a list of strings"}, 400)
+            merged["tags"] = tg
+        entries[i] = _normalise_experiment_entry(merged, fresh=False)
+        err = _agent_save_or_500(
+            lambda: _save_experiments(entries), "Experiments",
+        )
+        if err:
+            return err
+        _log_event("experiments.save", eid=eid, via="agent")
+        return {"ok": True, "experiment": _typed_clone(entries[i])}
+    return ({"error": f"no experiment with id {eid!r}"}, 404)
+
+
+@_agent_endpoint("delete-experiment", write=True)
+def _h_delete_experiment(app, payload):
+    """Delete a notebook entry by id. Removes the attachment dir
+    (`_EXPERIMENTS_DIR/<id>/`) too. Body: ``{id: str}``."""
+    eid = _sanitize_experiment_id(payload.get("id"))
+    if eid is None:
+        return ({"error": "missing or invalid 'id'"}, 400)
+    entries = _load_experiments()
+    new_entries = [e for e in entries if e.get("id") != eid]
+    if len(new_entries) == len(entries):
+        return ({"error": f"no experiment with id {eid!r}"}, 404)
+    err = _agent_save_or_500(
+        lambda: _save_experiments(new_entries), "Experiments",
+    )
+    if err:
+        return err
+    try:
+        _delete_experiment_attach_dir(eid)
+    except OSError as exc:
+        _log.warning(
+            "agent delete-experiment: attach dir cleanup failed: %s",
+            exc,
+        )
+    _log_event("experiments.delete", eid=eid, via="agent")
+    return {"ok": True, "id": eid,
+            "remaining": len(new_entries)}
+
+
+# ── Experiment projects (multi-notebook organisation) ────────────────────────
+
+
+@_agent_endpoint("list-experiment-projects")
+def _h_list_experiment_projects(app, payload):
+    """List experiment projects + the currently active one.
+    Returns project name, description, save-stamp, and entry count
+    per project (no body content — fetch via ``list-experiments``
+    after switching active)."""
+    projs = _load_experiment_projects()
+    out: "list[dict]" = []
+    for p in projs:
+        raw_entries = p.get("experiments") or []
+        n = len(raw_entries) if isinstance(raw_entries, list) else 0
+        out.append({
+            "name":        p.get("name", ""),
+            "description": p.get("description", ""),
+            "saved":       p.get("saved", ""),
+            "n_entries":   n,
+        })
+    return {"projects": out,
+            "active": _get_active_project_name() or ""}
+
+
+@_agent_endpoint("set-active-experiment-project", write=True)
+def _h_set_active_experiment_project(app, payload):
+    """Switch the active experiment project. Body: ``{name: str}``.
+    Mirrors the GUI flow (invariant #43 + sweep #9): updates the
+    active-pointer, forces a sync settings flush, then writes the
+    target project's entries into `experiments.json`. Power-loss
+    safe across the two writes."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name:
+        return ({"error": "missing 'name'"}, 400)
+    target = _find_project(name)
+    if target is None:
+        return ({"error": f"no project named {name!r}"}, 404)
+    raw_entries = target.get("experiments") or []
+    if not isinstance(raw_entries, list):
+        raw_entries = []
+    target_entries = [e for e in raw_entries if isinstance(e, dict)]
+    _set_active_project_name(name)
+    _settings_flush_sync()
+    try:
+        _safe_save_json(
+            _EXPERIMENTS_FILE, target_entries, "Experiments",
+        )
+    except (OSError, RuntimeError) as exc:
+        _notify_save_failure(
+            _LIVE_APP_REF.get(), "Experiments", exc,
+        )
+        return ({"error": f"save failed: {exc}"}, 500)
+    globals()["_experiments_cache"] = None
+    return {"ok": True, "active": name,
+            "n_entries": len(target_entries)}
+
+
+@_agent_endpoint("create-experiment-project", write=True)
+def _h_create_experiment_project(app, payload):
+    """Create a new (empty) experiment project. Body:
+    ``{name: str, description?: str = ""}``. Active-project pointer
+    is NOT modified by this endpoint — call
+    ``set-active-experiment-project`` afterwards if you want to
+    work in the new project."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing 'name'"}, 400)
+    name = name.strip()
+    if _project_name_taken(name):
+        return ({"error":
+                  f"project named {name!r} already exists"}, 409)
+    desc = payload.get("description") or ""
+    if not isinstance(desc, str):
+        desc = ""
+    projs = _load_experiment_projects()
+    projs.append({
+        "name":        name,
+        "description": desc,
+        "experiments": [],
+        "saved":       _date.today().isoformat(),
+    })
+    err = _agent_save_or_500(
+        lambda: _save_experiment_projects(projs),
+        "Experiment projects",
+    )
+    if err:
+        return err
+    _log_event("project.created", name=name, via="agent")
+    return {"ok": True, "name": name}
+
+
+@_agent_endpoint("rename-experiment-project", write=True)
+def _h_rename_experiment_project(app, payload):
+    """Rename a project. Body: ``{name: str, new_name: str}``. If
+    the renamed project is the active one, the active-pointer
+    follows so subsequent ``_save_experiments`` mirrors land in the
+    correct slot."""
+    old = payload.get("name")
+    new = payload.get("new_name")
+    if not isinstance(old, str) or not old.strip():
+        return ({"error": "missing 'name'"}, 400)
+    if not isinstance(new, str) or not new.strip():
+        return ({"error": "missing 'new_name'"}, 400)
+    old = old.strip()
+    new = new.strip()
+    if old == new:
+        return ({"error": "old and new names are identical"}, 400)
+    if _find_project(old) is None:
+        return ({"error": f"no project named {old!r}"}, 404)
+    if _project_name_taken(new):
+        return ({"error": f"name {new!r} already taken"}, 409)
+    projs = _load_experiment_projects()
+    for p in projs:
+        if p.get("name") == old:
+            p["name"]  = new
+            p["saved"] = _date.today().isoformat()
+            break
+    err = _agent_save_or_500(
+        lambda: _save_experiment_projects(projs),
+        "Experiment projects",
+    )
+    if err:
+        return err
+    if _get_active_project_name() == old:
+        _set_active_project_name(new)
+        _settings_flush_sync()
+    _log_event("project.renamed", old=old, new=new, via="agent")
+    return {"ok": True, "name": new}
+
+
+@_agent_endpoint("delete-experiment-project", write=True)
+def _h_delete_experiment_project(app, payload):
+    """Delete a project + its entries. Body: ``{name: str}``.
+    Refuses to delete the last remaining project (matches the GUI
+    last-project guard). If the deleted project was active,
+    promotes the first remaining project to active."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing 'name'"}, 400)
+    name = name.strip()
+    projs = _load_experiment_projects()
+    if len(projs) <= 1:
+        return ({"error":
+                  "cannot delete the last remaining project"}, 409)
+    if _find_project(name) is None:
+        return ({"error": f"no project named {name!r}"}, 404)
+    was_active = _get_active_project_name() == name
+    new_projs = [p for p in projs if p.get("name") != name]
+    err = _agent_save_or_500(
+        lambda: _save_experiment_projects(new_projs),
+        "Experiment projects",
+    )
+    if err:
+        return err
+    promoted = ""
+    if was_active and new_projs:
+        promoted = new_projs[0].get("name") or ""
+        _set_active_project_name(promoted)
+        _settings_flush_sync()
+        raw_entries = new_projs[0].get("experiments") or []
+        if not isinstance(raw_entries, list):
+            raw_entries = []
+        target_entries = [
+            e for e in raw_entries if isinstance(e, dict)
+        ]
+        try:
+            _safe_save_json(
+                _EXPERIMENTS_FILE, target_entries, "Experiments",
+            )
+        except (OSError, RuntimeError):
+            pass
+        globals()["_experiments_cache"] = None
+    _log_event("project.deleted", name=name, via="agent",
+                promoted=promoted)
+    return {"ok": True, "name": name, "promoted": promoted}
+
+
+# ── Gels (saved agarose-gel snapshots) ────────────────────────────────────────
+
+
+@_agent_endpoint("list-gels")
+def _h_list_gels(app, payload):
+    """List every saved gel snapshot. Returns id, name, lane count,
+    agarose %, and timestamps per gel (omits per-lane detail — fetch
+    via ``get-gel``)."""
+    out: "list[dict]" = []
+    for g in _load_gels():
+        lanes = g.get("lanes") or []
+        n_lanes = len(lanes) if isinstance(lanes, list) else 0
+        out.append({
+            "id":          g.get("id", ""),
+            "name":        g.get("name", ""),
+            "n_lanes":     n_lanes,
+            "agarose_pct": g.get("agarose_pct", 1.0),
+            "created_at":  g.get("created_at", ""),
+            "updated_at":  g.get("updated_at", ""),
+        })
+    return {"gels": out}
+
+
+@_agent_endpoint("get-gel")
+def _h_get_gel(app, payload):
+    """Fetch one saved gel snapshot (full lane payload + notes)."""
+    gid = _sanitize_gel_id(payload.get("id"))
+    if gid is None:
+        return ({"error": "missing or invalid 'id'"}, 400)
+    entry = _find_gel(gid)
+    if entry is None:
+        return ({"error": f"no gel with id {gid!r}"}, 404)
+    return {"gel": _typed_clone(entry)}
+
+
+@_agent_endpoint("create-gel", write=True)
+def _h_create_gel(app, payload):
+    """Save a new gel snapshot. Body:
+    ``{name: str, lanes: list[dict], agarose_pct?: float = 1.0,
+        notes?: str = ""}``.
+    Routes through `_normalise_gel_entry` (caps + clamps). Returns
+    the freshly-stamped id."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing 'name'"}, 400)
+    name = name.strip()
+    if _gel_name_taken(name):
+        return ({"error": f"gel named {name!r} already exists"}, 409)
+    lanes = payload.get("lanes") or []
+    if not isinstance(lanes, list):
+        return ({"error": "'lanes' must be a list of dicts"}, 400)
+    gels = _load_gels()
+    existing_gel_ids: set[str] = {
+        g.get("id") for g in gels if g.get("id")  # type: ignore[misc]
+    }
+    new_id = _new_gel_id(existing_gel_ids)
+    entry = _normalise_gel_entry({
+        "id":          new_id,
+        "name":        name,
+        "lanes":       lanes,
+        "agarose_pct": payload.get("agarose_pct", 1.0),
+        "notes":       payload.get("notes", ""),
+    }, fresh=True)
+    gels.append(entry)
+    err = _agent_save_or_500(lambda: _save_gels(gels), "Gels")
+    if err:
+        return err
+    _log_event("gel.created", gid=new_id, name=name, via="agent")
+    return {"ok": True, "id": new_id, "gel": _typed_clone(entry)}
+
+
+@_agent_endpoint("update-gel", write=True)
+def _h_update_gel(app, payload):
+    """Replace a saved gel's fields by id. Body:
+    ``{id: str, name?: str, lanes?: list[dict],
+        agarose_pct?: float, notes?: str}``. Fields not supplied
+    keep their prior value. Re-normalises through `_normalise_gel_entry`."""
+    gid = _sanitize_gel_id(payload.get("id"))
+    if gid is None:
+        return ({"error": "missing or invalid 'id'"}, 400)
+    gels = _load_gels()
+    for i, g in enumerate(gels):
+        if g.get("id") != gid:
+            continue
+        merged = dict(g)
+        if "name" in payload:
+            nm = payload["name"]
+            if not isinstance(nm, str) or not nm.strip():
+                return ({"error":
+                          "'name' must be a non-empty string"}, 400)
+            new_name = nm.strip()
+            if new_name != merged.get("name") and _gel_name_taken(new_name):
+                return ({"error":
+                          f"gel named {new_name!r} already exists"}, 409)
+            merged["name"] = new_name
+        if "lanes" in payload:
+            ln = payload["lanes"]
+            if not isinstance(ln, list):
+                return ({"error": "'lanes' must be a list"}, 400)
+            merged["lanes"] = ln
+        if "agarose_pct" in payload:
+            merged["agarose_pct"] = payload["agarose_pct"]
+        if "notes" in payload:
+            nt = payload["notes"]
+            merged["notes"] = nt if isinstance(nt, str) else ""
+        gels[i] = _normalise_gel_entry(merged, fresh=False)
+        err = _agent_save_or_500(lambda: _save_gels(gels), "Gels")
+        if err:
+            return err
+        _log_event("gel.renamed", gid=gid, via="agent") \
+            if "name" in payload else None
+        return {"ok": True, "gel": _typed_clone(gels[i])}
+    return ({"error": f"no gel with id {gid!r}"}, 404)
+
+
+@_agent_endpoint("delete-gel", write=True)
+def _h_delete_gel(app, payload):
+    """Delete a saved gel snapshot by id."""
+    gid = _sanitize_gel_id(payload.get("id"))
+    if gid is None:
+        return ({"error": "missing or invalid 'id'"}, 400)
+    gels = _load_gels()
+    new_gels = [g for g in gels if g.get("id") != gid]
+    if len(new_gels) == len(gels):
+        return ({"error": f"no gel with id {gid!r}"}, 404)
+    err = _agent_save_or_500(
+        lambda: _save_gels(new_gels), "Gels",
+    )
+    if err:
+        return err
+    _log_event("gel.deleted", gid=gid, via="agent")
+    return {"ok": True, "id": gid, "remaining": len(new_gels)}
+
+
+# ── Protein motifs (Synthesis-tab AA motif library) ──────────────────────────
+
+
+@_agent_endpoint("list-protein-motifs")
+def _h_list_protein_motifs(app, payload):
+    """List the merged protein-motif library (built-ins + user
+    overrides). Each entry carries name, feature_type, sequence,
+    color, description. Sourced from `_load_protein_motifs`."""
+    return {"motifs": [
+        {
+            "name":         m.get("name", ""),
+            "feature_type": m.get("feature_type", "Motif"),
+            "sequence":     m.get("sequence", ""),
+            "color":        m.get("color", ""),
+            "description":  m.get("description", ""),
+        }
+        for m in _load_protein_motifs()
+    ]}
+
+
+@_agent_endpoint("set-protein-motif", write=True)
+def _h_set_protein_motif(app, payload):
+    """Create or override a protein motif. Body:
+    ``{name: str, sequence: str, feature_type?: str = "Motif",
+        color?: str = "", description?: str = ""}``.
+
+    Persists only the user-modified entries (built-ins stay in code);
+    `_load_protein_motifs` merges on read. If `name` matches a
+    built-in, the user override replaces it in the merged list."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing 'name'"}, 400)
+    name = name.strip()
+    seq = payload.get("sequence")
+    if not isinstance(seq, str) or not seq.strip():
+        return ({"error": "missing 'sequence'"}, 400)
+    seq = seq.strip().upper()
+    # Same single-letter AA validation as `_h_optimize_protein`.
+    invalid = [c for c in seq if c not in "ACDEFGHIKLMNPQRSTVWY*"]
+    if invalid:
+        return ({"error":
+                  "non-canonical amino acids in 'sequence': "
+                  f"{''.join(sorted(set(invalid)))!r}"}, 400)
+    ftype = payload.get("feature_type") or "Motif"
+    if not isinstance(ftype, str):
+        ftype = "Motif"
+    color = payload.get("color") or ""
+    if not isinstance(color, str):
+        color = ""
+    desc = payload.get("description") or ""
+    if not isinstance(desc, str):
+        desc = ""
+    # Load existing user file directly (NOT the merged list, which
+    # includes built-ins). `_load_protein_motifs` merges on read, so
+    # we re-read the raw user file to know which entries to persist.
+    try:
+        user_entries, _ = _safe_load_json(
+            _PROTEIN_MOTIFS_FILE, "Protein motifs",
+        )
+    except Exception as exc:
+        _log.exception("agent set-protein-motif: load failed")
+        return ({"error": f"load failed: {exc}"}, 500)
+    user_entries = [
+        e for e in user_entries if isinstance(e, dict)
+    ]
+    # Drop any existing entry with the same name (copy-on-write).
+    user_entries = [
+        e for e in user_entries if e.get("name") != name
+    ]
+    user_entries.append({
+        "name":         name,
+        "feature_type": ftype,
+        "sequence":     seq,
+        "color":        color,
+        "description":  desc,
+    })
+    err = _agent_save_or_500(
+        lambda: _save_protein_motifs(user_entries),
+        "Protein motifs",
+    )
+    if err:
+        return err
+    _log_event("synthesis.protein.motif_edit", name=name, via="agent")
+    return {"ok": True, "name": name}
+
+
+@_agent_endpoint("delete-protein-motif", write=True)
+def _h_delete_protein_motif(app, payload):
+    """Delete a user-stored protein motif override. Built-in
+    motifs cannot be deleted — only user overrides. If `name`
+    matches a built-in but the user has not edited it, returns 404
+    (nothing to delete). If the user has overridden a built-in,
+    deleting the override restores the original built-in entry."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing 'name'"}, 400)
+    name = name.strip()
+    try:
+        user_entries, _ = _safe_load_json(
+            _PROTEIN_MOTIFS_FILE, "Protein motifs",
+        )
+    except Exception as exc:
+        _log.exception("agent delete-protein-motif: load failed")
+        return ({"error": f"load failed: {exc}"}, 500)
+    user_entries = [
+        e for e in user_entries if isinstance(e, dict)
+    ]
+    new_entries = [e for e in user_entries if e.get("name") != name]
+    if len(new_entries) == len(user_entries):
+        return ({"error":
+                  f"no user-stored override for {name!r} "
+                  "(built-ins cannot be deleted)"}, 404)
+    err = _agent_save_or_500(
+        lambda: _save_protein_motifs(new_entries),
+        "Protein motifs",
+    )
+    if err:
+        return err
+    _log_event(
+        "synthesis.protein.motif_edit",
+        name=name, action="delete", via="agent",
+    )
+    return {"ok": True, "name": name}
+
+
+# ── Entry-vector auto-detect + clear (sweep #20 follow-up) ───────────────────
+
+
+@_agent_endpoint("auto-detect-entry-vectors", write=True)
+def _h_auto_detect_entry_vectors(app, payload):
+    """Run the Type-IIS-digest auto-detection pass across every
+    library entry and bind newly-detected acceptors to their grammar
+    roles. Body: ``{grammar_ids?: list[str] = <all>}``.
+
+    Sacred — existing user bindings are NEVER clobbered (invariant
+    #47). Returns the consolidated summary string + per-grammar
+    bound-role count. Use ``list-entry-vectors`` afterwards to see
+    the new bindings."""
+    grammar_ids = payload.get("grammar_ids")
+    if grammar_ids is not None and not isinstance(grammar_ids, list):
+        return ({"error":
+                  "'grammar_ids' must be a list of grammar id strings"
+                }, 400)
+    entries = _load_library()
+    summary = _auto_bind_entry_vectors_from_entries(
+        entries,
+        grammar_ids=grammar_ids,
+    )
+    return {"ok": True, "summary": summary}
+
+
+@_agent_endpoint("clear-entry-vectors-for-grammar", write=True)
+def _h_clear_entry_vectors_for_grammar(app, payload):
+    """Drop every entry-vector binding for one grammar id. Body:
+    ``{grammar_id: str}``. Used by grammar-delete flows; agents
+    rarely need this directly but it round-trips for symmetry."""
+    gid = payload.get("grammar_id")
+    if not isinstance(gid, str) or not gid:
+        return ({"error": "missing 'grammar_id'"}, 400)
+    try:
+        n = _clear_entry_vectors_for_grammar(gid)
+    except (OSError, RuntimeError) as exc:
+        return ({"error": f"clear failed: {exc}"}, 500)
+    _log_event(
+        "entry_vector.cleared",
+        grammar=gid, n_cleared=n, via="agent",
+    )
+    return {"ok": True, "grammar_id": gid, "n_cleared": n}
 
 
 # ── HTTP plumbing ──────────────────────────────────────────────────────────────
@@ -76051,6 +76821,7 @@ SpeciesPickerModal { align: center middle; }
             return False
         return bool(getattr(top, "_blocks_undo", False))
 
+    @_action_log("app.undo")
     def action_undo(self) -> None:
         # Structured event per undo so a diagnostic bundle can replay
         # the user's sequence of edits — AI-parseable counterpart to
@@ -76072,6 +76843,7 @@ SpeciesPickerModal { align: center middle; }
         _log_event("undo.trigger", stack_depth=n)
         self._action_undo()
 
+    @_action_log("app.redo")
     def action_redo(self) -> None:
         if self._undo_blocked_by_modal():
             try:

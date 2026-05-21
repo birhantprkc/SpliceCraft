@@ -36,7 +36,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ## Endpoint inventory
 
-60+ endpoints across:
+80+ endpoints across:
 
 - **Records** — get / set sequence, add / update / delete features,
   list features, find ORFs, transfer annotations.
@@ -64,8 +64,16 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 - **Data safety** — list-backups, restore-backup,
   list-pre-update-snapshots, restore-pre-update-snapshot.
 - **Settings** — get-settings, set-setting (allowlisted toggles).
-- **Utility** — check-primer-duplicates, capture-snapshot,
-  entry-vector CRUD.
+- **Experiments lab notebook** — list / get / create / update /
+  delete experiment entries; list / create / rename / delete
+  projects; set active project (full notebook-layer CRUD).
+- **Gels** — list / get / create / update / delete saved gel
+  snapshots (in addition to simulate-gel for one-shot runs).
+- **Protein motifs** — list (built-ins + user overrides),
+  set (copy-on-write override), delete user overrides.
+- **Entry vectors** — list, get, set, plus auto-detect across the
+  full library and clear-for-grammar.
+- **Utility** — check-primer-duplicates, capture-snapshot.
 
 Call `/tools` for the live discovery endpoint that emits the current
 inventory with one-line docs per endpoint.
