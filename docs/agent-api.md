@@ -36,13 +36,17 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ## Endpoint inventory
 
-80+ endpoints across:
+90+ endpoints across:
 
 - **Records** — get / set sequence, add / update / delete features,
-  list features, find ORFs, transfer annotations.
-- **Files** — load (chromosome-scale safe via the path-based
-  loader), export GenBank / GFF3 / FASTA (symlink-guarded), bulk
-  import a folder.
+  list features, find ORFs, transfer annotations, apply GFF3 features
+  to the loaded record (`apply-gff3`).
+- **Files** — load (chromosome-scale safe via the path-based loader;
+  supports `.gb` / `.gbk` / `.genbank` / `.dna` / `.embl` /
+  FASTA / `.ab1` / single-record `.fastq` / `.gff3`),
+  export GenBank / GFF3 / FASTA / EMBL / CommercialSaaS `.dna`
+  (symlink-guarded), bulk import a folder, bulk export a
+  collection (`bulk-export-collection`).
 - **Library + collections** — list, search across collections,
   delete entries, create / rename / delete collections, set the
   active collection, list / set plasmid statuses.

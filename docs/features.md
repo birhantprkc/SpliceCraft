@@ -31,6 +31,25 @@ What you can do without leaving the terminal.
 - **Crash-recovery autosave** writes a 3-second-debounced `.gb`
   snapshot to the data dir; survivors surface on next launch.
 
+## Synthesis
+
+- **DNA synthesis composer** (`Synthesis → DNA`) — paste / type a
+  sequence target, set topology, then iteratively annotate using the
+  built-in feature library or motifs found via inline pattern match.
+  Synthesised records save to the library with feature annotations,
+  topology, and a `synthesised in SpliceCraft` provenance note.
+- **Protein synthesis composer** (`Synthesis → Protein`) — design at
+  the AA level. Paste a protein sequence, pick a codon-usage table
+  (E. coli K12 / S. cerevisiae / H. sapiens / +100 Kazusa tables), and
+  the composer back-translates to optimised DNA while scrubbing
+  forbidden Type IIS sites against the active cloning grammar.
+  In-editor protein-motif highlighting (signal peptide, NLS, mito
+  targeting, tags) flags regions of biological interest as you type.
+- **Codon-table picker** (`Synthesis → Codon table…`) — browse the
+  Kazusa usage-table catalog by organism / taxid, persist a preferred
+  table via `set-active-codon-table`. Custom tables are loadable from
+  TSV.
+
 ## Cloning
 
 - **Cloning grammars** — GB L0 (Esp3I) and MoClo Plant (BsaI) ship as
@@ -125,6 +144,14 @@ What you can do without leaving the terminal.
   alignment viewer with target-feature lane, parallel target/query
   rows, match track, and mismatch-red highlighting. Length-capped at
   200 kb per side; cancellable via the standard worker pattern.
+- **Sanger trace viewer (`.ab1`)** — Sequencing → Sanger tab.
+  Browse a directory for AB1 traces (highlighted sky-blue), pick
+  one to see the base-called length, mean Phred quality, and a
+  preview of the first 200 bases. Load straight onto the canvas or
+  add to the library for downstream alignment. BioPython base-calls
+  the trace channel; quality scores survive on
+  `letter_annotations["phred_quality"]` for any caller that wants
+  them.
 - **New Plasmid modal** (`Ctrl+N`) — paste a sequence, optionally name
   + set topology, then either Create / Annotate-from-library
   (substring match) / Annotate-via-BLAST (≥90% identity → `misc_feature`).
@@ -164,6 +191,92 @@ What you can do without leaving the terminal.
   on-disk order so `pPart-2` sits next to `pPart-10` rather than
   scattered alphabetically; entry indices remain stable across the
   re-sort so dirty-edit markers don't desync.
+- **Bulk export collection** (`File → Export collection (bulk)…`) —
+  pick a collection + format (GenBank / EMBL / FASTA / `.dna`) + a
+  target folder. Each plasmid is written as `<name>.<ext>` with
+  filesystem-safe sanitisation (path-traversal characters scrubbed,
+  Windows reserved device names prefixed, case-insensitive collision
+  defence on APFS/NTFS). Per-entry failures don't abort the run; the
+  summary toast reports written / failed counts.
+
+## File formats
+
+| Format | Extensions | Import | Export | Preserves |
+|---|---|---|---|---|
+| GenBank | `.gb` / `.gbk` / `.genbank` | yes | yes | features, qualifiers, wrap topology |
+| EMBL | `.embl` | yes | yes | features, qualifiers, wrap topology |
+| CommercialSaaS `.dna` | `.dna` | yes | yes | features + colours + primers + construction history (round-trip) |
+| FASTA | `.fa` / `.fasta` / `.fna` / `.ffn` / `.frn` / `.fas` / `.mpfa` / `.faa` | yes | yes (sequence only) | sequence only |
+| Sanger trace | `.ab1` / `.abi` | yes | — | base-called sequence + Phred quality |
+| FASTQ multi-read | `.fastq` / `.fq` | yes (≤ 1000 reads per file) | — | one library entry per read |
+| GFF3 | `.gff` / `.gff3` | yes (standalone via `##FASTA`; or apply features to loaded canvas via `apply-gff3`) | yes | wrap features as same-`ID=` split rows; `Is_circular=true` on region row |
+| Plasmidsaurus zip | `.zip` | yes (Sequencing → Plasmidsaurus tab) | — | consensus + run-level QC + AB1 traces |
+
+All file reads route through size-cap + symlink-refusal checks; all
+file writes route through `_atomic_write_text` / `_atomic_write_bytes`
+(tempfile + fsync + replace + symlink refusal). Bulk-import and
+single-file Open share one dispatch table so the agent CLI, GUI Open,
+and folder-import all accept the same set.
+
+## Experiments lab notebook
+
+- **Projects layer** (`Menu → Experiments`) — named projects (e.g.
+  "Yeast Y32 strain", "E. coli toolkit") each hold a list of
+  experiment entries. Active project persists across sessions; first
+  launch wraps the user's existing experiments into a default
+  project.
+- **Compose + Attachments** — per-entry markdown body (1 MB cap),
+  plus an image attachment grid. Win/Mac clipboard paste via
+  `Pillow.ImageGrab.grabclipboard()` (Linux/WSL disabled by Pillow).
+- **Cross-refs** — `@<plasmid-id>` inlines a coloured chip linking
+  to a library plasmid; `!<action-id>` references the curated
+  `_EXPERIMENT_ACTIONS` catalog; `&<gel-id>` references a saved
+  gel snapshot. Ctrl+G / double-click on any tag opens the
+  referenced entity.
+- **Spellcheck** (F7) — pyspellchecker-backed (pure-Python English
+  wordlist) with markdown-aware masking. Custom dict per-user.
+
+## Gels
+
+- **Save gel snapshots** — gel images created in `Simulator → Gel`
+  can be saved to `gels.json` for later reference, side-by-side
+  comparison across timepoints, or for citation from experiment
+  entries via `&<gel-id>` references.
+- **Gel library** — `Simulator → Gels…` browses every saved gel
+  with thumbnail rendering, lane composition, and gel-percentage
+  metadata.
+
+## Protein motifs
+
+- **Curated motif catalog** — 30+ patterns (NLS, signal peptide,
+  mitochondrial targeting sequence, common tags, phosphorylation
+  sites). Surfaced in the Synthesis protein composer as you type,
+  and in the AA lane on the main sequence panel under loaded CDSs.
+- **User-overrides** — add / edit / remove motifs persistently via
+  the protein-motifs editor; overrides round-trip through
+  `protein_motifs.json` with the same atomic-save + backup discipline
+  as every other persisted file.
+
+## Recovery + data safety
+
+- **Four-layer JSON safety net** — every persisted file gets atomic
+  write + single-gen `.bak` + rotating timestamped `.bak.<ts>` (10
+  retained) + daily snapshot in `<DATA_DIR>/snapshots/` (30 retained).
+  Suspicious-shrink guard (≥50% data loss) spills affected entries
+  to `<DATA_DIR>/lost_entries/` BEFORE the overwrite lands.
+- **Restore from backup** (`Settings → Restore … from backup…`) —
+  one modal lists every recoverable copy of any user-data file
+  across the four storage tiers. Damaged rows are surfaced tagged
+  `[damaged]` instead of silently dropped — you can see what was
+  there even if it can't be restored.
+- **Master Delete** (`Settings → Master Delete…`) — a typed-`YES`
+  guarded recovery affordance that resets the entire SpliceCraft
+  data dir to a fresh-install state. Two-stage confirmation +
+  enumerated cache reset so a partial wipe doesn't leave the in-
+  memory caches stale relative to disk.
+- **Pre-update snapshots** before any pip / pipx / uv subprocess;
+  stored in a sibling directory so a hypothetical recursive-wipe
+  bug in a new version cannot reach the snapshots.
 
 ## Drive it from outside the GUI
 
@@ -172,7 +285,7 @@ details. In short:
 
 - **Agent API** (`splicecraft --agent`) exposes a localhost JSON API
   with bearer-token auth, covering every GUI action external AI
-  agents need. 80+ endpoints; symlink-guarded write paths;
+  agents need. 90+ endpoints; symlink-guarded write paths;
   length/range/shape validation at the boundary.
 - **`splicecraft-cli`** — stdlib-only sidecar (~50 ms cold start)
   that reads connection details from the running session's token

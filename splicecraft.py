@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "0.9.14"
+__version__ = "0.9.15"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -1170,9 +1170,26 @@ def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
     change is journalled (see `_fsync_parent_dir`). Callers that need
     a ``.bak`` should use :func:`_safe_save_json` instead (it layers the
     envelope, shrink-guard, and schema handling on top of this).
+
+    Refuses to write when *path* is a symlink — ``os.replace`` would
+    silently replace the symlink itself with a regular file, breaking
+    the link chain and leaving the original target stale. Users who
+    legitimately want to overwrite through a symlink should resolve
+    the path themselves before calling.
     """
     import os
+    import stat as _stat
     import tempfile
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        st = None
+    if st is not None and _stat.S_ISLNK(st.st_mode):
+        raise OSError(
+            f"refusing to write to {path}: target is a symlink "
+            f"(would break the link chain). Resolve the path and "
+            f"retry if this is intentional."
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent),
@@ -1204,9 +1221,22 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
     cannot truncate the recovery files that invariant #31's four-layer
     safety net depends on. Raises ``OSError`` on disk failure so
     callers can decide to surface or log.
+
+    Refuses symlinked targets — see `_atomic_write_text` for rationale.
     """
     import os
+    import stat as _stat
     import tempfile
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        st = None
+    if st is not None and _stat.S_ISLNK(st.st_mode):
+        raise OSError(
+            f"refusing to write to {path}: target is a symlink "
+            f"(would break the link chain). Resolve the path and "
+            f"retry if this is intentional."
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent),
@@ -1814,36 +1844,44 @@ def _prune_old_snapshots(snap_dir: Path,
 
 def _backup_info(path: Path) -> "dict | None":
     """Parse `path` as a SpliceCraft persistence file (envelope or
-    legacy bare-list) and return ``{n_entries, mtime_str}`` or None
-    if unreadable. The mtime is used as the user-visible timestamp
-    so even an undated `.bak` shows when it was written.
+    legacy bare-list) and return ``{n_entries, mtime_str, error}``.
+    A damaged backup returns ``n_entries=None`` and a non-empty
+    ``error`` string so the Restore UI can surface it tagged
+    ``[damaged]`` instead of silently dropping it — users trying to
+    recover need to see what was there, even if parsing fails.
+
+    Returns ``None`` only when the file is structurally absent or
+    so wrong (e.g. cannot even stat) that no row should be shown.
 
     Size-capped at `_SAFE_LOAD_JSON_MAX_BYTES` (mirrors `_safe_load_json`'s
     1 GB cap) — a corrupted/oversized legacy `.bak` could otherwise OOM
     the Restore modal on open. Symlink-rejected via the same lstat path.
     """
-    ok, _reason = _safe_file_size_check(
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    ts = _datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+    ok, reason = _safe_file_size_check(
         path, _SAFE_LOAD_JSON_MAX_BYTES, "backup",
     )
     if not ok:
-        return None
+        return {"n_entries": None, "mtime_str": ts,
+                "error": reason or "size/symlink check failed"}
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"n_entries": None, "mtime_str": ts,
+                "error": f"parse failed: {exc}"}
     if isinstance(raw, list):
         n = len(raw)
     elif isinstance(raw, dict):
         entries = raw.get("entries", [])
         n = len(entries) if isinstance(entries, list) else 0
     else:
-        return None
-    try:
-        mtime = path.stat().st_mtime
-    except OSError:
-        return None
-    ts = _datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
-    return {"n_entries": n, "mtime_str": ts}
+        return {"n_entries": None, "mtime_str": ts,
+                "error": "unexpected JSON shape (not list or envelope)"}
+    return {"n_entries": n, "mtime_str": ts, "error": ""}
 
 
 def _list_recoverable_backups(target_path: Path) -> "list[dict]":
@@ -2075,6 +2113,32 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
 
 _DNA_ORIGINALS_DIR = _DATA_DIR / "dna_originals"
 _DNA_SIDECAR_MAX_BYTES = 50 * 1024 * 1024   # 50 MB — same as bulk import
+# Local `.dna` augment-read cap. Mirrors the network caps (pitfall #20)
+# for an untrusted-blob class that arrives via download/share, not just
+# the network path. `_augment_dna_record_from_packets` walks raw bytes;
+# without a cap a hostile `.dna` could OOM before any packet validation.
+_DNA_AUGMENT_MAX_BYTES = 100 * 1024 * 1024  # 100 MB
+
+# Windows reserved device names (case-insensitive). NTFS refuses to
+# open any file whose stem matches one of these, so every sanitiser
+# that produces an on-disk filename must rewrite a matching stem.
+# Hoisted to module scope so the three sanitisers (`_dna_sidecar_path`,
+# `_safe_export_filename`, `_safe_snapshot_token`) share one set and a
+# new sanitiser added later can't accidentally drift to a stale list.
+_WIN_RESERVED_FILENAMES: frozenset = frozenset({
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+})
+
+
+def _is_windows_reserved_stem(name: str) -> bool:
+    """True if `name`'s first dot-separated segment is a Windows
+    reserved device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9). Case-
+    insensitive; matches the Win32 namespace rules."""
+    if not name:
+        return False
+    return name.split(".")[0].lower() in _WIN_RESERVED_FILENAMES
 # Cap the sidecar basename so the full path stays under NTFS's 260-char
 # default limit on reasonable installs. Raised to 200 from the implicit
 # OS limit so a hostile / accidentally-pasted multi-KB entry_id can't
@@ -3364,6 +3428,8 @@ def _dna_sidecar_path(entry_id: str) -> "Path":
     import hashlib as _hashlib
     digest = _hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()[:8]
     safe_lower = safe.lower()
+    if _is_windows_reserved_stem(safe_lower):
+        safe_lower = f"_{safe_lower}"
     max_safe = _DNA_SIDECAR_BASENAME_MAX - len(digest) - len(".dna") - 1
     if len(safe_lower) > max_safe:
         safe_lower = safe_lower[:max_safe]
@@ -3758,19 +3824,35 @@ def _load_collections() -> list[dict]:
         _collections_cache = [e for e in entries if isinstance(e, dict)]
     return _typed_clone(_collections_cache)
 
+
+def _iter_collections_readonly() -> list[dict]:
+    """Read-only view of the collections cache — returns the cached list
+    directly without cloning. Callers MUST NOT mutate any returned dict
+    or its nested lists; doing so poisons the in-memory cache (pitfall
+    #17). Use for hot read paths (search modals, listing endpoints) where
+    the ~30–50 ms `_typed_clone` cost is meaningful on big libraries.
+    For any path that mutates entries, use `_load_collections()` instead.
+    """
+    global _collections_cache
+    if _collections_cache is None:
+        entries, warning = _safe_load_json(_COLLECTIONS_FILE, "Plasmid collections")
+        if warning:
+            _log.warning(warning)
+        _collections_cache = [e for e in entries if isinstance(e, dict)]
+    return _collections_cache
+
+
 def _save_collections(entries: list[dict]) -> None:
     global _collections_cache
     with _cache_lock:
         _safe_save_json(_COLLECTIONS_FILE, entries, "Plasmid collections")
         _collections_cache = _typed_clone(entries)
-    # Invalidate any cached BLAST databases so a freshly-renamed /
-    # deleted / edited collection doesn't keep returning hits from the
-    # old contents. The engine helpers are defined later in this file,
-    # so this call is guarded for the brief window during module import
-    # before they exist.
-    _clear = globals().get("_blast_clear_cache")
-    if _clear is not None:
-        _clear()
+    # BLAST cache no longer cleared here — `_BLAST_DB_CACHE` is keyed
+    # on a content fingerprint (`_blast_collections_fingerprint`), so
+    # content-affecting saves miss the cache naturally on next lookup
+    # while cosmetic saves (rename, recolour) keep their cached db.
+    # Explicit clears still happen on master-delete and the BLAST
+    # modal's force-rebuild path.
     # Same lazy-import guard for the primer-usage cache: every
     # collections write potentially changes the plasmid set, so the
     # next PrimerDesignScreen open should re-scan.
@@ -7926,19 +8008,45 @@ def _detect_plasmid_format(path: str) -> str:
 
     Supported:
       - GenBank        (.gb, .gbk, .genbank)       → "genbank"
+      - EMBL           (.embl)                     → "embl"
       - popular commercial plasmid editor binary (.dna)
                                                   → ``_BIOPYTHON_DNA_FMT``
 
-    Extensions are matched case-insensitively. Unknown extensions
-    default to "genbank" since that's the most common plasmid format;
-    the parser will then raise a clear error if the contents don't
-    match.
+    Extensions are matched case-insensitively. Unknown extensions get
+    a cheap content sniff: if the first non-empty line starts with
+    "LOCUS " (GenBank) or "ID " (EMBL), we route accordingly; the
+    8-byte CommercialSaaS cookie at offset 0 routes to `.dna`.
+    Otherwise we still default to GenBank — that's the historical
+    behaviour and the most common plasmid format; the parser will
+    then raise a clear error.
     """
     from pathlib import Path
     suffix = Path(path).suffix.lower()
     if suffix == ".dna":
         return _BIOPYTHON_DNA_FMT
-    # .gb, .gbk, .genbank, or anything else — try GenBank.
+    if suffix in (".gb", ".gbk", ".genbank"):
+        return "genbank"
+    if suffix == ".embl":
+        return "embl"
+    # Unknown extension — peek at the first few bytes to give a
+    # better error class than "GenBank parser said no". Reads are
+    # capped so a 10 GB symlink can't OOM us before `load_genbank`
+    # gets its own size guard.
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(256)
+    except OSError:
+        return "genbank"
+    if head.startswith(_COMMERCIALSAAS_COOKIE_MAGIC):
+        return _BIOPYTHON_DNA_FMT
+    try:
+        text_head = head.decode("ascii", errors="replace").lstrip()
+    except (UnicodeDecodeError, ValueError):
+        text_head = ""
+    if text_head.startswith("LOCUS "):
+        return "genbank"
+    if text_head.startswith("ID "):
+        return "embl"
     return "genbank"
 
 
@@ -8028,10 +8136,17 @@ def load_genbank(path: str):
     if fmt == _BIOPYTHON_DNA_FMT:
         try:
             with open(path, "rb") as fh:
-                _dna_bytes = fh.read()
-            extra_primers = _augment_dna_record_from_packets(rec, _dna_bytes)
-            if extra_primers:
-                rec._dna_primer_entries = extra_primers
+                _dna_bytes = fh.read(_DNA_AUGMENT_MAX_BYTES + 1)
+            if len(_dna_bytes) > _DNA_AUGMENT_MAX_BYTES:
+                _log.warning(
+                    "dna augment skipped for %s: exceeds %d MB cap; "
+                    "record loads with palette colours instead of source colours",
+                    path, _DNA_AUGMENT_MAX_BYTES // (1024 * 1024),
+                )
+            else:
+                extra_primers = _augment_dna_record_from_packets(rec, _dna_bytes)
+                if extra_primers:
+                    rec._dna_primer_entries = extra_primers
         except (OSError, ValueError) as exc:
             _log.warning(
                 "dna augment failed for %s (%s); record loads with "
@@ -9024,7 +9139,20 @@ def _serialize_commercialsaas_history(root: "_CommercialSaaSHistoryNode | None"
     return f'<?xml version="1.0" encoding="UTF-8"?>{body}'
 
 
-_BULK_IMPORT_EXTS = {".dna", ".gb", ".gbk", ".genbank"}
+_BULK_IMPORT_EXTS = {
+    ".dna", ".gb", ".gbk", ".genbank", ".embl",
+    # FASTA inclusion mirrors single-file Open. Bulk-import dispatch
+    # routes FASTA hits through `_fasta_path_to_record` (linear-default
+    # topology) instead of `load_genbank` which only handles GenBank /
+    # `.dna` binary. AB1 traces base-call to a single linear record;
+    # FASTQ reads expand to one entry per read. GFF3 must carry an
+    # inline ##FASTA section to qualify — sequence-less GFF3 needs a
+    # loaded record to overlay onto (use the apply-gff3 path).
+    ".fa", ".fasta", ".fna", ".ffn", ".frn", ".fas", ".mpfa", ".faa",
+    ".ab1", ".abi",
+    ".fastq", ".fq",
+    ".gff", ".gff3",
+}
 
 # Per-file size cap. Plasmids are typically <100 KB; anything larger is
 # probably a chromosome dump or an unrelated file. Refuse rather than
@@ -9092,7 +9220,14 @@ def _try_extract_history_xml_from_dna_path(path: Path) -> "str | None":
     try:
         if path.suffix.lower() != ".dna":
             return None
-        data = path.read_bytes()
+        with open(path, "rb") as fh:
+            data = fh.read(_DNA_AUGMENT_MAX_BYTES + 1)
+        if len(data) > _DNA_AUGMENT_MAX_BYTES:
+            _log.warning(
+                "history extract: %s exceeds %d MB cap; skipping",
+                path, _DNA_AUGMENT_MAX_BYTES // (1024 * 1024),
+            )
+            return None
     except OSError as exc:
         _log.warning("history extract: failed to read %s: %s", path, exc)
         return None
@@ -9214,24 +9349,58 @@ def _bulk_import_folder(
                 ))
                 continue
             try:
-                rec = load_genbank(str(path))
+                fastq_records: "list | None" = None
+                if _is_fasta_path(str(path)):
+                    rec = _fasta_path_to_record(str(path))
+                elif _is_ab1_path(str(path)):
+                    rec = _ab1_path_to_record(str(path))
+                elif _is_fastq_path(str(path)):
+                    # FASTQ expands to many records: stage them and
+                    # process below in the same loop iteration.
+                    fastq_records = _fastq_path_to_records(str(path))
+                    rec = fastq_records[0]
+                elif str(path).lower().endswith((".gff", ".gff3")):
+                    # Bulk-import requires self-contained records →
+                    # GFF3 must include an inline ##FASTA section.
+                    # Sequence-less GFF3 is skipped (would need a
+                    # target record to overlay onto, which bulk
+                    # import doesn't have).
+                    rec = _gff3_path_to_record(str(path))
+                else:
+                    rec = load_genbank(str(path))
                 if _seq_len(rec) == 0:
                     failures.append((path, "empty sequence (no bases)"))
                     continue
                 # CommercialSaaS .dna files carry a construction-history
                 # packet (0x07) that BioPython silently drops on
                 # parse. Pull it through manually so library entries
-                # imported from .dna keep their cloning lineage.
+                # imported from .dna keep their cloning lineage. FASTA
+                # never carries history; the helper short-circuits on
+                # non-`.dna` paths.
                 history_xml = _try_extract_history_xml_from_dna_path(path)
-                entry = _record_to_library_entry(rec, path,
-                                                    history_xml=history_xml)
-                base_id = entry["id"]
-                n = 1
-                while entry["id"] in seen_ids:
-                    n += 1
-                    entry["id"] = f"{base_id}_{n}"
-                seen_ids.add(entry["id"])
-                entries.append(entry)
+                # FASTQ files expand into one library entry per read.
+                # Every other format yields a single entry per file.
+                if fastq_records is not None:
+                    records_to_emit = fastq_records
+                else:
+                    records_to_emit = [rec]
+                primary_entry_id: "str | None" = None
+                for sub_rec in records_to_emit:
+                    if _seq_len(sub_rec) == 0:
+                        continue
+                    entry = _record_to_library_entry(
+                        sub_rec, path,
+                        history_xml=history_xml if sub_rec is rec else None,
+                    )
+                    base_id = entry["id"]
+                    n = 1
+                    while entry["id"] in seen_ids:
+                        n += 1
+                        entry["id"] = f"{base_id}_{n}"
+                    seen_ids.add(entry["id"])
+                    entries.append(entry)
+                    if sub_rec is rec and primary_entry_id is None:
+                        primary_entry_id = entry["id"]
                 # Harvest primer DB entries the augment helper stashed
                 # on the SeqRecord — bulk imports never hit
                 # `_apply_record`, so without this the user's primer
@@ -9245,10 +9414,11 @@ def _bulk_import_folder(
                 # lets us round-trip back to .dna later by splicing
                 # fresh history into the original byte stream. Only
                 # attempted for .dna files; failures are non-fatal.
-                if path.suffix.lower() == ".dna":
+                if (path.suffix.lower() == ".dna"
+                        and primary_entry_id is not None):
                     try:
                         original_bytes = path.read_bytes()
-                        _save_dna_original(entry["id"], original_bytes)
+                        _save_dna_original(primary_entry_id, original_bytes)
                     except OSError as exc:
                         _log.warning("dna sidecar: read failed for "
                                        "%s during import: %s", path, exc)
@@ -9327,6 +9497,19 @@ def _record_to_gb_text(record) -> str:
 _GB_TEXT_MAX_BYTES = 64 * 1024 * 1024
 
 
+# Parse-result cache for repeated `_gb_text_to_record` calls. Library
+# iteration paths (`_assembly_fragment_recover_gb_text`,
+# `_classify_part_from_plasmid`, `_bulk_export_collection` for non-
+# GenBank formats) call this against the SAME `gb_text` multiple times
+# during one user action — re-parsing is a measurable cost on large
+# libraries (BioPython GenBank parse is ~5–30 ms per record). Key is
+# the text's hash to avoid holding multi-MB strings in the key tuple.
+# Per pitfall #17 we deepcopy on read so callers can freely mutate.
+_GB_PARSE_CACHE: "_OD" = _OD()
+_GB_PARSE_CACHE_MAX = 64
+_GB_PARSE_CACHE_LOCK = threading.Lock()
+
+
 def _gb_text_to_record(text: str):
     """Parse GenBank format text back to a SeqRecord.
 
@@ -9336,15 +9519,34 @@ def _gb_text_to_record(text: str):
     member cap, but the GenBank parser itself is unbounded internally;
     a single record line that happens to slip past upstream caps would
     otherwise allocate intermediate parser objects without ceiling.
+
+    Results are LRU-cached (`_GB_PARSE_CACHE`, capped at
+    `_GB_PARSE_CACHE_MAX`) keyed on `hash(text)`. Returned records are
+    deepcopies of the cache value so callers can mutate freely (pitfall
+    #17 contract). Empty-string / oversize inputs bypass the cache.
     """
+    if not text:
+        from Bio import SeqIO
+        return SeqIO.read(StringIO(text), "genbank")
     if len(text) > _GB_TEXT_MAX_BYTES:
         raise ValueError(
             f"GenBank text too large to parse "
             f"({len(text):,} bytes > "
             f"{_GB_TEXT_MAX_BYTES:,} cap)"
         )
+    key = hash(text)
+    with _GB_PARSE_CACHE_LOCK:
+        hit = _GB_PARSE_CACHE.get(key)
+        if hit is not None:
+            _GB_PARSE_CACHE.move_to_end(key)
+            return deepcopy(hit)
     from Bio import SeqIO
-    return SeqIO.read(StringIO(text), "genbank")
+    rec = SeqIO.read(StringIO(text), "genbank")
+    with _GB_PARSE_CACHE_LOCK:
+        _GB_PARSE_CACHE[key] = deepcopy(rec)
+        while len(_GB_PARSE_CACHE) > _GB_PARSE_CACHE_MAX:
+            _GB_PARSE_CACHE.popitem(last=False)
+    return rec
 
 
 # ── Sequencing-data ingestion (Plasmidsaurus etc.) ────────────────────────────
@@ -10882,6 +11084,284 @@ def _record_to_gff3(record) -> str:
     return "\n".join(out)
 
 
+def _parse_gff3_text(text: str) -> dict:
+    """Parse GFF3 text into a structured dict for the loader.
+
+    Returns ``{seqid, length, is_circular, features, fasta_seq}``:
+      * ``seqid``        — first seqid encountered (from sequence-region
+                            directive, region row, or the first feature)
+      * ``length``       — value from ``##sequence-region`` or the region
+                            row, else None.
+      * ``is_circular``  — True if the synthesised region row carries
+                            ``Is_circular=true``.
+      * ``features``     — list of dicts: ``{type, start_0, end, strand,
+                            qualifiers, gff_id, phase}``. Wrap split-feat
+                            rows share the same ``gff_id``; callers merge
+                            them into one CompoundLocation.
+      * ``fasta_seq``    — sequence string from the inline ``##FASTA``
+                            directive (if present), else None.
+
+    Coordinates are converted from GFF3 1-based inclusive to SpliceCraft
+    0-based half-open. Raises ValueError on malformed input.
+    """
+    from urllib.parse import unquote as _u
+    seqid = None
+    length = None
+    is_circular = False
+    features: list[dict] = []
+    fasta_seq: "str | None" = None
+    in_fasta = False
+    fasta_buf: list[str] = []
+
+    for raw in text.splitlines():
+        line = raw.rstrip("\n").rstrip("\r")
+        if in_fasta:
+            if line.startswith(">"):
+                # Header — first record only.
+                if fasta_buf:
+                    break
+                continue
+            if line:
+                fasta_buf.append(line.strip())
+            continue
+        if not line:
+            continue
+        if line.startswith("##FASTA"):
+            in_fasta = True
+            continue
+        if line.startswith("##sequence-region"):
+            parts = line.split()
+            if len(parts) >= 4:
+                if seqid is None:
+                    seqid = _u(parts[1])
+                try:
+                    length = int(parts[3])
+                except ValueError:
+                    pass
+            continue
+        if line.startswith("#"):
+            continue
+        cols = line.split("\t")
+        if len(cols) < 9:
+            continue
+        seq_col = _u(cols[0])
+        if seqid is None:
+            seqid = seq_col
+        ftype = cols[2].strip()
+        try:
+            start_1 = int(cols[3])
+            end_1   = int(cols[4])
+        except ValueError:
+            continue
+        if end_1 < start_1:
+            continue
+        strand = cols[6].strip()
+        strand_int = 1 if strand == "+" else (-1 if strand == "-" else 0)
+        phase_s = cols[7].strip()
+        try:
+            phase = int(phase_s) if phase_s != "." else None
+        except ValueError:
+            phase = None
+        attrs_raw = cols[8]
+        quals: dict[str, list[str]] = {}
+        gff_id = ""
+        for kv in attrs_raw.split(";"):
+            kv = kv.strip()
+            if not kv or "=" not in kv:
+                continue
+            k, _, v = kv.partition("=")
+            k = _u(k)
+            vals = [_u(x) for x in v.split(",")]
+            if k == "ID":
+                gff_id = vals[0] if vals else ""
+                continue
+            if k == "Name":
+                quals.setdefault("label", []).extend(vals)
+                continue
+            if k == "Is_circular":
+                if ftype == "region" and vals and vals[0].lower() == "true":
+                    is_circular = True
+                continue
+            if k == "Note":
+                # `Note=key=value` round-trip (mirrors `_record_to_gff3`'s
+                # encoding for unknown qualifiers).
+                for v_one in vals:
+                    if "=" in v_one:
+                        nk, _, nv = v_one.partition("=")
+                        quals.setdefault(nk, []).extend(
+                            nv.split(",") if nv else [""]
+                        )
+                    else:
+                        quals.setdefault("note", []).append(v_one)
+                continue
+            quals.setdefault(k, []).extend(vals)
+        if ftype == "region":
+            if length is None:
+                length = end_1
+            continue
+        if ftype == "source":
+            continue
+        features.append({
+            "type":       ftype,
+            "start_0":    start_1 - 1,
+            "end":        end_1,
+            "strand":     strand_int,
+            "qualifiers": quals,
+            "gff_id":     gff_id,
+            "phase":      phase,
+        })
+    if fasta_buf:
+        fasta_seq = "".join(fasta_buf).upper()
+
+    return {
+        "seqid":       seqid or "plasmid",
+        "length":      length,
+        "is_circular": is_circular,
+        "features":    features,
+        "fasta_seq":   fasta_seq,
+    }
+
+
+def _gff3_features_to_biopython(
+    parsed: dict, total: int,
+) -> list:
+    """Convert parsed GFF3 feature rows into BioPython SeqFeature
+    objects. Same-`gff_id` rows are rejoined as a CompoundLocation
+    (canonical wrap inverse of `_record_to_gff3`). Rows with coords
+    outside ``[0, total)`` are silently dropped — callers should
+    validate ``total`` against ``parsed["length"]`` first.
+    """
+    from Bio.SeqFeature import (
+        SeqFeature, FeatureLocation, CompoundLocation,
+    )
+    by_id: dict[str, list[dict]] = {}
+    no_id: list[dict] = []
+    for f in parsed["features"]:
+        if f["gff_id"]:
+            by_id.setdefault(f["gff_id"], []).append(f)
+        else:
+            no_id.append(f)
+
+    out: list = []
+
+    def _make_loc(parts: list[dict]):
+        # Build FeatureLocation per part, then merge into a
+        # CompoundLocation when there are 2+ parts (wrap features).
+        locs = []
+        for p in parts:
+            s, e = p["start_0"], p["end"]
+            if s < 0 or e > total or e <= s:
+                return None
+            locs.append(FeatureLocation(s, e, strand=p["strand"] or 0))
+        if not locs:
+            return None
+        if len(locs) == 1:
+            return locs[0]
+        return CompoundLocation(locs)
+
+    for gid, parts in by_id.items():
+        loc = _make_loc(parts)
+        if loc is None:
+            continue
+        first = parts[0]
+        feat = SeqFeature(loc, type=first["type"],
+                            qualifiers=dict(first["qualifiers"]))
+        out.append(feat)
+    for f in no_id:
+        loc = _make_loc([f])
+        if loc is None:
+            continue
+        feat = SeqFeature(loc, type=f["type"],
+                            qualifiers=dict(f["qualifiers"]))
+        out.append(feat)
+    return out
+
+
+def _gff3_path_to_record(path: str):
+    """Load a GFF3 file as a SeqRecord.
+
+    Requires an inline ``##FASTA`` directive — GFF3 alone carries no
+    sequence and SpliceCraft is a sequence editor. Topology is set from
+    the synthesised region row's ``Is_circular=true`` attribute (mirrors
+    `_record_to_gff3`'s export convention).
+
+    For sequence-less GFF3 files, use ``_gff3_apply_to_loaded_record``
+    instead — that path treats the file as a feature-transfer overlay
+    on the currently-loaded plasmid.
+
+    Raises ValueError on malformed GFF3 or missing ``##FASTA`` section.
+    """
+    from pathlib import Path as _P
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    ok, reason = _safe_file_size_check(
+        _P(path), _SAFE_LOAD_JSON_MAX_BYTES, "GFF3",
+    )
+    if not ok:
+        raise ValueError(reason or "GFF3 file rejected")
+    text = _P(path).read_text(encoding="utf-8", errors="replace")
+    parsed = _parse_gff3_text(text)
+    if parsed["fasta_seq"] is None:
+        raise ValueError(
+            "GFF3 file has no ##FASTA section. Standalone GFF3 import "
+            "requires inline sequence; use the canvas-overlay path "
+            "instead to apply features to the currently-loaded plasmid."
+        )
+    seq = parsed["fasta_seq"]
+    total = len(seq)
+    if total == 0:
+        raise ValueError("GFF3 ##FASTA section is empty.")
+    features = _gff3_features_to_biopython(parsed, total)
+    seqid = parsed["seqid"]
+    rec = SeqRecord(Seq(seq), id=seqid, name=seqid,
+                     description=f"Imported from GFF3: {_P(path).name}",
+                     features=features)
+    rec.annotations["molecule_type"] = "DNA"
+    rec.annotations["topology"]      = (
+        "circular" if parsed["is_circular"] else "linear"
+    )
+    return rec
+
+
+def _gff3_apply_to_loaded_record(record, path: str) -> int:
+    """Feature-transfer mode for sequence-less GFF3 files.
+
+    Reads features from `path` and appends them to ``record.features``
+    in place. Returns the number of features added. Rejects rows whose
+    coords don't fit within ``len(record.seq)`` (which the caller's
+    sequence guards against tampering).
+
+    Raises ValueError when the GFF3 file IS a complete record (has a
+    ##FASTA section) — that case should use `_gff3_path_to_record`
+    instead.
+    """
+    from pathlib import Path as _P
+    ok, reason = _safe_file_size_check(
+        _P(path), _SAFE_LOAD_JSON_MAX_BYTES, "GFF3",
+    )
+    if not ok:
+        raise ValueError(reason or "GFF3 file rejected")
+    text = _P(path).read_text(encoding="utf-8", errors="replace")
+    parsed = _parse_gff3_text(text)
+    if parsed["fasta_seq"] is not None:
+        raise ValueError(
+            "GFF3 file carries its own sequence (##FASTA). Use the "
+            "standalone-import path so the imported plasmid isn't "
+            "silently grafted onto the currently-loaded one."
+        )
+    total = len(record.seq)
+    parsed_len = parsed.get("length")
+    if parsed_len and parsed_len != total:
+        raise ValueError(
+            f"GFF3 declares length {parsed_len:,} but loaded plasmid "
+            f"is {total:,} bp — coordinate frames don't match. Refusing "
+            f"to apply features that would land at wrong positions."
+        )
+    new_feats = _gff3_features_to_biopython(parsed, total)
+    record.features = list(record.features) + new_feats
+    return len(new_feats)
+
+
 def _export_gff_to_path(record, path) -> dict:
     """Write `record` to `path` as GFF3. Atomic write. Returns
     ``{"path", "bp", "features"}``.
@@ -10934,6 +11414,206 @@ def _export_fasta_to_path(name: str, sequence: str, path) -> dict:
 
     _log.info("Exported FASTA to %s (%s, %d bp)", p, header, len(seq))
     return {"path": str(p), "bp": len(seq), "name": header}
+
+
+def _export_embl_to_path(record, path) -> dict:
+    """Write `record` to `path` as EMBL flatfile via BioPython's SeqIO.
+
+    EMBL is the European Nucleotide Archive's flatfile format — same
+    feature-table model as GenBank, different text layout. Round-trip
+    via SeqIO is straightforward; the writer preserves features,
+    qualifiers, and circular topology. Atomic write.
+
+    Returns ``{path, bp, features}`` on success. Raises:
+      ValueError — record has no sequence.
+      OSError    — filesystem failures (write, replace, fsync).
+    """
+    from pathlib import Path as _Path
+    from io import StringIO
+    from Bio import SeqIO
+
+    if record is None or not getattr(record, "seq", None):
+        raise ValueError("EMBL export needs a record with a sequence.")
+    bp = len(record.seq)
+    if bp == 0:
+        raise ValueError("EMBL export needs a non-empty sequence.")
+
+    buf = StringIO()
+    SeqIO.write([record], buf, "embl")
+    text = buf.getvalue()
+
+    p = _Path(path).expanduser()
+    _atomic_write_text(p, text)
+
+    n_feats = len([f for f in (record.features or [])
+                   if f.type != "source"])
+    _log.info("Exported EMBL to %s (%d bp, %d features)", p, bp, n_feats)
+    return {"path": str(p), "bp": bp, "features": n_feats}
+
+
+# Output formats accepted by the bulk-export helper. Each maps to a
+# writer function + canonical extension. Keep in sync with the format
+# Select in `BulkExportCollectionModal` and the agent endpoint's
+# `format` validation.
+_BULK_EXPORT_FORMATS: dict = {
+    "genbank": ("gb",   "GenBank"),
+    "embl":    ("embl", "EMBL"),
+    "fasta":   ("fa",   "FASTA"),
+    "dna":     ("dna",  "CommercialSaaS .dna"),
+}
+
+
+def _safe_export_filename(name: str, ext: str) -> str:
+    """Sanitise `name` into a portable filename + canonical extension.
+    Strips path separators, control chars, leading dots, and Windows
+    reserved device names; truncates to a length safe under NTFS's
+    260-char total-path limit. Used by `_bulk_export_collection` so a
+    library entry literally named ``../foo`` or ``CON`` can't escape
+    the target directory or hit ENAMETOOLONG."""
+    safe = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "_", name or "").strip(" .")
+    if not safe:
+        safe = "unnamed"
+    if _is_windows_reserved_stem(safe):
+        safe = f"_{safe}"
+    max_stem = 200 - len(ext) - 1
+    if len(safe) > max_stem:
+        safe = safe[:max_stem]
+    return f"{safe}.{ext}"
+
+
+def _bulk_export_collection(collection_name: str,
+                              fmt: str,
+                              target_dir: "Path | str",
+                              progress_cb=None) -> dict:
+    """Write every plasmid in `collection_name` to `target_dir` as
+    files of format `fmt`. Returns ``{format, dir, written, failures,
+    total}``. ``failures`` is a list of ``{name, error}`` dicts.
+
+    Filename pattern: `_safe_export_filename(entry.name, ext)`. On
+    name collisions inside the loop, an ``_N`` suffix is appended.
+
+    ``fmt`` must be a key of `_BULK_EXPORT_FORMATS`. Unsupported
+    formats raise ValueError before any disk activity. `.dna` export
+    requires each entry to either have a sidecar OR have parseable
+    gb_text — failures (e.g., synthesised records with no GB) are
+    reported per-entry, not at the batch level.
+
+    ``progress_cb(idx, total, entry_name, ok)`` is called once per
+    entry if provided; failures are also recorded in the return dict
+    so callers don't need to subscribe to progress just to surface
+    them.
+    """
+    from pathlib import Path as _P
+    from Bio import SeqIO as _SeqIO
+    from io import StringIO as _SIO
+    if fmt not in _BULK_EXPORT_FORMATS:
+        raise ValueError(
+            f"unknown export format {fmt!r}; "
+            f"choose one of {sorted(_BULK_EXPORT_FORMATS)}"
+        )
+    ext, _fmt_label = _BULK_EXPORT_FORMATS[fmt]
+    target = _P(target_dir).expanduser()
+    target.mkdir(parents=True, exist_ok=True)
+
+    collections = _iter_collections_readonly()
+    matched: "dict | None" = None
+    for c in collections:
+        if c.get("name") == collection_name:
+            matched = c
+            break
+    if matched is None:
+        raise ValueError(f"collection not found: {collection_name!r}")
+    entries = matched.get("plasmids", []) or []
+
+    # Case-folded uniqueness set: protects against silent overwrites on
+    # case-insensitive filesystems (APFS, NTFS default, exFAT). Without
+    # the fold, two library entries `pUC19` and `puc19` would both
+    # write to the same on-disk file, silently clobbering each other.
+    # Mirrors the `_dna_sidecar_path` case-fold + hash defence.
+    used_names_cf: set[str] = set()
+    failures: list[dict] = []
+    written: list[dict] = []
+    total = len(entries)
+
+    for i, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict):
+            continue
+        ent_name = entry.get("name") or entry.get("id") or "unnamed"
+        ok = False
+        try:
+            fname = _safe_export_filename(ent_name, ext)
+            if fname.casefold() in used_names_cf:
+                stem, _dot, suf = fname.rpartition(".")
+                bump = 2
+                while True:
+                    candidate = f"{stem}_{bump}.{suf}"
+                    if candidate.casefold() not in used_names_cf:
+                        fname = candidate
+                        break
+                    bump += 1
+            used_names_cf.add(fname.casefold())
+            out_path = target / fname
+
+            if fmt == "dna":
+                _export_commercialsaas_dna(entry, out_path)
+                bp = entry.get("size") or 0
+            elif fmt == "genbank":
+                # Fast path: the entry already holds canonical GenBank
+                # text. Re-parsing + re-emitting via BioPython would
+                # do a 500-plasmid bulk export in ~2-10 s of wasted
+                # round-trip work. Atomic-write the cached text
+                # directly instead — `_atomic_write_text` handles the
+                # tempfile + fsync + replace dance.
+                gb_text = entry.get("gb_text") or ""
+                if not gb_text:
+                    raise ValueError("entry has no gb_text payload")
+                _atomic_write_text(out_path, gb_text)
+                bp = entry.get("size", 0) or 0
+            else:
+                gb_text = entry.get("gb_text") or ""
+                if not gb_text:
+                    raise ValueError("entry has no gb_text payload")
+                rec = next(_SeqIO.parse(_SIO(gb_text), "genbank"), None)
+                if rec is None:
+                    raise ValueError("entry gb_text could not be parsed")
+                if fmt == "embl":
+                    summary = _export_embl_to_path(rec, str(out_path))
+                    bp = summary.get("bp", 0)
+                elif fmt == "fasta":
+                    summary = _export_fasta_to_path(
+                        rec.name or rec.id or "plasmid",
+                        str(rec.seq),
+                        str(out_path),
+                    )
+                    bp = summary.get("bp", 0)
+                else:  # pragma: no cover — guarded above
+                    raise ValueError(f"unhandled fmt: {fmt}")
+            written.append({"name": ent_name, "path": str(out_path),
+                            "bp": bp})
+            ok = True
+        except (OSError, ValueError, StopIteration) as exc:
+            _log.exception(
+                "bulk_export: entry %r in collection %r failed",
+                ent_name, collection_name,
+            )
+            failures.append({"name": ent_name, "error": str(exc)})
+        if progress_cb is not None:
+            try:
+                progress_cb(i, total, ent_name, ok)
+            except Exception:
+                _log.exception("bulk_export: progress_cb raised")
+
+    _log.info(
+        "Bulk export %s/%s → %s: %d/%d written, %d failed",
+        collection_name, fmt, target, len(written), total, len(failures),
+    )
+    return {
+        "format":   fmt,
+        "dir":      str(target),
+        "total":    total,
+        "written":  written,
+        "failures": failures,
+    }
 
 
 # ── Core drawing ───────────────────────────────────────────────────────────────
@@ -11225,6 +11905,14 @@ class PlasmidMap(Widget):
         self.origin_bp    = 0
         self.selected_idx = -1
         self._feats       = self._parse(record)
+        # Stale tooltip clear: a worker callback (BLAST/RE-scan/diff)
+        # can reseat the record while the mouse hovers stationary over
+        # an old feature — `on_mouse_move` only fires on movement, so
+        # the tooltip would otherwise reference a feat dict that no
+        # longer matches what's under the cursor. Drop it on reload;
+        # the next mouse move repopulates against the new `_feats`.
+        if self.tooltip is not None:
+            self.tooltip = None
         # Sorted-by-start index: lets `_draw_linear` skip features
         # outside the visible bp window in O(log n + visible_count)
         # via bisect, instead of iterating every feature on every
@@ -11821,9 +12509,31 @@ class PlasmidMap(Widget):
     def _label_at(self, x: int, y: int) -> int:
         """Return the feature index whose label bbox covers the
         click cell (x, y), or -1 if no label was hit. Bboxes are
-        populated in `_draw` / `_draw_linear` per render pass."""
-        for x0, x1, ly, idx in getattr(self, "_label_bboxes", ()):
-            if y == ly and x0 <= x <= x1:
+        populated in `_draw` / `_draw_linear` per render pass.
+
+        Uses a row-indexed lookup cache (`{ly: [(x0, x1, idx), ...]}`)
+        so per-mouse-move hover lookup is O(labels-on-row) instead of
+        O(labels-total). Cache invalidates by `id(self._label_bboxes)`
+        — every `_draw` / `_draw_linear` rebuild reassigns the list,
+        so the cache misses on the next call and rebuilds once. On a
+        feature-dense plasmid with 60 fps hover, this drops per-move
+        cost from O(features-visible) to O(rows-with-labels).
+        """
+        bboxes = getattr(self, "_label_bboxes", None)
+        if not bboxes:
+            return -1
+        cache = getattr(self, "_label_at_cache", None)
+        if cache is None or cache[0] is not bboxes:
+            by_row: dict[int, list] = {}
+            for x0, x1, ly, idx in bboxes:
+                by_row.setdefault(ly, []).append((x0, x1, idx))
+            self._label_at_cache = (bboxes, by_row)
+            cache = self._label_at_cache
+        row_hits = cache[1].get(y)
+        if not row_hits:
+            return -1
+        for x0, x1, idx in row_hits:
+            if x0 <= x <= x1:
                 return idx
         return -1
 
@@ -13370,7 +14080,11 @@ def _search_collections_library(query: str, *,
     """
     out: list[dict] = []
     q = (query or "").strip()
-    for c in _load_collections():
+    # Read-only walk — we copy each match's scalar fields into a fresh
+    # dict below, so the cached entries themselves are never exposed
+    # to the caller. Lets us skip the per-call `_typed_clone` of the
+    # entire collections cache (~30–50 ms on a 5k-plasmid library).
+    for c in _iter_collections_readonly():
         cname = c.get("name") or "?"
         for entry in c.get("plasmids", []) or []:
             if not isinstance(entry, dict):
@@ -14776,13 +15490,9 @@ class LibraryPanel(Widget):
         """
         global _collections_cache
         _collections_cache = _typed_clone(entries)
-        # Same dependent-cache invalidation `_save_collections` does
-        # synchronously, preserved here so a freshly-renamed /
-        # deleted / new collection doesn't keep returning stale
-        # BLAST hits or primer-usage rows.
-        _clear_blast = globals().get("_blast_clear_cache")
-        if _clear_blast is not None:
-            _clear_blast()
+        # BLAST cache invalidates naturally via content fingerprint on
+        # next lookup; no explicit clear needed here. See the matching
+        # comment in `_save_collections`.
         _clear_primer = globals().get("_primer_usage_clear_cache")
         if _clear_primer is not None:
             _clear_primer()
@@ -16862,10 +17572,20 @@ class SequencePanel(Widget):
         return {"kind": "gap", "chunk": chunk_idx, "seq_col": seq_col}
 
     def _update_hover_status(self, screen_x: int, screen_y: int) -> None:
-        try:
-            status = self.query_one("#seq-hover-status", Static)
-        except NoMatches:
-            return
+        # Cache the Static reference. `on_mouse_move` fires up to 60 fps
+        # while the user hovers; resolving `#seq-hover-status` via
+        # `query_one` each time walks the DOM tree, which dominates the
+        # per-frame budget on large screens. The widget is mounted in
+        # SequencePanel.compose() and never unmounted until panel tear-
+        # down, so the cached reference stays valid for the life of
+        # the panel.
+        status = getattr(self, "_seq_hover_status_cache", None)
+        if status is None:
+            try:
+                status = self.query_one("#seq-hover-status", Static)
+            except NoMatches:
+                return
+            self._seq_hover_status_cache = status
         info = self._hover_at(screen_x, screen_y)
         status.update(self._hover_status_text(info))
 
@@ -20348,6 +21068,8 @@ def _safe_snapshot_token(s: str, max_len: int = 32) -> str:
     across Linux/Mac/Windows."""
     cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", s)
     cleaned = cleaned.lstrip(".") or "x"
+    if _is_windows_reserved_stem(cleaned):
+        cleaned = f"_{cleaned}"
     return cleaned[:max_len]
 
 
@@ -21957,6 +22679,26 @@ class OpenFileModal(ModalScreen):
                     )
                     return
                 record = _fasta_path_to_record(path)
+            elif _is_ab1_path(path):
+                record = _ab1_path_to_record(path)
+            elif _is_fastq_path(path):
+                # FASTQ: same single-vs-multi split as FASTA. Multi-read
+                # files (the common case for sequencing output) become
+                # a new collection with one entry per read.
+                fastq_records = _fastq_path_to_records(path)
+                if len(fastq_records) > 1:
+                    self.app.call_from_thread(
+                        self._handle_multi_record_fasta, path, fastq_records,
+                    )
+                    return
+                record = fastq_records[0]
+            elif path.lower().endswith((".gff", ".gff3")):
+                # GFF3 standalone import — requires inline ##FASTA.
+                # Sequence-less GFF3 is rejected here; users wanting
+                # feature transfer onto the loaded canvas should use
+                # the dedicated apply-gff3 path (agent endpoint or
+                # the forthcoming overlay UI affordance).
+                record = _gff3_path_to_record(path)
             else:
                 record = load_genbank(path)
         except Exception as exc:
@@ -22248,6 +22990,13 @@ class ExportCommercialSaaSModal(ModalScreen):
             default_path, fallback,
         )
         self._selected_dir = self._start_dir
+        self._dismissed: bool = False   # [INV-50]
+
+    def _dismiss_once(self, payload) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="export-box"):
@@ -22321,26 +23070,20 @@ class ExportCommercialSaaSModal(ModalScreen):
             path += ".dna"
         try:
             written = _export_commercialsaas_dna(self._entry, path)
-        except FileNotFoundError as exc:
-            status.update(
-                f"[red]No .dna sidecar for this plasmid: {exc} "
-                f"Use 'Export as GenBank' instead.[/red]"
-            )
-            return
         except (OSError, ValueError) as exc:
             _log.exception("CommercialSaaS export to %s failed", path)
             status.update(
                 f"[red]Could not write {path!r}: {exc}.[/red]"
             )
             return
-        self.dismiss({"path": written})
+        self._dismiss_once({"path": written})
 
     @on(Button.Pressed, "#btn-cancel-export")
     def _cancel_btn(self, _: Button.Pressed) -> None:
-        self.dismiss(None)
+        self._dismiss_once(None)
 
     def action_cancel(self) -> None:
-        self.dismiss(None)
+        self._dismiss_once(None)
 
     @on(Input.Submitted, "#export-filename")
     def _submitted(self) -> None:
@@ -22406,6 +23149,13 @@ class ExportGenBankModal(ModalScreen):
             default_path, fallback,
         )
         self._selected_dir = self._start_dir
+        self._dismissed: bool = False   # [INV-50]
+
+    def _dismiss_once(self, payload) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="export-box"):
@@ -22484,6 +23234,10 @@ class ExportGenBankModal(ModalScreen):
             status.update("[red]Enter a filename.[/red]")
             return
         path = str(Path(self._selected_dir).expanduser() / filename)
+        if (ext_err := _check_export_extension(
+                Path(path), _EXPORT_GENBANK_EXTS, "GenBank")) is not None:
+            status.update(f"[red]{ext_err}[/red]")
+            return
         status.update(f"[dim]Exporting to {path}…[/dim]")
         # Disable the Export button so the user can't double-click
         # while the worker is in flight. Cancel stays enabled so the
@@ -22524,7 +23278,7 @@ class ExportGenBankModal(ModalScreen):
         # `FetchModal._do_fetch` is_mounted pattern.
         def _dismiss_if_mounted() -> None:
             if self.is_mounted:
-                self.dismiss(summary)
+                self._dismiss_once(summary)
         self.app.call_from_thread(_dismiss_if_mounted)
 
     def _on_export_failed(self, msg: str) -> None:
@@ -22546,10 +23300,10 @@ class ExportGenBankModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-cancel-export")
     def _cancel_btn(self) -> None:
-        self.dismiss(None)
+        self._dismiss_once(None)
 
     def action_cancel(self) -> None:
-        self.dismiss(None)
+        self._dismiss_once(None)
 
 
 class GffExportModal(ModalScreen):
@@ -22579,6 +23333,13 @@ class GffExportModal(ModalScreen):
             default_path, fallback,
         )
         self._selected_dir = self._start_dir
+        self._dismissed: bool = False   # [INV-50]
+
+    def _dismiss_once(self, payload) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="gff-export-box"):
@@ -22652,6 +23413,10 @@ class GffExportModal(ModalScreen):
             status.update("[red]Enter a filename.[/red]")
             return
         path = str(Path(self._selected_dir).expanduser() / filename)
+        if (ext_err := _check_export_extension(
+                Path(path), _EXPORT_GFF_EXTS, "GFF3")) is not None:
+            status.update(f"[red]{ext_err}[/red]")
+            return
         status.update(f"[dim]Exporting to {path}…[/dim]")
         try:
             self.query_one("#btn-gff-export-ok", Button).disabled = True
@@ -22675,7 +23440,7 @@ class GffExportModal(ModalScreen):
         # Guard dismiss for the same reason as `GenBankExportModal`.
         def _dismiss_if_mounted() -> None:
             if self.is_mounted:
-                self.dismiss(summary)
+                self._dismiss_once(summary)
         self.app.call_from_thread(_dismiss_if_mounted)
 
     def _on_export_failed(self, msg: str) -> None:
@@ -22697,10 +23462,10 @@ class GffExportModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-gff-export-cancel")
     def _cancel_btn(self) -> None:
-        self.dismiss(None)
+        self._dismiss_once(None)
 
     def action_cancel(self) -> None:
-        self.dismiss(None)
+        self._dismiss_once(None)
 
 
 class FastaExportModal(ModalScreen):
@@ -22727,6 +23492,13 @@ class FastaExportModal(ModalScreen):
             default_path, fallback,
         )
         self._selected_dir = self._start_dir
+        self._dismissed: bool = False   # [INV-50]
+
+    def _dismiss_once(self, payload) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="fasta-export-box"):
@@ -22796,6 +23568,10 @@ class FastaExportModal(ModalScreen):
             status.update("[red]Enter a filename.[/red]")
             return
         path = str(Path(self._selected_dir).expanduser() / filename)
+        if (ext_err := _check_export_extension(
+                Path(path), _EXPORT_FASTA_EXTS, "FASTA")) is not None:
+            status.update(f"[red]{ext_err}[/red]")
+            return
         status.update(f"[dim]Exporting to {path}…[/dim]")
         try:
             self.query_one("#btn-fasta-export-ok", Button).disabled = True
@@ -22828,7 +23604,7 @@ class FastaExportModal(ModalScreen):
         # Guard dismiss for the same reason as `GenBankExportModal`.
         def _dismiss_if_mounted() -> None:
             if self.is_mounted:
-                self.dismiss(summary)
+                self._dismiss_once(summary)
         self.app.call_from_thread(_dismiss_if_mounted)
 
     def _on_export_failed(self, msg: str) -> None:
@@ -22850,10 +23626,10 @@ class FastaExportModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-fasta-export-cancel")
     def _cancel_btn(self) -> None:
-        self.dismiss(None)
+        self._dismiss_once(None)
 
     def action_cancel(self) -> None:
-        self.dismiss(None)
+        self._dismiss_once(None)
 
 
 class CustomEnzymeListModal(ModalScreen):
@@ -23126,6 +23902,188 @@ class ORFFinderModal(ModalScreen):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+# ── Bulk-export collection modal ───────────────────────────────────────────────
+
+class BulkExportCollectionModal(ModalScreen):
+    """Export every plasmid in a chosen collection to a target folder.
+
+    Three controls:
+      * Collection picker — populated from `_load_collections()`.
+      * Format picker     — GenBank / EMBL / FASTA / .dna.
+      * Folder picker     — DirectoryTree rooted at $HOME.
+
+    Failures are accumulated per-entry, not at the batch level, so a
+    single broken plasmid doesn't abort the run. On dismiss, returns
+    ``{collection, format, dir, total, written, failures}`` or None
+    on cancel.
+
+    `_blocks_undo: True` because the work happens off-thread and we
+    don't want undo snapshots interleaving with bulk writes.
+    """
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    BulkExportCollectionModal { align: center middle; }
+    #bulkexp-box {
+        width: 100; max-width: 95%; min-width: 70;
+        height: auto; max-height: 90%;
+        background: $surface; border: solid $primary; padding: 1 2;
+    }
+    #bulkexp-title { background: $primary-darken-2; color: $text;
+                     padding: 0 1; margin-bottom: 1; }
+    #bulkexp-tree  { height: 14; border: solid $primary-darken-2; }
+    #bulkexp-status { height: 3; margin-top: 1; }
+    #bulkexp-btns  { height: 3; margin-top: 1; align: right middle; }
+    """
+
+    def __init__(self, default_collection: str = "") -> None:
+        super().__init__()
+        self._default_collection = default_collection
+        self._selected_dir = str(Path.home())
+        # [INV-50] dismissal guard. Three exit paths: Cancel button,
+        # Esc/action_cancel, worker `_ok` callback. Without the flag a
+        # quick Cancel+worker race could fire two dismiss calls.
+        self._dismissed: bool = False
+
+    def _dismiss_once(self, payload) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="bulkexp-box"):
+            yield Static(" Export collection ", id="bulkexp-title")
+            colls = [c.get("name") or "?"
+                     for c in _iter_collections_readonly()
+                     if isinstance(c, dict)]
+            colls = [c for c in colls if c]
+            if not colls:
+                colls = ["(no collections)"]
+            initial_coll = (self._default_collection
+                            if self._default_collection in colls
+                            else colls[0])
+            yield Label("Collection:")
+            yield Select(
+                [(c, c) for c in colls],
+                value=initial_coll, id="bulkexp-collection",
+                allow_blank=False,
+            )
+            yield Label("Format:")
+            yield Select(
+                [(label, key)
+                 for key, (_ext, label) in _BULK_EXPORT_FORMATS.items()],
+                value="genbank", id="bulkexp-format",
+                allow_blank=False,
+            )
+            yield Static(
+                f"Save in: [b]{self._selected_dir}[/b]",
+                id="bulkexp-dir", markup=True,
+            )
+            yield DirectoryTree(str(Path.home()), id="bulkexp-tree")
+            yield Static("", id="bulkexp-status", markup=True)
+            with Horizontal(id="bulkexp-btns"):
+                yield Button("Export",  id="btn-bulkexp", variant="primary")
+                yield Button("Cancel",  id="btn-bulkexp-cancel")
+
+    @on(DirectoryTree.DirectorySelected, "#bulkexp-tree")
+    def _on_dir(self, event) -> None:
+        self._selected_dir = str(event.path)
+        try:
+            self.query_one("#bulkexp-dir", Static).update(
+                f"Save in: [b]{self._selected_dir}[/b]"
+            )
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-bulkexp")
+    def _do_export(self, _) -> None:
+        try:
+            coll_sel = self.query_one("#bulkexp-collection", Select).value
+            fmt_sel = self.query_one("#bulkexp-format", Select).value
+            status = self.query_one("#bulkexp-status", Static)
+        except NoMatches:
+            return
+        if not isinstance(coll_sel, str) or not isinstance(fmt_sel, str):
+            status.update("[red]Pick a collection and a format first.[/red]")
+            return
+        if fmt_sel not in _BULK_EXPORT_FORMATS:
+            status.update(f"[red]Unknown format: {fmt_sel}[/red]")
+            return
+        try:
+            self.query_one("#btn-bulkexp", Button).disabled = True
+        except NoMatches:
+            pass
+        status.update(
+            f"[dim]Exporting {coll_sel!r} as {fmt_sel} → "
+            f"{self._selected_dir}…[/dim]"
+        )
+        self._do_worker(coll_sel, fmt_sel, self._selected_dir)
+
+    @work(thread=True, exclusive=True, group="bulk_export")
+    def _do_worker(self, coll: str, fmt: str, target_dir: str) -> None:
+        # Progress hook: feeds the status line on the UI thread so a
+        # 500-plasmid bulk export doesn't look frozen. Throttled to
+        # one update per ~8 entries so DataTable / Static churn stays
+        # below 33 ms / frame on even very large libraries.
+        def _on_progress(i: int, total: int, name: str, ok: bool) -> None:
+            if i != total and (i % 8) != 0:
+                return
+            def _update():
+                if not self.is_mounted:
+                    return
+                try:
+                    self.query_one("#bulkexp-status", Static).update(
+                        f"[dim]Exporting {i}/{total} ({name})…[/dim]"
+                    )
+                except NoMatches:
+                    pass
+            try:
+                self.app.call_from_thread(_update)
+            except RuntimeError:
+                # App tearing down mid-export — drop the update silently;
+                # the worker still finishes its current write.
+                pass
+        try:
+            result = _bulk_export_collection(
+                coll, fmt, target_dir, progress_cb=_on_progress,
+            )
+        except (OSError, ValueError) as exc:
+            _log.exception("Bulk export failed")
+            err_msg = str(exc)
+            def _fail():
+                if not self.is_mounted:
+                    return
+                try:
+                    self.query_one("#bulkexp-status", Static).update(
+                        f"[red]Export failed: {err_msg}[/red]"
+                    )
+                    self.query_one("#btn-bulkexp", Button).disabled = False
+                except NoMatches:
+                    pass
+            self.app.call_from_thread(_fail)
+            return
+
+        def _ok():
+            if not self.is_mounted:
+                return
+            self._dismiss_once({"collection": coll, **result})
+        self.app.call_from_thread(_ok)
+
+    @on(Button.Pressed, "#btn-bulkexp-cancel")
+    def _cancel(self, _) -> None:
+        self._dismiss_once(None)
+
+    def action_cancel(self) -> None:
+        self._dismiss_once(None)
 
 
 # ── Dropdown menu modal ────────────────────────────────────────────────────────
@@ -27060,6 +28018,13 @@ _SETTINGS_SCHEMA: "dict[str, tuple[tuple, object]]" = {
     # `_init_codon_table`. Agent endpoint
     # `set-active-codon-table` writes this; Synthesis honors on open.
     "active_codon_table":      ((str,),                ""),
+    # Crash-recovery dedupe: list of recovery-file basenames already
+    # shown to the user so reopened sessions don't repeat the "found
+    # unsaved edits from <date>" prompt. Forward-compat passthrough
+    # catches it today; schema entry pins the type so a corrupted
+    # settings.json with `crash_recovery_seen: 42` won't crash the
+    # post-mount recovery scan.
+    "crash_recovery_seen":     ((list,),               []),
 }
 
 
@@ -33563,6 +34528,71 @@ _BLAST_DB_CACHE_MAX = 4
 _BLAST_CACHE_LOCK = threading.Lock()
 
 
+# Memoised fingerprint per (collections cache identity, wanted set).
+# `_save_collections` reseats `_collections_cache = _typed_clone(...)`
+# inside `_cache_lock`, so cache identity flips on every save — which
+# is exactly when we want to recompute. For a 5k-entry library this
+# skips ~5k iterations + hash calls per `_blast_get_db` call (the
+# fingerprint is otherwise on the hot path of every BLAST submit).
+_BLAST_FINGERPRINT_CACHE: "dict[tuple, int]" = {}
+_BLAST_FINGERPRINT_CACHE_LOCK = threading.Lock()
+
+
+def _blast_collections_fingerprint(
+    collection_names: "list[str] | None",
+) -> int:
+    """Cheap content hash of the collections that would feed
+    `_blast_build_db`. Walks the read-only cache (no clone) and folds
+    a per-entry tuple (id, name, size, n_feats, gb_text length) into a
+    single int. Used as part of the `_BLAST_DB_CACHE` key so that
+    cosmetic-only changes (collection rename, plasmid recolour) miss
+    the cache while content-affecting changes (added/removed/edited
+    plasmid) hit. Replaces the old "clear-everything on every
+    `_save_collections`" sledgehammer.
+
+    Result is memoised by `(id(_collections_cache), frozenset(names))`
+    so repeated `_blast_get_db` calls during one BLAST modal session
+    don't re-walk the cache.
+    """
+    global _collections_cache
+    wanted_fs = frozenset(collection_names) if collection_names else frozenset()
+    cache_id = id(_collections_cache)
+    key = (cache_id, wanted_fs)
+    with _BLAST_FINGERPRINT_CACHE_LOCK:
+        hit = _BLAST_FINGERPRINT_CACHE.get(key)
+        if hit is not None:
+            return hit
+    h = 0
+    wanted = set(collection_names) if collection_names else None
+    for c in _iter_collections_readonly():
+        cname = c.get("name") or ""
+        if wanted is not None and cname not in wanted:
+            continue
+        entries = c.get("plasmids", []) or []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            gb = entry.get("gb_text") or ""
+            sig = (
+                entry.get("id") or "",
+                entry.get("name") or "",
+                int(entry.get("size", 0) or 0),
+                int(entry.get("n_feats", 0) or 0),
+                len(gb),
+            )
+            h ^= hash(sig)
+    with _BLAST_FINGERPRINT_CACHE_LOCK:
+        # Bound the cache: clear on cache-identity rotation (any
+        # entry's first element != current `id(_collections_cache)`).
+        # Cheap O(N) prune since N stays small (≤ collection-set count
+        # × maybe 4 BLAST flavours).
+        stale = [k for k in _BLAST_FINGERPRINT_CACHE if k[0] != cache_id]
+        for k in stale:
+            _BLAST_FINGERPRINT_CACHE.pop(k, None)
+        _BLAST_FINGERPRINT_CACHE[key] = h
+    return h
+
+
 def _blast_get_db(program: str,
                   collection_names: "list[str] | None",
                   *, six_frame: bool = False) -> dict:
@@ -33570,10 +34600,13 @@ def _blast_get_db(program: str,
     subsequent calls with the same inputs until evicted.
 
     The cache key includes ``six_frame`` so a 6-frame BLASTP DB and a
-    CDS-only BLASTP DB for the same collection don't collide.
+    CDS-only BLASTP DB for the same collection don't collide. It also
+    includes a content fingerprint so the cache survives renames /
+    recolours but invalidates when plasmid contents change.
     """
+    fp = _blast_collections_fingerprint(collection_names)
     key = (program, frozenset(collection_names) if collection_names
-           else frozenset(), bool(six_frame))
+           else frozenset(), bool(six_frame), fp)
     with _BLAST_CACHE_LOCK:
         if key in _BLAST_DB_CACHE:
             _BLAST_DB_CACHE.move_to_end(key)
@@ -36119,6 +37152,13 @@ class EditGrammarConfirmModal(ModalScreen):
         super().__init__()
         self._grammar_name = grammar_name
         self._n_dependents = n_dependents
+        self._dismissed: bool = False   # [INV-50]
+
+    def _dismiss_once(self, payload) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="gec-dlg"):
@@ -36155,12 +37195,12 @@ class EditGrammarConfirmModal(ModalScreen):
             pass
 
     @on(Button.Pressed, "#btn-gec-no")
-    def _no(self, _): self.dismiss(False)
+    def _no(self, _): self._dismiss_once(False)
 
     @on(Button.Pressed, "#btn-gec-yes")
-    def _yes(self, _): self.dismiss(True)
+    def _yes(self, _): self._dismiss_once(True)
 
-    def action_cancel(self): self.dismiss(False)
+    def action_cancel(self): self._dismiss_once(False)
 
 
 class _ConfirmDeleteGrammarModal(ModalScreen):
@@ -36181,6 +37221,13 @@ class _ConfirmDeleteGrammarModal(ModalScreen):
         super().__init__()
         self._grammar_name = grammar_name
         self._body = body_markup
+        self._dismissed: bool = False   # [INV-50]
+
+    def _dismiss_once(self, payload) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="gec-dlg"):
@@ -36199,12 +37246,12 @@ class _ConfirmDeleteGrammarModal(ModalScreen):
             pass
 
     @on(Button.Pressed, "#btn-gec-no")
-    def _no(self, _): self.dismiss(False)
+    def _no(self, _): self._dismiss_once(False)
 
     @on(Button.Pressed, "#btn-gec-yes")
-    def _yes(self, _): self.dismiss(True)
+    def _yes(self, _): self._dismiss_once(True)
 
-    def action_cancel(self): self.dismiss(False)
+    def action_cancel(self): self._dismiss_once(False)
 
 
 
@@ -39798,6 +40845,37 @@ _FASTA_EXTS: frozenset[str] = frozenset({
     ".fa", ".fasta", ".fna", ".ffn", ".frn", ".fas", ".mpfa", ".faa",
 })
 
+# AB1 Sanger trace files (single record, base-called via BioPython's
+# `abi` SeqIO key). Plasmidsaurus zips include these and we now surface
+# them as loadable entries.
+_AB1_EXTS: frozenset[str] = frozenset({".ab1", ".abi"})
+
+# FASTQ multi-read files (sequencing output). Imported as a new
+# collection per file, same flow as multi-record FASTA. Quality scores
+# are read but not surfaced in the plasmid map (the editor's primary
+# axis is annotation, not basecall quality).
+_FASTQ_EXTS: frozenset[str] = frozenset({".fastq", ".fq"})
+
+
+def _is_ab1_path(path) -> bool:
+    try:
+        suffix = getattr(path, "suffix", None)
+        if suffix is None:
+            suffix = Path(str(path)).suffix
+    except Exception:
+        return False
+    return suffix.lower() in _AB1_EXTS
+
+
+def _is_fastq_path(path) -> bool:
+    try:
+        suffix = getattr(path, "suffix", None)
+        if suffix is None:
+            suffix = Path(str(path)).suffix
+    except Exception:
+        return False
+    return suffix.lower() in _FASTQ_EXTS
+
 # Hot pink and plain white — high contrast so the eye finds FASTA files
 # immediately in a mixed directory listing. 2026-05-06: switched from
 # lime green to pink so FASTA carries the same colour signal across
@@ -39987,6 +41065,106 @@ def _fasta_path_to_record(path: str):
     rec.annotations["molecule_type"] = "DNA"
     rec.annotations["topology"]      = "linear"
     return rec
+
+
+def _ab1_path_to_record(path: str):
+    """Parse a Sanger trace `.ab1` / `.abi` file into a `SeqRecord`.
+
+    BioPython's `SeqIO.parse(path, "abi")` base-calls the trace
+    automatically and produces a single SeqRecord with quality scores
+    in `letter_annotations["phred_quality"]`. We force `topology=linear`
+    because Sanger reads are linear sequencing fragments — circular
+    interpretation would mis-orient the user.
+
+    Size + symlink check via `_safe_file_size_check` at entry — typical
+    AB1 traces are 200 KB to a few MB, but a hostile / corrupted file
+    could be arbitrarily large. The cap mirrors `_BULK_IMPORT_MAX_BYTES`
+    (50 MB) used by every other import path.
+
+    Raises ValueError on malformed traces / missing base-call channels
+    or files exceeding the size cap.
+    """
+    from Bio import SeqIO
+    ok, reason = _safe_file_size_check(
+        Path(path), _BULK_IMPORT_MAX_BYTES, "AB1",
+    )
+    if not ok:
+        raise ValueError(reason or "AB1 trace rejected")
+    try:
+        records = list(SeqIO.parse(path, "abi"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"could not parse AB1 trace: {exc}") from exc
+    if not records:
+        raise ValueError(f"no base-called sequence in {Path(path).name}")
+    if len(records) > 1:
+        raise ValueError(
+            f"AB1 file contains {len(records)} records; expected one"
+        )
+    rec = records[0]
+    # AB1 records leave `name` / `id` as the sample name, which is fine.
+    # Force molecule_type/topology so downstream library/save paths see
+    # the same fields as every other linear import.
+    rec.annotations["molecule_type"] = "DNA"
+    rec.annotations["topology"]      = "linear"
+    if not rec.description or rec.description == rec.id:
+        rec.description = f"Imported from AB1 trace: {Path(path).name}"
+    return rec
+
+
+# FASTQ multi-read import caps. Without them a 1 GB Illumina FASTQ
+# (≈8 M reads) blows RAM before any guard fires, and a 100k-read FASTQ
+# would create 100k library entries blowing `_BULK_IMPORT_MAX_BYTES`
+# on the serialised library JSON. Plasmid editor != read aligner.
+_FASTQ_MAX_READS = 1000
+
+
+def _fastq_path_to_records(path: str) -> "list":
+    """Parse a multi-read `.fastq` / `.fq` file into a list of
+    `SeqRecord` objects. Each read becomes one record. Topology is
+    forced to linear (reads are by definition linear fragments).
+
+    Designed to feed `_handle_multi_record_fasta`'s collection-import
+    flow — FASTQ becomes a new collection with one entry per read.
+    Quality scores survive on `letter_annotations` but are not
+    surfaced in the plasmid map (which is annotation-axis, not
+    quality-axis).
+
+    Two caps protect against pathological inputs:
+      * File size capped at `_BULK_IMPORT_MAX_BYTES` (50 MB) via
+        `_safe_file_size_check` — a multi-GB Illumina FASTQ would
+        OOM `SeqIO.parse(...)`'s `list(...)` wrapper otherwise.
+      * Read-count capped at `_FASTQ_MAX_READS` (1000) — even at the
+        50 MB file cap a typical Illumina lane delivers ≫1000 short
+        reads; the plasmid library wasn't designed to hold raw
+        sequencing reads. Users with large datasets belong on the
+        Plasmidsaurus tab (consensus-only) or in a dedicated aligner.
+
+    Raises ValueError on malformed input, zero records, oversize, or
+    read-count over cap.
+    """
+    from Bio import SeqIO
+    ok, reason = _safe_file_size_check(
+        Path(path), _BULK_IMPORT_MAX_BYTES, "FASTQ",
+    )
+    if not ok:
+        raise ValueError(reason or "FASTQ file rejected")
+    try:
+        records = list(SeqIO.parse(path, "fastq"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"could not parse FASTQ: {exc}") from exc
+    if not records:
+        raise ValueError(f"no reads in {Path(path).name}")
+    if len(records) > _FASTQ_MAX_READS:
+        raise ValueError(
+            f"FASTQ contains {len(records):,} reads; cap is "
+            f"{_FASTQ_MAX_READS:,} per file. Split the file or use a "
+            f"dedicated read aligner — the plasmid library isn't "
+            f"designed for raw sequencing reads."
+        )
+    for rec in records:
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"]      = "linear"
+    return records
 
 
 # ── Multi-record FASTA → collection helpers ───────────────────────────────
@@ -40393,6 +41571,46 @@ def _is_seq_zip_path(path) -> bool:
     except Exception:
         return False
     return suffix.lower() in _SEQ_ZIP_EXTS
+
+
+_AB1_HIGHLIGHT_STYLE = "bold #87CEEB"   # sky-blue, distinct from FASTA pink
+_AB1_OTHER_STYLE     = "#FFFFFF"
+
+
+class _AbiAwareDirectoryTree(DirectoryTree):
+    """DirectoryTree variant that paints `.ab1`/`.abi` trace files sky
+    blue so users scanning a sequencing-results folder can find them at
+    a glance. Mirrors the FASTA/zip awareness pattern."""
+
+    def render_label(self, node, base_style, style):
+        label = super().render_label(node, base_style, style)
+        data = node.data
+        if data is None:
+            return label
+        p = getattr(data, "path", None)
+        if p is None:
+            return label
+        try:
+            if not p.is_file():
+                return label
+        except OSError:
+            return label
+        styled = label.copy()
+        if _is_ab1_path(p):
+            styled.stylize(_AB1_HIGHLIGHT_STYLE)
+        else:
+            styled.stylize(_AB1_OTHER_STYLE)
+        return styled
+
+    def _populate_node(self, node, content):
+        sorted_content = sorted(
+            content,
+            key=lambda p: (
+                not self._safe_is_dir(p),
+                _natural_sort_key(p.name),
+            ),
+        )
+        super()._populate_node(node, sorted_content)
 
 
 class _ZipAwareDirectoryTree(DirectoryTree):
@@ -41586,6 +42804,24 @@ class SequencingScreen(Screen):
     }
     #align-btns Button { margin-right: 1; min-width: 14; }
 
+    /* ── Sanger pane ────────────────────────────────────────── */
+    #sequencing-sanger { width: 100%; height: 1fr; }
+    #sanger-tree {
+        height: 12; min-height: 8;
+        border: solid $primary-darken-2;
+    }
+    #sanger-selected {
+        height: 1; color: $text-muted; margin-top: 1;
+    }
+    #sanger-preview {
+        height: 1fr; min-height: 6;
+        color: $text; margin-top: 1;
+    }
+    #sanger-btns {
+        height: 3; margin-top: 1; align: left middle;
+    }
+    #sanger-btns Button { margin-right: 1; min-width: 16; }
+
     /* ── Screen-level footer with the Close button ──────────── */
     #seq-bottom {
         height: 3; margin-top: 1; align: left middle;
@@ -41643,6 +42879,8 @@ class SequencingScreen(Screen):
             ):
                 with TabPane("Plasmidsaurus", id="seq-tab-plasmidsaurus"):
                     yield from self._compose_plasmidsaurus_pane()
+                with TabPane("Sanger (.ab1)", id="seq-tab-sanger"):
+                    yield from self._compose_sanger_pane()
             with Horizontal(id="seq-bottom"):
                 yield Button("Close  [Esc]", id="btn-sequencing-close")
         yield Footer()
@@ -41729,6 +42967,137 @@ class SequencingScreen(Screen):
         with Horizontal(id="align-btns"):
             yield Button("Align", id="btn-align-go",
                           variant="primary", disabled=True)
+
+    def _compose_sanger_pane(self) -> ComposeResult:
+        """Sanger tab: pick an .ab1 / .abi trace, preview it, and
+        either load it onto the canvas or use it as the alignment
+        query (handed to the Plasmidsaurus → Align sub-tab)."""
+        with Vertical(id="sequencing-sanger"):
+            yield Label(
+                "Browse for an .ab1 / .abi Sanger trace "
+                "(highlighted sky-blue):"
+            )
+            yield _AbiAwareDirectoryTree(
+                self._tree_start, id="sanger-tree",
+            )
+            yield Static(
+                "[dim]No trace selected.[/dim]",
+                id="sanger-selected", markup=True,
+            )
+            yield Static(
+                "[dim]Pick a trace to see its base-called length, "
+                "mean Phred quality, and a preview of the first 200 "
+                "bases.[/dim]",
+                id="sanger-preview", markup=True,
+            )
+            with Horizontal(id="sanger-btns"):
+                yield Button("Load into canvas",
+                              id="btn-sanger-load",
+                              variant="primary", disabled=True)
+                yield Button("Add to library",
+                              id="btn-sanger-add", disabled=True)
+
+    @on(DirectoryTree.FileSelected, "#sanger-tree")
+    def _on_sanger_picked(self, event) -> None:
+        path = Path(str(event.path))
+        if not _is_ab1_path(path):
+            try:
+                self.query_one("#sanger-selected", Static).update(
+                    f"[yellow]Not an AB1 trace: {path.name}[/yellow]"
+                )
+            except NoMatches:
+                pass
+            return
+        # Skip work if the user re-clicked the same file. AB1 parse is
+        # ~50–200 ms per trace; without this guard, double-clicks
+        # pay the parse cost twice. `_sanger_record` survives the
+        # first successful pick so the buttons stay armed.
+        if (path == getattr(self, "_sanger_path", None)
+                and getattr(self, "_sanger_record", None) is not None):
+            return
+        self._sanger_path = path
+        try:
+            self.query_one("#sanger-selected", Static).update(
+                f"Selected: [b]{path.name}[/b]"
+            )
+        except NoMatches:
+            pass
+        try:
+            rec = _ab1_path_to_record(str(path))
+        except ValueError as exc:
+            try:
+                self.query_one("#sanger-preview", Static).update(
+                    f"[red]Could not read trace: {exc}[/red]"
+                )
+            except NoMatches:
+                pass
+            return
+        bp = len(rec.seq)
+        quals = rec.letter_annotations.get("phred_quality", []) or []
+        mean_q = (sum(quals) / len(quals)) if quals else 0
+        head = str(rec.seq)[:200]
+        preview = (
+            f"[b]{rec.name or rec.id}[/b]   {bp} bp   "
+            f"mean Phred ≈ {mean_q:.1f}\n"
+            f"[dim]First 200 bases:[/dim]\n{head}"
+        )
+        try:
+            self.query_one("#sanger-preview", Static).update(preview)
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#btn-sanger-load", Button).disabled = False
+            self.query_one("#btn-sanger-add", Button).disabled = False
+        except NoMatches:
+            pass
+        self._sanger_record = rec
+
+    @on(Button.Pressed, "#btn-sanger-load")
+    def _sanger_load(self, _) -> None:
+        rec = getattr(self, "_sanger_record", None)
+        if rec is None:
+            return
+        try:
+            self.app._apply_record(rec)   # type: ignore[attr-defined]
+        except Exception as exc:
+            _log.exception("Sanger load_into_canvas failed: %s", exc)
+            return
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn-sanger-add")
+    def _sanger_add_to_library(self, _) -> None:
+        rec = getattr(self, "_sanger_record", None)
+        path = getattr(self, "_sanger_path", None)
+        if rec is None or path is None:
+            return
+        try:
+            entry = _record_to_library_entry(rec, path)
+            entries = _load_library()
+            seen = {e.get("id") for e in entries if isinstance(e, dict)}
+            base_id = entry["id"]
+            n = 1
+            while entry["id"] in seen:
+                n += 1
+                entry["id"] = f"{base_id}_{n}"
+            entries.append(entry)
+            _save_library(entries)
+        except (OSError, ValueError) as exc:
+            self.app.notify(
+                f"Add to library failed: {exc}",
+                severity="error", timeout=8,
+            )
+            return
+        self.app.notify(
+            f"Added {entry.get('name') or entry['id']} to library.",
+            severity="information", timeout=4,
+        )
+        try:
+            self.query_one("#sanger-preview", Static).update(
+                f"[green]Added {entry.get('name') or entry['id']} "
+                f"to library.[/green]"
+            )
+        except NoMatches:
+            pass
 
     # Sentinel value the Select shows when the library is empty.
     # `_go` checks for this string before kicking off the align so
@@ -43012,6 +44381,13 @@ class ExperimentDeleteConfirmModal(ModalScreen):
         super().__init__()
         self._title = title
         self._body  = body
+        self._dismissed: bool = False   # [INV-50]
+
+    def _dismiss_once(self, payload: bool) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="expdel-dlg"):
@@ -43045,14 +44421,14 @@ class ExperimentDeleteConfirmModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-expdel-no")
     def _no(self, _ev) -> None:
-        self.dismiss(False)
+        self._dismiss_once(False)
 
     @on(Button.Pressed, "#btn-expdel-yes")
     def _yes(self, _ev) -> None:
-        self.dismiss(True)
+        self._dismiss_once(True)
 
     def action_cancel(self) -> None:
-        self.dismiss(False)
+        self._dismiss_once(False)
 
 
 class ExperimentUnsavedChangesModal(ModalScreen):
@@ -43087,6 +44463,16 @@ class ExperimentUnsavedChangesModal(ModalScreen):
     #expunsaved-btns Button { margin: 0 1; min-width: 18; }
     """
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._dismissed: bool = False   # [INV-50]
+
+    def _dismiss_once(self, payload: str) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
+
     def compose(self) -> ComposeResult:
         with Vertical(id="expunsaved-dlg"):
             yield Static(" Unsaved changes ", id="expunsaved-title")
@@ -43117,18 +44503,18 @@ class ExperimentUnsavedChangesModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-expunsaved-cancel")
     def _cancel_btn(self, _ev) -> None:
-        self.dismiss("cancel")
+        self._dismiss_once("cancel")
 
     @on(Button.Pressed, "#btn-expunsaved-save")
     def _save_btn(self, _ev) -> None:
-        self.dismiss("save")
+        self._dismiss_once("save")
 
     @on(Button.Pressed, "#btn-expunsaved-abandon")
     def _abandon_btn(self, _ev) -> None:
-        self.dismiss("abandon")
+        self._dismiss_once("abandon")
 
     def action_cancel(self) -> None:
-        self.dismiss("cancel")
+        self._dismiss_once("cancel")
 
 
 class ExperimentRenameModal(ModalScreen):
@@ -48110,6 +49496,16 @@ class SynthesisUnsavedChangesModal(ModalScreen):
     #suc-btns Button { margin-left: 1; min-width: 12; }
     """
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._dismissed: bool = False   # [INV-50]
+
+    def _dismiss_once(self, payload) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
+
     def compose(self) -> ComposeResult:
         with Vertical(id="suc-dlg"):
             yield Static(" Unsaved fragment ", id="suc-title")
@@ -48132,18 +49528,18 @@ class SynthesisUnsavedChangesModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-suc-save")
     def _save(self, _) -> None:
-        self.dismiss("save")
+        self._dismiss_once("save")
 
     @on(Button.Pressed, "#btn-suc-abandon")
     def _abandon(self, _) -> None:
-        self.dismiss("abandon")
+        self._dismiss_once("abandon")
 
     @on(Button.Pressed, "#btn-suc-cancel")
     def _cancel_btn(self, _) -> None:
-        self.dismiss(None)
+        self._dismiss_once(None)
 
     def action_cancel(self) -> None:
-        self.dismiss(None)
+        self._dismiss_once(None)
 
 
 class SynthesisScreen(Screen):
@@ -61678,10 +63074,22 @@ class SimulatorScreen(Screen):
 class UnsavedQuitModal(ModalScreen):
     """Shown when the user tries to quit with unsaved edits."""
 
+    _blocks_undo: bool = True   # [INV-50] destructive confirm — Ctrl+Z above
+
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("tab",    "app.focus_next", "Next button", show=False),
     ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._dismissed: bool = False
+
+    def _dismiss_once(self, payload) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="quit-dlg"):
@@ -61701,15 +63109,15 @@ class UnsavedQuitModal(ModalScreen):
         self.query_one("#btn-cancel-quit", Button).focus()
 
     @on(Button.Pressed, "#btn-save-quit")
-    def _save_quit(self, _): self.dismiss("save")
+    def _save_quit(self, _): self._dismiss_once("save")
 
     @on(Button.Pressed, "#btn-abandon")
-    def _abandon(self, _):   self.dismiss("abandon")
+    def _abandon(self, _):   self._dismiss_once("abandon")
 
     @on(Button.Pressed, "#btn-cancel-quit")
-    def _cancel_btn(self, _): self.dismiss(None)
+    def _cancel_btn(self, _): self._dismiss_once(None)
 
-    def action_cancel(self): self.dismiss(None)
+    def action_cancel(self): self._dismiss_once(None)
 
 
 class QuitConfirmModal(ModalScreen):
@@ -61718,10 +63126,22 @@ class QuitConfirmModal(ModalScreen):
     instead. Default focus on `No`.
     """
 
+    _blocks_undo: bool = True   # [INV-50] confirm modal — Ctrl+Z above
+
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("tab",    "app.focus_next", "Next", show=False),
     ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._dismissed: bool = False
+
+    def _dismiss_once(self, payload: bool) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="quitcon-dlg"):
@@ -61738,12 +63158,12 @@ class QuitConfirmModal(ModalScreen):
         self.query_one("#btn-quitcon-no", Button).focus()
 
     @on(Button.Pressed, "#btn-quitcon-no")
-    def _no(self, _): self.dismiss(False)
+    def _no(self, _): self._dismiss_once(False)
 
     @on(Button.Pressed, "#btn-quitcon-yes")
-    def _yes(self, _): self.dismiss(True)
+    def _yes(self, _): self._dismiss_once(True)
 
-    def action_cancel(self): self.dismiss(False)
+    def action_cancel(self): self._dismiss_once(False)
 
 
 class SplashScreen(ModalScreen):
@@ -62169,6 +63589,8 @@ class UnsavedNavigateModal(ModalScreen):
     proceeds), or ``None`` (cancel — stay).
     """
 
+    _blocks_undo: bool = True   # [INV-50] destructive confirm — Ctrl+Z above
+
     BINDINGS = [
         Binding("escape", "cancel",     "Cancel"),
         Binding("tab",    "app.focus_next", "Next button", show=False),
@@ -62177,6 +63599,13 @@ class UnsavedNavigateModal(ModalScreen):
     def __init__(self, action_phrase: str = "leave"):
         super().__init__()
         self._action_phrase = action_phrase
+        self._dismissed: bool = False   # [INV-50]
+
+    def _dismiss_once(self, payload) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="navunsv-dlg"):
@@ -62194,15 +63623,15 @@ class UnsavedNavigateModal(ModalScreen):
                 yield Button("Cancel",          id="btn-navunsv-cancel")
 
     @on(Button.Pressed, "#btn-navunsv-save")
-    def _save(self, _):     self.dismiss("save")
+    def _save(self, _):     self._dismiss_once("save")
 
     @on(Button.Pressed, "#btn-navunsv-discard")
-    def _discard(self, _):  self.dismiss("discard")
+    def _discard(self, _):  self._dismiss_once("discard")
 
     @on(Button.Pressed, "#btn-navunsv-cancel")
-    def _cancel_btn(self, _): self.dismiss(None)
+    def _cancel_btn(self, _): self._dismiss_once(None)
 
-    def action_cancel(self): self.dismiss(None)
+    def action_cancel(self): self._dismiss_once(None)
 
 
 class AnnotationTransferModal(ModalScreen):
@@ -63196,8 +64625,20 @@ class RestoreFromBackupModal(ModalScreen):
         ("Plasmid library",      "_LIBRARY_FILE"),
         ("Collections",          "_COLLECTIONS_FILE"),
         ("Parts bin",            "_PARTS_BIN_FILE"),
+        ("Parts bin collections", "_PARTS_BIN_COLLECTIONS_FILE"),
         ("Primers",              "_PRIMERS_FILE"),
         ("Primer collections",   "_PRIMER_COLLECTIONS_FILE"),
+        # Feature library + colours + cloning grammars + entry vectors
+        # + codon tables — every persisted user-data file in
+        # `_USER_DATA_FILE_ATTRS` except `_SETTINGS_FILE`. Settings
+        # restore would clobber live in-session toggles
+        # (active_collection, last_seen_version, etc.); the user can
+        # restart to pick up a settings restore from disk.
+        ("Feature library",      "_FEATURES_FILE"),
+        ("Feature colours",      "_FEATURE_COLORS_FILE"),
+        ("Cloning grammars",     "_GRAMMARS_FILE"),
+        ("Entry vectors",        "_ENTRY_VECTORS_FILE"),
+        ("Codon tables",         "_CODON_TABLES_FILE"),
         # Sweep #9 (2026-05-19): 0.9.6 added these persisted files
         # but the in-app restore UI was never extended; users had
         # backups on disk with no UI to reach them.
@@ -63281,10 +64722,18 @@ class RestoreFromBackupModal(ModalScreen):
             )
             return
         for b in self._backups:
+            n = b.get("n_entries")
+            err = b.get("error") or ""
+            kind_cell = (
+                f"[red]{b['kind']} \\[damaged][/red]" if err else b["kind"]
+            )
+            entries_cell = (
+                "[red]?[/red]" if n is None else str(n)
+            )
             t.add_row(
                 Path(b["source_path"]).name,
-                b["kind"],
-                str(b["n_entries"]),
+                kind_cell,
+                entries_cell,
                 b["mtime_str"],
             )
         status.update(
@@ -63310,6 +64759,14 @@ class RestoreFromBackupModal(ModalScreen):
         if target is None:
             return
         backup = self._backups[idx]
+        if backup.get("error"):
+            # Damaged backup row — `_restore_from_backup` would raise
+            # anyway, but failing here gives a tighter message and
+            # avoids briefly touching the live file's backup chain.
+            status.update(
+                f"[red]Backup is damaged: {backup['error']}[/red]"
+            )
+            return
         # Resolve the user-facing label for the active target so the
         # `_safe_save_json` call uses a recognisable name in logs.
         target_label = next(
@@ -63873,6 +65330,13 @@ class LargeFileConfirmModal(ModalScreen):
         self.description    = description
         self.size_text      = size_text
         self.threshold_text = threshold_text
+        self._dismissed: bool = False   # [INV-50]
+
+    def _dismiss_once(self, payload: bool) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
 
     def compose(self) -> ComposeResult:
         from rich.markup import escape as _esc
@@ -63901,14 +65365,14 @@ class LargeFileConfirmModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-lfc-no")
     def _no(self, _) -> None:
-        self.dismiss(False)
+        self._dismiss_once(False)
 
     @on(Button.Pressed, "#btn-lfc-yes")
     def _yes(self, _) -> None:
-        self.dismiss(True)
+        self._dismiss_once(True)
 
     def action_cancel(self) -> None:
-        self.dismiss(False)
+        self._dismiss_once(False)
 
 
 # Module-level threshold: files / fetches above this size on disk or
@@ -64030,6 +65494,8 @@ class CollectionDeleteConfirmModal(ModalScreen):
     Default focus on [No] to protect against handslip-deletes.
     Dismisses True (delete) or False (keep)."""
 
+    _blocks_undo: bool = True   # [INV-50] destructive confirm — Ctrl+Z above
+
     BINDINGS = [
         Binding("escape", "cancel",     "Cancel"),
         Binding("tab",    "app.focus_next", "Next", show=False),
@@ -64039,6 +65505,9 @@ class CollectionDeleteConfirmModal(ModalScreen):
         super().__init__()
         self.coll_name = name
         self.n_plas = n_plasmids
+        # [INV-50] dismiss-once guard against double-click / double-Enter
+        # races landing two `dismiss()` calls on a destructive modal.
+        self._dismissed: bool = False
 
     def compose(self) -> ComposeResult:
         plural = "" if self.n_plas == 1 else "s"
@@ -64058,16 +65527,22 @@ class CollectionDeleteConfirmModal(ModalScreen):
     def on_mount(self) -> None:
         self.query_one("#btn-colldel-no", Button).focus()
 
+    def _dismiss_once(self, payload: bool) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
+
     @on(Button.Pressed, "#btn-colldel-no")
     def _no(self, _) -> None:
-        self.dismiss(False)
+        self._dismiss_once(False)
 
     @on(Button.Pressed, "#btn-colldel-yes")
     def _yes(self, _) -> None:
-        self.dismiss(True)
+        self._dismiss_once(True)
 
     def action_cancel(self) -> None:
-        self.dismiss(False)
+        self._dismiss_once(False)
 
 
 class ScaryDeleteConfirmModal(ModalScreen):
@@ -64075,6 +65550,8 @@ class ScaryDeleteConfirmModal(ModalScreen):
     visually loud (red border + warning banner + emphatic copy) to make
     the user pause. Default focus on [No] like every confirm modal in
     the app. Dismisses True (delete) or False (keep)."""
+
+    _blocks_undo: bool = True   # [INV-50] destructive confirm — Ctrl+Z above
 
     BINDINGS = [
         Binding("escape", "cancel",     "Cancel"),
@@ -64085,6 +65562,14 @@ class ScaryDeleteConfirmModal(ModalScreen):
         super().__init__()
         self.coll_name = name
         self.n_plas = n_plasmids
+        # [INV-50] dismiss-once guard
+        self._dismissed: bool = False
+
+    def _dismiss_once(self, payload: bool) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
 
     def compose(self) -> ComposeResult:
         plural = "" if self.n_plas == 1 else "s"
@@ -64118,14 +65603,14 @@ class ScaryDeleteConfirmModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-scarydel-no")
     def _no(self, _) -> None:
-        self.dismiss(False)
+        self._dismiss_once(False)
 
     @on(Button.Pressed, "#btn-scarydel-yes")
     def _yes(self, _) -> None:
-        self.dismiss(True)
+        self._dismiss_once(True)
 
     def action_cancel(self) -> None:
-        self.dismiss(False)
+        self._dismiss_once(False)
 
 
 class MasterDeleteModal(ModalScreen):
@@ -65292,6 +66777,8 @@ class PartsBinDeleteConfirmModal(ModalScreen):
     confirm, False on cancel / Escape.
     """
 
+    _blocks_undo: bool = True   # [INV-50] destructive confirm — Ctrl+Z above
+
     BINDINGS = [
         Binding("escape", "cancel",         "Cancel"),
         Binding("tab",    "app.focus_next", "Next button", show=False),
@@ -65649,6 +67136,8 @@ class LibraryDeleteConfirmModal(ModalScreen):
     Escape dismisses as False (cancel).
     """
 
+    _blocks_undo: bool = True   # [INV-50] destructive confirm — Ctrl+Z above
+
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
         Binding("tab",    "app.focus_next", "Next button", show=False),
@@ -65659,6 +67148,14 @@ class LibraryDeleteConfirmModal(ModalScreen):
         self.entry_name = name
         self.entry_size = size
         self.entry_id   = entry_id
+        # [INV-50] dismiss-once guard
+        self._dismissed: bool = False
+
+    def _dismiss_once(self, payload: bool) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
 
     def compose(self) -> ComposeResult:
         size_str = f" ({self.entry_size:,} bp)" if self.entry_size > 0 else ""
@@ -65681,14 +67178,14 @@ class LibraryDeleteConfirmModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-libdel-no")
     def _no(self, _):
-        self.dismiss(False)
+        self._dismiss_once(False)
 
     @on(Button.Pressed, "#btn-libdel-yes")
     def _yes(self, _):
-        self.dismiss(True)
+        self._dismiss_once(True)
 
     def action_cancel(self) -> None:
-        self.dismiss(False)
+        self._dismiss_once(False)
 
 
 # ── Agent API: HTTP server for external CLI/IDE control (0.4.6+) ───────────────
@@ -66308,7 +67805,31 @@ def _h_load_file(app, payload):
             ), "size_bytes": size, "cap_bytes": _BULK_IMPORT_MAX_BYTES}, 413)
         return ({"error": reason or "unsafe file"}, 400)
     try:
-        record = load_genbank(str(path))
+        # Mirror the UI Open flow's dispatch. FASTA / AB1 / FASTQ get
+        # specialised parsers; everything else falls through to
+        # `load_genbank` (which itself dispatches between GenBank and
+        # `.dna` binary via `_detect_plasmid_format`). FASTQ multi-read
+        # files are refused via the single-record agent endpoint —
+        # use bulk-import for those.
+        if _is_fasta_path(str(path)):
+            record = _fasta_path_to_record(str(path))
+        elif _is_ab1_path(str(path)):
+            record = _ab1_path_to_record(str(path))
+        elif _is_fastq_path(str(path)):
+            recs = _fastq_path_to_records(str(path))
+            if len(recs) > 1:
+                return ({"error": (
+                    "FASTQ contains multiple reads; agent load-file "
+                    "is single-record only. Use bulk-import or load "
+                    "via the UI to ingest as a new collection."
+                )}, 400)
+            record = recs[0]
+        elif str(path).lower().endswith((".gff", ".gff3")):
+            # GFF3 standalone import requires inline ##FASTA. For
+            # sequence-less GFF3 → loaded canvas, use `apply-gff3`.
+            record = _gff3_path_to_record(str(path))
+        else:
+            record = load_genbank(str(path))
     except (ValueError, OSError) as exc:
         return ({"error": f"parse failed: {exc}"}, 400)
     record._tui_source = str(path)
@@ -66809,6 +68330,8 @@ def _h_get_feature(app, payload):
 _EXPORT_GENBANK_EXTS = (".gb", ".gbk", ".genbank")
 _EXPORT_GFF_EXTS     = (".gff", ".gff3")
 _EXPORT_FASTA_EXTS   = (".fa", ".fasta", ".fna")
+_EXPORT_DNA_EXTS     = (".dna",)
+_EXPORT_EMBL_EXTS    = (".embl",)
 
 
 def _check_export_extension(path: Path, allowed: "tuple[str, ...]",
@@ -66899,6 +68422,180 @@ def _h_export_fasta(app, payload):
             str(rec.seq),
             path,
         )
+    except (OSError, ValueError) as exc:
+        return ({"error": f"export failed: {exc}"}, 500)
+    return {"ok": True, **result}
+
+
+@_agent_endpoint("export-commercialsaas", write=True)
+def _h_export_commercialsaas(app, payload):
+    """Write the current record to `path` as CommercialSaaS `.dna`.
+    Body: ``{path}``. Requires the loaded record to be in the active
+    library (`.dna` writer keys off the library entry's id / sidecar);
+    returns 422 otherwise. Splice mode (preserves all original packets
+    + updated history) when a sidecar exists; from-scratch mode
+    (sequence + features + notes + history only — cosmetic packets
+    omitted) otherwise. Mirrors `action_export_commercialsaas`."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    path = _sanitize_path(payload.get("path"))
+    if path is None:
+        return ({"error": "missing 'path'"}, 400)
+    if (ext_err := _check_export_extension(
+            path, _EXPORT_DNA_EXTS, "CommercialSaaS .dna")) is not None:
+        return ({"error": ext_err}, 400)
+    err = _check_agent_write_path(path)
+    if err is not None:
+        return ({"error": err}, 403)
+    rec_id = getattr(rec, "id", "") or ""
+    entry: "dict | None" = None
+    if rec_id:
+        for e in _load_library():
+            if e.get("id") == rec_id:
+                entry = e
+                break
+    if entry is None:
+        return ({"error": (
+            "loaded plasmid is not in the library; .dna export keys "
+            "off the library entry's id / sidecar. Add to library "
+            "first, or use export-genbank."
+        )}, 422)
+    try:
+        out_path = _export_commercialsaas_dna(entry, path)
+    except (OSError, ValueError) as exc:
+        return ({"error": f"export failed: {exc}"}, 500)
+    try:
+        size = Path(out_path).stat().st_size
+    except OSError:
+        size = 0
+    return {"ok": True, "path": str(out_path), "bytes": size}
+
+
+@_agent_endpoint("bulk-export-collection", write=True)
+def _h_bulk_export_collection(app, payload):
+    """Write every plasmid in `collection` to `dir` as files of
+    `format`. Body: ``{collection, format, dir}``. ``format`` ∈
+    {"genbank", "embl", "fasta", "dna"}. Returns ``{ok, total,
+    written, failures, dir}`` mirroring `_bulk_export_collection`.
+    Per-entry failures don't abort the batch — each is reported in
+    the `failures` list. Path is sanitised + symlink-refused via the
+    same checks `export-genbank` uses on the target dir."""
+    coll = payload.get("collection")
+    if not coll or not isinstance(coll, str):
+        return ({"error": "missing 'collection'"}, 400)
+    fmt = payload.get("format")
+    if fmt not in _BULK_EXPORT_FORMATS:
+        return ({"error": (
+            f"unknown format {fmt!r}; "
+            f"choose one of {sorted(_BULK_EXPORT_FORMATS)}"
+        )}, 400)
+    target = _sanitize_path(payload.get("dir"))
+    if target is None:
+        return ({"error": "missing 'dir'"}, 400)
+    if target.exists() and not target.is_dir():
+        return ({"error": f"target is not a directory: {target}"}, 400)
+    err = _check_agent_write_path(target)
+    if err is not None:
+        return ({"error": err}, 403)
+    try:
+        result = _bulk_export_collection(coll, fmt, target)
+    except (OSError, ValueError) as exc:
+        return ({"error": f"bulk export failed: {exc}"}, 500)
+    return {"ok": True, **result}
+
+
+@_agent_endpoint("apply-gff3", write=True)
+def _h_apply_gff3(app, payload):
+    """Apply features from a sequence-less GFF3 file onto the
+    currently-loaded record. Body: ``{path}``. The GFF3 file MUST NOT
+    carry a ##FASTA section — that case should use `load-file` to
+    replace the canvas with a new record. Coordinates outside the
+    current record's length, or a length mismatch against the GFF3's
+    ##sequence-region directive, are rejected. Returns ``{ok,
+    features_added}``.
+
+    Stale-canvas guard mirrors `transfer-annotations`: captures
+    `_record_load_counter` at handler entry; refuses with 409 if the
+    canvas swapped before the apply step. Mutation happens on the UI
+    thread via `_push_undo` + `_apply_record(clear_undo=False)` so
+    Ctrl+Z reverts the import cleanly.
+    """
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    entry_counter = getattr(app, "_record_load_counter", 0)
+    path = _sanitize_path(payload.get("path"))
+    if path is None:
+        return ({"error": "missing 'path'"}, 400)
+    if not path.exists():
+        return ({"error": f"file not found: {path}"}, 404)
+    if path.suffix.lower() not in (".gff", ".gff3"):
+        return ({"error": (
+            f"refusing to apply: extension must be .gff or .gff3, "
+            f"got {path.suffix!r}"
+        )}, 400)
+    # Mutate a deepcopy on the worker thread so a concurrent canvas
+    # swap can't see a half-mutated record. The UI thread does the
+    # actual apply + undo-push so the map refreshes through the
+    # canonical path (sibling of `_apply_annotation_transfers`).
+    new_record = deepcopy(rec)
+    try:
+        n_added = _gff3_apply_to_loaded_record(new_record, str(path))
+    except (OSError, ValueError) as exc:
+        return ({"error": f"GFF3 apply failed: {exc}"}, 400)
+
+    def _apply():
+        guard = _agent_dirty_guard(app, payload)
+        if guard is not None:
+            return guard
+        if getattr(app, "_record_load_counter", 0) != entry_counter:
+            return ({"error": "record changed mid-flight; retry"}, 409)
+        try:
+            app._push_undo()
+        except AttributeError:
+            pass
+        app._current_record = new_record
+        try:
+            app._apply_record(new_record, clear_undo=False)
+        except AttributeError:
+            # Last-resort fallback: set the record directly. Older
+            # callers without `_apply_record` still get the new feats
+            # in `_current_record`; the next manual refresh repaints.
+            pass
+        try:
+            app._mark_dirty()
+        except AttributeError:
+            app._unsaved = True
+        return None
+
+    err = app.call_from_thread(_apply)
+    if isinstance(err, tuple):
+        return err
+    return {"ok": True, "features_added": n_added}
+
+
+@_agent_endpoint("export-embl", write=True)
+def _h_export_embl(app, payload):
+    """Write the current record to `path` as EMBL flatfile. Body: ``{path}``.
+    EMBL is a near-equivalent of GenBank — same feature model, different
+    text layout. Useful for tools that consume EMBL directly (ENA
+    submissions, some annotation pipelines). Returns ``{ok, path, bp,
+    features}``."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    path = _sanitize_path(payload.get("path"))
+    if path is None:
+        return ({"error": "missing 'path'"}, 400)
+    if (ext_err := _check_export_extension(
+            path, _EXPORT_EMBL_EXTS, "EMBL")) is not None:
+        return ({"error": ext_err}, 400)
+    err = _check_agent_write_path(path)
+    if err is not None:
+        return ({"error": err}, 403)
+    try:
+        result = _export_embl_to_path(rec, path)
     except (OSError, ValueError) as exc:
         return ({"error": f"export failed: {exc}"}, 500)
     return {"ok": True, **result}
@@ -68148,6 +69845,199 @@ def _h_set_entry_vector(app, payload):
     return {"ok": True, "grammar_id": gid, "vector": out}
 
 
+# ── Cloning-grammar CRUD ──────────────────────────────────────────────────────
+#
+# Built-in grammars (GB L0, MoClo Plant) are read-only — the agent
+# endpoints below only accept custom grammars, mirroring the UI's
+# `editable=False` gate. Schema mirrors `_BUILTIN_GRAMMARS` entries:
+#   {id, name, enzyme, level_up_enzyme?, site, spacer, pad,
+#    forbidden_sites: {enzyme: site}, positions: [{name, type,
+#    oh5, oh3, color}], coding_types: [str], type_to_insdc: {type: str},
+#    catalog: [], editable: True}
+
+
+def _agent_grammar_dict(payload: dict) -> "dict | str":
+    """Coerce + validate a payload describing a cloning grammar.
+    Returns the cleaned grammar dict or a string error message.
+
+    Shape-checks each field type without auto-defaulting missing
+    ones; the agent must pass everything it wants persisted. Tighter
+    than the UI because we don't have an editing modal to fix up
+    on save."""
+    gid = payload.get("id")
+    if not isinstance(gid, str) or not gid.strip():
+        return "missing or non-string 'id'"
+    if gid in _BUILTIN_GRAMMARS:
+        return f"refusing to overwrite built-in grammar {gid!r}"
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return "missing or non-string 'name'"
+    enzyme = payload.get("enzyme")
+    if not isinstance(enzyme, str) or not enzyme.strip():
+        return "missing or non-string 'enzyme'"
+    site = payload.get("site")
+    if not isinstance(site, str) or not site.strip():
+        return "missing or non-string 'site'"
+    spacer = payload.get("spacer", "")
+    pad = payload.get("pad", "")
+    if not isinstance(spacer, str) or not isinstance(pad, str):
+        return "'spacer' and 'pad' must be strings"
+    forb = payload.get("forbidden_sites", {})
+    if not isinstance(forb, dict) or not all(
+            isinstance(k, str) and isinstance(v, str)
+            for k, v in forb.items()):
+        return "'forbidden_sites' must be {enzyme: site} string→string"
+    positions = payload.get("positions")
+    if not isinstance(positions, list) or not positions:
+        return "missing non-empty 'positions' list"
+    cleaned_positions: list[dict] = []
+    for i, pos in enumerate(positions):
+        if not isinstance(pos, dict):
+            return f"positions[{i}] is not a dict"
+        for k in ("name", "type", "oh5", "oh3"):
+            if not isinstance(pos.get(k), str):
+                return f"positions[{i}] missing string field {k!r}"
+        cleaned_positions.append({
+            "name": pos["name"], "type": pos["type"],
+            "oh5":  pos["oh5"].upper(), "oh3": pos["oh3"].upper(),
+            "color": pos.get("color") or "white",
+        })
+    coding_types = payload.get("coding_types") or []
+    if not isinstance(coding_types, list) or not all(
+            isinstance(x, str) for x in coding_types):
+        return "'coding_types' must be a list of strings"
+    type_to_insdc = payload.get("type_to_insdc") or {}
+    if not isinstance(type_to_insdc, dict) or not all(
+            isinstance(k, str) and isinstance(v, str)
+            for k, v in type_to_insdc.items()):
+        return "'type_to_insdc' must be {part_type: insdc_type} strings"
+    return {
+        "id":              gid.strip(),
+        "name":            name.strip()[:200],
+        "enzyme":          enzyme.strip(),
+        "level_up_enzyme": (payload.get("level_up_enzyme")
+                              if isinstance(payload.get("level_up_enzyme"), str)
+                              else ""),
+        "site":            site.strip().upper(),
+        "spacer":          spacer,
+        "pad":             pad,
+        "forbidden_sites": dict(forb),
+        "positions":       cleaned_positions,
+        "coding_types":    list(coding_types),
+        "type_to_insdc":   dict(type_to_insdc),
+        "catalog":         [],
+        "editable":        True,
+    }
+
+
+@_agent_endpoint("list-grammars")
+def _h_list_grammars(app, payload):
+    """Return every grammar (built-in + custom). Each item carries
+    ``{id, name, enzyme, level_up_enzyme, editable, n_positions,
+    catalog_size}``. Fetch the full grammar via `get-grammar`."""
+    out = []
+    for gid, g in _all_grammars().items():
+        out.append({
+            "id":              gid,
+            "name":            g.get("name", gid),
+            "enzyme":          g.get("enzyme", ""),
+            "level_up_enzyme": g.get("level_up_enzyme", ""),
+            "editable":        bool(g.get("editable")),
+            "n_positions":     len(g.get("positions") or []),
+            "catalog_size":    len(g.get("catalog") or []),
+        })
+    return {"ok": True, "grammars": out}
+
+
+@_agent_endpoint("get-grammar")
+def _h_get_grammar(app, payload):
+    """Return the full grammar dict for `grammar_id`. Body:
+    ``{grammar_id}``."""
+    gid = payload.get("grammar_id")
+    if not isinstance(gid, str) or not gid:
+        return ({"error": "missing or non-string 'grammar_id'"}, 400)
+    grammars = _all_grammars()
+    g = grammars.get(gid)
+    if g is None:
+        return ({"error": f"unknown grammar id {gid!r}"}, 404)
+    return {"ok": True, "grammar": g}
+
+
+@_agent_endpoint("create-grammar", write=True)
+def _h_create_grammar(app, payload):
+    """Create a new custom grammar. Body: every field in the schema
+    listed above. Returns 400 on validation failure, 409 if a grammar
+    with the same id already exists. Built-in ids are reserved."""
+    g = _agent_grammar_dict(payload)
+    if isinstance(g, str):
+        return ({"error": g}, 400)
+    custom = _load_custom_grammars()
+    if any(e.get("id") == g["id"] for e in custom):
+        return ({"error": (
+            f"grammar id {g['id']!r} already exists; use update-grammar"
+        )}, 409)
+    custom.append(g)
+    if (err := _agent_save_or_500(
+            lambda: _save_custom_grammars(custom),
+            "cloning_grammars")) is not None:
+        return err
+    return {"ok": True, "grammar_id": g["id"]}
+
+
+@_agent_endpoint("update-grammar", write=True)
+def _h_update_grammar(app, payload):
+    """Replace an existing custom grammar by id. Built-in ids are
+    refused (mirrors the UI's `editable=False` gate)."""
+    g = _agent_grammar_dict(payload)
+    if isinstance(g, str):
+        return ({"error": g}, 400)
+    custom = _load_custom_grammars()
+    for i, e in enumerate(custom):
+        if e.get("id") == g["id"]:
+            # Preserve the existing catalog list — `_agent_grammar_dict`
+            # always sets `catalog: []`, but the user might have built
+            # one up via Parts Bin. Keep it unless the payload
+            # explicitly clears it.
+            if "catalog" not in payload:
+                g["catalog"] = list(e.get("catalog") or [])
+            custom[i] = g
+            if (err := _agent_save_or_500(
+                    lambda: _save_custom_grammars(custom),
+                    "cloning_grammars")) is not None:
+                return err
+            return {"ok": True, "grammar_id": g["id"]}
+    return ({"error": f"unknown grammar id {g['id']!r}"}, 404)
+
+
+@_agent_endpoint("delete-grammar", write=True)
+def _h_delete_grammar(app, payload):
+    """Delete a custom grammar by id. Built-ins are refused. Also
+    clears any entry vector bound to the grammar so a future
+    create-grammar with the same id starts fresh."""
+    gid = payload.get("grammar_id")
+    if not isinstance(gid, str) or not gid:
+        return ({"error": "missing or non-string 'grammar_id'"}, 400)
+    if gid in _BUILTIN_GRAMMARS:
+        return ({"error": (
+            f"refusing to delete built-in grammar {gid!r}"
+        )}, 400)
+    custom = _load_custom_grammars()
+    new_list = [e for e in custom if e.get("id") != gid]
+    if len(new_list) == len(custom):
+        return ({"error": f"unknown grammar id {gid!r}"}, 404)
+    if (err := _agent_save_or_500(
+            lambda: _save_custom_grammars(new_list),
+            "cloning_grammars")) is not None:
+        return err
+    # Also clear the bound entry vector if any. Failure here is
+    # non-fatal — the orphan record gets pruned next save.
+    try:
+        _set_entry_vector(gid, None)
+    except (OSError, ValueError):
+        pass
+    return {"ok": True, "grammar_id": gid}
+
+
 # ── Primer-specific edit (mirrors PrimerEditModal) ────────────────────────────
 
 
@@ -68232,6 +70122,204 @@ def _h_update_primer(app, payload):
         return err
     return {"ok": True, "idx": idx,
             "applied": [k for k in edit_payload if k != "idx"]}
+
+
+# ── Primer-library CRUD (mirrors PrimerSaveModal + PrimerEditModal) ───────────
+
+
+@_agent_endpoint("list-primers")
+def _h_list_primers(app, payload):
+    """Return the primer library. Each item: ``{name, sequence,
+    source, tm, status, type, date, notes}``. Sequence + notes can
+    be long; clients on small terminals should paginate via the
+    `limit` + `offset` body params."""
+    raw_limit = payload.get("limit")
+    raw_offset = payload.get("offset")
+    limit = (int(raw_limit) if isinstance(raw_limit, (int, float))
+             else 1000)
+    offset = (int(raw_offset) if isinstance(raw_offset, (int, float))
+              else 0)
+    entries = _load_primers()
+    sliced = entries[max(0, offset):max(0, offset) + max(0, limit)]
+    out = []
+    for e in sliced:
+        out.append({
+            "name":     e.get("name", ""),
+            "sequence": e.get("sequence", ""),
+            "source":   e.get("source", ""),
+            "tm":       e.get("tm"),
+            "status":   e.get("status", ""),
+            "type":     e.get("type", ""),
+            "date":     e.get("date", ""),
+            "notes":    e.get("notes", ""),
+        })
+    return {"ok": True, "primers": out, "count": len(out),
+            "total": len(entries)}
+
+
+@_agent_endpoint("get-primer")
+def _h_get_primer(app, payload):
+    """Return a primer-library entry by exact (case-insensitive)
+    sequence match. Body: ``{sequence}``. Returns 404 if no match
+    — the agent should `list-primers` first to discover what's
+    available."""
+    seq = payload.get("sequence")
+    if not isinstance(seq, str) or not seq.strip():
+        return ({"error": "missing or non-string 'sequence'"}, 400)
+    target = seq.strip().upper()
+    for e in _load_primers():
+        if (e.get("sequence") or "").upper() == target:
+            return {"ok": True, "primer": e}
+    return ({"error": "no primer with that sequence"}, 404)
+
+
+_PRIMER_STATUS_VALUES: tuple = ("Designed", "Ordered", "Validated")
+
+
+def _agent_primer_dict(payload: dict) -> "dict | str":
+    """Coerce + validate a primer payload. Returns the cleaned dict
+    or a string error. Used by both create and update paths.
+
+    Sequence is the canonical identity field — `_dedupe_primers_by_sequence`
+    treats two primers with the same uppercase sequence as duplicates
+    and keeps the first.
+    """
+    name = _sanitize_label(payload.get("name"))
+    if not name:
+        return "missing or non-string 'name'"
+    raw_seq = payload.get("sequence")
+    if not isinstance(raw_seq, str) or not raw_seq.strip():
+        return "missing or non-string 'sequence'"
+    seq, seq_err = _sanitize_bases(raw_seq.upper())
+    if seq_err:
+        return f"'sequence' rejected: {seq_err}"
+    if not seq:
+        return "'sequence' empty after sanitisation"
+    if len(seq) > 500:
+        return "'sequence' too long (max 500 bp)"
+    source = payload.get("source", "")
+    if source is not None and not isinstance(source, str):
+        return "'source' must be a string"
+    status = payload.get("status", "Designed")
+    if status and status not in _PRIMER_STATUS_VALUES:
+        return (f"'status' must be one of {_PRIMER_STATUS_VALUES}")
+    ptype = payload.get("type", "")
+    if ptype is not None and not isinstance(ptype, str):
+        return "'type' must be a string"
+    notes = _sanitize_note(payload.get("notes", ""))
+    tm = payload.get("tm")
+    if tm is not None and not isinstance(tm, (int, float)):
+        return "'tm' must be a number or null"
+    return {
+        "name":     name,
+        "sequence": seq,
+        "source":   (source or "")[:300],
+        "status":   status or "Designed",
+        "type":     ptype or "",
+        "tm":       tm,
+        "notes":    notes or "",
+        "date":     _datetime.now().strftime("%Y-%m-%d"),
+    }
+
+
+@_agent_endpoint("create-primer", write=True)
+def _h_create_primer(app, payload):
+    """Add a primer to the persistent library. Body: ``{name,
+    sequence, source?, status?, type?, tm?, notes?}``. Duplicate
+    sequences (case-insensitive) return 409 — use `update-primer`
+    on the existing entry or pick a fresh sequence."""
+    p = _agent_primer_dict(payload)
+    if isinstance(p, str):
+        return ({"error": p}, 400)
+    entries = _load_primers()
+    target = p["sequence"]
+    for e in entries:
+        if (e.get("sequence") or "").upper() == target:
+            return ({"error": (
+                f"primer with sequence {target!r} already exists "
+                f"(name {e.get('name', '?')!r}); use update-primer "
+                f"or delete-primer first."
+            ), "existing_name": e.get("name", "")}, 409)
+    entries.insert(0, p)  # MRU at index 0
+    if (err := _agent_save_or_500(
+            lambda: _save_primers(entries),
+            "primers")) is not None:
+        return err
+    return {"ok": True, "name": p["name"], "sequence": p["sequence"]}
+
+
+@_agent_endpoint("delete-primer", write=True)
+def _h_delete_primer(app, payload):
+    """Remove a primer from the library by exact sequence match.
+    Body: ``{sequence}``. Returns 404 if no match. The library
+    write triggers the standard `.bak` rotation, so a misclick
+    can be recovered via Settings → Restore from backup."""
+    seq = payload.get("sequence")
+    if not isinstance(seq, str) or not seq.strip():
+        return ({"error": "missing or non-string 'sequence'"}, 400)
+    target = seq.strip().upper()
+    entries = _load_primers()
+    new_list = [e for e in entries
+                if (e.get("sequence") or "").upper() != target]
+    if len(new_list) == len(entries):
+        return ({"error": f"no primer with sequence {target!r}"}, 404)
+    if (err := _agent_save_or_500(
+            lambda: _save_primers(new_list),
+            "primers")) is not None:
+        return err
+    return {"ok": True, "removed": len(entries) - len(new_list)}
+
+
+# ── Primer-collection switching ─────────────────────────────────────────
+
+
+@_agent_endpoint("list-primer-collections")
+def _h_list_primer_collections(app, payload):
+    """Every named primer collection. Each item: ``{name, n_primers}``.
+    The unnamed "default" collection (= top-level primers.json) is
+    surfaced as ``{name: "", n_primers: <count>}`` if it has content."""
+    colls = _load_primer_collections()
+    out = []
+    # Top-level primers — surfaced as the "default" collection.
+    top = _load_primers()
+    if top:
+        out.append({"name": "", "n_primers": len(top)})
+    for c in colls:
+        out.append({
+            "name":      c.get("name", "?"),
+            "n_primers": len(c.get("primers", []) or []),
+        })
+    return {"ok": True, "primer_collections": out,
+            "active": _get_active_primer_collection_name() or ""}
+
+
+@_agent_endpoint("set-active-primer-collection", write=True)
+def _h_set_active_primer_collection(app, payload):
+    """Switch the active primer collection. Body: ``{name}`` where
+    `name` is one of the collections returned by
+    `list-primer-collections` (empty string = default top-level).
+    Routes through `_set_active_primer_collection_name` so the
+    mirror discipline (pitfall #10) keeps the live primers.json in
+    sync with the chosen collection's contents."""
+    name = payload.get("name")
+    if name is None:
+        return ({"error": "missing 'name' (use \"\" for default)"}, 400)
+    if not isinstance(name, str):
+        return ({"error": "'name' must be a string"}, 400)
+    name = name.strip()
+    valid_names = {c.get("name") for c in _load_primer_collections()}
+    valid_names.add("")  # default sentinel
+    if name not in valid_names:
+        return ({"error": (
+            f"unknown primer collection {name!r}; "
+            f"valid: {sorted(n for n in valid_names if n)}"
+        )}, 404)
+
+    if (err := _agent_save_or_500(
+            lambda: _set_active_primer_collection_name(name or None),
+            "primer_collections")) is not None:
+        return err
+    return {"ok": True, "active": name}
 
 
 # ── User settings (allowlisted toggles) ───────────────────────────────────────
@@ -68495,6 +70583,327 @@ def _h_delete_part(app, payload):
     if isinstance(result, tuple):
         return result
     return {"ok": True, "deleted": result, "name": name}
+
+
+def _agent_part_dict(payload: dict) -> "dict | str":
+    """Coerce + validate a parts-bin payload. Returns the cleaned
+    dict or a string error message. Mirrors `PartEditModal`'s save
+    path: every field except `gb_text` and `sequence` is optional;
+    one of those must be present so the part has actual content."""
+    name = _sanitize_label(payload.get("name"), max_len=200)
+    if not name:
+        return "missing or non-string 'name'"
+    grammar = payload.get("grammar", "")
+    if grammar is not None and not isinstance(grammar, str):
+        return "'grammar' must be a string"
+    sequence = payload.get("sequence")
+    gb_text  = payload.get("gb_text")
+    if not isinstance(sequence, str) and not isinstance(gb_text, str):
+        return "must provide 'sequence' or 'gb_text'"
+    if sequence is not None and not isinstance(sequence, str):
+        return "'sequence' must be a string"
+    if gb_text is not None and not isinstance(gb_text, str):
+        return "'gb_text' must be a string"
+    clean_seq = ""
+    if isinstance(sequence, str):
+        clean_seq, seq_err = _sanitize_bases(sequence.upper())
+        if seq_err:
+            return f"'sequence' rejected: {seq_err}"
+    elif isinstance(gb_text, str):
+        try:
+            rec = _gb_text_to_record(gb_text)
+            clean_seq = str(rec.seq).upper()
+        except Exception as exc:
+            return f"gb_text parse failed: {exc}"
+    if not clean_seq:
+        return "no usable sequence after sanitisation"
+    ptype = payload.get("type", "")
+    if ptype is not None and not isinstance(ptype, str):
+        return "'type' must be a string"
+    level = payload.get("level", 0)
+    if not isinstance(level, (int, float)) or isinstance(level, bool):
+        return "'level' must be a number"
+    position = payload.get("position", "")
+    if position is not None and not isinstance(position, str):
+        return "'position' must be a string"
+    oh5 = payload.get("oh5", "")
+    oh3 = payload.get("oh3", "")
+    for label, val in (("oh5", oh5), ("oh3", oh3)):
+        if val is not None and not isinstance(val, str):
+            return f"{label!r} must be a string"
+    notes = _sanitize_note(payload.get("notes", ""))
+    return {
+        "name":      name,
+        "grammar":   (grammar or ""),
+        "type":      (ptype or ""),
+        "level":     int(level),
+        "position":  (position or ""),
+        "oh5":       (oh5 or "").upper(),
+        "oh3":       (oh3 or "").upper(),
+        "sequence":  clean_seq,
+        "size":      len(clean_seq),
+        "gb_text":   gb_text if isinstance(gb_text, str) else "",
+        "notes":     notes or "",
+        "date":      _datetime.now().strftime("%Y-%m-%d"),
+    }
+
+
+@_agent_endpoint("create-part", write=True)
+def _h_create_part(app, payload):
+    """Add a part to the active parts bin. Body: see `_agent_part_dict`
+    for the schema. Returns 409 if a part with the same name + grammar
+    already exists — use `update-part` or pick a different name."""
+    p = _agent_part_dict(payload)
+    if isinstance(p, str):
+        return ({"error": p}, 400)
+    entries = _load_parts_bin()
+    for e in entries:
+        if (e.get("name") == p["name"]
+                and (e.get("grammar") or "") == p["grammar"]):
+            return ({"error": (
+                f"part {p['name']!r} already exists in grammar "
+                f"{p['grammar']!r}; use update-part or rename."
+            )}, 409)
+    entries.append(p)
+    if (err := _agent_save_or_500(
+            lambda: _save_parts_bin(entries),
+            "parts_bin")) is not None:
+        return err
+    return {"ok": True, "name": p["name"], "grammar": p["grammar"]}
+
+
+@_agent_endpoint("update-part", write=True)
+def _h_update_part(app, payload):
+    """Update an existing part. Body: `{name, grammar?, ...new fields}`.
+    Lookup is by `(name, grammar)`; if grammar is omitted matches the
+    first part by name across all grammars."""
+    p_new = _agent_part_dict(payload)
+    if isinstance(p_new, str):
+        return ({"error": p_new}, 400)
+    target_grammar = p_new["grammar"]
+    entries = _load_parts_bin()
+    for i, e in enumerate(entries):
+        if e.get("name") != p_new["name"]:
+            continue
+        if target_grammar and (e.get("grammar") or "") != target_grammar:
+            continue
+        # Preserve original date so update doesn't masquerade as add.
+        p_new["date"] = e.get("date") or p_new["date"]
+        entries[i] = p_new
+        if (err := _agent_save_or_500(
+                lambda: _save_parts_bin(entries),
+                "parts_bin")) is not None:
+            return err
+        return {"ok": True, "name": p_new["name"],
+                "grammar": p_new["grammar"]}
+    return ({"error": (
+        f"no part {p_new['name']!r}"
+        + (f" in grammar {target_grammar!r}" if target_grammar else "")
+    )}, 404)
+
+
+# ── Feature library CRUD (mirrors FeatureLibraryScreen) ──────────────────────
+
+
+def _agent_feature_dict(payload: dict) -> "dict | str":
+    """Coerce + validate a feature-library payload. Schema:
+    `{name, sequence, feature_type?, strand?, color?, notes?}`.
+    Sequence is the canonical identity field for dedupe purposes.
+    """
+    name = _sanitize_label(payload.get("name"), max_len=200)
+    if not name:
+        return "missing or non-string 'name'"
+    raw_seq = payload.get("sequence")
+    if not isinstance(raw_seq, str) or not raw_seq.strip():
+        return "missing or non-string 'sequence'"
+    seq, seq_err = _sanitize_bases(raw_seq.upper())
+    if seq_err:
+        return f"'sequence' rejected: {seq_err}"
+    if not seq:
+        return "'sequence' empty after sanitisation"
+    if len(seq) > 100_000:
+        return "'sequence' too long (max 100 kb)"
+    ftype = payload.get("feature_type", "misc_feature")
+    if ftype is not None and not isinstance(ftype, str):
+        return "'feature_type' must be a string"
+    strand = payload.get("strand", 1)
+    if isinstance(strand, bool) or not isinstance(strand, (int, float)):
+        return "'strand' must be -1, 0, or 1"
+    if int(strand) not in (-1, 0, 1):
+        return "'strand' must be -1, 0, or 1"
+    color = payload.get("color")
+    if color is not None and not isinstance(color, str):
+        return "'color' must be a string"
+    notes = _sanitize_note(payload.get("notes", ""))
+    return {
+        "name":         name,
+        "sequence":     seq,
+        "feature_type": ftype or "misc_feature",
+        "strand":       int(strand),
+        "color":        color or "",
+        "notes":        notes or "",
+    }
+
+
+@_agent_endpoint("list-feature-library")
+def _h_list_feature_library(app, payload):
+    """Return the feature library. Each item: ``{name, feature_type,
+    strand, sequence_length, color}``. Sequences themselves can be
+    long; agents needing the raw bases call `get-feature-library`.
+
+    Named `list-feature-library` (not `list-features`) to avoid
+    collision with the record-level feature endpoints (`add-feature`,
+    `delete-feature`, `update-feature`, `get-feature`) which all
+    operate on the LOADED record, not the persistent snippet library."""
+    rows = []
+    for e in _load_features():
+        rows.append({
+            "name":            e.get("name", ""),
+            "feature_type":    e.get("feature_type", ""),
+            "strand":          int(e.get("strand", 1)),
+            "sequence_length": len(e.get("sequence", "") or ""),
+            "color":           e.get("color", ""),
+        })
+    return {"ok": True, "features": rows, "count": len(rows)}
+
+
+@_agent_endpoint("get-feature-library")
+def _h_get_feature_library(app, payload):
+    """Fetch a feature-library entry by (name, feature_type). Body:
+    `{name, feature_type?}`. If feature_type is omitted, matches the
+    first entry by name. Returns the full entry including `sequence`
+    + `notes` so the agent can use it for downstream substring/BLAST
+    matches.
+
+    Named `get-feature-library` to disambiguate from `get-feature`
+    which fetches a feature on the loaded record by idx."""
+    name = _sanitize_label(payload.get("name"), max_len=200)
+    if not name:
+        return ({"error": "missing or non-string 'name'"}, 400)
+    ftype = payload.get("feature_type")
+    if ftype is not None and not isinstance(ftype, str):
+        return ({"error": "'feature_type' must be a string"}, 400)
+    for e in _load_features():
+        if e.get("name") != name:
+            continue
+        if ftype and (e.get("feature_type") or "") != ftype:
+            continue
+        return {"ok": True, "feature": e}
+    return ({"error": (
+        f"no feature named {name!r}"
+        + (f" of type {ftype!r}" if ftype else "")
+    )}, 404)
+
+
+@_agent_endpoint("create-feature-library", write=True)
+def _h_create_feature_library(app, payload):
+    """Add a feature snippet to the persistent feature library. Body:
+    see `_agent_feature_dict` for the schema. Returns 409 if a
+    feature with the same (name, feature_type) already exists — pick
+    a different name or use `update-feature-library`.
+
+    Named `create-feature-library` to disambiguate from `add-feature`
+    which adds a feature to the loaded record."""
+    f = _agent_feature_dict(payload)
+    if isinstance(f, str):
+        return ({"error": f}, 400)
+    entries = _load_features()
+    for e in entries:
+        if (e.get("name") == f["name"]
+                and (e.get("feature_type") or "") == f["feature_type"]):
+            return ({"error": (
+                f"feature {f['name']!r} (type {f['feature_type']!r}) "
+                f"already exists; use update-feature or pick a "
+                f"different name."
+            )}, 409)
+    entries.append(f)
+    if (err := _agent_save_or_500(
+            lambda: _save_features(entries),
+            "features")) is not None:
+        return err
+    return {"ok": True, "name": f["name"],
+            "feature_type": f["feature_type"]}
+
+
+@_agent_endpoint("update-feature-library", write=True)
+def _h_update_feature_library(app, payload):
+    """Update a feature-library entry, looked up by (name,
+    feature_type). Body: every field in `_agent_feature_dict`'s
+    schema; missing fields preserve existing values.
+
+    Named `update-feature-library` (not `update-feature`) because
+    `update-feature` is already taken by the record-level handler
+    that edits features on the loaded plasmid map."""
+    name = _sanitize_label(payload.get("name"), max_len=200)
+    if not name:
+        return ({"error": "missing or non-string 'name'"}, 400)
+    ftype = payload.get("feature_type")
+    if ftype is not None and not isinstance(ftype, str):
+        return ({"error": "'feature_type' must be a string"}, 400)
+    entries = _load_features()
+    target_idx = None
+    for i, e in enumerate(entries):
+        if e.get("name") != name:
+            continue
+        if ftype and (e.get("feature_type") or "") != ftype:
+            continue
+        target_idx = i
+        break
+    if target_idx is None:
+        return ({"error": (
+            f"no feature named {name!r}"
+            + (f" of type {ftype!r}" if ftype else "")
+        )}, 404)
+    # Merge: take existing entry as base, overlay user-provided
+    # fields. `_agent_feature_dict` requires sequence — patch it
+    # to use the existing sequence if the payload omits it.
+    base = entries[target_idx]
+    merged = {**base, **payload}
+    # Default sequence/feature_type from existing if missing.
+    if "sequence" not in payload:
+        merged["sequence"] = base.get("sequence", "")
+    if "feature_type" not in payload:
+        merged["feature_type"] = base.get("feature_type", "misc_feature")
+    f = _agent_feature_dict(merged)
+    if isinstance(f, str):
+        return ({"error": f}, 400)
+    entries[target_idx] = f
+    if (err := _agent_save_or_500(
+            lambda: _save_features(entries),
+            "features")) is not None:
+        return err
+    return {"ok": True, "name": f["name"],
+            "feature_type": f["feature_type"]}
+
+
+@_agent_endpoint("delete-feature-library", write=True)
+def _h_delete_feature_library(app, payload):
+    """Remove a feature-library entry by (name, feature_type). Body:
+    `{name, feature_type?}`. Named `delete-feature-library` so it
+    doesn't collide with `delete-feature` (which removes a feature
+    from the loaded record)."""
+    name = _sanitize_label(payload.get("name"), max_len=200)
+    if not name:
+        return ({"error": "missing or non-string 'name'"}, 400)
+    ftype = payload.get("feature_type")
+    if ftype is not None and not isinstance(ftype, str):
+        return ({"error": "'feature_type' must be a string"}, 400)
+    entries = _load_features()
+    new_list = [
+        e for e in entries
+        if not (e.get("name") == name
+                and (not ftype or (e.get("feature_type") or "") == ftype))
+    ]
+    if len(new_list) == len(entries):
+        return ({"error": (
+            f"no feature named {name!r}"
+            + (f" of type {ftype!r}" if ftype else "")
+        )}, 404)
+    if (err := _agent_save_or_500(
+            lambda: _save_features(new_list),
+            "features")) is not None:
+        return err
+    return {"ok": True, "removed": len(entries) - len(new_list)}
 
 
 @_agent_endpoint("classify-part")
@@ -68836,12 +71245,21 @@ _AGENT_BACKUP_LABELS: dict = {
     "parts_bin":               "_PARTS_BIN_FILE",
     "parts_bin_collections":   "_PARTS_BIN_COLLECTIONS_FILE",
     "primers":                 "_PRIMERS_FILE",
+    "primer_collections":      "_PRIMER_COLLECTIONS_FILE",
     "features":                "_FEATURES_FILE",
     "feature_colors":          "_FEATURE_COLORS_FILE",
     "grammars":                "_GRAMMARS_FILE",
     "entry_vectors":           "_ENTRY_VECTORS_FILE",
     "codon_tables":            "_CODON_TABLES_FILE",
     "settings":                "_SETTINGS_FILE",
+    # Parity with `RestoreFromBackupModal._TARGETS` — agent should
+    # be able to list/restore every persisted user-data file the GUI
+    # can. Pre-fix the agent rejected Experiments/Gels/Protein-motifs
+    # labels even though their `.bak` files exist on disk.
+    "experiments":             "_EXPERIMENTS_FILE",
+    "experiment_projects":     "_EXPERIMENT_PROJECTS_FILE",
+    "gels":                    "_GELS_FILE",
+    "protein_motifs":          "_PROTEIN_MOTIFS_FILE",
 }
 
 
@@ -68933,12 +71351,17 @@ def _h_restore_backup(app, payload):
         "parts_bin":             "_parts_bin_cache",
         "parts_bin_collections": "_parts_bin_collections_cache",
         "primers":               "_primers_cache",
+        "primer_collections":    "_primer_collections_cache",
         "features":              "_features_cache",
         "feature_colors":        "_feature_colors_cache",
         "grammars":              "_grammars_cache",
         "entry_vectors":         "_entry_vectors_cache",
         "codon_tables":          "_codon_tables_cache",
         "settings":              "_settings_cache",
+        "experiments":           "_experiments_cache",
+        "experiment_projects":   "_experiment_projects_cache",
+        "gels":                  "_gels_cache",
+        "protein_motifs":        "_protein_motifs_cache",
     }.get(msg)
     if cache_attr is not None:
         globals()[cache_attr] = None
@@ -72027,6 +74450,32 @@ SpeciesPickerModal { align: center middle; }
         # user shouldn't have to refocus the map first.
         Binding("alt+a",       "open_align_picker", "Align…",       show=False, priority=True),
         Binding("alt+shift+a", "clear_alignments", "Clear aligns",  show=False, priority=True),
+        # Menu-bar keyboard shortcuts (2026-05-21). Pre-fix the top
+        # menus were mouse-only — CI couldn't drive them, accessibility
+        # users were stuck. Letters picked for uniqueness across
+        # `MenuBar.MENUS`; first-letter where available, otherwise an
+        # internal letter (s`y`nthesis, se`q`uencing, e`x`periments,
+        # pa`r`ts, e`n`zymes, s`i`mulator). NOT priority=True so an
+        # inner Input/TextArea's own key handling wins (a user typing
+        # in a search box shouldn't trigger a menu). Three menus are
+        # deliberately mouse-only because their natural Alt+letter
+        # conflicts with an existing App-level binding:
+        #   * Features (Alt+T → SynthesisProteinEditor codon-mode)
+        #   * Mutagenize (Alt+M → toggle_click_debug)
+        #   * Constructor (Alt+C → copy_selection_bottom)
+        # If a future user complains, move one of those bindings
+        # before adding the menu shortcut here.
+        Binding("alt+f", "open_named_menu('File')",         "File menu",     show=False),
+        Binding("alt+s", "open_named_menu('Settings')",     "Settings menu", show=False),
+        Binding("alt+e", "open_named_menu('Edit')",         "Edit menu",     show=False),
+        Binding("alt+n", "open_named_menu('Enzymes')",      "Enzymes menu",  show=False),
+        Binding("alt+p", "open_named_menu('Primers')",      "Primers",       show=False),
+        Binding("alt+y", "open_named_menu('Synthesis')",    "Synthesis",     show=False),
+        Binding("alt+r", "open_named_menu('Parts')",        "Parts",         show=False),
+        Binding("alt+i", "open_named_menu('Simulator')",    "Simulator",     show=False),
+        Binding("alt+q", "open_named_menu('Sequencing')",   "Sequencing",    show=False),
+        Binding("alt+x", "open_named_menu('Experiments')",  "Experiments",   show=False),
+        Binding("alt+h", "open_named_menu('History')",      "History",       show=False),
         Binding("ctrl+e",      "edit_seq",         "Edit seq",      show=False),
         Binding("ctrl+shift+f","capture_to_features", "→ Feat lib", show=False, priority=True),
         # UI snapshot — capture a Markdown dump to <DATA_DIR>/
@@ -72929,7 +75378,7 @@ SpeciesPickerModal { align: center middle; }
                 self._seed_default_library()
 
     def _check_data_files(self) -> None:
-        """Validate plasmid library, parts bin, and primer library on startup.
+        """Validate every persisted user-data JSON on startup.
 
         For each file:
           - Missing → first run, no warning.
@@ -72938,64 +75387,42 @@ SpeciesPickerModal { align: center middle; }
             warning message that we surface to the user via notify().
           - Manually deleted mid-session → next load returns [], no crash.
 
-        This runs BEFORE any load call so the caches are cold and
-        _safe_load_json actually reads the files.
+        Does NOT seed the typed caches with the validated entries —
+        a 2026-05-21 attempt at that optimisation broke three loaders
+        whose post-validation logic the generic seed bypassed:
+        `_load_protein_motifs` merges built-ins, `_load_experiments`
+        runs `_migrate_legacy_tag_format`, `_load_entry_vectors`
+        applies a tighter filter on `grammar_id`. The lazy load on
+        first UI touch is correct; the double-read cost is small in
+        practice (libraries that fit in 50 MB).
         """
-        global _library_cache, _parts_bin_cache, _primers_cache
-        global _collections_cache, _settings_cache
-        # Force a cold read on every JSON registry so a corrupt file is
-        # detected NOW (with .bak recovery + a user notify) rather than at
-        # the first lazy-load when something breaks downstream. The
-        # cache reset is the mechanism that lets a .bak restore land in
-        # the next typed-loader call. Caches WITHOUT their own
-        # generation counter (library, parts_bin, primers, collections,
-        # entry_vectors, settings) need the reset.
-        for path, label, cache_attr in [
-            (_LIBRARY_FILE,            "Plasmid library",     "_library_cache"),
-            (_PARTS_BIN_FILE,          "Parts bin",           "_parts_bin_cache"),
-            (_PARTS_BIN_COLLECTIONS_FILE,
-                                       "Parts-bin collections",
-                                       "_parts_bin_collections_cache"),
-            (_PRIMERS_FILE,            "Primer library",      "_primers_cache"),
-            (_PRIMER_COLLECTIONS_FILE, "Primer collections",  "_primer_collections_cache"),
-            (_COLLECTIONS_FILE,        "Plasmid collections", "_collections_cache"),
-            (_ENTRY_VECTORS_FILE,      "Entry vectors",       "_entry_vectors_cache"),
-            (_SETTINGS_FILE,           "Settings",            "_settings_cache"),
-            # Sweep #9 (2026-05-19): 0.9.6's new persisted files.
-            # Without launch-time validation, corruption only
-            # surfaces on lazy first-load (warning lands in log,
-            # not always reaching the user via notify).
-            (_EXPERIMENTS_FILE,        "Experiments",         "_experiments_cache"),
-            (_EXPERIMENT_PROJECTS_FILE,
-                                       "Experiment projects",
-                                       "_experiment_projects_cache"),
-            (_GELS_FILE,               "Gels",                "_gels_cache"),
-            # Sweep #15 (2026-05-20): protein-motif user overrides.
-            (_PROTEIN_MOTIFS_FILE,     "Protein motifs",
-                                       "_protein_motifs_cache"),
-        ]:
-            globals()[cache_attr] = None
-            _, warning = _safe_load_json(path, label)
-            if warning:
-                self.notify(warning, severity="warning", timeout=12)
-        # Generation-tracked caches (features / feature_colors / grammars
-        # / codon_tables) DON'T need a cache reset — their typed loaders
-        # bump a global generation counter on every cold read, so the
-        # downstream generation-keyed consumers (Parts-Bin feat-lib
-        # index, FeatureLibraryScreen) would see a phantom invalidation
-        # if we forced a cold reread here. Just validate on-disk
-        # corruption + surface the warning; cache state is untouched.
         for path, label in [
-            (_FEATURES_FILE,       "Feature library"),
-            (_FEATURE_COLORS_FILE, "Feature colours"),
-            (_GRAMMARS_FILE,       "Cloning grammars"),
-            (_CODON_TABLES_FILE,   "Codon tables"),
+            (_LIBRARY_FILE,            "Plasmid library"),
+            (_PARTS_BIN_FILE,          "Parts bin"),
+            (_PARTS_BIN_COLLECTIONS_FILE, "Parts-bin collections"),
+            (_PRIMERS_FILE,            "Primer library"),
+            (_PRIMER_COLLECTIONS_FILE, "Primer collections"),
+            (_COLLECTIONS_FILE,        "Plasmid collections"),
+            (_ENTRY_VECTORS_FILE,      "Entry vectors"),
+            (_SETTINGS_FILE,           "Settings"),
+            # Sweep #9 (2026-05-19): 0.9.6's new persisted files.
+            # Without launch-time validation, corruption only surfaces
+            # on lazy first-load (warning lands in log, not always
+            # reaching the user via notify).
+            (_EXPERIMENTS_FILE,        "Experiments"),
+            (_EXPERIMENT_PROJECTS_FILE, "Experiment projects"),
+            (_GELS_FILE,               "Gels"),
+            # Sweep #15 (2026-05-20): protein-motif user overrides.
+            (_PROTEIN_MOTIFS_FILE,     "Protein motifs"),
+            # Generation-tracked caches.
+            (_FEATURES_FILE,           "Feature library"),
+            (_FEATURE_COLORS_FILE,     "Feature colours"),
+            (_GRAMMARS_FILE,           "Cloning grammars"),
+            (_CODON_TABLES_FILE,       "Codon tables"),
         ]:
             _, warning = _safe_load_json(path, label)
             if warning:
                 self.notify(warning, severity="warning", timeout=12)
-        # Caches stay None so the next typed loader (e.g. _load_settings)
-        # rebuilds them through its own filter/shape logic.
 
     # ── Crash-recovery autosave ────────────────────────────────────────────────
 
@@ -74663,6 +77090,38 @@ SpeciesPickerModal { align: center middle; }
                 f"Exported {feats} features / {bp} bp → {path}",
                 timeout=8,
             )
+            # If the source plasmid carried `.dna`-only baggage (history
+            # XML, original-bytes sidecar), warn the user that the .gb
+            # round-trip dropped it. GenBank has no place for either —
+            # silent loss surprised users who later re-imported the .gb
+            # and found construction history gone.
+            rec_id = getattr(self._current_record, "id", "") or ""
+            entry: "dict | None" = None
+            if rec_id:
+                for e in _load_library():
+                    if e.get("id") == rec_id:
+                        entry = e
+                        break
+            has_history = bool(entry and entry.get("history_xml"))
+            has_sidecar = False
+            if rec_id:
+                try:
+                    has_sidecar = _dna_sidecar_path(rec_id).exists()
+                except (OSError, ValueError):
+                    has_sidecar = False
+            if has_history or has_sidecar:
+                lost = []
+                if has_history:
+                    lost.append("construction history")
+                if has_sidecar:
+                    lost.append("original .dna packet data")
+                self.notify(
+                    f"Note: GenBank does not preserve "
+                    f"{' or '.join(lost)}. The library entry "
+                    f"keeps the original — re-export as .dna to "
+                    f"preserve everything.",
+                    severity="warning", timeout=10,
+                )
 
         self.push_screen(
             ExportGenBankModal(self._current_record, default_path=default),
@@ -74916,6 +77375,44 @@ SpeciesPickerModal { align: center middle; }
             _clear_flag()
 
     @_action_log("app.export.gff")
+    @_action_log("app.export.bulk_collection")
+    def action_export_collection(self) -> None:
+        """Open the bulk-export modal: pick a collection + format +
+        target folder, then write every plasmid in that collection
+        out as individual files. Failures are accumulated per-entry
+        so a single bad plasmid doesn't abort the run.
+
+        Defaults the collection picker to the active collection.
+        """
+        active = _get_setting("active_collection", "") or ""
+
+        def _on_done(result):
+            if not result:
+                return
+            written = len(result.get("written", []))
+            failures = result.get("failures", [])
+            total = result.get("total", 0)
+            coll = result.get("collection", "?")
+            fmt = result.get("format", "?")
+            tgt = result.get("dir", "?")
+            if failures:
+                self.notify(
+                    f"Exported {written}/{total} from {coll!r} as "
+                    f"{fmt} → {tgt} ({len(failures)} failed).",
+                    severity="warning", timeout=10,
+                )
+            else:
+                self._notify_success(
+                    f"Exported {written} plasmid(s) from {coll!r} as "
+                    f"{fmt} → {tgt}.",
+                    timeout=8,
+                )
+
+        self.push_screen(
+            BulkExportCollectionModal(default_collection=active),
+            callback=_on_done,
+        )
+
     def action_export_gff(self) -> None:
         """Prompt for a path and write the loaded record as GFF3.
 
@@ -77636,6 +80133,7 @@ SpeciesPickerModal { align: center middle; }
                 ("Export as FASTA (.fa)...",     "export_fasta"),
                 ("Export as GFF3 (.gff3)...",    "export_gff"),
                 ("Export as .dna...", "export_commercialsaas"),
+                ("Export collection (bulk)...",  "export_collection"),
                 ("---",                          None),
                 ("Collections...",               "open_collections"),
                 ("---",                          None),
@@ -77787,6 +80285,34 @@ SpeciesPickerModal { align: center middle; }
                 pass
             pm.refresh()
         self.notify(f"Min primer binding: {nxt} bp")
+
+    def action_open_named_menu(self, name: str) -> None:
+        """Keyboard entry point for the top menu bar. Mirrors what
+        clicking the menu does — queries the matching MenuBar `Static`
+        for its region, then delegates to `open_menu`. Without this,
+        every menu was mouse-only, blocking CI / accessibility usage
+        and frustrating users who navigate by keyboard.
+
+        Lookups by display name (case-sensitive, matches `MenuBar.MENUS`)
+        instead of the lowercase widget id so a future menu rename
+        cascades from one place. Silent no-op when the menubar isn't
+        composed (e.g., a modal swallows the App-level binding).
+        """
+        if not isinstance(name, str) or name not in MenuBar.MENUS:
+            return
+        try:
+            mb = self.query_one(MenuBar)
+            item = mb.query_one(f"#menu-{name.lower()}", Static)
+        except (NoMatches, AttributeError):
+            return
+        region = item.region
+        # Direct-action menus discard x/y inside `open_menu`; dropdown
+        # menus place the popup just below the clicked item. Mirror
+        # `MenuBar.on_click`'s placement.
+        if name == "Features":
+            self.push_screen(FeatureLibraryScreen())
+            return
+        self.open_menu(name, region.x, region.y + 1)
 
     @_action_log("app.open.sequencing")
     def action_open_sequencing(self) -> None:

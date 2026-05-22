@@ -133,6 +133,50 @@ class TestRestoreCacheBustEnumeration:
         assert "_parts_bin_cache" in src
         assert "_primers_cache" in src
 
+    def test_agent_backup_labels_parity_with_user_data_files(self):
+        """Regression guard for 2026-05-21 fix: `_AGENT_BACKUP_LABELS`
+        and the cache-bust map inside `_h_restore_backup` covered only
+        11 of 16 `_USER_DATA_FILE_ATTRS`. Users could list/restore
+        Experiments / Gels / Protein motifs / Primer collections via
+        the GUI but not via the agent API.
+
+        Every user-data file attr except `_SETTINGS_FILE` (which the
+        agent intentionally can't restore mid-session — see the
+        `RestoreFromBackupModal._TARGETS` docstring) MUST be reachable
+        by SOME label in `_AGENT_BACKUP_LABELS` AND have an entry in
+        the cache-bust map.
+        """
+        import inspect
+        labeled_attrs = set(sc._AGENT_BACKUP_LABELS.values())
+        # Settings restore is deliberately excluded — see comment in
+        # `RestoreFromBackupModal._TARGETS`.
+        expected = set(sc._USER_DATA_FILE_ATTRS) - {"_SETTINGS_FILE"}
+        missing = expected - labeled_attrs
+        assert not missing, (
+            f"_AGENT_BACKUP_LABELS missing entries for: {sorted(missing)}. "
+            f"Agent can't list/restore these even though they're "
+            f"user-data files. Pre-fix this set silently grew."
+        )
+
+        # Cache-bust map: white-box check that every label in
+        # `_AGENT_BACKUP_LABELS` is also reset by `_h_restore_backup`
+        # so a restore doesn't leave a stale in-memory cache.
+        bust_src = inspect.getsource(sc._h_restore_backup)
+        bust_gaps = []
+        for label in sc._AGENT_BACKUP_LABELS:
+            # Each label appears as a dict key in the cache_attr map.
+            # The settings label is included in the bust map; the
+            # restore path treats it conservatively (sets cache None
+            # so next read picks up disk).
+            if f'"{label}"' not in bust_src:
+                bust_gaps.append(label)
+        assert not bust_gaps, (
+            f"_h_restore_backup cache-bust map missing labels: "
+            f"{bust_gaps}. Agent restore of these files would not "
+            f"invalidate their in-memory cache, so the next UI read "
+            f"would silently re-overwrite the restored disk state."
+        )
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Save-chain lock-release gap — mirror inside cache lock

@@ -134,7 +134,7 @@ installs and the user-data directory location.
   through save as CDS sub-features.
 - **Search** your library with in-process BLASTN / BLASTP / HMMscan
   (via `pyhmmer` — no external `blast+` install).
-- **Drive from outside** via an 80+ endpoint localhost JSON API
+- **Drive from outside** via a 90+ endpoint localhost JSON API
   (`splicecraft --agent`) and a stdlib-only CLI sidecar
   (`splicecraft-cli`).
 
@@ -154,7 +154,7 @@ Full feature reference: [`docs/features.md`](docs/features.md).
 - **Pre-update snapshots** before any pip / pipx / uv subprocess; stored
   in a sibling directory so a hypothetical recursive-wipe bug in a new
   version cannot kill recovery.
-- **2,600+ tests** anchored on 41 sacred invariants (see
+- **2,600+ tests** anchored on 63+ sacred invariants (see
   [`CLAUDE.md`](CLAUDE.md)), hypothesis property-based fuzzing on
   biology primitives.
 - **Defence-in-depth size caps** on every external input (NCBI / PyPI

@@ -135,6 +135,7 @@ _MODAL_CASES = [
     ("FetchModal",                 lambda: sc.FetchModal()),
     ("OpenFileModal",              lambda: sc.OpenFileModal()),
     ("ExportGenBankModal",         lambda: sc.ExportGenBankModal(_make_record())),
+    ("BulkExportCollectionModal",  lambda: sc.BulkExportCollectionModal()),
     ("EditSeqDialog.insert",       lambda: sc.EditSeqDialog("insert",   "",  5, 5)),
     ("EditSeqDialog.replace",      lambda: sc.EditSeqDialog("replace", "ATCG", 5, 9)),
     ("UnsavedQuitModal",           lambda: sc.UnsavedQuitModal()),
