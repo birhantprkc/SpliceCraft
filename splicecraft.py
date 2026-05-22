@@ -4529,6 +4529,267 @@ _RESTRICTION_SITES: dict[str, str] = {
 }
 
 
+# ── Enzyme collections persistence ────────────────────────────────────────
+#
+# User-named subsets of `_NEB_ENZYMES`. The master catalog (`_NEB_ENZYMES`)
+# is the source of truth; collections are pure "name → list-of-enzyme-names"
+# shortlists. Restriction-overlay scan reads from the active collection
+# when one is set, otherwise scans the full master catalog. Mirrors the
+# plasmid `collections.json` pattern (above) so all of the [RECIPE] checklist
+# items — backup/restore UI, Master Delete cache attrs, _protect_user_data
+# fixture, _check_data_files launch-check — apply identically.
+#
+# Schema envelope v1: ``{"_schema_version": 1, "entries": [...]}``.
+# Each entry: ``{"name": str, "enzymes": [str, ...]}``.
+
+# Custom-enzyme catalog (extends the built-in NEB master). Same
+# persistence shape as the plasmid library — flat list of dicts the
+# user can grow via the "Add new enzyme…" modal. The combined view
+# `_all_enzymes()` returns built-in ∪ custom; user-added names
+# OVERRIDE built-in entries on name collision (gives the user the
+# last word on cut definitions).
+#
+# Schema envelope v1; each entry:
+# ``{"name": str, "site": str, "fwd_cut": int, "rev_cut": int,
+#    "type": str, "supplier": str}``
+_CUSTOM_ENZYMES_FILE = _DATA_DIR / "custom_enzymes.json"
+_custom_enzymes_cache: "list | None" = None
+
+
+def _load_custom_enzymes() -> list[dict]:
+    """Deep-copy on read (pitfall #17)."""
+    global _custom_enzymes_cache
+    if _custom_enzymes_cache is None:
+        entries, warning = _safe_load_json(
+            _CUSTOM_ENZYMES_FILE, "Custom enzymes",
+        )
+        if warning:
+            _log.warning(warning)
+        _custom_enzymes_cache = [
+            e for e in entries if isinstance(e, dict)
+        ]
+    return _typed_clone(_custom_enzymes_cache)
+
+
+def _save_custom_enzymes(entries: list[dict]) -> None:
+    global _custom_enzymes_cache
+    with _cache_lock:
+        _safe_save_json(
+            _CUSTOM_ENZYMES_FILE, entries, "Custom enzymes",
+        )
+        _custom_enzymes_cache = _typed_clone(entries)
+    # Repopulate `_SCAN_CATALOG` so the next restriction scan sees the
+    # new custom enzyme. Defensive `globals().get` because module
+    # bootstrap may import this helper before `_rebuild_scan_catalog`
+    # is defined.
+    init = globals().get("_rebuild_scan_catalog")
+    if init is not None:
+        try:
+            init()
+        except Exception:
+            _log.exception("scan catalog refresh failed after custom save")
+    # Bust caches that key on enzyme NAMES but read enzyme DEFINITIONS
+    # at value-derive time. Without these, a redefined custom enzyme
+    # (or a newly-added custom enzyme that now resolves where it
+    # didn't before) would return stale cached results — silent
+    # biology bug. `_RESTR_SCAN_CACHE` keys include `allowed_enzymes`
+    # so it self-invalidates when the active collection changes, but
+    # NOT when an enzyme definition changes underneath the same key.
+    # `_ASSEMBLY_FRAGMENT_CACHE` caches `None` for unresolved enzymes,
+    # so a newly-added custom enzyme would still hit a stale `None`.
+    for cache_name in ("_ENZYME_CUTS_CACHE",
+                       "_RESTR_SCAN_CACHE",
+                       "_ASSEMBLY_FRAGMENT_CACHE"):
+        cache = globals().get(cache_name)
+        if cache is not None:
+            try:
+                cache.clear()
+            except Exception:
+                _log.exception(
+                    "cache bust after custom-enzyme save failed (%s)",
+                    cache_name,
+                )
+
+
+def _all_enzymes() -> "dict[str, tuple[str, int, int]]":
+    """Combined view of built-in `_NEB_ENZYMES` + user-added custom
+    enzymes. Custom entries override built-in on name collision (so
+    the user can correct a wrong default cut position by adding a
+    custom row with the same name).
+
+    Returns the same shape as `_NEB_ENZYMES`: ``{name: (site, fwd_cut,
+    rev_cut)}``. Callers that need richer metadata (type tag, supplier)
+    must look up against `_load_custom_enzymes()` directly."""
+    out: dict[str, tuple[str, int, int]] = dict(_NEB_ENZYMES)
+    for entry in _load_custom_enzymes():
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        site = entry.get("site")
+        if not isinstance(name, str) or not isinstance(site, str):
+            continue
+        try:
+            fwd_cut = int(entry.get("fwd_cut", 0))
+            rev_cut = int(entry.get("rev_cut", 0))
+        except (TypeError, ValueError):
+            continue
+        out[name] = (site.upper(), fwd_cut, rev_cut)
+    return out
+
+
+def _custom_enzyme_meta(name: str) -> "dict | None":
+    """Return the full custom-enzyme dict (incl. type, supplier) for
+    ``name`` if present, else None. Used by the modal to show the
+    extra columns."""
+    if not isinstance(name, str) or not name:
+        return None
+    for entry in _load_custom_enzymes():
+        if isinstance(entry, dict) and entry.get("name") == name:
+            return entry
+    return None
+
+
+_ENZYME_COLLECTIONS_FILE = _DATA_DIR / "enzyme_collections.json"
+_enzyme_collections_cache: "list | None" = None
+
+# Visible label for the virtual "all NEB enzymes" pseudo-collection. Never
+# persisted — `_get_active_enzyme_collection_name() == None` already encodes
+# "use the master catalog". The label appears in the modal's selector so
+# the user has a non-blank choice to switch back to.
+_NEB_MASTER_PSEUDO_NAME = "NEB master (all enzymes)"
+
+
+def _load_enzyme_collections() -> list[dict]:
+    """Deep-copy on read so callers can mutate freely; pitfall #17."""
+    global _enzyme_collections_cache
+    if _enzyme_collections_cache is None:
+        entries, warning = _safe_load_json(
+            _ENZYME_COLLECTIONS_FILE, "Enzyme collections",
+        )
+        if warning:
+            _log.warning(warning)
+        _enzyme_collections_cache = [
+            e for e in entries if isinstance(e, dict)
+        ]
+    return _typed_clone(_enzyme_collections_cache)
+
+
+def _save_enzyme_collections(entries: list[dict]) -> None:
+    global _enzyme_collections_cache
+    with _cache_lock:
+        _safe_save_json(
+            _ENZYME_COLLECTIONS_FILE, entries, "Enzyme collections",
+        )
+        _enzyme_collections_cache = _typed_clone(entries)
+
+
+def _find_enzyme_collection(name: str) -> "dict | None":
+    """Return the collection dict matching ``name`` (case-sensitive), or
+    None. Operates on the readonly cache view to avoid the deepcopy cost
+    on hot read paths (modal grammar selector, restriction-scan dispatch)."""
+    if not isinstance(name, str) or not name:
+        return None
+    global _enzyme_collections_cache
+    if _enzyme_collections_cache is None:
+        _load_enzyme_collections()  # populates the cache as a side effect
+    for entry in (_enzyme_collections_cache or []):
+        if isinstance(entry, dict) and entry.get("name") == name:
+            return _typed_clone(entry)
+    return None
+
+
+def _get_active_enzyme_collection_name() -> "str | None":
+    """Return the active enzyme-collection name, or None when the user
+    hasn't picked one (= scan against the full NEB master catalog)."""
+    val = _get_setting("active_enzyme_collection", None)
+    return val if isinstance(val, str) and val else None
+
+
+def _set_active_enzyme_collection_name(name: "str | None") -> None:
+    """Persist (or clear) the active enzyme-collection pointer."""
+    prev = _get_active_enzyme_collection_name()
+    target = name or ""
+    if prev != target:
+        _log_event(
+            "enzyme_collection.switched",
+            prev=prev or "", new=target,
+        )
+    _set_setting("active_enzyme_collection", target)
+
+
+def _active_enzyme_allowed_set() -> "frozenset[str] | None":
+    """Resolve the enzyme allow-list for the active enzyme collection.
+
+    Returns ``None`` when no collection is active or the active one is
+    empty/missing — caller treats None as "scan the full master
+    catalog" (built-in NEB ∪ user-added custom enzymes). Filters
+    against `_all_enzymes()` so a stale name in a collection (manually
+    edited JSON, deleted built-in, or a custom enzyme since removed)
+    never reaches the scanner."""
+    name = _get_active_enzyme_collection_name()
+    if not name:
+        return None
+    coll = _find_enzyme_collection(name)
+    if not coll:
+        return None
+    enzymes = coll.get("enzymes") or []
+    if not isinstance(enzymes, list):
+        return None
+    known = _all_enzymes()
+    parsed = frozenset(
+        n for n in enzymes
+        if isinstance(n, str) and n in known
+    )
+    return parsed or None
+
+
+def _migrate_legacy_custom_enzyme_csv() -> None:
+    """One-shot migration: convert the pre-collection
+    ``restr_custom_enzymes`` CSV + ``restr_use_custom_list`` toggle into
+    a real enzyme collection named ``Custom (legacy)``.
+
+    Only fires when:
+      * The legacy CSV is non-empty.
+      * No collection with the legacy name already exists (so re-running
+        the migration is a no-op).
+
+    If ``restr_use_custom_list`` was on, the legacy collection is set
+    as the active one. The CSV + toggle settings are cleared so the
+    legacy `CustomEnzymeListModal` / Enzymes-menu toggle become
+    inert until removed.
+    """
+    csv = str(_get_setting("restr_custom_enzymes", "") or "").strip()
+    if not csv:
+        return
+    legacy_name = "Custom (legacy)"
+    existing = _load_enzyme_collections()
+    if any(e.get("name") == legacy_name for e in existing):
+        return
+    names = sorted({
+        s.strip() for s in csv.replace(";", ",").replace("\n", ",").split(",")
+        if s and s.strip() and s.strip() in _NEB_ENZYMES
+    })
+    if not names:
+        # CSV held only unknown names — nothing meaningful to migrate.
+        _set_setting("restr_custom_enzymes", "")
+        _set_setting("restr_use_custom_list", False)
+        return
+    existing.append({"name": legacy_name, "enzymes": names})
+    _save_enzyme_collections(existing)
+    was_active = bool(_get_setting("restr_use_custom_list", False))
+    if was_active:
+        _set_active_enzyme_collection_name(legacy_name)
+    # Retire the legacy settings keys so subsequent launches don't
+    # re-attempt the migration or surface the inert menu toggle.
+    _set_setting("restr_custom_enzymes", "")
+    _set_setting("restr_use_custom_list", False)
+    _log_event(
+        "enzyme_collection.migrated_from_csv",
+        name=legacy_name, n_enzymes=len(names),
+        was_active=was_active,
+    )
+
+
 _RESTR_PALETTE: list[str] = [
     "color(220)", "color(208)", "color(196)", "color(160)",
     "color(105)", "color(129)", "color(57)",  "color(21)",
@@ -4652,11 +4913,23 @@ def _feat_span_label(start: int, end: int, total: int) -> str:
 _SCAN_CATALOG: "list[tuple]" = []
 
 
+_DEFAULT_RESTR_COLOR = "color(247)"  # neutral grey for unknown / custom
+
+
 def _rebuild_scan_catalog() -> None:
-    """(Re)populate `_SCAN_CATALOG` from `_NEB_ENZYMES`. Called at import
-    time; also exposed so tests / future catalog edits can refresh it."""
+    """(Re)populate `_SCAN_CATALOG` from the combined master catalog
+    (`_NEB_ENZYMES` + user-added custom enzymes via `_all_enzymes()`).
+    Called at import time AND after every `_save_custom_enzymes` so a
+    newly-added user enzyme participates in subsequent restriction
+    scans without a relaunch. Custom enzymes without a registered
+    palette colour fall back to ``_DEFAULT_RESTR_COLOR`` (neutral grey)."""
     _SCAN_CATALOG.clear()
-    for name, (site, fwd_cut, rev_cut) in _NEB_ENZYMES.items():
+    # Use the combined accessor when available — at import time it
+    # falls back to `_NEB_ENZYMES` because `_load_custom_enzymes` reads
+    # from disk and works fine on a missing file.
+    catalog_fn = globals().get("_all_enzymes")
+    catalog = catalog_fn() if catalog_fn is not None else dict(_NEB_ENZYMES)
+    for name, (site, fwd_cut, rev_cut) in catalog.items():
         site_u  = site.upper()
         pat     = _iupac_pattern(site_u)
         rc_site = _rc(site_u)
@@ -4664,7 +4937,8 @@ def _rebuild_scan_catalog() -> None:
         rc_pat  = None if is_pal else _iupac_pattern(rc_site)
         _SCAN_CATALOG.append((
             name, site_u, len(site_u), fwd_cut, rev_cut,
-            _RESTR_COLOR[name], pat, is_pal, rc_pat,
+            _RESTR_COLOR.get(name, _DEFAULT_RESTR_COLOR),
+            pat, is_pal, rc_pat,
         ))
 
 _rebuild_scan_catalog()
@@ -5052,10 +5326,13 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
         return []
     seq_u = seq.upper()
     out: dict[tuple[int, int, str], dict] = {}
+    # Combined catalog so user-added custom enzymes participate in
+    # every cloning flow that funnels through `_enzyme_cuts`.
+    catalog = _all_enzymes()
     for ename in enzyme_names:
-        if ename not in _NEB_ENZYMES:
+        if ename not in catalog:
             continue
-        site, fwd_cut, rev_cut = _NEB_ENZYMES[ename]
+        site, fwd_cut, rev_cut = catalog[ename]
         site_u   = site.upper()
         site_len = len(site_u)
         pat      = _iupac_pattern(site_u)
@@ -5403,16 +5680,17 @@ def _make_synthetic_fragment(seq: str, *, enz_left: str, enz_right: str,
     input — it just synthesises the overhangs the user said they'd
     add via primer design.
 
-    Both enzymes must be in `_NEB_ENZYMES`. Raises ValueError on
-    unknown names. Features (if any) shift by the canonical overhang
-    length on the left so coords land in the right place after
-    ligation."""
-    if enz_left not in _NEB_ENZYMES:
+    Both enzymes must resolve via `_all_enzymes()` (built-in NEB ∪
+    user-added custom enzymes). Raises ValueError on unknown names.
+    Features (if any) shift by the canonical overhang length on the
+    left so coords land in the right place after ligation."""
+    catalog = _all_enzymes()
+    if enz_left not in catalog:
         raise ValueError(f"unknown enzyme: {enz_left!r}")
-    if enz_right not in _NEB_ENZYMES:
+    if enz_right not in catalog:
         raise ValueError(f"unknown enzyme: {enz_right!r}")
-    site_l, fwd_l, rev_l = _NEB_ENZYMES[enz_left]
-    site_r, fwd_r, rev_r = _NEB_ENZYMES[enz_right]
+    site_l, fwd_l, rev_l = catalog[enz_left]
+    site_r, fwd_r, rev_r = catalog[enz_right]
     site_l_u = site_l.upper()
     site_r_u = site_r.upper()
     site_l_len = len(site_l_u)
@@ -19326,7 +19604,7 @@ class HistoryViewerModal(ModalScreen):
         try:
             top = tree.root.children[0]
             tree.select_node(top)
-        except (IndexError, Exception):
+        except IndexError:
             pass
 
     @staticmethod
@@ -19539,7 +19817,7 @@ class HistoryScreen(Screen):
         try:
             top = tree.root.children[0]
             tree.select_node(top)
-        except (IndexError, Exception):
+        except IndexError:
             pass
 
     def _build_tree(self, tree: Tree) -> None:
@@ -20451,6 +20729,8 @@ _USER_DATA_FILE_ATTRS: tuple = (
     "_EXPERIMENT_PROJECTS_FILE",  # experiment_projects.json — all projects
     "_GELS_FILE",             # gels.json — saved agarose-gel snapshots
     "_PROTEIN_MOTIFS_FILE",   # protein_motifs.json — user motif overrides (sweep #15)
+    "_CUSTOM_ENZYMES_FILE",   # custom_enzymes.json — user-added restriction enzymes
+    "_ENZYME_COLLECTIONS_FILE",  # enzyme_collections.json — named subsets of master catalog
 )
 
 # User-data sub-directories — autosaved unsaved-edits + .dna sidecars.
@@ -20712,6 +20992,8 @@ _MASTER_DELETE_CACHE_ATTRS: tuple = (
     "_experiment_projects_cache",
     "_gels_cache",
     "_protein_motifs_cache",   # sweep #15: protein-motif user overrides
+    "_custom_enzymes_cache",      # user-added restriction enzymes
+    "_enzyme_collections_cache",  # enzyme-set collections
 )
 
 
@@ -23959,6 +24241,1452 @@ class CustomEnzymeListModal(ModalScreen):
         self.dismiss(None)
 
 
+class _EnzymeNamePromptModal(ModalScreen[str]):
+    """Tiny prompt: ask the user for a collection name. Dismisses with
+    the trimmed string (None on cancel). Used by EnzymeCollectionsModal
+    for New / Rename / Duplicate flows so each helper is one button +
+    one prompt rather than its own bespoke modal."""
+
+    _blocks_undo: bool = True  # Input widget
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    _EnzymeNamePromptModal { align: center middle; }
+    #enz-name-dlg { width: 60; height: auto; padding: 1 2;
+        background: #1c1c1c; border: solid $primary; }
+    #enz-name-input { margin-top: 1; }
+    #enz-name-btns { height: 3; margin-top: 1; }
+    #enz-name-btns Button { margin-right: 1; }
+    """
+
+    def __init__(self, title: str, initial: str = "") -> None:
+        super().__init__()
+        self._title = title
+        self._initial = initial
+        self._dismissed: bool = False   # [INV-50]
+
+    def _dismiss_once(self, payload) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="enz-name-dlg"):
+            yield Static(f" {self._title} ", id="enz-name-title")
+            yield Input(value=self._initial, id="enz-name-input")
+            with Horizontal(id="enz-name-btns"):
+                yield Button("OK", id="enz-name-ok", variant="primary")
+                yield Button("Cancel", id="enz-name-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            inp = self.query_one("#enz-name-input", Input)
+        except NoMatches:
+            return
+        inp.focus()
+
+    @on(Input.Submitted, "#enz-name-input")
+    def _on_submit(self, _: Input.Submitted) -> None:
+        self._ok()
+
+    @on(Button.Pressed, "#enz-name-ok")
+    def _ok(self, _=None) -> None:
+        try:
+            inp = self.query_one("#enz-name-input", Input)
+        except NoMatches:
+            self._dismiss_once(None)
+            return
+        val = (inp.value or "").strip()
+        self._dismiss_once(val or None)
+
+    @on(Button.Pressed, "#enz-name-cancel")
+    def _cancel(self, _=None) -> None:
+        self._dismiss_once(None)
+
+    def action_cancel(self) -> None:
+        self._dismiss_once(None)
+
+
+class AddCustomEnzymeModal(ModalScreen[dict]):
+    """Add a user-defined restriction enzyme to the master catalog.
+
+    Inputs: name, recognition site (IUPAC), forward + reverse cut
+    positions, type tag, supplier. Persisted to `custom_enzymes.json`
+    via `_save_custom_enzymes`; after save the scan catalog is rebuilt
+    so the new enzyme participates in subsequent restriction scans
+    without a relaunch.
+
+    Validation:
+      * Name 1–64 chars, no leading/trailing whitespace, must NOT
+        collide with an existing built-in or custom enzyme.
+      * Site 4–30 chars, IUPAC alphabet (``ACGTRYSWKMBDHVN``).
+      * Cut positions integer in ``-30 .. len(site)+30`` (typeIIS
+        enzymes cut outside their recognition site so we allow some
+        slack — guards against typos, not malice).
+
+    Dismisses with the saved entry dict on success, ``None`` on cancel.
+    """
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    AddCustomEnzymeModal { align: center middle; }
+    #ace-dlg {
+        width: 80; height: auto; max-height: 92%;
+        background: #1c1c1c; border: solid $primary; padding: 1 2;
+    }
+    #ace-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; margin-bottom: 1;
+    }
+    .ace-row { height: 3; }
+    .ace-row Label { width: 18; padding: 1 0 0 0; }
+    .ace-row Input { width: 50; }
+    .ace-row Select { width: 50; }
+    #ace-status { min-height: 1; margin-top: 1; }
+    #ace-btns { height: 3; margin-top: 1; }
+    #ace-btns Button { margin-right: 1; }
+    """
+
+    # Type tags are informational labels — the scanner only uses
+    # (site, fwd_cut, rev_cut). Keep the list short so the dropdown
+    # stays readable.
+    _ENZYME_TYPES = [
+        ("Type II — blunt",       "II_blunt"),
+        ("Type II — 5' overhang", "II_5overhang"),
+        ("Type II — 3' overhang", "II_3overhang"),
+        ("Type IIS",              "IIS"),
+        ("Type III",              "III"),
+        ("Other",                 "other"),
+    ]
+
+    _IUPAC_ALPHABET = frozenset("ACGTRYSWKMBDHVN")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._dismissed: bool = False   # [INV-50]
+
+    def _dismiss_once(self, payload) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ace-dlg"):
+            yield Static(" Add custom enzyme ", id="ace-title")
+            with Horizontal(classes="ace-row"):
+                yield Label("Name:")
+                yield Input(placeholder="e.g. MyEnzI", id="ace-name")
+            with Horizontal(classes="ace-row"):
+                yield Label("Recognition site:")
+                yield Input(
+                    placeholder="e.g. GGATCC (IUPAC OK)",
+                    id="ace-site",
+                )
+            with Horizontal(classes="ace-row"):
+                yield Label("Forward cut:")
+                yield Input(
+                    placeholder="0..len(site); offset from site start",
+                    id="ace-fwd",
+                )
+            with Horizontal(classes="ace-row"):
+                yield Label("Reverse cut:")
+                yield Input(
+                    placeholder="offset from site start on bottom strand",
+                    id="ace-rev",
+                )
+            with Horizontal(classes="ace-row"):
+                yield Label("Type:")
+                yield Select(
+                    options=[(lbl, key) for lbl, key in self._ENZYME_TYPES],
+                    value="II_blunt",
+                    id="ace-type",
+                    allow_blank=False,
+                )
+            with Horizontal(classes="ace-row"):
+                yield Label("Supplier:")
+                yield Input(
+                    placeholder="optional — e.g. NEB, Thermo",
+                    id="ace-supplier",
+                )
+            yield Static("", id="ace-status", markup=True)
+            with Horizontal(id="ace-btns"):
+                yield Button("Save", id="ace-save", variant="primary")
+                yield Button("Cancel", id="ace-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#ace-name", Input).focus()
+        except NoMatches:
+            pass
+
+    def _set_status(self, markup: str) -> None:
+        try:
+            self.query_one("#ace-status", Static).update(markup)
+        except NoMatches:
+            pass
+
+    def _validate(self) -> "dict | None":
+        """Pull every field, validate, and return the persistable dict
+        on success. Sets the status line + returns None on any error."""
+        try:
+            name     = (self.query_one("#ace-name", Input).value or "").strip()
+            site     = (self.query_one("#ace-site", Input).value or "").strip().upper()
+            fwd_raw  = (self.query_one("#ace-fwd",  Input).value or "").strip()
+            rev_raw  = (self.query_one("#ace-rev",  Input).value or "").strip()
+            type_v   = self.query_one("#ace-type", Select).value
+            supplier = (self.query_one("#ace-supplier", Input).value or "").strip()
+        except NoMatches:
+            return None
+        if not name or not (1 <= len(name) <= 64):
+            self._set_status(
+                "[red]Name must be 1–64 characters.[/red]"
+            )
+            return None
+        known = _all_enzymes()
+        if name in known:
+            self._set_status(
+                f"[red]{name!r} already exists in the master "
+                f"catalog.[/red]"
+            )
+            return None
+        if not site or not (4 <= len(site) <= 30):
+            self._set_status(
+                "[red]Recognition site must be 4–30 characters.[/red]"
+            )
+            return None
+        bad_chars = set(site) - self._IUPAC_ALPHABET
+        if bad_chars:
+            self._set_status(
+                f"[red]Site has non-IUPAC characters: "
+                f"{', '.join(sorted(bad_chars))}.[/red]"
+            )
+            return None
+        try:
+            fwd_cut = int(fwd_raw)
+            rev_cut = int(rev_raw)
+        except ValueError:
+            self._set_status(
+                "[red]Cut positions must be integers.[/red]"
+            )
+            return None
+        # Type IIS enzymes cut OUTSIDE the recognition site (offset
+        # can be larger than len(site)) — guard for typos with
+        # generous bounds but don't disallow real-world cases.
+        lo = -30
+        hi = len(site) + 30
+        if not (lo <= fwd_cut <= hi) or not (lo <= rev_cut <= hi):
+            self._set_status(
+                f"[red]Cut positions must be within "
+                f"{lo}..{hi} (site length {len(site)}).[/red]"
+            )
+            return None
+        return {
+            "name":     name,
+            "site":     site,
+            "fwd_cut":  fwd_cut,
+            "rev_cut":  rev_cut,
+            "type":     type_v if isinstance(type_v, str) else "other",
+            "supplier": supplier,
+        }
+
+    @on(Button.Pressed, "#ace-save")
+    def _save_btn(self, _) -> None:
+        payload = self._validate()
+        if payload is None:
+            return
+        entries = _load_custom_enzymes()
+        entries.append(payload)
+        try:
+            _save_custom_enzymes(entries)
+        except Exception as exc:
+            _log.exception("save custom enzyme failed")
+            self._set_status(
+                f"[red]Save failed: {exc}[/red]"
+            )
+            return
+        _log_event(
+            "custom_enzyme.added",
+            name=payload["name"], site=payload["site"],
+            type=payload["type"],
+        )
+        self._dismiss_once(payload)
+
+    @on(Button.Pressed, "#ace-cancel")
+    def _cancel_btn(self, _) -> None:
+        self._dismiss_once(None)
+
+    def action_cancel(self) -> None:
+        self._dismiss_once(None)
+
+
+class EnzymeCollectionsModal(ModalScreen):
+    """Manage enzyme catalogs — named subsets of the master enzyme
+    catalog (built-in NEB ∪ user-added custom enzymes).
+
+    Two-pane layout. **Left** = master catalog (always visible) with a
+    search Input and an ``+ Add new enzyme…`` button that opens
+    `AddCustomEnzymeModal`. **Right** = a switchable view with two
+    modes:
+
+      * **List mode** (default landing) — DataTable of every catalog,
+        with ``New… / Rename… / Duplicate / Delete / Open`` buttons.
+        Selecting a row + ``Open`` (or pressing Enter on the row)
+        switches to editor mode and makes that catalog the active
+        one for the restriction-overlay scan.
+      * **Editor mode** — DataTable of enzymes in the currently-open
+        catalog, with ``← Back`` (returns to list mode) and
+        ``← Remove``. ``Add →`` happens via the master pane: pressing
+        Enter / Space on a master row, double-clicking it, or hitting
+        the ``Add →`` button, copies that enzyme into the open catalog
+        and refocuses the search Input (clearing its value) for the
+        type-search-add-repeat cycle.
+
+    Mirrors the plasmid library / collections architecture: the
+    master catalog is the equivalent of the plasmid library, catalogs
+    are the equivalent of collections. The legacy
+    ``restr_use_custom_list`` toggle + ``restr_custom_enzymes`` CSV
+    are migrated to a single ``Custom (legacy)`` catalog at first
+    launch (see `_migrate_legacy_custom_enzyme_csv`) and then dormant.
+
+    `_blocks_undo = True` — every CRUD action mutates persistent state
+    via `_save_enzyme_collections` / `_save_custom_enzymes`; a stray
+    Ctrl+Z on the canvas underneath would race the save (mirrors
+    `EntryVectorsModal`).
+    """
+
+    _blocks_undo: bool = True
+    _MODE_LIST   = "list"
+    _MODE_EDITOR = "editor"
+
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+        # Space on the master table activates "add to current catalog"
+        # (mirrors the DataTable's built-in Enter binding which fires
+        # `RowSelected`). Keep `show=False` so the footer hint row
+        # doesn't get crowded.
+        Binding("space", "master_activate", "Add to catalog",
+                show=False),
+        # Down arrow from the search input → focus the master table.
+        # No-op if focus is elsewhere; the table's own Down arrow
+        # handles row navigation when it has focus.
+        Binding("down", "search_to_table", "→ Table", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    EnzymeCollectionsModal { align: center middle; }
+    #ec-dlg {
+        width: 140; height: auto; max-height: 92%;
+        background: #1c1c1c; border: solid $primary; padding: 1 2;
+    }
+    #ec-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; margin-bottom: 1;
+    }
+    #ec-tabs { height: auto; }
+    #ec-panes { height: 26; }
+    #ec-master-pane { width: 1fr; padding-right: 1; }
+    #ec-right-pane  { width: 1fr; padding-left: 1; }
+    #ec-master-label { color: $accent; margin-bottom: 1; }
+    #ec-search { margin-bottom: 1; }
+    #ec-master-table { height: 18; margin-bottom: 1; }
+    #ec-add-master { width: 100%; }
+    #ec-list-mode, #ec-editor-mode { height: 100%; }
+    #ec-list-label, #ec-editor-label { color: $accent; margin-bottom: 1; }
+    #ec-catalogs-table, #ec-current-table { height: 18; }
+    #ec-editor-header { height: 3; margin-bottom: 1; }
+    #ec-editor-header Button { margin-right: 1; }
+    #ec-list-btns, #ec-list-btns2, #ec-editor-btns {
+        height: 3; margin-top: 1;
+    }
+    #ec-list-btns Button, #ec-list-btns2 Button, #ec-editor-btns Button {
+        margin-right: 1;
+    }
+    #ec-settings-pane { height: auto; padding: 1 2; }
+    #ec-settings-pane Checkbox { margin-bottom: 1; }
+    #ec-settings-pane RadioSet { margin-bottom: 1; }
+    #ec-settings-pane .ec-settings-label {
+        color: $accent; margin-top: 1;
+    }
+    #ec-status { margin-top: 1; min-height: 1; }
+    #ec-btns { height: 3; margin-top: 1; }
+    #ec-btns Button { margin-right: 1; }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Search filter — substring matched against name + recognition site.
+        self._search: str = ""
+        # Right-pane mode. Default to "list" so the user always lands
+        # on the catalog browser; "editor" is reached by clicking Open
+        # (or pressing Enter on a catalog row).
+        self._mode: str = self._MODE_LIST
+        # Name of the catalog being edited in editor mode. None when
+        # in list mode.
+        self._editor_catalog: "str | None" = None
+        # If a catalog is already marked active in settings, the modal
+        # opens straight into its editor view — matches the user's
+        # mental model "I want to keep editing where I left off".
+        active = _get_active_enzyme_collection_name()
+        if active and _find_enzyme_collection(active):
+            self._mode = self._MODE_EDITOR
+            self._editor_catalog = active
+        self._dismissed: bool = False   # [INV-50]
+
+    def _dismiss_once(self, payload) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
+
+    def _save_or_status(self, entries: list) -> bool:
+        """Persist via `_save_enzyme_collections` and surface failures.
+        Sacred invariant #7: `_safe_save_json` re-raises on disk full /
+        RO mount / EACCES; without this wrap the exception would crash
+        the modal mid-CRUD. Returns True on success so callers can
+        early-return before the success-side refresh + status."""
+        try:
+            _save_enzyme_collections(entries)
+        except Exception as exc:
+            _notify_save_failure(self.app, "Enzyme collections", exc)
+            self._set_status(f"[red]Save failed: {exc}[/red]")
+            return False
+        return True
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ec-dlg"):
+            yield Static(" Enzyme collections ", id="ec-title")
+            with TabbedContent(initial="tab-sets", id="ec-tabs"):
+                # TAB 1: catalog manager (the original modal body).
+                with TabPane("Enzyme Sets", id="tab-sets"):
+                    with Horizontal(id="ec-panes"):
+                        # LEFT: master enzymes (NEB + custom) — always visible.
+                        with Vertical(id="ec-master-pane"):
+                            yield Static(
+                                "Master catalog (NEB + custom)",
+                                id="ec-master-label",
+                            )
+                            yield Input(
+                                placeholder="Search name or recognition site…",
+                                id="ec-search",
+                            )
+                            yield DataTable(
+                                id="ec-master-table",
+                                cursor_type="row",
+                                zebra_stripes=True,
+                            )
+                            yield Button(
+                                "+ Add new enzyme…",
+                                id="ec-add-master",
+                            )
+                        # RIGHT: two modes; we mount BOTH and toggle `display`
+                        # so the user can't tab into a hidden widget.
+                        with Vertical(id="ec-right-pane"):
+                            # MODE A: catalog list (default landing).
+                            with Vertical(id="ec-list-mode"):
+                                yield Static(
+                                    "Enzyme catalogs",
+                                    id="ec-list-label",
+                                )
+                                yield DataTable(
+                                    id="ec-catalogs-table",
+                                    cursor_type="row",
+                                    zebra_stripes=True,
+                                )
+                                with Horizontal(id="ec-list-btns"):
+                                    yield Button("Open",      id="ec-open",
+                                                 variant="primary")
+                                    yield Button("New…",      id="ec-new")
+                                    yield Button("Rename…",   id="ec-rename")
+                                with Horizontal(id="ec-list-btns2"):
+                                    yield Button("Duplicate", id="ec-duplicate")
+                                    yield Button("Delete",    id="ec-delete",
+                                                 variant="error")
+                            # MODE B: catalog editor.
+                            with Vertical(id="ec-editor-mode"):
+                                with Horizontal(id="ec-editor-header"):
+                                    yield Button("← Back", id="ec-back")
+                                    yield Static(
+                                        "Editing: —",
+                                        id="ec-editor-label",
+                                    )
+                                yield DataTable(
+                                    id="ec-current-table",
+                                    cursor_type="row",
+                                    zebra_stripes=True,
+                                )
+                                with Horizontal(id="ec-editor-btns"):
+                                    yield Button("Add →",    id="ec-add",
+                                                 variant="primary")
+                                    yield Button("← Remove", id="ec-remove")
+                # TAB 2: restriction-overlay settings (moved out of the
+                # Enzymes dropdown when that menu was promoted to
+                # direct-open). Each control reads its initial state
+                # from the live settings + app attrs; Changed events
+                # delegate to the existing `action_toggle_*` methods so
+                # rescan + persist + notify wiring stays in one place.
+                with TabPane("Enzyme Settings", id="tab-settings"):
+                    with Vertical(id="ec-settings-pane"):
+                        yield Static(
+                            "Restriction-site overlay",
+                            classes="ec-settings-label",
+                        )
+                        yield Checkbox(
+                            "Show RE sites (keyboard shortcut: r)",
+                            value=bool(_get_setting("show_restr", True)),
+                            id="ec-set-show-restr",
+                        )
+                        yield Checkbox(
+                            "Unique cutters only",
+                            value=bool(_get_setting(
+                                "restr_unique_only", True,
+                            )),
+                            id="ec-set-unique",
+                        )
+                        yield Static(
+                            "Minimum recognition length",
+                            classes="ec-settings-label",
+                        )
+                        _min_len = int(_get_setting("restr_min_len", 6))
+                        with RadioSet(id="ec-set-min-len"):
+                            yield RadioButton(
+                                "4+ bp sites",
+                                value=(_min_len == 4),
+                                id="ec-set-min-4",
+                            )
+                            yield RadioButton(
+                                "6+ bp sites",
+                                value=(_min_len != 4),
+                                id="ec-set-min-6",
+                            )
+                        yield Static(
+                            "Map labels",
+                            classes="ec-settings-label",
+                        )
+                        yield Checkbox(
+                            "Show feature label connectors",
+                            value=bool(_get_setting(
+                                "show_connectors", True,
+                            )),
+                            id="ec-set-connectors",
+                        )
+            yield Static("", id="ec-status", markup=True)
+            with Horizontal(id="ec-btns"):
+                yield Button("Close", id="ec-close")
+
+    # ── Mount + initial population ────────────────────────────────────────
+
+    def on_mount(self) -> None:
+        # Build column headers once.
+        try:
+            self.query_one("#ec-master-table", DataTable).add_columns(
+                "Enzyme", "Recognition site", "Source",
+            )
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#ec-current-table", DataTable).add_columns(
+                "Enzyme", "Recognition site",
+            )
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#ec-catalogs-table", DataTable).add_columns(
+                "Catalog", "# enzymes", "Active",
+            )
+        except NoMatches:
+            pass
+        self._apply_mode()
+        self._refresh_master_table()
+        self._refresh_catalogs_table()
+        self._refresh_current_table()
+        self._refresh_status()
+        # Default focus on the search input — the type-search-add-repeat
+        # cycle is the dominant workflow.
+        self._focus_search(clear=False)
+
+    # ── Mode switching ────────────────────────────────────────────────────
+
+    def _apply_mode(self) -> None:
+        """Show only one right-pane mode at a time. Toggling `display`
+        keeps focus traversal honest (a hidden Vertical's children
+        aren't tab targets in Textual)."""
+        list_show   = self._mode == self._MODE_LIST
+        editor_show = self._mode == self._MODE_EDITOR
+        try:
+            self.query_one("#ec-list-mode", Vertical).display = list_show
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#ec-editor-mode", Vertical).display = editor_show
+        except NoMatches:
+            pass
+        # Update editor header label.
+        try:
+            label = self.query_one("#ec-editor-label", Static)
+            label.update(
+                f"Editing: {self._editor_catalog or '—'}"
+            )
+        except NoMatches:
+            pass
+
+    def _enter_editor(self, name: str) -> None:
+        """Switch to editor mode on the given catalog + make it active."""
+        self._editor_catalog = name
+        self._mode = self._MODE_EDITOR
+        _set_active_enzyme_collection_name(name)
+        self._apply_mode()
+        self._refresh_master_table()
+        self._refresh_current_table()
+        self._refresh_status()
+        self._kick_live_rescan()
+        self._focus_search(clear=True)
+
+    def _leave_editor(self) -> None:
+        """Switch back to catalog list mode. Active pointer stays as-is —
+        the user might just want to browse other catalogs without
+        changing what the overlay shows."""
+        self._editor_catalog = None
+        self._mode = self._MODE_LIST
+        self._apply_mode()
+        self._refresh_master_table()
+        self._refresh_catalogs_table()
+        self._refresh_status()
+
+    # ── Table population ──────────────────────────────────────────────────
+
+    def _site_display(self, name: str) -> str:
+        spec = _all_enzymes().get(name)
+        if not spec:
+            return ""
+        site, fwd_cut, _rev_cut = spec
+        if 0 <= fwd_cut <= len(site):
+            return f"{site[:fwd_cut]}^{site[fwd_cut:]}"
+        return site
+
+    def _refresh_master_table(self) -> None:
+        try:
+            t = self.query_one("#ec-master-table", DataTable)
+        except NoMatches:
+            return
+        t.clear()
+        q = self._search.strip().upper()
+        current_set: set[str] = set()
+        if self._mode == self._MODE_EDITOR and self._editor_catalog:
+            coll = _find_enzyme_collection(self._editor_catalog) or {}
+            current_set = {
+                e for e in (coll.get("enzymes") or [])
+                if isinstance(e, str)
+            }
+        custom_names = {
+            e.get("name") for e in _load_custom_enzymes()
+            if isinstance(e, dict) and isinstance(e.get("name"), str)
+        }
+        for ename in sorted(_all_enzymes().keys()):
+            site = _all_enzymes()[ename][0]
+            if q and q not in ename.upper() and q not in site.upper():
+                continue
+            source = "Custom" if ename in custom_names else "NEB"
+            if ename in current_set:
+                t.add_row(
+                    Text(ename, style="dim italic"),
+                    Text(self._site_display(ename),
+                         style="dim italic"),
+                    Text(source, style="dim italic"),
+                    key=ename,
+                )
+            else:
+                t.add_row(
+                    Text(ename),
+                    Text(self._site_display(ename)),
+                    Text(source),
+                    key=ename,
+                )
+
+    def _refresh_current_table(self) -> None:
+        try:
+            t = self.query_one("#ec-current-table", DataTable)
+        except NoMatches:
+            return
+        t.clear()
+        if self._mode != self._MODE_EDITOR or not self._editor_catalog:
+            return
+        coll = _find_enzyme_collection(self._editor_catalog) or {}
+        known = _all_enzymes()
+        enzymes = [
+            e for e in (coll.get("enzymes") or [])
+            if isinstance(e, str) and e in known
+        ]
+        for ename in sorted(enzymes):
+            t.add_row(
+                Text(ename),
+                Text(self._site_display(ename)),
+                key=ename,
+            )
+
+    def _refresh_catalogs_table(self) -> None:
+        try:
+            t = self.query_one("#ec-catalogs-table", DataTable)
+        except NoMatches:
+            return
+        t.clear()
+        active = _get_active_enzyme_collection_name() or ""
+        for coll in _load_enzyme_collections():
+            name = coll.get("name")
+            if not isinstance(name, str):
+                continue
+            enzymes = [
+                e for e in (coll.get("enzymes") or [])
+                if isinstance(e, str)
+            ]
+            t.add_row(
+                Text(name, style="bold"),
+                Text(str(len(enzymes))),
+                Text("✓ active" if name == active else "",
+                     style="green bold" if name == active else ""),
+                key=name,
+            )
+
+    def _refresh_status(self) -> None:
+        try:
+            status = self.query_one("#ec-status", Static)
+        except NoMatches:
+            return
+        active = _get_active_enzyme_collection_name()
+        if not active:
+            status.update(
+                f"[dim]Active scan: full master catalog "
+                f"({len(_all_enzymes())} enzymes).[/dim]"
+            )
+            return
+        coll = _find_enzyme_collection(active) or {}
+        known = _all_enzymes()
+        n = len([
+            e for e in (coll.get("enzymes") or [])
+            if isinstance(e, str) and e in known
+        ])
+        status.update(
+            f"[dim]Active scan: {active} — {n} enzyme(s).[/dim]"
+        )
+
+    def _set_status(self, markup: str) -> None:
+        try:
+            self.query_one("#ec-status", Static).update(markup)
+        except NoMatches:
+            pass
+
+    # ── Search input flow ─────────────────────────────────────────────────
+
+    @on(Input.Changed, "#ec-search")
+    def _on_search_changed(self, event: Input.Changed) -> None:
+        self._search = event.value or ""
+        self._refresh_master_table()
+
+    @on(Input.Submitted, "#ec-search")
+    def _on_search_submitted(self, _: Input.Submitted) -> None:
+        # Enter inside the search box: move focus to the master table
+        # on its first row — matches the type-then-pick flow.
+        self._focus_master_table()
+
+    def _focus_master_table(self) -> None:
+        try:
+            t = self.query_one("#ec-master-table", DataTable)
+        except NoMatches:
+            return
+        if t.row_count <= 0:
+            return
+        t.focus()
+        try:
+            t.cursor_coordinate = _Coordinate(0, 0)
+        except Exception:
+            pass
+
+    def _focus_search(self, *, clear: bool) -> None:
+        """Focus the search input, optionally clearing its value first.
+        Called after every add so the user can type the next query
+        without reaching for the mouse."""
+        try:
+            inp = self.query_one("#ec-search", Input)
+        except NoMatches:
+            return
+        if clear:
+            inp.value = ""
+            # `value=` doesn't fire Input.Changed when set
+            # programmatically; mirror the side effect manually.
+            self._search = ""
+            self._refresh_master_table()
+        inp.focus()
+
+    def action_search_to_table(self) -> None:
+        """Modal-level Down binding: only acts when the search input
+        has focus (other widgets get the normal Down behaviour)."""
+        try:
+            inp = self.query_one("#ec-search", Input)
+        except NoMatches:
+            return
+        if not inp.has_focus:
+            return
+        self._focus_master_table()
+
+    def action_master_activate(self) -> None:
+        """Modal-level Space binding: only acts when the master table
+        has focus. Mirrors DataTable's built-in Enter (which fires
+        `RowSelected` and is handled separately) so the two activation
+        keys behave identically."""
+        try:
+            t = self.query_one("#ec-master-table", DataTable)
+        except NoMatches:
+            return
+        if not t.has_focus:
+            return
+        enz = self._master_row_key()
+        if enz:
+            self._add_to_current(enz)
+
+    # ── Catalog row navigation in list mode ───────────────────────────────
+
+    @on(DataTable.RowSelected, "#ec-catalogs-table")
+    def _on_catalog_row_selected(
+        self, event: DataTable.RowSelected,
+    ) -> None:
+        """Enter on a catalog row → open it (mirrors clicking Open)."""
+        key = event.row_key.value if event.row_key else None
+        if isinstance(key, str) and _find_enzyme_collection(key):
+            self._enter_editor(key)
+
+    # ── Master row activation (Enter / Space / double-click) ──────────────
+
+    @on(DataTable.RowSelected, "#ec-master-table")
+    def _on_master_row_selected(
+        self, event: DataTable.RowSelected,
+    ) -> None:
+        """Enter on a master row → add to current catalog."""
+        key = event.row_key.value if event.row_key else None
+        if isinstance(key, str):
+            self._add_to_current(key)
+
+    @on(Click, "#ec-master-table")
+    def _on_master_click(self, event: "Click") -> None:
+        """Double-click on a master row → add. Single click selects
+        the row (default behaviour); chain >= 2 fires the add."""
+        # Textual's Click.chain is 1 for a normal click, 2 for double,
+        # 3 for triple. Skip if it's just a single click — the row
+        # selection from the underlying DataTable handler is enough.
+        if getattr(event, "chain", 1) < 2:
+            return
+        enz = self._master_row_key()
+        if enz:
+            self._add_to_current(enz)
+
+    def _master_row_key(self) -> "str | None":
+        try:
+            t = self.query_one("#ec-master-table", DataTable)
+        except NoMatches:
+            return None
+        if t.cursor_row is None or t.cursor_row < 0:
+            return None
+        try:
+            key = t.coordinate_to_cell_key(
+                _Coordinate(t.cursor_row, 0)
+            ).row_key.value
+        except Exception:
+            return None
+        return key if isinstance(key, str) else None
+
+    def _current_row_key(self) -> "str | None":
+        try:
+            t = self.query_one("#ec-current-table", DataTable)
+        except NoMatches:
+            return None
+        if t.cursor_row is None or t.cursor_row < 0:
+            return None
+        try:
+            key = t.coordinate_to_cell_key(
+                _Coordinate(t.cursor_row, 0)
+            ).row_key.value
+        except Exception:
+            return None
+        return key if isinstance(key, str) else None
+
+    def _catalogs_row_key(self) -> "str | None":
+        try:
+            t = self.query_one("#ec-catalogs-table", DataTable)
+        except NoMatches:
+            return None
+        if t.cursor_row is None or t.cursor_row < 0:
+            return None
+        try:
+            key = t.coordinate_to_cell_key(
+                _Coordinate(t.cursor_row, 0)
+            ).row_key.value
+        except Exception:
+            return None
+        return key if isinstance(key, str) else None
+
+    # ── List-mode CRUD ────────────────────────────────────────────────────
+
+    def _existing_names(self) -> set:
+        return {
+            c.get("name") for c in _load_enzyme_collections()
+            if isinstance(c, dict) and isinstance(c.get("name"), str)
+        }
+
+    @on(Button.Pressed, "#ec-open")
+    def _open_btn(self, _) -> None:
+        name = self._catalogs_row_key()
+        if not name or not _find_enzyme_collection(name):
+            self._set_status(
+                "[yellow]Pick a catalog row first.[/yellow]"
+            )
+            return
+        self._enter_editor(name)
+
+    @on(Button.Pressed, "#ec-new")
+    def _new_btn(self, _) -> None:
+        def _on_named(name: "str | None") -> None:
+            if not name:
+                return
+            if name in self._existing_names():
+                self._set_status(
+                    f"[yellow]A catalog named {name!r} "
+                    f"already exists.[/yellow]"
+                )
+                return
+            entries = _load_enzyme_collections()
+            entries.append({"name": name, "enzymes": []})
+            if not self._save_or_status(entries):
+                return
+            self._refresh_catalogs_table()
+            self._set_status(
+                f"[green]Created catalog {name!r}. "
+                f"Pick a row + Open to edit.[/green]"
+            )
+        self.app.push_screen(
+            _EnzymeNamePromptModal("New catalog — name?"),
+            _on_named,
+        )
+
+    @on(Button.Pressed, "#ec-rename")
+    def _rename_btn(self, _) -> None:
+        name = self._catalogs_row_key()
+        if not name or not _find_enzyme_collection(name):
+            self._set_status(
+                "[yellow]Pick a catalog row first.[/yellow]"
+            )
+            return
+        def _on_named(new_name: "str | None") -> None:
+            if not new_name or new_name == name:
+                return
+            if new_name in self._existing_names():
+                self._set_status(
+                    f"[yellow]{new_name!r} already exists.[/yellow]"
+                )
+                return
+            entries = _load_enzyme_collections()
+            for entry in entries:
+                if entry.get("name") == name:
+                    entry["name"] = new_name
+                    break
+            if not self._save_or_status(entries):
+                return
+            if _get_active_enzyme_collection_name() == name:
+                _set_active_enzyme_collection_name(new_name)
+            self._refresh_catalogs_table()
+            self._set_status(
+                f"[green]Renamed to {new_name!r}.[/green]"
+            )
+        self.app.push_screen(
+            _EnzymeNamePromptModal(
+                f"Rename {name!r} →", initial=name,
+            ),
+            _on_named,
+        )
+
+    @on(Button.Pressed, "#ec-duplicate")
+    def _duplicate_btn(self, _) -> None:
+        name = self._catalogs_row_key()
+        if not name or not _find_enzyme_collection(name):
+            self._set_status(
+                "[yellow]Pick a catalog row first.[/yellow]"
+            )
+            return
+        existing = self._existing_names()
+        base = f"{name} (copy)"
+        new_name = base
+        n = 2
+        while new_name in existing:
+            new_name = f"{base} {n}"
+            n += 1
+        coll = _find_enzyme_collection(name) or {}
+        entries = _load_enzyme_collections()
+        entries.append({
+            "name": new_name,
+            "enzymes": list(coll.get("enzymes") or []),
+        })
+        if not self._save_or_status(entries):
+            return
+        self._refresh_catalogs_table()
+        self._set_status(
+            f"[green]Duplicated to {new_name!r}.[/green]"
+        )
+
+    @on(Button.Pressed, "#ec-delete")
+    def _delete_btn(self, _) -> None:
+        name = self._catalogs_row_key()
+        if not name or not _find_enzyme_collection(name):
+            self._set_status(
+                "[yellow]Pick a catalog row first.[/yellow]"
+            )
+            return
+        entries = [
+            c for c in _load_enzyme_collections()
+            if c.get("name") != name
+        ]
+        if not self._save_or_status(entries):
+            return
+        if _get_active_enzyme_collection_name() == name:
+            _set_active_enzyme_collection_name(None)
+        self._refresh_catalogs_table()
+        self._refresh_status()
+        self._kick_live_rescan()
+        self._set_status(
+            f"[yellow]Deleted {name!r}.[/yellow]"
+        )
+
+    # ── Editor mode add/remove ────────────────────────────────────────────
+
+    @on(Button.Pressed, "#ec-back")
+    def _back_btn(self, _) -> None:
+        self._leave_editor()
+
+    @on(Button.Pressed, "#ec-add")
+    def _add_btn(self, _) -> None:
+        enz = self._master_row_key()
+        if not enz:
+            self._set_status(
+                "[yellow]Select an enzyme in the master pane "
+                "first.[/yellow]"
+            )
+            return
+        self._add_to_current(enz)
+
+    @on(Button.Pressed, "#ec-remove")
+    def _remove_btn(self, _) -> None:
+        if not self._editor_catalog:
+            self._set_status(
+                "[yellow]Open a catalog first.[/yellow]"
+            )
+            return
+        enz = self._current_row_key()
+        if not enz:
+            self._set_status(
+                "[yellow]Select an enzyme on the right pane "
+                "first.[/yellow]"
+            )
+            return
+        entries = _load_enzyme_collections()
+        for entry in entries:
+            if entry.get("name") != self._editor_catalog:
+                continue
+            entry["enzymes"] = [
+                e for e in (entry.get("enzymes") or [])
+                if e != enz
+            ]
+            break
+        if not self._save_or_status(entries):
+            return
+        self._refresh_master_table()
+        self._refresh_current_table()
+        self._refresh_status()
+        self._kick_live_rescan()
+        self._set_status(
+            f"[yellow]Removed {enz} from "
+            f"{self._editor_catalog!r}.[/yellow]"
+        )
+
+    def _add_to_current(self, enz: str) -> None:
+        """The single code path that pushes an enzyme into the active
+        catalog (Enter / Space / double-click / Add button all route
+        here). After-add UX: focus the search input + clear it so the
+        user can immediately type the next query."""
+        if self._mode != self._MODE_EDITOR or not self._editor_catalog:
+            self._set_status(
+                "[yellow]Open a catalog first (right pane → "
+                "Open).[/yellow]"
+            )
+            return
+        if enz not in _all_enzymes():
+            self._set_status(
+                f"[red]Unknown enzyme {enz!r} — refresh and try "
+                f"again.[/red]"
+            )
+            return
+        entries = _load_enzyme_collections()
+        for entry in entries:
+            if entry.get("name") != self._editor_catalog:
+                continue
+            current = list(entry.get("enzymes") or [])
+            if enz in current:
+                # Idempotent — but still tell the user something
+                # happened, and clear the search bar so the next
+                # type-search-add iteration starts from a clean slate.
+                self._set_status(
+                    f"[dim]{enz} already in "
+                    f"{self._editor_catalog!r}.[/dim]"
+                )
+                self._focus_search(clear=True)
+                return
+            current.append(enz)
+            entry["enzymes"] = sorted(current)
+            break
+        if not self._save_or_status(entries):
+            return
+        self._refresh_master_table()  # dim newly-added row
+        self._refresh_current_table()
+        self._refresh_status()
+        self._kick_live_rescan()
+        self._set_status(
+            f"[green]Added {enz} to "
+            f"{self._editor_catalog!r}.[/green]"
+        )
+        # The user wants the search bar focused + cleared so they can
+        # type the NEXT enzyme name without reaching for the mouse.
+        self._focus_search(clear=True)
+
+    # ── Add new enzyme (extend master) ────────────────────────────────────
+
+    @on(Button.Pressed, "#ec-add-master")
+    def _add_master_btn(self, _) -> None:
+        def _on_added(payload: "dict | None") -> None:
+            if not payload:
+                return
+            self._refresh_master_table()
+            self._set_status(
+                f"[green]Added {payload.get('name')} to master "
+                f"catalog.[/green]"
+            )
+            # Bring focus back so the search-add cycle resumes.
+            self._focus_search(clear=False)
+        self.app.push_screen(AddCustomEnzymeModal(), _on_added)
+
+    # ── Live restriction-overlay rescan ───────────────────────────────────
+
+    def _kick_live_rescan(self) -> None:
+        """Re-dispatch the restriction scan on the underlying canvas so
+        the overlay reflects the new active catalog immediately. Best-
+        effort — silently no-ops if no record is loaded."""
+        try:
+            app = self.app
+            cur = getattr(app, "_current_record", None)
+            if cur is None:
+                return
+            try:
+                pm = app.query_one("#plasmid-map", PlasmidMap)
+                pm._restr_feats = []
+                pm.refresh()
+            except NoMatches:
+                pass
+            app._dispatch_restr_scan(str(cur.seq))  # type: ignore[attr-defined]
+        except (AttributeError, NoMatches):
+            pass
+
+    # ── Enzyme Settings tab handlers ──────────────────────────────────────
+    # Each handler routes through the existing `action_toggle_*`
+    # methods so the rescan + persist + notify wiring stays in one
+    # place. The "differs" guard makes the initial Changed event
+    # (fired during compose when `value=...` matches the current
+    # state) a no-op — without it, every modal mount would emit a
+    # spurious "Restriction enzymes shown" toast.
+
+    @on(Checkbox.Changed, "#ec-set-show-restr")
+    def _on_settings_show_restr(self, event: Checkbox.Changed) -> None:
+        app = self.app
+        current = bool(getattr(app, "_show_restr", True))
+        if bool(event.value) != current:
+            try:
+                app.action_toggle_restr()  # type: ignore[attr-defined]
+            except (AttributeError, NoMatches):
+                pass
+
+    @on(Checkbox.Changed, "#ec-set-unique")
+    def _on_settings_unique(self, event: Checkbox.Changed) -> None:
+        app = self.app
+        current = bool(getattr(app, "_restr_unique_only", True))
+        if bool(event.value) != current:
+            try:
+                app.action_toggle_restr_unique()  # type: ignore[attr-defined]
+            except (AttributeError, NoMatches):
+                pass
+
+    @on(RadioSet.Changed, "#ec-set-min-len")
+    def _on_settings_min_len(self, event: RadioSet.Changed) -> None:
+        app = self.app
+        pressed_id = getattr(event.pressed, "id", "") or ""
+        current = int(getattr(app, "_restr_min_len", 6))
+        try:
+            if pressed_id == "ec-set-min-4" and current != 4:
+                app.action_toggle_restr_min4()  # type: ignore[attr-defined]
+            elif pressed_id == "ec-set-min-6" and current != 6:
+                app.action_toggle_restr_min6()  # type: ignore[attr-defined]
+        except (AttributeError, NoMatches):
+            pass
+
+    @on(Checkbox.Changed, "#ec-set-connectors")
+    def _on_settings_connectors(self, event: Checkbox.Changed) -> None:
+        app = self.app
+        # `_show_connectors` lives on the seq-panel + plasmid-map,
+        # not on the app — fetch it defensively so the differs guard
+        # falls back to the persisted setting if the panel isn't
+        # mounted (unit tests).
+        try:
+            sp = app.query_one("#seq-panel", SequencePanel)
+            current = bool(getattr(sp, "_show_connectors", True))
+        except NoMatches:
+            current = bool(_get_setting("show_connectors", True))
+        if bool(event.value) != current:
+            try:
+                app.action_toggle_connectors()  # type: ignore[attr-defined]
+            except (AttributeError, NoMatches):
+                pass
+
+    # ── Close ─────────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#ec-close")
+    def _close_btn(self, _) -> None:
+        self._dismiss_once(None)
+
+    def action_close(self) -> None:
+        self._dismiss_once(None)
+
+
+class SettingsModal(ModalScreen):
+    """Consolidate every entry from the Settings dropdown into a
+    single dialog.
+
+    Three groups: **Display** (feature tooltips, click-debug echo),
+    **Workflow** (update check, Constructor grammar filter), and
+    **Primers** (min primer binding integer). A final **Advanced**
+    section holds buttons that launch sub-modals — cloning grammars,
+    entry vectors, enzyme collections, restore from backup.
+
+    Toggles bind directly to `_set_setting` + the live `app._<key>`
+    field so the change is effective immediately without going
+    through the existing `action_toggle_*` methods (the modal lives
+    on the screen stack; calling those actions while we're on top
+    would race the live state).
+
+    `_blocks_undo = True` because every interaction mutates persistent
+    state (settings.json).
+    """
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    SettingsModal { align: center middle; }
+    #set-dlg {
+        width: 80; height: auto; max-height: 92%;
+        background: #1c1c1c; border: solid $primary; padding: 1 2;
+    }
+    #set-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; margin-bottom: 1;
+    }
+    .set-group-label {
+        color: $accent; margin-top: 1; margin-bottom: 0;
+        text-style: bold;
+    }
+    .set-row { height: 3; padding: 0 1; }
+    .set-row Label { width: 36; padding: 1 0 0 0; }
+    .set-row Input { width: 12; }
+    .set-row Button { margin-left: 1; }
+    Checkbox { width: 60; margin-left: 1; }
+    #set-status { min-height: 1; margin-top: 1; }
+    #set-btns { height: 3; margin-top: 1; }
+    #set-btns Button { margin-right: 1; }
+    """
+
+    def compose(self) -> ComposeResult:
+        app = self.app
+        with Vertical(id="set-dlg"):
+            yield Static(" Settings ", id="set-title")
+            yield Static("Display", classes="set-group-label")
+            yield Checkbox(
+                "Show feature hover tooltips",
+                value=bool(getattr(app, "_show_feature_tooltips", False)),
+                id="set-tooltips",
+            )
+            yield Checkbox(
+                "Click debug echo  (Alt+M also toggles)",
+                value=bool(getattr(app, "_click_debug", False)),
+                id="set-click-debug",
+            )
+            yield Static("Workflow", classes="set-group-label")
+            yield Checkbox(
+                "Check for updates on launch",
+                value=bool(getattr(app, "_check_updates", True)),
+                id="set-check-updates",
+            )
+            yield Checkbox(
+                "Filter Constructor parts by grammar",
+                value=bool(getattr(
+                    app, "_constructor_filter_by_grammar", True,
+                )),
+                id="set-constr-filter",
+            )
+            yield Static("Primers", classes="set-group-label")
+            with Horizontal(classes="set-row"):
+                yield Label("Min primer binding (bp):")
+                yield Input(
+                    value=str(getattr(app, "_min_primer_binding", 15)),
+                    id="set-min-primer",
+                    restrict=r"[0-9]*",
+                )
+                yield Button("Apply", id="set-min-primer-apply")
+            yield Static("Advanced", classes="set-group-label")
+            with Horizontal(classes="set-row"):
+                yield Button(
+                    "Cloning grammars…", id="set-grammars",
+                )
+                yield Button(
+                    "Entry Vectors…", id="set-entry-vectors",
+                )
+            with Horizontal(classes="set-row"):
+                yield Button(
+                    "Enzyme collections…", id="set-enzyme-collections",
+                )
+                yield Button(
+                    "Restore from backup…", id="set-restore",
+                )
+            yield Static("", id="set-status", markup=True)
+            with Horizontal(id="set-btns"):
+                yield Button("Close", id="set-close")
+
+    def _set_status(self, markup: str) -> None:
+        try:
+            self.query_one("#set-status", Static).update(markup)
+        except NoMatches:
+            pass
+
+    # ── Toggle handlers ───────────────────────────────────────────────────
+    #
+    # We mirror onto the live app instance + persist via `_set_setting`
+    # directly rather than calling `app.action_toggle_<key>()`. The
+    # action wrappers fire `self.notify(...)` which is fine, but they
+    # also assume "fresh toggle from menu" semantics — calling them
+    # from within the modal would race the live state we just read.
+
+    @on(Checkbox.Changed, "#set-tooltips")
+    def _on_tooltips(self, event: Checkbox.Changed) -> None:
+        app = self.app
+        app._show_feature_tooltips = bool(event.value)  # type: ignore[attr-defined]
+        _set_setting("show_feature_tooltips", bool(event.value))
+        if not event.value:
+            # Wipe any tooltip currently shown.
+            for sel, cls in (("#plasmid-map", PlasmidMap),
+                              ("#seq-panel",   SequencePanel)):
+                try:
+                    app.query_one(sel, cls).tooltip = None
+                except (NoMatches, AttributeError):
+                    pass
+
+    @on(Checkbox.Changed, "#set-click-debug")
+    def _on_click_debug(self, event: Checkbox.Changed) -> None:
+        app = self.app
+        app._click_debug = bool(event.value)  # type: ignore[attr-defined]
+        _set_setting("click_debug", bool(event.value))
+
+    @on(Checkbox.Changed, "#set-check-updates")
+    def _on_check_updates(self, event: Checkbox.Changed) -> None:
+        app = self.app
+        app._check_updates = bool(event.value)  # type: ignore[attr-defined]
+        _set_setting("check_updates", bool(event.value))
+
+    @on(Checkbox.Changed, "#set-constr-filter")
+    def _on_constr_filter(self, event: Checkbox.Changed) -> None:
+        app = self.app
+        app._constructor_filter_by_grammar = bool(event.value)  # type: ignore[attr-defined]
+        _set_setting(
+            "constructor_filter_by_grammar", bool(event.value),
+        )
+
+    # ── Min primer binding ────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#set-min-primer-apply")
+    def _on_min_primer_apply(self, _) -> None:
+        try:
+            inp = self.query_one("#set-min-primer", Input)
+        except NoMatches:
+            return
+        try:
+            val = int((inp.value or "").strip())
+        except ValueError:
+            self._set_status(
+                "[red]Min primer binding must be an integer.[/red]"
+            )
+            return
+        if not (1 <= val <= 60):
+            self._set_status(
+                "[red]Min primer binding must be 1–60 bp.[/red]"
+            )
+            return
+        app = self.app
+        try:
+            app._apply_min_primer_binding(val)  # type: ignore[attr-defined]
+        except Exception:
+            _log.exception("min primer binding apply failed")
+            self._set_status(
+                "[red]Failed to apply — see log.[/red]"
+            )
+            return
+        self._set_status(
+            f"[green]Min primer binding: {val} bp.[/green]"
+        )
+
+    # ── Sub-modal launchers ───────────────────────────────────────────────
+
+    @on(Button.Pressed, "#set-grammars")
+    def _on_grammars(self, _) -> None:
+        self.app.push_screen(GrammarManagerModal())
+
+    @on(Button.Pressed, "#set-entry-vectors")
+    def _on_entry_vectors(self, _) -> None:
+        self.app.push_screen(EntryVectorsModal())
+
+    @on(Button.Pressed, "#set-enzyme-collections")
+    def _on_enzyme_collections(self, _) -> None:
+        self.app.push_screen(EnzymeCollectionsModal())
+
+    @on(Button.Pressed, "#set-restore")
+    def _on_restore(self, _) -> None:
+        self.app.push_screen(RestoreFromBackupModal())
+
+    # ── Close ─────────────────────────────────────────────────────────────
+
+    @on(Button.Pressed, "#set-close")
+    def _close_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class ORFFinderModal(ModalScreen):
     """Find open reading frames in the loaded record.
 
@@ -24406,9 +26134,13 @@ class MenuBar(Widget):
             region = item.region
             if (region.x <= event.screen_x < region.x + region.width and
                     region.y <= event.screen_y < region.y + region.height):
-                # "Features", "Experiments", and "History" are direct-
-                # open screens (no dropdown). Every other menu surfaces
-                # items via DropdownScreen.
+                # "Features", "Experiments", "History", "Settings", and
+                # "Enzymes" are direct-open screens (no dropdown). Every
+                # other menu surfaces items via DropdownScreen. Settings
+                # was promoted to direct-open after its dropdown
+                # collapsed to a single "Settings…" entry; Enzymes was
+                # promoted when its radio toggles moved into the
+                # `EnzymeCollectionsModal` "Enzyme Settings" tab.
                 if name == "Features":
                     self.app.push_screen(FeatureLibraryScreen())
                     break
@@ -24417,6 +26149,12 @@ class MenuBar(Widget):
                     break
                 if name == "History":
                     self.app.action_show_history()  # type: ignore[attr-defined]
+                    break
+                if name == "Settings":
+                    self.app.action_open_settings()  # type: ignore[attr-defined]
+                    break
+                if name == "Enzymes":
+                    self.app.action_open_enzyme_collections()  # type: ignore[attr-defined]
                     break
                 x = region.x
                 y = region.y + 1
@@ -25157,9 +26895,9 @@ def _clone_part_into_entry_vector(
     integration tests in tests/test_smoke.py.
     """
     enzyme = grammar.get("enzyme") if isinstance(grammar, dict) else None
-    if not isinstance(enzyme, str) or enzyme not in _NEB_ENZYMES:
+    if not isinstance(enzyme, str) or enzyme not in _all_enzymes():
         return _clone_part_bail(
-            part, f"grammar enzyme {enzyme!r} not in NEB catalog"
+            part, f"grammar enzyme {enzyme!r} not in enzyme catalog"
         )
     gb_text = (entry_vector.get("gb_text") or "").strip() \
         if isinstance(entry_vector, dict) else ""
@@ -25258,10 +26996,10 @@ def _clone_part_into_entry_vector(
 
 
 def _site_for_enzyme(enzyme: str) -> str:
-    """Look up the recognition site for ``enzyme`` from the NEB
-    catalog. Returns "" for unknown enzymes (callers fall back to the
-    grammar's primary site)."""
-    info = _NEB_ENZYMES.get(enzyme)
+    """Look up the recognition site for ``enzyme`` from the combined
+    catalog (built-in NEB ∪ user-added custom). Returns "" for unknown
+    enzymes (callers fall back to the grammar's primary site)."""
+    info = _all_enzymes().get(enzyme)
     if isinstance(info, tuple) and info:
         return str(info[0]).upper()
     return ""
@@ -26175,7 +27913,7 @@ def _splice_part_into_vector_by_overhang(
     # required overhangs.
     if isinstance(grammar, dict):
         enzyme = grammar.get("enzyme")
-        if isinstance(enzyme, str) and enzyme in _NEB_ENZYMES:
+        if isinstance(enzyme, str) and enzyme in _all_enzymes():
             vec_circular = (
                 (vec_rec.annotations.get("topology", "") or "").lower()
                 != "linear"
@@ -26453,7 +28191,7 @@ def _diagnose_part_cloning(part: dict) -> "str | None":
     if not isinstance(entry_vector, dict) or not entry_vector.get("gb_text"):
         return None   # legitimate stub-fallback case, no error
     enzyme = grammar.get("enzyme") if isinstance(grammar, dict) else None
-    if not isinstance(enzyme, str) or enzyme not in _NEB_ENZYMES:
+    if not isinstance(enzyme, str) or enzyme not in _all_enzymes():
         return f"grammar's enzyme {enzyme!r} is not recognised"
     gb_text = entry_vector.get("gb_text") or ""
     try:
@@ -26787,6 +28525,10 @@ def _save_custom_grammars(entries: list[dict]) -> None:
     # releases, so the cached overhangs from the previous grammar
     # must not survive into the next palette refresh.
     _clear_assembly_fragment_cache()
+    # Same reasoning for entry-vector role detection: changing a
+    # grammar's enzymes invalidates the cached `(gb_text, grammar_id)`
+    # → role results since detection runs against the new enzyme pair.
+    _clear_entry_vector_detect_cache()
 
 
 def _all_grammars() -> dict[str, dict]:
@@ -27721,6 +29463,64 @@ def _resolve_acceptor_role(
     return None
 
 
+# ── _detect_entry_vector_role: LRU cache layer ────────────────────────────
+# Result cache for the dual-enzyme digest. Re-clicking Auto-detect on the
+# same active collection (or re-running auto-bind after a partial folder
+# import) used to repeat 4–30 s of `_excise_fragment_pair` work; now the
+# second pass over unchanged `(gb_text, grammar)` pairs is dict-lookup
+# fast. Mirrors `_ASSEMBLY_FRAGMENT_CACHE`'s pattern.
+#
+# Cache key: `(hash(gb_text), grammar_id)`. We don't key on the full
+# grammar dict (unhashable) — grammar enzyme changes invalidate via
+# `_save_custom_grammars` calling `_clear_entry_vector_detect_cache`,
+# same idiom as `[PIT-16]` (`_blast_clear_cache` from `_save_collections`).
+_ENTRY_VECTOR_DETECT_CACHE: "_OD[tuple[int, str], tuple[str, str] | None]" = _OD()
+_ENTRY_VECTOR_DETECT_CACHE_MAX = 4096
+
+
+def _clear_entry_vector_detect_cache() -> None:
+    """Drop every cached EV-role detection result. Called from
+    `_save_custom_grammars` when grammar enzymes / canonical overhangs
+    may have shifted, and from Master Delete's residual sweep."""
+    _ENTRY_VECTOR_DETECT_CACHE.clear()
+
+
+def _detect_entry_vector_role_cached(
+    gb_text: str, grammar: dict,
+) -> "tuple[str, str] | None":
+    """Memoised wrapper around `_detect_entry_vector_role`.
+
+    Equivalent to ``_detect_entry_vector_role(_gb_text_to_record(gb_text),
+    grammar)`` for valid GenBank input but returns ``None`` on parse
+    failure (matches the modal/bulk-import skip-on-error contract).
+
+    The cache key uses ``hash(gb_text)`` so re-detection on an unchanged
+    library entry is O(1). Cache invalidation is the caller's job via
+    `_clear_entry_vector_detect_cache` — wired into `_save_custom_grammars`
+    so grammar edits force a recompute. Capped at
+    `_ENTRY_VECTOR_DETECT_CACHE_MAX` entries (LRU eviction via
+    ``OrderedDict.move_to_end``)."""
+    grammar_id = grammar.get("id") if isinstance(grammar, dict) else ""
+    if not isinstance(grammar_id, str):
+        grammar_id = ""
+    key = (hash(gb_text), grammar_id)
+    # `in` check distinguishes "absent" from "cached None" (parse-fail
+    # short-circuit) — bare `.get(key)` would re-parse on every miss.
+    if key in _ENTRY_VECTOR_DETECT_CACHE:
+        _ENTRY_VECTOR_DETECT_CACHE.move_to_end(key)
+        return _ENTRY_VECTOR_DETECT_CACHE[key]
+    try:
+        rec = _gb_text_to_record(gb_text)
+    except Exception:
+        result = None
+    else:
+        result = _detect_entry_vector_role(rec, grammar)
+    _ENTRY_VECTOR_DETECT_CACHE[key] = result
+    if len(_ENTRY_VECTOR_DETECT_CACHE) > _ENTRY_VECTOR_DETECT_CACHE_MAX:
+        _ENTRY_VECTOR_DETECT_CACHE.popitem(last=False)
+    return result
+
+
 def _detect_entry_vector_role(
     record,
     grammar: dict,
@@ -27912,23 +29712,18 @@ def _auto_bind_entry_vectors_from_entries(
         return ""
     target_grammars = grammar_ids or list(_all_grammars().keys())
     bound_by_grammar: dict[str, list[str]] = {}
-    # Sweep #11 (2026-05-20): parse each gb_text ONCE up-front
-    # instead of N × M (entries × grammars) times. A 100-entry,
-    # 3-grammar import previously paid 300 BioPython parses on the
-    # UI thread; now it pays 100. Parse failures are silently
-    # skipped (same behaviour as pre-fix per-grammar loop).
-    parsed_records: list[tuple[dict, object]] = []
+    # Sweep #11 (2026-05-20): parse each gb_text ONCE up-front. The
+    # cached wrapper (`_detect_entry_vector_role_cached`) now provides
+    # this guarantee implicitly — `_gb_text_to_record` is LRU-cached,
+    # and the dual-enzyme digest is cached by `(hash(gb_text),
+    # grammar_id)`. Re-imports of a partially-detected folder skip both.
+    valid_entries: list[dict] = []
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        gb_text = entry.get("gb_text") or ""
-        if not gb_text:
+        if not (entry.get("gb_text") or ""):
             continue
-        try:
-            rec = _gb_text_to_record(gb_text)
-        except Exception:
-            continue
-        parsed_records.append((entry, rec))
+        valid_entries.append(entry)
     # Accumulate every binding into one batch and apply with ONE
     # _save_entry_vectors call at the end. Pre-fix: N × _set_entry_vector
     # → N × _safe_save_json + .bak + fsync round-trips. Now: ONE round-trip.
@@ -27938,8 +29733,10 @@ def _auto_bind_entry_vectors_from_entries(
         if not isinstance(grammar, dict):
             continue
         proposals: dict[str, tuple[dict, str]] = {}
-        for entry, rec in parsed_records:
-            result = _detect_entry_vector_role(rec, grammar)
+        for entry in valid_entries:
+            result = _detect_entry_vector_role_cached(
+                entry["gb_text"], grammar,
+            )
             if not result:
                 continue
             role, conf = result
@@ -28159,6 +29956,7 @@ _SETTINGS_SCHEMA: "dict[str, tuple[tuple, object]]" = {
     "linear_layout":           ((bool,),               False),
     "active_collection":       ((str,),                ""),
     "active_primer_collection": ((str,),               ""),
+    "active_enzyme_collection": ((str,),               ""),
     "active_grammar":          ((str,),                ""),
     "constructor_filter_by_grammar": ((bool,),         True),
     "last_seen_version":       ((str,),                ""),
@@ -30911,14 +32709,16 @@ def _design_cloning_primers(
     target_tm: float = 60.0,
     padding: str = "GCGC",
 ) -> dict:
-    """Design cloning primers using NEB enzyme names. Delegates to
+    """Design cloning primers using enzyme names from the combined
+    catalog (built-in NEB ∪ user-added custom). Delegates to
     _design_cloning_primers_raw after looking up recognition sites."""
-    if re_5prime not in _NEB_ENZYMES:
+    catalog = _all_enzymes()
+    if re_5prime not in catalog:
         return {"error": f"Unknown enzyme: {re_5prime}"}
-    if re_3prime not in _NEB_ENZYMES:
+    if re_3prime not in catalog:
         return {"error": f"Unknown enzyme: {re_3prime}"}
-    site_5, _, _ = _NEB_ENZYMES[re_5prime]
-    site_3, _, _ = _NEB_ENZYMES[re_3prime]
+    site_5, _, _ = catalog[re_5prime]
+    site_3, _, _ = catalog[re_3prime]
     return _design_cloning_primers_raw(
         template_seq, start, end, site_5, site_3,
         name_5=re_5prime, name_3=re_3prime,
@@ -37750,6 +39550,11 @@ class EntryVectorsModal(ModalScreen):
     """
 
     _blocks_undo: bool = True
+    # Re-entrancy / double-click guard for the off-thread auto-detect
+    # worker. Set True when `_auto_btn` dispatches, cleared in the
+    # worker's `finally` (mirrors `[INV-41]`'s `_settings_flush_running`
+    # pattern so an exception can't permanently wedge the button).
+    _auto_running: bool = False
 
     BINDINGS = [
         Binding("escape", "close",         "Close"),
@@ -37984,6 +39789,8 @@ class EntryVectorsModal(ModalScreen):
             status = self.query_one("#ev-status", Static)
         except NoMatches:
             return
+        if self._auto_running:
+            return
         active = _get_active_collection_name()
         if not active:
             status.update(
@@ -37995,9 +39802,6 @@ class EntryVectorsModal(ModalScreen):
         if not isinstance(grammar, dict):
             status.update("[red]Grammar not found.[/red]")
             return
-        # Pull every plasmid out of the active collection, detect
-        # roles. Collisions (two plasmids both detected as Alpha1):
-        # prefer the first STRICT hit; "weak" loses to "strict".
         coll = _find_collection(active) or {}
         coll_entries = [
             e for e in (coll.get("plasmids") or [])
@@ -38008,57 +39812,185 @@ class EntryVectorsModal(ModalScreen):
                 "[yellow]Active collection is empty.[/yellow]"
             )
             return
-        proposals: dict[str, tuple[dict, str]] = {}
-        for entry in coll_entries:
-            gb_text = entry.get("gb_text") or ""
-            if not gb_text:
-                continue
+        # Heavy work — parse N gb_texts + N×enzyme digests + 1 batched
+        # save — moves to a worker so the terminal doesn't freeze.
+        # `_record_load_counter` doesn't apply here (modal isn't tied
+        # to a canvas record); staleness guards instead check the
+        # captured grammar_id against the current one before applying,
+        # and `is_mounted` before touching widgets.
+        self._auto_running = True
+        try:
+            btn = self.query_one("#btn-ev-auto", Button)
+            btn.disabled = True
+        except NoMatches:
+            pass
+        status.update(
+            f"[dim]Auto-detecting across {len(coll_entries)} "
+            f"plasmid(s)…[/dim]"
+        )
+        self._auto_detect_worker(
+            list(coll_entries), self._grammar_id, dict(grammar),
+        )
+
+    @work(thread=True, exclusive=True, group="ev-auto-detect")
+    def _auto_detect_worker(
+        self,
+        coll_entries: "list[dict]",
+        grammar_id: str,
+        grammar: dict,
+    ) -> None:
+        """Off-thread entry-vector detection across an active collection.
+
+        Three reasons this moved off the UI thread (see [PIT-28] +
+        [CONV] worker pattern):
+          1. `_gb_text_to_record` runs BioPython GenBank parse per
+             entry (~5–50 ms each, LRU-cached). Cold first click on
+             a 200–500 plasmid collection was 4–30 s of frozen UI.
+          2. `_detect_entry_vector_role` runs two `_excise_fragment_pair`
+             passes per plasmid (full restriction scan + feature split
+             + backbone-marker scan). Same pitfall #28 cost model as
+             pairwise alignment / restriction scan.
+          3. The N×`_set_entry_vector` save loop pre-fix did N
+             `_safe_save_json` round-trips (`.bak` + fsync each).
+             Now collapsed to ONE `_set_entry_vectors_batch` call.
+
+        Staleness: captures `grammar_id` at entry. On completion checks
+        `self._grammar_id` against capture before applying — if the
+        user changed the grammar dropdown mid-flight, the worker still
+        binds to the grammar the user actually requested when they
+        clicked the button. UI updates check `self.is_mounted` so a
+        worker that finishes after the modal closes is a no-op.
+        """
+        try:
+            proposals: dict[str, tuple[dict, str]] = {}
+            n_total = len(coll_entries)
+            progress_step = max(1, n_total // 20)  # ~20 updates max
+            for idx, entry in enumerate(coll_entries):
+                gb_text = entry.get("gb_text") or ""
+                if not gb_text:
+                    continue
+                # Cached wrapper — re-clicks Auto-detect or re-opens
+                # the modal on the same collection skip the expensive
+                # dual-enzyme digest. Cache invalidated by
+                # `_save_custom_grammars` when enzymes shift.
+                result = _detect_entry_vector_role_cached(gb_text, grammar)
+                if result:
+                    role, conf = result
+                    existing = proposals.get(role)
+                    if existing is None or (
+                        existing[1] == "weak" and conf == "strict"
+                    ):
+                        proposals[role] = (entry, conf)
+                if (idx + 1) % progress_step == 0:
+                    self.app.call_from_thread(
+                        self._update_auto_progress,
+                        idx + 1, n_total,
+                    )
+            # Build update list now so `_set_entry_vectors_batch` is
+            # ONE save instead of N. Existing bindings survive —
+            # user-set bindings take precedence.
+            applied: list[tuple[str, str, str]] = []  # (role_key, label, conf)
+            skipped: list[str] = []
+            updates: "list[tuple[str, str, dict | None]]" = []
+            for role_key, (entry, conf) in proposals.items():
+                if _get_entry_vector(grammar_id, role_key) is not None:
+                    skipped.append(role_key or "UPD")
+                    continue
+                payload = {
+                    "name":    entry.get("name") or entry.get("id", "?"),
+                    "size":    entry.get("size") or 0,
+                    "source":  "auto-detect",
+                    "id":      entry.get("id", ""),
+                    "gb_text": entry.get("gb_text") or "",
+                }
+                updates.append((grammar_id, role_key, payload))
+                applied.append(
+                    (role_key, role_key or "UPD", conf),
+                )
+            if updates:
+                _set_entry_vectors_batch(updates)
+                for role_key, _label, conf in applied:
+                    _log_event(
+                        "entry_vector.auto_bound",
+                        grammar=grammar_id, role=role_key,
+                        confidence=conf,
+                    )
+        except Exception as exc:
+            _log.exception("EV auto-detect worker failed")
+            self.app.call_from_thread(
+                self._finish_auto_detect,
+                grammar_id, [], [], str(exc),
+            )
+            return
+        finally:
+            # Clear the in-flight flag even on exception so a future
+            # click isn't permanently blocked ([INV-41] try/finally).
+            self._auto_running = False
+        applied_labels = [label for _r, label, _c in applied]
+        self.app.call_from_thread(
+            self._finish_auto_detect,
+            grammar_id, applied_labels, skipped, "",
+        )
+
+    def _update_auto_progress(self, done: int, total: int) -> None:
+        """UI-thread callback for periodic progress."""
+        if not self.is_mounted:
+            return
+        try:
+            status = self.query_one("#ev-status", Static)
+        except NoMatches:
+            return
+        status.update(
+            f"[dim]Auto-detecting ({done}/{total})…[/dim]"
+        )
+
+    def _finish_auto_detect(
+        self,
+        scanned_grammar_id: str,
+        applied: "list[str]",
+        skipped: "list[str]",
+        error: str,
+    ) -> None:
+        """UI-thread completion callback. No-op if the modal has
+        unmounted between dispatch and finish."""
+        # Re-enable the button regardless of mount state — but the
+        # widget query can fail if the modal closed.
+        if self.is_mounted:
             try:
-                rec = _gb_text_to_record(gb_text)
-            except Exception:
-                continue
-            result = _detect_entry_vector_role(rec, grammar)
-            if not result:
-                continue
-            role, conf = result
-            existing = proposals.get(role)
-            if existing is None or (
-                existing[1] == "weak" and conf == "strict"
-            ):
-                proposals[role] = (entry, conf)
-        if not proposals:
+                self.query_one("#btn-ev-auto", Button).disabled = False
+            except NoMatches:
+                pass
+        if not self.is_mounted:
+            return
+        try:
+            status = self.query_one("#ev-status", Static)
+        except NoMatches:
+            return
+        if error:
+            status.update(
+                f"[red]Auto-detect failed: {error}[/red]"
+            )
+            return
+        if not applied and not skipped:
             status.update(
                 "[yellow]No acceptors detected in active "
                 "collection.[/yellow]"
             )
             return
-        # Apply each proposal that doesn't already have a binding.
-        # Existing bindings survive — user-set bindings take precedence
-        # over auto-detection so a manual pick doesn't get clobbered.
-        applied: list[str] = []
-        skipped: list[str] = []
-        for role_key, (entry, conf) in proposals.items():
-            if _get_entry_vector(self._grammar_id, role_key) is not None:
-                skipped.append(role_key or "UPD")
-                continue
-            payload = {
-                "name":    entry.get("name") or entry.get("id", "?"),
-                "size":    entry.get("size") or 0,
-                "source":  "auto-detect",
-                "id":      entry.get("id", ""),
-                "gb_text": entry.get("gb_text") or "",
-            }
-            _set_entry_vector(self._grammar_id, payload, role_key)
-            applied.append(role_key or "UPD")
-            _log_event(
-                "entry_vector.auto_bound",
-                grammar=self._grammar_id, role=role_key,
-                confidence=conf,
-                entry_id=entry.get("id", ""),
+        # If the user switched grammars mid-flight, tell them the
+        # bindings landed on the grammar they originally clicked from.
+        grammar_note = ""
+        if scanned_grammar_id != self._grammar_id:
+            scanned_name = _all_grammars().get(
+                scanned_grammar_id, {},
+            ).get("name", scanned_grammar_id)
+            grammar_note = (
+                f"  [dim](bound to {scanned_name})[/dim]"
             )
         msg = (
             f"[green]Auto-detected {len(applied)} role(s):[/green] "
             f"{', '.join(applied) if applied else '(none new)'}"
+            f"{grammar_note}"
         )
         if skipped:
             msg += (
@@ -46304,7 +48236,7 @@ class ExperimentsScreen(Screen):
             try:
                 ta = self.query_one("#exp-body", TextArea)
                 ta.load_text(normalised_body)
-            except (NoMatches, Exception):
+            except NoMatches:
                 pass
         self._mark_dirty(False)
         self._refresh_entries_table()
@@ -47146,7 +49078,7 @@ class ExperimentsScreen(Screen):
             cur_row_before = (
                 t.cursor_row if t.cursor_row is not None else -1
             )
-        except (NoMatches, Exception):
+        except NoMatches:
             pass
 
         def _on_confirmed(yes) -> None:
@@ -47178,7 +49110,7 @@ class ExperimentsScreen(Screen):
                         cur_row_before, t.row_count - 1,
                     ))
                     t.move_cursor(row=new_row)
-            except (NoMatches, Exception):
+            except NoMatches:
                 pass
             self.app.notify(f"Deleted: {title}", timeout=4)
         self.app.push_screen(
@@ -64815,6 +66747,9 @@ class RestoreFromBackupModal(ModalScreen):
         ("Gels",                 "_GELS_FILE"),
         # Sweep #15 (2026-05-20): user-edited protein motifs.
         ("Protein motifs",       "_PROTEIN_MOTIFS_FILE"),
+        # Enzyme catalog extensions (2026-05-22).
+        ("Custom enzymes",       "_CUSTOM_ENZYMES_FILE"),
+        ("Enzyme collections",   "_ENZYME_COLLECTIONS_FILE"),
     ]
 
     def __init__(self, initial_target: str = "_LIBRARY_FILE") -> None:
@@ -68900,10 +70835,20 @@ def _h_delete_from_library(app, payload):
 @_agent_endpoint("list-restriction-sites")
 def _h_list_restriction_sites(app, payload):
     """Scan the loaded record for restriction sites. Body:
-    ``{enzymes?: [str, ...], min_length?: int, unique_only?: bool}``.
-    Default scans the full NEB curated catalog with `min_length=4`
-    and `unique_only=False`. Returns each hit as
-    ``{enzyme, start, end, strand, cut_bp}``."""
+    ``{enzymes?: [str, ...], min_length?: int, unique_only?: bool,
+       respect_active_collection?: bool = true}``.
+
+    Default scans the combined catalog (built-in NEB ∪ user-added
+    custom enzymes) with `min_length=4` and `unique_only=False`.
+
+    When ``enzymes`` is omitted AND ``respect_active_collection`` is
+    true (the default), the agent endpoint mirrors the UI overlay: if
+    the user has set an active enzyme collection, only those enzymes
+    surface in the result. Pass ``respect_active_collection=false`` to
+    force a full-catalog scan regardless. Explicit ``enzymes`` always
+    wins.
+
+    Returns each hit as ``{enzyme, start, end, strand, cut_bp}``."""
     rec = getattr(app, "_current_record", None)
     if rec is None:
         return ({"error": "no plasmid loaded"}, 422)
@@ -68922,13 +70867,23 @@ def _h_list_restriction_sites(app, payload):
     if isinstance(min_len, str):
         return ({"error": min_len}, 400)
     unique = bool(payload.get("unique_only", False))
+    respect_active = bool(payload.get("respect_active_collection", True))
     seq = str(rec.seq)
     is_circular = rec.annotations.get("topology") == "circular"
     sites = _scan_restriction_sites(
         seq, min_recognition_len=min_len,
         unique_only=unique, circular=is_circular,
     )
-    enzyme_filter = (set(enzymes) if enzymes else None)
+    # Build the filter set. Explicit `enzymes` overrides everything;
+    # otherwise fall back to the user's active enzyme collection (if
+    # any) so the agent mirrors UI overlay semantics.
+    if enzymes:
+        enzyme_filter: "set[str] | None" = set(enzymes)
+    elif respect_active:
+        active = _active_enzyme_allowed_set()
+        enzyme_filter = set(active) if active is not None else None
+    else:
+        enzyme_filter = None
     out = []
     for s in sites:
         if s.get("type") != "resite":
@@ -70537,8 +72492,9 @@ def _settings_validator_min_len_4_or_6(value):
 
 
 def _settings_validator_custom_enzymes_csv(value):
-    """Comma-separated list of enzyme names, each in `_NEB_ENZYMES`.
-    Whitespace tolerated; duplicates silently collapsed.
+    """Comma-separated list of enzyme names, each in the combined
+    catalog (built-in NEB ∪ user-added custom enzymes). Whitespace
+    tolerated; duplicates silently collapsed.
 
     Defensive parse — we'd rather drop an unknown name than reject the
     whole list, so a typo or a HF-variant rename doesn't strand the
@@ -70552,9 +72508,10 @@ def _settings_validator_custom_enzymes_csv(value):
         s.strip() for s in value.replace(";", ",").split(",")
         if s and s.strip()
     ]
+    catalog = _all_enzymes()
     valid: list[str] = []
     for nm in raw_names:
-        if nm in _NEB_ENZYMES and nm not in valid:
+        if nm in catalog and nm not in valid:
             valid.append(nm)
     return ",".join(sorted(valid)), None
 
@@ -70596,6 +72553,7 @@ _AGENT_SETTINGS_ALLOWLIST: "dict[str, tuple]" = {
     "restr_use_custom_list": (_settings_validator_bool,                  False),
     "min_primer_binding":    (_settings_validator_int_range(1, 60),      15),
     "active_collection":     (_settings_validator_collection_name,       ""),
+    "active_enzyme_collection": (_settings_validator_collection_name,     ""),
     "active_grammar":        (_settings_validator_grammar_id,            "gb_l0"),
     "constructor_filter_by_grammar": (_settings_validator_bool,           True),
 }
@@ -71428,6 +73386,10 @@ _AGENT_BACKUP_LABELS: dict = {
     "experiment_projects":     "_EXPERIMENT_PROJECTS_FILE",
     "gels":                    "_GELS_FILE",
     "protein_motifs":          "_PROTEIN_MOTIFS_FILE",
+    # Enzyme catalog extensions (2026-05-22). Parity with
+    # `RestoreFromBackupModal._TARGETS` and `_USER_DATA_FILE_ATTRS`.
+    "custom_enzymes":          "_CUSTOM_ENZYMES_FILE",
+    "enzyme_collections":      "_ENZYME_COLLECTIONS_FILE",
 }
 
 
@@ -71530,6 +73492,8 @@ def _h_restore_backup(app, payload):
         "experiment_projects":   "_experiment_projects_cache",
         "gels":                  "_gels_cache",
         "protein_motifs":        "_protein_motifs_cache",
+        "custom_enzymes":        "_custom_enzymes_cache",
+        "enzyme_collections":    "_enzyme_collections_cache",
     }.get(msg)
     if cache_attr is not None:
         globals()[cache_attr] = None
@@ -71617,6 +73581,8 @@ def _h_restore_pre_update_snapshot(app, payload):
             "_gels_cache",
             # Sweep #15 (2026-05-20): protein-motif user overrides.
             "_protein_motifs_cache",
+            # Enzyme catalog extensions (2026-05-22).
+            "_custom_enzymes_cache", "_enzyme_collections_cache",
     ):
         globals()[cache_attr] = None
     return {"ok": True, "report": report}
@@ -72791,6 +74757,293 @@ def _h_delete_protein_motif(app, payload):
         "synthesis.protein.motif_edit",
         name=name, action="delete", via="agent",
     )
+    return {"ok": True, "name": name}
+
+
+# ── Custom enzymes + enzyme collections (sweep #24 CRUD parity) ─────────────
+
+
+_ENZYME_IUPAC_ALPHABET = frozenset("ACGTRYSWKMBDHVN")
+
+
+def _agent_validate_custom_enzyme_payload(payload: dict) -> "dict | str":
+    """Validate + canonicalise an agent-supplied custom-enzyme dict.
+    Returns the persistable dict on success or an error string on
+    failure — mirrors `AddCustomEnzymeModal._validate` so the agent
+    surface accepts the same shape the UI does."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return "missing or non-string 'name'"
+    name = name.strip()
+    if not (1 <= len(name) <= 64):
+        return "'name' must be 1-64 characters"
+    site = payload.get("site")
+    if not isinstance(site, str) or not site.strip():
+        return "missing or non-string 'site'"
+    site = site.strip().upper()
+    if not (4 <= len(site) <= 30):
+        return "'site' must be 4-30 characters"
+    bad = set(site) - _ENZYME_IUPAC_ALPHABET
+    if bad:
+        return f"'site' has non-IUPAC characters: {''.join(sorted(bad))!r}"
+    fwd_raw = payload.get("fwd_cut")
+    rev_raw = payload.get("rev_cut")
+    if fwd_raw is None or rev_raw is None:
+        return "missing 'fwd_cut' or 'rev_cut'"
+    try:
+        fwd_cut = int(fwd_raw)
+        rev_cut = int(rev_raw)
+    except (TypeError, ValueError):
+        return "'fwd_cut' and 'rev_cut' must be integers"
+    lo, hi = -30, len(site) + 30
+    if not (lo <= fwd_cut <= hi) or not (lo <= rev_cut <= hi):
+        return f"cut positions must be in {lo}..{hi}"
+    ftype = payload.get("type") or "other"
+    if not isinstance(ftype, str):
+        ftype = "other"
+    supplier = payload.get("supplier") or ""
+    if not isinstance(supplier, str):
+        supplier = ""
+    return {
+        "name":     name,
+        "site":     site,
+        "fwd_cut":  fwd_cut,
+        "rev_cut":  rev_cut,
+        "type":     ftype,
+        "supplier": supplier.strip(),
+    }
+
+
+@_agent_endpoint("list-custom-enzymes")
+def _h_list_custom_enzymes(app, payload):
+    """List every user-added custom enzyme. Built-in NEB enzymes are
+    NOT included — fetch the combined view via list-restriction-sites
+    or `_all_enzymes()` introspection. Each item carries name, site,
+    fwd_cut, rev_cut, type, supplier."""
+    return {"ok": True, "enzymes": _load_custom_enzymes()}
+
+
+@_agent_endpoint("get-custom-enzyme")
+def _h_get_custom_enzyme(app, payload):
+    """Return a single custom enzyme by `name`. Body: ``{name}``."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing or non-string 'name'"}, 400)
+    name = name.strip()
+    meta = _custom_enzyme_meta(name)
+    if meta is None:
+        return ({"error": f"unknown custom enzyme {name!r}"}, 404)
+    return {"ok": True, "enzyme": meta}
+
+
+@_agent_endpoint("create-custom-enzyme", write=True)
+def _h_create_custom_enzyme(app, payload):
+    """Add a new custom enzyme. Body:
+    ``{name, site, fwd_cut, rev_cut, type?, supplier?}``. Returns 409
+    if `name` collides with an existing built-in or custom enzyme.
+    Mirrors `AddCustomEnzymeModal` validation rules."""
+    payload_or_err = _agent_validate_custom_enzyme_payload(payload)
+    if isinstance(payload_or_err, str):
+        return ({"error": payload_or_err}, 400)
+    if payload_or_err["name"] in _all_enzymes():
+        return ({"error":
+                  f"enzyme {payload_or_err['name']!r} already exists; "
+                  "use update-custom-enzyme to modify"}, 409)
+    entries = _load_custom_enzymes()
+    entries.append(payload_or_err)
+    if (err := _agent_save_or_500(
+            lambda: _save_custom_enzymes(entries),
+            "Custom enzymes")) is not None:
+        return err
+    _log_event("custom_enzyme.added",
+                name=payload_or_err["name"], via="agent")
+    return {"ok": True, "name": payload_or_err["name"]}
+
+
+@_agent_endpoint("update-custom-enzyme", write=True)
+def _h_update_custom_enzyme(app, payload):
+    """Replace an existing custom enzyme by `name`. Built-in NEB
+    enzymes are not editable via this endpoint (refuse with 400) —
+    add a custom enzyme with the same name to override."""
+    payload_or_err = _agent_validate_custom_enzyme_payload(payload)
+    if isinstance(payload_or_err, str):
+        return ({"error": payload_or_err}, 400)
+    name = payload_or_err["name"]
+    entries = _load_custom_enzymes()
+    for i, e in enumerate(entries):
+        if e.get("name") == name:
+            entries[i] = payload_or_err
+            if (err := _agent_save_or_500(
+                    lambda: _save_custom_enzymes(entries),
+                    "Custom enzymes")) is not None:
+                return err
+            return {"ok": True, "name": name}
+    return ({"error": f"unknown custom enzyme {name!r}"}, 404)
+
+
+@_agent_endpoint("delete-custom-enzyme", write=True)
+def _h_delete_custom_enzyme(app, payload):
+    """Delete a custom enzyme by `name`. Built-in NEB enzymes are
+    refused. Any enzyme collection that referenced the deleted name
+    keeps the stale row — `_active_enzyme_allowed_set` filters
+    against `_all_enzymes()` so the stale name is dropped at
+    scan time without separate housekeeping."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing or non-string 'name'"}, 400)
+    name = name.strip()
+    entries = _load_custom_enzymes()
+    new_entries = [e for e in entries if e.get("name") != name]
+    if len(new_entries) == len(entries):
+        return ({"error": f"unknown custom enzyme {name!r}"}, 404)
+    if (err := _agent_save_or_500(
+            lambda: _save_custom_enzymes(new_entries),
+            "Custom enzymes")) is not None:
+        return err
+    _log_event("custom_enzyme.deleted", name=name, via="agent")
+    return {"ok": True, "name": name}
+
+
+@_agent_endpoint("list-enzyme-collections")
+def _h_list_enzyme_collections(app, payload):
+    """List every enzyme collection (named subset of the master
+    catalog). Each item carries ``{name, enzymes: [str, ...]}``."""
+    return {"ok": True, "collections": _load_enzyme_collections()}
+
+
+@_agent_endpoint("get-enzyme-collection")
+def _h_get_enzyme_collection(app, payload):
+    """Return one enzyme collection by `name`. Body: ``{name}``."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing or non-string 'name'"}, 400)
+    name = name.strip()
+    coll = _find_enzyme_collection(name)
+    if coll is None:
+        return ({"error": f"unknown enzyme collection {name!r}"}, 404)
+    return {"ok": True, "collection": coll}
+
+
+@_agent_endpoint("create-enzyme-collection", write=True)
+def _h_create_enzyme_collection(app, payload):
+    """Create a new enzyme collection. Body:
+    ``{name, enzymes?: [str, ...] = []}``. Returns 409 if a collection
+    with the same name already exists. Unknown enzyme names are
+    accepted at create time (they're filtered at scan time by
+    `_active_enzyme_allowed_set` so the user can add custom enzymes
+    later and have them participate retroactively)."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing or non-string 'name'"}, 400)
+    name = name.strip()
+    enzymes = payload.get("enzymes") or []
+    if not isinstance(enzymes, list) or not all(
+            isinstance(e, str) for e in enzymes):
+        return ({"error": "'enzymes' must be a list of strings"}, 400)
+    entries = _load_enzyme_collections()
+    if any(e.get("name") == name for e in entries):
+        return ({"error":
+                  f"enzyme collection {name!r} already exists; "
+                  "use update-enzyme-collection to modify"}, 409)
+    entries.append({"name": name, "enzymes": sorted(set(enzymes))})
+    if (err := _agent_save_or_500(
+            lambda: _save_enzyme_collections(entries),
+            "Enzyme collections")) is not None:
+        return err
+    return {"ok": True, "name": name}
+
+
+@_agent_endpoint("update-enzyme-collection", write=True)
+def _h_update_enzyme_collection(app, payload):
+    """Replace an existing enzyme collection by `name`. Body:
+    ``{name, enzymes?: [str, ...], new_name?: str}``. ``new_name``
+    renames the collection (and updates the active pointer if it
+    matched). Omitting ``enzymes`` keeps the existing list."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing or non-string 'name'"}, 400)
+    name = name.strip()
+    new_name = payload.get("new_name")
+    if new_name is not None:
+        if not isinstance(new_name, str) or not new_name.strip():
+            return ({"error": "'new_name' must be a non-empty string"}, 400)
+        new_name = new_name.strip()
+    enzymes_arg = payload.get("enzymes")
+    if enzymes_arg is not None:
+        if not isinstance(enzymes_arg, list) or not all(
+                isinstance(e, str) for e in enzymes_arg):
+            return ({"error":
+                      "'enzymes' must be a list of strings"}, 400)
+    entries = _load_enzyme_collections()
+    for i, e in enumerate(entries):
+        if e.get("name") == name:
+            updated = dict(e)
+            if new_name is not None:
+                # Reject rename onto an already-taken name.
+                if new_name != name and any(
+                        x.get("name") == new_name for x in entries):
+                    return ({"error":
+                              f"name {new_name!r} already exists"}, 409)
+                updated["name"] = new_name
+            if enzymes_arg is not None:
+                updated["enzymes"] = sorted(set(enzymes_arg))
+            entries[i] = updated
+            if (err := _agent_save_or_500(
+                    lambda: _save_enzyme_collections(entries),
+                    "Enzyme collections")) is not None:
+                return err
+            # Update active pointer on rename.
+            if new_name is not None and new_name != name and \
+                    _get_active_enzyme_collection_name() == name:
+                _set_active_enzyme_collection_name(new_name)
+            return {"ok": True, "name": updated["name"]}
+    return ({"error": f"unknown enzyme collection {name!r}"}, 404)
+
+
+@_agent_endpoint("delete-enzyme-collection", write=True)
+def _h_delete_enzyme_collection(app, payload):
+    """Delete an enzyme collection by `name`. If the deleted
+    collection was the active one, clears the active pointer."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing or non-string 'name'"}, 400)
+    name = name.strip()
+    entries = _load_enzyme_collections()
+    new_entries = [e for e in entries if e.get("name") != name]
+    if len(new_entries) == len(entries):
+        return ({"error": f"unknown enzyme collection {name!r}"}, 404)
+    if (err := _agent_save_or_500(
+            lambda: _save_enzyme_collections(new_entries),
+            "Enzyme collections")) is not None:
+        return err
+    if _get_active_enzyme_collection_name() == name:
+        _set_active_enzyme_collection_name(None)
+    return {"ok": True, "name": name}
+
+
+@_agent_endpoint("get-active-enzyme-collection")
+def _h_get_active_enzyme_collection(app, payload):
+    """Return the currently active enzyme collection name (or
+    ``None`` if no collection is active — the scanner then uses the
+    full catalog)."""
+    return {"ok": True, "name": _get_active_enzyme_collection_name()}
+
+
+@_agent_endpoint("set-active-enzyme-collection", write=True)
+def _h_set_active_enzyme_collection(app, payload):
+    """Set or clear the active enzyme collection pointer. Body:
+    ``{name: str | null}`` — ``null`` clears the pointer. Refuses
+    names that don't resolve to an existing collection."""
+    name = payload.get("name")
+    if name is not None and (not isinstance(name, str) or not name.strip()):
+        return ({"error":
+                  "'name' must be a non-empty string or null"}, 400)
+    if isinstance(name, str):
+        name = name.strip()
+        if _find_enzyme_collection(name) is None:
+            return ({"error":
+                      f"unknown enzyme collection {name!r}"}, 404)
+    _set_active_enzyme_collection_name(name)
     return {"ok": True, "name": name}
 
 
@@ -75490,6 +77743,13 @@ SpeciesPickerModal { align: center middle; }
         # are auto-restored from .bak if possible; the user is notified
         # either way so they know the state of their data.
         self._check_data_files()
+        # One-shot migrations driven by the launch flow. Idempotent
+        # (no-op when the legacy CSV is absent or the legacy collection
+        # already exists), so subsequent launches skip cleanly.
+        try:
+            _migrate_legacy_custom_enzyme_csv()
+        except Exception:
+            _log.exception("legacy custom-enzyme CSV migration failed")
         self._check_crash_recovery()
         # Migration to the collection-driven model already ran in compose
         # (so child panels see the correct active collection on mount).
@@ -75582,6 +77842,9 @@ SpeciesPickerModal { align: center middle; }
             (_GELS_FILE,               "Gels"),
             # Sweep #15 (2026-05-20): protein-motif user overrides.
             (_PROTEIN_MOTIFS_FILE,     "Protein motifs"),
+            # Enzyme catalog extensions (2026-05-22).
+            (_CUSTOM_ENZYMES_FILE,     "Custom enzymes"),
+            (_ENZYME_COLLECTIONS_FILE, "Enzyme collections"),
             # Generation-tracked caches.
             (_FEATURES_FILE,           "Feature library"),
             (_FEATURE_COLORS_FILE,     "Feature colours"),
@@ -76088,16 +78351,24 @@ SpeciesPickerModal { align: center middle; }
         bigger ones). Capture is on the UI thread so the worker never
         reads instance state across threads (finding #13).
 
-        Custom enzyme list (GH #13): when `_restr_use_custom_list` is
-        True and the CSV is non-empty, parse it into a frozenset and
-        hand to the scan as the allow-list. The scan overrides
-        `min_len` / `unique_only` in this mode so the user's
-        hand-picked set always shows in full.
+        Active enzyme collection (2026-05-22): when the user has set
+        an active collection via `EnzymeCollectionsModal`, the scan
+        uses that collection's enzyme list as the allow-list. Empty /
+        no-active = full NEB master catalog. Falls back to the legacy
+        `restr_custom_enzymes` CSV path only if the in-app migration
+        hasn't yet run (defensive — covers the test/harness case where
+        `on_mount` doesn't fire).
         """
         circular = self._current_record_is_circular()
-        allowed: "frozenset[str] | None" = None
-        if (self._restr_use_custom_list
-                and self._restr_custom_enzymes):
+        allowed = _active_enzyme_allowed_set()
+        if allowed is None and (
+            self._restr_use_custom_list and self._restr_custom_enzymes
+        ):
+            # Legacy fallback. Once `_migrate_legacy_custom_enzyme_csv`
+            # has run, both settings are cleared, so this branch is
+            # dormant in steady state. Kept so a session that imports
+            # the module without firing `on_mount` (a few unit tests)
+            # still honours the pre-collection custom-list path.
             parsed = frozenset(
                 s.strip() for s in self._restr_custom_enzymes.split(",")
                 if s and s.strip() and s.strip() in _NEB_ENZYMES
@@ -80268,26 +82539,13 @@ SpeciesPickerModal { align: center middle; }
             return
 
         # ── Multi-action menus (dropdown) ──────────────────────────────────
-        ck = "\u2713"  # checkmark
-        nc = " "
-        u  = ck if self._restr_unique_only else nc
-        m6 = ck if self._restr_min_len == 6  else nc
-        m4 = ck if self._restr_min_len == 4  else nc
-        rs = ck if self._show_restr        else nc
-        cl = ck if self._restr_use_custom_list else nc
-
-        # Settings dropdown is built from a flat list of toggles. Adding
-        # a new boolean preference: append `(label, action_name)` to
-        # this section's list, define `action_<name>` on PlasmidApp,
-        # and (if the in-memory mirror matters) load the value from
-        # `_get_setting` in `on_mount`. Non-toggle settings (numeric,
-        # enum, file path) will need their own modal — keep this list
-        # for simple booleans only.
-        ft  = "✓" if self._show_feature_tooltips         else " "
-        cd  = "✓" if self._click_debug                   else " "
-        cu  = "✓" if self._check_updates                 else " "
-        cfg = "✓" if self._constructor_filter_by_grammar else " "
-        # Linear layout is a tri-label since it's NOT a binary toggle —
+        # Settings + Enzymes are direct-open menubar entries — see
+        # `MenuBar.on_click` and `action_open_named_menu`. The toggles
+        # that used to live in the Enzymes dropdown (Show RE sites /
+        # Unique cutters / Min site length / Connectors) moved to the
+        # "Enzyme Settings" tab inside `EnzymeCollectionsModal`;
+        # keyboard shortcuts (e.g. `r`) keep working via App.BINDINGS
+        # independent of any menu.
         menus = {
             "File": [
                 ("Open file (.gb / .dna)  [^O]", "open_file"),
@@ -80318,21 +82576,9 @@ SpeciesPickerModal { align: center middle; }
                 ("---",                          None),
                 ("Quit  [q]",                    "quit"),
             ],
-            "Settings": [
-                (f"[{ft}] Show feature hover tooltips",  "toggle_feature_tooltips"),
-                (f"[{cd}] Click debug echo  [Alt+M]",    "toggle_click_debug"),
-                (f"[{cu}] Check for updates on launch",  "toggle_check_updates"),
-                (f"[{cfg}] Filter Constructor parts by grammar",
-                                                          "toggle_constructor_filter"),
-                (f"Min primer binding: {self._min_primer_binding} bp → set…",
-                                                          "set_min_primer_binding"),
-                ("---",                                   None),
-                ("Cloning grammars…",                     "open_grammars"),
-                ("Entry Vectors…",                        "open_entry_vectors"),
-                ("---",                                   None),
-                ("Restore library / collections from backup…",
-                                                          "restore_from_backup"),
-            ],
+            # "Settings" is a direct-open menubar entry — see
+            # `MenuBar.on_click` and `action_open_named_menu` for the
+            # dispatch. No dropdown rows needed.
             "Edit": [
                 ("Edit Sequence  [^E]",            "edit_seq"),
                 ("---",                             None),
@@ -80346,18 +82592,13 @@ SpeciesPickerModal { align: center middle; }
                 ("Find ORFs…",                      "find_orfs"),
                 ("Transfer annotations from…",       "transfer_annotations"),
             ],
-            "Enzymes": [
-                (f"[{rs}] Show RE sites  [r]",   "toggle_restr"),
-                ("---",                            None),
-                (f"[{u}] Unique cutters",         "toggle_restr_unique"),
-                (f"[{m6}] 6+ bp sites",           "toggle_restr_min6"),
-                (f"[{m4}] 4+ bp sites",           "toggle_restr_min4"),
-                ("---",                            None),
-                ("Edit custom enzyme list…",      "edit_custom_enzyme_list"),
-                (f"[{cl}] Use custom list",       "toggle_custom_enzyme_list"),
-                ("---",                            None),
-                ("Toggle connectors",              "toggle_connectors"),
-            ],
+            # "Enzymes" is a direct-open menubar entry — clicking the
+            # menubar item opens `EnzymeCollectionsModal` straight
+            # away. The "Enzyme Settings" tab inside the modal hosts
+            # Show RE sites / Unique cutters / Min site length /
+            # Connectors toggles that used to live here. Keyboard
+            # shortcuts (e.g. `r` → `action_toggle_restr`) remain
+            # wired via App.BINDINGS independent of this menu.
         }
         items = menus.get(name, [])
         if not items:
@@ -80480,6 +82721,12 @@ SpeciesPickerModal { align: center middle; }
         if name == "Features":
             self.push_screen(FeatureLibraryScreen())
             return
+        if name == "Settings":
+            self.action_open_settings()
+            return
+        if name == "Enzymes":
+            self.action_open_enzyme_collections()
+            return
         self.open_menu(name, region.x, region.y + 1)
 
     @_action_log("app.open.sequencing")
@@ -80592,7 +82839,7 @@ SpeciesPickerModal { align: center middle; }
             self.refresh(layout=True)
             try:
                 sp.query_one(ScrollableContainer).focus()
-            except (NoMatches, Exception):
+            except NoMatches:
                 pass
             self.notify("Layout: sequence panel only  [F5 = restore]",
                          timeout=2)
@@ -80630,7 +82877,7 @@ SpeciesPickerModal { align: center middle; }
                 pm.focus()
             elif panel_id == "sidebar":
                 sb.query_one("#feat-table").focus()
-        except (NoMatches, Exception):
+        except NoMatches:
             pass
 
         self.notify(f"Layout: {label} only  [F5 = restore]", timeout=2)
@@ -81214,6 +83461,25 @@ SpeciesPickerModal { align: center middle; }
         single-slot widget in `GrammarEditorModal` (which only ever
         exposed the empty-role binding)."""
         self.push_screen(EntryVectorsModal())
+
+    @_action_log("app.open.settings")
+    def action_open_settings(self) -> None:
+        """Settings menu → 'Settings…' opens `SettingsModal`, which
+        consolidates every prior dropdown entry (display toggles,
+        update check, Constructor grammar filter, min primer binding,
+        plus buttons launching the grammar / entry-vector /
+        enzyme-collections / restore sub-modals) into one dialog."""
+        self.push_screen(SettingsModal())
+
+    @_action_log("app.open.enzyme_collections")
+    def action_open_enzyme_collections(self) -> None:
+        """Enzymes menu → 'Enzyme collections…' opens
+        `EnzymeCollectionsModal`. Two-pane manager: master catalog
+        (NEB + user-added custom) on the left, named user catalogs
+        (subsets) on the right. The active catalog drives the
+        restriction-overlay scan; an empty/no-active state scans the
+        full master."""
+        self.push_screen(EnzymeCollectionsModal())
 
     @_action_log("app.find.annotation")
     def action_find_annotation(self) -> None:

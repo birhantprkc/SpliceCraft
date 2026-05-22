@@ -1,13 +1,15 @@
 # Invariants — sweep history and feature-area rules
 
-Companion to `CLAUDE.md`. The short, broadly-applicable invariants live in `CLAUDE.md`; this file holds the longer sweep-history entries (#36–#63) and feature-specific contracts.
+Companion to `CLAUDE.md`. The 10 SACRED biology-correctness invariants live in `CLAUDE.md`; this file holds **everything else** — the 35 known pitfalls, the sweep-history entries [INV-36]…[INV-64], persistent settings rules, architecture pointers, conventions, the sister-project note, and the new-feature playbook ("Borrow before respinning").
 
 ## How agents should use this file
 
-**Before editing any subsystem, grep this file for the tag.** Each invariant carries a `[INV-NN]` anchor plus topic keywords so a single `grep` finds it fast.
+**Before editing any subsystem, grep this file for the tag.** Each entry carries a `[PIT-NN]` / `[INV-NN]` / `[PREFS]` / `[ARCH]` / `[CONV]` / `[SISTER]` / `[RECIPE]` anchor plus topic keywords so a single `grep` finds it fast.
 
 ```bash
 grep -n '\[INV-50\]' docs/invariants.md           # by number
+grep -n '\[PIT-17\]' docs/invariants.md           # known-pitfall lookup
+grep -n '\[RECIPE\]' docs/invariants.md           # new-feature playbook
 grep -ni 'master.delete\|wipe' docs/invariants.md # by topic
 grep -ni 'synthesis\|protein' docs/invariants.md  # by feature area
 ```
@@ -16,6 +18,12 @@ grep -ni 'synthesis\|protein' docs/invariants.md  # by feature area
 
 | Tag | Topic keywords |
 |---|---|
+| `[PIT-01]`…`[PIT-35]` | Known pitfalls (bare-except, wrap features, `_re_highlight` schema, Primer3 linear-only, cache contracts, trademark scrub, agent-endpoint rules, natural-sort row mapping, CommercialSaaS writer packet inventory…) |
+| `[PREFS]` | Persistent user preferences (`settings.json`, the 4-step add-a-toggle recipe, full toggle list) |
+| `[ARCH]` | Architecture pointers (top-to-bottom `splicecraft.py` layout, `grep` recipe for live map) |
+| `[CONV]` | Conventions (worker pattern, JSON-library envelope, modal subclass rule, test rules, regression-guard dating) |
+| `[SISTER]` | Sister project (ScriptoScope) — perf-pattern crib source, single-file-merge question |
+| `[RECIPE]` | "Borrow before respinning" — new modal / JSON file / save action / `action_*` / worker / agent endpoint / picker / feature iter / HTTP fetch / XML parse / logging / file traversal |
 | `[INV-36]` | future-proofing scaffolding; migrations; SPLICECRAFT_PYPI_URL; data-version stamp; plugins |
 | `[INV-37]` | robustness 0.7.6; data-dir lock; threading excepthook; settings schema; clipboard fallback |
 | `[INV-38]` | diagnostic logging; UI snapshot Alt+D; logs bundle; sequence-leak prohibition |
@@ -44,6 +52,7 @@ grep -ni 'synthesis\|protein' docs/invariants.md  # by feature area
 | `[INV-62]` | sweep #21; modal-staleness audit; `_guard_callback`; feature/primer/annotate-edit wrap |
 | `[INV-63]` | sweep #22; `_safe_save_json` ancestor symlink walk; `_iupac_pattern` case-fold; migration framework tests |
 | `[INV-64]` | sweep #23; new file formats (EMBL/AB1/FASTQ/GFF3); bulk export; 18 new agent endpoints; backup-label parity; readonly cache contract; rejected seed-from-validate cache pattern |
+| `[INV-65]` | sweep #24; custom enzymes + enzyme collections hardening; `_AGENT_BACKUP_LABELS` parity for new files; `_dismiss_once` retrofit; `_save_or_status` modal helper; `_all_enzymes()` routing across scan/cloning paths; redundant exception-tuple narrowing; 12 new agent endpoints; enzyme-save cache invalidation |
 
 ---
 
@@ -340,3 +349,203 @@ Multi-week sweep covering format support, agent-API CRUD gaps, modal hardening, 
 * **Settings schema bumps.** `crash_recovery_seen` added to `_SETTINGS_SCHEMA` with `((list,), [])` so a corrupted settings.json with `crash_recovery_seen: 42` can't crash the post-mount recovery scan. Forward-compat unknown-key passthrough already handled it but the schema is the documented contract for "what's persisted."
 
 * **`BulkExportCollectionModal` added to `tests/test_modal_boundaries.py::_MODAL_CASES`.** The 160×48 fit guarantee now covers the new collection-export modal.
+
+---
+
+## [INV-65] Sweep #24 — custom enzymes + enzyme collections hardening (2026-05-22)
+Audit-driven cleanup for the in-flight "custom enzymes + enzyme collections" feature (~2000 LOC added before v1.0.0). The new `_save_*` helpers landed but the cross-cutting contracts ([INV-50] `_dismiss_once`, [INV-51] save-failure notify, [INV-64] `_AGENT_BACKUP_LABELS` parity, the `_NEB_ENZYMES`-vs-`_all_enzymes()` consumer audit) were not all wired through. New tests: 13 cases in `tests/test_enzyme_collections.py` + 9 cases in `tests/test_new_agent_endpoints.py`.
+
+* **`_AGENT_BACKUP_LABELS` parity (P0 ship-blocker).** `_USER_DATA_FILE_ATTRS` got `_CUSTOM_ENZYMES_FILE` + `_ENZYME_COLLECTIONS_FILE` and `RestoreFromBackupModal._TARGETS` covered both, but `_AGENT_BACKUP_LABELS` (`splicecraft.py:73145-73166`) was missed — the agent restore-backup endpoint couldn't list/restore the two new files. The `_h_restore_backup` cache-bust map and the bulk-restore cache tuple in `_h_restore_pre_update_snapshot` had the same gap. All three maps now mirror `_USER_DATA_FILE_ATTRS` minus `_SETTINGS_FILE`. Regression guard: existing `tests/test_sweep10.py::test_agent_backup_labels_parity_with_user_data_files` + new `test_agent_backup_labels_include_enzyme_files` in `tests/test_enzyme_collections.py`.
+
+* **Modal `_dismiss_once` retrofit ([INV-50]).** `AddCustomEnzymeModal`, `EnzymeCollectionsModal`, and `_EnzymeNamePromptModal` all write to disk on dismiss (or carry payloads that trigger downstream saves) but lacked the double-fire guard. A double-click on Save in `AddCustomEnzymeModal` appended the same custom enzyme twice; the second pass bypassed the duplicate-name check because the FIRST pass had already persisted. Pattern uniform across all three: `_dismissed: bool = False` in `__init__` (AFTER docstring per [INV-41]), `_dismiss_once(payload)` helper, every exit path (button + Esc + worker callback) routed through it.
+
+* **`_save_or_status` modal helper.** `EnzymeCollectionsModal` had six bare `_save_enzyme_collections(entries)` callsites in the CRUD button handlers (New / Rename / Duplicate / Delete / Add / Remove). Sacred invariant #7: `_safe_save_json` re-raises on OSError; without a wrap the exception would crash the modal mid-CRUD instead of routing through `_notify_save_failure`. New `EnzymeCollectionsModal._save_or_status(entries) -> bool` helper handles try/except + `_notify_save_failure` + inline `_set_status` red toast; each callsite becomes `if not self._save_or_status(entries): return`. Mirrors the pattern from `AddCustomEnzymeModal._save_btn` which wraps correctly.
+
+* **Scan/cloning path routing to `_all_enzymes()` (P0).** Custom enzymes are visible to the restriction-overlay scan via `_SCAN_CATALOG` (rebuilt from `_all_enzymes()` after every `_save_custom_enzymes`), but **seven downstream consumers still keyed on `_NEB_ENZYMES` directly** — a user could add `MyEnzI` but couldn't use it in Domesticator, fragment excision, cloning grammars, or via the agent. Fixed:
+  - `_enzyme_cuts_impl` (the underlying scanner used by all cloning paths via `_enzyme_cuts`) — local `catalog = _all_enzymes()` at function entry, all membership tests + indexing route through it.
+  - `_excise_fragment_pair` (synthetic 2-enzyme digest used by traditional cloning UI) — same pattern.
+  - `_site_for_enzyme` (cloning-grammar site lookup) — `_all_enzymes().get(enzyme)`.
+  - `_clone_part_into_entry_vector` + IIS-conflict guard + second-pass clone helper (3 sites) — grammar's enzyme can now be a custom one.
+  - `_design_cloning_primers` (cloning primer design) — local `catalog = _all_enzymes()`.
+  - `_settings_validator_custom_enzymes_csv` (legacy CSV settings validator).
+  - `_h_list_restriction_sites` agent endpoint — new `respect_active_collection: bool = true` parameter; when no explicit `enzymes` list is provided, defaults to the user's active enzyme collection so the agent mirrors UI overlay semantics. Explicit `enzymes` always wins.
+
+* **`(IndexError|NoMatches, Exception)` antipattern cleanup.** 7 sites used the redundant tuple-with-Exception pattern that [INV-64] flagged as bare-except in disguise. `HistoryViewerModal` (19586) + `HistoryScreen` (19799) narrowed to `except IndexError:`. 5 sites in `ExperimentEditor` / `SequencingScreen` / `action_layout_*` narrowed to `except NoMatches:`. Sacred lesson: `Exception` already subsumes `IndexError` / `NoMatches`, so the tuple form is the same as `except Exception` — pyright won't catch it, only grep will.
+
+* **12 new agent endpoints (CRUD parity per [INV-64] sweep #23 pattern).**
+  - **Custom enzymes:** `list-custom-enzymes`, `get-custom-enzyme`, `create-custom-enzyme`, `update-custom-enzyme`, `delete-custom-enzyme`. Built-in NEB names refused for create (409) — agent must add a custom enzyme with the SAME name to override (matches the `_all_enzymes()` override-by-name contract). Shared `_agent_validate_custom_enzyme_payload` helper mirrors `AddCustomEnzymeModal._validate` so UI + agent accept the same shape.
+  - **Enzyme collections:** `list-enzyme-collections`, `get-enzyme-collection`, `create-enzyme-collection`, `update-enzyme-collection`, `delete-enzyme-collection`. Update supports rename via `new_name` + enzyme-list replacement; rename onto an existing name returns 409. Delete clears the active-pointer if the deleted collection was active. Unknown enzyme names accepted at create/update time — `_active_enzyme_allowed_set` filters them at scan time so a custom enzyme added later participates retroactively.
+  - **Active pointer:** `get-active-enzyme-collection`, `set-active-enzyme-collection`. `set` refuses unknown names (404); pass `name: null` to clear.
+
+* **`_save_custom_enzymes` cache invalidation (correctness, not perf).** After `_save_custom_enzymes`, `_SCAN_CATALOG` is rebuilt, but three other caches that key on enzyme NAMES (not definitions) held stale results: `_ENZYME_CUTS_CACHE` (LRU on `(hash(seq), tuple(sorted enzymes), circular)`), `_RESTR_SCAN_CACHE` (LRU on the scan params), and `_ASSEMBLY_FRAGMENT_CACHE` (which caches `None` for unresolved enzymes — a newly-added custom enzyme would forever hit the cached `None`). All three now `.clear()` at the end of `_save_custom_enzymes`. `_save_enzyme_collections` does NOT need this fix — `_RESTR_SCAN_CACHE`'s key already includes `allowed_enzymes`, so it self-invalidates on collection change.
+
+* **`AddCustomEnzymeModal` agent-payload validation hardening.** Pyright caught `int(payload.get("fwd_cut"))` accepting `None` and raising at runtime via `TypeError`. Refactored to extract the raw values, explicit `None` check ("missing 'fwd_cut' or 'rev_cut'" → 400), then `int(raw)` inside a `(TypeError, ValueError)` catch — cleaner error message + appeases pyright.
+
+* **`_EnzymeNamePromptModal` fit guarantee.** Added to `tests/test_modal_boundaries.py::_MODAL_CASES` so the 160×48 baseline-terminal fit test exercises the prompt modal alongside `EnzymeCollectionsModal` + `AddCustomEnzymeModal` + `SettingsModal` (all already covered from initial landing).
+
+* **Deferred (P2 follow-up candidates).** UI palette dropdowns (`_CLONING_RE_OPTIONS` at 32355, restriction-insert modal at 51199, traditional-cloning enzyme picker at 55246, primer-design dialog at 62776) still enumerate `_NEB_ENZYMES.keys()` directly. Custom enzymes appear in the scan + cloning paths but NOT in these dropdown widgets — a user can type a custom-enzyme name in a custom field but can't pick from the picker. Lower priority since the cloning path resolution is correct; UX gap, not a robustness gap. `EditGrammarDialog` enzyme validation (38808) similarly accepts only NEB enzymes — defer until a user requests custom-enzyme-keyed grammars. Library-walk perf items from audit #3 (BulkExportCollectionModal compose, full-library entry-id lookup at 3 sites) deferred — they're optimisations not correctness fixes, and benchmarking them is more cost than the 1.0.0 deadline allows.
+
+---
+
+## [PIT-01]…[PIT-35] Known pitfalls (moved from CLAUDE.md)
+
+Pitfalls discovered during regular development and codified as rules. Each has at least one regression test. **`[PIT-NN]` numbering is stable** — old grep recipes like `grep -ni 'pitfall #17' docs/` still work because the numbering matches the historic CLAUDE.md ordering.
+
+1. **[PIT-01] Bare `except` forbidden.** Use narrow types (`NoMatches`, `ET.ParseError`, `(OSError, json.JSONDecodeError)`). Bare `except Exception` reserved for `@work` thread bodies — always `_log.exception` there.
+2. **[PIT-02] User-facing errors:** `self.notify(...)` or `Static.update("[red]...[/]")`. Never raw tracebacks. Diagnostic detail → `_log.exception`.
+3. **[PIT-03] Wrapped features (`end < start`) first-class.** Use `_bp_in()` / `_feat_len()` for any distance, midpoint, or membership check.
+4. **[PIT-04] Cache keys use `id(...)` of feature lists.** Correct only because lists are *reassigned* on load, not mutated. Don't start mutating `self._feats` in-place.
+5. **[PIT-05] Textual reactive auto-invalidation requires assignment, not mutation.** `self._feats = new_list` triggers refresh; `.append(x)` does not.
+6. **[PIT-06] Primer3 is linear-only.** For wrap regions, rotate template to `seq[start:] + seq[:start]`, then unrotate via `(coord + rotation) % total`. See `_design_detection_primers`.
+7. **[PIT-07] `_source_path` survives in-place edits.** Cleared only when `clear_undo=True` (fresh loads). `_discard_changes` explicitly stashes/restores `_source_path`.
+8. **[PIT-08] NCBI XML routes through `_safe_xml_parse`.** Rejects DOCTYPE/ENTITY before `ET.fromstring`.
+9. **[PIT-09] Migration runs in `App.compose()`, not `on_mount`.** Textual mount fires leaves→root; `App.on_mount` runs AFTER `LibraryPanel.on_mount`. Collections / active-collection setup must happen before children mount.
+10. **[PIT-10] `_save_library` mirrors to active collection.** Every panel CRUD writes BOTH `plasmid_library.json` and `collections.json`. Routing around `_save_library` (e.g. `_restore_library_from_active_collection`) bypasses the mirror; do that only when the collection IS the source.
+11. **[PIT-11] Wrap-CDS rendering uses `_orig_start`/`_orig_end`.** `_feats_in_chunk` splits wrap features into linear half-features; CDS halves carry original coords as `_orig_start` / `_orig_end`. Codon-midpoint math, AA translation, AA-click detection must read `f.get("_orig_start", f["start"])`. Half-local `f["start"]` (= 0 for head halves) gives wrong reading frame.
+12. **[PIT-12] `_re_highlight` schema (0.4.5+):** `start, end, top_cut_bp, bottom_cut_bp, color, name`. Legacy `fwd_cut_bp`/`rev_cut_bp` gone. Resites with `cut == -1` fall back to plain `black on white`.
+13. **[PIT-13] Map rotation keys live on `PlasmidMap.BINDINGS`.** Not `App.BINDINGS` — rotations would fire from modals. App-level `on_key` skips arrow / Enter when `DataTable`, `Input`, or `PlasmidMap` is focused.
+14. **[PIT-14] Ctrl+Shift+C is functionally an alias for Ctrl+C** (both ETX, 0x03). Alt+C is the actual RC-copy trigger.
+15. **[PIT-15] `PlasmidApp.on_key`/`on_click` early-return when `len(screen_stack) > 1`** so seq-panel cursor / RE-highlight clears can't fire under modal. Ctrl+Z / Ctrl+Y above this guard.
+16. **[PIT-16] `_blast_get_db` LRU invalidated by `_save_collections`** via `globals().get("_blast_clear_cache")()`. Any new collection-mutation path not going through `_save_collections` must call `_blast_clear_cache()` manually.
+17. **[PIT-17] Cache contracts (deepcopy on BOTH read AND save).** `_load_library` / `_load_collections` / `_load_features` / `_load_custom_grammars` / `_load_parts_bin` / `_load_primers` deepcopy on read; corresponding `_save_*` deepcopy when re-seating the cache. Without both halves, a caller editing the list it just saved leaks post-save mutations into the next reader.
+18. **[PIT-18] Trademark scrub.** `.dna` is the popular commercial plasmid editor's binary format. Code identifiers use `CommercialSaaS` / `commercialsaas` / `_BIOPYTHON_DNA_FMT`. BioPython API string and 8-byte cookie magic stored hex-encoded as `_BIOPYTHON_DNA_FMT` and `_COMMERCIALSAAS_COOKIE_MAGIC` so trademarked text never appears verbatim. User-facing prose says "popular commercial plasmid editor file format".
+19. **[PIT-19] Untrusted XML routes through `_safe_xml_parse`.** Includes NCBI responses AND `.dna` history packets (`_parse_commercialsaas_history`).
+20. **[PIT-20] Network reads size-capped.** PyPI (`_PYPI_MAX_RESPONSE_BYTES`), NCBI (`_NCBI_MAX_RESPONSE_BYTES`), Kazusa (`_KAZUSA_MAX_RESPONSE_BYTES`). Any new HTTP fetch must follow `resp.read(MAX + 1)` + bail-if-exceeded.
+21. **[PIT-21] `_extract_commercialsaas_history_xml` uses streaming LZMA decompress** with `max_length=cap+1`.
+22. **[PIT-22] `_dna_sidecar_path` strips `..`/dot-only/NUL** via `Path(...).name` after replacing separators. Don't loosen — `entry_id` is user-controlled.
+23. **[PIT-23] `_safe_load_json` size-capped at `_SAFE_LOAD_JSON_MAX_BYTES` (1 GB).** Distinct from the 50 MB `_BULK_IMPORT_MAX_BYTES` agent-API cap (different threat models).
+24. **[PIT-24] `_h_load_file` agent endpoint size-capped at `_BULK_IMPORT_MAX_BYTES` (50 MB)** with `force=true` override.
+25. **[PIT-25] `_excise_fragment_pair` enforces exactly-2 cuts on circular plasmids.** ≥3 cuts surfaces error rather than ambiguous fragments. Sacred — restriction-cloning correctness depends on this.
+26. **[PIT-26] GFF3 export off-by-one.** `_record_to_gff3` converts 0-based half-open to 1-based inclusive: `start+1`, `end` (unchanged because GFF3 end is inclusive). Wrap features emit two rows sharing one `ID=`; circular records carry `Is_circular=true` on synthesised `region` row. Source features filtered.
+27. **[PIT-27] Annotation transfer exact-match only.** `_find_annotation_transfers` does verbatim substring on both strands; no fuzzy / BLAST. Skips below `_ANNOT_TRANSFER_MIN_LEN` (30 bp). Wrap-aware; whole-plasmid case (`feat_len == n_tgt`) special-cased to single `[0, n)` transfer.
+28. **[PIT-28] Pairwise alignment cap + cancellability.** `_pairwise_align` caps at `_PAIRWISE_MAX_LEN = 200_000` bp per side. PairwiseAligner C loop **cannot be cancelled mid-flight** — `_diff_align_worker` uses `exclusive=True`. Workers capture `_record_load_counter` at entry and refuse if canvas moved on (mirrors `_restr_scan_worker`, `_seed_default_library`).
+29. **[PIT-29] Cross-collection search skips id-less entries.** `_search_collections_library` filters entries lacking `id` to avoid aliasing dismiss payload `(collection, "")`. Same reason `LibrarySearchModal` row keys carry the `(collection, id)` pair.
+30. **[PIT-30] Agent endpoints `transfer-annotations`/`diff-plasmid` look up against active library only** (via `_load_library()`). Cross-collection lookup is the `search-library` endpoint's job; agents call that first, then `set-active-collection`, then transfer/diff.
+31. **[PIT-31] Four-layer JSON data-safety net.** Every `_safe_save_json` write produces: (a) `<file>.bak` single-gen (back-compat with `_safe_load_json` recovery); (b) timestamped `<file>.bak.YYYYMMDD-HHMMSS` (`_BACKUP_RETENTION_COUNT = 10`); (c) daily `<DATA_DIR>/snapshots/<stem>-YYYY-MM-DD.json` (`_SNAPSHOT_RETENTION_DAYS = 30`, via `_snapshot_data_files` at launch); (d) suspicious-shrink guard (>50% loss + ≥5 prior entries) spills to `<DATA_DIR>/lost_entries/` BEFORE overwrite. Restore UI: `Settings → Restore … from backup…` (`RestoreFromBackupModal`); helpers `_list_recoverable_backups` + `_restore_from_backup` reusable from agent path.
+32. **[PIT-32] `_skip_snapshot: bool = True`** on `PlasmidApp` (test default); `main()` flips False. Same pattern as `_skip_seed`, `_skip_update_check`.
+33. **[PIT-33] Natural-sort row mapping symmetric.** Every screen sorting a `DataTable` for display (`LibraryPanel`, `FeatureLibraryScreen`, `PartsBinModal`, `MutagenizeModal`, `PrimerDesignScreen`, `PlasmidPickerModal`, `TraditionalCloningPane`, `_palette_rows_for_grammar`) MUST resolve every `cursor_row` lookup against the SAME sort. Mismatched sort/lookup is the 0.7.4.5 bug class. `FeatureLibraryScreen` uses `_row_to_entry_idx` + `_entry_idx_to_row`; `PrimerDesignScreen` uses `_row_to_primer_idx`. `PlasmidPickerModal` sidesteps via `key=e.get("id")` on `add_row` (preferred pattern for new pickers).
+34. **[PIT-34] `_classify_part_from_plasmid` is grammar-by-grammar Type IIS digest.** Loops `_all_grammars()`, runs `_excise_fragment_pair`, picks first 2-fragment digest whose smaller fragment's `(left.overhang_seq, right.overhang_seq)` matches a position. Smaller = insert; larger = vector. Linear records skipped. Parts Bin "Load Part" runs in `@work` thread (sync froze UI 200–500 ms on plasmids with many grammars).
+35. **[PIT-35] CommercialSaaS `.dna` writer emits the editor's full default packet inventory.** `_write_commercialsaas_dna_bytes` writes 0x00 (sequence) + 0x0A (features) + 0x06 (notes) + 0x08 (`AdditionalSequenceProperties`, 289 bytes) + 0x05 (`Primers` with `HybridizationParams`, 217 bytes) + optional history. Defaults match real CommercialSaaS files even when no user primers / no meaningful end-stickiness on circular plasmids — Viewer's panels fall back to "(empty)" if missing. Byte-for-byte assertions in `tests/test_commercialsaas_io.py::TestWriteCommercialSaaSDnaBytes`.
+
+---
+
+## [PREFS] Persistent user preferences
+
+`settings.json` via `_get_setting`/`_set_setting`. To add a new toggle:
+
+1. Class-level annotation on `PlasmidApp` with default (e.g. `_my_setting: bool = True`).
+2. Hydrate in `PlasmidApp.compose()` — `self._my_setting = bool(_get_setting("my_setting", True))`. **`compose()` not `on_mount`** (mount fires leaves→root, so by `on_mount` children read stale defaults).
+3. `action_toggle_my_setting` calls `_set_setting("my_setting", self._my_setting)` after flipping.
+4. Surface in Settings menu (`MenuBar.MENUS` between File and Edit; `Settings` entry in `PlasmidApp.open_menu`'s `menus` dict).
+
+**Persisted toggles:** `show_feature_tooltips`, `click_debug`, `check_updates`, `show_restr`, `restr_unique_only`, `restr_min_len`, `min_primer_binding`, `show_connectors`, `linear_layout`, `active_collection`, `active_grammar`. `map_mode` is **per-plasmid** on each library entry's `map_mode` field. `_library_load` stashes as `_tui_map_mode`; `pm.load_record` honours over topology default; `action_toggle_map_view` + `_register_alignment` write through `_persist_map_mode_for_active`. Sequencing-aligned plasmids auto-tag `linear`. `show_connectors`/`linear_layout` need deferred apply via `_pending_show_connectors`/`_pending_linear_layout` (targets not composed yet in `compose()`).
+
+**Persisted infrastructure:** `last_seen_version` (What's New auto-push), `last_known_latest` + `last_update_check_ts` (24 h PyPI cache), `hmm_db_path`, `active_parts_bin`, `active_project`, `experiments_custom_dict`.
+
+See also: `[INV-43]` settings schema, `[INV-37]` `_SETTINGS_SCHEMA` + `_validate_settings`.
+
+---
+
+## [ARCH] Architecture pointers
+
+`splicecraft.py` top-to-bottom: imports + persistence helpers → enzyme catalog + IUPAC + scanner + 2D feature packer + seq-panel renderer → GenBank I/O → `_Canvas` / `_BrailleCanvas` / `PlasmidMap` / `FeatureSidebar` → `LibraryPanel` → `SequencePanel` → core modals → grammars + settings → codon registry + Kazusa + mutagenesis → feature-library → parts bin → domesticator + constructor → mutagenize → primer design → small modals → `PlasmidApp` → `main()`.
+
+Use `grep -n "^class \|^def " splicecraft.py` for live map. Test files 1:1 named after the subsystem.
+
+See `docs/architecture.md` for the long-form rationale (single-file rule, test pyramid, concurrency model, observability).
+
+---
+
+## [CONV] Conventions
+
+- **Workers:** `@work(thread=True)`, `try / except Exception as exc / _log.exception`, friendly message via `call_from_thread`. Stale-record guard: capture `self._current_record` identity at entry, compare in callback.
+- **JSON libraries:** envelope schema v1. Filter `isinstance(entry, dict)` after load. Add new files to `_protect_user_data` in `tests/conftest.py` and `_check_data_files`. Cover corruption recovery in `test_data_safety.py`.
+- **Modals:** subclass `ModalScreen[ReturnType]`. Add row to `test_modal_boundaries.py::_MODAL_CASES` (fits 160×48).
+- **Tests:** cross-validate against Biopython where biological. No network, no real files (autouse `_protect_user_data` monkeypatches every `_*_FILE` path). Async: `async with app.run_test(size=...)` + double `await pilot.pause()` for `call_after_refresh`.
+- **Regression guards** cite date in docstring (`# Regression guard for 2026-MM-DD fix`).
+
+---
+
+## [SISTER] Sister project (ScriptoScope)
+
+`/home/seb/proteoscope/scriptoscope.py` (~8,600 lines) — same author, same single-file convention. Patterns to crib if seq-panel renders blow 33 ms/frame: thread-local `Console` for `_text_to_content`; two-level render cache (`_seq_render_cache` + `_content_cache`, LRU via `OrderedDict.move_to_end`); `@lru_cache(1)` availability probes.
+
+User is undecided whether to merge SpliceCraft / ScriptoScope / MitoShift / RefHunter / molCalc into one Textual app with modes. Single-file convention keeps the option open.
+
+---
+
+## [RECIPE] Borrow before respinning
+
+When building a new feature, look at this map FIRST. Almost every category has a working sibling in-tree whose patterns + invariants are already debugged. Respinning from scratch re-discovers bug classes that earlier sweeps already fixed. **Before writing new code: `grep -ni '<area>' docs/invariants.md docs/subsystems.md`** — the relevant `[INV-NN]` / `[PIT-NN]` / `[SUB-xxx]` likely already encodes the bug class.
+
+**New modal:**
+* Subclass `ModalScreen[ReturnType]` (Textual base).
+* Hosts an `Input` / `TextArea`? → `_blocks_undo: bool = True` AFTER docstring (`[INV-41]`).
+* Mutates `_current_record`? → wrap dismiss callback via `self._guard_callback(cb, "Label")` so a canvas reload mid-modal drops the edit (`[INV-62]`).
+* Looks up an item by idx on dismiss? → use **identity-based lookup** like `PartEditModal._on_result` does with `(name, sequence)` tuple — refuses + notifies on miss. Better than counter-based for in-place mutations.
+* Double-click race? → `_dismissed: bool` flag + `_dismiss_once(payload)` helper, applied to every exit path (`[INV-50]`).
+* Add a row to `tests/test_modal_boundaries.py::_MODAL_CASES` (must fit 160×48).
+
+**New persisted JSON file (cache + reload semantics):**
+1. `_<NAME>_FILE = _DATA_DIR / "<name>.json"` constant.
+2. `_<name>_cache: "list | dict | None" = None` module-level global.
+3. `_load_<name>()` returns `_typed_clone(_<name>_cache)` (`[PIT-17]`, deepcopy on read).
+4. `_save_<name>()` wraps `_safe_save_json` + cache reseat inside `with _cache_lock:` (`[INV-41]` — concurrency).
+5. Register cache name in `_MASTER_DELETE_CACHE_ATTRS` (`[INV-48]`).
+6. Register file attr in `_USER_DATA_FILE_ATTRS` (`[INV-39]`).
+7. Add the `(file_attr, cache_attr)` tuple to `tests/conftest.py::_protect_user_data::_DATA_FILES`.
+8. Add to `_check_data_files` launch-check.
+9. Add the attr name to `RestoreFromBackupModal._TARGETS` so the Restore-from-backup UI covers it (`[INV-43]`).
+10. Settings keys → add to `_SETTINGS_SCHEMA` with explicit type tuple + default (`[INV-43]`).
+
+**New save action:**
+* All writes go through `_safe_save_json` (sacred #7) — never raw `json.dump`.
+* On failure call `_notify_save_failure(app, label, exc)` — fires the `save.failed` structured event AND surfaces a user toast (`[INV-41]`).
+* Agent endpoints use `_agent_save_or_500(save_fn, label)` for uniform 500 shape.
+* If the save has a downstream mirror (active collection, active project, etc.), the mirror call MUST live inside the `_cache_lock` block (`[INV-50]`).
+
+**New `action_*` method:**
+* Decorate `@_action_log("app.<area>.<verb>")` for the user-intent event (`[INV-42]`). Decorator AND body events can co-exist — intent vs outcome are different signals.
+* Destructive? Use a confirm modal with default-focus on `No` (mirror `LibraryDeleteConfirmModal`). Stray Enter should never delete.
+
+**New `@work` worker:**
+* `@work(thread=True, exclusive=True, group="<name>")` for heavy / cancellable ops.
+* Capture `entry_counter = self._record_load_counter` at entry; bail in `_apply` callback if it shifted (`[PIT-28]`).
+* `except Exception as exc / _log.exception("...")` — `[PIT-01]`'s explicit carve-out for worker bodies.
+* `try / finally` to drop any "in-flight" sentinels so an exception can't wedge the worker permanently (`[INV-41]` example: `_settings_flush_running`).
+
+**New agent endpoint:**
+* `@_agent_endpoint("name", write=True/False)` — `_AGENT_HANDLERS` registry is auto-populated.
+* Write endpoints: route through `_agent_save_or_500`; check `_agent_dirty_guard(app, payload)` if the canvas dirty state matters.
+* Inputs use `_sanitize_label`, `_sanitize_bases`, `_sanitize_accession`, etc. — never trust raw payload values.
+* Idx-based payloads: capture `_record_load_counter`, check in `_apply` (`[PIT-28]`).
+* Listing endpoints with large payloads (library, search): hard-cap at endpoint-specific limit; `_AGENT_RESPONSE_MAX_BYTES = 50 MB` is the global backstop.
+* Add a row to `test_agent_api.py` covering happy + error paths.
+
+**New picker / DataTable:**
+* Same sort for display AND for cursor → idx resolution (`[PIT-33]`). Easiest: `key=` parameter on `add_row` (pre-empts the bug class — `PlasmidPickerModal` is the reference).
+* If using `cursor_row` int + sort, build explicit `_row_to_entry_idx` + `_entry_idx_to_row` maps.
+
+**New feature-list iteration:**
+* Use `_feat_bounds(feat, total) → (start, end, strand)` for wrap-aware extraction (`[INV-41]`).
+* Use `_smallest_enclosing_feature(bp)` not O(N) `_feat_at` for bp-lookup (`[INV-41]`).
+* `_feat_len(start, end, total)` for wrap-aware distance — naive `end - start` is wrong on origin-spanning features (sacred #8).
+
+**New HTTP fetch:**
+* `resp.read(MAX + 1)` + bail-if-exceeded — never `resp.read()` raw (`[PIT-20]`).
+* Existing caps: `_PYPI_MAX_RESPONSE_BYTES`, `_NCBI_MAX_RESPONSE_BYTES`, `_KAZUSA_MAX_RESPONSE_BYTES`, `_PLASMIDSAURUS_*_MAX_BYTES`.
+* Retry pattern: 1 try + 250 ms backoff (mirrors `_fetch_latest_pypi_version`, `fetch_genbank`).
+
+**New XML parsing:**
+* Route through `_safe_xml_parse` — rejects DOCTYPE / ENTITY (`[PIT-19]`). Includes NCBI responses AND `.dna` history packets.
+
+**New logging point:**
+* User actions: `@_action_log("app.area.verb")` decorator.
+* State changes: `_log_event("<noun>.<verb>", **fields)`.
+* Heavy ops: `@_timed("op.area.name", threshold_ms=50)` wrapper.
+* **SACRED: never log sequence content** — `_repr_for_log` truncates/summarises automatically (`[INV-38]`). `seq.chunk_dump` and similar route through structured events that hash or length-only the payload.
+
+**New file-system traversal:**
+* `path.lstat()` + `stat.S_ISREG(st.st_mode)` — refuses symlinks outright (`[INV-50]`).
+* `_safe_save_json` already covers symlink refusal for writes.
+* Bulk imports: walk via `path.iterdir()` not `os.walk(followlinks=True)`.

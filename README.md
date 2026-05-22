@@ -134,9 +134,12 @@ installs and the user-data directory location.
   through save as CDS sub-features.
 - **Search** your library with in-process BLASTN / BLASTP / HMMscan
   (via `pyhmmer` — no external `blast+` install).
-- **Drive from outside** via a 90+ endpoint localhost JSON API
+- **Drive from outside** via a 100+ endpoint localhost JSON API
   (`splicecraft --agent`) and a stdlib-only CLI sidecar
-  (`splicecraft-cli`).
+  (`splicecraft-cli`). Custom enzymes + enzyme collections expose
+  full CRUD parity (`list/get/create/update/delete-custom-enzyme`,
+  `list/get/create/update/delete-enzyme-collection`,
+  `get/set-active-enzyme-collection`).
 
 Full feature reference: [`docs/features.md`](docs/features.md).
 
@@ -176,6 +179,19 @@ Full feature reference: [`docs/features.md`](docs/features.md).
   Settings → Entry Vectors…. Configured acceptors flip TU
   classification from the lenient fallback to strict per-acceptor
   matching with explicit role labels.
+- **Enzyme collections.** Manage named subsets of the master enzyme
+  catalog (built-in NEB ∪ user-added customs) via
+  Enzymes → Enzyme collections…. Two-pane layout: master list with
+  search-by-name-or-site on the left, the active catalog on the
+  right. Add enzymes with Enter / Space / double-click / Add →. The
+  active catalog drives the restriction-overlay scan; empty = scan
+  the full master. Add a custom enzyme via the same modal: name,
+  site, fwd/rev cut, type, supplier — persisted to
+  `custom_enzymes.json` and live in every subsequent scan.
+- **Settings dialog.** Settings menu collapsed into one
+  `SettingsModal` — every toggle, the min-primer-binding numeric,
+  plus buttons launching the grammar / entry-vector /
+  enzyme-collection / restore-from-backup sub-modals.
 
 Full data-safety writeup: [`docs/data-safety.md`](docs/data-safety.md).
 Security policy: [`SECURITY.md`](SECURITY.md).

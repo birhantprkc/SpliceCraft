@@ -340,6 +340,16 @@ _MODAL_CASES = [
     ("GrammarEditorModal.new",     lambda: sc.GrammarEditorModal("")),
     ("GrammarManagerModal",        lambda: sc.GrammarManagerModal()),
     ("EntryVectorsModal",          lambda: sc.EntryVectorsModal("gb_l0")),
+    # Enzyme catalog management + custom-enzyme add modals (2026-05-22).
+    # Two-pane layout fits comfortably at 140 width; the smaller add
+    # modal is single-column at 80.
+    ("EnzymeCollectionsModal",     lambda: sc.EnzymeCollectionsModal()),
+    ("AddCustomEnzymeModal",       lambda: sc.AddCustomEnzymeModal()),
+    ("_EnzymeNamePromptModal",     lambda: sc._EnzymeNamePromptModal(
+                                                "New catalog — name?")),
+    # SettingsModal consolidates the Settings dropdown into one dialog
+    # (2026-05-22). Width 80, vertical grouping.
+    ("SettingsModal",              lambda: sc.SettingsModal()),
     ("EditGrammarConfirmModal",    lambda: sc.EditGrammarConfirmModal(
                                                 "MyCustomGrammar",
                                                 n_dependents=3)),

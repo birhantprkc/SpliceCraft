@@ -231,3 +231,153 @@ def test_feature_library_update_unknown_returns_404():
         "sequence": "AAATTT",
     })
     assert isinstance(res, tuple) and res[1] == 404
+
+
+# ── Custom enzymes + enzyme collections CRUD (sweep #24) ─────────────────────
+
+pytestmark_protect = pytest.mark.usefixtures("_protect_user_data")
+
+
+@pytestmark_protect
+def test_custom_enzyme_create_get_update_delete_roundtrip(mock_app):
+    payload = {
+        "name":     "TestAgentEnz",
+        "site":     "GGTACC",
+        "fwd_cut":  1, "rev_cut": 5,
+        "type":     "II_5overhang",
+        "supplier": "agent-test",
+    }
+    res = sc._h_create_custom_enzyme(mock_app, payload)
+    assert res == {"ok": True, "name": "TestAgentEnz"}
+
+    got = sc._h_get_custom_enzyme(None, {"name": "TestAgentEnz"})
+    assert got["ok"] and got["enzyme"]["site"] == "GGTACC"
+
+    listed = sc._h_list_custom_enzymes(None, {})
+    names = {e["name"] for e in listed["enzymes"]}
+    assert "TestAgentEnz" in names
+
+    upd = sc._h_update_custom_enzyme(mock_app, {
+        **payload, "supplier": "edited",
+    })
+    assert upd["ok"]
+    assert sc._h_get_custom_enzyme(None, {"name": "TestAgentEnz"}) \
+        ["enzyme"]["supplier"] == "edited"
+
+    deleted = sc._h_delete_custom_enzyme(mock_app, {"name": "TestAgentEnz"})
+    assert deleted == {"ok": True, "name": "TestAgentEnz"}
+
+
+@pytestmark_protect
+def test_custom_enzyme_create_rejects_builtin_collision(mock_app):
+    res = sc._h_create_custom_enzyme(mock_app, {
+        "name":     "EcoRI",   # built-in
+        "site":     "GAATTC",
+        "fwd_cut":  1, "rev_cut": 5,
+    })
+    assert isinstance(res, tuple) and res[1] == 409
+
+
+@pytestmark_protect
+def test_custom_enzyme_create_rejects_bad_iupac(mock_app):
+    res = sc._h_create_custom_enzyme(mock_app, {
+        "name":     "BadSite",
+        "site":     "GAAZTC",   # Z is not IUPAC
+        "fwd_cut":  1, "rev_cut": 5,
+    })
+    assert isinstance(res, tuple) and res[1] == 400
+
+
+@pytestmark_protect
+def test_custom_enzyme_update_unknown_returns_404(mock_app):
+    res = sc._h_update_custom_enzyme(mock_app, {
+        "name":     "GhostEnz",
+        "site":     "GAATTC",
+        "fwd_cut":  1, "rev_cut": 5,
+    })
+    assert isinstance(res, tuple) and res[1] == 404
+
+
+@pytestmark_protect
+def test_enzyme_collection_create_get_update_delete_roundtrip(mock_app):
+    res = sc._h_create_enzyme_collection(mock_app, {
+        "name":    "AgentCol",
+        "enzymes": ["EcoRI", "BamHI"],
+    })
+    assert res == {"ok": True, "name": "AgentCol"}
+
+    got = sc._h_get_enzyme_collection(None, {"name": "AgentCol"})
+    assert got["ok"]
+    assert sorted(got["collection"]["enzymes"]) == ["BamHI", "EcoRI"]
+
+    upd = sc._h_update_enzyme_collection(mock_app, {
+        "name":    "AgentCol",
+        "enzymes": ["EcoRI", "BamHI", "HindIII"],
+    })
+    assert upd["ok"]
+
+    renamed = sc._h_update_enzyme_collection(mock_app, {
+        "name":     "AgentCol",
+        "new_name": "AgentColRenamed",
+    })
+    assert renamed == {"ok": True, "name": "AgentColRenamed"}
+
+    deleted = sc._h_delete_enzyme_collection(mock_app, {
+        "name": "AgentColRenamed",
+    })
+    assert deleted == {"ok": True, "name": "AgentColRenamed"}
+
+
+@pytestmark_protect
+def test_enzyme_collection_create_duplicate_returns_409(mock_app):
+    sc._h_create_enzyme_collection(mock_app, {
+        "name":    "DupCol",
+        "enzymes": ["EcoRI"],
+    })
+    res = sc._h_create_enzyme_collection(mock_app, {
+        "name":    "DupCol",
+        "enzymes": ["EcoRI"],
+    })
+    assert isinstance(res, tuple) and res[1] == 409
+
+
+@pytestmark_protect
+def test_active_enzyme_collection_get_set_clear(mock_app):
+    sc._h_create_enzyme_collection(mock_app, {
+        "name":    "ActiveTarget",
+        "enzymes": ["EcoRI"],
+    })
+    assert sc._h_get_active_enzyme_collection(None, {}) \
+        == {"ok": True, "name": None}
+
+    set_res = sc._h_set_active_enzyme_collection(mock_app, {
+        "name": "ActiveTarget",
+    })
+    assert set_res == {"ok": True, "name": "ActiveTarget"}
+    assert sc._h_get_active_enzyme_collection(None, {}) \
+        == {"ok": True, "name": "ActiveTarget"}
+
+    clear_res = sc._h_set_active_enzyme_collection(mock_app, {
+        "name": None,
+    })
+    assert clear_res == {"ok": True, "name": None}
+
+
+@pytestmark_protect
+def test_set_active_enzyme_collection_unknown_returns_404(mock_app):
+    res = sc._h_set_active_enzyme_collection(mock_app, {
+        "name": "DoesNotExist",
+    })
+    assert isinstance(res, tuple) and res[1] == 404
+
+
+@pytestmark_protect
+def test_delete_enzyme_collection_clears_active_pointer(mock_app):
+    sc._h_create_enzyme_collection(mock_app, {
+        "name":    "WillDelete",
+        "enzymes": ["EcoRI"],
+    })
+    sc._h_set_active_enzyme_collection(mock_app, {"name": "WillDelete"})
+    assert sc._get_active_enzyme_collection_name() == "WillDelete"
+    sc._h_delete_enzyme_collection(mock_app, {"name": "WillDelete"})
+    assert sc._get_active_enzyme_collection_name() is None

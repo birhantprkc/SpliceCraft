@@ -389,13 +389,169 @@ async def test_entry_vectors_modal_default_focus_on_table():
         assert t.has_focus
 
 
-def test_settings_menu_has_entry_vectors():
-    """The Entry Vectors entry must be in the Settings menu so users
-    can discover it. Greppable check against the source so future
-    refactors of the menu list trip the test."""
+def test_settings_modal_has_entry_vectors():
+    """The Entry Vectors launcher must be reachable from the Settings
+    surface. As of 2026-05-22 the menu was consolidated into a single
+    `SettingsModal`; the Entry Vectors entry lives there as a button
+    (`#set-entry-vectors`) plus the unchanged `action_open_entry_vectors`
+    method on `PlasmidApp`. Greppable so future refactors trip the test."""
     with open(sc.__file__, encoding="utf-8") as f:
         src = f.read()
-    # The menu definition is the only place an action attribute name
-    # appears as `"open_entry_vectors"` in the tuple shape.
-    assert '"open_entry_vectors"' in src
+    assert "action_open_entry_vectors" in src
+    assert "set-entry-vectors" in src
     assert "Entry Vectors" in src
+
+
+# ── Modal auto-detect performance regression guards ────────────────────────
+
+def test_auto_detect_runs_in_worker():
+    """Regression guard for 2026-05-22 perf fix.
+
+    `EntryVectorsModal._auto_detect_worker` must be decorated with
+    `@work(thread=True, ...)` so a 200–500 plasmid active collection
+    doesn't freeze the UI for seconds. Pre-fix the detection loop
+    ran inline in `_auto_btn` on the UI thread."""
+    worker = sc.EntryVectorsModal._auto_detect_worker
+    # Textual's @work decorator preserves the original callable on
+    # `_textual_worker_function` or wraps it; either way the wrapper
+    # exposes `_thread` / `group` metadata. Sanity check: the method
+    # is not the same as a plain function — it's wrapped.
+    assert callable(worker)
+    # Check by source: the decorator line is present immediately above
+    # the def. (Whitebox is acceptable here per the project pattern:
+    # `test_settings_menu_has_entry_vectors` uses the same approach.)
+    with open(sc.__file__, encoding="utf-8") as f:
+        src = f.read()
+    assert (
+        'group="ev-auto-detect"' in src
+    ), "auto-detect worker must use exclusive group 'ev-auto-detect'"
+    # Confirm the worker method is decorated with @work + thread=True
+    # immediately above its def line.
+    import re
+    m = re.search(
+        r'@work\(thread=True[^)]*group="ev-auto-detect"[^)]*\)\s+'
+        r'def _auto_detect_worker',
+        src,
+    )
+    assert m, "@work decorator missing on _auto_detect_worker"
+
+
+def test_detect_cache_hit_skips_recompute(monkeypatch):
+    """Regression guard for 2026-05-22 cache layer.
+
+    Second call with the same (gb_text, grammar_id) must NOT call
+    `_detect_entry_vector_role` again — that's the whole point of
+    the cache (avoids 4–30 s re-digest cost on re-clicks)."""
+    # Clear cache to start clean.
+    sc._clear_entry_vector_detect_cache()
+    grammar = sc._all_grammars()["gb_l0"]
+    rec = _build_acceptor(
+        oh5_inner="GGAG", oh3_inner="CGCT",
+        oh5_outer="GGAG", oh3_outer="GTCA",
+    )
+    from io import StringIO
+    from Bio import SeqIO
+    buf = StringIO()
+    SeqIO.write([rec], buf, "genbank")
+    gb_text = buf.getvalue()
+
+    # First call: cold miss → runs detection.
+    result1 = sc._detect_entry_vector_role_cached(gb_text, grammar)
+    assert result1 is not None
+    assert result1[0] == "Alpha1"
+
+    # Patch the underlying detector to a tripwire — any further call
+    # means the cache missed.
+    called = []
+    real = sc._detect_entry_vector_role
+
+    def _tripwire(record, g):
+        called.append((record, g))
+        return real(record, g)
+
+    monkeypatch.setattr(sc, "_detect_entry_vector_role", _tripwire)
+
+    # Second call: cache hit → tripwire must NOT fire.
+    result2 = sc._detect_entry_vector_role_cached(gb_text, grammar)
+    assert result2 == result1
+    assert called == [], (
+        f"cache hit should have skipped recompute, but detector "
+        f"was called {len(called)} time(s)"
+    )
+
+
+def test_detect_cache_invalidates_on_grammar_save():
+    """Regression guard for 2026-05-22 cache layer.
+
+    `_save_custom_grammars` must clear the EV detection cache so an
+    enzyme change in a user grammar doesn't return a stale role. Same
+    invalidation pattern as `_blast_clear_cache` from `_save_collections`
+    ([PIT-16])."""
+    sc._clear_entry_vector_detect_cache()
+    grammar = sc._all_grammars()["gb_l0"]
+    rec = _build_acceptor(
+        oh5_inner="GGAG", oh3_inner="CGCT",
+        oh5_outer="GGAG", oh3_outer="GTCA",
+    )
+    from io import StringIO
+    from Bio import SeqIO
+    buf = StringIO()
+    SeqIO.write([rec], buf, "genbank")
+    gb_text = buf.getvalue()
+
+    # Warm the cache.
+    sc._detect_entry_vector_role_cached(gb_text, grammar)
+    assert len(sc._ENTRY_VECTOR_DETECT_CACHE) >= 1
+
+    # Save grammars → cache should be empty.
+    sc._save_custom_grammars([])
+    assert len(sc._ENTRY_VECTOR_DETECT_CACHE) == 0, (
+        "_save_custom_grammars must clear _ENTRY_VECTOR_DETECT_CACHE — "
+        "stale results would otherwise survive grammar enzyme edits."
+    )
+
+
+def test_detect_cache_caches_parse_failures():
+    """Regression guard for 2026-05-22 cache layer.
+
+    A gb_text that fails to parse should cache `None` so a re-click
+    doesn't re-pay the (failing) parse attempt. Without this, malformed
+    entries in a 500-plasmid collection would re-parse on every
+    Auto-detect click."""
+    sc._clear_entry_vector_detect_cache()
+    grammar = sc._all_grammars()["gb_l0"]
+    junk = "not a genbank file at all"
+    result1 = sc._detect_entry_vector_role_cached(junk, grammar)
+    assert result1 is None
+    assert len(sc._ENTRY_VECTOR_DETECT_CACHE) == 1, (
+        "parse failure should be cached as None — otherwise re-click "
+        "re-pays the failing parse"
+    )
+
+
+def test_auto_detect_uses_batched_save():
+    """Regression guard for 2026-05-22 perf fix.
+
+    The worker must call `_set_entry_vectors_batch` (one save) not
+    N × `_set_entry_vector` (N saves). Each `_set_entry_vector`
+    triggers `_safe_save_json` + `.bak` + fsync, so a 5-role grammar
+    pre-fix did 5 disk round-trips. Now one."""
+    with open(sc.__file__, encoding="utf-8") as f:
+        src = f.read()
+    # Find the worker body and assert the batch helper is called
+    # inside it.
+    worker_start = src.find("def _auto_detect_worker")
+    assert worker_start > 0, "worker method not found"
+    # Find the next method def after _auto_detect_worker.
+    next_def = src.find("\n    def ", worker_start + 10)
+    worker_body = src[worker_start:next_def]
+    assert "_set_entry_vectors_batch" in worker_body, (
+        "worker must call _set_entry_vectors_batch (one save), "
+        "not per-role _set_entry_vector"
+    )
+    # And the per-role helper should NOT be inside the worker body —
+    # if it slips back in, we're back to N saves.
+    assert "_set_entry_vector(" not in worker_body, (
+        "_set_entry_vector(per-role) leaked back into the worker; "
+        "use _set_entry_vectors_batch for the bulk write"
+    )
