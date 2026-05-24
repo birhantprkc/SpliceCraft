@@ -116,22 +116,27 @@ class TestRestoreCacheBustEnumeration:
 
     def test_modal_cache_bust_covers_sweep9_caches(self):
         """The cache-bust block in `_restore_btn` enumerates every
-        persisted-state cache. Drift between `_TARGETS` and the
-        bust list is the bug the fix locked down.
+        persisted-state cache. Sweep #25 (2026-05-23) replaced the
+        hand-list with iteration of `_MASTER_DELETE_CACHE_ATTRS`
+        (the canonical source of truth). Verify both that the modal
+        iterates the master tuple AND that the master tuple contains
+        the sweep-#9 + original caches.
         """
-        # Inspect the function source to verify each sweep #9 cache
-        # is mentioned (white-box but stable — the cache names are
-        # global state attributes, not implementation detail).
         import inspect
         src = inspect.getsource(sc.RestoreFromBackupModal._restore_btn)
-        assert "_experiments_cache" in src
-        assert "_experiment_projects_cache" in src
-        assert "_gels_cache" in src
+        assert "_MASTER_DELETE_CACHE_ATTRS" in src, (
+            "RestoreFromBackupModal must iterate the canonical "
+            "_MASTER_DELETE_CACHE_ATTRS tuple, not a hand-list"
+        )
+        # Sweep #9 additions must be in the master tuple.
+        assert "_experiments_cache" in sc._MASTER_DELETE_CACHE_ATTRS
+        assert "_experiment_projects_cache" in sc._MASTER_DELETE_CACHE_ATTRS
+        assert "_gels_cache" in sc._MASTER_DELETE_CACHE_ATTRS
         # Original four are still there.
-        assert "_library_cache" in src
-        assert "_collections_cache" in src
-        assert "_parts_bin_cache" in src
-        assert "_primers_cache" in src
+        assert "_library_cache" in sc._MASTER_DELETE_CACHE_ATTRS
+        assert "_collections_cache" in sc._MASTER_DELETE_CACHE_ATTRS
+        assert "_parts_bin_cache" in sc._MASTER_DELETE_CACHE_ATTRS
+        assert "_primers_cache" in sc._MASTER_DELETE_CACHE_ATTRS
 
     def test_agent_backup_labels_parity_with_user_data_files(self):
         """Regression guard for 2026-05-21 fix: `_AGENT_BACKUP_LABELS`

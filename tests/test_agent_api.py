@@ -612,21 +612,24 @@ class TestPlasmidsaurusEndpoints:
         assert isinstance(result, tuple)
         assert result[1] == 400
 
-    def test_list_members_nonexistent_path_returns_422(self, tmp_path):
+    def test_list_members_nonexistent_path_returns_400(self, tmp_path):
+        # Sweep #25 (2026-05-23): collapsed 422 → uniform 400 (FS
+        # oracle reduction — see `_h_list_plasmidsaurus_members`).
         result = sc._h_list_plasmidsaurus_members(
             MockApp(), {"path": str(tmp_path / "does-not-exist.zip")},
         )
         assert isinstance(result, tuple)
-        assert result[1] == 422
+        assert result[1] == 400
 
     def test_list_members_non_zip_rejected(self, tmp_path):
+        # Sweep #25: collapsed 422 → 400.
         bogus = tmp_path / "not-a-zip.zip"
         bogus.write_text("hello world")
         result = sc._h_list_plasmidsaurus_members(
             MockApp(), {"path": str(bogus)},
         )
         assert isinstance(result, tuple)
-        assert result[1] == 422
+        assert result[1] == 400
 
     def test_list_members_filters_non_gbk(self, tiny_record, tmp_path):
         """Members with non-`.gbk`/`.gb`/`.genbank` extensions are
@@ -841,18 +844,18 @@ class TestLoadFileSizeCap:
     could load a 10 GB GenBank file and OOM the worker. Cap is now
     `_BULK_IMPORT_MAX_BYTES` (50 MB) with `force=true` override."""
 
-    def test_oversized_file_rejected_with_413(self, tmp_path, monkeypatch):
-        # 10-byte cap so we don't actually need to write 50 MB.
+    def test_oversized_file_rejected_with_400(self, tmp_path, monkeypatch):
+        # Sweep #25 (2026-05-23): size-cap response collapsed
+        # 413 → uniform 400 (FS oracle reduction — error body no
+        # longer carries `size_bytes` / `cap_bytes`; details in logs).
         monkeypatch.setattr(sc, "_BULK_IMPORT_MAX_BYTES", 10)
         big = tmp_path / "huge.gb"
         big.write_bytes(b"X" * 100)
         app = MockApp()
         result = sc._h_load_file(app, {"path": str(big)})
         payload, status = result
-        assert status == 413
-        assert "cap" in payload["error"].lower()
-        assert payload["size_bytes"] == 100
-        assert payload["cap_bytes"] == 10
+        assert status == 400
+        assert "log" in payload["error"].lower()
 
     def test_force_overrides_size_cap(self, tmp_path, monkeypatch, tiny_record):
         """Pass force=true and the cap is bypassed (matches GUI's
@@ -866,9 +869,11 @@ class TestLoadFileSizeCap:
         _SeqIO.write([tiny_record], sio, "genbank")
         gb.write_text(sio.getvalue())
         app = MockApp()
-        # Without force: rejected.
+        # Sweep #25 (2026-05-23): size-cap response collapsed 413 → 400
+        # (FS oracle reduction). Without force still rejected; with
+        # force still parses.
         result = sc._h_load_file(app, {"path": str(gb)})
-        assert isinstance(result, tuple) and result[1] == 413
+        assert isinstance(result, tuple) and result[1] == 400
         # With force: parsed.
         result = sc._h_load_file(app, {"path": str(gb), "force": True})
         assert isinstance(result, dict) and result["ok"] is True
@@ -877,10 +882,11 @@ class TestLoadFileSizeCap:
         result = sc._h_load_file(MockApp(), {})
         assert result[1] == 400 and "missing" in result[0]["error"]
 
-    def test_nonexistent_path_returns_404(self, tmp_path):
+    def test_nonexistent_path_returns_400(self, tmp_path):
+        # Sweep #25: collapsed 404 → 400 (FS oracle reduction).
         result = sc._h_load_file(MockApp(),
                                   {"path": str(tmp_path / "nope.gb")})
-        assert result[1] == 404
+        assert result[1] == 400
 
 
 # ── End-to-end HTTP tests (real socket + JSON wire format) ─────────────────────
@@ -971,12 +977,23 @@ class TestHTTPAuth:
         )
         assert status == 401
 
-    def test_read_endpoint_works_without_token(self, http_server):
-        """Read-only endpoints should be reachable without auth — they
-        can't damage state, and forcing token-on-every-curl makes
-        scripted introspection awkward."""
+    def test_read_endpoint_requires_token(self, http_server):
+        """Sweep #25 (2026-05-23): bearer token required on ALL
+        endpoints, not just writers. The earlier "reads can't damage
+        state" assumption ignored that several read endpoints
+        (hmmscan, blast, list-library) leak filesystem state or
+        consume CPU/RAM — concrete attack surface for any co-
+        resident local process. `tools` stays unauthenticated as the
+        self-describe entry point."""
         base, _token, _app = http_server
-        status, payload = _http(f"{base}/status", token=None)
+        # Without token: 401.
+        status, _payload = _http(f"{base}/status", token=None)
+        assert status == 401
+        # `tools` stays open so clients can self-describe.
+        status, _payload = _http(f"{base}/tools", token=None)
+        assert status == 200
+        # With token: 200.
+        status, _payload = _http(f"{base}/status", token=_token)
         assert status == 200
 
 
@@ -1857,9 +1874,12 @@ class TestRequestDispatcherHardening:
         # is that the handler didn't AttributeError on a None body.
         assert status in (200, 422)
 
-    def test_handle_normalizes_non_dict_json(self, http_server):
-        # JSON body that's a list, not a dict — should be normalised
-        # to {} before reaching the handler.
+    def test_handle_rejects_non_dict_json(self, http_server):
+        # Sweep #25 (2026-05-23): non-dict / malformed JSON body now
+        # 400s explicitly (was: silently normalised to {} which
+        # masked caller serialisation bugs). The handler still can't
+        # 500 from a `.get()` on a list — the dispatcher catches the
+        # bad shape before reaching the handler.
         base, token, _ = http_server
         import urllib.request, urllib.error
         req = urllib.request.Request(
@@ -1873,8 +1893,8 @@ class TestRequestDispatcherHardening:
             status = 200
         except urllib.error.HTTPError as exc:
             status = exc.code
-        # Must be a clean 200/422 — not a 500 from .get() on a list.
-        assert status in (200, 422)
+        # Either accepted (200) or rejected (400/422) — never a 500.
+        assert status in (200, 400, 422)
 
 
 # ── Plasmid status endpoints (added 2026-05-05 for v1.0) ──────────────────────

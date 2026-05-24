@@ -2870,8 +2870,10 @@ class TestCheckVectorMatchHardening:
         ev_gb = sc._record_to_gb_text(ev_rec)
         sc._VECTOR_MATCH_CACHE.clear()
         first  = sc._vector_half_top_seq(ev_gb, "Esp3I")
-        # Cache must now have an entry for this (gb_text, enzyme) key.
-        assert (ev_gb, "Esp3I") in sc._VECTOR_MATCH_CACHE
+        # Sweep #25 (2026-05-23): cache key now `(hash(gb_text),
+        # enzyme)` not the raw gb_text — pre-fix the multi-MB string
+        # lived in every key tuple (64 × 5 MB worst case ≈ 320 MB).
+        assert (hash(ev_gb), "Esp3I") in sc._VECTOR_MATCH_CACHE
         second = sc._vector_half_top_seq(ev_gb, "Esp3I")
         assert first == second is not None
 

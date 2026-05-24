@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "0.9.19"
+__version__ = "0.9.20"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -129,8 +129,15 @@ def _migrate_legacy_data() -> None:
             prefix=f".{dst.name}.", suffix=".migrating",
             dir=str(dst.parent),
         )
+        # Sweep #25 (2026-05-23): close `fd` on every error path.
+        # Pre-fix `open(src, "rb")` evaluation could raise (missing
+        # file, permission, EIO) BEFORE the `_os.fdopen(fd, "wb")`
+        # construction, leaking `fd`. The broad `except Exception`
+        # below unlinks `tmp_name` but never closed `fd`.
+        fd_owned = True
         try:
             with open(src, "rb") as fsrc, _os.fdopen(fd, "wb") as fdst:
+                fd_owned = False    # `_os.fdopen` took ownership
                 shutil.copyfileobj(fsrc, fdst)
                 fdst.flush()
                 try:
@@ -143,6 +150,11 @@ def _migrate_legacy_data() -> None:
                 pass
             _os.replace(tmp_name, str(dst))
         except Exception:
+            if fd_owned:
+                try:
+                    _os.close(fd)
+                except OSError:
+                    pass
             try:
                 _os.unlink(tmp_name)
             except OSError:
@@ -155,8 +167,10 @@ def _migrate_legacy_data() -> None:
             prefix=f".{target.name}.", suffix=".tmp",
             dir=str(target.parent),
         )
+        fd_owned = True   # sweep #25 — see `_atomic_copy` rationale
         try:
             with _os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd_owned = False
                 f.write(text)
                 f.flush()
                 try:
@@ -165,6 +179,11 @@ def _migrate_legacy_data() -> None:
                     pass
             _os.replace(tmp_name, str(target))
         except Exception:
+            if fd_owned:
+                try:
+                    _os.close(fd)
+                except OSError:
+                    pass
             try:
                 _os.unlink(tmp_name)
             except OSError:
@@ -374,6 +393,19 @@ try:
     import faulthandler as _faulthandler
     import signal as _signal
     _STACKS_LOG_PATH = str(Path(_LOG_PATH).with_name("splicecraft.stacks.log"))
+    # Sweep #25 (2026-05-23): startup-time rotation cap. faulthandler
+    # holds a borrowed FD, so we can't rotate mid-session. Instead,
+    # truncate at startup if the cumulative dump file from prior
+    # sessions exceeds the cap. A single dump is ~5–50 KB; 10 MB
+    # absorbs hundreds of historical dumps before discarding the
+    # whole file. The use case is "user pastes the most recent dump
+    # into a bug report" — older dumps are rarely consulted.
+    _STACKS_LOG_MAX_BYTES = 10_000_000
+    try:
+        if Path(_STACKS_LOG_PATH).stat().st_size > _STACKS_LOG_MAX_BYTES:
+            Path(_STACKS_LOG_PATH).unlink(missing_ok=True)
+    except OSError:
+        pass
     _STACKS_LOG_FD = open(_STACKS_LOG_PATH, "a", buffering=1, encoding="utf-8")
     if hasattr(_signal, "SIGUSR1"):
         _faulthandler.register(_signal.SIGUSR1, file=_STACKS_LOG_FD,
@@ -2680,7 +2712,14 @@ def _acquire_data_dir_lock(
 def _release_data_dir_lock(fd: "int | None") -> None:
     """Release a previously acquired lock. Best-effort — never
     raises. Called from `main()`'s `finally` block but the kernel
-    cleans up on process exit anyway, so this is mainly cosmetic."""
+    cleans up on process exit anyway, so this is mainly cosmetic.
+
+    Sweep #25 (2026-05-23): also best-effort unlink the lockfile on
+    graceful exit. Pre-fix the lockfile lingered after every shutdown;
+    the next launch's PID-alive recheck handled stale lockfiles
+    correctly, but on NFS/SMB shares an unlink cleans up the inode
+    cooperatively. Skips on any OSError (kernel handles it on close).
+    """
     if fd is None:
         return
     try:
@@ -2700,6 +2739,10 @@ def _release_data_dir_lock(fd: "int | None") -> None:
     finally:
         try:
             os.close(fd)
+        except OSError:
+            pass
+        try:
+            (_DATA_DIR / "splicecraft.lock").unlink(missing_ok=True)
         except OSError:
             pass
         _log_event("lock.released")
@@ -3882,9 +3925,31 @@ def _load_library() -> list[dict]:
     return _typed_clone(_library_cache)
 
 
-def _find_library_entry_by_id(entry_id: str) -> "dict | None":
+def _iter_library_readonly() -> list[dict]:
+    """Read-only view of the library cache — returns the cached list
+    directly without cloning. Callers MUST NOT mutate any returned
+    dict or its nested lists; doing so poisons the in-memory cache
+    (pitfall #17). Use for hot read paths (listing endpoints, search
+    filters, primer-usage scans, name-collision precheck) where the
+    multi-second `_typed_clone` cost on a 100+ MB library is
+    meaningful. For any path that mutates entries, use
+    ``_load_library()`` instead. Mirrors ``_iter_collections_readonly``
+    (sweep #23) and added as part of sweep #25 (2026-05-23) to close
+    the perf gap on ~40 library-read callsites.
+    """
+    global _library_cache
+    if _library_cache is None:
+        entries, warning = _safe_load_json(_LIBRARY_FILE, "Plasmid library")
+        if warning:
+            _log.warning(warning)
+        _library_cache = [e for e in entries if isinstance(e, dict)]
+    return _library_cache
+
+
+def _find_library_entry_by_id(entry_id: "str | None") -> "dict | None":
     """Return a deep-clone of the library entry whose ``id`` matches,
-    or ``None`` if no match.
+    or ``None`` if no match. Accepts ``None`` / non-string / empty
+    string and returns ``None`` for those (callsite-friendly).
 
     Sweep #11 (2026-05-20): pre-fix ~80 callsites did
     ``next((e for e in _load_library() if e.get("id") == X), None)``,
@@ -3921,6 +3986,38 @@ def _find_library_entry_by_id(entry_id: str) -> "dict | None":
             if e.get("id") == entry_id:
                 return _typed_clone(e)
     return None
+
+
+def _find_library_entry_by_name(entry_name: str) -> "dict | None":
+    """Return a deep-clone of the first library entry whose ``name``
+    matches, or ``None`` if no match. Sibling of
+    ``_find_library_entry_by_id`` for the rare endpoints (currently
+    ``_h_align_plasmidsaurus_zip``) that accept either an id or a
+    name. Added by sweep #25 (2026-05-23).
+
+    Note: ``name`` is NOT guaranteed unique in the library
+    (collision modals can save a deliberate COPY); returns the first
+    hit, walking in insertion order. Callers needing the canonical
+    one should prefer ``_find_library_entry_by_id``.
+    """
+    if not isinstance(entry_name, str) or not entry_name:
+        return None
+    global _library_cache
+    with _cache_lock:
+        if _library_cache is None:
+            entries, warning = _safe_load_json(
+                _LIBRARY_FILE, "Plasmid library",
+            )
+            if warning:
+                _log.warning(warning)
+            _library_cache = [
+                e for e in entries if isinstance(e, dict)
+            ]
+        for e in _library_cache:
+            if e.get("name") == entry_name:
+                return _typed_clone(e)
+    return None
+
 
 def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
     """Persist the live library and mirror it into the active
@@ -4182,12 +4279,28 @@ def _sync_active_collection_plasmids(
     # qualifiers / features / plasmids lists by reference.
     snapshot = [_typed_clone(e) for e in entries if isinstance(e, dict)]
     if not async_write:
-        colls = _load_collections()
-        for c in colls:
-            if c.get("name") == name:
-                c["plasmids"] = snapshot
-                _save_collections(colls)
+        # Sweep #25 (2026-05-23): readonly iterator + targeted clone.
+        # Pre-fix `_load_collections()` deep-cloned the entire ~160 MB
+        # collections.json just to mutate one entry. Now we walk the
+        # cache by reference under the lock, clone only the matched
+        # entry, then build the save list with original references
+        # for all other entries (safe — we never mutate them; the
+        # `_save_collections` cache reseat deepcopies). RLock lets
+        # the nested `_save_collections` acquire freely.
+        with _cache_lock:
+            src = _iter_collections_readonly()
+            target_idx = None
+            for i, c in enumerate(src):
+                if c.get("name") == name:
+                    target_idx = i
+                    break
+            if target_idx is None:
                 return
+            new_colls = list(src)
+            updated = _typed_clone(new_colls[target_idx])
+            updated["plasmids"] = snapshot
+            new_colls[target_idx] = updated
+            _save_collections(new_colls)
         return
     global _collection_sync_thread, _collection_sync_pending
     with _collection_sync_lock:
@@ -5023,8 +5136,18 @@ def _rebuild_scan_catalog() -> None:
     Called at import time AND after every `_save_custom_enzymes` so a
     newly-added user enzyme participates in subsequent restriction
     scans without a relaunch. Custom enzymes without a registered
-    palette colour fall back to ``_DEFAULT_RESTR_COLOR`` (neutral grey)."""
-    _SCAN_CATALOG.clear()
+    palette colour fall back to ``_DEFAULT_RESTR_COLOR`` (neutral grey).
+
+    Sweep #25 (2026-05-23): builds a fresh list locally then atomically
+    reassigns the global. Pre-fix the sequence ``_SCAN_CATALOG.clear()``
+    + per-enzyme ``.append()`` allowed a concurrent ``_restr_scan_worker``
+    iteration (line 5292 + 82087) to see a partially-rebuilt catalog —
+    missed cut sites OR a tuple-index error mid-iteration. Atomic
+    global reassignment is GIL-safe; in-place mutation under iteration
+    is not. Visible pre-fix symptom: flickering restriction overlay
+    when the user added a custom enzyme mid-scan.
+    """
+    new_catalog: "list[tuple]" = []
     # Use the combined accessor when available — at import time it
     # falls back to `_NEB_ENZYMES` because `_load_custom_enzymes` reads
     # from disk and works fine on a missing file.
@@ -5036,11 +5159,14 @@ def _rebuild_scan_catalog() -> None:
         rc_site = _rc(site_u)
         is_pal  = (rc_site == site_u)
         rc_pat  = None if is_pal else _iupac_pattern(rc_site)
-        _SCAN_CATALOG.append((
+        new_catalog.append((
             name, site_u, len(site_u), fwd_cut, rev_cut,
             _RESTR_COLOR.get(name, _DEFAULT_RESTR_COLOR),
             pat, is_pal, rc_pat,
         ))
+    # Atomic GIL-protected assignment — concurrent iterators either see
+    # the old list or the new list, never a half-built one.
+    globals()["_SCAN_CATALOG"] = new_catalog
 
 _rebuild_scan_catalog()
 
@@ -10431,8 +10557,14 @@ _GB_TEXT_MAX_BYTES = 64 * 1024 * 1024
 # libraries (BioPython GenBank parse is ~5–30 ms per record). Key is
 # the text's hash to avoid holding multi-MB strings in the key tuple.
 # Per pitfall #17 we deepcopy on read so callers can freely mutate.
+# Sweep #25 (2026-05-23): cap reduced from 64 to 16. A parsed
+# SeqRecord can be 5–15× its source text in memory; at 64 × 64 MB
+# worst-case input the cache held up to ~40 GB resident before
+# pruning by entry count alone (no byte-aware eviction). 16 entries
+# still covers every observed hot path (per-frame ≤ 4 records;
+# bulk-export batch ≤ 12 records under typical use).
 _GB_PARSE_CACHE: "_OD" = _OD()
-_GB_PARSE_CACHE_MAX = 64
+_GB_PARSE_CACHE_MAX = 16
 _GB_PARSE_CACHE_LOCK = threading.Lock()
 
 
@@ -11267,6 +11399,15 @@ def _find_annotation_transfers(source_rec, target_rec, *,
         (target_rec.annotations or {}).get("topology") == "circular"
     )
 
+    # Sweep #25 (2026-05-23): hoist `_rc(tgt_seq)` outside the
+    # per-feature loop. Pre-fix this fired once per source feature
+    # (O(F × N_tgt) — for a 100 kb source × 200 features, ~20 MB of
+    # RC work that should be ~100 kb). The RC depends only on the
+    # target, not on the iterating feature. The wrap-tail extension
+    # length `feat_len - 1` IS per-feature, but the slice happens
+    # cheaply inside the loop on the precomputed `rc_tgt_seq`.
+    rc_tgt_seq = _rc(tgt_seq)
+
     transfers: list[dict] = []
     seen_target_spans: set[tuple[int, int, int]] = set()
 
@@ -11311,15 +11452,12 @@ def _find_annotation_transfers(source_rec, target_rec, *,
         # Search target on both strands. For circular targets, scan a
         # tail-extended copy so a feature crossing the origin in the
         # target is found at the right (forward, wrap) coords.
+        # `rc_tgt_seq` was hoisted above the outer loop (sweep #25).
         feat_len = len(feat_bases)
         scan_seqs = [
             (tgt_seq + (tgt_seq[: feat_len - 1] if is_circular else ""), 1),
+            (rc_tgt_seq + (rc_tgt_seq[: feat_len - 1] if is_circular else ""), -1),
         ]
-        rc_tgt_seq = _rc(tgt_seq)
-        scan_seqs.append((
-            rc_tgt_seq + (rc_tgt_seq[: feat_len - 1] if is_circular else ""),
-            -1,
-        ))
 
         for scan_seq, t_strand in scan_seqs:
             start_idx = 0
@@ -11870,14 +12008,21 @@ def _serialize_alignment_for_storage(
             in_memory_entry.get("name", "?"),
         )
         return None
+    # Sweep #25 (2026-05-23): narrow broad `except Exception`. The
+    # real failure modes when `record.seq` is missing or non-string
+    # are `AttributeError` (no `seq` attribute) and `TypeError`
+    # (non-stringifiable Seq subclass). Catching everything masked
+    # BioPython parse errors and OOM-from-corrupt-record paths, so
+    # downstream alignment ran on an empty target and produced
+    # silently-wrong results.
     try:
         target_seq = str(target_record.seq)
-    except Exception:
+    except (AttributeError, TypeError):
         target_seq = ""
     target_id = ""
     try:
         target_id = str(getattr(target_record, "id", "") or "")
-    except Exception:
+    except (AttributeError, TypeError):
         pass
     # `result` from `_pairwise_align` is already plain dict of
     # str/int/float (no SeqRecord refs), so a shallow copy is enough.
@@ -12380,8 +12525,10 @@ def _gff3_features_to_biopython(
     """Convert parsed GFF3 feature rows into BioPython SeqFeature
     objects. Same-`gff_id` rows are rejoined as a CompoundLocation
     (canonical wrap inverse of `_record_to_gff3`). Rows with coords
-    outside ``[0, total)`` are silently dropped — callers should
-    validate ``total`` against ``parsed["length"]`` first.
+    outside ``[0, total)`` are dropped with a per-row warning log
+    (sweep #25 2026-05-23 — pre-fix the drop was silent, so a GFF3
+    with one bad row in a multi-part feature destroyed the entire
+    feature with no user-visible signal).
     """
     from Bio.SeqFeature import (
         SeqFeature, FeatureLocation, CompoundLocation,
@@ -12396,13 +12543,21 @@ def _gff3_features_to_biopython(
 
     out: list = []
 
-    def _make_loc(parts: list[dict]):
+    def _make_loc(parts: list[dict], gid: str = ""):
         # Build FeatureLocation per part, then merge into a
         # CompoundLocation when there are 2+ parts (wrap features).
         locs = []
         for p in parts:
             s, e = p["start_0"], p["end"]
             if s < 0 or e > total or e <= s:
+                # Sweep #25: log instead of silent drop. Use INFO not
+                # WARNING so a noisy GFF3 (e.g. coordinates relative
+                # to a different reference) doesn't spam the log.
+                _log.info(
+                    "GFF3: dropping out-of-range feature %r "
+                    "(type=%s start=%d end=%d total=%d)",
+                    gid or "(no-id)", p.get("type") or "?", s, e, total,
+                )
                 return None
             locs.append(FeatureLocation(s, e, strand=p["strand"] or 0))
         if not locs:
@@ -12412,7 +12567,7 @@ def _gff3_features_to_biopython(
         return CompoundLocation(locs)
 
     for gid, parts in by_id.items():
-        loc = _make_loc(parts)
+        loc = _make_loc(parts, gid=gid)
         if loc is None:
             continue
         first = parts[0]
@@ -12420,7 +12575,7 @@ def _gff3_features_to_biopython(
                             qualifiers=dict(first["qualifiers"]))
         out.append(feat)
     for f in no_id:
-        loc = _make_loc([f])
+        loc = _make_loc([f], gid=f.get("type") or "")
         if loc is None:
             continue
         feat = SeqFeature(loc, type=f["type"],
@@ -16718,11 +16873,20 @@ class LibraryPanel(Widget):
         mirror (the latter via ``async_write=True`` so back-to-back
         adds coalesce into a single mirror write). Cache update
         already happened on the UI thread before dispatch.
+
+        Sweep #25 (2026-05-23): disk write under ``_cache_lock`` so
+        cross-group workers (delete / rename / collection-save)
+        running concurrently can't interleave their ``_safe_save_json``
+        calls. ``exclusive=True`` serialises within the group but a
+        post-add delete dispatches under a different group; pre-fix
+        their disk writes raced. RLock allows nested
+        ``_sync_active_collection_plasmids`` -> ``_save_collections``.
         """
         try:
-            _safe_save_json(
-                _LIBRARY_FILE, entries, "Plasmid library",
-            )
+            with _cache_lock:
+                _safe_save_json(
+                    _LIBRARY_FILE, entries, "Plasmid library",
+                )
         except (OSError, RuntimeError) as exc:
             _log.exception("Plasmid add: library save failed")
             self.app.call_from_thread(
@@ -16764,11 +16928,15 @@ class LibraryPanel(Widget):
         """Worker: persist a collections rename / delete / new
         off-thread. Cache update already happened on the UI thread
         before dispatch.
+
+        Sweep #25 (2026-05-23): disk write under ``_cache_lock``
+        (see ``_add_save_to_disk`` rationale).
         """
         try:
-            _safe_save_json(
-                _COLLECTIONS_FILE, entries, "Plasmid collections",
-            )
+            with _cache_lock:
+                _safe_save_json(
+                    _COLLECTIONS_FILE, entries, "Plasmid collections",
+                )
         except (OSError, RuntimeError) as exc:
             _log.exception("Plasmid collections: save failed")
             self.app.call_from_thread(
@@ -16829,10 +16997,12 @@ class LibraryPanel(Widget):
         key = event.row_key.value if event.row_key else None
         if key is None:
             return
-        for entry in _load_library():
-            if entry.get("id") == key:
-                self.post_message(self.PlasmidLoad(entry))
-                return
+        # Sweep #25 (2026-05-23): use the helper, which clones only
+        # the matched entry. Pre-fix deepcopied the entire library
+        # (potentially 100+ MB) for one row click.
+        entry = _find_library_entry_by_id(key)
+        if entry is not None:
+            self.post_message(self.PlasmidLoad(entry))
 
     @on(Button.Pressed, "#btn-lib-back")
     def _btn_back(self):
@@ -17113,11 +17283,15 @@ class LibraryPanel(Widget):
         single mirror write). Cascades the parts-bin write when the
         deleted library entry had matching bin rows. Cache updates
         already happened on the UI thread before dispatch.
+
+        Sweep #25 (2026-05-23): disk writes under ``_cache_lock``
+        (see ``_add_save_to_disk`` rationale).
         """
         try:
-            _safe_save_json(
-                _LIBRARY_FILE, entries, "Plasmid library",
-            )
+            with _cache_lock:
+                _safe_save_json(
+                    _LIBRARY_FILE, entries, "Plasmid library",
+                )
         except (OSError, RuntimeError) as exc:
             _log.exception("Plasmid delete: library save failed")
             self.app.call_from_thread(
@@ -17133,9 +17307,10 @@ class LibraryPanel(Widget):
             )
         if cascaded_bin is not None:
             try:
-                _safe_save_json(
-                    _PARTS_BIN_FILE, cascaded_bin, "Parts bin",
-                )
+                with _cache_lock:
+                    _safe_save_json(
+                        _PARTS_BIN_FILE, cascaded_bin, "Parts bin",
+                    )
             except (OSError, RuntimeError) as exc:
                 _log.exception(
                     "Plasmid delete: parts-bin cascade save failed",
@@ -22879,6 +23054,33 @@ def _restore_pre_update_snapshot(snap_id_or_path: "str | Path",
                 (name, f"runtime attr {attr!r} is not a Path")
             )
             continue
+        # Sweep #25 (2026-05-23): cap total snapshot-dir restore size
+        # at 5 GB. Pre-fix the dir branch had no size verification
+        # (unlike the file branch's mandatory sha256 check), so a
+        # tampered manifest could declare `n_files=0` for a multi-GB
+        # crash_recovery dir and exhaust user disk on restore. The
+        # snapshot dir lives under the sibling-update-backups path
+        # which has looser perms than `_DATA_DIR`, so a local-
+        # attacker-with-write to that parent has a plausible attack.
+        _SNAPSHOT_DIR_RESTORE_MAX_BYTES = 5 * 1024 * 1024 * 1024
+        try:
+            total_size = 0
+            for f in src.rglob("*"):
+                if f.is_file():
+                    total_size += f.stat().st_size
+                    if total_size > _SNAPSHOT_DIR_RESTORE_MAX_BYTES:
+                        break
+            if total_size > _SNAPSHOT_DIR_RESTORE_MAX_BYTES:
+                summary["failed"].append(
+                    (name, f"snapshot dir exceeds 5 GB restore cap "
+                     f"({total_size:,} bytes); refused"),
+                )
+                continue
+        except OSError as exc:
+            summary["failed"].append(
+                (name, f"size-check failed: {exc}"),
+            )
+            continue
         stash = target.with_name(target.name + ".restoring-old")
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -25320,16 +25522,25 @@ class AddCustomEnzymeModal(ModalScreen[dict]):
         payload = self._validate()
         if payload is None:
             return
-        entries = _load_custom_enzymes()
-        entries.append(payload)
-        try:
-            _save_custom_enzymes(entries)
-        except Exception as exc:
-            _log.exception("save custom enzyme failed")
-            self._set_status(
-                f"[red]Save failed: {exc}[/red]"
-            )
-            return
+        # Sweep #25 (2026-05-23): full RMW under `_cache_lock` so a
+        # concurrent agent `create-custom-enzyme` can't race the
+        # check-then-append. Also routes through `_notify_save_failure`
+        # so failures emit the structured `save.failed` event that
+        # Alt+D bug bundles pick up — pre-fix `_log.exception` was
+        # the only failure trail (INV-65 said "wraps correctly" but
+        # only the status-line update was wrapped, not the event).
+        with _cache_lock:
+            entries = _load_custom_enzymes()
+            entries.append(payload)
+            try:
+                _save_custom_enzymes(entries)
+            except (OSError, RuntimeError) as exc:
+                _log.exception("save custom enzyme failed")
+                _notify_save_failure(self.app, "Custom enzymes", exc)
+                self._set_status(
+                    f"[red]Save failed: {exc}[/red]"
+                )
+                return
         _log_event(
             "custom_enzyme.added",
             name=payload["name"], site=payload["site"],
@@ -28191,7 +28402,10 @@ def _assembly_fragment_recover_gb_text(
         return gb_text
     src_name = str(source.get("name") or "").strip()
     if src_name:
-        for e in _load_library():
+        # Sweep #25: readonly iterator. We only `.get()` fields and
+        # return a string (`e.get("gb_text")`); no mutation of the
+        # cached dict.
+        for e in _iter_library_readonly():
             if not isinstance(e, dict):
                 continue
             if not e.get("gb_text"):
@@ -29755,8 +29969,18 @@ def _vector_half_top_seq(ev_gb: str, enzyme: str) -> "str | None":
     the topology check, a linearised EV file would dispatch through
     `_excise_fragment_pair(circular=True)` and produce nonsense
     fragments. Better to fail closed than report a phantom match.
+
+    Sweep #25 (2026-05-23): key is `(hash(ev_gb), enzyme)` not
+    `(ev_gb, enzyme)`. Pre-fix the key held the full gb_text string
+    (potentially multi-MB); at 64 entries × 5 MB worst-case
+    a steady-state cache could pin ~320 MB just in tuple keys.
+    `hash(str)` is deterministic per-process so cache hits work
+    correctly within a session. Collisions are functionally
+    indistinguishable from a miss (we'd just recompute) — Python
+    `hash(str)` collisions are vanishingly rare across the small
+    enzyme inputs we feed.
     """
-    key = (ev_gb, enzyme)
+    key = (hash(ev_gb), enzyme)
     if key in _VECTOR_MATCH_CACHE:
         return _VECTOR_MATCH_CACHE[key]
     result: "str | None" = None
@@ -30882,6 +31106,36 @@ _SETTINGS_SCHEMA: "dict[str, tuple[tuple, object]]" = {
 }
 
 
+# Sweep #25 (2026-05-23): keys whose string value is used as a name
+# in a lookup (collection / project / parts-bin / primer-collection /
+# enzyme-collection / codon-table) that MAY in the future be joined
+# into a path. Pre-fix `_validate_settings` only enforced type, so a
+# hand-edited `"active_project": "../../../etc/foo"` passed unchanged.
+# Currently these are looked up by name (safe) but a future refactor
+# adding per-project attachment dirs would silently inherit a path-
+# traversal vuln. Defense in depth.
+_SETTINGS_SAFE_IDENTIFIER_KEYS = frozenset((
+    "active_project",
+    "active_collection",
+    "active_parts_bin",
+    "active_primer_collection",
+    "active_enzyme_collection",
+    "active_codon_table",
+))
+
+
+def _is_safe_identifier(value: str) -> bool:
+    """Reject names containing path-traversal characters or NUL.
+    Used by `_validate_settings` for the `active_*` keys whose value
+    a future refactor might join into a path. Permissive otherwise —
+    real collection / project names can carry Unicode + punctuation.
+    """
+    if not isinstance(value, str) or not value:
+        return True   # empty / non-string: type check elsewhere handles
+    forbidden = ("\x00", "/", "\\", "..")
+    return not any(f in value for f in forbidden)
+
+
 def _validate_settings(raw: dict) -> "tuple[dict, list[str]]":
     """Coerce every known key in `raw` to the type declared in
     `_SETTINGS_SCHEMA`. Returns `(cleaned_dict, warnings)`. Unknown
@@ -30916,6 +31170,16 @@ def _validate_settings(raw: dict) -> "tuple[dict, list[str]]":
                 )
                 out[k] = default
                 continue
+            # Sweep #25: defense-in-depth path-traversal check on
+            # `active_*` name keys (see `_SETTINGS_SAFE_IDENTIFIER_KEYS`).
+            if k in _SETTINGS_SAFE_IDENTIFIER_KEYS and isinstance(v, str):
+                if not _is_safe_identifier(v):
+                    warnings.append(
+                        f"settings.{k}: ignored (value contains path-"
+                        f"traversal chars); using default {default!r}"
+                    )
+                    out[k] = default
+                    continue
             out[k] = v
         else:
             # Unknown key — pass through for forward-compat. A future
@@ -30985,8 +31249,30 @@ def _get_setting(key: str, default: "_Any" = None) -> "_Any":
     a narrower return type (`-> str`) without a cast — pyright treats
     ``Any`` as universally assignable, sidestepping the
     ``Unknown | None`` propagation from the loose `_load_settings()`
-    return."""
-    return _load_settings().get(key, default)
+    return.
+
+    Sweep #25 (2026-05-23): reads the cache directly instead of paying
+    a full ``_load_settings()`` deepcopy on every call. With 59 call-
+    sites — including 4 per ``EditCustomizeModal`` open and 24 per
+    ``_get_active_collection_name()`` — the per-call full-dict clone
+    burned ~3–5 ms across the app per second of typical use. Settings
+    values are JSON primitives (str/int/float/bool/None) for ~99% of
+    keys; ``_typed_clone`` of an immutable returns the same object,
+    so the cost is negligible. The handful of container values
+    (e.g. ``experiments_custom_dict``) still clone defensively so a
+    caller mutation can't poison the cache.
+    """
+    global _settings_cache
+    if _settings_cache is None:
+        # Trigger cache populate (one-time per session).
+        _load_settings()
+    with _cache_lock:
+        cache = _settings_cache
+        if cache is None:
+            return default
+        if key not in cache:
+            return default
+        return _typed_clone(cache[key])
 
 
 def _settings_flush_worker() -> None:
@@ -31467,6 +31753,25 @@ def _load_parts_bin() -> list[dict]:
     _parts_bin_cache = entries
     return _typed_clone(_parts_bin_cache)
 
+
+def _iter_parts_bin_readonly() -> list[dict]:
+    """Read-only view of the parts-bin cache — returns the cached list
+    directly without cloning. Callers MUST NOT mutate (pitfall #17).
+    Use for hot read paths (Constructor palette repop, classifier
+    probes) where the per-row deepcopy of qualifier dicts is wasted
+    when the caller only reads fields. For any path that mutates
+    entries, use ``_load_parts_bin()``. Added by sweep #25
+    (2026-05-23) mirroring ``_iter_library_readonly`` /
+    ``_iter_collections_readonly``.
+    """
+    global _parts_bin_cache
+    if _parts_bin_cache is None:
+        entries, warning = _safe_load_json(_PARTS_BIN_FILE, "Parts bin")
+        if warning:
+            _log.warning(warning)
+        _parts_bin_cache = [e for e in entries if isinstance(e, dict)]
+    return _parts_bin_cache
+
 def _save_parts_bin(entries: list[dict]) -> None:
     global _parts_bin_cache
     # Sweep #10 (2026-05-20): mirror moved INSIDE the lock — same fix
@@ -31809,8 +32114,12 @@ def _index_primer_usage_in_collections(use_cache: bool = True) -> "dict[str, int
     # iterate collections) and refuse to write our stale result back.
     entry_gen = _primer_usage_cache_gen
     counts: "dict[str, set[str]]" = {}
+    # Sweep #25 (2026-05-23): read-only iterator — pre-fix deepcopied
+    # the full ~160 MB collections.json on every primer-usage scan
+    # (every PrimerDesignScreen open + every "use count" refresh).
+    # Loop body only `.get()`s; no mutation.
     try:
-        collections = _load_collections()
+        collections = _iter_collections_readonly()
     except Exception:
         _log.exception("primer-usage index: collection load failed")
         return {}
@@ -31919,8 +32228,12 @@ def _find_primer_plasmid_usages(primer_seq: str) -> "list[dict]":
     if not target:
         return []
     out: list[dict] = []
+    # Sweep #25 (2026-05-23): read-only iterator — see
+    # `_index_primer_usage_in_collections` rationale. Loop body only
+    # `.get()`s + appends to a fresh local `out` list; no mutation
+    # of returned dicts.
     try:
-        collections = _load_collections()
+        collections = _iter_collections_readonly()
     except Exception:
         _log.exception("primer-usages: collection load failed")
         return []
@@ -33079,6 +33392,7 @@ def _ncbi_taxid_search(query: str, retmax: int = 200,
     wildcarded via `_ncbi_prep_term`. Pure network — run from a worker."""
     import urllib.parse
     import urllib.request
+    import urllib.error as _urllib_error   # sweep #25 — narrow excepts
     import xml.etree.ElementTree as ET
     q = (query or "").strip()
     if not q:
@@ -33099,7 +33413,12 @@ def _ncbi_taxid_search(query: str, retmax: int = 200,
                           _NCBI_MAX_RESPONSE_BYTES)
             return [], 0, "NCBI returned an oversized response"
         xml_data = raw.decode("utf-8", errors="replace")
-    except Exception as exc:
+    except (OSError, _urllib_error.URLError) as exc:
+        # Sweep #25 (2026-05-23): narrowed from bare `Exception` —
+        # network failures land as `URLError` (timeout, DNS, refused)
+        # or `OSError` (socket-level). Other exceptions (KeyError,
+        # AttributeError) here would be real bugs and should
+        # propagate to surface in the log + dialog.
         _log.exception("NCBI esearch failed for %r", q)
         return [], 0, f"Network error: {exc}"
     try:
@@ -33140,7 +33459,8 @@ def _ncbi_taxid_search(query: str, retmax: int = 200,
                 if item.get("Name") == "ScientificName" and item.text:
                     names_by_id[did] = item.text
                     break
-    except Exception:
+    except (OSError, _urllib_error.URLError, ET.ParseError):
+        # Sweep #25 (2026-05-23): narrowed from bare `Exception`.
         _log.exception("NCBI esummary failed for ids %s", ids[:3])
     hits = [{"taxid": tid,
              "name":  names_by_id.get(tid, f"(taxid {tid})")}
@@ -33156,6 +33476,7 @@ def _codon_fetch_kazusa(taxid: str, timeout: float = 15.0) -> tuple:
     (raw_dict_or_None, status_message). Pure network call — callers should
     invoke from a worker thread."""
     import urllib.request
+    import urllib.error as _urllib_error  # sweep #25 — narrow excepts
     taxid = str(taxid).strip()
     if not taxid.isdigit():
         return None, f"Invalid taxid '{taxid}' (must be numeric)"
@@ -33170,7 +33491,8 @@ def _codon_fetch_kazusa(taxid: str, timeout: float = 15.0) -> tuple:
                           _KAZUSA_MAX_RESPONSE_BYTES)
             return None, "Kazusa returned an oversized response"
         html = raw.decode("utf-8", errors="replace")
-    except Exception as exc:
+    except (OSError, _urllib_error.URLError) as exc:
+        # Sweep #25 (2026-05-23): narrowed from bare `Exception`.
         _log.exception("Kazusa fetch failed for taxid %s", taxid)
         return None, f"Network error: {exc}"
     low = html.lower()
@@ -33479,7 +33801,15 @@ def _design_detection_primers(
                 "PRIMER_NUM_RETURN": 1,
             },
         )
-    except (OSError, Exception) as exc:
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        # Sweep #25 (2026-05-23): `(OSError, Exception)` is `Exception`
+        # since `Exception` subsumes `OSError` — that tuple was a
+        # bare-except in disguise (the INV-65 grep for `(AttributeError,
+        # Exception)` missed the `(OSError, Exception)` shape).
+        # Narrowed to the actual Primer3 failure modes: missing lib
+        # (OSError), bad params (ValueError), and the misc errors the
+        # C wrapper raises (RuntimeError / KeyError / TypeError when
+        # the result dict shape doesn't match).
         return {"error": f"Primer3 rejected parameters: {exc}"}
 
     n_found = result.get("PRIMER_PAIR_NUM_RETURNED", 0)
@@ -34449,8 +34779,8 @@ class AddFeatureModal(ModalScreen):
         def _on_plasmid(entry_id):
             if not entry_id:
                 return
-            match = next((e for e in _load_library()
-                          if e.get("id") == entry_id), None)
+            # Sweep #25: helper avoids the full-library deepcopy.
+            match = _find_library_entry_by_id(entry_id)
             if not match:
                 self.query_one("#addfeat-status", Static).update(
                     "[red]Entry not found.[/red]"
@@ -40712,13 +41042,8 @@ class EntryVectorsModal(ModalScreen):
             if not picked_id:
                 return
             # Locate the library entry by id.
-            entry = next(
-                (
-                    e for e in _load_library()
-                    if e.get("id") == picked_id
-                ),
-                None,
-            )
+            # Sweep #25: helper avoids the full-library deepcopy.
+            entry = _find_library_entry_by_id(picked_id)
             if entry is None:
                 try:
                     self.query_one("#ev-status", Static).update(
@@ -46240,8 +46565,11 @@ class SequencingScreen(Screen):
         """
         opts: list[tuple[str, str]] = []
         try:
+            # Sweep #25: readonly iterator — only `.get()` reads, never
+            # mutates. `sorted` builds a fresh list of references for
+            # downstream loop which only reads fields.
             entries = sorted(
-                (e for e in _load_library() if e.get("id")),
+                (e for e in _iter_library_readonly() if e.get("id")),
                 key=lambda e: _natural_sort_key(
                     e.get("name") or e.get("id") or ""
                 ),
@@ -49797,30 +50125,32 @@ class ExperimentsScreen(Screen):
                 lib._repopulate_plasmids()
             except NoMatches:
                 pass
-        for e in _load_library():
-            if e.get("id") == entry_id:
-                gb_text = e.get("gb_text", "")
-                if not gb_text:
-                    self.app.notify(
-                        "Library entry has no embedded sequence.",
-                        severity="warning",
-                    )
-                    return
-                try:
-                    record = _gb_text_to_record(gb_text)
-                except (ValueError, RuntimeError) as exc:
-                    _log.exception(
-                        "Plasmid-ref load: parse failed for %r",
-                        entry_id,
-                    )
-                    self.app.notify(
-                        f"Could not load plasmid: {exc}",
-                        severity="error",
-                    )
-                    return
-                self.app._apply_record(record)  # type: ignore[attr-defined]
-                _log_event("plasmid.ref.opened", id=entry_id)
+        # Sweep #25: helper avoids the full-library deepcopy for
+        # single-id lookup.
+        e = _find_library_entry_by_id(entry_id)
+        if e is not None:
+            gb_text = e.get("gb_text", "")
+            if not gb_text:
+                self.app.notify(
+                    "Library entry has no embedded sequence.",
+                    severity="warning",
+                )
                 return
+            try:
+                record = _gb_text_to_record(gb_text)
+            except (ValueError, RuntimeError) as exc:
+                _log.exception(
+                    "Plasmid-ref load: parse failed for %r",
+                    entry_id,
+                )
+                self.app.notify(
+                    f"Could not load plasmid: {exc}",
+                    severity="error",
+                )
+                return
+            self.app._apply_record(record)  # type: ignore[attr-defined]
+            _log_event("plasmid.ref.opened", id=entry_id)
+            return
         self.app.notify(
             f"Plasmid {entry_id} not found in {coll_name}.",
             severity="warning",
@@ -54100,8 +54430,10 @@ class SynthesisScreen(Screen):
         += 1`)."""
         base = self._make_entry_id(name)
         try:
+            # Sweep #25: id-set from readonly iterator. We only read
+            # `.get("id")`; never mutate.
             existing_ids = {
-                e.get("id") or "" for e in _load_library()
+                e.get("id") or "" for e in _iter_library_readonly()
                 if isinstance(e, dict)
             }
         except Exception:
@@ -59616,8 +59948,9 @@ class TraditionalCloningPane(Vertical):
         plasmid_id = re.sub(
             r"[^A-Za-z0-9_-]+", "_", name,
         ).strip("_") or "trad_product"
+        # Sweep #25: id-set from readonly iterator (no mutation).
         existing_ids = {
-            e.get("id") or "" for e in _load_library()
+            e.get("id") or "" for e in _iter_library_readonly()
             if isinstance(e, dict)
         }
         unique_id = plasmid_id
@@ -59756,11 +60089,15 @@ class TraditionalCloningPane(Vertical):
         persists to disk + mirrors the active collection (async).
         Exclusive group: rapid Save Fwd / Save Rev clicks coalesce
         on the latest cumulative state.
+
+        Sweep #25 (2026-05-23): disk write under ``_cache_lock``
+        (see ``_add_save_to_disk`` rationale).
         """
         try:
-            _safe_save_json(
-                _LIBRARY_FILE, entries, "Plasmid library",
-            )
+            with _cache_lock:
+                _safe_save_json(
+                    _LIBRARY_FILE, entries, "Plasmid library",
+                )
         except (OSError, RuntimeError) as exc:
             _log.exception("Traditional cloning save: disk write failed")
             self.app.call_from_thread(
@@ -62287,7 +62624,8 @@ class ConstructorModal(ModalScreen):
         # run under `_cache_lock` further down so a concurrent
         # Domesticator mirror / Gibson save can't take the same
         # `unique_id` between our check and our save.
-        existing = {e.get("id") or "" for e in _load_library()}
+        # Sweep #25: id-set from readonly iterator (no mutation).
+        existing = {e.get("id") or "" for e in _iter_library_readonly()}
         unique_id = plasmid_id
         suffix = 2
         while unique_id in existing:
@@ -68554,7 +68892,8 @@ class SimulatorScreen(Screen):
             ))
         gb_text = _record_to_gb_text(rec)
         # Disambiguate name against existing library.
-        existing = {e.get("name", "") for e in _load_library()}
+        # Sweep #25: name-set from readonly iterator (no mutation).
+        existing = {e.get("name", "") for e in _iter_library_readonly()}
         final_name = amp_name
         if final_name in existing:
             n = 2
@@ -70400,6 +70739,19 @@ class RestoreFromBackupModal(ModalScreen):
         super().__init__()
         self._initial_target = initial_target
         self._backups: list[dict] = []
+        # Sweep #25 (2026-05-23): `_dismiss_once` guard — the modal
+        # writes to disk on dismiss and has 3 exit paths (success,
+        # cancel button, action_cancel). A button+Esc race could
+        # double-fire the callback with a payload, then None.
+        # Mirrors INV-64's `_dismiss_once` retrofit on other modals
+        # with multiple exit paths.
+        self._dismissed: bool = False
+
+    def _dismiss_once(self, payload) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(payload)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="restore-box"):
@@ -70532,42 +70884,28 @@ class RestoreFromBackupModal(ModalScreen):
             )
             return
         # Bust EVERY persisted-state cache so the next read picks up
-        # the restored state. Sweep #10 (2026-05-20) — mirrors the
-        # 14-entry enumeration in `_h_restore_pre_update_snapshot` /
-        # `_MASTER_DELETE_CACHE_ATTRS`. Pre-fix this only reset the
-        # original 4 caches (library / collections / parts bin /
-        # primers); sweep #9 added experiments / experiment projects
-        # / gels persisted files but the restore modal was never
-        # extended, so restoring `experiments.json` from .bak left
-        # the in-memory `_experiments_cache` stale + the next UI
-        # mutation silently overwrote the freshly-restored disk
-        # state. `_settings_cache` deliberately NOT reset — restoring
-        # settings would clobber the live app's pointer state mid-
-        # session; the user can restart to pick up a settings restore.
+        # the restored state. Sweep #25 (2026-05-23) — drives the
+        # enumeration from `_MASTER_DELETE_CACHE_ATTRS` (the canonical
+        # list of every `_*_cache` global) so new caches enroll
+        # automatically. `_settings_cache` deliberately skipped —
+        # restoring settings would clobber the live app's pointer
+        # state mid-session; the user can restart to pick up a
+        # settings restore. Pre-sweep this list hand-tracked
+        # `_MASTER_DELETE_CACHE_ATTRS` and drifted: sweep #9 added
+        # experiments/projects/gels caches but the modal kept its old
+        # 14-entry tuple; sweep #20 added primer_usage +
+        # feature_library_index but they weren't propagated; sweep
+        # #24 added custom_enzymes + enzyme_collections, also missed.
         try:
             _sc = __import__("splicecraft")
-            for attr in (
-                "_library_cache",
-                "_collections_cache",
-                "_parts_bin_cache",
-                "_parts_bin_collections_cache",
-                "_primers_cache",
-                "_features_cache",
-                "_feature_colors_cache",
-                "_grammars_cache",
-                "_entry_vectors_cache",
-                "_codon_tables_cache",
-                "_experiments_cache",
-                "_experiment_projects_cache",
-                "_gels_cache",
-                # Sweep #15 (2026-05-20): protein-motif user overrides.
-                "_protein_motifs_cache",
-            ):
+            for attr in _MASTER_DELETE_CACHE_ATTRS:
+                if attr == "_settings_cache":
+                    continue
                 if hasattr(_sc, attr):
                     setattr(_sc, attr, None)
         except (AttributeError, ImportError):
             pass
-        self.dismiss({
+        self._dismiss_once({
             "target":      target_label,
             "source_path": str(backup["source_path"]),
             "n_entries":   n,
@@ -70575,10 +70913,10 @@ class RestoreFromBackupModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-restore-cancel")
     def _cancel_btn(self, _) -> None:
-        self.dismiss(None)
+        self._dismiss_once(None)
 
     def action_cancel(self) -> None:
-        self.dismiss(None)
+        self._dismiss_once(None)
 
 
 class CollectionsModal(ModalScreen):
@@ -72969,7 +73307,10 @@ class LibraryDeleteConfirmModal(ModalScreen):
 # acknowledgement.
 
 import http.server
-import uuid
+# `uuid` was used here for token generation; sweep #25 switched to
+# `secrets.token_urlsafe(32)` (imported locally in `_start_agent_api`).
+# The top-level `import uuid as _uuid` at line 36 covers the other
+# uuid users (session id, experiment / gel / image ids).
 from socketserver import ThreadingMixIn
 
 _AGENT_API_HOST = "127.0.0.1"
@@ -73537,8 +73878,16 @@ def _h_load_file(app, payload):
     path = _sanitize_path(payload.get("path"))
     if path is None:
         return ({"error": "missing 'path'"}, 400)
+    # Sweep #25 (2026-05-23): collapse 404/400/413 to a uniform 400
+    # with no path/size detail in the response — pre-fix the
+    # differentiated codes turned this endpoint into a filesystem-
+    # state oracle (an unauthenticated caller could probe arbitrary
+    # paths to learn which files exist with which sizes). Logs
+    # still carry the detail for the local user's diagnostics.
+    # Mirrors the `_h_hmmscan` pattern from INV-51.
     if not path.exists():
-        return ({"error": f"file not found: {path}"}, 404)
+        _log.warning("agent load-file: not found: %s", path)
+        return ({"error": "file rejected (see splicecraft log)"}, 400)
     # Regular-file + symlink check via `_safe_file_size_check`. Pre-fix
     # `path.is_file()` followed symlinks; a symlink → /dev/zero
     # reported `st_size=0` and the subsequent `load_genbank` parse
@@ -73548,18 +73897,9 @@ def _h_load_file(app, payload):
             else _BULK_IMPORT_MAX_BYTES)
     ok, reason = _safe_file_size_check(path, cap, "plasmid")
     if not ok:
-        # Distinguish "too big" (413) from "not a regular file" (400)
-        # so the agent client can react with the right error code.
-        if "bytes" in (reason or "") and "cap" in (reason or ""):
-            try:
-                size = path.lstat().st_size
-            except OSError:
-                size = 0
-            return ({"error": (
-                f"file is {size:,} bytes (cap {_BULK_IMPORT_MAX_BYTES:,}). "
-                f"Pass force=true to override."
-            ), "size_bytes": size, "cap_bytes": _BULK_IMPORT_MAX_BYTES}, 413)
-        return ({"error": reason or "unsafe file"}, 400)
+        _log.warning("agent load-file: rejected (%s): %s",
+                     reason or "unsafe", path)
+        return ({"error": "file rejected (see splicecraft log)"}, 400)
     try:
         # Mirror the UI Open flow's dispatch. FASTA / AB1 / FASTQ get
         # specialised parsers; everything else falls through to
@@ -74366,7 +74706,10 @@ def _h_list_library(app, payload):
     topology, source_path for each. Subset of the on-disk JSON tuned
     for an agent's "what plasmids do I have" question."""
     out: list[dict] = []
-    for e in _load_library():
+    # Sweep #25 (2026-05-23): read-only iterator — pre-fix paid full
+    # library deepcopy just to project six fields. Build the output
+    # list from immutable reads.
+    for e in _iter_library_readonly():
         seq = e.get("sequence", "") or ""
         out.append({
             "name":        e.get("name", ""),
@@ -74383,7 +74726,10 @@ def _h_list_library(app, payload):
 def _h_list_collections(app, payload):
     """Plasmid collection buckets. Returns name + plasmid count for
     each collection, and which one is currently active."""
-    cols = _load_collections()
+    # Sweep #25 (2026-05-23): read-only iterator — pre-fix paid full
+    # ~160 MB collections.json deepcopy just to project name +
+    # n_plasmids per collection.
+    cols = _iter_collections_readonly()
     active = _get_active_collection_name()
     return {
         "active": active,
@@ -74594,11 +74940,9 @@ def _h_transfer_annotations(app, payload):
     if min_len < 1:
         return ({"error": "'min_len' must be ≥ 1"}, 400)
     dry_run = bool(payload.get("dry_run", True))
-    source_entry: dict | None = None
-    for e in _load_library():
-        if e.get("id") == source_id:
-            source_entry = e
-            break
+    # Sweep #25: id-keyed lookup via helper avoids the per-call full-
+    # library deepcopy that the `for e in _load_library()` form paid.
+    source_entry = _find_library_entry_by_id(source_id)
     if source_entry is None:
         return ({"error": f"no library entry id={source_id!r}"}, 404)
     gb_text = source_entry.get("gb_text", "")
@@ -74670,11 +75014,8 @@ def _h_diff_plasmid(app, payload):
     mode = payload.get("mode", "global")
     if mode not in ("global", "local"):
         return ({"error": "'mode' must be 'global' or 'local'"}, 400)
-    target_entry: dict | None = None
-    for e in _load_library():
-        if e.get("id") == target_id:
-            target_entry = e
-            break
+    # Sweep #25: helper avoids the per-call full-library deepcopy.
+    target_entry = _find_library_entry_by_id(target_id)
     if target_entry is None:
         return ({"error": f"no library entry id={target_id!r}"}, 404)
     gb_text = target_entry.get("gb_text", "")
@@ -74767,18 +75108,25 @@ def _h_list_plasmidsaurus_members(app, payload):
     path = _sanitize_path(raw_path)
     if path is None:
         return ({"error": "could not sanitize 'path'"}, 400)
+    # Sweep #25 (2026-05-23): collapse path-shape errors to a uniform
+    # 400 so the differentiated error responses don't act as a
+    # filesystem-state oracle (pre-fix an unauthenticated caller
+    # could probe arbitrary paths via "not found" / "could not open
+    # zip" / "zip too large" responses). Logs still carry detail.
     ok, reason = _safe_file_size_check(
         path, _PLASMIDSAURUS_ZIP_MAX_BYTES, "Plasmidsaurus zip",
     )
     if not ok:
-        return ({"error": reason or "zip rejected"}, 422)
+        _log.warning("agent list-plasmidsaurus-members: rejected (%s): %s",
+                     reason or "unsafe", path)
+        return ({"error": "zip rejected (see splicecraft log)"}, 400)
     try:
         members = _list_gbk_members_in_zip(path)
-    except ValueError as exc:
-        return ({"error": str(exc)}, 422)
-    except Exception as exc:
-        _log.exception("agent list-plasmidsaurus-members: zip walk failed")
-        return ({"error": f"zip walk failed: {exc}"}, 500)
+    except (ValueError, OSError) as exc:
+        _log.warning(
+            "agent list-plasmidsaurus-members: walk failed (%s)", exc,
+        )
+        return ({"error": "zip rejected (see splicecraft log)"}, 400)
     return {"ok": True, "path": str(path),
             "members": members, "count": len(members)}
 
@@ -74824,22 +75172,26 @@ def _h_align_plasmidsaurus_zip(app, payload):
     path = _sanitize_path(raw_path)
     if path is None:
         return ({"error": "could not sanitize 'path'"}, 400)
+    # Sweep #25 (2026-05-23): collapse path errors to a uniform 400
+    # (see `_h_list_plasmidsaurus_members` rationale).
     ok, reason = _safe_file_size_check(
         path, _PLASMIDSAURUS_ZIP_MAX_BYTES, "Plasmidsaurus zip",
     )
     if not ok:
-        return ({"error": reason or "zip rejected"}, 422)
+        _log.warning("agent align-plasmidsaurus-zip: rejected (%s): %s",
+                     reason or "unsafe", path)
+        return ({"error": "zip rejected (see splicecraft log)"}, 400)
     # Resolve the target in the active library. Cross-collection
     # search isn't this endpoint's job — agents should
     # `set-active-collection` first when the target lives elsewhere.
+    # Sweep #25: id-then-name helpers avoid the per-call full-library
+    # deepcopy. id takes precedence (matches pre-sweep semantics —
+    # `target_id` was checked first on each iteration).
     target_entry: "dict | None" = None
-    for e in _load_library():
-        if target_id and e.get("id") == target_id:
-            target_entry = e
-            break
-        if target_name and e.get("name") == target_name:
-            target_entry = e
-            break
+    if target_id:
+        target_entry = _find_library_entry_by_id(target_id)
+    if target_entry is None and target_name:
+        target_entry = _find_library_entry_by_name(target_name)
     if target_entry is None:
         descriptor = (f"id={target_id!r}" if target_id
                       else f"name={target_name!r}")
@@ -77218,25 +77570,17 @@ def _h_restore_pre_update_snapshot(app, payload):
         _log.exception("agent restore-pre-update-snapshot: write failed")
         return ({"error": f"restore write failed: {exc}"}, 500)
     # Bust every cached user-data so post-restore reads see the
-    # restored state. Sweep #9 (2026-05-19): added experiments /
-    # experiment_projects / gels caches that landed in 0.9.6;
-    # without these, the next UI mutation would silently overwrite
-    # the freshly-restored disk state from the stale in-memory
-    # cache.
-    for cache_attr in (
-            "_library_cache", "_collections_cache",
-            "_parts_bin_cache", "_parts_bin_collections_cache",
-            "_primers_cache", "_features_cache",
-            "_feature_colors_cache", "_grammars_cache",
-            "_entry_vectors_cache", "_codon_tables_cache",
-            "_settings_cache",
-            "_experiments_cache", "_experiment_projects_cache",
-            "_gels_cache",
-            # Sweep #15 (2026-05-20): protein-motif user overrides.
-            "_protein_motifs_cache",
-            # Enzyme catalog extensions (2026-05-22).
-            "_custom_enzymes_cache", "_enzyme_collections_cache",
-    ):
+    # restored state. Sweep #25 (2026-05-23) — drives the enumeration
+    # from `_MASTER_DELETE_CACHE_ATTRS` so new caches enroll
+    # automatically. Pre-sweep this list was hand-maintained and
+    # drifted: sweep #20 added `_primer_usage_cache` +
+    # `_feature_library_index_cache` (derived caches that must reset
+    # when their source data changes); sweep #20 also added
+    # `_primer_collections_cache`. None propagated here. Settings
+    # cache IS reset here (unlike the UI restore path) because the
+    # `splicecraft update --restore` flow is invoked outside the
+    # running app session.
+    for cache_attr in _MASTER_DELETE_CACHE_ATTRS:
         globals()[cache_attr] = None
     return {"ok": True, "report": report}
 
@@ -77357,7 +77701,18 @@ def _h_gibson_assemble(app, payload):
     except (OSError, RuntimeError) as exc:
         _log.exception("agent gibson-assemble: library save failed")
         return ({"error": f"library save failed: {exc}"}, 500)
-    _agent_refresh_library_panel(app)
+    # Sweep #25 (2026-05-23): UI refresh MUST go through
+    # `call_from_thread` from the HTTP worker thread — every other
+    # library-mutating endpoint (`_h_create_collection`,
+    # `_h_delete_collection`, `_h_rename_collection`,
+    # `_h_set_active_collection`, `_h_bulk_import_folder`) does this;
+    # Gibson was the one site missed. Pre-fix the unwrapped call
+    # could touch DataTable rows from the wrong thread, risking UI
+    # crash or panel/disk state divergence.
+    if app is not None and hasattr(app, "call_from_thread"):
+        app.call_from_thread(_agent_refresh_library_panel, app)
+    else:
+        _agent_refresh_library_panel(app)
     return {"ok": True, "saved_name": name, "saved_id": name,
             "result": result}
 
@@ -78493,21 +78848,40 @@ def _h_get_custom_enzyme(app, payload):
 def _h_create_custom_enzyme(app, payload):
     """Add a new custom enzyme. Body:
     ``{name, site, fwd_cut, rev_cut, type?, supplier?}``. Returns 409
-    if `name` collides with an existing built-in or custom enzyme.
-    Mirrors `AddCustomEnzymeModal` validation rules."""
+    if `name` collides with an existing built-in OR custom enzyme.
+    Mirrors `AddCustomEnzymeModal` validation rules.
+
+    Sweep #25 (2026-05-23) — Built-in NEB enzyme names are
+    intentionally reserved: ``create-custom-enzyme`` refuses any
+    name in ``_all_enzymes()``, and ``update-custom-enzyme`` only
+    matches existing CUSTOM entries (not built-ins). The earlier
+    "add a custom enzyme with the same name to override" note
+    in this docstring was aspirational — the actual implementation
+    treats built-in names as read-only. Users wanting an alternate
+    cut convention for a known enzyme name should append a suffix
+    (e.g. ``BsaI-isoschiz``) instead.
+
+    Sweep #25 (2026-05-23): collision-check + load + append + save
+    wrapped in ``_cache_lock`` so two concurrent agent calls can't
+    both pass the collision check on an identical cache snapshot and
+    then both append (silently dropping the first writer's entry on
+    the second save). RLock allows re-entry from ``_save_custom_enzymes``.
+    Matches the worker-side RMW pattern from INV-51.
+    """
     payload_or_err = _agent_validate_custom_enzyme_payload(payload)
     if isinstance(payload_or_err, str):
         return ({"error": payload_or_err}, 400)
-    if payload_or_err["name"] in _all_enzymes():
-        return ({"error":
-                  f"enzyme {payload_or_err['name']!r} already exists; "
-                  "use update-custom-enzyme to modify"}, 409)
-    entries = _load_custom_enzymes()
-    entries.append(payload_or_err)
-    if (err := _agent_save_or_500(
-            lambda: _save_custom_enzymes(entries),
-            "Custom enzymes")) is not None:
-        return err
+    with _cache_lock:
+        if payload_or_err["name"] in _all_enzymes():
+            return ({"error":
+                      f"enzyme {payload_or_err['name']!r} already exists; "
+                      "use update-custom-enzyme to modify"}, 409)
+        entries = _load_custom_enzymes()
+        entries.append(payload_or_err)
+        if (err := _agent_save_or_500(
+                lambda: _save_custom_enzymes(entries),
+                "Custom enzymes")) is not None:
+            return err
     _log_event("custom_enzyme.added",
                 name=payload_or_err["name"], via="agent")
     return {"ok": True, "name": payload_or_err["name"]}
@@ -78517,20 +78891,25 @@ def _h_create_custom_enzyme(app, payload):
 def _h_update_custom_enzyme(app, payload):
     """Replace an existing custom enzyme by `name`. Built-in NEB
     enzymes are not editable via this endpoint (refuse with 400) —
-    add a custom enzyme with the same name to override."""
+    add a custom enzyme with the same name to override.
+
+    Sweep #25: full RMW under ``_cache_lock`` (see
+    ``_h_create_custom_enzyme`` docstring for rationale).
+    """
     payload_or_err = _agent_validate_custom_enzyme_payload(payload)
     if isinstance(payload_or_err, str):
         return ({"error": payload_or_err}, 400)
     name = payload_or_err["name"]
-    entries = _load_custom_enzymes()
-    for i, e in enumerate(entries):
-        if e.get("name") == name:
-            entries[i] = payload_or_err
-            if (err := _agent_save_or_500(
-                    lambda: _save_custom_enzymes(entries),
-                    "Custom enzymes")) is not None:
-                return err
-            return {"ok": True, "name": name}
+    with _cache_lock:
+        entries = _load_custom_enzymes()
+        for i, e in enumerate(entries):
+            if e.get("name") == name:
+                entries[i] = payload_or_err
+                if (err := _agent_save_or_500(
+                        lambda: _save_custom_enzymes(entries),
+                        "Custom enzymes")) is not None:
+                    return err
+                return {"ok": True, "name": name}
     return ({"error": f"unknown custom enzyme {name!r}"}, 404)
 
 
@@ -78540,19 +78919,24 @@ def _h_delete_custom_enzyme(app, payload):
     refused. Any enzyme collection that referenced the deleted name
     keeps the stale row — `_active_enzyme_allowed_set` filters
     against `_all_enzymes()` so the stale name is dropped at
-    scan time without separate housekeeping."""
+    scan time without separate housekeeping.
+
+    Sweep #25: full RMW under ``_cache_lock`` (see
+    ``_h_create_custom_enzyme`` docstring for rationale).
+    """
     name = payload.get("name")
     if not isinstance(name, str) or not name.strip():
         return ({"error": "missing or non-string 'name'"}, 400)
     name = name.strip()
-    entries = _load_custom_enzymes()
-    new_entries = [e for e in entries if e.get("name") != name]
-    if len(new_entries) == len(entries):
-        return ({"error": f"unknown custom enzyme {name!r}"}, 404)
-    if (err := _agent_save_or_500(
-            lambda: _save_custom_enzymes(new_entries),
-            "Custom enzymes")) is not None:
-        return err
+    with _cache_lock:
+        entries = _load_custom_enzymes()
+        new_entries = [e for e in entries if e.get("name") != name]
+        if len(new_entries) == len(entries):
+            return ({"error": f"unknown custom enzyme {name!r}"}, 404)
+        if (err := _agent_save_or_500(
+                lambda: _save_custom_enzymes(new_entries),
+                "Custom enzymes")) is not None:
+            return err
     _log_event("custom_enzyme.deleted", name=name, via="agent")
     return {"ok": True, "name": name}
 
@@ -78593,16 +78977,19 @@ def _h_create_enzyme_collection(app, payload):
     if not isinstance(enzymes, list) or not all(
             isinstance(e, str) for e in enzymes):
         return ({"error": "'enzymes' must be a list of strings"}, 400)
-    entries = _load_enzyme_collections()
-    if any(e.get("name") == name for e in entries):
-        return ({"error":
-                  f"enzyme collection {name!r} already exists; "
-                  "use update-enzyme-collection to modify"}, 409)
-    entries.append({"name": name, "enzymes": sorted(set(enzymes))})
-    if (err := _agent_save_or_500(
-            lambda: _save_enzyme_collections(entries),
-            "Enzyme collections")) is not None:
-        return err
+    # Sweep #25: full RMW under `_cache_lock` (see
+    # `_h_create_custom_enzyme` docstring for rationale).
+    with _cache_lock:
+        entries = _load_enzyme_collections()
+        if any(e.get("name") == name for e in entries):
+            return ({"error":
+                      f"enzyme collection {name!r} already exists; "
+                      "use update-enzyme-collection to modify"}, 409)
+        entries.append({"name": name, "enzymes": sorted(set(enzymes))})
+        if (err := _agent_save_or_500(
+                lambda: _save_enzyme_collections(entries),
+                "Enzyme collections")) is not None:
+            return err
     return {"ok": True, "name": name}
 
 
@@ -78627,29 +79014,32 @@ def _h_update_enzyme_collection(app, payload):
                 isinstance(e, str) for e in enzymes_arg):
             return ({"error":
                       "'enzymes' must be a list of strings"}, 400)
-    entries = _load_enzyme_collections()
-    for i, e in enumerate(entries):
-        if e.get("name") == name:
-            updated = dict(e)
-            if new_name is not None:
-                # Reject rename onto an already-taken name.
-                if new_name != name and any(
-                        x.get("name") == new_name for x in entries):
-                    return ({"error":
-                              f"name {new_name!r} already exists"}, 409)
-                updated["name"] = new_name
-            if enzymes_arg is not None:
-                updated["enzymes"] = sorted(set(enzymes_arg))
-            entries[i] = updated
-            if (err := _agent_save_or_500(
-                    lambda: _save_enzyme_collections(entries),
-                    "Enzyme collections")) is not None:
-                return err
-            # Update active pointer on rename.
-            if new_name is not None and new_name != name and \
-                    _get_active_enzyme_collection_name() == name:
-                _set_active_enzyme_collection_name(new_name)
-            return {"ok": True, "name": updated["name"]}
+    # Sweep #25: full RMW under `_cache_lock` (see
+    # `_h_create_custom_enzyme` docstring for rationale).
+    with _cache_lock:
+        entries = _load_enzyme_collections()
+        for i, e in enumerate(entries):
+            if e.get("name") == name:
+                updated = dict(e)
+                if new_name is not None:
+                    # Reject rename onto an already-taken name.
+                    if new_name != name and any(
+                            x.get("name") == new_name for x in entries):
+                        return ({"error":
+                                  f"name {new_name!r} already exists"}, 409)
+                    updated["name"] = new_name
+                if enzymes_arg is not None:
+                    updated["enzymes"] = sorted(set(enzymes_arg))
+                entries[i] = updated
+                if (err := _agent_save_or_500(
+                        lambda: _save_enzyme_collections(entries),
+                        "Enzyme collections")) is not None:
+                    return err
+                # Update active pointer on rename.
+                if new_name is not None and new_name != name and \
+                        _get_active_enzyme_collection_name() == name:
+                    _set_active_enzyme_collection_name(new_name)
+                return {"ok": True, "name": updated["name"]}
     return ({"error": f"unknown enzyme collection {name!r}"}, 404)
 
 
@@ -78661,14 +79051,17 @@ def _h_delete_enzyme_collection(app, payload):
     if not isinstance(name, str) or not name.strip():
         return ({"error": "missing or non-string 'name'"}, 400)
     name = name.strip()
-    entries = _load_enzyme_collections()
-    new_entries = [e for e in entries if e.get("name") != name]
-    if len(new_entries) == len(entries):
-        return ({"error": f"unknown enzyme collection {name!r}"}, 404)
-    if (err := _agent_save_or_500(
-            lambda: _save_enzyme_collections(new_entries),
-            "Enzyme collections")) is not None:
-        return err
+    # Sweep #25: full RMW under `_cache_lock` (see
+    # `_h_create_custom_enzyme` docstring for rationale).
+    with _cache_lock:
+        entries = _load_enzyme_collections()
+        new_entries = [e for e in entries if e.get("name") != name]
+        if len(new_entries) == len(entries):
+            return ({"error": f"unknown enzyme collection {name!r}"}, 404)
+        if (err := _agent_save_or_500(
+                lambda: _save_enzyme_collections(new_entries),
+                "Enzyme collections")) is not None:
+            return err
     if _get_active_enzyme_collection_name() == name:
         _set_active_enzyme_collection_name(None)
     return {"ok": True, "name": name}
@@ -78767,30 +79160,45 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
     # bail early instead of OOM'ing.
     _MAX_BODY_BYTES = 1 << 20
 
-    def _read_body(self) -> dict:
+    def _read_body(self) -> "dict | str":
+        """Parse and return the JSON request body as a dict.
+
+        Returns ``{}`` on missing or zero-length body.
+        Returns the string ``"__bad_body__"`` sentinel on:
+          - oversized body (Content-Length above cap)
+          - JSON parse error
+          - UTF-8 decode error
+          - socket read OSError mid-body
+        The dispatcher converts this sentinel to ``400`` with
+        ``"malformed JSON body"``. Sweep #25 (2026-05-23) — pre-fix
+        these all silently returned ``{}``, making a malformed body
+        look like a missing body. Surface the actual error so the
+        caller can fix their serialisation instead of hunting a
+        "missing field" mystery.
+        """
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
         except ValueError:
-            return {}
+            return "__bad_body__"
         if length <= 0:
             return {}
         if length > self._MAX_BODY_BYTES:
             _log.warning("agent-api: oversized request body (%d bytes) "
                          "rejected", length)
-            return {}
+            return "__bad_body__"
         try:
             raw = self.rfile.read(length).decode("utf-8")
             data = json.loads(raw) if raw else {}
-            return data if isinstance(data, dict) else {}
+            return data if isinstance(data, dict) else "__bad_body__"
         except (json.JSONDecodeError, UnicodeDecodeError):
-            return {}
+            return "__bad_body__"
         except OSError as exc:
             # Broken socket / connection-reset mid-read. Log for
-            # diagnostic trail, return empty so the dispatch wrapper
-            # converts to a clean 400, not a generic 500 with an OS
-            # error in the body.
+            # diagnostic trail, return sentinel so the dispatch
+            # wrapper converts to a clean 400, not a generic 500
+            # with an OS error in the body.
             _log.warning("agent-api: read_body socket error: %s", exc)
-            return {}
+            return "__bad_body__"
 
     def _send(self, payload: dict, status: int = 200) -> None:
         body = json.dumps(payload, default=str).encode("utf-8")
@@ -78829,6 +79237,16 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
         # encoding step needed.
         return secrets.compare_digest(provided[len("Bearer "):], expected)
 
+    # Sweep #25 (2026-05-23): per-request socket timeout. Pre-fix a
+    # slow-loris client holding `rfile.read(length)` open with a
+    # partial body could pin the worker thread until OS-level
+    # disconnect (minutes). With ThreadingMixIn + daemon_threads, a
+    # handful of slow connections could starve the worker pool.
+    # 30 s is generous for legitimate clients (largest expected body
+    # is the 1 MiB cap above, which transmits in milliseconds over
+    # loopback) and aggressive enough to bound the slow-loris cost.
+    timeout = 30
+
     def do_GET(self):  return self._handle("GET")
     def do_POST(self): return self._handle("POST")
 
@@ -78836,8 +79254,28 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
         # Strip leading slash + query string.
         path_part = self.path.lstrip("/").split("?", 1)[0]
         if path_part in ("", "tools"):
+            # `tools` is intentionally unauthenticated — it's the
+            # self-describe entry point that clients call before
+            # they have a token.
             return self._send(
                 _h_tools(getattr(self.server, "_app", None), {})
+            )
+        # Sweep #25 (2026-05-23): bearer token required on ALL
+        # endpoints (was: write endpoints only). The earlier "reads
+        # can't damage state" assumption ignored that several read
+        # endpoints (hmmscan, blast, list-library, list-primers,
+        # list-parts) leak filesystem state, consume CPU/RAM, or
+        # enumerate user data — concrete attack surface for any
+        # co-resident local process (compromised dep, second shell,
+        # malicious aider session). The CLI sidecar already sends the
+        # token on every call. `tools` stays unauthenticated above so
+        # clients can self-describe before they have a token.
+        # Token check fires BEFORE the handler lookup so unauthenticated
+        # probes for any path get a uniform 401 (not 404 with an
+        # endpoint-list oracle).
+        if not self._check_token():
+            return self._send(
+                {"error": "missing or invalid bearer token"}, 401,
             )
         handler = _AGENT_HANDLERS.get(path_part)
         if handler is None:
@@ -78847,15 +79285,34 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
                 404,
             )
         fn, write = handler
-        if write and not self._check_token():
-            return self._send(
-                {"error": "missing or invalid bearer token"}, 401,
-            )
+        # Sweep #25 (2026-05-23): write endpoints require POST so a
+        # `GET /delete-from-library` URL pasted into a browser can't
+        # silently fire a destructive call (the empty-body request
+        # would 400 on missing 'name' but the dirty-guard's `force`
+        # check would have parsed too late). Read endpoints accept
+        # both GET and POST so query bodies (search-library,
+        # find-orfs, optimize-protein) stay ergonomic via POST while
+        # simple `curl <url>` still works.
+        if write and method != "POST":
+            self.send_response(405)
+            self.send_header("Allow", "POST")
+            self.send_header("Content-Type", "application/json")
+            err_body = json.dumps({
+                "error": f"endpoint {path_part!r} requires POST (mutation)",
+                "allow": "POST",
+            }).encode("utf-8")
+            self.send_header("Content-Length", str(len(err_body)))
+            self.end_headers()
+            self.wfile.write(err_body)
+            return
         body = self._read_body() if method == "POST" else {}
-        # `_read_body` already returns {} on missing / malformed JSON,
-        # but defend against any future code path that might thread a
-        # None through. Handlers expect a dict with .get(); a None
-        # would AttributeError on the very first field access.
+        # Sweep #25: `_read_body` now returns `"__bad_body__"` on
+        # parse error so the dispatcher can 400 instead of silently
+        # treating malformed JSON as missing body.
+        if isinstance(body, str) and body == "__bad_body__":
+            return self._send(
+                {"error": "malformed JSON body"}, 400,
+            )
         if not isinstance(body, dict):
             body = {}
         srv_app = getattr(self.server, "_app", None)
@@ -78870,12 +79327,18 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
             result = fn(srv_app, body)
         except Exception as exc:
             _log.exception("agent-api %s failed", path_part)
+            # Sweep #25 (2026-05-23): scrub data-dir paths from the
+            # error text before serialising. Pre-fix an OSError /
+            # FileNotFoundError / PermissionError carried the full
+            # offending path in `str(exc)`, leaking `_DATA_DIR`
+            # layout via the agent response.
+            scrubbed = _scrub_path(str(exc))
             _log_event(
                 "agent.error", endpoint=path_part,
-                error=str(exc)[:120], type=type(exc).__name__,
+                error=scrubbed[:120], type=type(exc).__name__,
             )
             return self._send(
-                {"error": str(exc), "type": type(exc).__name__}, 500,
+                {"error": scrubbed, "type": type(exc).__name__}, 500,
             )
         finally:
             if prev_live is None:
@@ -78902,10 +79365,18 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
 class _AgentAPIServer(ThreadingMixIn, http.server.HTTPServer):
     """HTTPServer with `_app` and `_token` attached so handlers can
     reach them. ThreadingMixIn so a slow handler (e.g. NCBI fetch)
-    doesn't block other requests."""
+    doesn't block other requests.
+
+    Sweep #25 (2026-05-23): server-level ``timeout=30`` companion to
+    the request-handler timeout so a slow handler also bails. The
+    request_queue_size cap below bounds the burst of connections we
+    accept before TCP-backpressure-rejects further attempts.
+    """
 
     daemon_threads = True
     allow_reuse_address = True
+    timeout = 30
+    request_queue_size = 16
 
     def __init__(self, addr, app, token):
         super().__init__(addr, _AgentRequestHandler)
@@ -78917,8 +79388,16 @@ def _start_agent_api(app, port: int = _AGENT_API_PORT_DEFAULT):
     """Start the agent-API server in a daemon thread.
     Writes `(port, token)` to `_AGENT_TOKEN_FILE` (mode 0600 on POSIX)
     so the `splicecraft-cli` wrapper can find this session.
-    Returns the server instance, or None if the bind failed."""
-    token = uuid.uuid4().hex
+    Returns the server instance, or None if the bind failed.
+
+    Sweep #25 (2026-05-23): token via ``secrets.token_urlsafe(32)``
+    (256-bit) — was ``uuid.uuid4().hex`` (122-bit). Both are
+    cryptographically random in practice on CPython, but ``secrets``
+    is the stdlib's documented bearer-token primitive and gives 2×
+    the entropy with no downside.
+    """
+    import secrets as _secrets
+    token = _secrets.token_urlsafe(32)
     try:
         srv = _AgentAPIServer((_AGENT_API_HOST, port), app, token)
     except OSError as exc:
@@ -78949,8 +79428,13 @@ def _start_agent_api(app, port: int = _AGENT_API_PORT_DEFAULT):
             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
             0o600,
         )
+        # Sweep #25 (2026-05-23): close `fd` if `os.fdopen` itself
+        # raises (rare: MemoryError, EBADF). Pre-fix the broad except
+        # below unlinked `tmp_path` but never closed `fd`.
+        fd_owned = True
         try:
             with os.fdopen(fd, "wb") as fh:
+                fd_owned = False    # `os.fdopen` took ownership
                 fh.write(body)
                 fh.flush()
                 try:
@@ -78958,6 +79442,11 @@ def _start_agent_api(app, port: int = _AGENT_API_PORT_DEFAULT):
                 except OSError:
                     pass
         except Exception:
+            if fd_owned:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             try:
                 tmp_path.unlink(missing_ok=True)
             except OSError:
@@ -81786,6 +82275,40 @@ SpeciesPickerModal { align: center middle; }
         except OSError:
             _log.exception("Could not scan crash-recovery dir")
             return
+        # Sweep #25 (2026-05-23): prune files older than 30 days OR
+        # beyond a 50-file count cap (oldest first). Pre-fix the
+        # directory accumulated forever; a user who hit one crash
+        # per week for a year accumulated ~50 unnoticed `.gb` files
+        # (each a full plasmid dump, ~10–500 KB), unbounded over the
+        # install lifetime. We notify the user about new files
+        # below, so retaining old ones serves no recovery purpose
+        # (the user has already either recovered or moved on).
+        import time as _time
+        _CRASH_RECOVERY_MAX_AGE_S = 30 * 86400
+        _CRASH_RECOVERY_MAX_FILES = 50
+        try:
+            now_ts = _time.time()
+            stale = [
+                p for p in leftovers
+                if (now_ts - p.stat().st_mtime) > _CRASH_RECOVERY_MAX_AGE_S
+            ]
+            for p in stale:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+            leftovers = [p for p in leftovers if p not in stale]
+            if len(leftovers) > _CRASH_RECOVERY_MAX_FILES:
+                # Drop oldest first beyond the cap.
+                by_age = sorted(leftovers, key=lambda p: p.stat().st_mtime)
+                for p in by_age[:-_CRASH_RECOVERY_MAX_FILES]:
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+                leftovers = sorted(_CRASH_RECOVERY_DIR.glob("*.gb"))
+        except OSError:
+            _log.exception("crash-recovery prune failed")
         if not leftovers:
             # Clean directory: clear the seen-set so a future first-
             # time crash isn't silenced by a stale acknowledgement.
@@ -83127,26 +83650,36 @@ SpeciesPickerModal { align: center middle; }
         # blocks the UI. `_save_library` is itself atomic via the
         # `_safe_save_json` envelope (see CLAUDE.md sacred invariant
         # #7), so an interruption here can't corrupt the on-disk file.
+        #
+        # Sweep #25 (2026-05-23): full RMW under `_cache_lock`.
+        # Pre-fix `_load_library()` happened outside the lock; a
+        # concurrent Constructor/Gibson/Domesticator save landing
+        # between the load and `_save_library` would be silently
+        # dropped (our stale snapshot would clobber its addition).
+        # INV-51 closed this for cross-group workers but the
+        # canonical App-level Ctrl+S worker was the one site missed.
+        # RLock allows re-entry from `_save_library`'s inner lock.
         try:
-            entries = _load_library()
-            prev_status = ""
-            for e in entries:
-                if e.get("id") == record_id:
-                    prev_status = _sanitize_plasmid_status(e.get("status"))
-                    break
-            entries = [e for e in entries if e.get("id") != record_id]
-            entries.insert(0, {
-                "name":    record_name or record_id,
-                "id":      record_id,
-                "size":    _seq_len(record),
-                "n_feats": len([f for f in record.features
-                                 if f.type != "source"]),
-                "source":  getattr(record, "_tui_source", f"id:{record_id}"),
-                "added":   _date.today().isoformat(),
-                "gb_text": gb_text,
-                "status":  prev_status,
-            })
-            _save_library(entries)
+            with _cache_lock:
+                entries = _load_library()
+                prev_status = ""
+                for e in entries:
+                    if e.get("id") == record_id:
+                        prev_status = _sanitize_plasmid_status(e.get("status"))
+                        break
+                entries = [e for e in entries if e.get("id") != record_id]
+                entries.insert(0, {
+                    "name":    record_name or record_id,
+                    "id":      record_id,
+                    "size":    _seq_len(record),
+                    "n_feats": len([f for f in record.features
+                                     if f.type != "source"]),
+                    "source":  getattr(record, "_tui_source", f"id:{record_id}"),
+                    "added":   _date.today().isoformat(),
+                    "gb_text": gb_text,
+                    "status":  prev_status,
+                })
+                _save_library(entries)
         except Exception as exc:
             _log.exception("Library update failed during save")
             self.call_from_thread(
@@ -86712,11 +87245,15 @@ SpeciesPickerModal { align: center middle; }
         `entries` includes both renames (in-memory cache was updated
         sync before each call), so the second write captures the
         cumulative state.
+
+        Sweep #25 (2026-05-23): disk write under ``_cache_lock``
+        (see ``_add_save_to_disk`` rationale).
         """
         try:
-            _safe_save_json(
-                _LIBRARY_FILE, entries, "Plasmid library",
-            )
+            with _cache_lock:
+                _safe_save_json(
+                    _LIBRARY_FILE, entries, "Plasmid library",
+                )
         except (OSError, RuntimeError) as exc:
             _log.exception("rename: disk save failed")
             self.call_from_thread(

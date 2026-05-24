@@ -80,8 +80,21 @@ def _read_session() -> tuple[str, int, str]:
             f"  Expected token file: {f}\n"
             f"  Start the GUI with: splicecraft --agent"
         )
+    # Sweep #25 (2026-05-23): `lstat` not `stat` — `f.stat()`
+    # follows symlinks. A pre-placed symlink at the token path
+    # pointing to (e.g.) `/etc/passwd` would be silently followed,
+    # read up to 1 KB, and stderr-leak via the malformed-port
+    # error message ("Malformed port in <token-file>: 'root:x:0...'").
+    # Niche but trivially fixable.
+    import stat as _stat
     try:
-        size = f.stat().st_size
+        st = f.lstat()
+        if _stat.S_ISLNK(st.st_mode):
+            sys.exit(
+                f"Refusing to read symlinked token file {f}. "
+                f"Restart the GUI to regenerate."
+            )
+        size = st.st_size
     except OSError as exc:
         sys.exit(f"Could not stat token file {f}: {exc}")
     if size > _CLI_TOKEN_FILE_MAX_BYTES:

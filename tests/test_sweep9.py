@@ -33,16 +33,25 @@ class TestRestoreEndpointBustsNewCaches:
     silently overwrite them from the stale in-memory cache."""
 
     def test_handler_source_lists_all_three_new_caches(self):
-        # Inspect the handler's source string — the cache list is a
-        # literal tuple. Any drift in the list shows up here.
+        # Sweep #25 (2026-05-23): the handler no longer hand-lists
+        # cache names — it iterates `_MASTER_DELETE_CACHE_ATTRS` (the
+        # canonical source of truth). Verify both that the handler
+        # iterates the master tuple AND that the master tuple
+        # actually contains the three sweep-#9 caches.
         import inspect
         src = inspect.getsource(sc._h_restore_pre_update_snapshot)
+        assert "_MASTER_DELETE_CACHE_ATTRS" in src, (
+            "Restore handler must iterate the canonical "
+            "_MASTER_DELETE_CACHE_ATTRS tuple, not a hand-list"
+        )
         for name in (
             "_experiments_cache",
             "_experiment_projects_cache",
             "_gels_cache",
         ):
-            assert name in src, f"restore handler missing {name}"
+            assert name in sc._MASTER_DELETE_CACHE_ATTRS, (
+                f"_MASTER_DELETE_CACHE_ATTRS missing {name}"
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
