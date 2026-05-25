@@ -41725,8 +41725,16 @@ class FeatureLibraryScreen(Screen):
 
         Audit fix 2026-05-14: extends invariant #17's spirit to the
         Screen-resume lifecycle.
+
+        Sweep #26 (2026-05-25): also bail when `_has_pending_changes`
+        is set even without dirty indices. The remove path
+        (`action_remove`) sets pending without dirty (deletes don't
+        get asterisks since the row is gone) and the resume reload
+        used to silently undo the deletion when the
+        `LibraryDeleteConfirmModal` popped — the in-memory delete was
+        clobbered before the next `action_save` could persist it.
         """
-        if self._dirty_indices:
+        if self._dirty_indices or self._has_pending_changes:
             return
         try:
             self._entries = _load_features()

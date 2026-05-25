@@ -136,19 +136,26 @@ class TestFeatureLibraryCrud:
             app.push_screen(sc.FeatureLibraryScreen())
             await pilot.pause()
             await pilot.pause(0.1)
-            app.screen.action_remove()
+            lib_screen = app.screen
+            lib_screen.action_remove()
+            await pilot.pause()
+            # Sweep #26: action_remove now pushes LibraryDeleteConfirmModal
+            # (parity with every other delete path). Simulate the user
+            # picking "Yes, remove" so the callback fires the actual delete.
+            assert isinstance(app.screen, sc.LibraryDeleteConfirmModal)
+            app.screen._dismiss_once(True)
             await pilot.pause()
             # In-memory list shows the removal; disk does not.
-            assert app.screen._entries == []
-            assert app.screen._has_pending_changes is True
+            assert lib_screen._entries == []
+            assert lib_screen._has_pending_changes is True
             sc._features_cache = None
             assert len(sc._load_features()) == 1
             # action_save persists.
-            app.screen.action_save()
+            lib_screen.action_save()
             await pilot.pause()
             sc._features_cache = None
             assert sc._load_features() == []
-            assert app.screen._has_pending_changes is False
+            assert lib_screen._has_pending_changes is False
 
     async def test_duplicate_adds_copy_suffix(self, tiny_record):
         sc._save_features([{
@@ -403,6 +410,11 @@ class TestFeatureLibraryUnsavedFlow:
             # Remove middle entry (index 1).
             screen._selected_index = 1
             screen.action_remove()
+            await pilot.pause()
+            # Sweep #26: confirm the LibraryDeleteConfirmModal that
+            # action_remove now pushes so the callback's deletion fires.
+            assert isinstance(app.screen, sc.LibraryDeleteConfirmModal)
+            app.screen._dismiss_once(True)
             await pilot.pause()
             # Index 0 still dirty, former index 2 is now index 1.
             assert screen._dirty_indices == {0, 1}, (
