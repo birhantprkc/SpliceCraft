@@ -14,6 +14,40 @@
 
 ---
 
+## [0.9.26] — 2026-05-25
+
+### Bug fixes
+
+- **Switching parts bins no longer fails with a catastrophic-shrink error.** Switching from a populated parts bin (e.g. "Eden Parts" with 26 parts) to an empty one (e.g. a freshly-created "FFE Parts") used to be refused by the catastrophic-shrink guard — your data was always safe (the guard saved every "lost" part to `lost_entries/` for triple safety), but the UI bin switch failed with no recovery path. The bin-switch save now correctly signals to the shrink guard that this is a deliberate mirror swap (the outgoing bin's parts are intact under their original name in `parts_bin_collections.json`). Same fix applied to collection-switch, project-switch (UI + agent endpoint), and project-delete-with-auto-promote.
+- **Bare `@work` decorators caught at test time.** A new AST-walk test asserts every `@work(...)` decorator carries `thread=True`. A missing `thread=True` silently runs the worker on the UI thread as a coroutine — defeats the worker contract and freezes the app. Catches the next regression at test time instead of bug-report time.
+- **GFF3 strand column now validated.** Pre-sweep any string in the strand column was silently mapped to strand 0 (neither); a malformed GFF3 with embedded ANSI escape codes or HTML in the strand column would parse and could surface in toasts unescaped. Rows with strand outside `{+, -, ., ?}` are now skipped with a debug log.
+- **FASTA Open dialog can't OOM the app.** A 1 GB FASTA pasted into the Open dialog used to OOM the worker before any size check fired (`SeqIO.parse` is eager). New `_FASTA_MAX_BYTES = 64 MB` cap rejects oversized files BEFORE the parse runs, with a clear error message.
+
+### New features
+
+- **Agent API rate limiting.** Per-token bucket (60 tokens, refilling 30/sec; writes cost 2). A misbehaving local script with the bearer token can no longer fire unlimited mutations against the server. Exhausted bucket returns HTTP 429 with a back-off hint.
+- **Agent API idempotency keys.** Optional `X-Idempotency-Key` header on write endpoints. Retries within 60 s replay the prior response without re-invoking the handler, so a hiccupy network can't silently double-create entries. Cached responses carry `_idempotent_replay: true` so the caller can tell a replay from a fresh execution.
+- **Pillow decompression-bomb hard ceiling.** `Image.MAX_IMAGE_PIXELS` set at module import to match our existing `_EXPERIMENT_CLIP_MAX_PIXELS = 50 MP`. A malicious clipboard paste now blocks at decoder time, BEFORE Pillow allocates the decompressed RGB buffer.
+
+### Hardening
+
+- **L2 chokepoint extended to deletes.** New `_refuse_unauthorized_delete` helper covers `_delete_dna_original`, `_clear_autosave`, crash-recovery pruning. Pre-sweep an unsandboxed `import splicecraft` script could call these helpers and unlink user data; now refused unless `_authorize_writes_for_sandbox` has been called.
+- **L2 chokepoint on `_save_ui_snapshot`.** The last `_atomic_write_text` caller under `_DATA_DIR` that bypassed the chokepoint. Same gate as `_save_dna_original` / `_save_experiment_image` / `_do_autosave`.
+- **5 agent endpoints stop leaking exception text.** `_h_load_file`, `_h_load_entry`, `_h_transfer_annotations`, `_h_diff_plasmid`, `_h_align_plasmidsaurus_zip` now route exception messages through `_scrub_path` or collapse to opaque "see log" responses. Pre-sweep an `OSError` carrying `strerror` / `filename` could leak filesystem layout to a token-holding local attacker.
+- **NCBI Entrez `tool` identifier.** We now identify our traffic to NCBI via `Entrez.tool = "SpliceCraft/<version>"` as their E-utilities policy requests. Pre-sweep we set `email` only; NCBI could throttle or block unidentified traffic.
+- **`Authorization` header case-insensitive.** The "bearer" scheme keyword is now matched case-insensitive per RFC 7235; the token comparison itself stays case-sensitive (URL-safe base64) and constant-time.
+- **Three threading caches converted to `RLock`.** `_GB_PARSE_CACHE_LOCK`, `_BLAST_CACHE_LOCK`, `_BLAST_FINGERPRINT_CACHE_LOCK` were `threading.Lock` (non-reentrant) while the rest of the codebase standardised on `RLock` so save chains can nest. A future caller that builds a BLAST DB while holding `_cache_lock` no longer risks deadlock for no good reason.
+- **`_find_usages_worker` shutdown-safe.** The primer-usages-lookup worker now bails before `call_from_thread` if its screen is unmounted or the app is exiting. Pre-sweep a race during shutdown could call `call_from_thread` after the runtime had already started tearing down workers.
+- **Autosave timer cancelled on app exit.** Hygiene: explicit `timer.stop()` in `on_unmount` + every quit path, so the 3 s debounce can't fire against a record we're abandoning.
+- **Crash-injection regression test.** New `tests/test_sweep27.py::TestCrashInjectionSafeSaveJson` SIGKILLs a child process mid-`_safe_save_json` and confirms the `.bak` recovery returns a non-torn payload. Codifies the atomic-write contract from `[INV-37]`.
+- **Concurrency fuzz regression test.** N-thread random save/load schedule against the library; post-run we assert every entry is dict, every id is non-empty, no duplicate ids, and JSON on disk parses. Would have caught the 20 RMW races sweep #26 fixed individually.
+- **Golden-file regression for JSON envelopes.** Tests pin the envelope shape (`{"_schema_version": 1, "entries": [...]}`, indented for diffability, legacy bare-list back-compat). A regression in the writer (key order, indent drift) gets caught at test time.
+- **Single `_now()` time source.** `_now()` returns tz-aware datetime; `_monotonic()` returns float. New callsites should route through these; existing 18 `datetime.now()` sites can migrate incrementally. Side benefit: deterministic timestamps in tests via a single monkeypatch.
+- **`_safe_data_repr` helper for error messages.** Type/length-only summary; never echoes raw user data. Use in `notify(...)` / error paths instead of f-string interpolating sequences, names, or other content that could carry terminal escape codes from a malicious paste.
+- **New invariants pinned**: `[INV-75]` delete chokepoint, `[INV-76]` crash-injection test, `[INV-77]` concurrency fuzz, `[INV-78]` single time source, `[INV-79]` golden-file envelope, `[INV-80]` idempotency keys, `[INV-81]` data-value scrub helper, `[INV-82]` `@work` thread enforcement, `[INV-83]` mirror-write helper.
+
+---
+
 ## [0.9.25] — 2026-05-25
 
 _(auto-generated from commits since v0.9.24)_

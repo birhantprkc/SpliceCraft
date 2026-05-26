@@ -693,8 +693,19 @@ class TestBlastCacheLock:
 
     def test_lock_exists(self):
         assert hasattr(sc, "_BLAST_CACHE_LOCK")
-        import threading as _threading
-        assert isinstance(sc._BLAST_CACHE_LOCK, type(_threading.Lock()))
+        # Sweep #27 (LOW-11): converted to RLock for convention parity
+        # with `_cache_lock`. Either lock type is acceptable for the
+        # critical sections (none re-enter today), but RLock is the
+        # codebase-wide standard so a future caller that does end up
+        # nesting can compose without deadlock risk. Accept either
+        # type so a hypothetical revert wouldn't trip the test, but
+        # do confirm it IS a lock-like object with `acquire`/`release`.
+        lock = sc._BLAST_CACHE_LOCK
+        assert hasattr(lock, "acquire") and hasattr(lock, "release")
+        # Probe the context-manager interface — both Lock and RLock
+        # support it; this catches a regression to a non-lock object.
+        with lock:
+            pass
 
     def test_get_db_source_uses_lock(self):
         import inspect

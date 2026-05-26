@@ -42,7 +42,7 @@ from io import StringIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-__version__ = "0.9.25"
+__version__ = "0.9.26"
 
 # Snapshot the runtime platform string ONCE at module import. On some
 # OSes `platform.platform()` shells out via `subprocess.run` to learn
@@ -55,6 +55,46 @@ try:
     _RUNTIME_PLATFORM: str = platform.platform()
 except Exception:  # pragma: no cover — defensive against weird platforms
     _RUNTIME_PLATFORM = "?"
+
+# ── Single time source (INV-78, sweep #27) ────────────────────────────
+# Every wall-clock and monotonic-clock read in the codebase should go
+# through these two helpers. Three reasons:
+#
+#   1. **Testability** — a monkeypatch on `_now` / `_monotonic` covers
+#      every callsite at once. Pre-sweep, ~18 direct `datetime.now()`
+#      calls had to be patched individually (backup rotation, daily
+#      snapshot dedup, lock staleness, autosave debounce, etc.), which
+#      made clock-skew tests practically infeasible.
+#
+#   2. **Timezone discipline** — `_now()` always returns a tz-aware
+#      datetime. Naive `datetime.now()` returns local-naive, which
+#      compares badly against `datetime.now(timezone.utc)` and surfaces
+#      as silent off-by-hours bugs around DST transitions.
+#
+#   3. **Single point of attack** — a future "freeze clock for the
+#      duration of this transaction" requirement (e.g. atomic batch
+#      saves whose timestamps must agree) gets implemented in one place.
+import time as _time_mod
+
+
+def _now() -> _datetime:
+    """Current wall-clock as a tz-aware datetime in the user's local
+    zone. Use this everywhere instead of `datetime.now()`."""
+    return _datetime.now().astimezone()
+
+
+def _monotonic() -> float:
+    """Monotonic clock reading in seconds. Use for elapsed-time
+    measurements; `_now()` for absolute timestamps."""
+    return _time_mod.monotonic()
+
+# ── Format size caps ──────────────────────────────────────────────────
+# Centralised here so every parser's cap is greppable in one place.
+# Mirror of `_GB_TEXT_MAX_BYTES` (defined near the GenBank section);
+# the FASTA cap landed in sweep #27 after an audit found `_do_load`
+# called `SeqIO.parse(path, "fasta")` without a size pre-check, which
+# would have OOM'd on a 1 GB user-supplied FASTA.
+_FASTA_MAX_BYTES = 64 * 1024 * 1024
 
 # ── Biopython warning filters ─────────────────────────────────────────
 # Some real-world records (notably NCBI Entrez exports that picked up
@@ -75,6 +115,24 @@ try:
         category=_BiopythonWarning,
     )
 except ImportError:
+    pass
+
+# ── Pillow decompression-bomb ceiling (MED-7, sweep #27) ──────────────
+# Pillow ships with a default 89_478_485-pixel decompression-bomb
+# warning + a 178_956_970-pixel hard error. We want the hard refusal at
+# our own ceiling so a malicious clipboard-paste / file attach blocks
+# at decode time, BEFORE Pillow allocates the decompressed RGB buffer.
+# `ImageAttachModal._clip` separately checks `img.width * img.height`
+# AFTER `grabclipboard()` returns — but `grabclipboard()` already
+# allocates the buffer to read `img.width`. Setting MAX_IMAGE_PIXELS
+# here pushes the refusal earlier into Pillow's decoder so the
+# allocation never happens. Defensive against PIL absence (optional
+# dep) — set is best-effort.
+try:
+    from PIL import Image as _PILImage  # type: ignore
+    _PILImage.MAX_IMAGE_PIXELS = 50_000_000  # mirrors _EXPERIMENT_CLIP_MAX_PIXELS
+    del _PILImage
+except (ImportError, AttributeError):
     pass
 
 # ── User data directory ────────────────────────────────────────────────────────
@@ -343,6 +401,37 @@ def _chmod_user_only(path: "Path | str") -> None:
         os.chmod(str(path), 0o600)
     except OSError:
         pass
+
+
+def _safe_data_repr(value, *, max_len: int = 32) -> str:
+    """[INV-81, sweep #27] Type/length-only summary for user-facing
+    error messages. Use this in notify() / Static.update() error
+    paths instead of f-string interpolating raw user data.
+
+    Pre-sweep some error paths embedded the offending value verbatim,
+    e.g. ``f"Sequence too short: {seq}"`` — fine for short inputs but
+    a 50 KB pasted FASTA would surface as a toast that wraps off the
+    bottom of the terminal. More importantly, raw values can carry
+    embedded ANSI escape sequences or terminal control codes from a
+    malicious paste / agent payload that would render in the toast.
+
+    Returns: ``"<type>(len=N)"`` for sized containers / strings /
+    bytes; ``"<type>"`` for scalars; ``"None"`` for None. Never
+    surfaces the value itself."""
+    if value is None:
+        return "None"
+    type_name = type(value).__name__
+    try:
+        if isinstance(value, (str, bytes, bytearray)):
+            return f"<{type_name}(len={len(value)})>"
+        if isinstance(value, (list, tuple, set, dict)):
+            return f"<{type_name}(n={len(value)})>"
+        if isinstance(value, (int, float, bool)):
+            return f"<{type_name}>"
+        # Fallback: type name only.
+        return f"<{type_name}>"
+    except Exception:
+        return f"<{type_name}>"
 
 
 def _repr_for_log(value, max_len: int = 100) -> str:
@@ -1531,6 +1620,44 @@ def _allow_catastrophic_shrink():
         _CATASTROPHIC_SHRINK_TOKEN -= 1
 
 
+def _safe_save_json_mirror(path: Path, entries: list, label: str,
+                            *, schema_version: "int | None" = None
+                            ) -> None:
+    """[INV-83, sweep #27] Mirror-write helper. Use this **instead of**
+    a bare `_safe_save_json` for any write whose source-of-truth lives
+    in a sibling *collections* file.
+
+    Caught-live failure (2026-05-25 incident): switching from
+    "Eden Parts" (26 entries) to an empty "FFE Parts" bin called
+    ``_safe_save_json(_PARTS_BIN_FILE, [], "Parts bin")`` directly.
+    The L3 catastrophic shrink guard saw 26 → 0 entries and refused
+    the write — saving the user from data loss but also breaking the
+    legitimate bin switch. The "old" data was NEVER at risk: the 26
+    Eden entries live in ``parts_bin_collections.json`` under the
+    "Eden Parts" key and the L3 spillover dumped a copy to
+    ``lost_entries/`` for triple safety. The shrink guard correctly
+    treats parts_bin.json as the primary store; this helper tells it
+    explicitly that this particular write is a *mirror swap* — the
+    primary is the collections file, the named bin's data is intact,
+    so a 100% shrink is a legitimate state transition.
+
+    Symmetric for every mirror pair:
+
+      * `parts_bin.json`   <- `parts_bin_collections.json`     (active bin)
+      * `plasmid_library.json` <- `collections.json`           (active collection)
+      * `primers.json`     <- `primer_collections.json`        (active primer coll)
+      * `experiments.json` <- `experiment_projects.json`       (active project)
+
+    Implementation: just wraps `_safe_save_json` in
+    `_allow_catastrophic_shrink()`. The wrapper exists so:
+    (a) callers don't have to remember the context manager pattern;
+    (b) a `grep _safe_save_json_mirror` enumerates every cross-mirror
+    write — a future audit can confirm none have drifted back to the
+    bare `_safe_save_json`."""
+    with _allow_catastrophic_shrink():
+        _safe_save_json(path, entries, label, schema_version=schema_version)
+
+
 def _authorize_writes(*, reason: str) -> None:
     """Internal: flip the authorisation flag. Three legitimate callers
     use this (main, conftest, agent server). Verifier scripts go
@@ -1595,6 +1722,37 @@ def _refuse_unauthorized_write(path: Path, label: str) -> None:
         f"`.claude/skills/verifier-splicecraft.md`. "
         f"(Authorisation is set automatically by `main()`, the pytest "
         f"`_protect_user_data` fixture, and the agent HTTP server.)"
+    )
+
+
+def _refuse_unauthorized_delete(path: Path, label: str) -> None:
+    """[INV-75, sweep #27] Mirror of `_refuse_unauthorized_write` for
+    delete paths. Sweep #26 hardened the write chokepoint to cover
+    every JSON save helper + the `.dna` sidecar, experiment images
+    and crash-recovery autosaves; deletes are the equally-dangerous
+    half of the data-dir API and were not gated.
+
+    Threat model: a maintenance helper added in a future sweep that
+    walks `_DATA_DIR` to prune rotated backups, expired snapshots, or
+    stale crash-recovery files could be imported by an unsandboxed
+    probe and tricked into running `unlink()` / `shutil.rmtree()`
+    against the user's real files. The write gate alone wouldn't
+    catch that — it only fires on `_safe_save_json` / the named
+    chokepoint helpers.
+
+    Sanctioned callers route through this helper before calling
+    `unlink` / `rmtree` on a path under `_DATA_DIR`. The authorisation
+    state is shared with the write gate (`_SAVES_AUTHORIZED`); a
+    process that's authorised to write is by definition authorised
+    to delete (the four sanctioned callers all need both)."""
+    if _SAVES_AUTHORIZED:
+        return
+    raise RuntimeError(
+        f"refusing to delete {label!r} → {path}: data-dir deletes are "
+        f"not authorised in this process. Same gate as "
+        f"`_refuse_unauthorized_write` — sandbox `XDG_DATA_HOME` or "
+        f"call `_authorize_writes_for_sandbox` before invoking any "
+        f"helper that unlinks/rmtrees under `_DATA_DIR`."
     )
 
 
@@ -3410,16 +3568,27 @@ def _save_ui_snapshot(text: str,
     saved path. Raises OSError on disk failure (caller's call to
     notify the user — typically wrapped in try/except by the action
     handler so a captured snapshot never explodes the keypress
-    handler)."""
-    import datetime as _dt
+    handler).
+
+    [INV-74 extension, sweep #27] L2 chokepoint covers UI snapshots
+    too. Pre-sweep `_save_ui_snapshot` was the last `_atomic_write_*`
+    caller under `_DATA_DIR` that didn't go through the authorisation
+    gate — an unsandboxed probe calling
+    `sc._save_ui_snapshot("malicious md")` would land a real file in
+    the user's `~/.local/share/splicecraft/ui_snapshots/` and could
+    eventually evict legitimate diagnostic dumps via the retention
+    sweep. The chokepoint here matches the pattern in
+    `_save_dna_original` / `_save_experiment_image` / `_do_autosave`.
+    """
     d = dest_dir if dest_dir is not None else _UI_SNAPSHOTS_DIR
     d.mkdir(parents=True, exist_ok=True)
-    ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    ts = _now().strftime("%Y%m%d-%H%M%S")
     path = d / f"ui-snapshot-{ts}.md"
     bump = 0
     while path.exists():
         bump += 1
         path = d / f"ui-snapshot-{ts}.{bump}.md"
+    _refuse_unauthorized_write(path, "ui snapshot")
     _atomic_write_text(path, text)
     _enforce_ui_snapshot_retention(d)
     return path
@@ -3969,11 +4138,14 @@ def _delete_dna_original(entry_id: str) -> bool:
         return False
     target = _dna_sidecar_path(entry_id)
     legacy = _dna_sidecar_legacy_path(entry_id)
-    # [INV-66 extension] L2 chokepoint: refuse to unlink a user sidecar
-    # from an unsandboxed import. Same threat model as
-    # `_save_dna_original` — a probe calling `_delete_dna_original`
-    # would otherwise wipe the user's real sidecar.
-    _refuse_unauthorized_write(target, "dna sidecar")
+    # [INV-66 extension + INV-75 sweep #27] L2 chokepoint: refuse to
+    # unlink a user sidecar from an unsandboxed import. Same threat
+    # model as `_save_dna_original` — a probe calling
+    # `_delete_dna_original` would otherwise wipe the user's real
+    # sidecar. Routed through `_refuse_unauthorized_delete` (sweep
+    # #27); semantically equivalent to the prior write-gate call but
+    # uses the delete-flavoured helper for grep-discoverability.
+    _refuse_unauthorized_delete(target, "dna sidecar")
     paths = (target,) if target == legacy else (target, legacy)
     removed = False
     for p in paths:
@@ -4832,7 +5004,12 @@ def _restore_library_from_active_collection() -> None:
         return
     plasmids = [dict(p) for p in (coll.get("plasmids") or [])
                 if isinstance(p, dict)]
-    _safe_save_json(_LIBRARY_FILE, plasmids, "Plasmid library")
+    # [INV-83, sweep #27] Mirror-swap: collections.json is the source-
+    # of-truth, plasmid_library.json is the mirror. A switch from
+    # active=BigCollection to active=EmptyCollection must not trip the
+    # L3 shrink guard — the "missing" entries are safely preserved in
+    # collections.json under their original collection name.
+    _safe_save_json_mirror(_LIBRARY_FILE, plasmids, "Plasmid library")
     # Deep-copy on cache re-seat per invariant #17 — pre-fix this used
     # `list(plasmids)` which only copies the outer list; nested-dict
     # mutations on the collection's `plasmids` list (a separate code
@@ -9499,6 +9676,14 @@ def fetch_genbank(accession: str, email: str = "splicecraft@local"):
     import time as _time
     from Bio import Entrez, SeqIO
     Entrez.email = email
+    # Sweep #27: NCBI's E-utilities policy asks every caller to identify
+    # itself via `Entrez.tool` + `Entrez.email` so they can rate-limit
+    # and contact problem clients. Pre-sweep we set only `email`; NCBI
+    # could (and occasionally does) throttle or block unidentified
+    # traffic. `tool` is a free-form ASCII identifier — using
+    # `SpliceCraft/<version>` mirrors the User-Agent set on PyPI /
+    # Kazusa fetches and makes our traffic identifiable in NCBI logs.
+    Entrez.tool = f"SpliceCraft/{__version__}"
     prev_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(_NCBI_TIMEOUT_S)
     # One-retry pattern with 250 ms backoff to absorb transient
@@ -11074,7 +11259,13 @@ _GB_TEXT_MAX_BYTES = 64 * 1024 * 1024
 # bulk-export batch ≤ 12 records under typical use).
 _GB_PARSE_CACHE: "_OD" = _OD()
 _GB_PARSE_CACHE_MAX = 16
-_GB_PARSE_CACHE_LOCK = threading.Lock()
+# Sweep #27 (LOW-11): RLock for convention parity with `_cache_lock`.
+# Today's critical sections are all simple read-modify-evict patterns
+# that don't re-enter, but a future caller that opens a parse cache
+# entry while holding a sibling JSON-cache RLock can now compose
+# without deadlock risk. The fast-path overhead of RLock vs Lock is
+# negligible on CPython (single integer increment).
+_GB_PARSE_CACHE_LOCK = threading.RLock()
 
 
 def _gb_text_to_record(text: str, *, cache: bool = True):
@@ -14251,6 +14442,20 @@ def _parse_gff3_text(text: str) -> dict:
         if end_1 < start_1:
             continue
         strand = cols[6].strip()
+        # Sweep #27: validate strand against the GFF3 spec
+        # ({"+", "-", ".", "?"}). Pre-sweep ANY string silently mapped
+        # to strand 0; a malformed GFF3 with embedded shell metas /
+        # terminal escapes / HTML in the strand column would parse and
+        # potentially surface in user-facing toasts unescaped. We now
+        # SKIP the row (with a debug log) when the strand column isn't
+        # one of the canonical four; matches the silent-skip semantics
+        # GFF3 readers conventionally use for malformed records.
+        if strand not in ("+", "-", ".", "?"):
+            _log.debug(
+                "GFF3 row skipped: invalid strand %r (must be one of "
+                "'+', '-', '.', '?')", strand[:32],
+            )
+            continue
         strand_int = 1 if strand == "+" else (-1 if strand == "-" else 0)
         phase_s = cols[7].strip()
         try:
@@ -19424,7 +19629,12 @@ class LibraryPanel(Widget):
         cumulative state.
         """
         try:
-            _safe_save_json(
+            # [INV-83, sweep #27] Collection switch is a mirror-swap
+            # (collections.json is the source-of-truth, the named
+            # collection's `plasmids` is intact regardless of the
+            # incoming list size). A switch to an empty collection
+            # would otherwise trip the L3 shrink guard.
+            _safe_save_json_mirror(
                 _LIBRARY_FILE, plasmids, "Plasmid library",
             )
         except (OSError, RuntimeError) as exc:
@@ -26112,6 +26322,22 @@ class OpenFileModal(ModalScreen):
         """
         try:
             if _is_fasta_path(path):
+                # Sweep #27: hard size-cap BEFORE SeqIO.parse. The
+                # downstream `list(SeqIO.parse(...))` is eager — a
+                # multi-GB FASTA pasted into the Open dialog would
+                # OOM the worker before any record-count check fires.
+                # _FASTA_MAX_BYTES mirrors `_GB_TEXT_MAX_BYTES`'s
+                # ceiling, scaled for the fact that FASTA carries
+                # only the bare sequence (no annotation envelope).
+                from pathlib import Path as _Path
+                ok, reason = _safe_file_size_check(
+                    _Path(path), _FASTA_MAX_BYTES, "fasta",
+                )
+                if not ok:
+                    raise ValueError(
+                        reason
+                        or f"FASTA exceeds {_FASTA_MAX_BYTES:,} bytes."
+                    )
                 from Bio import SeqIO
                 try:
                     parsed = list(SeqIO.parse(path, "fasta"))
@@ -34994,7 +35220,9 @@ def _restore_primers_from_active_primer_collection() -> None:
         return
     primers = [dict(p) for p in (coll.get("primers") or [])
                if isinstance(p, dict)]
-    _safe_save_json(_PRIMERS_FILE, primers, "Primer library")
+    # [INV-83, sweep #27] Mirror-swap: primer_collections.json is the
+    # source-of-truth, primers.json is the mirror.
+    _safe_save_json_mirror(_PRIMERS_FILE, primers, "Primer library")
     _primers_cache = _typed_clone(primers)
 
 
@@ -40180,7 +40408,15 @@ _BLAST_DB_CACHE_MAX = 4
 # corruption but does NOT prevent KeyError if a `clear()` lands
 # between the `in` check and the dict access. Belt-and-suspenders
 # lock removes that race entirely.
-_BLAST_CACHE_LOCK = threading.Lock()
+# Sweep #27 (LOW-11): RLock for convention parity with `_cache_lock`.
+# Pre-sweep the BLAST cache locks were plain `threading.Lock()` while
+# the rest of the codebase standardised on RLock so save chains can
+# nest. The BLAST critical sections don't re-enter today, but the
+# convention drift is a footgun: a future caller that builds a BLAST
+# DB while holding `_cache_lock` (e.g. a save path that probes the
+# DB to decide whether to rebuild) would deadlock under the old
+# non-reentrant lock for no good reason.
+_BLAST_CACHE_LOCK = threading.RLock()
 
 
 # Memoised fingerprint per (collections cache identity, wanted set).
@@ -40190,7 +40426,8 @@ _BLAST_CACHE_LOCK = threading.Lock()
 # skips ~5k iterations + hash calls per `_blast_get_db` call (the
 # fingerprint is otherwise on the hot path of every BLAST submit).
 _BLAST_FINGERPRINT_CACHE: "dict[tuple, int]" = {}
-_BLAST_FINGERPRINT_CACHE_LOCK = threading.Lock()
+# Sweep #27 (LOW-11): RLock; see `_BLAST_CACHE_LOCK` comment.
+_BLAST_FINGERPRINT_CACHE_LOCK = threading.RLock()
 
 
 def _blast_collections_fingerprint(
@@ -44466,7 +44703,19 @@ class PartsBinPickerModal(ModalScreen):
             raw_parts = []
         target_parts = [p for p in raw_parts if isinstance(p, dict)]
         try:
-            _safe_save_json(
+            # [INV-83, sweep #27 incident fix] Mirror-swap: the
+            # active-bin file (parts_bin.json) is a mirror of the
+            # selected named bin inside parts_bin_collections.json.
+            # Switching from a populated bin to an empty bin must
+            # NOT trip the L3 catastrophic-shrink guard — the
+            # outgoing bin's parts are safely preserved in
+            # parts_bin_collections.json under their original
+            # "Eden Parts" (or wherever) key. Pre-sweep this used
+            # bare `_safe_save_json`; on 2026-05-25 a switch from
+            # Eden (26 parts) to FFE Parts (0 parts) was correctly
+            # refused by the guard, but the UI offered no recovery
+            # path. The mirror helper communicates the intent.
+            _safe_save_json_mirror(
                 _PARTS_BIN_FILE, target_parts, "Parts bin",
             )
         except (OSError, RuntimeError) as exc:
@@ -51124,8 +51373,11 @@ class ExperimentProjectsPickerModal(ModalScreen):
             # Bypass `_save_experiments` here because that would
             # re-mirror back into the project we just switched to
             # (the project IS the source of truth in this
-            # direction).
-            _safe_save_json(
+            # direction). [INV-83, sweep #27]: mirror-swap helper
+            # exempts the write from the L3 shrink guard (the
+            # outgoing project's entries are intact in
+            # experiment_projects.json).
+            _safe_save_json_mirror(
                 _EXPERIMENTS_FILE, target_entries, "Experiments",
             )
         except (OSError, RuntimeError) as exc:
@@ -51389,7 +51641,12 @@ class ExperimentProjectsPickerModal(ModalScreen):
                 _set_active_project_name(promoted)
                 _settings_flush_sync()
                 try:
-                    _safe_save_json(
+                    # [INV-83, sweep #27] Project delete auto-
+                    # promotes another project to active and
+                    # mirrors its entries. Mirror-swap; the
+                    # promoted project's entries are intact in
+                    # experiment_projects.json.
+                    _safe_save_json_mirror(
                         _EXPERIMENTS_FILE, promoted_entries,
                         "Experiments",
                     )
@@ -70600,9 +70857,25 @@ class PrimerDesignScreen(Screen):
             "primer-usages lookup: %d usage(s) for %r",
             len(usages), primer.get("name", "?"),
         )
-        self.app.call_from_thread(
-            self._on_usages_found, primer, usages,
-        )
+        # Sweep #27 (LOW-9): bail before `call_from_thread` if the
+        # screen has been dismissed or the app is mid-shutdown. The
+        # worker is `exclusive=True` but the cancellation path doesn't
+        # interrupt mid-flight C-level loops in `_find_primer_plasmid_
+        # usages`, so we can land here with the screen unmounted. Sis-
+        # ter pattern to the `_on_usages_found` guard below — push the
+        # check up so we don't even cross the thread boundary.
+        if not self.is_mounted:
+            _log.debug("primer-usages lookup: screen unmounted; dropping result")
+            return
+        app = getattr(self, "app", None)
+        if app is None or not getattr(app, "_running", True):
+            return
+        try:
+            app.call_from_thread(self._on_usages_found, primer, usages)
+        except Exception:
+            # Race: app shutdown landed between guard and dispatch.
+            # Logged + swallowed; the result is dropped, no UI impact.
+            _log.debug("primer-usages: call_from_thread refused", exc_info=True)
 
     def _on_usages_found(self, primer: dict,
                           usages: "list[dict]") -> None:
@@ -78316,7 +78589,13 @@ def _h_load_file(app, payload):
         else:
             record = load_genbank(str(path))
     except (ValueError, OSError) as exc:
-        return ({"error": f"parse failed: {exc}"}, 400)
+        # Sweep #27: route through `_scrub_path` so `OSError.strerror`,
+        # `OSError.filename`, and Biopython parse internals don't leak
+        # to a token-holding local attacker. Mirrors the pattern
+        # `_h_apply_gff3` + `_h_hmmscan` established. Detail still goes
+        # to the log for legitimate triage.
+        _log.warning("agent load-file: parse failed (%s)", exc)
+        return ({"error": f"parse failed: {_scrub_path(str(exc))}"}, 400)
     record._tui_source = str(path)  # type: ignore[attr-defined]
 
     def _apply():
@@ -78373,8 +78652,11 @@ def _h_load_entry(app, payload):
     try:
         record = _gb_text_to_record(gb_text)
     except Exception as exc:
+        # Sweep #27: scrub exception text. The library entry's gb_text
+        # is user-controlled; parse failures could reveal storage layout
+        # via Biopython's exception messages.
         _log.exception("agent-api load-entry parse failed")
-        return ({"error": f"parse failed: {exc}"}, 500)
+        return ({"error": f"parse failed: {_scrub_path(str(exc))}"}, 500)
 
     def _apply():
         guard = _agent_dirty_guard(app, payload)
@@ -79409,7 +79691,11 @@ def _h_transfer_annotations(app, payload):
     try:
         source_record = _gb_text_to_record(gb_text)
     except Exception as exc:
-        return ({"error": f"source parse failed: {exc}"}, 500)
+        # Sweep #27: scrub exception text.
+        _log.warning("agent transfer-annotations: source parse failed (%s)",
+                      exc)
+        return ({"error": f"source parse failed: {_scrub_path(str(exc))}"},
+                500)
     transfers = _find_annotation_transfers(
         source_record, rec, min_len=min_len,
     )
@@ -79497,7 +79783,10 @@ def _h_diff_plasmid(app, payload):
     try:
         target_record = _gb_text_to_record(gb_text)
     except Exception as exc:
-        return ({"error": f"target parse failed: {exc}"}, 500)
+        # Sweep #27: scrub exception text.
+        _log.warning("agent diff-plasmid: target parse failed (%s)", exc)
+        return ({"error": f"target parse failed: {_scrub_path(str(exc))}"},
+                500)
     # Auto-detect circular from topology annotation; agents can override
     # with an explicit `circular` boolean.
     circ_raw = payload.get("circular")
@@ -79704,19 +79993,29 @@ def _h_align_plasmidsaurus_zip(app, payload):
     try:
         target_record = _gb_text_to_record(gb_text_target)
     except Exception as exc:
-        return ({"error": f"target parse failed: {exc}"}, 500)
+        # Sweep #27: scrub exception text on all three parse paths.
+        _log.warning("agent align-plasmidsaurus: target parse failed (%s)",
+                      exc)
+        return ({"error": f"target parse failed: {_scrub_path(str(exc))}"},
+                500)
     # Extract + parse the zip member.
     try:
         gb_text_query = _extract_gbk_member(path, member)
     except ValueError as exc:
-        return ({"error": f"could not extract member: {exc}"}, 422)
+        _log.warning("agent align-plasmidsaurus: extract failed (%s)", exc)
+        return ({"error": "could not extract member (see splicecraft log)"},
+                422)
     except Exception as exc:
         _log.exception("agent align-plasmidsaurus-zip: extract failed")
-        return ({"error": f"extract failed: {exc}"}, 500)
+        return ({"error": "extract failed (see splicecraft log)",
+                 "type":  type(exc).__name__}, 500)
     try:
         query_record = _gb_text_to_record(gb_text_query)
     except Exception as exc:
-        return ({"error": f"query parse failed: {exc}"}, 422)
+        _log.warning("agent align-plasmidsaurus: query parse failed (%s)",
+                      exc)
+        return ({"error": f"query parse failed: {_scrub_path(str(exc))}"},
+                422)
     query_seq = str(query_record.seq)
     target_seq = str(target_record.seq)
     if not query_seq or not target_seq:
@@ -82994,7 +83293,9 @@ def _h_set_active_experiment_project(app, payload):
         _set_active_project_name(name)
         _settings_flush_sync()
         try:
-            _safe_save_json(
+            # [INV-83, sweep #27] Agent project-switch mirror-swap;
+            # source-of-truth is experiment_projects.json.
+            _safe_save_json_mirror(
                 _EXPERIMENTS_FILE, target_entries, "Experiments",
             )
         except (OSError, RuntimeError) as exc:
@@ -83124,7 +83425,9 @@ def _h_delete_experiment_project(app, payload):
             e for e in raw_entries if isinstance(e, dict)
         ]
         try:
-            _safe_save_json(
+            # [INV-83, sweep #27] Agent project-delete auto-promotes;
+            # mirror-swap to the promoted project's entries.
+            _safe_save_json_mirror(
                 _EXPERIMENTS_FILE, target_entries, "Experiments",
             )
         except (OSError, RuntimeError):
@@ -83796,6 +84099,146 @@ def _h_clear_entry_vectors_for_grammar(app, payload):
 
 # ── HTTP plumbing ──────────────────────────────────────────────────────────────
 
+
+# ── Rate limiting (MED-4, sweep #27) ──────────────────────────────────
+# Token-bucket per bearer-token. Pre-sweep an agent that held a token
+# could fire unlimited writes against the server and exhaust disk via
+# the L1 atomic-write tmp files (one tempfile per `_save_*` × hundreds
+# of saves per second on a fast loopback). 30 writes/sec is generous
+# for a legitimate scripting client (one write per UI-frame at 30 fps
+# is the practical ceiling); reads are individually cheaper but
+# unbounded reads also have CPU cost (BLAST DB iteration, alignment
+# C-loops), so they share the bucket.
+_AGENT_RATE_LIMIT_TOKENS_PER_SEC = 30.0
+_AGENT_RATE_LIMIT_BURST = 60        # bucket capacity
+_AGENT_RATE_LIMIT_BUCKETS: "dict[str, tuple[float, float]]" = {}
+_AGENT_RATE_LIMIT_LOCK = threading.Lock()
+
+
+def _agent_rate_limit_check(token: str, cost: float = 1.0) -> bool:
+    """Token-bucket rate limit. Returns True if the request may
+    proceed; False if the bucket is empty. `cost` lets write endpoints
+    consume 2× the bucket per call so a burst of mutations exhausts
+    the bucket faster than reads. Thread-safe.
+
+    Tokens refill at `_AGENT_RATE_LIMIT_TOKENS_PER_SEC` per wall-second
+    up to `_AGENT_RATE_LIMIT_BURST`. State lives in
+    `_AGENT_RATE_LIMIT_BUCKETS` keyed by bearer token (so two
+    differently-tokenised clients have independent buckets); the
+    server clears it on shutdown via `_stop_agent_api`."""
+    now = _monotonic()
+    with _AGENT_RATE_LIMIT_LOCK:
+        prev = _AGENT_RATE_LIMIT_BUCKETS.get(token)
+        if prev is None:
+            # First request from this token — start with a full bucket
+            # minus the current request cost.
+            tokens_left = _AGENT_RATE_LIMIT_BURST - cost
+            _AGENT_RATE_LIMIT_BUCKETS[token] = (tokens_left, now)
+            return tokens_left >= 0
+        tokens, last_ts = prev
+        elapsed = max(0.0, now - last_ts)
+        # Refill capped at burst.
+        tokens = min(
+            float(_AGENT_RATE_LIMIT_BURST),
+            tokens + elapsed * _AGENT_RATE_LIMIT_TOKENS_PER_SEC,
+        )
+        if tokens < cost:
+            # Don't consume — record the new fill level so the caller
+            # can retry after enough wall-time has elapsed.
+            _AGENT_RATE_LIMIT_BUCKETS[token] = (tokens, now)
+            return False
+        _AGENT_RATE_LIMIT_BUCKETS[token] = (tokens - cost, now)
+        return True
+
+
+def _agent_rate_limit_reset(token: "str | None" = None) -> None:
+    """Reset the rate-limit bucket(s). Used by `_stop_agent_api` for
+    full reset and by tests to clear state between scenarios. Pass
+    `token=None` to clear all buckets."""
+    with _AGENT_RATE_LIMIT_LOCK:
+        if token is None:
+            _AGENT_RATE_LIMIT_BUCKETS.clear()
+        else:
+            _AGENT_RATE_LIMIT_BUCKETS.pop(token, None)
+
+
+# ── Idempotency cache (INV-80, sweep #27) ─────────────────────────────
+# Agent retries on network hiccup pre-sweep would silently re-create
+# a collection / re-add a primer / etc. (the second call hits the
+# "name collision" suffix logic and creates "Foo_2", leaving the
+# caller unable to tell whether the original "Foo" landed). Sweep #27
+# adds opt-in `X-Idempotency-Key` header support: write endpoints
+# cache (endpoint, key) → response for 60 seconds; a retry with the
+# same key returns the cached response without re-invoking the
+# handler. Reads are deliberately NOT cached — they're already
+# idempotent and caching them would mask state changes.
+_AGENT_IDEMPOTENCY_TTL_S = 60.0
+_AGENT_IDEMPOTENCY_MAX_ENTRIES = 1024   # hard cap so a malicious client
+                                          # spraying random keys can't
+                                          # OOM the server.
+_AGENT_IDEMPOTENCY_KEY_MAX_LEN = 128
+# Each entry: ((endpoint, key) → (payload, status, expiry_monotonic_ts)).
+_AGENT_IDEMPOTENCY_CACHE: "dict[tuple[str, str], tuple[dict, int, float]]" = {}
+_AGENT_IDEMPOTENCY_LOCK = threading.Lock()
+
+
+def _agent_idempotency_get(endpoint: str,
+                             key: str
+                             ) -> "tuple[dict, int] | None":
+    """Return `(payload, status)` for a prior response to this
+    (endpoint, key), or None on miss / expired."""
+    now = _monotonic()
+    with _AGENT_IDEMPOTENCY_LOCK:
+        hit = _AGENT_IDEMPOTENCY_CACHE.get((endpoint, key))
+        if hit is None:
+            return None
+        payload, status, expiry = hit
+        if expiry < now:
+            _AGENT_IDEMPOTENCY_CACHE.pop((endpoint, key), None)
+            return None
+        return payload, status
+
+
+def _agent_idempotency_put(endpoint: str, key: str,
+                             payload: dict, status: int) -> None:
+    """Cache the response for retries within the TTL window."""
+    now = _monotonic()
+    expiry = now + _AGENT_IDEMPOTENCY_TTL_S
+    with _AGENT_IDEMPOTENCY_LOCK:
+        # Lazy eviction: drop the oldest entry if at cap.
+        if len(_AGENT_IDEMPOTENCY_CACHE) >= _AGENT_IDEMPOTENCY_MAX_ENTRIES:
+            # Find the earliest-expiring entry and evict it; if every
+            # entry is in the future, evict whichever comes first in
+            # iteration order (deterministic on CPython 3.7+).
+            oldest_key = min(
+                _AGENT_IDEMPOTENCY_CACHE,
+                key=lambda k: _AGENT_IDEMPOTENCY_CACHE[k][2],
+            )
+            _AGENT_IDEMPOTENCY_CACHE.pop(oldest_key, None)
+        _AGENT_IDEMPOTENCY_CACHE[(endpoint, key)] = (payload, status, expiry)
+
+
+def _agent_idempotency_reset() -> None:
+    """Clear the cache. Called by `_stop_agent_api` + tests."""
+    with _AGENT_IDEMPOTENCY_LOCK:
+        _AGENT_IDEMPOTENCY_CACHE.clear()
+
+
+_AGENT_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
+
+
+def _agent_validate_idempotency_key(raw: str) -> "str | None":
+    """Return a sanitised idempotency key, or None if invalid.
+    Accepts URL-safe characters only (`[A-Za-z0-9_-]`) so a key can't
+    smuggle terminal escapes or path separators into anything that
+    might surface in a log message."""
+    if not raw or len(raw) > _AGENT_IDEMPOTENCY_KEY_MAX_LEN:
+        return None
+    if not _AGENT_IDEMPOTENCY_KEY_RE.match(raw):
+        return None
+    return raw
+
+
 class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
     """Routes `/<name>` to the registered handler. JSON in, JSON out.
     Bearer-token auth on write endpoints; no CORS handling since we
@@ -83883,15 +84326,25 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
         expected = getattr(self.server, "_token", None)
         if expected is None:
             return True   # token-free mode (used by some tests)
+        # Sweep #27 (LOW-8): tolerate the "bearer" scheme keyword in
+        # any case. RFC 7235 §2.1 declares scheme tokens
+        # case-insensitive; stdlib `http.server` lowercases the header
+        # NAME ("Authorization" → "authorization") but doesn't touch
+        # the value, so a client sending `bearer <token>` (all-lower,
+        # all-upper, mixed-case) was rejected pre-sweep. Real-world
+        # clients (curl, httpie, several language HTTP libs) emit
+        # capitalised "Bearer", so the practical exposure is small —
+        # this fix is hygiene against a future refactor onto a
+        # framework that normalises differently.
         provided = self.headers.get("Authorization", "")
-        if not provided.startswith("Bearer "):
+        if len(provided) < 7 or provided[:7].lower() != "bearer ":
             return False
         # `secrets.compare_digest` is constant-time on equal-length
         # inputs — eliminates the per-byte timing oracle that a naïve
         # `==` would expose to a local attacker probing the token
-        # one byte at a time. Both sides are str (UUID hex), so no
-        # encoding step needed.
-        return secrets.compare_digest(provided[len("Bearer "):], expected)
+        # one byte at a time. Both sides are str (URL-safe base64),
+        # so no encoding step needed.
+        return secrets.compare_digest(provided[7:], expected)
 
     # Sweep #25 (2026-05-23): per-request socket timeout. Pre-fix a
     # slow-loris client holding `rfile.read(length)` open with a
@@ -83933,6 +84386,12 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
             return self._send(
                 {"error": "missing or invalid bearer token"}, 401,
             )
+        # Sweep #27 (MED-4): rate-limit per token. Writes cost 2× a
+        # read so a mutation burst exhausts the bucket faster.
+        provided_token = self.headers.get("Authorization", "")
+        token_key = (provided_token[7:]
+                     if len(provided_token) > 7
+                     else provided_token)
         handler = _AGENT_HANDLERS.get(path_part)
         if handler is None:
             return self._send(
@@ -83941,6 +84400,19 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
                 404,
             )
         fn, write = handler
+        rl_cost = 2.0 if write else 1.0
+        if not _agent_rate_limit_check(token_key, cost=rl_cost):
+            # 429 Too Many Requests — bucket exhausted. Client should
+            # back off and retry. No `Retry-After` header (would require
+            # exposing the exact refill cadence; the documentation in
+            # `docs/agent-api.md` covers the bucket parameters).
+            _log_event(
+                "agent.rate_limited", endpoint=path_part, write=write,
+            )
+            return self._send(
+                {"error": "rate limit exceeded; back off and retry"},
+                429,
+            )
         # Sweep #25 (2026-05-23): write endpoints require POST so a
         # `GET /delete-from-library` URL pasted into a browser can't
         # silently fire a destructive call (the empty-body request
@@ -83971,6 +84443,27 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
             )
         if not isinstance(body, dict):
             body = {}
+        # Sweep #27 (INV-80): idempotency-key cache for write
+        # endpoints. Read endpoints aren't cached — they're idempotent
+        # by definition and caching them would mask state changes.
+        idem_raw = self.headers.get("X-Idempotency-Key") or ""
+        idem_key = (_agent_validate_idempotency_key(idem_raw)
+                    if (write and idem_raw) else None)
+        if idem_key is not None:
+            cached = _agent_idempotency_get(path_part, idem_key)
+            if cached is not None:
+                payload, status = cached
+                # Tag the response so the caller can tell a replay
+                # from a fresh execution. Inject only if it doesn't
+                # clobber an existing key.
+                if isinstance(payload, dict) and "_idempotent_replay" not in payload:
+                    payload = {**payload, "_idempotent_replay": True}
+                _log_event(
+                    "agent.idempotent.replay",
+                    endpoint=path_part,
+                    status=status,
+                )
+                return self._send(payload, status)
         srv_app = getattr(self.server, "_app", None)
         # The agent handler may run while the app is alive (the
         # decorator sets `_LIVE_APP_REF` in `PlasmidApp.on_mount`).
@@ -84003,6 +84496,13 @@ class _AgentRequestHandler(http.server.BaseHTTPRequestHandler):
             payload, status = result
         else:
             payload, status = result, 200
+        # Sweep #27 (INV-80): cache successful responses for retry
+        # replay. Cache failures too (4xx/5xx) so a deterministic
+        # validation error doesn't pass on retry — the second call
+        # should see the same error, not a possibly-different one
+        # produced by a state mutation between attempts.
+        if idem_key is not None and isinstance(payload, dict):
+            _agent_idempotency_put(path_part, idem_key, payload, status)
         # Audit fix 2026-05-14: log every write endpoint's outcome at
         # INFO so a "an agent silently overwrote my library" report
         # has a forensic trail. Read endpoints stay at DEBUG (via
@@ -84147,7 +84647,9 @@ def _start_agent_api(app, port: int = _AGENT_API_PORT_DEFAULT):
 def _stop_agent_api(srv) -> None:
     """Shutdown helper. Removes the token file so a stale CLI
     invocation can't accidentally hit a different process that bound
-    the same port later."""
+    the same port later. Sweep #27: also clears rate-limit + idempotency
+    state so a future agent server start in the same process doesn't
+    inherit stale buckets / replays."""
     if srv is None:
         return
     try:
@@ -84159,6 +84661,11 @@ def _stop_agent_api(srv) -> None:
         _AGENT_TOKEN_FILE.unlink(missing_ok=True)
     except OSError:
         pass
+    # Sweep #27 (MED-4 + INV-80): clear per-server state on shutdown
+    # so the next server start (same-process re-launch, test fixtures)
+    # begins with a clean slate.
+    _agent_rate_limit_reset()
+    _agent_idempotency_reset()
 
 
 # ── Main app ───────────────────────────────────────────────────────────────────
@@ -86921,11 +87428,18 @@ SpeciesPickerModal { align: center middle; }
             _log.exception("Autosave to %s failed", path)
 
     def _clear_autosave(self, record) -> None:
-        """Delete the autosave file for `record` (called after save / abandon)."""
+        """Delete the autosave file for `record` (called after save / abandon).
+
+        [INV-75, sweep #27] Routes through `_refuse_unauthorized_delete`
+        so an unsandboxed probe that managed to instantiate a
+        PlasmidApp and call `_clear_autosave` against a real-data path
+        can't wipe the user's crash-recovery file. Same gate as
+        `_do_autosave`'s write-side chokepoint added in INV-74."""
         path = self._autosave_path(record)
         if path is None or not path.exists():
             return
         try:
+            _refuse_unauthorized_delete(path, "autosave")
             path.unlink()
             _log.info("Cleared autosave %s", path)
         except OSError:
@@ -86979,6 +87493,11 @@ SpeciesPickerModal { align: center middle; }
             ]
             for p in stale:
                 try:
+                    # Sweep #27 (INV-75): gate every crash-recovery
+                    # prune. Pre-sweep an unsandboxed probe could fire
+                    # `_check_crash_recovery` and have it walk the
+                    # user's real crash-recovery dir.
+                    _refuse_unauthorized_delete(p, "crash recovery (stale)")
                     p.unlink()
                 except OSError:
                     pass
@@ -86988,6 +87507,9 @@ SpeciesPickerModal { align: center middle; }
                 by_age = sorted(leftovers, key=lambda p: p.stat().st_mtime)
                 for p in by_age[:-_CRASH_RECOVERY_MAX_FILES]:
                     try:
+                        _refuse_unauthorized_delete(
+                            p, "crash recovery (over-cap)",
+                        )
                         p.unlink()
                     except OSError:
                         pass
@@ -88411,18 +88933,53 @@ SpeciesPickerModal { align: center middle; }
             self.push_screen(QuitConfirmModal(),
                              callback=self._on_quit_confirm)
 
+    def _cancel_autosave_timer(self) -> None:
+        """Stop any pending autosave debounce. Sweep #27 (LOW-10).
+
+        Pre-sweep the 3-second autosave debounce timer wasn't
+        explicitly stopped on shutdown — atomic-write + daemon-thread
+        teardown still kept the disk safe, but a timer that fired
+        between `self.exit()` returning and the runtime tearing down
+        the workers could schedule a `_do_autosave` worker against a
+        record we're already abandoning. Hygiene: stop the timer
+        before exit so the post-exit window is fully quiet."""
+        timer = getattr(self, "_autosave_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                # Timer may already be stopped or torn down; not
+                # worth surfacing to the user on shutdown.
+                pass
+            self._autosave_timer = None
+
+    def on_unmount(self) -> None:
+        """App teardown hook. Sweep #27 (LOW-10) wired the autosave
+        timer cancel here so a programmatic `app.exit()` path (tests,
+        `splicecraft logs --bundle`, agent-API-driven exit) also
+        cancels the pending debounce. Defensive try/except so a
+        teardown-time exception can't wedge the Textual unmount
+        cascade."""
+        try:
+            self._cancel_autosave_timer()
+        except Exception:
+            _log.exception("on_unmount: autosave cancel failed")
+
     def _on_quit_confirm(self, result) -> None:
         if result is True:
+            self._cancel_autosave_timer()
             self.exit()
 
     def _on_quit_response(self, result) -> None:
         if result == "save":
             if self._do_save():
+                self._cancel_autosave_timer()
                 self.exit()
         elif result == "abandon":
             # User chose to discard unsaved work — clear the autosave so
             # next startup doesn't flag recovery for a file they abandoned.
             self._clear_autosave(self._current_record)
+            self._cancel_autosave_timer()
             self.exit()
         # None = cancel → stay
 

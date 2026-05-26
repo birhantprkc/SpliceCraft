@@ -164,7 +164,10 @@ installs and the user-data directory location.
   (`splicecraft-cli`). Custom enzymes + enzyme collections expose
   full CRUD parity (`list/get/create/update/delete-custom-enzyme`,
   `list/get/create/update/delete-enzyme-collection`,
-  `get/set-active-enzyme-collection`).
+  `get/set-active-enzyme-collection`). Per-token rate-limit (token
+  bucket, 30 reqs/sec, writes cost 2× a read) bounds runaway
+  scripts; optional `X-Idempotency-Key` header lets retries replay
+  the prior response without double-creating entries.
 
 Full feature reference: [`docs/features.md`](docs/features.md).
 
@@ -182,9 +185,12 @@ Full feature reference: [`docs/features.md`](docs/features.md).
 - **Pre-update snapshots** before any pip / pipx / uv subprocess; stored
   in a sibling directory so a hypothetical recursive-wipe bug in a new
   version cannot kill recovery.
-- **2,600+ tests** anchored on 63+ sacred invariants (see
+- **2,700+ tests** anchored on 72+ sacred invariants (see
   [`CLAUDE.md`](CLAUDE.md)), hypothesis property-based fuzzing on
-  biology primitives.
+  biology primitives, AST-walk regression tests for cross-cutting
+  rules (@work decorator + mirror-write helper enforcement),
+  crash-injection test for `_safe_save_json`, concurrency fuzz
+  for save/load invariants.
 - **Defence-in-depth size caps** on every external input (NCBI / PyPI
   / Kazusa fetch, `.dna` history packets, JSON saves, agent-API
   bodies, CLI responses).
