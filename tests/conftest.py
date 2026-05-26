@@ -60,6 +60,7 @@ def _protect_user_data(tmp_path, monkeypatch):
         ("_PROTEIN_MOTIFS_FILE",  "_protein_motifs_cache"),
         ("_CUSTOM_ENZYMES_FILE",  "_custom_enzymes_cache"),
         ("_ENZYME_COLLECTIONS_FILE", "_enzyme_collections_cache"),
+        ("_HMM_DB_CATALOG_FILE",  "_hmm_db_catalog_cache"),   # sweep #28
         ("_AGENT_TOKEN_FILE",     None),   # written when --agent-api is on
     ]
 
@@ -101,6 +102,11 @@ def _protect_user_data(tmp_path, monkeypatch):
     # that exercise attach. Redirect to tmp_path so the whole experiments
     # surface (entries JSON + per-entry attach dirs) is isolated.
     monkeypatch.setattr(sc, "_EXPERIMENTS_DIR", tmp_path / "experiments")
+    # HMM database downloads (sweep #28) — per-DB dir under
+    # `<DATA_DIR>/hmm_databases/<id>/`. Redirect so download tests
+    # never touch the user's real GBs of Pfam-A.
+    monkeypatch.setattr(sc, "_HMM_DATABASES_DIR",
+                          tmp_path / "hmm_databases")
 
     # Pre-update snapshot directory (`splicecraft update` data-safety net):
     # tests that exercise the `update` subcommand all the way through to

@@ -18,6 +18,80 @@ grep -ni 'experiment\|project\|gel' docs/subsystems.md
 | `[SUB-plasmidsaurus]` | Plasmidsaurus zip ingestion; pairwise alignment; SequencingScreen; sub-tabs |
 | `[SUB-experiments]` | Experiments lab-notebook; projects; cross-refs `@`/`!`/`&`; spellcheck; ImageAttachModal |
 | `[SUB-gels]` | Gels; gels.json; GelLibraryModal; SimulatorScreen |
+| `[SUB-hmm-db]` | HMM database registry; Pfam-A / NCBIfam / custom URL download; `HmmDbCatalogModal`; `hmm_db_catalog.json`; pyhmmer hmmpress; cross-internet hardening |
+
+---
+
+## [SUB-hmm-db] HMM database registry + download manager (sweep #28, 2026-05-25)
+
+Replaces the "paste an absolute path to Pfam-A.hmm" UX with a built-in
+catalog + downloader. Lives under the BLAST modal's HMM-database
+picker.
+
+**Catalog file** `<DATA_DIR>/hmm_db_catalog.json` (envelope-v1) holds
+the registered databases. Two builtins (`pfam-a`, `ncbifam`) are
+re-injected on every load if missing, so a hand-edited catalog can't
+permanently nuke the well-known defaults. User can add custom URLs
+via `HmmDbAddEditModal`; user entries are renameable / removable.
+
+**Per-DB on disk** `<DATA_DIR>/hmm_databases/<id>/`:
+* `db.hmm.gz` — the streamed download (kept for re-press if pyhmmer
+  changes its on-disk format)
+* `db.hmm` — decompressed HMMER3 file
+* `db.hmm.h3i` / `.h3m` / `.h3p` / `.h3f` — pyhmmer's `hmmpress` index
+  files (created post-download)
+* `meta.json` — schema-v1 envelope with `{id, version, downloaded_at,
+  sha256, source_url, n_profiles, pressed, last_remote_version,
+  last_remote_version_check_ts}`
+
+**Modal stack**
+* `BlastModal` HMM-database row: `Select` of registered DBs + Manage
+  button + status banner (`✓ ready` / `update available` /
+  `not downloaded`). On modal mount + on picker change, schedules a
+  24h-cached background version check via `_auto_version_check_worker`.
+* `HmmDbCatalogModal`: DataTable of every registered DB; Download,
+  Check for updates, Add custom URL, Edit, Remove entry, Delete
+  download buttons. Workers `_download_worker` (`@work(thread=True,
+  exclusive=True, group="hmm_db_download")`) and `_version_check_
+  worker`. `_blocks_undo=True`; `_dismiss_once`.
+* `HmmDbAddEditModal`: Inputs for name, source URL, optional version
+  URL, description. Builtin-edit mode locks name + builtin flag,
+  only URL editable. `_blocks_undo=True`; `_dismiss_once`.
+
+**Sacred network discipline** (see [INV-84] for the full list of layers):
+HTTPS-only-by-default; bounded redirects (5 max) via custom
+`OpenerDirector`; explicit `ssl.create_default_context()`;
+Content-Type guard refuses HTML/JSON; gzip + HMMER3 magic
+verification on first chunk; disk-space pre-check; one retry with
+250ms backoff; cancel-aware (`cancel_check_cb` polled between
+chunks; modal-close ⇒ cancellation); URL credential redaction in
+every log line; cross-modal-instance download slot
+(`_HMM_DB_DOWNLOAD_INFLIGHT`); atomic hmmpress cleanup; n_profiles
+== 0 treated as download failure.
+
+**Caps:**
+* `_HMM_DB_DOWNLOAD_MAX_BYTES = 4 GB` — refuses a typo'd URL that
+  points at a 100 GB tarball (or a hostile mirror serving /dev/zero).
+* `_HMM_DB_VERSION_MAX_BYTES = 64 KB` — version file is tiny (Pfam's
+  is ~150 bytes); a malicious mirror serving a huge version file
+  can't OOM us.
+* `_HMM_DB_DISK_RESERVE_MULTIPLIER = 2.5` — free space must be ≥
+  Content-Length × 2.5 (covers decompression + hmmpress headroom).
+* `_HMM_DB_NETWORK_TIMEOUT_S = 60` — connect + read timeout per op.
+* `_HMM_DB_VERSION_CHECK_TTL_S = 86400` — 24h cache so reopening the
+  modal doesn't re-poll on every click.
+
+**Tests:** `tests/test_hmm_db_catalog.py` (57 cases) cover catalog
+persistence (builtins always present; user entries round-trip;
+corrupted entries dropped), sanitisation (ASCII-only id, no path
+traversal/NUL/control chars; URL whitespace rejected pre-strip;
+scheme allowlist), URL credential redaction, content-type guard,
+disk-space pre-check (stubs `shutil.disk_usage`), magic-byte
+verification (rejects non-gzip + non-HMMER3 + zip-bomb + corrupt
+gzip), hmmpress cleanup, network retry (one retry + persistent
+failure), version-file parsing, per-DB local state with 24h cache,
+cross-modal download slot (concurrent acquire only one wins), and
+modal smoke (fits 160×48).
 
 ---
 

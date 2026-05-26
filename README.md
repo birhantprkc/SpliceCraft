@@ -158,7 +158,10 @@ installs and the user-data directory location.
   centred labels, multi-lane stacking on overlap). Round-trips
   through save as CDS sub-features.
 - **Search** your library with in-process BLASTN / BLASTP / HMMscan
-  (via `pyhmmer` — no external `blast+` install).
+  (via `pyhmmer` — no external `blast+` install). The HMMscan tab
+  ships a one-click downloader for Pfam-A and NCBIfam (or any
+  custom HMMER3 `.hmm.gz` URL) with auto update-detection — no
+  manual `wget` + `hmmpress` ritual.
 - **Drive from outside** via a 100+ endpoint localhost JSON API
   (`splicecraft --agent`) and a stdlib-only CLI sidecar
   (`splicecraft-cli`). Custom enzymes + enzyme collections expose

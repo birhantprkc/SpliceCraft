@@ -14,6 +14,53 @@
 
 ---
 
+## [0.9.27] — 2026-05-25
+
+_(auto-generated changelog — no notable commits found since the previous release)_
+
+---
+
+## [unreleased] — sweep #28
+
+### New features
+
+- **Bulk-mark + move/copy plasmids across collections.** In the Library panel's plasmids view, press **Space** to mark a row (▶ shows in the status-ball column), then **M** to move the marked plasmids to another collection or **Y** to copy them. With no marks set, the hotkeys fall back to the cursor row so a single-plasmid move is one keypress. All entry metadata follows — status badge, alignments, history XML, color overrides, custom fields, `_plugin_data` — and the target-collection picker hides the source so you can't accidentally move into yourself. Name collisions in the target silently rename the landing entries with a " COPY" / " COPY 2" suffix (no overwrites). `Ctrl+Shift+C` clears marks; switching collections also clears them.
+- **HMM database downloader** in the BLAST modal (sweep #28 from earlier this session — Pfam-A + NCBIfam + custom URLs, hardened network code).
+- **Synthesis editor: paste now works** via Ctrl+V (or your terminal's native paste shortcut — Cmd+V on macOS, Ctrl+Shift+V on most Linux terminals). The empty-fragment placeholder said "Ctrl+E to insert from clipboard" but Ctrl+E actually opens the Edit Sequence dialog; the new `on_paste` handler routes bracketed-paste content through the same IUPAC filter + size cap as keyboard typing.
+- **Synthesis editor: cursor can hop onto the 5'/3' hyphens.** Press End on the last base to hop onto the trailing `-3'` marker (the hyphen reverses to show the cursor); press Home on the first base to hop onto the leading `5'-` marker. Typing at the marker appends (3') or prepends (5'); the cursor stays on the marker after an append so you can keep typing without re-pressing End. Backspace at the 3' marker deletes the last base; Delete at the 5' marker deletes the first base.
+
+### Built-in HMM database downloader
+
+- **One-click download.** The BLAST modal's HMM-database picker no longer requires you to manually download Pfam-A and paste an absolute path. Pick a registered database from the dropdown (Pfam-A and NCBIfam ship as builtins) and click **Manage…** to download with a single click — the file is streamed, decompressed, and `hmmpress`ed automatically so subsequent `hmmscan` runs are fast. Per-DB status badge shows `✓ ready`, `update available`, or `not downloaded`.
+- **Custom HMM database URLs.** The Manage modal has an **Add custom URL…** button for any HMMER3-format `.hmm.gz` database (Dfam, organism-specific HMMs, internal collections). Add, rename, edit, remove — same UX as the built-ins. Future-proof against the canonical EBI / NCBI URLs changing: you can override any built-in's URL in-place.
+- **Automatic update detection.** On modal open, the active DB's remote version file is polled (24h cache so reopening the modal doesn't re-poll on every click). If the remote release is newer than what's on disk, the banner shows "update available". Manual **Check for updates** button forces a re-poll.
+
+### Hardening (the download path talks to the internet — careful)
+
+- **HTTPS-only by default.** http URLs are refused unless you explicitly enable `hmm_db_allow_http` in settings — opt-in for legacy mirrors that don't serve TLS.
+- **Bounded redirects + explicit SSL context.** Custom urllib opener follows at most 5 redirects (urllib's default is 10) and uses `ssl.create_default_context()` so certificate validation always goes through the system trust store.
+- **Content-Type guard.** Responses with `text/html`, `application/json`, or `application/xml` are rejected as error pages (some CDNs serve a "blocked" page with HTTP 200 — pre-sweep we'd happily save 12 KB of HTML as `db.hmm.gz` and bewilder you later).
+- **Magic-byte verification.** Downloaded gzip stream must start with `0x1f8b`; decompressed output must start with `HMMER3/` or `HMMER2.0`. Catches a download that was the right size but the wrong file (CDN substitution, mirror drift, README served instead of database).
+- **Disk-space pre-check.** Before any byte hits disk, `shutil.disk_usage` confirms ≥ 2.5× the Content-Length is free (or ≥ 5 GB if Content-Length is unknown). Refused with a clear message rather than mysteriously dying mid-download.
+- **Retry on transient failures.** One retry with 250 ms backoff for `URLError` / `socket.timeout`, matching the existing PyPI + NCBI fetch pattern.
+- **Cancel-aware long ops.** The download and decompress loops poll `is_mounted` between chunks — closing the modal mid-download aborts cleanly and removes the partial `.download_tmp` / `.gz_tmp` file.
+- **n_profiles == 0 → failure.** A `hmmpress` that returns 0 profiles means the file parsed but was empty; treated as a download failure (and the half-pressed `.h3*` siblings cleaned up).
+- **Cross-modal download slot.** A global `_HMM_DB_DOWNLOAD_INFLIGHT` set prevents starting a second download of the same DB even if you close + reopen the modal mid-download.
+- **URL credential redaction.** A user-pasted URL with `user:pass@host` is scrubbed in every log line so the diagnostic bundle never leaks credentials.
+- **Zip-bomb defence.** Decompressed output capped at the configured per-DB max (4 GB by default); legitimate Pfam-A is ~2 GB so this is comfortable headroom while refusing a 100:1 bomb.
+- **`_USER_DATA_DIR_ATTRS` covers `_HMM_DATABASES_DIR`.** Master Delete + pre-update snapshots both pick up the downloaded HMM databases automatically.
+
+### Tests
+
+- 57 new tests in `tests/test_hmm_db_catalog.py` covering catalog persistence, URL/id sanitisation (ASCII-only, no path traversal, no NUL, no control chars), credential redaction, scheme policy, content-type guard, disk-space check, magic-byte verification, decompression hardening (zip-bomb refused, corrupt gzip refused, cancel works), hmmpress cleanup, network retry, version-file parsing, per-DB local state with 24h cache, and both new modals' 160×48 boundary smoke.
+- 16 new tests in `tests/test_library_bulk_mark.py` covering the bulk-move/copy commit: basic move + copy, deep-copy isolation (mutating source after copy doesn't bleed into target), name-collision suffix (single + multi), source==target refused, source-disappeared-mid-commit, invalid mode, partial-id filtering, metadata-preserved-fully (status / alignments / history XML / `_plugin_data` / custom fields), active-mirror re-stages on move-from-active + copy-to-active, id-collision rename, two-thread concurrency without corruption.
+
+### New invariant
+
+- **[INV-84]** HMM database registry: every cross-internet helper goes through `_hmm_db_build_url_opener` (bounded redirects + explicit SSL) + `_hmm_db_assert_content_type_ok` + URL credential redaction; every persisted catalog entry passes through `_normalise_hmm_db_entry` so a hand-edited `hmm_db_catalog.json` can't smuggle un-sanitised ids or URLs into the live runtime.
+
+---
+
 ## [0.9.26] — 2026-05-25
 
 ### Bug fixes
