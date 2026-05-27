@@ -63,10 +63,18 @@ installs and the user-data directory location.
   Align: the picked library plasmid loads onto the canvas and the
   plasmidsaurus virtual plasmid lands as a blue alignment bar on its
   linear view (origin of the library entry stays the absolute
-  reference; the read is rotated to match). Bar is labelled `<row#>
-  <gbk_basename>` and persists onto the target's library entry so
-  re-loading restores it. Target auto-tags to linear view for future
-  opens.
+  reference; the read is rotated to match). The read's name is
+  painted IN-PLACE on the bar as black text — same character reads
+  on blue (match), red (mismatch), or gray (gap) depending on what's
+  under it — so you can scan a multi-read pile-up and identify every
+  lane without losing the bar's data carry. Zoom past one column
+  per bp and the name turns into a fixed-width lane number (`1`,
+  `2`, …) at the left margin so the raw bases stay legible. Bars
+  persist onto the target's library entry — and if the target lives
+  in a different collection than the one you're working from, the
+  alignment is saved into THAT collection's snapshot with a toast
+  telling you where it landed (no more vanished alignments on
+  restart). Target auto-tags to linear view for future opens.
 - **Bulk-align a whole results folder** — on the **2. Pick sample**
   tab, click **Bulk auto-align all samples** to match every sample
   against the library by name (Plasmidsaurus filename → library

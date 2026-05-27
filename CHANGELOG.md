@@ -14,6 +14,31 @@
 
 ---
 
+## [0.9.32] — 2026-05-27
+
+### Alignment overlay name + cross-collection persistence fix
+
+#### Bug fixes
+
+- **Alignments to plasmids in a different collection no longer vanish on restart.** When you ran a Plasmidsaurus zip (or Alt+A) from one collection (say BLUE) but the target plasmid lived in another (say Eden), the alignment showed on the band during the session but was lost the moment you swapped records or quit. The flush walked only the active library, which was BLUE's snapshot — couldn't find the Eden target's id, returned silently, never wrote anywhere. Now the flush falls back to walking `collections.json` and persists into whichever collection holds the target. You get a toast telling you where it landed ("Alignment saved to "Eden" collection — switch there to see it"). For ad-hoc records that aren't in any collection at all (file open, NCBI fetch never added), a clear warning surfaces so you know to add the plasmid to a collection if you want the alignment to stick.
+- **Re-flushing the same alignment in one session no longer creates a duplicate row.** Pre-fix `_flush_active_alignments` minted a fresh uuid every serialize pass — so two quick `_align_worker` completions for the same target wrote the same alignment twice to disk. Now the canonical stored id is stamped back onto the in-memory entry (`_stored_id`) the moment serialise lands; the second flush matches it against the existing row by id and updates in place.
+
+#### New features
+
+- **Alignment name painted IN-PLACE on the bar.** When the overlay band is in bar mode (zoomed out), each alignment row now shows its name (read filename / query label) as black text overlaid on the colored bar — the same character reads on blue where the bar matches, red where it mismatches, gray where the read has a deletion. Lets you scan a pile-up and identify every read without losing the bar's data carry. The name truncates silently when the visible bar is shorter than the name; bars under 4 cols wide skip the overlay entirely (a 1-char fragment of a name carries no signal).
+- **Lane indicator at the left margin in letter mode.** When you zoom in far enough to see raw bases (1 col / bp), the name overlay would clash with the letters, so it's replaced by a short right-justified lane number (" 1", " 9", "10", "9+" for >99) in the left margin. Fixed-width so the letter area's left edge stays stable across rows — easy to compare pile-ups from a sequencing run base-by-base while still knowing which lane is which.
+
+#### Hardening
+
+- **9 new tests** in `tests/test_alignment_overlay.py`:
+  * `TestAlignmentNameOverlay` (12 cases) — pure helper that emits the (col, char, state) tuples consumed by the renderer; covers truncation, min-bar skip, per-column state lookup, empty/whitespace names, unknown-state fallback, and defensive non-int / non-dict inputs.
+  * `TestAlignmentLaneIndicator` (9 cases) — 1-indexed format, two-digit rollover, "9+" overflow at width 2, negative / non-int → blanks, zero-width → empty.
+  * Cross-collection persistence regression (`test_flush_persists_into_other_collection_when_target_lives_there`) — sets up two collections, loads the target from the inactive collection onto the canvas, registers an alignment, flushes, verifies it landed in the right collection's snapshot AND that `_stored_id` was stamped back so a second flush doesn't duplicate.
+  * Helper-level coverage for `_persist_alignments_into_collection_for_target` (returns success path + the "no collection holds the target" case) and `_merge_stored_alignments` (stamp_pairs propagation prevents double-write).
+- **Existing 4136-test suite passes** — added cleanup to one downstream test that interrogated the band row's whitespace (the new lane indicator added a leading " 1 " prefix; updated regex strips it before counting internal spaces in the letter area).
+
+---
+
 ## [0.9.31] — 2026-05-27
 
 ### Tidy: test suite cleanup + doc freshness

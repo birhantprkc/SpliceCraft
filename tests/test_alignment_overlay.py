@@ -112,6 +112,116 @@ class TestAlignmentToTargetSegments:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# _alignment_name_overlay + _alignment_lane_indicator (bar-overlay + lane tags)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestAlignmentNameOverlay:
+    """Pure helper that emits the (col, char, state) tuples used by the
+    alignment band's in-bar name overlay. The renderer turns each
+    tuple into a black-on-state-color cell so the name reads on the
+    same colored bar that carries the alignment's data."""
+
+    def test_basic_overlay_returns_one_tuple_per_char(self):
+        col_state = {10: "match", 11: "match", 12: "match", 13: "match",
+                     14: "match", 15: "match"}
+        out = sc._alignment_name_overlay("READ_1", 10, 6, col_state)
+        assert out == [
+            (10, "R", "match"),
+            (11, "E", "match"),
+            (12, "A", "match"),
+            (13, "D", "match"),
+            (14, "_", "match"),
+            (15, "1", "match"),
+        ]
+
+    def test_truncates_when_name_wider_than_bar(self):
+        col_state = {0: "match", 1: "match", 2: "match", 3: "match"}
+        out = sc._alignment_name_overlay("WAY_TOO_LONG", 0, 4, col_state)
+        assert [t[1] for t in out] == ["W", "A", "Y", "_"]
+
+    def test_skipped_when_bar_below_min_cols(self):
+        # Default min is 4 — a 3-col bar produces nothing.
+        col_state = {0: "match", 1: "match", 2: "match"}
+        assert sc._alignment_name_overlay("ABC", 0, 3, col_state) == []
+
+    def test_picks_state_per_column_for_mixed_bar(self):
+        # Mid-bar mismatch should color that name char's bg red.
+        col_state = {5: "match", 6: "match", 7: "mismatch", 8: "match"}
+        out = sc._alignment_name_overlay("name", 5, 4, col_state)
+        states = [t[2] for t in out]
+        assert states == ["match", "match", "mismatch", "match"]
+
+    def test_missing_col_state_defaults_to_match(self):
+        # Edge col not in col_state → falls back to "match" (a stable
+        # default so the overlay never paints transparent / unstyled).
+        out = sc._alignment_name_overlay("xy", 100, 4, {})
+        assert [t[2] for t in out] == ["match", "match"]
+
+    def test_empty_name_returns_empty(self):
+        assert sc._alignment_name_overlay("", 0, 10, {0: "match"}) == []
+
+    def test_whitespace_only_name_returns_empty(self):
+        assert sc._alignment_name_overlay("   ", 0, 10, {0: "match"}) == []
+
+    def test_strips_surrounding_whitespace(self):
+        out = sc._alignment_name_overlay("  ab  ", 0, 6, {})
+        assert [t[1] for t in out] == ["a", "b"]
+
+    def test_unknown_state_falls_back_to_match(self):
+        out = sc._alignment_name_overlay("z", 0, 4, {0: "bogus"})
+        assert out == [(0, "z", "match")]
+
+    def test_non_int_bar_width_returns_empty(self):
+        assert sc._alignment_name_overlay("ab", 0, "wide", {}) == []  # type: ignore[arg-type]
+
+    def test_non_int_col_start_returns_empty(self):
+        assert sc._alignment_name_overlay("ab", 1.5, 4, {}) == []  # type: ignore[arg-type]
+
+    def test_non_dict_col_state_falls_back_to_match(self):
+        # Defensive: pass-through robustness if the caller wires a
+        # list / None by mistake (don't crash, default to match).
+        out = sc._alignment_name_overlay("ab", 0, 4, None)  # type: ignore[arg-type]
+        assert [t[2] for t in out] == ["match", "match"]
+
+
+class TestAlignmentLaneIndicator:
+    """1-indexed, fixed-width lane tag used at the left margin when
+    letter mode is on (raw bases visible — name overlay would clash)."""
+
+    def test_first_lane_is_one(self):
+        assert sc._alignment_lane_indicator(0) == " 1"
+
+    def test_second_lane_is_two(self):
+        assert sc._alignment_lane_indicator(1) == " 2"
+
+    def test_ninth_lane_right_justified(self):
+        assert sc._alignment_lane_indicator(8) == " 9"
+
+    def test_two_digit_lane_uses_full_width(self):
+        assert sc._alignment_lane_indicator(9) == "10"
+        assert sc._alignment_lane_indicator(98) == "99"
+
+    def test_overflow_collapses_to_truncated_marker(self):
+        # 100+ lanes at width 2 collapses to "9+" so the column
+        # boundary stays stable (letter area never shifts between rows).
+        assert sc._alignment_lane_indicator(99) == "9+"
+        assert sc._alignment_lane_indicator(500) == "9+"
+
+    def test_overflow_at_width_three(self):
+        assert sc._alignment_lane_indicator(999, width=3) == "99+"
+
+    def test_negative_returns_blanks(self):
+        assert sc._alignment_lane_indicator(-1) == "  "
+
+    def test_non_int_returns_blanks(self):
+        assert sc._alignment_lane_indicator("x") == "  "  # type: ignore[arg-type]
+
+    def test_zero_width_returns_empty(self):
+        assert sc._alignment_lane_indicator(0, width=0) == ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # _alignment_to_target_letters
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -580,8 +690,9 @@ class TestAlignmentPersistenceRoundTrip:
     async def test_flush_no_op_when_record_not_in_library(
             self, isolated_library, tiny_record):
         """Loading a record that isn't in the library (file open, demo)
-        means there's no library entry to persist onto. Flush must
-        silently no-op rather than raising."""
+        AND isn't in any collection means there's nowhere to persist.
+        Flush must not raise; surfaces a warning notify (2026-05-27)
+        so the user knows the alignment won't survive a restart."""
         app = sc.PlasmidApp()
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
@@ -596,6 +707,228 @@ class TestAlignmentPersistenceRoundTrip:
             )
             # Must not raise.
             app._flush_active_alignments()
+
+    async def test_flush_persists_into_other_collection_when_target_lives_there(
+            self, isolated_library):
+        """Regression: 2026-05-27 user report. Running a Plasmidsaurus
+        alignment from collection 'ActiveCol' against a plasmid that
+        lives in collection 'TargetCol' — `_apply_record(target)` swaps
+        the canvas, then the worker calls `_flush_active_alignments`.
+        Pre-fix the flush looked up the target id in the ACTIVE library
+        (= ActiveCol's snapshot) and missed → silently returned → the
+        alignment vanished on the next record swap or restart.
+
+        New contract: walk `collections.json`, find whichever
+        collection holds the target id, persist into that collection's
+        snapshot. The active library is untouched (target plasmid
+        isn't there). User gets an info notify so they know where
+        it landed.
+        """
+        rec_active, entry_active = self._make_library_record(
+            "A" * 200, "ACTIVE_PLASMID",
+        )
+        rec_target, entry_target = self._make_library_record(
+            "T" * 250, "TARGET_PLASMID",
+        )
+        sc._save_collections([
+            {
+                "name":        "ActiveCol",
+                "description": "active",
+                "plasmids":    [entry_active],
+                "saved":       "2026-05-27",
+            },
+            {
+                "name":        "TargetCol",
+                "description": "holds the alignment target",
+                "plasmids":    [entry_target],
+                "saved":       "2026-05-27",
+            },
+        ])
+        sc._set_active_collection_name("ActiveCol")
+        sc._save_library([entry_active])   # active library = ActiveCol's
+
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            # Simulate the Plasmidsaurus flow: load the TARGET onto
+            # the canvas (canvas record id = "TARGET_PLASMID", which
+            # is NOT in the active library / ActiveCol).
+            app._apply_record(rec_target)
+            await pilot.pause(0.05)
+            app._register_alignment(
+                name="WZX_read_1",
+                query_label="WZX_read_1",
+                target_label="TARGET_PLASMID",
+                target_record=rec_target,
+                result={
+                    "aligned_q": "A" * 200 + "-" * 50,
+                    "aligned_t": "T" * 250,
+                },
+            )
+            assert len(app._alignments) == 1
+            app._flush_active_alignments()
+
+            # Active library untouched — target isn't there, so the
+            # active library save path didn't even run.
+            active_entries = sc._load_library()
+            assert {e.get("id") for e in active_entries} == {"ACTIVE_PLASMID"}
+            assert (active_entries[0].get("alignments") or []) == []
+
+            # The alignment MUST land in TargetCol's snapshot.
+            cols = sc._load_collections()
+            target_col = next(
+                c for c in cols if c.get("name") == "TargetCol"
+            )
+            target_pl = next(
+                p for p in (target_col.get("plasmids") or [])
+                if p.get("id") == "TARGET_PLASMID"
+            )
+            stored = target_pl.get("alignments") or []
+            assert len(stored) == 1
+            assert stored[0]["target_label"] == "TARGET_PLASMID"
+            assert stored[0]["visible"] is True
+            stored_id_first = stored[0]["id"]
+
+            # _stored_id stamped on the in-memory entry so a re-flush
+            # picks the same on-disk row instead of appending a clone.
+            assert app._alignments[0].get("_stored_id") == stored_id_first
+
+            # Re-flush in the same session must NOT create a duplicate.
+            app._flush_active_alignments()
+            cols2 = sc._load_collections()
+            target_col2 = next(
+                c for c in cols2 if c.get("name") == "TargetCol"
+            )
+            target_pl2 = next(
+                p for p in (target_col2.get("plasmids") or [])
+                if p.get("id") == "TARGET_PLASMID"
+            )
+            assert len(target_pl2.get("alignments") or []) == 1, (
+                "second flush in same session must not append a "
+                "duplicate of the same alignment"
+            )
+
+    def test_persist_alignments_into_collection_finds_target_across_collections(
+            self, isolated_library):
+        """Pure helper test: `_persist_alignments_into_collection_for_target`
+        walks every collection in `collections.json` to find the
+        target id. Pre-fix the flush only looked in the active
+        library — this helper is the path that catches the cross-
+        collection case before the alignment is lost."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec_t = SeqRecord(
+            Seq("G" * 120), id="LIVES_IN_OTHER",
+            name="LIVES_IN_OTHER",
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        entry_t = {
+            "id":      "LIVES_IN_OTHER",
+            "name":    "LIVES_IN_OTHER",
+            "size":    120,
+            "gb_text": sc._record_to_gb_text(rec_t),
+        }
+        sc._save_collections([
+            {"name": "Empty", "description": "", "plasmids": []},
+            {"name": "Holds_Target",
+             "description": "", "plasmids": [entry_t]},
+        ])
+        in_memory = [{
+            "name":         "stray_read",
+            "query_label":  "stray_read",
+            "target_label": "LIVES_IN_OTHER",
+            "target_record": rec_t,
+            "result": {"aligned_q": "G" * 120, "aligned_t": "G" * 120},
+            "aligned_q":    "G" * 120,
+            "aligned_t":    "G" * 120,
+            "axis":         "target",
+            "segments":     [(0, 120, "match")],
+            "t_lo":         0,
+            "t_hi":         120,
+            "letters":      None,
+        }]
+        ok, col_name, n = sc._persist_alignments_into_collection_for_target(
+            "LIVES_IN_OTHER", in_memory,
+        )
+        assert ok is True
+        assert col_name == "Holds_Target"
+        assert n == 1
+        # The collection now carries the alignment.
+        cols = sc._load_collections()
+        holds = next(c for c in cols if c.get("name") == "Holds_Target")
+        pl = holds["plasmids"][0]
+        assert len(pl.get("alignments") or []) == 1
+
+    def test_persist_alignments_into_collection_returns_false_when_target_nowhere(
+            self, isolated_library):
+        """When no collection holds the target id, the helper returns
+        (False, None, 0) so the caller can warn the user that the
+        alignment cannot persist."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec_t = SeqRecord(
+            Seq("C" * 50), id="UNTRACKED",
+            name="UNTRACKED",
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        sc._save_collections([
+            {"name": "OnlyCol", "description": "",
+             "plasmids": [{
+                 "id": "DIFFERENT", "name": "DIFFERENT", "size": 50,
+                 "gb_text": sc._record_to_gb_text(SeqRecord(
+                     Seq("A" * 50), id="DIFFERENT", name="DIFFERENT",
+                     annotations={"molecule_type": "DNA",
+                                  "topology": "linear"})),
+             }]},
+        ])
+        ok, col_name, n = sc._persist_alignments_into_collection_for_target(
+            "UNTRACKED",
+            [{"target_record": rec_t,
+              "result": {"aligned_q": "C"*50, "aligned_t": "C"*50},
+              "name": "x", "query_label": "x", "target_label": "x",
+              "axis": "target", "aligned_q": "C"*50, "aligned_t": "C"*50,
+              "segments": [(0, 50, "match")], "t_lo": 0, "t_hi": 50,
+              "letters": None}],
+        )
+        assert ok is False
+        assert col_name is None
+        assert n == 0
+
+    def test_merge_stored_alignments_stamps_in_memory_with_canonical_id(
+            self, isolated_library):
+        """`_merge_stored_alignments` returns ``stamp_pairs`` so the
+        caller writes ``_stored_id`` back onto the in-memory entry.
+        Without this, a SECOND flush in the same session re-mints a
+        fresh uuid on serialise and the merge appends a duplicate row.
+        """
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        rec_t = SeqRecord(Seq("A" * 30), id="T", name="T",
+                          annotations={"molecule_type": "DNA",
+                                       "topology": "linear"})
+        in_mem = [{
+            "name": "r", "query_label": "r", "target_label": "T",
+            "target_record": rec_t,
+            "result": {"aligned_q": "A"*30, "aligned_t": "A"*30},
+            "aligned_q": "A"*30, "aligned_t": "A"*30,
+            "axis": "target",
+            "segments": [(0, 30, "match")],
+            "t_lo": 0, "t_hi": 30, "letters": None,
+        }]
+        merged, stamp_pairs = sc._merge_stored_alignments([], in_mem)
+        assert len(merged) == 1
+        assert len(stamp_pairs) == 1
+        align, sid = stamp_pairs[0]
+        assert align is in_mem[0]
+        assert isinstance(sid, str) and sid
+        assert merged[0]["id"] == sid
+        # Caller applies the stamp:
+        align["_stored_id"] = sid
+        # Now a re-merge against the just-written existing list must
+        # update in-place (no duplicate).
+        merged2, _ = sc._merge_stored_alignments(merged, in_mem)
+        assert len(merged2) == 1
+        assert merged2[0]["id"] == sid
 
     async def test_flush_preserves_hidden_stored_alignments(
             self, isolated_library):
@@ -2145,7 +2478,14 @@ class TestAlignmentBandCenterline:
             assert band_row, (
                 f"could not locate band row; rows={rows!r}"
             )
+            # Strip the leading lane indicator + gap (introduced
+            # 2026-05-27 as " 1 " / "10 " etc. — see
+            # `_alignment_lane_indicator`) before counting internal
+            # spaces. The test pins down adjacent-bp precision in the
+            # LETTER area, not the margin area.
             stripped = band_row.strip()
+            import re as _re
+            stripped = _re.sub(r"^[0-9+]{1,3}\s+", "", stripped)
             internal_spaces = sum(1 for c in stripped if c == " ")
             assert internal_spaces == 0, (
                 f"band row has {internal_spaces} internal spaces at "

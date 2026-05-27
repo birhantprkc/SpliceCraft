@@ -7032,7 +7032,7 @@ class TestShiftClickFeatureExtend:
         boundaries so the match needs an isolated word."""
         # `category` should NOT match `cat` keyword.
         gb_no_match = (
-            "LOCUS       X 100 bp DNA circular UNK 26-MAY-2026\n"
+            "LOCUS       X                        100 bp    DNA     circular UNK 26-MAY-2026\n"
             "FEATURES             Location/Qualifiers\n"
             '     CDS             1..99\n'
             '                     /label="category"\n'
@@ -7046,7 +7046,7 @@ class TestShiftClickFeatureExtend:
         )
         # `cat` as a standalone token SHOULD match.
         gb_match = (
-            "LOCUS       X 100 bp DNA circular UNK 26-MAY-2026\n"
+            "LOCUS       X                        100 bp    DNA     circular UNK 26-MAY-2026\n"
             "FEATURES             Location/Qualifiers\n"
             '     CDS             1..99\n'
             '                     /label="cat"\n'
@@ -7058,7 +7058,7 @@ class TestShiftClickFeatureExtend:
         assert sc._detect_selection_marker(gb_match) == "Chloramphenicol"
         # `kanR-cat-tet` (compound label) — still matches cat.
         gb_compound = (
-            "LOCUS       X 100 bp DNA circular UNK 26-MAY-2026\n"
+            "LOCUS       X                        100 bp    DNA     circular UNK 26-MAY-2026\n"
             "FEATURES             Location/Qualifiers\n"
             '     CDS             1..99\n'
             '                     /label="kanR-cat-tet"\n'
