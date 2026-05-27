@@ -616,12 +616,17 @@ class TestNormalizeForGenbank:
         normalized = sc._normalize_for_genbank(rec)
         assert normalized.annotations["molecule_type"] == "DNA"
 
-    def test_fills_topology_circular_default(self, tiny_record):
+    def test_fills_topology_linear_default(self, tiny_record):
+        # 2026-05-27 (audit-3 H1): default changed from "circular"
+        # to "linear" so a record imported from GFF3 / FASTA without
+        # an explicit topology is NOT silently relabelled circular.
+        # Topology is biologically load-bearing; circular-default
+        # corrupted PCR sim + restriction wrap detection downstream.
         rec = tiny_record
         rec.annotations = {k: v for k, v in rec.annotations.items()
                            if k != "topology"}
         normalized = sc._normalize_for_genbank(rec)
-        assert normalized.annotations["topology"] == "circular"
+        assert normalized.annotations["topology"] == "linear"
 
     def test_fills_division_syn_default(self, tiny_record):
         """Synthetic plasmids default to the SYN division code."""
@@ -759,7 +764,9 @@ class TestExportGenBankToPath:
         sc._export_genbank_to_path(bare, out)
         reloaded = sc.load_genbank(str(out))
         assert reloaded.annotations["molecule_type"] == "DNA"
-        assert reloaded.annotations["topology"] == "circular"
+        # 2026-05-27 (audit-3 H1): topology defaults to "linear"
+        # for records with no explicit value.
+        assert reloaded.annotations["topology"] == "linear"
 
     def test_export_parent_dir_created(self, tiny_record, tmp_path):
         """Intermediate directories are created as needed."""

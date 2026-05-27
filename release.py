@@ -989,8 +989,13 @@ def main(argv: list[str] | None = None) -> int:
         _die("no build artifacts found in dist/.")
     _run([sys.executable, "-m", "twine", "check", *dist_files])
 
-    _heading("Syncing conda recipe")
-    _sync_conda_recipe(new_version)
+    # 2026-05-27: conda recipe sync + bioconda PR removed from the
+    # default release flow at user request — too-frequent bioconda
+    # submissions were drawing reviewer complaints. The recipe in
+    # `conda-recipe/meta.yaml` stays in the tree for the rare manual
+    # re-submission, but is no longer touched per release. The
+    # `--bioconda-only` flag still works for explicit re-submission
+    # via `./release.py --bioconda-only`.
 
     _heading("Committing + tagging + pushing")
     # Sweep #18 (2026-05-21): bundle ALL accumulated working-tree
@@ -1013,22 +1018,8 @@ def main(argv: list[str] | None = None) -> int:
     print(" GitHub Actions will publish to PyPI in ~2 minutes.")
     print(" Watch:  https://github.com/Binomica-Labs/SpliceCraft/actions")
     print(" Verify: https://pypi.org/project/splicecraft/")
-    print("═" * 61)
-
-    _heading("Waiting for PyPI before opening bioconda PR")
-    _wait_for_pypi(new_version)
-
-    _heading("Opening bioconda PR")
-    _submit_bioconda_pr(new_version)
-
-    print()
-    print("═" * 61)
-    print(f" Bioconda PR step complete for v{new_version}.")
-    print(" Watch:  "
-          f"https://github.com/{BIOCONDA_UPSTREAM}/pulls?q=splicecraft")
-    print(" End users will get the package via:")
-    print("   conda install -c bioconda splicecraft")
-    print(" once the PR is reviewed and merged.")
+    print(" (Bioconda PR step skipped — run `./release.py "
+          "--bioconda-only` to re-submit the recipe manually.)")
     print("═" * 61)
     return 0
 

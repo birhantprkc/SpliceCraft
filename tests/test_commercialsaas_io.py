@@ -82,12 +82,17 @@ class TestIterCommercialSaaSPackets:
         # dropped (no exception).
         assert len(packets) == 1
 
-    def test_truncated_payload_stops_cleanly(self):
-        # Header claims 100 bytes but only 5 follow.
+    def test_truncated_payload_raises(self):
+        # 2026-05-27 (audit-3 H2): a length-overrun used to silently
+        # stop the iterator, and `_inject_commercialsaas_history`
+        # would then re-emit only the packets seen — irreversibly
+        # truncating the file on save. Now raises so the load
+        # refuses cleanly instead of producing data loss on round-
+        # trip. Header claims 100 bytes but only 5 follow.
         bad = bytes([0x07]) + (100).to_bytes(4, "big") + b"hello"
         data = _make_minimal_dna() + bad
-        packets = list(sc._iter_commercialsaas_packets(data))
-        assert len(packets) == 1   # only cookie
+        with pytest.raises(ValueError, match="length overrun"):
+            list(sc._iter_commercialsaas_packets(data))
 
     def test_empty_input_yields_nothing(self):
         assert list(sc._iter_commercialsaas_packets(b"")) == []

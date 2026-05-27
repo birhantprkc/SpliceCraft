@@ -425,6 +425,279 @@ class TestAlignmentToQueryLetters:
 # Cross-check: segments and letters agree on state
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class TestIupacCompatible:
+    """Pure helper that powers IUPAC-aware match counting. ``N`` vs
+    ``A`` is a match (N stands for any base); ``R`` (A/G) vs ``A`` is
+    a match; ``R`` vs ``C`` is a mismatch. Pre-2026-05-27 the aligner
+    counted these as strict-equality mismatches, dropping identity %
+    on any consensus / primer carrying ambiguity codes."""
+
+    def test_strict_self_match(self):
+        for b in "ACGT":
+            assert sc._iupac_compatible(b, b)
+
+    def test_n_matches_anything(self):
+        for b in "ACGTN":
+            assert sc._iupac_compatible("N", b)
+            assert sc._iupac_compatible(b, "N")
+
+    def test_r_matches_a_and_g_only(self):
+        assert sc._iupac_compatible("R", "A")
+        assert sc._iupac_compatible("R", "G")
+        assert not sc._iupac_compatible("R", "C")
+        assert not sc._iupac_compatible("R", "T")
+
+    def test_y_matches_c_and_t_only(self):
+        assert sc._iupac_compatible("Y", "C")
+        assert sc._iupac_compatible("Y", "T")
+        assert not sc._iupac_compatible("Y", "A")
+        assert not sc._iupac_compatible("Y", "G")
+
+    def test_two_ambiguities_compatible_if_any_base_shared(self):
+        # R = {A,G}; M = {A,C}; share `A`.
+        assert sc._iupac_compatible("R", "M")
+        # R = {A,G}; Y = {C,T}; share nothing.
+        assert not sc._iupac_compatible("R", "Y")
+
+    def test_case_insensitive(self):
+        assert sc._iupac_compatible("a", "N")
+        assert sc._iupac_compatible("r", "g")
+
+    def test_u_treated_as_t(self):
+        assert sc._iupac_compatible("U", "T")
+        assert sc._iupac_compatible("u", "t")
+        # U should mismatch C/G/A
+        assert not sc._iupac_compatible("U", "A")
+
+    def test_gap_chars_return_false(self):
+        # `-` is not in the IUPAC alphabet; callers must filter gaps
+        # BEFORE this check. Returning False keeps the helper safe
+        # if a caller forgets.
+        assert not sc._iupac_compatible("-", "A")
+        assert not sc._iupac_compatible("A", "-")
+
+    def test_empty_inputs_return_false(self):
+        assert not sc._iupac_compatible("", "A")
+        assert not sc._iupac_compatible("A", "")
+
+    def test_non_iupac_char_returns_false(self):
+        assert not sc._iupac_compatible("X", "A")
+        assert not sc._iupac_compatible("E", "A")
+
+
+class TestPairwiseAlignIupacAndGapFields:
+    """`_pairwise_align` 2026-05-27 changes: IUPAC-aware match
+    counting + gap-open / gap-col split + degenerate-input safety."""
+
+    def test_strict_match_counts(self):
+        r = sc._pairwise_align("ATGC", "ATGC", mode="global")
+        assert r["n_matches"] == 4
+        assert r["n_mismatches"] == 0
+        assert r["n_gap_cols"] == 0
+        assert r["n_gap_opens_q"] == 0
+        assert r["n_gap_opens_t"] == 0
+        # Strict 100% — feeds the light-blue color tier.
+        assert r["identity_pct"] == 100.0
+
+    def test_n_against_a_counts_as_match(self):
+        # Single-N consensus aligned against ATGC: pre-2026-05-27
+        # the N position was a mismatch, identity_pct = 75. Now N
+        # is IUPAC-compatible with any base → 100%.
+        r = sc._pairwise_align("ANGC", "ATGC", mode="global")
+        assert r["n_matches"] == 4
+        assert r["n_mismatches"] == 0
+        assert r["identity_pct"] == 100.0
+
+    def test_r_vs_c_is_mismatch(self):
+        r = sc._pairwise_align("RTGC", "CTGC", mode="global")
+        # R = {A,G}; C is not in R's base set → mismatch.
+        assert r["n_matches"] == 3
+        assert r["n_mismatches"] == 1
+
+    def test_u_normalized_to_t(self):
+        # RNA pasted as DNA — every U used to mismatch T. Now U→T
+        # mapping in `_normalize_dna_for_align` makes the alignment
+        # behave identically to all-T input.
+        r = sc._pairwise_align("AUGC", "ATGC", mode="global")
+        assert r["n_matches"] == 4
+        assert r["n_mismatches"] == 0
+        assert r["identity_pct"] == 100.0
+
+    def test_n_gap_cols_vs_opens(self):
+        # Hand-build the gapped strings then count via the gap-open
+        # logic by aligning sequences known to produce a 4-bp del.
+        # AAAA vs AAAAAATTTT: query is shorter, so global mode
+        # opens one gap in query.
+        r = sc._pairwise_align(
+            "AAAATTTT" + "G" * 4,
+            "AAAATTTTGGGG",
+            mode="global",
+        )
+        # The exact gap layout depends on Biopython's tie-breaking,
+        # but n_gap_cols >= n_gap_opens_q + n_gap_opens_t MUST hold.
+        assert r["n_gap_cols"] >= r["n_gap_opens_q"] + r["n_gap_opens_t"]
+        # back-compat: n_gaps is alias for n_gap_cols.
+        assert r["n_gaps"] == r["n_gap_cols"]
+
+    def test_n_gap_opens_counts_runs_not_chars(self):
+        # Multi-bp deletion: insert 10 As into query, target stays
+        # short — the aligner produces 10 contiguous gaps in target.
+        r = sc._pairwise_align(
+            "AAAAAAAAAAAAAA",       # 14 A's
+            "AAAA",                  # 4 A's
+            mode="global",
+        )
+        # Target has 10 gap chars but ONE gap-open run.
+        assert r["n_gap_opens_t"] >= 1
+        # Gap-cols counts each '-' column.
+        assert r["n_gap_cols"] >= 10
+        # Gap-opens in target must be << gap-cols (run vs chars).
+        assert r["n_gap_opens_t"] < r["n_gap_cols"]
+
+
+class TestNormalizeMapsURnaToT:
+    def test_uppercase_u_becomes_t(self):
+        assert sc._normalize_dna_for_align("AUGC") == "ATGC"
+
+    def test_lowercase_u_becomes_t(self):
+        assert sc._normalize_dna_for_align("augc") == "ATGC"
+
+    def test_mixed_dna_rna_normalizes(self):
+        # AAUUGGCC → AATTGGCC
+        assert sc._normalize_dna_for_align("AAUUGGCC") == "AATTGGCC"
+
+    def test_u_in_iupac_string_normalized(self):
+        # Ambiguity + RNA mixed: NRUYW → NRTYW (only U becomes T).
+        assert sc._normalize_dna_for_align("NRUYW") == "NRTYW"
+
+
+class TestRotateFrameRaisesOnFallthrough:
+    """Pre-2026-05-27 the rotate-back helpers returned the input
+    unchanged when the cut point wasn't found — silently leaving
+    segments in rotated-target frame. Now strict: raise so a future
+    local-mode caller catches the case loudly."""
+
+    def test_target_frame_helper_raises(self):
+        with pytest.raises(ValueError, match="cut point"):
+            sc._rotate_aligned_to_original_target_frame(
+                "AT-GC-", "AT-GC-", 3, 8,
+            )
+
+    def test_query_frame_helper_raises(self):
+        with pytest.raises(ValueError, match="cut point"):
+            sc._rotate_aligned_to_original_query_frame(
+                "AT-GC-", "AT-GC-", 3, 8,
+            )
+
+
+class TestAlignmentContentKey:
+    """Content-key helper that powers in-batch dedup in
+    `_merge_stored_alignments`. Stable across re-serialise; only
+    sensitive to target_id + axis + aligned strings."""
+
+    @staticmethod
+    def _entry(target_id="T", axis="target", aq="ATGC", at="ATGC"):
+        return {
+            "target_id": target_id, "axis": axis,
+            "aligned_q": aq, "aligned_t": at,
+        }
+
+    def test_identical_entries_share_key(self):
+        a = self._entry()
+        b = self._entry()
+        assert sc._alignment_content_key(a) == sc._alignment_content_key(b)
+
+    def test_different_target_id_distinct(self):
+        assert (sc._alignment_content_key(self._entry(target_id="A"))
+                != sc._alignment_content_key(self._entry(target_id="B")))
+
+    def test_different_axis_distinct(self):
+        assert (sc._alignment_content_key(self._entry(axis="target"))
+                != sc._alignment_content_key(self._entry(axis="query")))
+
+    def test_different_aligned_q_distinct(self):
+        assert (sc._alignment_content_key(self._entry(aq="ATGC"))
+                != sc._alignment_content_key(self._entry(aq="AAAA")))
+
+    def test_missing_aligned_strings_returns_none(self):
+        assert sc._alignment_content_key({"target_id": "T"}) is None
+
+    def test_pulls_from_result_dict_fallback(self):
+        # Some entry shapes (in-flight worker results) carry aq/at
+        # only under `result` — helper looks there too.
+        e = {
+            "target_id": "T", "axis": "target",
+            "result": {"aligned_q": "ATGC", "aligned_t": "ATGC"},
+        }
+        e_direct = {
+            "target_id": "T", "axis": "target",
+            "aligned_q": "ATGC", "aligned_t": "ATGC",
+        }
+        assert sc._alignment_content_key(e) == sc._alignment_content_key(e_direct)
+
+
+class TestMergeDedupConcurrentRace:
+    """`_merge_stored_alignments` 2026-05-27: in-batch content-key
+    dedup. Two workers producing the same alignment near-simultaneously
+    both pass the id check (neither has a `_stored_id` yet) — without
+    dedup they'd both append, producing duplicate stored rows."""
+
+    @staticmethod
+    def _in_memory(name="dup"):
+        return {
+            "name": name, "query_label": "q", "target_label": "t",
+            "target_id": "T", "target_record": None,
+            "axis": "target",
+            "aligned_q": "ATGCATGC", "aligned_t": "ATGCATGC",
+            "result": {
+                "aligned_q": "ATGCATGC", "aligned_t": "ATGCATGC",
+                "n_matches": 8, "n_mismatches": 0,
+                "identity_pct": 100.0,
+            },
+        }
+
+    def test_two_concurrent_workers_collapse_to_one_row(self):
+        # `_serialize_alignment_for_storage` returns None when
+        # target_record is None — use a real record so the serialise
+        # succeeds.
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq("ATGCATGC"), id="T", name="T",
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        a = self._in_memory("worker_1")
+        b = self._in_memory("worker_2")
+        a["target_record"] = rec
+        b["target_record"] = rec
+        merged, _ = sc._merge_stored_alignments([], [a, b])
+        # Without dedup we'd get 2 rows; with dedup, 1.
+        assert len(merged) == 1
+        assert merged[0]["target_label"] == "t"
+
+    def test_existing_with_same_content_is_NOT_deduped(self):
+        # If an alignment is already on disk with the same content
+        # AND the user runs a NEW alignment with identical content,
+        # that's a legitimate "I did this again" — preserve as a
+        # separate stored row.
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq("ATGCATGC"), id="T", name="T",
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        existing_stored = sc._serialize_alignment_for_storage(
+            {**self._in_memory("old"), "target_record": rec},
+        )
+        assert existing_stored is not None
+        in_mem = [{**self._in_memory("new"), "target_record": rec}]
+        merged, _ = sc._merge_stored_alignments(
+            [existing_stored], in_mem,
+        )
+        # Existing + new = 2 rows. New one gets a fresh uuid.
+        assert len(merged) == 2
+
+
 class TestSegmenterLetterConsistency:
     """The two helpers walk the same gapped strings with the same
     classification — every target column in `letters` must fall inside
@@ -3563,20 +3836,23 @@ class TestRotateAlignedToOriginalTargetFrame:
         # Non-gap count of at is unchanged (still tracks 8 bp of target)
         assert at.count("-") == new_at.count("-")
 
-    def test_cut_not_found_falls_back_to_unchanged(self):
+    def test_cut_not_found_raises(self):
         """If the alignment's `at` doesn't contain enough non-gap
-        chars to reach cut_target_bp, the helper falls back to
-        returning the inputs (defensive — alignment didn't span the
-        rotation point so we can't transform it cleanly)."""
+        chars to reach cut_target_bp, the helper raises ValueError.
+
+        Pre-2026-05-27 returned the inputs unchanged — but those
+        strings are in ROTATED frame, so downstream segments would
+        render at the wrong bp on the canvas (silent positional
+        corruption). The new strict contract surfaces the case
+        loudly so any future local-mode caller catches it instead
+        of producing wrong-frame overlays.
+        """
         # 8 bp target, t_rot 3 → need to find the 5th non-gap char
         # (cut_target_bp=5). If `at` has only 4 non-gap chars, can't.
         aq = "AT-GC-"
         at = "AT-GC-"   # 4 non-gap chars
-        out_q, out_t = sc._rotate_aligned_to_original_target_frame(
-            aq, at, 3, 8,
-        )
-        assert out_q == aq
-        assert out_t == at
+        with pytest.raises(ValueError, match="cut point"):
+            sc._rotate_aligned_to_original_target_frame(aq, at, 3, 8)
 
 
 class TestRotateAlignedToOriginalQueryFrame:

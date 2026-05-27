@@ -14,6 +14,115 @@
 
 ---
 
+## [0.9.35] — 2026-05-27
+
+### Four-area paranoid audit + conda detachment
+
+Four parallel deep audits (data persistence, sequence editing, concurrency, GenBank/CommercialSaaS I/O) surfaced 14 HIGH + 25 MED + 20 LOW findings on top of the alignment work already in this version. This release lands every HIGH plus the high-leverage MEDs.
+
+#### Release-flow change
+
+- **Conda recipe sync + bioconda PR step removed from the default release flow.** User feedback that too-frequent bioconda submissions were drawing reviewer complaints. `./release.py X.Y.Z` no longer touches `conda-recipe/meta.yaml` or opens a bioconda PR. The `--bioconda-only` flag is still available for explicit manual re-submission when needed.
+
+#### Data integrity (HIGH)
+
+- **Atomic-write `os.fsync` failures now propagate.** Pre-fix `os.fsync` `OSError` was silently swallowed — a disk returning EIO mid-flush meant the data was NOT on stable storage but `os.replace` proceeded anyway. Power loss after that = lost save with the UI already saying "saved". Now any fsync failure aborts the write.
+- **`.bak` rotation order swapped.** Pre-fix the legacy `.bak` was written BEFORE the timestamped `.bak.<ts>` — on ENOSPC during the legacy write, the previous-good `.bak` was clobbered with a truncated file, and the timestamped backup that would have caught the condition came AFTER. Now: timestamped first, legacy second, both raise on failure.
+- **`.bak` recovery preserves schema-version stamp.** If main is corrupt and we recover from `.bak`, the recovered envelope's `_schema_version` is now stashed into `_OBSERVED_SCHEMA_VERSIONS` so the next save preserves it. Pre-fix a `.bak` from a newer SpliceCraft would be silently demoted to `_CURRENT_SCHEMA_VERSION`.
+- **`.bak` recovery preserves the corrupt main file aside** as `<file>.corrupt-<ts>` so a forensic look at what corrupted the original is still possible after restore.
+- **Pre-update snapshot copy now under `_cache_lock`.** Pre-fix `shutil.copy2` ran without the lock and could capture a mid-rename inode → manifest sha256 locked in a half-old/half-new Frankenstein file.
+- **Library id-name backfill captures a `_typed_clone` snapshot inside the lock** before saving — prevents a concurrent save from reseating the cache between snapshot capture and disk write.
+- **Async collection-sync drain holds `_cache_lock` across its read-modify-write** — closes a window where a synchronous-path save could land between the worker's load and save.
+
+#### Sequence editing (HIGH)
+
+- **Wrap features with 3+ parts preserve origin anchor on bp-0 inserts.** Pre-fix `is_wrap_canonical` required exactly 2 parts; a legal multi-segment wrap location (e.g. `join(900..1000, 1..100, 200..300)` from a multi-exon CDS imported from GenBank) fell through to the generic per-part shift and broke the wrap anchor. Now any 2+ part canonical wrap is preserved.
+- **`_shift_range` else branch no longer steals 5' bp from features.** Pre-fix when a replace edit started at or before a feature's start and extended partway into it, the feature's new start became the EDIT start — granting the feature `ins_len` of phantom 5' bp from the inserted payload that never belonged to it. Now the new start is just past the inserted payload.
+- **In-place edits (`_apply_record(clear_undo=False)`) refresh the undo stash key.** Pre-fix the key still pointed at the OLD seq-hash after an in-place edit; switching away then back hydrated stale undo snapshots whose embedded record was captured at the earlier sequence state.
+- **Feature qualifiers deepcopied in `_rebuild_record_with_edit`.** Pre-fix qualifier lists were aliased between the rebuild output and the source record, so a downstream mutation of the new feature's qualifiers also mutated the source. Safe today only because `_push_undo` always runs first; deepcopy is belt-and-braces.
+
+#### GenBank / CommercialSaaS / NCBI I/O (HIGH)
+
+- **Default topology changed from "circular" to "linear"** in `_normalize_for_genbank`. Pre-fix a record imported from GFF3 / FASTA without an explicit topology was silently relabelled circular on the first GenBank save — corrupting PCR sim and restriction wrap detection downstream.
+- **CommercialSaaS `.dna` packet length overrun now raises** instead of silently stopping the iterator. Pre-fix a truncated file would silently load a partial packet list, then `_inject_commercialsaas_history` re-emit only the packets seen — irreversibly truncating the file on save.
+- **GenBank export round-trip verify upgraded from feature-count-only to feature-signature.** Pre-fix `len(parsed.features) == len(src.features)` passed even when a wrap CompoundLocation flattened on write. Now compares `(type, str(location), sorted_qualifiers)` per feature so a flatten-on-write surfaces as a round-trip failure rather than silent corruption.
+- **NCBI fetch verifies returned accession.** Pre-fix NCBI occasionally redirected an obsolete accession to a different record and we silently accepted it. Now fails loud with the actual vs requested accession.
+- **CommercialSaaS DNA-packet builder validates sequence is ASCII upfront** instead of crashing mid-write on `.encode("ASCII")` strict. Pre-fix a stray unicode char produced an opaque `UnicodeEncodeError` after some packets were already serialised → user lost the save with no clear cause.
+- **EMBL export now routes through `_normalize_for_genbank`.** Pre-fix it bypassed normalisation — records constructed without `molecule_type` (GFF3 import, programmatic) raised mid-write from Biopython's EMBL writer.
+- **LOCUS truncation logs a warning** when the display name exceeds 16 chars so the user knows the on-disk LOCUS no longer matches.
+
+#### Concurrency (MED)
+
+- **`_LIVE_APP_REF` is now refcounted.** Pre-fix concurrent agent-API threads each ran a `if prev_live is None: set; finally clear if prev_live is None` pattern — request A could clear the ref while request B was still running, leaving B's save-failure notifications routing to a dead `None`. Now an `acquire/release` refcount pair makes the slot safe under concurrent agent traffic.
+
+#### Defensive (MED)
+
+- **XML parser caps nesting depth at 256 levels** so a 10k-deep `<Node>` chain in a `.dna` history-tree can't blow the Python stack in downstream consumers.
+
+#### Verified clean (no fix needed)
+
+The audits also covered a long list of areas where everything checks out — `_safe_save_json` chokepoint + authorization gate + sandbox rule; `os.replace` atomicity (POSIX + Windows); catastrophic-shrink token; pre-update snapshot SHA256 verify (before `os.replace`); `_cache_lock` RLock re-entry into `_save_library` chain; `_pairwise_align` thread-safety (fresh aligner per call); autosave timer cancellation across all three quit paths; sacred invariant #10 (undo deepcopy), #8 (`_feat_len` wrap-aware); all 53 `@work` workers re-checked for stale-load token discipline; agent endpoints don't call `_register_alignment` directly from worker threads (route through `call_from_thread`).
+
+#### Tests
+
+- **3 existing tests updated** to reflect intentional behavior changes: `test_fills_topology_linear_default` (renamed from `_circular_default`), `test_fills_missing_annotations_on_export` (topology=linear assertion), `test_truncated_payload_raises` (renamed from `_stops_cleanly`).
+
+#### Deferred audit findings
+
+A handful of MED items were assessed as too design-y for this batch and held for a follow-up release after real-data validation:
+
+- Rotation tiebreak gap penalty (would shift winner for marginal cases)
+- `_pick_best_rotation` early-stop vs RC interaction (same regression risk)
+- Multi-record GenBank refusal vs picker prompt (UX choice)
+- HistoryTree single-node extraction (sibling preservation)
+- `.dna` cookie packet validation gate (defensive hardening)
+- GFF3 `##FASTA` multi-record raise (current behavior is "first wins")
+- Idempotency cache O(N) eviction (perf optimisation)
+- Various LOW cosmetic items
+
+### Paranoid alignment audit (already in this release)
+
+User feedback: alignment is the highest-stakes area in the codebase after data integrity. Two adversarial deep audits produced a 23-item punch-list; this release lands every HIGH and MED finding plus the actionable LOW items.
+
+#### Bug fixes (correctness)
+
+- **IUPAC ambiguity counted as match, not mismatch.** Pre-fix the pairwise aligner did strict character equality — a primer with `N` aligned against an `A` target scored the `N` position as a mismatch and dropped `identity_pct`. Now `_pairwise_align`'s match/mismatch counting and all four state-classifier helpers (`_alignment_to_*_segments/letters`) use a new `_iupac_compatible(a, b)` predicate: `N` vs any base = match, `R` (A/G) vs `A` = match, `R` vs `C` = mismatch, etc. The Aligner ITSELF still uses scalar match/mismatch scoring (which biases the layout slightly for ambiguity-rich pairs); identity COUNTING is what surfaces in the UI and that's now biologically correct.
+- **RNA `U` silently mismatched DNA `T`.** Pasting an RNA consensus into a DNA-only field used to score 0% identity with no hint why. Now `_normalize_dna_for_align` maps `U` → `T` before the aligner runs.
+- **Wrap-spanning alignments produced phantom lanes.** When `_pick_best_rotation` returned target-rotated segments and the rotation point fell inside a matched region, `t_lo/t_hi` spanned the whole plasmid even though most positions had no segment. The lane-packer allocated visual rows at every view position. Fixed at the visibility filter: an alignment only takes a lane when at least one segment intersects the visible bp window.
+- **Duplicate alignments under concurrent workers.** Two `_align_worker` invocations completing near-simultaneously against the same target each minted a fresh uuid → merge appended both as distinct stored rows even though aq/at were identical. `_merge_stored_alignments` now does in-batch content-key dedup (`target_id + axis + aq_sha8 + at_sha8`). Dedup is intentionally NOT applied against existing on-disk entries — a user legitimately re-running the same alignment as a new event still gets a fresh row.
+- **Alignment Manager save race with workers.** Both `action_open_alignment_manager`'s save callback AND `_persist_alignment_manager_updates` ran the read-modify-write OUTSIDE `_cache_lock`. A concurrent worker flush could interleave: worker loads → manager loads → worker saves → manager overwrites with stale data. Both paths now hold `_cache_lock` across the full RMW (RLock allows the inner `_save_library` to re-enter).
+- **`_alignment_target_hash` whitespace-sensitive.** Pre-fix hashed the raw target sequence; if `_normalize_dna_for_align` stripped whitespace at align time, the stale-detection on hydrate compared a clean hash against a raw hash and falsely reported every stored alignment as stale. Now hashes the normalised form (whitespace / digits / FASTA headers stripped, `U`→`T`, uppercase).
+- **Frame-shift fall-through corrupted segment positions silently.** `_rotate_aligned_to_original_target_frame` and `_rotate_aligned_to_original_query_frame` used to log + return the inputs unchanged when the cut point wasn't found — but those strings were still in ROTATED frame, so downstream segments rendered at the wrong canvas bp. Now strict: raise `ValueError`. The fall-through is only reachable in `mode="local"` (`_pick_best_rotation` uses global exclusively), so existing flows are unchanged; the raise loudly catches any future local-mode caller.
+- **`_stored_id` not validated as uuid4 hex.** A corrupted in-memory `_stored_id` (`""`, `"garbage"`) used to be preserved as-is through serialise — could collide with another entry's id under the merge logic. Now validated as 32-char hex; invalid → fresh uuid.
+
+#### New fields in pairwise-align result dict
+
+- `n_gap_cols` — number of alignment columns where EITHER side has `-` (replaces the misleading `n_gaps`, now an alias for back-compat).
+- `n_gap_opens_q`, `n_gap_opens_t` — number of contiguous gap RUNS per side. A 10-bp deletion in the query reports `n_gap_opens_q=1, n_gap_cols=10` — matches BLAST's gap-open semantics that downstream consumers expect.
+
+#### Renderer correctness
+
+- **Off-by-one on the right margin.** The boundary check `margin_l <= col <= margin_l + usable_w` allowed painting at `margin_l + usable_w` (one past the last valid col, bleeding into the right gutter). Changed to strict `<` on the right side at the letter-mode paint AND the arrow-tip placement.
+- **Asymmetric clamp in lane packer.** `cx0` clamped to `w-1` while `cx1` clamped to `margin_l + usable_w` — on small terminals the bar could collapse to 1 col. Now both clamp consistently to `[margin_l, margin_l + usable_w)`.
+
+#### Tests
+
+- **30 new tests** in `tests/test_alignment_overlay.py`:
+  * `TestIupacCompatible` (10 cases) — pure helper covering each ambiguity code and edge case.
+  * `TestPairwiseAlignIupacAndGapFields` (6 cases) — `N` vs `A` matches, `R` vs `C` mismatches, `U` → `T` mapping, gap-cols vs gap-opens distinction.
+  * `TestNormalizeMapsURnaToT` (4 cases) — RNA normalisation.
+  * `TestRotateFrameRaisesOnFallthrough` (2 cases) — strict-raise on cut-point miss.
+  * `TestAlignmentContentKey` (6 cases) — dedup key derivation.
+  * `TestMergeDedupConcurrentRace` (2 cases) — in-batch dedup vs. existing-on-disk preservation.
+- The pre-existing `test_cut_not_found_falls_back_to_unchanged` was inverted to expect the new strict-raise behaviour.
+
+#### Audit findings deferred
+
+- **Rotation-picker tiebreak** (audit MED): the current `(n_matches, ungapped_identity_pct)` rank can prefer over-padded rotations on length-mismatched pairs. Changing this would shift which rotation wins for marginal cases; held until you can validate against real reads. Documented as a known consideration.
+- **`_pick_best_rotation` early-stop vs. RC** (audit MED): the early-stop threshold can skip RC + target-rotation candidates when a forward-rotation candidate scores ≥ 99.5%. Same regression risk; deferred.
+
+---
+
 ## [0.9.34] — 2026-05-27
 
 ### Alignment Manager: New Align button + identity color tiers
