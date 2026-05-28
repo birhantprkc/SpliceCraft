@@ -14,6 +14,29 @@
 
 ---
 
+## [0.9.38] — 2026-05-27
+
+### CDS frame-break warning fixes + code-quality sweep
+
+#### Bug fixes
+
+- **A CDS that ends in multiple stop codons is no longer mistaken for a broken reading frame.** Synthetic constructs routinely end with two or three stops back-to-back (e.g. `…TAA TAG TGA`) for clean ribosome termination. The frame-break `⚠` introduced in 0.9.30 counted every stop past the first as "premature" and flagged these intentional tails. Now a contiguous run of trailing stops collapses to one effective terminator before the check runs — only a stop *inside* the protein body trips the warning. A genuine mid-sequence frame shift (internal stop) still flags even when the CDS also has a trailing-stop tail.
+- **The `⚠` frame-break glyph now sits to the left of the feature name with a space, instead of crowding the first letter.** Pre-fix the warning rendered as `⚠lacZ`; it now reads `⚠ lacZ` in both the sequence panel and the circular map so the name stays legible.
+
+#### Hardening
+
+- **Workspace pyright is back to 0 errors / 0 warnings.** The 0.9.30 one-shot-dismiss guard on the Edit Sequence dialog had quietly widened the `dismiss` return type in a way the type checker flagged; annotated as the intentional override it is.
+- **Pyright configuration consolidated into `pyproject.toml`.** A leftover sibling `pyrightconfig.json` was silently overriding the `[tool.pyright]` section (split-brain config). Merged into one source of truth; behaviour is identical.
+- **Test suite runs warning-free again.** Cleared a stray Biopython LOCUS-parse warning (hand-built fixture with off-spec column spacing) and a Python 3.12 `fork()` deprecation warning in the crash-recovery test.
+- **Background save-failure notifications and the slow-worker watchdog no longer emit a spurious "coroutine was never awaited" warning** if they fire after the app has already closed. Both now check the app is still running before marshalling to the UI thread.
+- **Removed two exception guards that could never trigger** (bounds-checked feature-selection sync) and narrowed three broad `except Exception` blocks to the specific error they actually catch. Part of a "would any test fail if this guard were removed?" audit pass.
+
+#### Verification
+
+- Sanity-checked every change across v0.9.28 → v0.9.37 against the code + test tree — no hallucinated functions, endpoints, or tests; all claimed symbols present. ruff clean, pyright clean, biology + alignment + smoke suites green.
+
+---
+
 ## [0.9.37] — 2026-05-27
 
 ### Biology-correctness chain audit — fixes across 4 areas

@@ -14348,11 +14348,14 @@ class TestPrematureStopWarning:
         assert sc._feat_decorated_label(f) == "lacZ"
 
     def test_decorated_label_prepends_glyph(self):
+        """2026-05-27: glyph + space + label so the ⚠ reads as
+        its own column to the left of the name rather than
+        crowding the first letter."""
         f = {
             "label": "lacZ", "type": "CDS",
             "_premature_stops": 2,
         }
-        assert sc._feat_decorated_label(f) == "⚠lacZ"
+        assert sc._feat_decorated_label(f) == "⚠ lacZ"
 
     def test_decorated_label_falsy_count_does_not_prepend(self):
         """``_premature_stops`` of 0 should NOT trigger the
@@ -14361,6 +14364,19 @@ class TestPrematureStopWarning:
         f = {"label": "lacZ", "_premature_stops": 0}
         assert sc._feat_decorated_label(f) == "lacZ"
 
+    def test_decorated_label_has_space_between_glyph_and_name(self):
+        """The decorated string puts a literal space between the
+        glyph and the label so the ⚠ reads as its own column to
+        the LEFT of the name. Regression-locks the user-reported
+        "overlaps the name" fix."""
+        f = {"label": "broken", "_premature_stops": 1}
+        out = sc._feat_decorated_label(f)
+        assert out[0] == sc._PREMATURE_STOP_GLYPH
+        assert out[1] == " ", (
+            f"expected a space after the ⚠ glyph; got {out!r}"
+        )
+        assert out[2:] == "broken"
+
     def test_decorated_label_fallback_to_type(self):
         """Feature without an explicit label falls back to
         ``f["type"]`` — the existing behaviour preserved through
@@ -14368,7 +14384,7 @@ class TestPrematureStopWarning:
         f = {"type": "misc_feature"}
         assert sc._feat_decorated_label(f) == "misc_feature"
         f["_premature_stops"] = 1
-        assert sc._feat_decorated_label(f) == "⚠misc_feature"
+        assert sc._feat_decorated_label(f) == "⚠ misc_feature"
 
     # Constants used by the frame-break tests below — a body designed
     # so a single-base insertion in frame produces multiple premature
@@ -14521,3 +14537,129 @@ class TestPrematureStopWarning:
                 f"{cds_after.get('_premature_stops')!r}"
             )
             assert sc._feat_decorated_label(cds_after) == "test"
+
+    async def test_trailing_multi_stop_cds_not_flagged(
+            self, tiny_record, isolated_library,
+    ):
+        """2026-05-27 follow-up: a synthetic CDS that ends with
+        multiple stops (``*TAA TAG TGA*`` for clean ribosome
+        termination) is NOT a frame-break — the trailing run of
+        stops should collapse to one effective terminator before
+        the ">1 stop" rule fires. Pre-fix the user reported double-
+        / triple-stop tails were incorrectly decorated with ⚠."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        # ATG + 9 codons of GCC (=A) + TAA TAG TGA — three trailing
+        # stops, no internal stops. Frame is clean.
+        body = "ATG" + ("GCC" * 9) + "TAA" + "TAG" + "TGA"
+        seq = body + ("N" * 50)
+        rec = SeqRecord(
+            Seq(seq), id="TRIPLE_STOP", name="TRIPLE_STOP",
+            annotations={"molecule_type": "DNA",
+                          "topology": "circular"},
+        )
+        rec.features = [
+            SeqFeature(
+                FeatureLocation(0, len(body), strand=1),
+                type="CDS",
+                qualifiers={"label": ["triple_stop"]},
+            ),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            cds_feats = [f for f in pm._feats if f.get("type") == "CDS"]
+            assert cds_feats, "Test setup: expected a CDS"
+            cds = cds_feats[0]
+            assert not cds.get("_premature_stops"), (
+                f"Trailing multi-stop CDS must NOT carry "
+                f"_premature_stops; got {cds.get('_premature_stops')!r}"
+            )
+            assert sc._feat_decorated_label(cds) == "triple_stop"
+
+    async def test_internal_stop_still_flags_even_with_trailing_run(
+            self, tiny_record, isolated_library,
+    ):
+        """An internal stop mid-CDS still trips the warning even
+        when the CDS also ends in a trailing-stop run. Trailing-
+        only is the exemption, not "any extra stops anywhere"."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        # ATG + 4 codons + TAA (internal stop) + 4 codons + TAA TAG.
+        # The middle TAA is premature; the trailing pair is the
+        # ribosome-termination tail.
+        body = (
+            "ATG"
+            + ("GCC" * 4)
+            + "TAA"
+            + ("GCC" * 4)
+            + "TAA" + "TAG"
+        )
+        seq = body + ("N" * 50)
+        rec = SeqRecord(
+            Seq(seq), id="MID_STOP", name="MID_STOP",
+            annotations={"molecule_type": "DNA",
+                          "topology": "circular"},
+        )
+        rec.features = [
+            SeqFeature(
+                FeatureLocation(0, len(body), strand=1),
+                type="CDS",
+                qualifiers={"label": ["mid_stop"]},
+            ),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            cds = next(
+                f for f in pm._feats if f.get("type") == "CDS"
+            )
+            assert cds.get("_premature_stops"), (
+                f"Internal stop with trailing-run tail must still "
+                f"flag; got {cds.get('_premature_stops')!r}"
+            )
+            assert sc._feat_decorated_label(cds).startswith(
+                sc._PREMATURE_STOP_GLYPH,
+            )
+
+    async def test_double_stop_tail_not_flagged(
+            self, tiny_record, isolated_library,
+    ):
+        """Two trailing stops (``*TAA TAG*``) — the user's
+        specific case — also clears the warning. The rule isn't
+        N==3 trailing; it's any contiguous tail run."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        body = "ATG" + ("GCC" * 9) + "TAA" + "TAG"
+        seq = body + ("N" * 50)
+        rec = SeqRecord(
+            Seq(seq), id="DOUBLE_STOP", name="DOUBLE_STOP",
+            annotations={"molecule_type": "DNA",
+                          "topology": "circular"},
+        )
+        rec.features = [
+            SeqFeature(
+                FeatureLocation(0, len(body), strand=1),
+                type="CDS",
+                qualifiers={"label": ["double_stop"]},
+            ),
+        ]
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            cds = next(
+                f for f in pm._feats if f.get("type") == "CDS"
+            )
+            assert not cds.get("_premature_stops"), (
+                f"Double-stop tail must clear the warning; got "
+                f"{cds.get('_premature_stops')!r}"
+            )

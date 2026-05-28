@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name            = "splicecraft"
-version         = "0.9.37"
+version         = "0.9.38"
 description     = "Terminal-based circular plasmid map viewer, sequence editor, and Primer3/Golden Braid primer design workbench"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -175,24 +175,55 @@ exclude = ["tests/**", ".hypothesis/**", "build/**", "dist/**"]
 exclude = ["*"]
 
 [tool.pyright]
-# Pyright runs strict on the shipped application code only. Tests
-# duck-type heavily on Textual's `App.push_screen()` return (which
-# is typed as `Screen[object]`), assert non-None after explicit
-# guards pyright can't narrow, and call BioPython APIs whose stubs
-# don't model `Position | ExactPosition` precisely. The resulting
-# noise drowns out genuine errors on the application surface, so
-# the test tree is excluded from analysis. Real test breakage is
-# caught by `pytest -n auto -q` which already runs against the
-# same files.
-include = ["splicecraft.py", "splicecraft_biology.py", "splicecraft_cli.py"]
+# Pyright is configured ONLY here (no sibling pyrightconfig.json).
+# Pyright loads pyrightconfig.json over [tool.pyright] when both
+# exist; keeping a single source of truth in pyproject.toml means
+# real TOML comments stay readable (vs the JSONC hack the JSON
+# file required).
+#
+# Main-source code is analysed strictly. Tests are included with a
+# per-directory `executionEnvironment` override below — they
+# duck-type on Textual's `App.push_screen()` return (`Screen[object]`),
+# assert non-None after explicit guards pyright can't narrow, and
+# call BioPython APIs whose stubs don't model `Position |
+# ExactPosition` precisely. Suppressing the noise on the test tree
+# lets genuine errors on the application surface stay visible. Real
+# test breakage is caught by `pytest -n auto -q`.
+include = [
+    "splicecraft.py",
+    "splicecraft_biology.py",
+    "splicecraft_cli.py",
+    "tests",
+]
 exclude = [
-    "tests/**",
     "build/**",
     "dist/**",
     "**/__pycache__/**",
     ".venv/**",
     "venv/**",
 ]
+extraPaths = ["."]
+reportUnreachable = "none"
+reportUnnecessaryComparison = "none"
+
+# INV-73 (2026-05-25): tests interact with Textual widgets via
+# `query_one(selector)` — base-Widget return type, dynamic attrs,
+# Optional record access. These patterns are pervasive in TUI
+# integration tests and don't reflect real safety issues. Main-source
+# rules above stay strict.
+[[tool.pyright.executionEnvironments]]
+root = "tests"
+extraPaths = ["."]
+reportAttributeAccessIssue = "none"
+reportOptionalMemberAccess = "none"
+reportOptionalSubscript = "none"
+reportArgumentType = "none"
+reportCallIssue = "none"
+reportReturnType = "none"
+reportGeneralTypeIssues = "none"
+reportUnusedVariable = "none"
+reportIndexIssue = "none"
+reportOperatorIssue = "none"
 
 
 [tool.pytest.ini_options]

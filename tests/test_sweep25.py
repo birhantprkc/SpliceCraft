@@ -693,15 +693,23 @@ class TestSweep26GBParseCacheFlag:
         assert sig.parameters["cache"].default is True
 
     def test_cache_false_bypasses_population(self):
-        # Pick a unique sentinel text so we don't collide with any
-        # warm cache entries.
-        text = """LOCUS       sweep26_test            10 bp    DNA     linear   UNK 01-JAN-2026
-DEFINITION  .
-FEATURES             Location/Qualifiers
-ORIGIN
-        1 atcgatcgat
-//
-"""
+        # Build a valid GenBank text via Biopython so we don't trip
+        # `BiopythonParserWarning` on a hand-rolled LOCUS line with
+        # off-spec column spacing (same trap 0.9.31 cleared from
+        # `TestConstructorMultiGrammarTabs::test_per_role_entry_vector_banner`).
+        from io import StringIO
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq("ATCGATCGAT"),
+            id="sweep26_test",
+            name="sweep26_test",
+            annotations={"molecule_type": "DNA", "topology": "linear"},
+        )
+        buf = StringIO()
+        SeqIO.write([rec], buf, "genbank")
+        text = buf.getvalue()
         sc._GB_PARSE_CACHE.clear()
         sc._gb_text_to_record(text, cache=False)
         assert hash(text) not in sc._GB_PARSE_CACHE

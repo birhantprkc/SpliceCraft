@@ -581,6 +581,17 @@ class TestCrashInjectionSafeSaveJson:
     a torn mix.
     """
 
+    # `fork()` is intentional here — `spawn` would re-import the
+    # 105k-line `splicecraft.py` in the child (~1-2 s startup),
+    # blowing past the 50 ms SIGKILL window the test relies on to
+    # catch the write mid-flight. Python 3.12+ emits a
+    # `DeprecationWarning` because pytest's xdist worker (this
+    # process) is multi-threaded, but the child immediately calls
+    # `_safe_save_json` without spinning extra threads, so the
+    # documented deadlock risk doesn't apply here.
+    @pytest.mark.filterwarnings(
+        "ignore:This process.*is multi-threaded.*fork:DeprecationWarning"
+    )
     def test_recovery_after_sigkill(self, tmp_path):
         import multiprocessing as mp
         import signal
