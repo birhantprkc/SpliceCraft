@@ -547,6 +547,19 @@ class TestRbsStrengthHandler:
     def test_bad_start_400(self):
         assert sc._h_rbs_strength(None, {"mrna": "AUGAAA", "start": 99})[1] == 400
 
+    def test_bool_start_400(self):
+        # JSON true must not silently coerce to start=1 (audit #5e)
+        assert sc._h_rbs_strength(None, {"mrna": "AUGAAAAAA", "start": True})[1] == 400
+
+    def test_result_is_json_serializable(self):
+        # start too close to the 5' end used to return dg_total=Infinity,
+        # which is invalid JSON shipped with HTTP 200 (audit #1)
+        import json as _json
+        r = sc._h_rbs_strength(None, {"mrna": "AAAAAAAUGAAA", "start": 5})
+        assert r["ok"] is True and r["dg_total"] is None
+        body = _json.dumps(r)
+        assert "Infinity" not in body and "NaN" not in body
+
 
 class TestDesignRbsHandler:
     """`design-rbs` — reverse-design a 5'UTR for a target strength."""
@@ -592,6 +605,13 @@ class TestAssembleOperonHandler:
     def test_bad_gene_400(self):
         bad = {"genes": [{"cds": "AU", "target": 5}]}
         assert sc._h_assemble_operon(None, bad)[1] == 400
+
+    def test_nonfinite_target_400(self):
+        # NaN / Infinity target used to be echoed -> invalid JSON @ 200 (audit #2)
+        for bad in (float("inf"), float("nan")):
+            r = sc._h_assemble_operon(
+                None, {"genes": [{"cds": "AUGAAAUACUAA", "target_strength": bad}]})
+            assert r[1] == 400
 
     def test_registered_read_only(self):
         assert "assemble-operon" in sc._AGENT_HANDLERS

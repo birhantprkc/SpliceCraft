@@ -14,6 +14,22 @@
 
 ---
 
+## [1.0.33] — 2026-06-07
+
+### New features
+
+- **Fetch proteins from NCBI by accession.** The Operon Design tab's protein library gains a **Fetch** button — type an accession (e.g. `AAK98552` for luxC) and SpliceCraft pulls the protein straight from NCBI into your collection, the same way it fetches plasmids. Building an operon from published parts (like the luxCDABE + frp bioluminescence genes) is now a few keystrokes.
+
+### Bug fixes
+
+- **RNA folding now matches ViennaRNA exactly on large loops too.** An internal rounding step diverged by 0.01 kcal/mol on hairpin / internal / bulge loops larger than 30 nt (rare, and below the resolution of the original validation set). The folder now reproduces ViennaRNA to the cent at *every* loop size.
+
+### Hardening
+
+- **A full adversarial audit of the RNA / RBS / operon engine.** The structure evaluator now rejects chemically-impossible structures (non-canonical pairs, sub-3-nt hairpin loops) with a clear error instead of crashing or returning a nonsense energy. The `rbs-strength` / `assemble-operon` / `design-rbs` agent endpoints now always return valid JSON and reject infinite / not-a-number targets, over-long sequences, and boolean indices with a clean 400 rather than a 200-with-`Infinity` or a 500. Editing an operon (adding a gene, changing the promoter or terminator) now correctly invalidates the previous assembly, so an export can never ship a stale sequence. And the folding engine's shared model is built under a lock.
+
+---
+
 ## [1.0.32] — 2026-06-07
 
 ### New features

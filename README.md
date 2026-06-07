@@ -214,9 +214,10 @@ unbound (enzyme-tail) regions, so you can see exactly how each was built (and
 regenerate the amplicon later for a synthesis order).
 The **Operon Design tab** turns the codon optimizer and SpliceCraft's
 built-in RBS engine into an expression-tuning workbench. Keep a library of
-**protein collections** on the right (add by pasting a sequence, or **From
-feature** to pull a CDS from any plasmid in your library), drop proteins into
-the **assembly lane**, and give each gene a **target relative RBS strength**.
+**protein collections** on the right (add a protein by pasting a sequence,
+grabbing a CDS from any plasmid in your library with **From feature**, or
+**Fetch**ing one from NCBI by accession), drop proteins into the **assembly
+lane**, and give each gene a **target relative RBS strength**.
 **Assemble** codon-optimizes every CDS and reverse-designs every ribosome
 binding site *in its real assembled context* — so the achieved strength tracks
 your target, and a gene the surrounding sequence can't drive strongly is

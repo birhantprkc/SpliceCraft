@@ -31,6 +31,7 @@ import functools
 import gzip as _gzip
 import math as _math
 import re
+import threading as _threading
 from collections import OrderedDict
 
 
@@ -714,7 +715,12 @@ class _RNAModel:
     def _loop_init(self, table, size):
         if size <= 30:
             return table[size]
-        return table[30] + int(self.lxc * _math.log(size / 30.0) + 0.5)
+        # ViennaRNA's C `(int)` cast TRUNCATES toward zero (no half-up
+        # rounding); matching it keeps large-loop (>30 nt) energies exact
+        # to the cent. A prior `+ 0.5` here diverged by +0.01 kcal on big
+        # loops (the validation suite's max loop was 22 nt, so it never
+        # caught it — found in the 2026-06-07 adversarial audit).
+        return table[30] + int(self.lxc * _math.log(size / 30.0))
 
     def _stem_d2(self, t, s5i, s3i, mm):
         if s5i and s3i:
@@ -837,6 +843,23 @@ class _RNAModel:
     def eval_structure(self, s, db):
         pt = _rna_pairtable(db)
         n = len(s)
+        # Fail loud on a structurally-valid bracketing that's chemically
+        # impossible: a non-canonical pair (the energy tables have no
+        # type-6 entry — would IndexError) or a hairpin loop < 3 nt (would
+        # leak the _RNA_INF sentinel as a finite ~1e7 energy). The MFE
+        # folder never emits either; this guards the eval-only path.
+        for a in range(n):
+            b = pt[a]
+            if b > a:
+                if _rna_pairtype(s[a], s[b]) == 6:
+                    raise ValueError(
+                        f"structure has a non-canonical pair at {a},{b} "
+                        f"({s[a]}·{s[b]})")
+                if (b - a - 1 < 3
+                        and not any(pt[x] > x for x in range(a + 1, b))):
+                    raise ValueError(
+                        f"structure has an infeasible hairpin loop "
+                        f"(<3 nt) closed at {a},{b}")
         total, k = 0, 0
         while k < n:
             if pt[k] > k:
@@ -849,6 +872,8 @@ class _RNAModel:
                 k = j + 1
             else:
                 k += 1
+        if total >= _RNA_INF:
+            raise ValueError("structure contains an infeasible loop")
         return total / 100.0
 
     # ---- d2 helix-end contributions for the folder ----
@@ -1102,14 +1127,22 @@ class _RNAModel:
 
 
 _RNA_MODEL_SINGLETON = None
+_RNA_MODEL_LOCK = _threading.Lock()
 
 
 def _rna_model():
+    # Double-checked locking: the lock-free fast path serves the common
+    # case (singleton already built); the lock serialises the one-time
+    # build so concurrent first-requests (the threaded agent server) can't
+    # each parse a model. Construction is pure + idempotent, so the lock is
+    # belt-and-braces, but it makes the "thread-safe singleton" real.
     global _RNA_MODEL_SINGLETON
     if _RNA_MODEL_SINGLETON is None:
-        text = _gzip.decompress(
-            _base64.b64decode(_RNA_TURNER_PARAMS_GZ_B64)).decode('ascii')
-        _RNA_MODEL_SINGLETON = _RNAModel(text)
+        with _RNA_MODEL_LOCK:
+            if _RNA_MODEL_SINGLETON is None:
+                text = _gzip.decompress(
+                    _base64.b64decode(_RNA_TURNER_PARAMS_GZ_B64)).decode('ascii')
+                _RNA_MODEL_SINGLETON = _RNAModel(text)
     return _RNA_MODEL_SINGLETON
 
 
@@ -1245,7 +1278,9 @@ def _rbs_strength(mrna, start_pos):
         if best is None or dg_f < best:
             best, best_d, best_hybrid = dg_f, d, dg_h
     if best is None:                       # start too close to the 5' end
-        return {'dg_total': float('inf'), 'dg_mrna': round(dg_mrna, 2),
+        # dg_total is None (not float('inf')) so the dict is JSON-valid —
+        # `Infinity` is not legal JSON and broke the agent endpoint.
+        return {'dg_total': None, 'dg_mrna': round(dg_mrna, 2),
                 'dg_hybrid': None, 'spacing': None, 'rel_strength': 0.0}
     dg_total = best - dg_mrna
     return {'dg_total': round(dg_total, 2), 'dg_mrna': round(dg_mrna, 2),
@@ -1262,6 +1297,8 @@ _RBS_DESIGN_SD_LADDER = ['UAAGGAGGU', 'AAGGAGGU', 'AGGAGGA', 'AGGAGG', 'UAAGGAG'
 _RBS_DESIGN_SPACERS = {4: 'AAUA', 5: 'AAUAA', 6: 'AACAAU', 7: 'AACAAUA',
                        8: 'AACAAUAA', 9: 'AACAAUAAU'}
 _RBS_DESIGN_UPSTREAM = 'UUAAUUAAUU'      # low-structure 5' context (standby region)
+_RBS_DESIGN_MAX_CDS = 50000              # cds length cap (the design does ~84
+#                                          O(len) passes — bounds worst-case cost)
 
 
 def _rbs_design(cds, target_strength, *, upstream=_RBS_DESIGN_UPSTREAM):
@@ -1281,10 +1318,15 @@ def _rbs_design(cds, target_strength, *, upstream=_RBS_DESIGN_UPSTREAM):
         raise ValueError("cds must be a non-empty A/C/G/U(T) string")
     if len(c) < 3:
         raise ValueError("cds must include the start codon (>= 3 nt)")
+    if len(c) > _RBS_DESIGN_MAX_CDS:
+        raise ValueError(
+            f"cds too long ({len(c)} > {_RBS_DESIGN_MAX_CDS} nt cap)")
     if (isinstance(target_strength, bool)
             or not isinstance(target_strength, (int, float))
+            or not _math.isfinite(target_strength)
             or target_strength < 0):
-        raise ValueError("target_strength must be a non-negative number")
+        raise ValueError(
+            "target_strength must be a finite non-negative number")
     up = (upstream or '').strip().upper().replace('T', 'U')
     if set(up) - {'A', 'C', 'G', 'U'}:
         raise ValueError("upstream must be A/C/G/U(T)")

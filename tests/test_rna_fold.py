@@ -316,3 +316,46 @@ class TestAssembleOperon:
                 bio._assemble_operon(bad)
         with pytest.raises(ValueError):
             bio._assemble_operon(self.G, promoter="AUGN")    # bad promoter
+
+
+class TestAuditRegressions:
+    """Locks for bugs found in the 2026-06-07 adversarial audit."""
+
+    def test_large_loop_truncates_like_vienna(self):
+        # >30 nt loop: _loop_init must TRUNCATE the log extrapolation (not
+        # round half-up), else it diverged from ViennaRNA by +0.01 kcal.
+        # The whole 4221-case validation had max loop 22 nt, so it couldn't
+        # catch this. -6.44 is the ViennaRNA-exact value (was -6.43 buggy).
+        seq = "GGGGG" + "A" * 35 + "CCCCC"
+        db = "(((((" + "." * 35 + ")))))"
+        assert abs(bio._rna_eval_structure(seq, db) - (-6.44)) < 1e-9
+
+    def test_eval_rejects_noncanonical_pair(self):
+        # was an uncaught int22 IndexError
+        with pytest.raises(ValueError):
+            bio._rna_eval_structure("ACCGCCCCCCA", "(..(...)..)")
+
+    def test_eval_rejects_infeasible_hairpin(self):
+        # was a silent _RNA_INF leak (~1e7 kcal) for a <3 nt hairpin loop
+        with pytest.raises(ValueError):
+            bio._rna_eval_structure("GCGC", "(..)")
+
+    def test_rbs_strength_no_inf(self):
+        # start too close to the 5' end -> dg_total None (JSON-valid), NOT inf
+        r = bio._rbs_strength("AAAAAAUGAAA", 5)
+        assert r["dg_total"] is None and r["rel_strength"] == 0.0
+        assert "Infinity" not in json.dumps(r)
+
+    def test_rbs_design_rejects_nonfinite_target(self):
+        for bad in (float("inf"), float("nan"), -float("inf")):
+            with pytest.raises(ValueError):
+                bio._rbs_design("AUGAAAUAA", bad)
+
+    def test_rbs_design_rejects_overlong_cds(self):
+        with pytest.raises(ValueError):
+            bio._rbs_design("AUG" + "A" * 60000, 5.0)
+
+    def test_assemble_operon_rejects_nonfinite_target(self):
+        for bad in (float("inf"), float("nan")):
+            with pytest.raises(ValueError):
+                bio._assemble_operon([{"cds": "AUGAAAUACUAA", "target": bad}])
