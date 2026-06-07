@@ -78,6 +78,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   lineage as nested JSON.
 - **Codon tables** — list, add (Kazusa fetch or raw dict), delete.
 - **Search** — blast, hmmscan.
+- **RNA structure** — fold-rna (pure-Python minimum-free-energy
+  secondary structure: returns the dot-bracket fold + ΔG in kcal/mol via
+  the Turner-2004 nearest-neighbor model, no external dependency; DNA
+  `T` is read as `U`, ambiguous / over-length input returns 400).
 - **HMM databases** — list / get / set-active / delete / add /
   download-hmm-database (the registry that backs hmmscan). `add`
   registers a custom `.hmm.gz` URL (mirrors the GUI "Add" form);

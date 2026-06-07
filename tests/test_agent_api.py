@@ -478,6 +478,41 @@ class TestFeaturesHandler:
                     for f in feats)
 
 
+class TestFoldRnaHandler:
+    """`fold-rna` — pure-Python RNA MFE folding via the agent API. The
+    handler is record-independent (folds the payload sequence), so `app`
+    is unused."""
+
+    def test_folds_stemloop(self):
+        r = sc._h_fold_rna(None, {"sequence": "GGGGAAAACCCC"})
+        assert r["ok"] is True
+        assert r["structure"] == "((((....))))"
+        assert abs(r["dg"] - (-5.40)) < 0.011
+        assert r["length"] == 12
+
+    def test_seq_alias_and_dna_t(self):
+        r = sc._h_fold_rna(None, {"seq": "GGGGTTTTCCCC"})    # 'seq' alias + T->U
+        assert r["structure"] == "((((....))))"
+
+    def test_missing_sequence_400(self):
+        assert sc._h_fold_rna(None, {})[1] == 400
+
+    def test_non_string_400(self):
+        assert sc._h_fold_rna(None, {"sequence": 123})[1] == 400
+
+    def test_ambiguous_400(self):
+        body, code = sc._h_fold_rna(None, {"sequence": "ACGUN"})
+        assert code == 400 and "error" in body
+
+    def test_overlength_400(self):
+        assert sc._h_fold_rna(None, {"sequence": "A" * 700})[1] == 400
+
+    def test_registered_read_only(self):
+        assert "fold-rna" in sc._AGENT_HANDLERS
+        _fn, write = sc._AGENT_HANDLERS["fold-rna"]
+        assert write is False
+
+
 class TestExportGffHandler:
     """`_h_export_gff` writes the loaded record to disk as GFF3."""
 

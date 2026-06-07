@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.30] — 2026-06-06
+
+### New features
+
+- **RNA secondary-structure folding, built in.** Give SpliceCraft an RNA (or DNA) sequence and it computes the most stable secondary structure — the dot-bracket fold and its free energy (ΔG in kcal/mol) — using the standard Turner-2004 nearest-neighbor thermodynamics. It's pure Python with **no external library to install** (no ViennaRNA), yet it reproduces ViennaRNA's energies exactly. Available now through the agent API (`fold-rna`), and it's the foundation for the operon / gene-expression-tuning tools coming next.
+
+---
+
 ## [1.0.29] — 2026-06-06
 
 ### Hardening
