@@ -513,6 +513,62 @@ class TestFoldRnaHandler:
         assert write is False
 
 
+class TestCofoldRnaHandler:
+    """`cofold-rna` — bound-state heterodimer ΔG (anti-SD : mRNA hybrid)."""
+
+    def test_antisd_duplex(self):
+        r = sc._h_cofold_rna(None, {"seq_a": "UAAGGAGGU", "seq_b": "ACCUCCUUA"})
+        assert r["ok"] is True and r["dg"] < -10.0
+
+    def test_dna_t_accepted(self):
+        assert sc._h_cofold_rna(None, {"seq_a": "GGGGTTTT", "seq_b": "AAAACCCC"})["ok"]
+
+    def test_missing_400(self):
+        assert sc._h_cofold_rna(None, {"seq_a": "ACGU"})[1] == 400
+
+    def test_ambiguous_400(self):
+        assert sc._h_cofold_rna(None, {"seq_a": "ACGUN", "seq_b": "ACGU"})[1] == 400
+
+
+class TestRbsStrengthHandler:
+    """`rbs-strength` — relative translation-initiation strength."""
+
+    def test_strong_rbs(self):
+        r = sc._h_rbs_strength(
+            None, {"mrna": "AAUAAAAGGAGGAAUAAAUGAGCAAAGCAACU", "start": 17})
+        assert r["ok"] is True and r["rel_strength"] > 1 and "spacing" in r
+
+    def test_missing_mrna_400(self):
+        assert sc._h_rbs_strength(None, {"start": 5})[1] == 400
+
+    def test_missing_start_400(self):
+        assert sc._h_rbs_strength(None, {"mrna": "AUGAAAAAA"})[1] == 400
+
+    def test_bad_start_400(self):
+        assert sc._h_rbs_strength(None, {"mrna": "AUGAAA", "start": 99})[1] == 400
+
+
+class TestDesignRbsHandler:
+    """`design-rbs` — reverse-design a 5'UTR for a target strength."""
+
+    def test_designs_to_target(self):
+        r = sc._h_design_rbs(None, {"cds": "AUGAGCAAAUACUAA", "target": 5.0})
+        assert r["ok"] is True and r["full"].endswith("AUGAGCAAAUACUAA")
+        assert "on_target" in r and isinstance(r["spacing"], int)
+
+    def test_missing_cds_400(self):
+        assert sc._h_design_rbs(None, {"target": 5})[1] == 400
+
+    def test_bad_target_400(self):
+        assert sc._h_design_rbs(None, {"cds": "AUGAAAUAA", "target": -1})[1] == 400
+        assert sc._h_design_rbs(None, {"cds": "AUGAAAUAA", "target": "x"})[1] == 400
+
+    def test_endpoints_registered_read_only(self):
+        for name in ("cofold-rna", "rbs-strength", "design-rbs"):
+            assert name in sc._AGENT_HANDLERS
+            assert sc._AGENT_HANDLERS[name][1] is False
+
+
 class TestExportGffHandler:
     """`_h_export_gff` writes the loaded record to disk as GFF3."""
 

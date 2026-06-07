@@ -24,6 +24,12 @@ _REF = json.loads(r"""{"vienna_version":"2.7.2","fold":[["CGACCGAUGGCAAGUCACUCUC
 
 _TOL = 0.011        # 1 centi-kcal: the engine matches ViennaRNA to the cent
 
+# Frozen ViennaRNA RNAcofold reference for the bound-state heterodimer
+# (`_rna_cofold`): {"cofold": [[seq_a, seq_b, dg], ...]}. Captured on the
+# binding / anti-SD cases where the constrained bound state equals the
+# unconstrained RNAcofold MFE. Injected at build time.
+_COFOLD_REF = json.loads(r"""{"cofold":[["AAAGGAGGUAAAAAUG","ACCUCCUUA",-12.9],["UAAGGAGGUACAAAAAUGGCA","ACCUCCUUA",-13.2],["GGGGAGGUGAUACAUG","ACCUCCUUA",-12.2],["AAGGAGGACAUACUAUG","ACCUCCUUA",-11.3],["AGGAGGUAAAAAAAAAUG","ACCUCCUUA",-11.1],["UUUAGGAGGUUUUAUG","ACCUCCUUA",-10.9],["CGUCAGCACGAAAC","UGUUGGCCCAGUG",-8.3],["GAAUCGCUUAAGG","UUAAGUAAGUG",-4.5],["GAUGCAUACGCC","UUACUUGCUGUG",-3.1],["CCACCCCAUCGG","CUGGCA",-2.3],["AACUCGGGUAAUUUU","ACAGGUCACG",-0.7],["AGAGGCGC","GCCCUCCUGAAGUG",-7.6],["GUGGACACU","GCUAUGAAU",-1.9],["GAAUAAUGC","UUCGCUCUAU",-1.0],["GACUACGACGCGC","CAUUCCCUUGUCG",-5.0],["AGAGUUAUGGA","CAAGGAC",-0.4],["CUGUCUGAGA","UAGAAGAC",-3.2],["GAUAGUG","CACACGACCGGCGUC",-2.5],["CGUAGGGG","AGCGCAGUA",-1.7],["GCCAAGACUAUAG","CACUGUCGCA",-3.6],["UCACAAACGAUUAA","CUGAUAAAUGAGCC",-0.8],["UUUAUGACA","CGGGCAUAUGACUGG",-2.0],["UUACGAUAGUAUG","CCAACGGCGAGC",-1.0],["UUACAUUUGCUGU","AGAGGUACAGG",-3.4],["AUUAGUGAGAA","CCGUGCGUAU",-1.2],["CAAUUCGUACCUUG","GGGUCGUUAC",-5.0],["ACUCUGUU","CCACGAGC",-2.9],["GCAUUUCUGGA","GGCCAGCUUUUGA",-5.3],["CGUAAAGCUG","AAGUGGCUC",-4.0],["CAUGAACUUAGCUG","UAGUGUCAG",-2.1],["AACUUGAACGCC","UAGUGGUCAAAGAG",-5.5],["ACUGGUAAUCGU","GGUAUCUAU",-2.2],["UGUUCUCAGCCGG","GACUCCUAAUGCU",-2.0],["CUCCCCCGCG","UGCCAUA",-1.9],["AUCUGAG","AACCAGCUG",-2.1],["CGACAUUAUAU","CACUGUGGUAGGUU",-2.5],["AGCCGGCCAAUU","GCAUGAUAC",-1.6],["UCUCCAUCU","ACCCAAGAUUG",-1.4],["GCUUGUUCAAUU","UUCUUAACG",-0.5],["GAUAACAGAAUC","AACCUG",-2.1]]}""")
+
 
 class TestRnaEvaluator:
     def test_eval_matches_frozen_vienna(self):
@@ -102,3 +108,149 @@ class TestRnaApiHardening:
     def test_mfe_helper_agrees_with_fold(self):
         for s in ("GGGGAAAACCCC", "ACGUACGUACGUGCAU", "GCGCAAAAGCGCAAAAGCGC"):
             assert abs(bio._rna_mfe(s) - bio._rna_fold(s)[1]) < 1e-12
+
+
+class TestRnaCofold:
+    """Bound-state heterodimer ΔG (`_rna_cofold`) — the 16S anti-SD tail
+    hybridized to an mRNA window. Locked against a frozen ViennaRNA
+    RNAcofold reference (the binding / anti-SD cases where the constrained
+    bound state equals the unconstrained cofold MFE)."""
+
+    def test_matches_frozen_vienna(self):
+        bad = []
+        for a, b, ref in _COFOLD_REF["cofold"]:
+            dg = bio._rna_cofold(a, b)
+            if abs(dg - ref) > _TOL:
+                bad.append((a, b, dg, ref))
+        assert not bad, f"{len(bad)} cofold mismatches vs frozen RNAcofold: {bad[:3]}"
+
+    def test_antisd_sd_duplex_is_strong(self):
+        # the 16S anti-SD tail vs its complement -> a strong 9-bp duplex
+        assert bio._rna_cofold("UAAGGAGGU", "ACCUCCUUA") < -10.0
+
+    def test_weak_pair_is_unfavorable(self):
+        # no complementarity: the forced-bound ΔG is high (weak / no RBS),
+        # ~ the DuplexInit penalty, not a favorable binding energy
+        assert bio._rna_cofold("AAAAAAAA", "AAAAAAAA") > -2.0
+
+    def test_dna_t_to_u(self):
+        assert abs(bio._rna_cofold("GGGGTTTT", "AAAACCCC")
+                   - bio._rna_cofold("GGGGUUUU", "AAAACCCC")) < 1e-9
+
+    def test_symmetric(self):
+        assert abs(bio._rna_cofold("ACCUCCUUA", "UAAGGAGGU")
+                   - bio._rna_cofold("UAAGGAGGU", "ACCUCCUUA")) < 1e-9
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError):
+            bio._rna_cofold("", "ACGU")
+        with pytest.raises(ValueError):
+            bio._rna_cofold("ACGU", "")
+
+    def test_ambiguous_raises(self):
+        with pytest.raises(ValueError):
+            bio._rna_cofold("ACGUN", "ACGU")
+
+    def test_overlength_raises(self):
+        with pytest.raises(ValueError):
+            bio._rna_cofold("A" * 300, "A" * 200)
+
+
+class TestRbsStrength:
+    """Relative RBS translation-initiation strength (`_rbs_strength`). The
+    structural ΔGs are exact (folder/cofold, locked above); this validates
+    the MODEL'S RELATIVE RANKING on the canonical determinants — the tuning
+    utility — not absolute values (β / spacing / start are calibration)."""
+
+    @staticmethod
+    def _mk(utr, sd, spacer, codon="AUG", cds="AGCAAAGCAACU"):
+        return utr + sd + spacer + codon + cds, len(utr + sd + spacer)
+
+    def _tir(self, *a, **kw):
+        seq, start = self._mk(*a, **kw)
+        return bio._rbs_strength(seq, start)["rel_strength"]
+
+    def test_sd_strength_ranking(self):
+        assert (self._tir("AAUAAA", "AGGAGG", "AAUAA")
+                > self._tir("AAUAAA", "AGAGG", "AAUAAA")
+                > self._tir("AAUAAA", "CACACA", "AAUAA"))
+
+    def test_start_codon_aug_beats_gug(self):
+        assert (self._tir("AAUAAA", "AGGAGG", "AAUAA")
+                > self._tir("AAUAAA", "AGGAGG", "AAUAA", codon="GUG"))
+
+    def test_spacing(self):
+        opt = self._tir("AAUAAA", "AGGAGG", "AAUAA")          # 5-nt spacer
+        short = self._tir("AAUAAA", "AGGAGG", "AA")
+        long_ = self._tir("AAUAAA", "AGGAGG", "AAUAAAAAAAA")
+        assert opt > short and opt > long_
+        assert short < long_        # too-short spacing penalised harder (steric)
+
+    def test_5utr_structure_occludes(self):
+        plain = self._tir("AAUAAA", "AGGAGG", "AAUAA")
+        occluded = bio._rbs_strength("GGGCCGGAGGUGGCCCCCAUGAGCAAA", 18)["rel_strength"]
+        assert occluded < plain / 10        # SD buried in a hairpin -> much weaker
+
+    def test_result_dict_shape(self):
+        r = bio._rbs_strength("AAUAAAAGGAGGAAUAAAUGAGCAAAGCAACU", 17)
+        assert set(r) == {"dg_total", "dg_mrna", "dg_hybrid", "spacing", "rel_strength"}
+        assert r["rel_strength"] > 0 and isinstance(r["spacing"], int)
+
+    def test_dna_t_accepted(self):
+        seq = "AAUAAAAGGAGGAAUAAAUGAGCAAAGCAACU"
+        assert abs(bio._rbs_strength(seq, 17)["rel_strength"]
+                   - bio._rbs_strength(seq.replace("U", "T"), 17)["rel_strength"]) < 1e-9
+
+    def test_no_sd_room_returns_zero(self):
+        assert bio._rbs_strength("AUGAAAAAAAAA", 0)["rel_strength"] == 0.0
+
+    def test_bad_input_raises(self):
+        for seq, st in (("AUGAAAAAA", 99), ("", 0), ("AUGNNN", 0),
+                        ("AUGAAAAAA", 1.5), ("AUGAAAAAA", True)):
+            with pytest.raises(ValueError):
+                bio._rbs_strength(seq, st)
+
+
+class TestRbsDesign:
+    """Reverse RBS design (`_rbs_design`) — search SD/spacer space for a
+    target relative strength. A short CDS keeps the ~84-call search fast."""
+
+    CDS = "AUGAGCAAAUACUAA"
+
+    def test_design_predict_roundtrip(self):
+        r = bio._rbs_design(self.CDS, 5.0)
+        fwd = bio._rbs_strength(r["utr"] + self.CDS, len(r["utr"]))["rel_strength"]
+        assert abs(r["rel_strength"] - fwd) < 1e-9        # design is a real RBS
+        assert r["full"] == r["utr"] + self.CDS
+
+    def test_result_shape(self):
+        r = bio._rbs_design(self.CDS, 5.0)
+        assert set(r) == {"utr", "full", "sd", "spacing", "rel_strength",
+                          "dg_total", "achievable_min", "achievable_max", "on_target"}
+        assert isinstance(r["spacing"], int)
+        assert r["achievable_max"] >= r["achievable_min"]
+
+    def test_monotonic_target(self):
+        weak = bio._rbs_design(self.CDS, 0.1)["rel_strength"]
+        strong = bio._rbs_design(self.CDS, 1e9)["rel_strength"]    # above range -> max
+        assert strong > weak
+
+    def test_in_range_target_on_target(self):
+        achievable_max = bio._rbs_design(self.CDS, 1e9)["achievable_max"]
+        r = bio._rbs_design(self.CDS, achievable_max * 0.4)
+        assert r["on_target"] is True
+
+    def test_out_of_range_flagged(self):
+        r = bio._rbs_design(self.CDS, 1e12)
+        assert r["on_target"] is False
+        assert r["rel_strength"] <= r["achievable_max"] + 1e-9
+
+    def test_dna_cds_accepted(self):
+        assert abs(bio._rbs_design(self.CDS, 5.0)["rel_strength"]
+                   - bio._rbs_design(self.CDS.replace("U", "T"), 5.0)["rel_strength"]) < 1e-9
+
+    def test_bad_input_raises(self):
+        for cds, tgt in ((self.CDS, -1), (self.CDS, "x"), ("", 5),
+                         ("AUGNNN", 5), (self.CDS, True), ("AU", 5)):
+            with pytest.raises(ValueError):
+                bio._rbs_design(cds, tgt)

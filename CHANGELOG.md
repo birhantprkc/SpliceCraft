@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.31] — 2026-06-06
+
+### New features
+
+- **Ribosome-binding-site strength prediction + design (E. coli), built in.** SpliceCraft can now estimate how strongly a ribosome binding site drives translation, and **reverse-design a 5′UTR** (Shine-Dalgarno + spacer) to hit a target strength — pure Python, no external library. It's a biophysical model on top of the new RNA folder/cofold: it weighs the SD : anti-SD match, the 5′UTR structure that hides the site, the spacing to the start codon, and the start codon itself. Strengths are **relative** — ideal for tuning one gene against another (the operon use case), not an absolute rate. Available through the agent API: `rbs-strength` (predict), `design-rbs` (reverse-design to a target), and `cofold-rna` (heterodimer ΔG, e.g. an anti-SD : mRNA hybrid). The foundation for the operon expression-tuning tools coming next.
+
+---
+
 ## [1.0.30] — 2026-06-06
 
 ### New features

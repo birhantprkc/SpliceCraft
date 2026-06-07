@@ -1012,6 +1012,94 @@ class _RNAModel:
             return
         raise RuntimeError(f"M1 traceback failed at {i},{j}")
 
+    # ---- bound-state heterodimer (cofold) ----
+    def _junction(self, s, i, j, cut):
+        """Energy of a cut-spanning pair's duplex junction — replaces the
+        hairpin for inter-strand pairs. The two cut-facing bases dangle
+        across the backbone break, scored via the exterior mismatch table
+        in the inward (reversed-pair) orientation."""
+        s5 = _RNA_BI[s[j - 1]] if j - 1 >= cut else 0
+        s3 = _RNA_BI[s[i + 1]] if i + 1 < cut else 0
+        return self._stem_d2(_rna_pairtype(s[j], s[i]), s5, s3, self.mm_ext)
+
+    def cofold(self, a_seq, b_seq):
+        """Bound-state heterodimer free energy of strands A & B (kcal/mol).
+        Concatenates A+B with an inter-strand cut and computes the BOUND
+        complex (DuplexInit always paid — the ribosome-bound state).
+        Matches ViennaRNA RNAcofold on binding duplexes; intra-strand
+        structure inside the duplex (the footprint) is forbidden, which is
+        the constrained bound state the translation-initiation model
+        uses. Energy only (no traceback)."""
+        s = a_seq + b_seq
+        cut = len(a_seq)
+        n = len(s)
+        if n < 2 or cut == 0 or cut == n:
+            return 0.0
+        INF, MLP = _RNA_INF, _RNA_MAXLOOP
+        a, b = self.ml_close, self.ml_branch
+        V = [[INF] * n for _ in range(n)]
+        M = [[INF] * n for _ in range(n)]
+        M1 = [[INF] * n for _ in range(n)]
+        for d in range(1, n):
+            for i in range(0, n - d):
+                j = i + d
+                if _rna_pairtype(s[i], s[j]) != 6:
+                    if i < cut <= j:
+                        best = self._junction(s, i, j, cut)
+                    elif j - i - 1 >= 3:
+                        best = self.energy_hairpin(s, i, j)
+                    else:
+                        best = INF
+                    pmax = min(j - 1, i + MLP + 1)
+                    for p in range(i + 1, pmax + 1):
+                        lg = p - i - 1
+                        qmin = max(p + 1, j - 1 - (MLP - lg))
+                        for q in range(qmin, j):
+                            if V[p][q] >= INF or _rna_pairtype(s[p], s[q]) == 6:
+                                continue
+                            if (i < cut <= p) or (q < cut <= j):
+                                continue        # loop's unpaired stretch spans the cut
+                            c = self._loop_e(s, i, j, p, q) + V[p][q]
+                            if c < best:
+                                best = c
+                    base = a + b + self._d2_ml_close(s, i, j)
+                    for u in range(i + 2, j - 1):
+                        if M[i + 1][u] < INF and M1[u + 1][j - 1] < INF:
+                            c = base + M[i + 1][u] + M1[u + 1][j - 1]
+                            if c < best:
+                                best = c
+                    V[i][j] = best
+                m1 = M1[i][j - 1] if M1[i][j - 1] < INF else INF
+                if V[i][j] < INF:
+                    c = V[i][j] + b + self._d2_ml(s, i, j, n)
+                    if c < m1:
+                        m1 = c
+                M1[i][j] = m1
+                m = M[i][j - 1] if M[i][j - 1] < INF else INF
+                for k in range(i, j):
+                    if V[k][j] < INF:
+                        c = V[k][j] + b + self._d2_ml(s, k, j, n)
+                        if c < m:
+                            m = c
+                for u in range(i, j):
+                    if M[i][u] < INF and M1[u + 1][j] < INF:
+                        c = M[i][u] + M1[u + 1][j]
+                        if c < m:
+                            m = c
+                M[i][j] = m
+        F = [0] * n
+        for j in range(1, n):
+            best = F[j - 1]
+            for i in range(0, j):
+                if V[i][j] < INF:
+                    prev = F[i - 1] if i > 0 else 0
+                    c = prev + V[i][j] + self._d2_ext(s, i, j, n)
+                    if c < best:
+                        best = c
+            F[j] = best
+        # + DuplexInit (Turner-2004 Misc, +4.10 kcal) for the bound state.
+        return (F[n - 1] + 410) / 100.0
+
 
 _RNA_MODEL_SINGLETON = None
 
@@ -1058,6 +1146,166 @@ def _rna_eval_structure(seq, dot_bracket):
     if len(s) != len(dot_bracket):
         raise ValueError("sequence / structure length mismatch")
     return _rna_model().eval_structure(s, dot_bracket)
+
+
+_RNA_COFOLD_MAX_LEN = 400               # combined A+B length cap (O(n^3) DP)
+
+
+def _rna_cofold(seq_a, seq_b, *, max_len=_RNA_COFOLD_MAX_LEN):
+    """Bound-state heterodimer free energy (kcal/mol) of two strands — the
+    ΔG of strand B bound to strand A (e.g. the 16S anti-SD tail hybridized
+    to an mRNA window). DNA `T` is read as `U`. The bound state is forced
+    (DuplexInit always paid), matching ViennaRNA RNAcofold on binding
+    duplexes; a weak / non-complementary pair returns a high (unfavorable)
+    ΔG rather than reporting 'unbound'. Raises ValueError on empty /
+    ambiguous / over-length input."""
+    a = _rna_normalize(seq_a)
+    b = _rna_normalize(seq_b)
+    if len(a) + len(b) > max_len:
+        raise ValueError(
+            f"combined length too long to cofold "
+            f"({len(a) + len(b)} > {max_len} nt cap)")
+    return _rna_model().cofold(a, b)
+
+
+# ── Ribosome binding site strength (E. coli translation initiation) ─────────
+#
+# A biophysically-grounded RELATIVE estimate of translation-initiation
+# strength, built on the validated RNA folder + cofold. The STRUCTURAL
+# energies are exact (`_rna_fold` / `_rna_cofold`, validated to the cent vs
+# ViennaRNA); the constants below — the Boltzmann factor β, the
+# spacing-penalty curve, and the start-codon ΔG — are literature-standard
+# empirical CALIBRATION values, not first-principles. So only RATIOS
+# between RBSs are meaningful: this is a tuning / ranking score, NOT an
+# absolute expression rate. Validated by relative ranking on the canonical
+# determinants (SD strength, 5'UTR occlusion, spacing, start codon), not
+# against an absolute thermodynamic oracle.
+#
+#   ΔG_total = ΔG_hybrid(best SD register) + ΔG_start + ΔG_spacing − ΔG_mRNA
+#   strength ∝ exp(−β · ΔG_total)
+
+_RBS_ANTI_SD = 'ACCUCCUUA'         # E. coli 16S rRNA 3' tail (anti-SD), 5'->3'
+_RBS_BETA = 0.45                   # mol/kcal — apparent Boltzmann factor (calibration)
+_RBS_OPT_SPACING = 5               # optimal SD-to-start aligned spacing (nt)
+_RBS_WINDOW = 35                   # nt up/downstream of the start folded for ΔG_mRNA
+_RBS_SPACING_SCAN = range(3, 13)   # aligned-spacing registers scanned for the SD
+# start-codon : initiator-tRNA(fMet) hybridisation ΔG (kcal/mol, favourable);
+# a non-canonical start gets 0 (no favourable initiation). Calibration.
+_RBS_START_DG = {'AUG': -1.19, 'GUG': -0.075, 'UUG': -0.075, 'CUG': -0.03,
+                 'AUU': -0.03, 'AUC': -0.03, 'AUA': -0.03}
+
+
+def _rbs_spacing_penalty(d):
+    """ΔG penalty (kcal/mol) for an SD-to-start spacing of `d` nt deviating
+    from the ~5-nt optimum. Asymmetric: too-short (steric clash with the
+    ribosome) is penalised far harder than too-long (entropic). Calibration."""
+    if d == _RBS_OPT_SPACING:
+        return 0.0
+    if d < _RBS_OPT_SPACING:
+        return 0.20 * (_RBS_OPT_SPACING - d) ** 2
+    return 0.05 * (d - _RBS_OPT_SPACING) ** 2
+
+
+def _rbs_strength(mrna, start_pos):
+    """Relative E. coli translation-initiation strength of the ribosome
+    binding site preceding the start codon at `start_pos` (0-based) in
+    `mrna` (RNA or DNA; T read as U). Returns a dict::
+
+        {dg_total, dg_mrna, dg_hybrid, spacing, rel_strength}
+
+    `rel_strength` ∝ exp(−β·dg_total): only RATIOS between RBSs are
+    meaningful (a ranking score, not an absolute rate). Captures
+    SD:anti-SD complementarity, the 5'UTR structure that occludes the site
+    (incl. the upstream standby region, via the folded window), the
+    SD-to-start spacing, and the start codon. Raises ValueError on bad
+    input; returns rel_strength 0.0 when the start is too close to the 5'
+    end for an SD to fit."""
+    s = mrna.strip().upper().replace('T', 'U') if isinstance(mrna, str) else None
+    if not s:
+        raise ValueError("mRNA must be a non-empty string")
+    bad = set(s) - {'A', 'C', 'G', 'U'}
+    if bad:
+        raise ValueError(f"mRNA needs unambiguous A/C/G/U; got {sorted(bad)}")
+    if (not isinstance(start_pos, int) or isinstance(start_pos, bool)
+            or not (0 <= start_pos <= len(s) - 3)):
+        raise ValueError(f"start_pos {start_pos!r} out of range for length {len(s)}")
+    dg_start = _RBS_START_DG.get(s[start_pos:start_pos + 3], 0.0)
+    w0 = max(0, start_pos - _RBS_WINDOW)
+    w1 = min(len(s), start_pos + _RBS_WINDOW)
+    dg_mrna = _rna_mfe(s[w0:w1])
+    best = None
+    best_d, best_hybrid = 0, 0.0
+    for d in _RBS_SPACING_SCAN:
+        end = start_pos - d
+        begin = end - len(_RBS_ANTI_SD)
+        if begin < 0:
+            continue
+        dg_h = _rna_cofold(s[begin:end], _RBS_ANTI_SD)
+        dg_f = dg_h + dg_start + _rbs_spacing_penalty(d)
+        if best is None or dg_f < best:
+            best, best_d, best_hybrid = dg_f, d, dg_h
+    if best is None:                       # start too close to the 5' end
+        return {'dg_total': float('inf'), 'dg_mrna': round(dg_mrna, 2),
+                'dg_hybrid': None, 'spacing': None, 'rel_strength': 0.0}
+    dg_total = best - dg_mrna
+    return {'dg_total': round(dg_total, 2), 'dg_mrna': round(dg_mrna, 2),
+            'dg_hybrid': round(best_hybrid, 2), 'spacing': best_d,
+            'rel_strength': round(_math.exp(-_RBS_BETA * dg_total), 3)}
+
+
+# Graded Shine-Dalgarno library (complementarity to the anti-SD, strong → none)
+# + spacer lengths, for reverse RBS design. The forward model ranks them;
+# this just spans the strength range so a target can be matched.
+_RBS_DESIGN_SD_LADDER = ['UAAGGAGGU', 'AAGGAGGU', 'AGGAGGA', 'AGGAGG', 'UAAGGAG',
+                         'GGAGGU', 'AGGAG', 'GGAGG', 'AGGA', 'GAGGA', 'AGAGA',
+                         'AAGAA', 'ACAUA', '']
+_RBS_DESIGN_SPACERS = {4: 'AAUA', 5: 'AAUAA', 6: 'AACAAU', 7: 'AACAAUA',
+                       8: 'AACAAUAA', 9: 'AACAAUAAU'}
+_RBS_DESIGN_UPSTREAM = 'UUAAUUAAUU'      # low-structure 5' context (standby region)
+
+
+def _rbs_design(cds, target_strength, *, upstream=_RBS_DESIGN_UPSTREAM):
+    """Design a 5'UTR (Shine-Dalgarno + spacer) preceding `cds` (which must
+    begin with the start codon) to achieve a target RELATIVE RBS strength.
+    Searches a graded SD × spacer library, scores each construct with
+    `_rbs_strength`, and returns the design closest to `target_strength`::
+
+        {utr, full, sd, spacing, rel_strength, dg_total,
+         achievable_min, achievable_max, on_target}
+
+    Strength is relative (see `_rbs_strength`). A target outside the
+    CDS-achievable range yields the nearest achievable design and
+    `on_target=False`. Raises ValueError on bad input."""
+    c = cds.strip().upper().replace('T', 'U') if isinstance(cds, str) else ''
+    if not c or (set(c) - {'A', 'C', 'G', 'U'}):
+        raise ValueError("cds must be a non-empty A/C/G/U(T) string")
+    if len(c) < 3:
+        raise ValueError("cds must include the start codon (>= 3 nt)")
+    if (isinstance(target_strength, bool)
+            or not isinstance(target_strength, (int, float))
+            or target_strength < 0):
+        raise ValueError("target_strength must be a non-negative number")
+    up = (upstream or '').strip().upper().replace('T', 'U')
+    if set(up) - {'A', 'C', 'G', 'U'}:
+        raise ValueError("upstream must be A/C/G/U(T)")
+    best = None
+    lo, hi = float('inf'), -1.0
+    for sd in _RBS_DESIGN_SD_LADDER:
+        for slen, sp in _RBS_DESIGN_SPACERS.items():
+            utr = up + sd + sp
+            r = _rbs_strength(utr + c, len(utr))
+            v = r['rel_strength']
+            lo, hi = min(lo, v), max(hi, v)
+            if best is None or abs(v - target_strength) < abs(
+                    best['rel_strength'] - target_strength):
+                best = {'utr': utr, 'sd': sd, 'spacing': slen,
+                        'rel_strength': v, 'dg_total': r['dg_total']}
+    assert best is not None              # the SD ladder is non-empty -> always set
+    best['full'] = best['utr'] + c
+    best['achievable_min'] = round(lo, 3)
+    best['achievable_max'] = round(hi, 3)
+    best['on_target'] = lo <= target_strength <= hi
+    return best
 
 
 # What is intentionally NOT extracted (yet):

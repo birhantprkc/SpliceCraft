@@ -78,10 +78,16 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   lineage as nested JSON.
 - **Codon tables** — list, add (Kazusa fetch or raw dict), delete.
 - **Search** — blast, hmmscan.
-- **RNA structure** — fold-rna (pure-Python minimum-free-energy
-  secondary structure: returns the dot-bracket fold + ΔG in kcal/mol via
-  the Turner-2004 nearest-neighbor model, no external dependency; DNA
-  `T` is read as `U`, ambiguous / over-length input returns 400).
+- **RNA structure + RBS** — fold-rna (minimum-free-energy secondary
+  structure: dot-bracket fold + ΔG in kcal/mol, pure-Python Turner-2004,
+  no external dependency); cofold-rna (bound-state heterodimer ΔG of two
+  strands, e.g. a 16S anti-SD : mRNA hybrid); rbs-strength (relative
+  E. coli translation-initiation strength of a ribosome binding site —
+  weighs SD:anti-SD match, 5'UTR occlusion, SD-to-start spacing, and the
+  start codon; returns a RELATIVE ranking score, not an absolute rate);
+  design-rbs (reverse-design a 5'UTR / Shine-Dalgarno + spacer to a
+  target relative strength, with the achievable range + an on-target
+  flag). DNA `T` read as `U`; ambiguous / over-length / bad input → 400.
 - **HMM databases** — list / get / set-active / delete / add /
   download-hmm-database (the registry that backs hmmscan). `add`
   registers a custom `.hmm.gz` URL (mirrors the GUI "Add" form);
