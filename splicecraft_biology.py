@@ -1297,8 +1297,10 @@ _RBS_DESIGN_SD_LADDER = ['UAAGGAGGU', 'AAGGAGGU', 'AGGAGGA', 'AGGAGG', 'UAAGGAG'
 _RBS_DESIGN_SPACERS = {4: 'AAUA', 5: 'AAUAA', 6: 'AACAAU', 7: 'AACAAUA',
                        8: 'AACAAUAA', 9: 'AACAAUAAU'}
 _RBS_DESIGN_UPSTREAM = 'UUAAUUAAUU'      # low-structure 5' context (standby region)
-_RBS_DESIGN_MAX_CDS = 50000              # cds length cap (the design does ~84
+_RBS_DESIGN_MAX_CDS = 50000              # cds length cap (the design does
 #                                          O(len) passes — bounds worst-case cost)
+_RBS_DESIGN_COARSE_SPACER = 6            # spacer length used to rank SDs in the
+#                                          coarse pass of the coarse-to-fine search
 
 
 def _rbs_design(cds, target_strength, *, upstream=_RBS_DESIGN_UPSTREAM):
@@ -1330,18 +1332,42 @@ def _rbs_design(cds, target_strength, *, upstream=_RBS_DESIGN_UPSTREAM):
     up = (upstream or '').strip().upper().replace('T', 'U')
     if set(up) - {'A', 'C', 'G', 'U'}:
         raise ValueError("upstream must be A/C/G/U(T)")
+    # Coarse-to-fine search. A full 14 SD × 6 spacer = 84-eval scan costs
+    # ~5-7 s. Instead: (coarse) rank every SD at one representative spacer —
+    # 14 evals — then (fine) scan every spacer for the SD that brackets the
+    # target plus its two ladder neighbours — ~15 evals. The fine pass
+    # covers the target's neighbourhood densely, so the achievable extreme
+    # NEAR the target (the one that drives `on_target`) is exact; the FAR
+    # extreme is an estimate. ~29 evals total (~2.5-3x faster).
     best = None
     lo, hi = float('inf'), -1.0
-    for sd in _RBS_DESIGN_SD_LADDER:
-        for slen, sp in _RBS_DESIGN_SPACERS.items():
-            utr = up + sd + sp
-            r = _rbs_strength(utr + c, len(utr))
-            v = r['rel_strength']
-            lo, hi = min(lo, v), max(hi, v)
-            if best is None or abs(v - target_strength) < abs(
-                    best['rel_strength'] - target_strength):
-                best = {'utr': utr, 'sd': sd, 'spacing': slen,
-                        'rel_strength': v, 'dg_total': r['dg_total']}
+    spacers = _RBS_DESIGN_SPACERS
+    coarse_len = _RBS_DESIGN_COARSE_SPACER
+
+    def _consider(sd, slen, sp):
+        nonlocal best, lo, hi
+        utr = up + sd + sp
+        r = _rbs_strength(utr + c, len(utr))
+        v = r['rel_strength']
+        lo, hi = min(lo, v), max(hi, v)
+        if best is None or abs(v - target_strength) < abs(
+                best['rel_strength'] - target_strength):
+            best = {'utr': utr, 'sd': sd, 'spacing': slen,
+                    'rel_strength': v, 'dg_total': r['dg_total']}
+        return v
+
+    coarse = []
+    for i, sd in enumerate(_RBS_DESIGN_SD_LADDER):
+        coarse.append((_consider(sd, coarse_len, spacers[coarse_len]), i))
+    coarse.sort(key=lambda x: abs(x[0] - target_strength))
+    best_i = coarse[0][1]
+    last = len(_RBS_DESIGN_SD_LADDER) - 1
+    for i in {best_i, max(0, best_i - 1), min(last, best_i + 1)}:
+        sd = _RBS_DESIGN_SD_LADDER[i]
+        for slen, sp in spacers.items():
+            if slen == coarse_len:
+                continue                     # already scored in the coarse pass
+            _consider(sd, slen, sp)
     assert best is not None              # the SD ladder is non-empty -> always set
     best['full'] = best['utr'] + c
     best['achievable_min'] = round(lo, 3)

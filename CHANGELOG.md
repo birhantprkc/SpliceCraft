@@ -14,6 +14,19 @@
 
 ---
 
+## [1.0.34] — 2026-06-07
+
+### Bug fixes
+
+- **Modals fit small / low-resolution terminals.** Every dialog is capped to the viewport, so on a small window (e.g. a non-maximized terminal on a 1080p laptop) a wide or tall modal no longer renders partly off-screen with its buttons out of reach. The two-pane Enzyme Collections dialog reflows to fit, and the Gibson Assembly "Paste DNA" box is now tall enough to actually show a pasted sequence (it was clipped to about two rows).
+
+### Improvements
+
+- **RBS / operon design is ~2× faster.** The reverse RBS designer uses a coarse-to-fine search instead of an exhaustive scan, so per-gene tuning in the Operon Design tab returns in a couple of seconds instead of 5–7.
+- **UI consistency pass.** One slim scrollbar theme everywhere; the selected radio button is clearly highlighted in every group; the assembly-lane controls across the Constructor (Golden Braid / MoClo), Gibson, and Operon Design tabs now use consistent, evenly-sized icon buttons (↑ ↓ ✕) with tooltips and proper spacing; and the Operon Design tab gained filled section headers + an even panel split, so it no longer jumps width when you switch between the Synthesis tabs.
+
+---
+
 ## [1.0.33] — 2026-06-07
 
 ### New features
