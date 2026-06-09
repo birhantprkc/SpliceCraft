@@ -2570,10 +2570,38 @@ class TestSynthesisCloneFragmentButton:
             )
 
 
+def _bind_valid_gb_l0_vector():
+    """Bind a synthetic gb_l0 entry vector carrying two Esp3I sites so the
+    Clone Fragment → Domesticator path finds a valid acceptor (and doesn't
+    pop the entry-vector picker)."""
+    import random
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    rng = random.Random(0xBEEF)
+
+    def _scrub(s):
+        for x in ("CGTCTC", "GAGACG", "GGTCTC", "GAGACC"):
+            s = s.replace(x, "CTGCAG")
+        return s
+    bb = _scrub("".join(rng.choice("ACGT") for _ in range(1400)))
+    drop = _scrub("".join(rng.choice("ACGT") for _ in range(160)))
+    cassette = "CGTCTCA" + "CTCG" + drop + "TGAG" + "AGAGACG"
+    seq = bb[:700] + cassette + bb[700:]
+    rec = SeqRecord(Seq(seq), id="TESTUPD", name="TESTUPD",
+                    annotations={"molecule_type": "DNA", "topology": "circular"})
+    sc._set_entry_vector("gb_l0", {
+        "name": "TESTUPD", "size": 0, "source": "test",
+        "id": "TESTUPD", "gb_text": sc._record_to_gb_text(rec)})
+
+
 class TestSynthesisCloneFragmentFlow:
-    """End-to-end integration guard for the Clone Fragment handoff."""
+    """End-to-end integration guard for the reworked Clone Fragment
+    handoff (2026-06-09): a method chooser first, NO premature save, then
+    the Domesticator prefilled byte-exact."""
 
-    async def test_clone_saves_and_opens_parts_bin(self, isolated_library):
+    async def test_clone_opens_method_chooser_without_saving(self, isolated_library):
+        # Clicking Clone Fragment opens the method chooser and saves
+        # NOTHING — the old flow auto-saved an unprimed copy first.
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
@@ -2582,65 +2610,52 @@ class TestSynthesisCloneFragmentFlow:
             await pilot.pause()
             await pilot.pause()
             scr = app.screen
-            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
-            ed.load("ATGAAACCCGGGTTT", [])
+            scr.query_one("#syn-editor", sc.SynthesisEditor).load(
+                "ATGAAACCCGGGTTT", [])
             scr._dirty = True
-            # Stub NamePlasmidModal — user types name once during the
-            # auto-save inside Clone Fragment.
-            orig_push = app.push_screen
-            def _stub_push(modal, callback=None):
-                if isinstance(modal, sc.NamePlasmidModal):
-                    if callback is not None:
-                        callback("clone_test_fragment")
-                    return None
-                return orig_push(modal, callback=callback)
-            app.push_screen = _stub_push  # type: ignore[method-assign]
-            try:
-                scr.action_clone_fragment()
-            finally:
-                app.push_screen = orig_push  # type: ignore[method-assign]
-            # Settle the async push of PartsBinModal.
+            scr.action_clone_fragment()
             await pilot.pause()
             await pilot.pause()
-            await pilot.pause()
-            # 1. Synthesis fragment landed in the library.
-            entries = sc._load_library()
-            ids = {e.get("id") for e in entries}
-            assert "clone_test_fragment" in ids, (
-                f"Synthesis save didn't land — ids: {ids}"
+            assert isinstance(app.screen, sc.CloneMethodChooserModal), (
+                f"expected the method chooser, got {type(app.screen).__name__}"
             )
-            # 2. The current record is now the synthesis fragment
-            #    (so PartsBinModal._new_part picks it up).
-            rec = app._current_record
-            assert rec is not None
-            assert str(rec.seq).upper() == "ATGAAACCCGGGTTT"
-            # 3. The full handoff chain fired:
-            #    Synthesis dismissed → PartsBinModal mounted →
-            #    auto_trigger_new_part fired _new_part(None) →
-            #    DomesticatorModal stacked on top. So the topmost
-            #    screen should be DomesticatorModal, and the parts
-            #    bin should sit below it in the screen stack.
+            assert sc._load_library() == [], "nothing should be saved yet"
+
+    async def test_grammar_choice_routes_to_domesticator(self, isolated_library):
+        # Picking a modular grammar (with a valid bound entry vector)
+        # routes through the Parts Bin to the Domesticator — still with
+        # no premature library save.
+        _bind_valid_gb_l0_vector()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            scr.query_one("#syn-editor", sc.SynthesisEditor).load(
+                "ATGAAACCCGGGTTT", [])
+            scr._dirty = True
+            scr.action_clone_fragment()
+            await pilot.pause()
+            await pilot.pause()
+            app.screen.dismiss({"method": "grammar", "grammar_id": "gb_l0"})
+            for _ in range(8):
+                await pilot.pause()
             assert isinstance(app.screen, sc.DomesticatorModal), (
-                f"expected DomesticatorModal on top after handoff, "
-                f"got {type(app.screen).__name__}"
+                f"expected DomesticatorModal, got {type(app.screen).__name__}"
             )
-            stack_types = [type(s).__name__ for s in app.screen_stack]
-            assert "PartsBinModal" in stack_types, (
-                f"PartsBinModal should sit under the Domesticator; "
-                f"stack: {stack_types}"
-            )
-            assert "SynthesisScreen" not in stack_types, (
-                f"SynthesisScreen should have dismissed; "
-                f"stack: {stack_types}"
-            )
+            stack = [type(s).__name__ for s in app.screen_stack]
+            assert "PartsBinModal" in stack, f"stack: {stack}"
+            assert sc._load_library() == [], "still nothing saved"
 
-    async def test_clone_preserves_clean_display_name(self, isolated_library):
-        """Regression (2026-06-02): a fragment named with SPACES keeps a
-        clean, underscore-free display name after Clone Fragment loads it
-        onto the canvas. Pre-fix, the gb_text round-trip dropped
-        `_tui_display_name`, so the canvas record fell back to the
-        underscored LOCUS ("Batch_57_clone_t") and a later Ctrl+S
-        persisted underscores."""
+    async def test_clone_carries_clean_display_name(self, isolated_library):
+        """A fragment named with SPACES seeds the Domesticator's part-name
+        field cleanly (no underscores), with NO library save — the old
+        flow round-tripped through a save; the new one just carries the
+        name into the chooser → Domesticator handoff."""
+        _bind_valid_gb_l0_vector()
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
@@ -2649,47 +2664,33 @@ class TestSynthesisCloneFragmentFlow:
             await pilot.pause()
             await pilot.pause()
             scr = app.screen
-            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
-            ed.load("ATGAAACCCGGGTTTAAA", [])
+            scr.query_one("#syn-editor", sc.SynthesisEditor).load(
+                "ATGAAACCCGGGTTTAAA", [])
+            scr._loaded_name = "Batch 57 clone test"
             scr._dirty = True
-            orig_push = app.push_screen
-            def _stub_push(modal, callback=None):
-                if isinstance(modal, sc.NamePlasmidModal):
-                    if callback is not None:
-                        callback("Batch 57 clone test")
-                    return None
-                return orig_push(modal, callback=callback)
-            app.push_screen = _stub_push  # type: ignore[method-assign]
-            try:
-                scr.action_clone_fragment()
-            finally:
-                app.push_screen = orig_push  # type: ignore[method-assign]
+            scr.action_clone_fragment()
             await pilot.pause()
             await pilot.pause()
-            await pilot.pause()
-            # The synthesis save keeps the clean typed name in the library.
-            names = {e.get("name") for e in sc._load_library()}
-            assert "Batch 57 clone test" in names, (
-                f"clean name didn't persist to library; names: {names}"
+            app.screen.dismiss({"method": "grammar", "grammar_id": "gb_l0"})
+            for _ in range(8):
+                await pilot.pause()
+            assert isinstance(app.screen, sc.DomesticatorModal)
+            from textual.widgets import Input
+            name_val = app.screen.query_one("#dom-name", Input).value
+            assert name_val == "Batch 57 clone test", (
+                f"clean name not carried into Domesticator: {name_val!r}"
             )
-            # The canvas record loaded by the handoff reports a clean
-            # display name — so a later manual save can't leak underscores.
-            rec = app._current_record
-            assert rec is not None
-            disp = app._record_display_name(rec)
-            assert disp == "Batch 57 clone test", (
-                f"canvas display name not restored: {disp!r}"
-            )
-            assert "_" not in disp, f"underscore leaked into name: {disp!r}"
+            assert "_" not in name_val, f"underscore leaked into name: {name_val!r}"
+            assert sc._load_library() == [], "no premature save"
 
     async def test_clone_prefills_direct_input_textarea(
         self, isolated_library,
     ):
-        """The complete synthesis sequence must land in the
-        Domesticator's #dom-direct-seq TextArea atomically — the
-        whole string in one TextArea.text write so the user can't
-        catch the prefill mid-paste."""
+        """The complete synthesis sequence lands byte-exact in the
+        Domesticator's #dom-direct-seq TextArea after choosing a grammar —
+        the whole string in one write, no missed bases."""
         from textual.widgets import TextArea
+        _bind_valid_gb_l0_vector()
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
@@ -2698,29 +2699,17 @@ class TestSynthesisCloneFragmentFlow:
             await pilot.pause()
             await pilot.pause()
             scr = app.screen
-            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
             # Use a sequence with a mix of bases so we can verify
             # the full payload landed, not just a prefix.
             full_seq = "ATGAAACCCGGGTTTAACCGGTTAACCGGTTAA"
-            ed.load(full_seq, [])
+            scr.query_one("#syn-editor", sc.SynthesisEditor).load(full_seq, [])
             scr._dirty = True
-            orig_push = app.push_screen
-            def _stub_push(modal, callback=None):
-                if isinstance(modal, sc.NamePlasmidModal):
-                    if callback is not None:
-                        callback("prefill_test_fragment")
-                    return None
-                return orig_push(modal, callback=callback)
-            app.push_screen = _stub_push  # type: ignore[method-assign]
-            try:
-                scr.action_clone_fragment()
-            finally:
-                app.push_screen = orig_push  # type: ignore[method-assign]
+            scr.action_clone_fragment()
             await pilot.pause()
             await pilot.pause()
-            await pilot.pause()
-            # Domesticator on top, with the full sequence in the
-            # direct-input TextArea.
+            app.screen.dismiss({"method": "grammar", "grammar_id": "gb_l0"})
+            for _ in range(8):
+                await pilot.pause()
             assert isinstance(app.screen, sc.DomesticatorModal)
             ta = app.screen.query_one("#dom-direct-seq", TextArea)
             assert ta.text == full_seq, (
@@ -2735,6 +2724,7 @@ class TestSynthesisCloneFragmentFlow:
         clears after _new_part consumes it so a subsequent manual
         'New Part' click doesn't re-prime the textarea with the same
         synthesis fragment."""
+        _bind_valid_gb_l0_vector()
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
@@ -2743,24 +2733,14 @@ class TestSynthesisCloneFragmentFlow:
             await pilot.pause()
             await pilot.pause()
             scr = app.screen
-            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
-            ed.load("ATGCATGC", [])
+            scr.query_one("#syn-editor", sc.SynthesisEditor).load("ATGCATGC", [])
             scr._dirty = True
-            orig_push = app.push_screen
-            def _stub_push(modal, callback=None):
-                if isinstance(modal, sc.NamePlasmidModal):
-                    if callback is not None:
-                        callback("self_clearing_test")
-                    return None
-                return orig_push(modal, callback=callback)
-            app.push_screen = _stub_push  # type: ignore[method-assign]
-            try:
-                scr.action_clone_fragment()
-            finally:
-                app.push_screen = orig_push  # type: ignore[method-assign]
+            scr.action_clone_fragment()
             await pilot.pause()
             await pilot.pause()
-            await pilot.pause()
+            app.screen.dismiss({"method": "grammar", "grammar_id": "gb_l0"})
+            for _ in range(8):
+                await pilot.pause()
             # Walk the screen stack to find the PartsBinModal under
             # the Domesticator and verify its prefill attr is empty.
             pb = next(
@@ -2774,10 +2754,10 @@ class TestSynthesisCloneFragmentFlow:
                 f"still holds {pb._clone_prefill_seq!r}"
             )
 
-    async def test_clone_aborted_when_save_fails(self, isolated_library):
-        # If the user cancels the NamePlasmidModal (callback fires
-        # with an empty string), Clone Fragment must NOT proceed to
-        # the handoff — no canvas swap, no parts-bin push.
+    async def test_chooser_cancel_is_a_noop(self, isolated_library):
+        # Cancelling the method chooser leaves the user in Synthesis with
+        # their buffer intact and nothing written — there's no save to
+        # fail anymore (the premature save is gone).
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
@@ -2786,26 +2766,18 @@ class TestSynthesisCloneFragmentFlow:
             await pilot.pause()
             await pilot.pause()
             scr = app.screen
-            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
-            ed.load("ATGAAA", [])
+            scr.query_one("#syn-editor", sc.SynthesisEditor).load("ATGAAA", [])
             scr._dirty = True
-            orig_push = app.push_screen
-            def _stub_push(modal, callback=None):
-                if isinstance(modal, sc.NamePlasmidModal):
-                    if callback is not None:
-                        callback("")  # cancel — empty name
-                    return None
-                return orig_push(modal, callback=callback)
-            app.push_screen = _stub_push  # type: ignore[method-assign]
-            try:
-                scr.action_clone_fragment()
-            finally:
-                app.push_screen = orig_push  # type: ignore[method-assign]
+            scr.action_clone_fragment()
             await pilot.pause()
             await pilot.pause()
-            # Synthesis screen still on top — no handoff happened.
+            assert isinstance(app.screen, sc.CloneMethodChooserModal)
+            app.screen.dismiss(None)
+            for _ in range(4):
+                await pilot.pause()
+            # Synthesis screen back on top — no handoff happened.
             assert isinstance(app.screen, sc.SynthesisScreen), (
-                f"Clone Fragment must abort on save cancel; "
+                f"chooser cancel must return to Synthesis; "
                 f"screen is {type(app.screen).__name__}"
             )
             # Library still empty.

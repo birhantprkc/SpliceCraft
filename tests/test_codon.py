@@ -2053,7 +2053,13 @@ class TestCodonManagerTabs:
             # ATG is Met, not Ala → _parse_codon_tsv raises ValueError.
             modal.query_one("#sp-import-text", TextArea).text = "ATG\tA\t5\n"
             modal.query_one("#btn-sp-import-go", Button).action_press()
-            await pilot.pause(0.2)
+            # `_import_tsv` is synchronous and does NOT switch tabs on a
+            # parse error, so the Import tab must HOLD. Use `_settle_tab`
+            # (not a fixed pause) to flush the trailing TabActivated message
+            # that can transiently revert `.active` — the documented race
+            # that flaked this under the release's `-n auto` load. The
+            # success-path import tests already settle this way.
+            await _settle_tab(pilot, tabs, "sp-tab-import")
             assert tabs.active == "sp-tab-import"
             assert "failed" in str(modal.query_one(
                 "#sp-import-status", Static).render()).lower()

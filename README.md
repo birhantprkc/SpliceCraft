@@ -201,17 +201,28 @@ sites** controls as Mutato) and hand the CDS straight to the DNA tab as an
 editable fragment. Or hit **Open** to
 load a sequence straight from a single-entry FASTA (or other amino-acid file) — a
 file browser highlights the loadable formats in pink. Compose a part,
-hit **Clone Fragment**, and it's handed straight to the Domesticator as an L0
-building block. When you save the domesticated part, one dialog names — and independently
-files — three things: the **cloned plasmid** (into any collection), the
-**linear fragment** you'd send for a DNA-synthesis order (its own name,
-defaulting to a `FRAG-…` form, into any collection), and which **parts bin**
+hit **Clone Fragment**, and pick how to clone it: any modular grammar
+(Golden Braid L0, MoClo, your own custom grammars) hands the fragment straight
+to the **Domesticator** as an L0 building block, while **Gibson** and
+**Traditional (restriction / ligation)** open the **Constructor** on the matching
+tab with the fragment already pasted in. Nothing is saved and nothing on your
+canvas is touched at this point — you name things later, at the save step. If the
+modular grammar you pick has no **entry vector** bound yet (a fresh install, say),
+SpliceCraft asks you to pick an acceptor plasmid from your library and checks it
+really carries that grammar's dropout cassette before binding it, so the clone
+can't quietly degrade to a bare insert. When you save the domesticated part, one
+dialog names — and independently files — three things: the **cloned plasmid** (the
+part actually cloned into the entry vector — a full circular plasmid — into any
+collection), the **linear fragment** you'd send for a DNA-synthesis order (its own
+name, defaulting to a `FRAG-…` form, into any collection), and which **parts bin**
 the L0 part files into. The fragment is the *primed amplicon* — the insert
 flanked by the designed domestication primers' enzyme sites + overhangs, exactly
 as it would run on the bench — and both the fragment **and** the clone carry the
 **domestication primers**, drawn with their bound (annealing + overhang) and
 unbound (enzyme-tail) regions, so you can see exactly how each was built (and
-regenerate the amplicon later for a synthesis order).
+regenerate the amplicon later for a synthesis order). Both the DNA and Protein
+tabs also carry a **Clear** button — a mouse twin for the keyboard reset — that
+empties the editor, prompting first if you have unsaved edits.
 The **Operon Design tab** turns the codon optimizer and SpliceCraft's
 built-in RBS engine into an expression-tuning workbench. Keep a library of
 **protein collections** on the right (add a protein by pasting a sequence,

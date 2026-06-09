@@ -14,6 +14,24 @@
 
 ---
 
+## [1.0.42] — 2026-06-09
+
+### Bug fixes
+
+- **Synthesis → Clone Fragment no longer saves a stray unprimed copy of your fragment, and the cloned L0 plasmid is the real thing.** Cloning a composed fragment used to (1) silently save the raw, unprimed coding sequence to your library before you'd done anything, and (2) — on a fresh install with no entry vector configured — save a "cloned plasmid" that was really just the bare insert with no cloning sites. The net effect looked like the same unprimed fragment saved three times under different names. Clone Fragment now goes straight to a method chooser (nothing saved, nothing on your canvas touched), and the saved plasmid is the part *actually cloned into the entry vector* — a full circular plasmid — alongside the orderable linear primed fragment, each carrying its domestication primers and full construction history.
+
+### New features
+
+- **Clone Fragment now asks how to clone, the moment you click it.** A chooser lists every cloning grammar (Golden Braid L0, MoClo, your custom grammars) plus **Gibson** and **Traditional (restriction / ligation)**. Modular grammars hand the fragment to the Parts Domesticator, prefilled; Gibson and Traditional open the Constructor on the matching tab with the fragment already pasted into the lane box. You name the fragment and the plasmid later, at the save step — not up front.
+- **An entry-vector picker appears automatically when the grammar you chose has none bound.** Instead of silently producing a stub backbone, SpliceCraft asks you to pick an acceptor plasmid from your library and **validates** that it actually carries the grammar's dropout cassette (at least two of the grammar's enzyme sites) before binding it — so a fresh install can't quietly degrade the clone. The binding is remembered for next time.
+- **Clear buttons on the Synthesis DNA and Protein tabs.** Every keyboard reset now has an on-tab mouse twin; both prompt to save first if you have unsaved edits.
+
+### Hardening
+
+- The Clone Fragment handoff carries your composed sequence through **byte-for-byte** — no missed bases, no truncated plasmids — never writes to your library until you explicitly save a deliverable, and never overwrites whatever plasmid you have open on the canvas.
+
+---
+
 ## [1.0.41] — 2026-06-09
 
 ### Bug fixes
