@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.40] — 2026-06-09
+
+### Bug fixes
+
+- **Copy-to-clipboard now works on far more terminals and on every OS.** SpliceCraft relied on the OSC 52 terminal escape to set your clipboard, but a number of terminals silently ignore it — notably GNOME Terminal and other VTE-based terminals on Linux/Wayland, oversized copies, and `tmux` without clipboard passthrough — so F9 diagnostics, sequence copies, and the like would say "copied" while your clipboard stayed empty. SpliceCraft now uses your operating system's real clipboard tool first (`wl-copy` / `xclip` / `xsel` on Linux, `pbcopy` on macOS, `clip` / PowerShell on Windows, `clip.exe` on WSL, `termux-clipboard-set` on Android), which actually sets the clipboard *and confirms it worked*; OSC 52 stays as the fallback for remote/SSH sessions. If copy still doesn't work, install the matching helper — e.g. `sudo apt install wl-clipboard` on a Wayland desktop, or `xclip` on X11.
+
+---
+
 ## [1.0.39] — 2026-06-09
 
 ### Bug fixes

@@ -13910,7 +13910,11 @@ class TestRobustnessHardening:
 
     # ── (7) Clipboard fallback ─────────────────────────────────────
 
-    def test_clipboard_fallback_uses_app_when_available(self):
+    def test_clipboard_fallback_uses_app_when_available(self, monkeypatch):
+        # Disable the native tier so this deterministically exercises the
+        # Textual tier regardless of which clipboard tools the test
+        # machine happens to have installed.
+        monkeypatch.setattr(sc, "_copy_via_native_tool", lambda *a, **k: None)
         class StubApp:
             captured: list = []
             def copy_to_clipboard(self, text):
@@ -13928,7 +13932,8 @@ class TestRobustnessHardening:
         class BrokenApp:
             def copy_to_clipboard(self, text):
                 raise RuntimeError("no clipboard channel")
-        # Force OSC 52 to fail too.
+        # Force the native tier + OSC 52 to fail too.
+        monkeypatch.setattr(sc, "_copy_via_native_tool", lambda *a, **k: None)
         monkeypatch.setattr(sc, "_copy_to_clipboard_osc52",
                               lambda text: False)
         mode, detail = sc._copy_to_clipboard_with_fallback(
@@ -13944,6 +13949,7 @@ class TestRobustnessHardening:
         class BrokenApp:
             def copy_to_clipboard(self, text):
                 raise RuntimeError("no clipboard")
+        monkeypatch.setattr(sc, "_copy_via_native_tool", lambda *a, **k: None)
         monkeypatch.setattr(sc, "_copy_to_clipboard_osc52",
                               lambda text: False)
         # Force the file-write fallback to fail too.
@@ -13958,6 +13964,137 @@ class TestRobustnessHardening:
         assert detail is None
         # Restore for cleanliness.
         monkeypatch.setattr(sc, "_atomic_write_text", original)
+
+    # ── native clipboard tier — all common OSes (2026-06-09) ────────
+    # OSC 52 is fire-and-forget (a terminal that ignores it makes the
+    # copy *look* successful while the clipboard stays empty — the
+    # Wayland/GNOME-Terminal user report). The native tier shells out to
+    # a real clipboard tool that reports success via exit code. These
+    # tests fake each platform so coverage doesn't need the actual OS.
+
+    def test_native_cmds_macos(self, monkeypatch):
+        monkeypatch.setattr(sc.sys, "platform", "darwin")
+        assert sc._clipboard_native_commands() == [["pbcopy"]]
+
+    def test_native_cmds_windows(self, monkeypatch):
+        monkeypatch.setattr(sc.sys, "platform", "win32")
+        cmds = sc._clipboard_native_commands()
+        assert ["clip"] in cmds
+        assert any("Set-Clipboard" in " ".join(c) for c in cmds)
+
+    def test_native_cmds_linux_wayland(self, monkeypatch):
+        monkeypatch.setattr(sc.sys, "platform", "linux")
+        monkeypatch.setattr(sc, "_is_wsl", lambda: False)
+        monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("TERMUX_VERSION", raising=False)
+        monkeypatch.delenv("PREFIX", raising=False)
+        assert ["wl-copy"] in sc._clipboard_native_commands()
+
+    def test_native_cmds_linux_x11(self, monkeypatch):
+        monkeypatch.setattr(sc.sys, "platform", "linux")
+        monkeypatch.setattr(sc, "_is_wsl", lambda: False)
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        monkeypatch.setenv("DISPLAY", ":0")
+        monkeypatch.delenv("TERMUX_VERSION", raising=False)
+        monkeypatch.delenv("PREFIX", raising=False)
+        cmds = sc._clipboard_native_commands()
+        assert ["xclip", "-selection", "clipboard"] in cmds
+        assert ["xsel", "--clipboard", "--input"] in cmds
+
+    def test_native_cmds_wsl_uses_clip_exe(self, monkeypatch):
+        monkeypatch.setattr(sc.sys, "platform", "linux")
+        monkeypatch.setattr(sc, "_is_wsl", lambda: True)
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        monkeypatch.delenv("DISPLAY", raising=False)
+        cmds = sc._clipboard_native_commands()
+        assert ["clip.exe"] in cmds
+
+    def test_native_cmds_headless_linux_is_empty(self, monkeypatch):
+        # No display, not WSL, not Termux → no native tool → caller
+        # falls back to OSC 52 (the correct path for a bare SSH remote).
+        monkeypatch.setattr(sc.sys, "platform", "linux")
+        monkeypatch.setattr(sc, "_is_wsl", lambda: False)
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("TERMUX_VERSION", raising=False)
+        monkeypatch.delenv("PREFIX", raising=False)
+        assert sc._clipboard_native_commands() == []
+
+    def test_native_cmds_termux(self, monkeypatch):
+        monkeypatch.setattr(sc.sys, "platform", "linux")
+        monkeypatch.setattr(sc, "_is_wsl", lambda: False)
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.setenv("TERMUX_VERSION", "0.118")
+        assert ["termux-clipboard-set"] in sc._clipboard_native_commands()
+
+    def test_copy_via_native_tool_success_feeds_stdin(self, monkeypatch):
+        monkeypatch.setattr(sc, "_clipboard_native_commands",
+                              lambda: [["wl-copy"]])
+        monkeypatch.setattr(sc.shutil, "which",
+                              lambda name: "/usr/bin/wl-copy")
+        captured = {}
+        class _CP:
+            returncode = 0
+        def _run(cmd, **k):
+            captured["cmd"] = cmd
+            captured["input"] = k.get("input")
+            return _CP()
+        monkeypatch.setattr(sc.subprocess, "run", _run)
+        assert sc._copy_via_native_tool("hello") == "wl-copy"
+        assert captured["cmd"] == ["/usr/bin/wl-copy"]
+        assert captured["input"] == b"hello"   # text fed on stdin as UTF-8
+
+    def test_copy_via_native_tool_skips_missing_binary(self, monkeypatch):
+        # First candidate not on PATH → fall through to the second.
+        monkeypatch.setattr(
+            sc, "_clipboard_native_commands",
+            lambda: [["wl-copy"], ["xclip", "-selection", "clipboard"]])
+        monkeypatch.setattr(
+            sc.shutil, "which",
+            lambda name: "/usr/bin/xclip" if name == "xclip" else None)
+        class _CP:
+            returncode = 0
+        monkeypatch.setattr(sc.subprocess, "run", lambda cmd, **k: _CP())
+        assert sc._copy_via_native_tool("x") == "xclip"
+
+    def test_copy_via_native_tool_nonzero_exit_is_none(self, monkeypatch):
+        monkeypatch.setattr(sc, "_clipboard_native_commands",
+                              lambda: [["wl-copy"]])
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/wl-copy")
+        class _CP:
+            returncode = 1
+        monkeypatch.setattr(sc.subprocess, "run", lambda cmd, **k: _CP())
+        assert sc._copy_via_native_tool("x") is None
+
+    def test_copy_via_native_tool_exception_is_none(self, monkeypatch):
+        monkeypatch.setattr(sc, "_clipboard_native_commands",
+                              lambda: [["wl-copy"]])
+        monkeypatch.setattr(sc.shutil, "which", lambda name: "/usr/bin/wl-copy")
+        def _boom(cmd, **k):
+            raise OSError("spawn failed")
+        monkeypatch.setattr(sc.subprocess, "run", _boom)
+        assert sc._copy_via_native_tool("x") is None
+
+    def test_copy_via_native_tool_none_when_no_candidates(self, monkeypatch):
+        monkeypatch.setattr(sc, "_clipboard_native_commands", lambda: [])
+        assert sc._copy_via_native_tool("x") is None
+
+    def test_fallback_prefers_native_over_osc52(self, monkeypatch):
+        # When a native tool succeeds, it wins and the (unverifiable)
+        # Textual/OSC 52 tiers are never consulted.
+        monkeypatch.setattr(sc, "_copy_via_native_tool",
+                              lambda *a, **k: "wl-copy")
+        class StubApp:
+            called = False
+            def copy_to_clipboard(self, text):
+                StubApp.called = True
+        mode, detail = sc._copy_to_clipboard_with_fallback(
+            StubApp(), "x", label="t")
+        assert mode == "native"
+        assert detail is None
+        assert StubApp.called is False
 
     # ── (8) Modal stack cap ────────────────────────────────────────
 

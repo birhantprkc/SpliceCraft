@@ -59,9 +59,17 @@ SpliceCraft soft-requires (degrades on absence):
 * **True-color (24-bit) ANSI** — used for ApEinfo feature colors; on
   256-color-only terminals colors approximate to nearest palette
   entry.
-* **OSC 52 clipboard** — copy-to-clipboard falls back through a
-  3-tier chain: Textual's API → OSC 52 escape → temp file in
-  `<DATA_DIR>/clipboard/`. The last tier always works.
+* **Clipboard** — copy-to-clipboard tries, in order: a **native OS
+  clipboard tool** (`wl-copy`/`xclip`/`xsel` on Linux, `pbcopy` on
+  macOS, `clip`/PowerShell on Windows, `clip.exe` on WSL,
+  `termux-clipboard-set` on Android) → Textual's API → OSC 52 escape →
+  temp file in `<DATA_DIR>/clipboard/`. The native tier is preferred
+  because it actually sets the clipboard **and reports success**, unlike
+  fire-and-forget OSC 52 (which a terminal can silently ignore — e.g.
+  GNOME Terminal / VTE, oversized payloads, tmux without passthrough);
+  it's skipped on a headless/SSH remote, where OSC 52 is the right path.
+  Install the matching tool if copy isn't working (`sudo apt install
+  wl-clipboard` on Wayland, `xclip` on X11). The file tier always works.
 
 ---
 
@@ -86,7 +94,7 @@ Stale lock detection:
 
 | Operation | Linux / WSL | macOS | Windows |
 |---|---|---|---|
-| Copy text (Ctrl+C selection) | Textual → OSC 52 → file fallback | Textual → OSC 52 → file fallback | Textual → OSC 52 (via `CONOUT$`) → file fallback |
+| Copy text (Ctrl+C selection) | `wl-copy`/`xclip`/`xsel` (or `clip.exe` on WSL) → Textual → OSC 52 → file | `pbcopy` → Textual → OSC 52 → file | `clip`/PowerShell → Textual → OSC 52 (via `CONOUT$`) → file |
 | Paste image (Experiments tab) | ❌ Button disabled | ✅ via Pillow `ImageGrab` | ✅ via Pillow `ImageGrab` |
 
 Linux/WSL has no pure-Python clipboard image API; users must drop
