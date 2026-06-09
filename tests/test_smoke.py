@@ -16168,3 +16168,60 @@ class TestSeqPanelDragRefreshDedup:
             # bp 20 (paint) · 20 (skip) · 20 (skip) · 25 (paint) · 25 (skip)
             assert len(calls) == 2, calls
             assert sp._user_sel == (10, 26)                   # final selection
+
+
+class TestTextualVersionGate:
+    """`_check_deps` must reject a too-old-but-present Textual (the
+    Debian/Ubuntu `python3-textual` 2.1.2 trap) up front with an
+    actionable message, instead of letting it import and then die deep in
+    CSS parsing on a cryptic 'Invalid CSS property' error (2026-06-09)."""
+
+    def test_version_at_least_basic(self):
+        assert sc._version_at_least("8.2.7", (8, 2, 7)) is True
+        assert sc._version_at_least("8.2.8", (8, 2, 7)) is True
+        assert sc._version_at_least("9.0.0", (8, 2, 7)) is True
+        assert sc._version_at_least("8.3", (8, 2, 7)) is True   # (8,3) > (8,2,7)
+        assert sc._version_at_least("2.1.2", (8, 2, 7)) is False
+        assert sc._version_at_least("8.2.6", (8, 2, 7)) is False
+
+    def test_version_at_least_tolerates_suffixes(self):
+        # Leading digit of each segment; suffixes don't corrupt the compare.
+        assert sc._version_at_least("8.2.7.dev0", (8, 2, 7)) is True
+        assert sc._version_at_least("8.3.0rc1", (8, 2, 7)) is True
+        assert sc._version_at_least("8.2.9rc1", (8, 2, 7)) is True
+        assert sc._version_at_least("2.1.2-1.1", (8, 2, 7)) is False  # the Debian build
+
+    def test_version_at_least_fail_open_on_garbage(self):
+        # Unparseable → True (never block startup on an unreadable version).
+        assert sc._version_at_least("garbage", (8, 2, 7)) is True
+        assert sc._version_at_least("", (8, 2, 7)) is True
+
+    def test_check_deps_rejects_old_textual(self, monkeypatch, capsys):
+        import textual
+        monkeypatch.setattr(textual, "__version__", "2.1.2", raising=False)
+        with pytest.raises(SystemExit) as ei:
+            sc._check_deps()
+        assert ei.value.code == 1
+        out = capsys.readouterr().out
+        assert "Textual" in out and "2.1.2" in out
+        assert "8.2.7" in out                  # the required floor
+        assert ("pipx" in out or "venv" in out)  # actionable remedy
+
+    def test_check_deps_accepts_current_textual(self, monkeypatch):
+        # The actually-installed Textual (>= 8.2.7) must pass cleanly.
+        sc._check_deps()  # no SystemExit
+
+    def test_min_textual_matches_pyproject_pin(self):
+        """The startup gate must track pyproject's `textual>=X` pin so a
+        future bump in one place can't silently diverge from the other."""
+        import re as _re
+        import pathlib as _pl
+        pp = _pl.Path(sc.__file__).resolve().parent / "pyproject.toml"
+        if not pp.is_file():
+            pytest.skip("pyproject.toml not adjacent (installed package)")
+        m = _re.search(r'"textual>=([0-9.]+)"', pp.read_text(encoding="utf-8"))
+        assert m, "couldn't find the textual pin in pyproject.toml"
+        pin = tuple(int(x) for x in m.group(1).split("."))
+        assert sc._MIN_TEXTUAL == pin, (
+            f"_MIN_TEXTUAL {sc._MIN_TEXTUAL} != pyproject pin {pin} — "
+            "keep them in sync")

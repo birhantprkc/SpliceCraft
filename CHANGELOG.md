@@ -14,6 +14,18 @@
 
 ---
 
+## [1.0.41] — 2026-06-09
+
+### Bug fixes
+
+- **Domestication / cloning primers now reach the 60 °C target Tm on low-GC templates.** Designing primers for an AT-rich fragment — e.g. a CDS codon-optimized for a low-GC host like *E. faecium* — produced binding regions stuck around 50 °C instead of the intended ~60 °C, because the annealing region was hard-capped at 25 bp and a 25-mer simply can't get an AT-rich arm up to 60 °C. The binding region now grows as needed to hit the target, while the **whole oligo (binding + the Golden Braid/RE tail) is capped at 50 bp** so synthesis stays in the cheap/standard range. High-GC templates are unaffected (they still settle on the shortest arm nearest the target). Applies to every primer path: Golden Braid domestication, traditional/Gibson cloning, plain binding primers, and the Scrub re-circularization primers.
+
+### Hardening
+
+- **A clearer error when SpliceCraft is run against a too-old Textual.** Launching under a system Python that carries a distro-packaged Textual (e.g. Ubuntu's `python3-textual`, currently 2.1.2) used to fail with a cryptic "Invalid CSS property" deep in startup. SpliceCraft now checks the Textual version up front and, if it's below the required 8.2.7, prints exactly what's wrong and how to fix it (use a virtualenv or `pipx`).
+
+---
+
 ## [1.0.40] — 2026-06-09
 
 ### Bug fixes

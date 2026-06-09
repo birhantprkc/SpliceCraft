@@ -384,6 +384,57 @@ class TestPickBindingRegionNextBest:
         assert tm > 0
 
 
+class TestPrimerOligoLengthCap:
+    """The 50 bp total-oligo cap (2026-06-09 user report): designs grow the
+    binding region to reach ~60 °C for low-GC (AT-rich) templates — the old
+    fixed 25 bp binding cap stranded them at ~50 °C — while keeping the WHOLE
+    oligo (5' tail + binding) within `_PRIMER_MAX_OLIGO_LEN` so synthesis
+    stays cheap."""
+
+    # ~30% GC (low-GC-host / codon-optimised style): a 25 bp binding tops out
+    # near 53 °C, so reaching 60 °C requires the binding to grow to ~35 bp.
+    _LOWGC = ("ATGAAAACATTAGAAAAATTAGCAGAAGAATTAGGTGTACCAAAATGGGTTATTAACGAT"
+              "TTAGCAGAACAATTAGGTATTAAAGAAGCATTAGCAGATTTAGGTGAAGCATTAGAAAAA")
+
+    def _design(self):
+        tmpl = "ACACGTACGT" * 3 + self._LOWGC + "ACGTACACGT" * 3
+        return sc._design_gb_primers(tmpl, 30, 30 + len(self._LOWGC), "Promoter")
+
+    def test_binding_max_len_from_tail(self):
+        assert sc._binding_max_len(0)  == sc._PRIMER_MAX_OLIGO_LEN      # no tail
+        assert sc._binding_max_len(15) == sc._PRIMER_MAX_OLIGO_LEN - 15
+        # An over-long tail never shrinks the binding below the 18 bp floor.
+        assert sc._binding_max_len(40) == 18
+
+    def test_gb_lowgc_binding_grows_to_reach_target(self):
+        pytest.importorskip("primer3")   # accurate Tm needed for the °C asserts
+        r = self._design()
+        assert "error" not in r, r.get("error")
+        p = r["pairs"][0]
+        # Grew past the OLD 25 bp cap specifically to reach ~60 °C...
+        assert len(p["fwd_binding"]) > 25, "binding didn't grow past the old cap"
+        assert p["fwd_tm"] >= 58.0, f"fwd Tm still low: {p['fwd_tm']}"
+        # ...without exceeding the total-oligo budget.
+        assert len(p["fwd_full"]) <= sc._PRIMER_MAX_OLIGO_LEN
+        assert len(p["rev_full"]) <= sc._PRIMER_MAX_OLIGO_LEN
+
+    def test_all_gb_arms_within_oligo_cap(self):
+        # SACRED budget: neither full primer may exceed the cap, ever.
+        r = self._design()
+        assert "error" not in r, r.get("error")
+        for p in r["pairs"]:
+            assert len(p["fwd_full"]) <= sc._PRIMER_MAX_OLIGO_LEN
+            assert len(p["rev_full"]) <= sc._PRIMER_MAX_OLIGO_LEN
+
+    def test_scrub_gb_shares_the_budget(self):
+        # Scrub's binding cap is derived from the same total budget:
+        # tail (pad + site + spacer) + binding == cap, and it grew past 25.
+        tail = (len(sc._SCRUB_GB_PAD) + len(sc._SCRUB_GB_SITE)
+                + len(sc._SCRUB_GB_SPACER))
+        assert tail + sc._SCRUB_GB_BIND_MAX == sc._PRIMER_MAX_OLIGO_LEN
+        assert sc._SCRUB_GB_BIND_MAX > 25
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # PrimerDesignScreen layout smoke (Option A wizard redesign, 2026-04-12)
 # ═══════════════════════════════════════════════════════════════════════════════

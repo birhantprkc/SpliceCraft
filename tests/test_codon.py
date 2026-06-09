@@ -13,7 +13,7 @@ import pytest
 import splicecraft as sc
 
 
-async def _settle_tab(pilot, tabs, want, tries=24):
+async def _settle_tab(pilot, tabs, want, tries=60):
     """Drain the message queue until a `TabbedContent` reports `want` as its
     active tab AND it HOLDS there for a second drain.
 
@@ -29,7 +29,12 @@ async def _settle_tab(pilot, tabs, want, tries=24):
     drain flushes any in-flight activation before we trust the switch.
 
     A generous budget only ever costs extra pauses on a genuinely
-    slow/contended switch."""
+    slow/contended switch — `tries` was bumped 24→60 (2026-06-09) after
+    `test_genome_build_done_adds_and_selects` timed out at 24 under the
+    release's `-n auto` parallel load (the library-tab activation hadn't
+    propagated in time), aborting a release on a false failure. The
+    early-return keeps fast switches fast; only a load-stalled switch
+    spends the headroom."""
     for _ in range(tries):
         await pilot.pause()
         if tabs.active == want:
