@@ -933,16 +933,16 @@ class TestAlignmentPersistenceRoundTrip:
     async def test_alignment_target_keeps_display_name_not_locus(
             self, isolated_library):
         """Regression ([INV-98], recurring user report): aligning against a
-        library plasmid whose typed name has SPACES ("Phase 4 pTRKH2") must
-        not leave the underscored GenBank LOCUS ("Phase_4_pTRKH2") as the
+        library plasmid whose typed name has SPACES ("My Plasmid 1") must
+        not leave the underscored GenBank LOCUS ("My_Plasmid_1") as the
         displayed / saved name. The align workers parse the target from
         gb_text (which round-trips ONLY the sanitised LOCUS) and now STAMP
         `_tui_display_name` from the library entry's name; `_apply_record`
         must preserve it so the canvas + any later save keep the clean name."""
         # gb_text's LOCUS can't hold spaces, so the record's `.name` is the
         # underscored LOCUS while the typed DISPLAY name lives in the entry.
-        _rec, entry = self._make_library_record("ACGT" * 50, "Phase_4_pTRKH2")
-        entry["name"] = "Phase 4 pTRKH2"   # the user's typed display name
+        _rec, entry = self._make_library_record("ACGT" * 50, "My_Plasmid_1")
+        entry["name"] = "My Plasmid 1"   # the user's typed display name
         sc._save_collections([{
             "name": sc._DEFAULT_COLLECTION_NAME, "plasmids": [entry],
             "saved": "2026-06-09",
@@ -957,18 +957,18 @@ class TestAlignmentPersistenceRoundTrip:
             # A target parsed straight from gb_text carries only the LOCUS —
             # this is the leak the workers used to propagate.
             parsed = sc._gb_text_to_record(entry["gb_text"])
-            assert app._record_display_name(parsed) == "Phase_4_pTRKH2"
+            assert app._record_display_name(parsed) == "My_Plasmid_1"
             # The fix: stamp the entry's display name onto the parsed record
             # (exactly what the Plasmidsaurus / diff / multi-align workers
             # now do before _apply_record).
             parsed._tui_display_name = entry["name"]
-            assert app._record_display_name(parsed) == "Phase 4 pTRKH2"
+            assert app._record_display_name(parsed) == "My Plasmid 1"
             # _apply_record MUST preserve the stamp so the header + any save
             # keep the clean name instead of re-underscoring it.
             app._apply_record(parsed)
             await pilot.pause(0.05)
             assert (app._record_display_name(app._current_record)
-                    == "Phase 4 pTRKH2")
+                    == "My Plasmid 1")
 
     async def test_alignment_survives_record_swap_and_back(
             self, isolated_library):

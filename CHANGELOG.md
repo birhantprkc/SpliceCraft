@@ -18,7 +18,7 @@
 
 ### Bug fixes
 
-- **Aligning a sequencing read against a library plasmid no longer renames it with underscores.** When you aligned (Plasmidsaurus, "Diff with another plasmid", or multi-align) against a plasmid whose name has spaces — e.g. "Phase 4 pTRKH2" — the alignment label, and the plasmid loaded onto the canvas, fell back to the underscored GenBank LOCUS ("Phase_4_pTRKH2"), which could then get saved as the library name. All three alignment paths now carry your typed display name through, so it stays exactly as you named it.
+- **Aligning a sequencing read against a library plasmid no longer renames it with underscores.** When you aligned (Plasmidsaurus, "Diff with another plasmid", or multi-align) against a plasmid whose name has spaces — e.g. "My Plasmid 1" — the alignment label, and the plasmid loaded onto the canvas, fell back to the underscored GenBank LOCUS ("My_Plasmid_1"), which could then get saved as the library name. All three alignment paths now carry your typed display name through, so it stays exactly as you named it.
 
 ### New features
 
