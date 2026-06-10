@@ -333,11 +333,15 @@ exports (GenBank / FASTA / GFF3), bulk-imports a folder, and restores from
 backup. Every GenBank SpliceCraft writes (library entries, exports, autosaves)
 records a `Created by SpliceCraft v… on …` line in its COMMENT, so a file's
 origin is always traceable. It also runs record-level jobs — including
-**Clone selected region**:
+**Clone selected region** (also **Alt+Shift+P**):
 highlight any stretch of DNA in the sequence panel, pick a restriction enzyme
-for each end, and SpliceCraft designs the cut-site-tailed PCR primers, builds
-the amplicon, and hands it to the Constructor's Traditional cloning tab
-pre-configured (add a vector and Simulate). It's also where you **Migrate
+for each end and a name for the amplicon, and SpliceCraft designs the
+cut-site-tailed PCR primers, builds the amplicon — carrying every annotation
+your highlight spans — and hands it to the Constructor's Traditional cloning
+tab pre-configured (add a vector and Simulate). The cloned product keeps those
+insert features and flags any vector feature your cut sites land inside as
+*(disrupted)*, so dropping an insert into a lacZα MCS reads as the knock-out it
+is. It's also where you **Migrate
 Data** — package your *entire* setup
 (library, collections, parts, primers, features, grammars, codon tables,
 settings, lab notebook, and full construction history) into one portable,

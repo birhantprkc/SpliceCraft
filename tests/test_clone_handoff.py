@@ -497,6 +497,118 @@ class TestCloneRegion:
             assert any(f.get("label") == "TU-CDS" for f in pf), \
                 f"region feature not carried into the donor: {pf}"
 
+    def test_clone_region_shortcut_bound(self):
+        """Alt+Shift+P triggers Clone selected region, without clobbering the
+        existing Alt+Shift+C (Capture → Feature library) binding."""
+        binds = {(b.key, b.action) for b in sc.PlasmidApp.BINDINGS
+                 if hasattr(b, "key")}
+        assert ("alt+shift+p", "clone_region") in binds
+        assert ("alt+shift+c", "capture_to_features") in binds
+
+    def test_clone_region_modal_prefills_pcr_name(self):
+        """The enzyme modal carries a "PCR-…" amplicon-name default (mirrors
+        Synthesis's "FRAG-…"); the bare default is just "PCR-"."""
+        m = sc.CloneRegionEnzymeModal(default_name="PCR-pUC19 100-400")
+        assert m._default_name == "PCR-pUC19 100-400"
+        assert sc.CloneRegionEnzymeModal()._default_name == "PCR-"
+
+    def test_gather_region_feats_carries_all_spanning(self):
+        """ALL features overlapping the region — fully-inside AND partially-
+        spanning either edge — ride into the clone, clipped to region-local
+        coords. Pseudo overlays (site/recut/source) + non-overlapping features
+        are skipped."""
+        feats = [
+            {"type": "CDS",  "label": "inside",     "start": 120, "end": 180, "strand": 1},
+            {"type": "CDS",  "label": "span_left",  "start": 50,  "end": 150, "strand": 1},
+            {"type": "CDS",  "label": "span_right", "start": 180, "end": 260, "strand": 1},
+            {"type": "CDS",  "label": "outside",    "start": 300, "end": 400, "strand": 1},
+            {"type": "site", "label": "EcoRI",      "start": 130, "end": 136, "strand": 0},
+        ]
+        out = sc.PlasmidApp._gather_region_feats(feats, 100, 200)
+        labels = {f["label"] for f in out}
+        assert {"inside", "span_left", "span_right"} <= labels
+        assert "outside" not in labels and "EcoRI" not in labels
+        sl = next(f for f in out if f["label"] == "span_left")
+        assert sl["start"] == 0 and sl["end"] == 50      # 50..150 clipped to region
+
+    @pytest.mark.asyncio
+    async def test_custom_amplicon_name_flows_to_donor(self):
+        """The PCR-name textbox value rides through to the seeded donor row so
+        the user can name the amplicon they're about to clone + save."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await _load_clone_region_plasmid(app, pilot)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel = (100, 400)
+            app.action_clone_region()
+            for _ in range(6):
+                await pilot.pause()
+            assert isinstance(app.screen, sc.CloneRegionEnzymeModal)
+            app.screen.dismiss({"enz5": "EcoRI", "enz3": "BamHI",
+                                "name": "PCR-myInsert"})
+            for _ in range(16):
+                await pilot.pause()
+            pane = app.screen.query_one(sc.TraditionalCloningPane)
+            donors = [s for s in pane._lane_inserts if s.get("mode") == "pcr"]
+            assert donors, "no PCR donor seeded"
+            assert donors[0]["pcr_name"] == "PCR-myInsert"
+
+    @pytest.mark.asyncio
+    async def test_modal_name_sanitized_and_capped(self):
+        """The modal strips control bytes from a pasted name and caps its
+        length before dismissing — a hostile/giant name can't bloat the donor
+        row, primer names, or the toast."""
+        from textual.widgets import Input as _Input
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            for _ in range(4):
+                await pilot.pause()
+            while len(app.screen_stack) > 1:
+                app.pop_screen()
+                for _ in range(2):
+                    await pilot.pause()
+            captured: dict = {}
+            app.push_screen(sc.CloneRegionEnzymeModal(default_name="PCR-x"),
+                            lambda r: captured.update(r=r))
+            for _ in range(4):
+                await pilot.pause()
+            modal = app.screen
+            assert isinstance(modal, sc.CloneRegionEnzymeModal)
+            modal.query_one("#cre-name", _Input).value = (
+                "PCR-\x00\x07ab\x1f" + "Z" * 80)
+            modal._submit()
+            for _ in range(6):
+                await pilot.pause()
+            nm = captured["r"]["name"]
+            assert all(c not in nm for c in "\x00\x07\x1f")
+            assert nm.startswith("PCR-ab")          # control bytes excised
+            assert len(nm) <= 64                     # capped
+
+    @pytest.mark.asyncio
+    async def test_clone_build_blank_name_falls_back_to_auto(self):
+        """A name that's only whitespace / control bytes (e.g. handed in via
+        the agent API) collapses to the auto "<plasmid> <start>-<end>" label
+        rather than naming the donor an empty/garbage string."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await _load_clone_region_plasmid(app, pilot)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel = (100, 400)
+            app.action_clone_region()
+            for _ in range(6):
+                await pilot.pause()
+            assert isinstance(app.screen, sc.CloneRegionEnzymeModal)
+            app.screen.dismiss({"enz5": "EcoRI", "enz3": "BamHI",
+                                "name": "  \x00\x07  "})
+            for _ in range(16):
+                await pilot.pause()
+            pane = app.screen.query_one(sc.TraditionalCloningPane)
+            donors = [s for s in pane._lane_inserts if s.get("mode") == "pcr"]
+            assert donors
+            nm = donors[0]["pcr_name"]
+            assert all(c not in nm for c in "\x00\x07")
+            assert "101-400" in nm                   # auto label (start+1..end)
+
 
 def _plasmid_with_feat():
     from Bio.Seq import Seq

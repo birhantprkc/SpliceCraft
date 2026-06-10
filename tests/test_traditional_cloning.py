@@ -1584,6 +1584,82 @@ class TestSimulateTraditionalCloningMulti:
                       f"{[f.get('label') for f in res['forward']['features']]}")
         assert gene[0]["end"] - gene[0]["start"] == 48   # length preserved
 
+    def test_disrupted_split_feature_labeling(self):
+        """`_label_disrupted_split_features` suffixes "(disrupted)" + a note on
+        cut-split (`_split`) halves only, names the enzyme(s), and is
+        idempotent — leaving un-split (carried insert) features alone."""
+        feats = [
+            {"label": "lacZ", "type": "CDS", "_split": "head", "start": 0, "end": 8},
+            {"label": "lacZ", "type": "CDS", "_split": "tail", "start": 50, "end": 58},
+            {"label": "AmpR", "type": "CDS", "start": 20, "end": 40},   # not split
+        ]
+        sc._label_disrupted_split_features(feats, ["BamHI", "EcoRI"])
+        assert feats[0]["label"] == "lacZ (disrupted)"
+        assert feats[1]["label"] == "lacZ (disrupted)"
+        assert "BamHI/EcoRI" in feats[0]["note"]        # sorted enzyme set
+        assert feats[2]["label"] == "AmpR"              # un-split untouched
+        assert "note" not in feats[2]
+        # Idempotent — a second pass doesn't double-suffix.
+        sc._label_disrupted_split_features(feats, ["EcoRI"])
+        assert feats[0]["label"] == "lacZ (disrupted)"
+
+    def test_simulate_disrupts_vector_feature_at_cut(self):
+        """A vector feature the cut sites sit inside (e.g. lacZα across the MCS)
+        is split by the digest (`_split` head/tail) and must surface in the
+        cloned product as "(disrupted)" with a note naming the cut enzyme —
+        the blue/white-screening knock-out you'd see cloning into a lacZ MCS."""
+        pad, s5, s3 = "GCGC", "GAATTC", "GGATCC"        # EcoRI / BamHI
+        insert = "ATGAAACGT" + "ACTGCATGCAGTACGTAGCT" * 3
+        ins = sc._make_synthetic_fragment(
+            pad + s5 + insert + s3 + sc._rc(pad),
+            enz_left="EcoRI", enz_right="BamHI")
+        vbody = "TTACGGATCAGCTAGGCATTAGC" * 6
+        # Vector digested at the MCS inside lacZα → the backbone fragment
+        # carries a split half of lacZα (what `_split_features_at_cuts` emits).
+        lacz_head = {"start": 0, "end": 8, "type": "CDS", "label": "lacZα",
+                     "strand": 1, "_split": "head"}
+        vfrag = sc._make_synthetic_fragment(
+            s3 + vbody + s5, enz_left="BamHI", enz_right="EcoRI",
+            source_label="vec", features=[lacz_head])
+        res = sc._simulate_traditional_cloning(ins, vfrag)
+        lac = [f for f in res["forward"]["features"]
+               if "lacZ" in str(f.get("label"))]
+        assert lac, "vector lacZα feature lost from product"
+        assert all("(disrupted)" in f["label"] for f in lac)
+        assert any("EcoRI" in (f.get("note") or "")
+                   or "BamHI" in (f.get("note") or "") for f in lac)
+
+    def test_disrupts_feature_with_excised_middle(self):
+        """The classic lacZ-MCS case: a feature whose MIDDLE is excised by two
+        cuts that both sit inside it — so both ends survive in the same
+        (backbone) fragment — is still flagged disrupted, not just features
+        split across two fragments. Regression for the gap found verifying on
+        real pUC19 (cloning into lacZα's MCS used to leave lacZα looking
+        intact)."""
+        feats = [{"start": 10, "end": 60, "strand": 1,
+                  "type": "CDS", "label": "lacZ"}]
+        # Circular vector, cuts at 25 + 40 (both strictly inside [10, 60)).
+        slots = sc._split_features_at_cuts(feats, 100, [25, 40], circular=True)
+        allf = [f for fs in slots.values() for f in fs]
+        lac = [f for f in allf if f.get("label") == "lacZ"]
+        assert lac and any(f.get("_split") == "whole" for f in lac), (
+            "lacZ spanning an excised MCS not flagged: "
+            f"{[f.get('_split') for f in lac]}")
+        sc._label_disrupted_split_features(allf, ["EcoRI"])
+        assert all("(disrupted)" in f["label"] for f in lac)
+
+    def test_excise_inside_feature_does_not_flag_neighbours(self):
+        """An excise INSIDE one feature must not flag a neighbouring feature
+        that merely shares the backbone fragment but has no cut inside it."""
+        feats = [
+            {"start": 10, "end": 60,  "strand": 1, "type": "CDS", "label": "lacZ"},
+            {"start": 70, "end": 95,  "strand": 1, "type": "CDS", "label": "keep"},
+        ]
+        slots = sc._split_features_at_cuts(feats, 100, [25, 40], circular=True)
+        allf = [f for fs in slots.values() for f in fs]
+        keep = [f for f in allf if f.get("label") == "keep"]
+        assert keep and all(f.get("_split") is None for f in keep)
+
     def test_internal_junction_mismatch_surfaces_pair(self):
         """If two adjacent inserts have incompatible sticky ends, the
         error message names the failing pair by source_label so the

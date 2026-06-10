@@ -518,6 +518,48 @@ class TestSeqPanelFocusAndResize:
             assert sp._cursor_pos >= 0, (
                 "mouse click after F4 didn't set a base cursor")
 
+    async def test_lane_area_click_falls_back_to_base(self, isolated_library):
+        """A click in the feature-lane area (above OR below the DNA) at a
+        column with no feature lands the cursor on that column's base instead
+        of dead-ending at -1 — so a drag/selection can reach the sequence end.
+        Regression for the 2026-06-10 'can't highlight to the bottom of the
+        plasmid' report: clicks below the DNA row near the sequence end logged
+        `lane_miss_below` and did nothing."""
+        from textual.containers import ScrollableContainer
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        seq = "ACGT" * 15                          # 60 bp — fits one chunk
+        rec = SeqRecord(Seq(seq), id="LANE", name="LANE",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        # fwd feature → above lane, rev feature → below lane; both away from
+        # column 50 so that column's lane cells are empty.
+        rec.features.append(SeqFeature(FeatureLocation(10, 20, strand=1),
+                            type="CDS", qualifiers={"label": ["fwd"]}))
+        rec.features.append(SeqFeature(FeatureLocation(30, 40, strand=-1),
+                            type="CDS", qualifiers={"label": ["rev"]}))
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            app.action_focus_panel_seq()
+            for _ in range(3):
+                await pilot.pause()
+            scroll = sp.query_one("#seq-scroll", ScrollableContainer)
+            reg = scroll.region
+            nw = len(str(len(sp._seq)))
+            col_x = reg.x + nw + 2 + 50            # screen x of seq_col 50
+            hits = [sp._click_to_bp(col_x, reg.y + r)
+                    for r in range(reg.height)]
+            base_hits = [h for h in hits if h == 50]
+            # The 2 DNA rows always resolve col 50 → base 50; the fix adds the
+            # empty above/below lane rows over that column. Pre-fix: exactly 2.
+            assert len(base_hits) > 2, (
+                f"lane-area clicks at col 50 didn't fall back to base 50 "
+                f"(only the DNA rows resolved): {hits}")
+
     async def test_line_width_invariant_across_height_resize(
             self, tiny_record, isolated_library):
         # The drag bar changes HEIGHT only; line_width (chars/row) must

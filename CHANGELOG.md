@@ -14,6 +14,20 @@
 
 ---
 
+## [1.0.47] — 2026-06-10
+
+### Bug fixes
+
+- **You can now highlight and drag-select all the way to the end of the sequence.** Clicking (or dragging a selection) into the feature-lane strip just above or below the bases — the band near the very bottom of a plasmid's last line — used to do nothing when no feature sat under the pointer, so a selection couldn't be extended onto the final bases. Those clicks now land on the base in that column, exactly like clicking the sequence row itself, so a drag no longer dead-ends at the bottom.
+
+### New features
+
+- **Clone selected region has a keyboard shortcut and lets you name the amplicon.** Press **Alt+Shift+P** on a sequence highlight to jump straight into the "PCR-add cut sites → Traditional cloning" flow (still in the File menu too). The cut-site picker now has an **amplicon name** box, prefilled `PCR-<plasmid> <start>-<end>` (the same way Synthesis prefills `FRAG-…`), so you can name the PCR product before saving it.
+
+- **Traditional cloning now shows the features your cut sites disrupt.** When a chosen cut site lands inside a feature — classically, dropping an insert into lacZα's MCS — the cloned product marks the two flanking remnants **"<name> (disrupted)"** with a note naming the cut enzyme, so a knocked-out lacZ (blue/white screening) reads at a glance instead of looking like an intact gene running through your insert. Every annotation spanning the region you PCR'd is carried into the clone and labelled the same way a Golden Braid assembly carries its parts.
+
+---
+
 ## [1.0.46] — 2026-06-10
 
 ### Bug fixes
