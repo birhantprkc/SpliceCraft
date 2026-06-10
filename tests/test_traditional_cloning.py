@@ -1521,16 +1521,44 @@ class TestSimulateTraditionalCloningMulti:
         assert "scar" in joined.lower(), (
             f"expected SpeI/XbaI scar warning; got: {result['warnings']!r}"
         )
-        # Saved product carries a LIGATION SCAR misc_feature.
-        scar_feats = [
-            f for f in result["forward"]["features"]
-            if f.get("type") == "misc_feature"
-            and "SCAR" in str(f.get("label", "")).upper()
-        ]
-        assert scar_feats, (
-            f"expected scar feature on forward product; "
-            f"features: {result['forward']['features']!r}"
+        # The product is NO LONGER annotated with a "LIGATION SCAR" feature
+        # (user request 2026-06-09: leave the scars as-is in the sequence,
+        # not annotated). The scar CLASSIFICATION still rides the warnings
+        # above; the junction itself is tagged as a light-blue, arrowless
+        # 4 bp overhang `misc_feature` instead.
+        feats = result["forward"]["features"]
+        assert not any("SCAR" in str(f.get("label", "")).upper()
+                       for f in feats), (
+            f"LIGATION SCAR feature should be gone; features: {feats!r}"
         )
+        overhang_feats = [
+            f for f in feats
+            if f.get("type") == "misc_feature"
+            and f.get("strand") == 0
+            and f.get("color") == "#ADD8E6"
+        ]
+        assert overhang_feats, (
+            f"expected a light-blue arrowless overhang tag; "
+            f"features: {feats!r}"
+        )
+
+    def test_origin_junction_overhang_is_4bp_wrap(self):
+        """The closing junction at the origin tags a FULL 4 bp overhang as a
+        wrap feature (end < start → CompoundLocation on save), not the 2 bp
+        head a flat [0,2) clamp gives (adversarial review F6)."""
+        vec = {"top_seq": "AAAATTTT" * 6, "left": {"enzyme": "EcoRI"},
+               "right": {"enzyme": "BamHI"}}
+        ins = [{"top_seq": "C" * 24, "left": {"enzyme": "BamHI"},
+                "right": {"enzyme": "EcoRI"}}]
+        prod = vec["top_seq"] + ins[0]["top_seq"]
+        res = {"forward": {"top_seq": prod, "features": [], "compatible": True},
+               "reverse": {"top_seq": prod, "features": [], "compatible": True},
+               "warnings": []}
+        sc._annotate_scars_on_product(res, ins, vec)
+        wrap = [f for f in res["forward"]["features"] if f["start"] > f["end"]]
+        assert wrap, f"no origin wrap overhang: {res['forward']['features']!r}"
+        assert len(wrap[0]["label"]) == 4
+        assert wrap[0]["color"] == "#ADD8E6" and wrap[0]["strand"] == 0
 
     def test_internal_junction_mismatch_surfaces_pair(self):
         """If two adjacent inserts have incompatible sticky ends, the

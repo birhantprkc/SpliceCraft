@@ -297,6 +297,275 @@ class TestConstructorSeed:
             assert app.screen.query_one("#trad-pcr-seq", sc.TextArea).text.upper() == _INSERT
 
 
+def _clone_region_plasmid():
+    """A varied circular plasmid so cloning-primer Tm lands near 60."""
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    b = "ACGT"
+    seq = "".join(b[(i * 7 + (i * i) // 11 + i // 3) % 4] for i in range(600))
+    rec = SeqRecord(Seq(seq), id="CloneRegionTest",
+                    name="Clone Region Test",
+                    annotations={"molecule_type": "DNA",
+                                 "topology": "circular"})
+    return rec, seq
+
+
+async def _load_clone_region_plasmid(app, pilot):
+    rec, seq = _clone_region_plasmid()
+    for _ in range(6):
+        await pilot.pause()
+    while len(app.screen_stack) > 1:
+        app.pop_screen()
+        for _ in range(2):
+            await pilot.pause()
+    app._apply_record(rec)
+    for _ in range(6):
+        await pilot.pause()
+    return rec, seq
+
+
+class TestCloneRegion:
+    """One-click "Clone selected region" (File ▸ Clone selected region):
+    an arbitrary seq-panel highlight is PCR-tailed with two restriction
+    sites and dropped into the Constructor's Traditional tab as a fully-
+    configured donor."""
+
+    def test_designs_tailed_amplicon_binding_region(self):
+        _, seq = _clone_region_plasmid()
+        d = sc._design_cloning_primers(seq, 100, 400, "EcoRI", "BamHI")
+        assert not d.get("error"), d
+        # Catastrophic-class: the forward primer's 3' binding IS the
+        # region's 5' end (a cloning primer must anneal where it claims).
+        assert d["fwd_binding"] == d["insert_seq"][:len(d["fwd_binding"])]
+        assert d["fwd_full"].startswith("GCGC" + d["site_5"])
+        amplicon = ("GCGC" + d["site_5"] + d["insert_seq"]
+                    + d["site_3"] + sc._rc("GCGC"))
+        # The added enzyme sites must be present so the later digest can
+        # release the insert.
+        assert "GAATTC" in amplicon and "GGATCC" in amplicon
+
+    @pytest.mark.asyncio
+    async def test_flow_seeds_constructor_with_configured_donor(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await _load_clone_region_plasmid(app, pilot)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel = (100, 400)          # mark arbitrary DNA
+            app.action_clone_region()
+            for _ in range(6):
+                await pilot.pause()
+            assert isinstance(app.screen, sc.CloneRegionEnzymeModal)
+            app.screen.dismiss({"enz5": "EcoRI", "enz3": "BamHI"})
+            for _ in range(16):
+                await pilot.pause()
+            assert isinstance(app.screen, sc.ConstructorModal)
+            pane = app.screen.query_one(sc.TraditionalCloningPane)
+            donors = [s for s in pane._lane_inserts
+                      if s.get("mode") == "pcr"]
+            assert donors, "no PCR donor seeded into the Traditional lane"
+            assert donors[0]["enz_left"] == "EcoRI"
+            assert donors[0]["enz_right"] == "BamHI"
+            assert "GAATTC" in donors[0]["pcr_seq"]
+            saved = {p.get("name") for p in sc._load_primers()}
+            assert any(n and n.endswith("-F") for n in saved)
+            assert any(n and n.endswith("-R") for n in saved)
+
+    @pytest.mark.asyncio
+    async def test_no_selection_warns_no_modal(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await _load_clone_region_plasmid(app, pilot)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel = None
+            sp._sel_range = None
+            app.action_clone_region()
+            for _ in range(4):
+                await pilot.pause()
+            assert not isinstance(app.screen, sc.CloneRegionEnzymeModal)
+
+    @pytest.mark.asyncio
+    async def test_short_region_warns_no_modal(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await _load_clone_region_plasmid(app, pilot)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel = (100, 110)          # 10 bp < 18
+            app.action_clone_region()
+            for _ in range(4):
+                await pilot.pause()
+            assert not isinstance(app.screen, sc.CloneRegionEnzymeModal)
+
+    # ── Hardening (adversarial review F1/F2/F3): catastrophic-class refusals ──
+
+    async def _clone_refused(self, app, pilot, sel, enz5, enz3):
+        sp = app.query_one("#seq-panel", sc.SequencePanel)
+        sp._user_sel = sel
+        sp._sel_range = None
+        app.action_clone_region()
+        for _ in range(6):
+            await pilot.pause()
+        if not isinstance(app.screen, sc.CloneRegionEnzymeModal):
+            return True    # gated before the modal — also a refusal
+        app.screen.dismiss({"enz5": enz5, "enz3": enz3})
+        for _ in range(10):
+            await pilot.pause()
+        return not isinstance(app.screen, sc.ConstructorModal)
+
+    def test_type_iis_detector(self):
+        assert sc._enzyme_is_type_iis("BsaI")
+        assert sc._enzyme_is_type_iis("BsmBI")
+        assert not sc._enzyme_is_type_iis("EcoRI")
+        assert not sc._enzyme_is_type_iis("BamHI")
+
+    @pytest.mark.asyncio
+    async def test_type_iis_enzyme_refused(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await _load_clone_region_plasmid(app, pilot)
+            assert await self._clone_refused(app, pilot, (100, 400),
+                                             "BsaI", "BamHI")
+
+    @pytest.mark.asyncio
+    async def test_short_region_overlapping_primers_refused(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await _load_clone_region_plasmid(app, pilot)
+            assert await self._clone_refused(app, pilot, (100, 118),
+                                             "HindIII", "SalI")
+
+    @pytest.mark.asyncio
+    async def test_internal_recognition_site_refused(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        b = "ACGT"
+        sl = list("".join(b[(i * 7 + i // 3) % 4] for i in range(600)))
+        sl[200:206] = list("GAATTC")            # EcoRI site INSIDE [100,400)
+        rec = SeqRecord(Seq("".join(sl)), id="Int", name="Int",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            for _ in range(6):
+                await pilot.pause()
+            while len(app.screen_stack) > 1:
+                app.pop_screen()
+                for _ in range(2):
+                    await pilot.pause()
+            app._apply_record(rec)
+            for _ in range(6):
+                await pilot.pause()
+            assert await self._clone_refused(app, pilot, (100, 400),
+                                             "EcoRI", "BamHI")
+
+
+def _plasmid_with_feat():
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    from Bio.SeqFeature import SeqFeature, FeatureLocation
+    b = "ACGT"
+    seq = "".join(b[(i * 7 + i // 3) % 4] for i in range(600))
+    rec = SeqRecord(Seq(seq), id="FeatP", name="Feat P",
+                    annotations={"molecule_type": "DNA",
+                                 "topology": "circular"})
+    rec.features.append(SeqFeature(FeatureLocation(120, 200, strand=1),
+                        type="misc_feature", qualifiers={"label": ["MyFeat"]}))
+    return rec, seq
+
+
+class TestFeatureRichCopy:
+    """Copying a selection stashes its features (rebased) on the app, and a
+    matching paste into the Synthesis editor carries them in."""
+
+    def test_gather_region_feats_rebases_and_clips(self):
+        feats = [{"start": 120, "end": 200, "type": "misc_feature",
+                  "label": "In", "color": "cyan", "strand": 1},
+                 {"start": 250, "end": 350, "type": "gene", "label": "Stradl"},
+                 {"start": 50, "end": 90, "type": "CDS", "label": "Out"},
+                 {"start": 5, "end": 5, "type": "x"}]
+        g = sc.PlasmidApp._gather_region_feats(feats, 100, 300)
+        assert any(f["label"] == "In" and f["start"] == 20 and f["end"] == 100
+                   for f in g)
+        assert any(f["label"] == "Stradl" and f["start"] == 150
+                   and f["end"] == 200 for f in g)        # clipped to span
+        assert not any(f["label"] == "Out" for f in g)    # outside the span
+
+    def test_render_keys_carried_only_when_contained(self):
+        # Fully-contained CDS keeps codon_start / transl_table (reading
+        # frame); a CLIPPED CDS drops them — its codon_start is relative to
+        # the original off-selection start, so it'd mis-frame after rebasing
+        # (adversarial review F4).
+        feats = [{"start": 120, "end": 200, "type": "CDS", "label": "Cont",
+                  "codon_start": 2, "transl_table": 11},
+                 {"start": 50, "end": 150, "type": "CDS", "label": "Clip",
+                  "codon_start": 3}]
+        g = sc.PlasmidApp._gather_region_feats(feats, 100, 300)
+        cont = next(f for f in g if f["label"] == "Cont")
+        clip = next(f for f in g if f["label"] == "Clip")
+        assert cont.get("codon_start") == 2 and cont.get("transl_table") == 11
+        assert "codon_start" not in clip
+
+    @pytest.mark.asyncio
+    async def test_copy_then_synthesis_paste_carries_features(self):
+        from textual.events import Paste
+        rec, seq = _plasmid_with_feat()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            for _ in range(6):
+                await pilot.pause()
+            while len(app.screen_stack) > 1:
+                app.pop_screen()
+                for _ in range(2):
+                    await pilot.pause()
+            app._apply_record(rec)
+            for _ in range(6):
+                await pilot.pause()
+            app.query_one("#seq-panel", sc.SequencePanel)._user_sel = (100, 300)
+            app.action_copy_selection()
+            for _ in range(4):
+                await pilot.pause()
+            cr = getattr(app, "_copied_region", None)
+            assert cr and cr["seq"] == seq[100:300]
+            assert any(f["label"] == "MyFeat" and f["start"] == 20
+                       and f["end"] == 100 for f in cr["feats"])
+            app.action_open_synthesis()
+            for _ in range(10):
+                await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.focus()
+            for _ in range(2):
+                await pilot.pause()
+            try:
+                ev = Paste(cr["seq"])
+            except TypeError:
+                ev = Paste(text=cr["seq"])
+            ed.on_paste(ev)
+            for _ in range(6):
+                await pilot.pause()
+            assert len(ed._seq) == 200
+            assert any(f.get("label") == "MyFeat" and f.get("start") == 20
+                       and f.get("end") == 100 for f in ed._feats)
+
+    @pytest.mark.asyncio
+    async def test_bottom_strand_copy_carries_no_features(self):
+        rec, _ = _plasmid_with_feat()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            for _ in range(6):
+                await pilot.pause()
+            while len(app.screen_stack) > 1:
+                app.pop_screen()
+                for _ in range(2):
+                    await pilot.pause()
+            app._apply_record(rec)
+            for _ in range(6):
+                await pilot.pause()
+            app.query_one("#seq-panel", sc.SequencePanel)._user_sel = (100, 300)
+            app.action_copy_selection_bottom()
+            for _ in range(4):
+                await pilot.pause()
+            assert getattr(app, "_copied_region", "x") is None
+
+
 class TestSynthesisClearButtons:
     @pytest.mark.asyncio
     async def test_dna_clear_empties_editor(self):

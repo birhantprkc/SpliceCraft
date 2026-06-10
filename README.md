@@ -180,7 +180,9 @@ never forced.
 A gene-synthesis composer with three tabs. The **DNA tab** is a
 horizontally-scrolling linear editor with anti-parallel strand markers, live
 feature stripes, restriction overlay, and AA translation, plus a feature
-library side-pane (Insert to splice, Annotate to overlay). The **Protein
+library side-pane (Insert to splice, Annotate to overlay), and a feature-aware
+paste — copy a stretch of a plasmid (`Ctrl+C`) and paste it here, and its
+features ride along, annotated at the right positions. The **Protein
 tab** lets you type or paste amino acids and watch the codons appear underneath
 using your chosen codon table — pick a different one or hit **Manage** to open
 the **tabbed codon-table manager**, where each way of getting a table has its
@@ -323,7 +325,12 @@ this again?" is always one keystroke away.
 
 The housekeeping. **File** opens local files, fetches from NCBI, saves,
 exports (GenBank / FASTA / GFF3), bulk-imports a folder, and restores from
-backup. It's also where you **Migrate Data** — package your *entire* setup
+backup. It also runs record-level jobs — including **Clone selected region**:
+highlight any stretch of DNA in the sequence panel, pick a restriction enzyme
+for each end, and SpliceCraft designs the cut-site-tailed PCR primers, builds
+the amplicon, and hands it to the Constructor's Traditional cloning tab
+pre-configured (add a vector and Simulate). It's also where you **Migrate
+Data** — package your *entire* setup
 (library, collections, parts, primers, features, grammars, codon tables,
 settings, lab notebook, and full construction history) into one portable,
 compressed `.zip` and import it into another install, so a fresh machine picks

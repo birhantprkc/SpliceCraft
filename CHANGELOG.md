@@ -14,6 +14,26 @@
 
 ---
 
+## [1.0.45] — 2026-06-10
+
+### Bug fixes
+
+- **Dragging the map/sequence divider to the top no longer over-extends the panel.** The split could be dragged far enough to squeeze the map / library / sidebar below their usable minimum, which over-extended the layout. Two things went wrong as a result: the sequence viewer scrolled against a too-tall panel (scrolling up "overflowed" and snapped back to the bottom), and a snapshot (F9 / Alt+D) captured during the glitch could fail to copy to the clipboard. The divider now stops at the point where the top region stays usable, which keeps both the scroll and the snapshot copy reliable.
+
+### New features
+
+- **Cleaner cloning annotations — overhang tags instead of "LIGATION SCAR" labels.** Assembling a plasmid (Constructor ▸ Traditional cloning) used to tag every junction with a "LIGATION SCAR" feature, which cluttered the map. The junction sequence is untouched — instead, each 4 bp ligation overhang is now marked with a subtle light-blue, arrowless feature. (The re-cuttable-junction notice still shows in the cloning result for diagnostics.)
+
+- **One-click "Clone selected region".** Highlight any stretch of DNA in the sequence panel (drag across the bases — it doesn't have to be an annotated feature), then **File ▸ Clone selected region**: pick a restriction enzyme for each end, and SpliceCraft designs the PCR primers that add those cut sites, builds the amplicon, saves the primers, and drops the amplicon straight into the Constructor's Traditional cloning tab as a ready-to-digest donor with both enzymes already set. Add a destination vector and Simulate. (Bridges an arbitrary canvas selection → traditional cloning — previously a three-tool, copy-paste workflow.)
+
+- **Copy is now feature-rich.** Copying a stretch of DNA (`Ctrl+C` on a sequence-panel selection) now remembers the features inside it, so when you paste that DNA into the Synthesis editor the features come along — annotated at the right positions, clipped to what you copied — instead of arriving as bare bases. A fully-contained CDS keeps its reading frame and a primer keeps its sequence; clipped features carry their basic annotation. (The clipboard still holds plain bases for pasting anywhere outside SpliceCraft; the feature carry applies to the top strand of a non-origin-spanning selection.)
+
+### Hardening
+
+- **Clone selected region** now refuses up front — with a clear message — instead of producing a dead clone: when you pick a Type IIS enzyme (BsaI/BsmBI/BbsI/SapI — the add-cut-sites model can't place those; use the Domesticator), when the chosen enzyme's site already occurs **inside** your selection (the amplicon would be cut internally), when the region is too short for non-overlapping primers, or if the loaded plasmid changes while the enzyme dialog is open.
+
+---
+
 ## [1.0.44] — 2026-06-09
 
 ### Bug fixes

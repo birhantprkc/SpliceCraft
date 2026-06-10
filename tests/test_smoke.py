@@ -287,6 +287,31 @@ class TestMapSequenceResize:
             mid = handle._clamp_sequence_height(20)
             assert mid >= handle._MIN_SEQ_HEIGHT
 
+    async def test_clamp_max_keeps_top_row_usable(self, tiny_record,
+                                                   isolated_library):
+        """Dragging the seq panel to its MAX must never squeeze the top row
+        (map / library / sidebar) below `_MIN_TOP_HEIGHT`. Regression for
+        2026-06-09: the clamp was `screen_h - handle - _MIN_TOP`, which
+        ignored the header / menu-bar / footer chrome — so a max drag
+        over-extended the panel (top row 12 < 14) and the seq scroll bottomed
+        out against a too-tall layout ("scrolling up overflows + snaps to
+        bottom"). The clamp now derives the cap from the actual combined
+        top-row + seq-panel height, which reserves the chrome automatically."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            handle = app.query_one("#map-seq-resize",
+                                    sc.MapSequenceResizeHandle)
+            handle._apply_sequence_height(10_000)   # drag to max
+            await pilot.pause()
+            await pilot.pause(0.05)
+            top_row = app.query_one("#top-row")
+            assert top_row.size.height >= handle._MIN_TOP_HEIGHT, (
+                f"Top row squeezed to {top_row.size.height} "
+                f"(< {handle._MIN_TOP_HEIGHT}) at max seq-panel height"
+            )
+
     async def test_persists_to_settings_after_drag(self, tiny_record,
                                                      isolated_library,
                                                      monkeypatch):
