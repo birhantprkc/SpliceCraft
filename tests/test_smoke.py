@@ -488,6 +488,89 @@ class TestSeqPanelFocusAndResize:
                 f"right arrow with cursor at 10 should land on 11, got "
                 f"{sp._cursor_pos}")
 
+    async def test_shift_arrow_wraps_across_origin_after_rotate(
+            self, isolated_library):
+        """After rotating the origin, Shift+Arrow selection extends ACROSS the
+        absolute origin (now mid-display) instead of freezing there. Computed
+        in display space so the clamp lands at the visual edge, not the
+        absolute origin. Regression for the 2026-06-10 'highlight sticks at the
+        junction after I rotate origin' report."""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        seq = "ACGT" * 50                       # 200 bp circular
+        rec = SeqRecord(Seq(seq), id="ROT", name="ROT",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp.set_view_origin(100)             # rotate: display starts at bp 100
+            app.action_focus_panel_seq()
+            for _ in range(3):
+                await pilot.pause()
+            sp._cursor_pos = 150
+            sp._sel_anchor = -1
+            sp._user_sel = None
+            sp._refresh_view()
+            for _ in range(2):
+                await pilot.pause()
+            for _ in range(60):                 # extend right across abs-origin
+                await pilot.press("shift+right")
+                await pilot.pause()
+            # The cursor must have crossed the absolute origin (199 → 0+),
+            # not frozen at it.
+            assert sp._cursor_pos < 100, (
+                f"cursor stuck at {sp._cursor_pos} — Shift+Arrow didn't cross "
+                "the rotated origin")
+            # …and the result is a WRAP selection anchored at 150.
+            s, e = sp._user_sel
+            assert s == 150 and s > e, (
+                f"expected a wrap selection from 150, got {(s, e)}")
+
+    async def test_all_selection_paths_wrap_aware_after_rotate(
+            self, isolated_library):
+        """Every selection path is wrap-aware on a rotated circular view: the
+        shared `_disp_selection` builder maps a display range across the origin
+        to a wrap selection, and Ctrl+Arrow slides a selection AROUND the
+        origin (mod n) — length preserved — instead of clamping/sticking. (The
+        Shift+Arrow / mouse-drag / Shift+click paths all share the builder.)"""
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        rec = SeqRecord(Seq("ACGT" * 50), id="ROT", name="ROT",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        app = _build_app(rec, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp.set_view_origin(100)                 # rotate
+            # Shared builder (used by Shift+Arrow, mouse drag, Shift+click):
+            assert sp._disp_selection(50, 60) == (150, 161)   # non-wrap
+            assert sp._disp_selection(90, 120) == (190, 21)   # wraps origin
+            assert sp._disp_selection(0, 199) == (0, 200)     # whole molecule
+            # Ctrl+Arrow slides a 4-bp selection across the origin, length kept.
+            app.action_focus_panel_seq()
+            for _ in range(3):
+                await pilot.pause()
+            sp._user_sel = (196, 200)
+            sp._cursor_pos = 196
+            sp._sel_anchor = 196
+            sp._refresh_view()
+            for _ in range(2):
+                await pilot.pause()
+            sels = []
+            for _ in range(6):
+                await pilot.press("ctrl+right")
+                await pilot.pause()
+                sels.append(sp._user_sel)
+            lengths = [(e - s) if e > s else (200 - s) + e for s, e in sels]
+            assert all(L == 4 for L in lengths), f"slide changed length: {sels}"
+            assert any(s > e for s, e in sels), (
+                f"Ctrl+Arrow never slid across the origin (no wrap): {sels}")
+
     async def test_mouse_click_resolves_after_focus_seq(
             self, tiny_record, isolated_library):
         from textual.containers import ScrollableContainer
@@ -2583,27 +2666,28 @@ class TestSeqHomeEndAndCtrlArrow:
             await pilot.pause(0.05)
             assert sp._user_sel == (9, 19)
 
-    async def test_ctrl_left_clamps_at_zero(
+    async def test_ctrl_left_wraps_around_circular_origin(
         self, tiny_record, isolated_library,
     ):
-        """Ctrl+Left at the start of the sequence should clamp to
-        (0, span) instead of going negative."""
+        """On a CIRCULAR plasmid, Ctrl+Left slides the selection AROUND the
+        origin (mod n) instead of clamping at 0 — all selection paths are
+        wrap-aware (user request 2026-06-10)."""
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
             sp = app.query_one("#seq-panel", sc.SequencePanel)
-            sp._user_sel = (0, 10)   # already at start
+            n = len(sp._seq)
+            sp._user_sel = (0, 10)       # flush against the origin
             app.set_focus(None)
             await pilot.pause(0.05)
             await pilot.press("ctrl+left")
             await pilot.pause(0.05)
-            assert sp._user_sel == (0, 10), (
-                f"Ctrl+Left at start should be a no-op; "
-                f"got {sp._user_sel}"
-            )
+            # slid -1 across the origin → wrap selection, 10 bp preserved
+            assert sp._user_sel == (n - 1, 9), (
+                f"Ctrl+Left should wrap across the origin; got {sp._user_sel}")
 
-    async def test_ctrl_right_clamps_at_n(
+    async def test_ctrl_right_wraps_around_circular_origin(
         self, tiny_record, isolated_library,
     ):
         app = _build_app(tiny_record, isolated_library)
@@ -2612,12 +2696,39 @@ class TestSeqHomeEndAndCtrlArrow:
             await pilot.pause(0.05)
             sp = app.query_one("#seq-panel", sc.SequencePanel)
             n = len(sp._seq)
-            sp._user_sel = (n - 10, n)   # already flush right
+            sp._user_sel = (n - 10, n)   # flush against the origin
             app.set_focus(None)
             await pilot.pause(0.05)
             await pilot.press("ctrl+right")
             await pilot.pause(0.05)
-            assert sp._user_sel == (n - 10, n)
+            assert sp._user_sel == (n - 9, 1), (
+                f"Ctrl+Right should wrap across the origin; got {sp._user_sel}")
+
+    async def test_ctrl_arrow_clamps_on_linear(
+        self, tiny_record, isolated_library,
+    ):
+        """A LINEAR molecule still clamps at the ends (no wrap) — only circular
+        plasmids slide around the origin."""
+        tiny_record.annotations["topology"] = "linear"
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            n = len(sp._seq)
+            sp._user_sel = (0, 10)
+            app.set_focus(None)
+            await pilot.pause(0.05)
+            await pilot.press("ctrl+left")
+            await pilot.pause(0.05)
+            assert sp._user_sel == (0, 10), (
+                f"linear Ctrl+Left at start should clamp; got {sp._user_sel}")
+            sp._user_sel = (n - 10, n)
+            await pilot.pause(0.05)
+            await pilot.press("ctrl+right")
+            await pilot.pause(0.05)
+            assert sp._user_sel == (n - 10, n), (
+                f"linear Ctrl+Right at end should clamp; got {sp._user_sel}")
 
     async def test_ctrl_arrow_no_op_without_selection(
         self, tiny_record, isolated_library,

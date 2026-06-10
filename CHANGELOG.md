@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.48] — 2026-06-10
+
+### Bug fixes
+
+- **Selection is now wrap-aware — highlights no longer freeze at the origin after you rotate the view.** On a circular plasmid, extending or moving a highlight used to clamp at the molecule's absolute origin, which — once you've rotated the view to put your region in one piece — sits in the *middle* of the screen, so the selection got stuck there. **Every** selection gesture now follows the on-screen layout and runs cleanly across the origin (wrapping as needed): **Shift+Arrow** (extend), **Ctrl+Arrow** (slide — a circular selection now slides all the way around), and **click-drag / Shift+click** all grab the visual range you mean. Linear molecules still clamp at the ends.
+
+---
+
 ## [1.0.47] — 2026-06-10
 
 ### Bug fixes
