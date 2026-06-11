@@ -1062,7 +1062,7 @@ class TestLibraryRename:
     async def test_rename_to_whitespace_name_keeps_gb_text_fresh(
         self, tiny_record, isolated_library
     ):
-        """A display name with whitespace + '+' (e.g. 'MAV 33 MOD CDS+RUBY')
+        """A display name with whitespace + '+' (e.g. 'DEMO 33 MOD CDS+REPORTERR')
         must succeed and update gb_text. Pre-fix the SeqIO writer raised
         ValueError("Invalid whitespace in '...' for LOCUS line"); the
         exception was swallowed, leaving gb_text stale while e['name']
@@ -1073,7 +1073,7 @@ class TestLibraryRename:
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            new_name = "MAV 33 MOD CDS+RUBY"
+            new_name = "DEMO 33 MOD CDS+REPORTERR"
             app._rename_library_entry(tiny_record.id, new_name)
             await pilot.pause(0.05)
             entries = sc._load_library()
@@ -1084,14 +1084,14 @@ class TestLibraryRename:
             # gb_text now parses without raising; LOCUS carries the
             # sanitised form, NOT the old (pre-rename) LOCUS name.
             reloaded = sc._gb_text_to_record(match[0]["gb_text"])
-            assert reloaded.name == "MAV_33_MOD_CDS_RUBY", (
+            assert reloaded.name == "DEMO_33_MOD_CDS_REPORTERR", (
                 f"expected sanitised LOCUS name on rec; got {reloaded.name!r}"
             )
             # Belt-and-braces: the LOCUS line in raw text should also
             # carry the sanitised form (pre-fix it would be the OLD
             # LOCUS name from before the failed re-serialize).
             locus_line = match[0]["gb_text"].split("\n", 1)[0]
-            assert "MAV_33_MOD_CDS_RUBY" in locus_line, (
+            assert "DEMO_33_MOD_CDS_REPORTERR" in locus_line, (
                 f"LOCUS line stale after rename: {locus_line!r}"
             )
 
@@ -1190,7 +1190,7 @@ class TestSaveKeepsLibraryNameAndFocus:
 class TestNamePlasmidModalDupWarning:
     """`NamePlasmidModal._existing_ids` previously mapped case-folded
     id → id, so the dup-warning's id-conflict path surfaced the bare
-    sanitised id (e.g. 'MAV_34'). After a rename, e['id'] is the OLD
+    sanitised id (e.g. 'DEMO_34'). After a rename, e['id'] is the OLD
     sanitised name (immutable by design) while e['name'] is the new
     display label — surfacing the id confused users into thinking the
     warning referenced a phantom old plasmid. The map now points to
@@ -1273,12 +1273,12 @@ class TestRenameUpdatesId:
             await pilot.pause()
             await pilot.pause(0.05)
             old_id = tiny_record.id
-            app._rename_library_entry(old_id, "MAV 33")
+            app._rename_library_entry(old_id, "DEMO 33")
             await pilot.pause(0.05)
             lib = sc._load_library()
             assert len(lib) == 1
-            assert lib[0]["id"]   == "MAV_33"
-            assert lib[0]["name"] == "MAV 33"
+            assert lib[0]["id"]   == "DEMO_33"
+            assert lib[0]["name"] == "DEMO 33"
             # The pre-rename id is fully gone — no entry holds it.
             assert all(e["id"] != old_id for e in lib)
 
@@ -1286,16 +1286,16 @@ class TestRenameUpdatesId:
         self, tiny_record, isolated_library
     ):
         """Two distinct display names can sanitise to the same id
-        (e.g. ``MAV 33`` and ``MAV-33`` both → ``MAV_33``). When a
+        (e.g. ``DEMO 33`` and ``DEMO-33`` both → ``DEMO_33``). When a
         rename would create such a collision, the renamed entry's id
         gets the `_2` suffix; the entry that already held the bare
         id keeps it."""
         # Seed two entries: the second one collides on sanitised id
-        # if the first is renamed to "MAV 33" (because the first is
-        # then "MAV_33" and the second already is too).
+        # if the first is renamed to "DEMO 33" (because the first is
+        # then "DEMO_33" and the second already is too).
         sc._save_library([
             {"id": "TEST001",  "name": "TEST001",  "size": 1, "n_feats": 0},
-            {"id": "MAV_33",   "name": "MAV 33",   "size": 1, "n_feats": 0},
+            {"id": "DEMO_33",   "name": "DEMO 33",   "size": 1, "n_feats": 0},
         ])
         sc._library_cache = None
         sc._id_name_backfill_done = True   # skip backfill (already aligned)
@@ -1303,14 +1303,14 @@ class TestRenameUpdatesId:
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            # Rename TEST001 → "MAV-33" (sanitises to MAV_33, which
-            # the other entry already holds). Expect MAV_33_2.
-            app._rename_library_entry("TEST001", "MAV-33")
+            # Rename TEST001 → "DEMO-33" (sanitises to DEMO_33, which
+            # the other entry already holds). Expect DEMO_33_2.
+            app._rename_library_entry("TEST001", "DEMO-33")
             await pilot.pause(0.05)
             lib = sc._load_library()
             by_name = {e["name"]: e["id"] for e in lib}
-            assert by_name["MAV 33"]  == "MAV_33"
-            assert by_name["MAV-33"]  == "MAV_33_2"
+            assert by_name["DEMO 33"]  == "DEMO_33"
+            assert by_name["DEMO-33"]  == "DEMO_33_2"
 
 
 class TestLibraryIdBackfill:
@@ -1324,17 +1324,17 @@ class TestLibraryIdBackfill:
         """Direct unit test of the pure backfill helper, no app /
         pilot involved."""
         entries = [
-            {"id": "MAV_34", "name": "MAV 33", "size": 1, "n_feats": 0,
+            {"id": "DEMO_34", "name": "DEMO 33", "size": 1, "n_feats": 0,
              "gb_text": ""},
         ]
         out, n_changed = sc._backfill_library_ids_match_names(entries)
         assert n_changed == 1
-        assert out[0]["id"]   == "MAV_33"
-        assert out[0]["name"] == "MAV 33"
+        assert out[0]["id"]   == "DEMO_33"
+        assert out[0]["name"] == "DEMO 33"
 
     def test_backfill_idempotent_on_aligned_entries(self):
         entries = [
-            {"id": "MAV_33", "name": "MAV 33", "size": 1, "n_feats": 0,
+            {"id": "DEMO_33", "name": "DEMO 33", "size": 1, "n_feats": 0,
              "gb_text": ""},
             {"id": "Sample_A", "name": "Sample A", "size": 1, "n_feats": 0,
              "gb_text": ""},
@@ -1350,17 +1350,17 @@ class TestLibraryIdBackfill:
         appears first in iteration."""
         entries = [
             # Came from an old rename (id stale)
-            {"id": "OLD_TAG", "name": "MAV 33", "size": 1, "n_feats": 0,
+            {"id": "OLD_TAG", "name": "DEMO 33", "size": 1, "n_feats": 0,
              "gb_text": ""},
-            # Also sanitises to MAV_33 from a different display
-            {"id": "ANOTHER", "name": "MAV-33", "size": 1, "n_feats": 0,
+            # Also sanitises to DEMO_33 from a different display
+            {"id": "ANOTHER", "name": "DEMO-33", "size": 1, "n_feats": 0,
              "gb_text": ""},
         ]
         out, n_changed = sc._backfill_library_ids_match_names(entries)
         assert n_changed == 2
         # First-walked wins the base id; second gets the bump.
-        assert out[0]["id"] == "MAV_33"
-        assert out[1]["id"] == "MAV_33_2"
+        assert out[0]["id"] == "DEMO_33"
+        assert out[1]["id"] == "DEMO_33_2"
 
     def test_backfill_leaves_pathological_names_alone(self):
         """Entries with empty or all-punctuation display names can't
@@ -1393,28 +1393,28 @@ class TestLibraryIdBackfill:
         tmp_lib.write_text(json.dumps({
             "_schema_version": 1,
             "entries": [
-                {"id": "MAV_34", "name": "MAV 33",
+                {"id": "DEMO_34", "name": "DEMO 33",
                  "size": 1, "n_feats": 0, "gb_text": ""},
             ],
         }))
         loaded = sc._load_library()
-        assert loaded[0]["id"]   == "MAV_33"
-        assert loaded[0]["name"] == "MAV 33"
+        assert loaded[0]["id"]   == "DEMO_33"
+        assert loaded[0]["name"] == "DEMO 33"
         # And the backfill rewrote the JSON on disk too.
         re_read = json.loads(tmp_lib.read_text())
-        assert re_read["entries"][0]["id"] == "MAV_33"
+        assert re_read["entries"][0]["id"] == "DEMO_33"
 
     def test_backfill_trims_leading_and_trailing_whitespace(self):
         """The name-trim arm of the backfill strips leading/trailing
         whitespace from `e["name"]` so the delete-cascade's strict
         `==` against parts_bin doesn't silently miss the row.
-        Real-world trigger: a `.dna` file like `'MAV 27 ….dna'`
+        Real-world trigger: a `.dna` file like `'DEMO 27 ….dna'`
         (trailing space before the extension) seeded the library
-        with `name='MAV 27 …'` while the parts_bin row carried the
+        with `name='DEMO 27 …'` while the parts_bin row carried the
         trimmed version."""
         entries = [
             # Trailing-space name, id already aligned to the trimmed form
-            {"id": "MAV_27", "name": "MAV 27 ", "size": 1, "n_feats": 0,
+            {"id": "DEMO_27", "name": "DEMO 27 ", "size": 1, "n_feats": 0,
              "gb_text": ""},
             # Leading + trailing space
             {"id": "Sample", "name": "  Sample  ", "size": 1, "n_feats": 0,
@@ -1422,7 +1422,7 @@ class TestLibraryIdBackfill:
         ]
         out, n_changed = sc._backfill_library_ids_match_names(entries)
         assert n_changed == 2
-        assert out[0]["name"] == "MAV 27"
+        assert out[0]["name"] == "DEMO 27"
         assert out[1]["name"] == "Sample"
 
     def test_backfill_handles_corrupt_entries_without_aborting(self):
@@ -1546,7 +1546,7 @@ class TestNamePlasmidModalWhitespaceWarning:
             save_btn = modal.query_one(
                 "#btn-nameplasmid-save", sc.Button,
             )
-            inp.value = "MAV 27 "
+            inp.value = "DEMO 27 "
             await pilot.pause()
             rendered = str(status.render()).lower()
             assert "trailing" in rendered
@@ -1569,7 +1569,7 @@ class TestNamePlasmidModalWhitespaceWarning:
             status = modal.query_one(
                 "#nameplasmid-status", sc.Static,
             )
-            inp.value = "  MAV 27"
+            inp.value = "  DEMO 27"
             await pilot.pause()
             rendered = str(status.render()).lower()
             assert "leading" in rendered
@@ -1590,7 +1590,7 @@ class TestNamePlasmidModalWhitespaceWarning:
             status = modal.query_one(
                 "#nameplasmid-status", sc.Static,
             )
-            inp.value = "MAV 27"
+            inp.value = "DEMO 27"
             await pilot.pause()
             rendered = str(status.render()).lower()
             assert "whitespace" not in rendered
@@ -4405,6 +4405,94 @@ class TestFeatureDeleteRestacksCleanly:
             assert lab in after, f"survivor {lab} dropped after re-stack"
 
 
+class TestResiteLabelPacking:
+    """A restriction-site label renders a paren block WIDER than its
+    recognition span (`max(rec_len, len(label)+2)`, centred). The 2D packer
+    must reserve that wider span so two close MCS sites whose blocks overlap
+    stack on separate rows instead of overprinting their labels into a garble
+    like "(Sal())(BamHI)". Regression for the cloned-product MCS readout."""
+
+    def test_overlapping_render_spans_stack(self):
+        feats = [
+            {"type": "resite", "start": 10, "end": 16, "label": "SalI",
+             "strand": 1},
+            {"type": "resite", "start": 12, "end": 18, "label": "HindIII",
+             "strand": 1},   # recognition + render span overlaps SalI
+        ]
+        pl = sc._pack_features_2d(feats, 0, 60, total=60)
+        rows = {f["label"]: r for f, r in pl}
+        assert rows["SalI"] != rows["HindIII"], (
+            "overlapping resite labels must stack on separate rows")
+
+    def test_render_span_is_wider_than_recognition_for_long_label(self):
+        # BamHI recognition is 6 bp; "BamHI" + parens needs 7 cols, so the
+        # block extends one column past the recognition right edge.
+        f = {"type": "resite", "start": 16, "end": 22, "label": "BamHI"}
+        lo, hi = sc._resite_render_span(f)
+        assert (hi - lo) == 7 and lo <= 16 and hi >= 22
+
+    def test_far_apart_resites_do_not_needlessly_stack(self):
+        feats = [
+            {"type": "resite", "start": 10, "end": 16, "label": "SalI",
+             "strand": 1},
+            {"type": "resite", "start": 40, "end": 46, "label": "BamHI",
+             "strand": 1},
+        ]
+        pl = sc._pack_features_2d(feats, 0, 60, total=60)
+        rows = {f["label"]: r for f, r in pl}
+        assert rows["SalI"] == rows["BamHI"]
+
+
+class TestRebuildCarriesDisplayName:
+    """A record REBUILD (feature delete, base edit) must carry the typed
+    `_tui_display_name` onto the fresh record, or `_record_display_name` falls
+    back to the space-stripped GenBank LOCUS and the next save re-bakes
+    underscores into the user's name ([INV-98]). Regression for the logged
+    flow: clone via Alt+Shift+P → load product → delete a feature → Ctrl+S
+    silently renamed "My Plasmid" → "My_Plasmid"."""
+
+    def test_carry_tui_attrs_copies_private_attrs(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        src = SeqRecord(Seq("ACGT"), id="X_Y", name="X_Y")
+        src._tui_display_name = "X Y"          # type: ignore[attr-defined]
+        src._tui_source = "lib:X_Y"            # type: ignore[attr-defined]
+        src._tui_map_mode = "linear"           # type: ignore[attr-defined]
+        dst = SeqRecord(Seq("ACGT"), id="X_Y", name="X_Y")
+        sc._carry_tui_attrs(dst, src)
+        assert dst._tui_display_name == "X Y"
+        assert dst._tui_source == "lib:X_Y"
+        assert dst._tui_map_mode == "linear"
+
+    async def test_delete_feature_keeps_typed_name(
+            self, tiny_record, isolated_library):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            rec = app._current_record
+            # Simulate the trad-clone product: underscored LOCUS + a typed
+            # display name with spaces, plus a deletable feature.
+            rec.name = "My_Plasmid_7"
+            rec._tui_display_name = "My Plasmid 7"   # type: ignore[attr-defined]
+            rec.features.append(SeqFeature(
+                FeatureLocation(2, 8, strand=1),
+                type="misc_feature", qualifiers={"label": ["doomed"]}))
+            # Rebuild without the feature we just added (last non-source idx).
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm.load_record(rec)
+            doomed_idx = next(
+                i for i, f in enumerate(pm._feats) if f.get("label") == "doomed")
+            new_rec = app._rebuild_record_without_feature(doomed_idx)
+            assert new_rec is not None
+            # The rebuilt record must STILL resolve to the typed name — not the
+            # underscored LOCUS — so the map title + Ctrl+S keep the spaces.
+            assert app._record_display_name(new_rec) == "My Plasmid 7", (
+                "rebuild dropped _tui_display_name → name would re-bake "
+                "underscores on the next save")
+
+
 class TestCrashRecoveryNoticeOncePerSet:
     """`_check_crash_recovery` should warn ONCE per leftover set —
     same files / same mtimes on the next launch should NOT re-fire
@@ -6610,7 +6698,7 @@ class TestShiftClickFeatureExtend:
         (F-keys chosen because terminals collapse Ctrl+digit and eat
         Alt+digit for tab-switching). F5 was reassigned to
         `show_history` on 2026-05-11 but reverted to `focus_panel_all`
-        on 2026-05-14 (GH #15, Cory Tobin) — the muscle memory was too
+        on 2026-05-14 (GH #15, a user) — the muscle memory was too
         strong and the focus-mode notify strings still said "F5 =
         restore". History now lives on F6 + Ctrl+H."""
         from Bio.Seq import Seq

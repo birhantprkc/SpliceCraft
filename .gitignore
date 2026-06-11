@@ -69,6 +69,13 @@ TechSupport/
 .claude/.credentials.json
 .claude/scheduled_tasks.lock
 
+# Confidential client-name patterns — read by release.py's private-name gate
+# (`_check_private_tokens`). NEVER track: spelling the client's plasmid /
+# construct / part names here, in a repo whose `master` is pushed to the
+# PUBLIC release `origin`, would itself leak them. Keep it local per-machine
+# and copy it out-of-band between the two laptops (not via git).
+.private-names
+
 # uv resolver lock — generated locally, not committed
 # (contributed by Harley King in closed PR #7)
 uv.lock

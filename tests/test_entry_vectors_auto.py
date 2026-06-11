@@ -185,7 +185,7 @@ def test_tu_plasmid_not_detected_as_acceptor():
     alphabet (matches `_classify_part_from_plasmid` pass-4). The
     detector must REJECT — TUs aren't empty acceptors."""
     gb_l0 = sc._all_grammars()["gb_l0"]
-    # Match MAV 26 TUA1 release: Esp3I gives (GGAG, GTCA).
+    # Match DEMO 26 TUx1 release: Esp3I gives (GGAG, GTCA).
     rec = _build_acceptor(
         oh5_inner="GGAG", oh3_inner="GTCA",
         oh5_outer="GGAG", oh3_outer="GTCA",

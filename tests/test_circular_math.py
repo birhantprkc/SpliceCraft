@@ -631,7 +631,7 @@ class TestWrapFeaturePrimerDesignScreen:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Intron-bearing CDS — issue #9 from Cory Tobin (har1eyk reported similar)
+# Intron-bearing CDS — issue #9 from a user (har1eyk reported similar)
 # Pre-fix `_translate_cds` and `_paint_cds_aa` treated every CDS as
 # contiguous, so an intron whose length isn't a multiple of 3 frame-
 # shifted every AA past the splice. The loader now stamps `_exons`

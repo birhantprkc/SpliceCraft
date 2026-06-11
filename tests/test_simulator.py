@@ -1082,11 +1082,11 @@ class TestAmpliconSaveModal:
 
     def test_active_collection_first_and_deduped(self):
         m = sc.AmpliconSaveModal(
-            default_name="amp", collections=["A", "B", "A", "Eden"],
+            default_name="amp", collections=["A", "B", "A", "DemoColl"],
             active_collection="B",
         )
         # Active first, duplicates removed, order otherwise preserved.
-        assert m._collections == ["B", "A", "Eden"]
+        assert m._collections == ["B", "A", "DemoColl"]
         assert m._active == "B"
 
     def test_empty_collections_falls_back_to_default(self):
@@ -1168,13 +1168,13 @@ class TestCommitAmpliconToCollection:
         assert any(e.get("id") == "amp1" for e in lib)
 
     def test_save_into_other_collection_leaves_active_mirror(self):
-        _seed_collections(active="Default", others=["Eden"])
+        _seed_collections(active="Default", others=["DemoColl"])
         s = self._screen()
-        s._commit_amplicon_to_collection(_amp_entry(), "Eden")
+        s._commit_amplicon_to_collection(_amp_entry(), "DemoColl")
         colls = sc._load_collections()
-        eden = next(c for c in colls if c["name"] == "Eden")
+        democoll = next(c for c in colls if c["name"] == "DemoColl")
         default = next(c for c in colls if c["name"] == "Default")
-        assert [e["name"] for e in eden["plasmids"]] == ["amp1"]
+        assert [e["name"] for e in democoll["plasmids"]] == ["amp1"]
         assert default["plasmids"] == []
         # Active (Default) mirror untouched.
         assert sc._load_library() == []
@@ -1241,7 +1241,7 @@ class TestSaveAmpliconFlow:
 
     async def test_save_button_opens_modal_then_commits(self):
         from textual.widgets import Input, Select
-        _seed_collections(active="Default", others=["Eden"])
+        _seed_collections(active="Default", others=["DemoColl"])
         app = self._host_app()
         async with app.run_test(size=(170, 48)) as pilot:
             await pilot.pause()
@@ -1262,14 +1262,14 @@ class TestSaveAmpliconFlow:
             modal = app.screen
             assert isinstance(modal, sc.AmpliconSaveModal)
             modal.query_one("#ampsave-name", Input).value = "My amplicon"
-            modal.query_one("#ampsave-collection", Select).value = "Eden"
+            modal.query_one("#ampsave-collection", Select).value = "DemoColl"
             modal._submit()
             await pilot.pause()
             await pilot.pause()
-            # Landed in Eden, not the active Default.
+            # Landed in DemoColl, not the active Default.
             colls = sc._load_collections()
-            eden = next(c for c in colls if c["name"] == "Eden")
-            assert [e["name"] for e in eden["plasmids"]] == ["My amplicon"]
+            democoll = next(c for c in colls if c["name"] == "DemoColl")
+            assert [e["name"] for e in democoll["plasmids"]] == ["My amplicon"]
 
     async def test_save_refuses_with_no_amplicon(self):
         _seed_collections(active="Default")

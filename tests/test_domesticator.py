@@ -6724,14 +6724,14 @@ class TestClassifyPartFromPlasmidLevels:
         level=2 (MOD) via enzyme-parity inference (`primary release
         ⇒ MOD`). That inference assumed splicecraft's enzyme
         convention (Esp3I=primary=L0); the pDGB1 convention used by
-        EDEN flips parity — Esp3I IS the L1→L2 release in their
+        DemoColl flips parity — Esp3I IS the L1→L2 release in their
         labs, and the user's TUs cut with Esp3I.
 
         Overhang shape alone can't tell TU from MOD across both
         conventions, so the classifier now returns level=1 for any
         TU-boundary match regardless of which enzyme cut. Users who
         need to tag a MOD specifically can do so via Parts Bin →
-        Edit. Regression guard for the MAV-25-in-alpha-2 fix
+        Edit. Regression guard for the DEMO-25-in-alpha-2 fix
         (2026-05-13).
         """
         seq = _build_gb_mod_seq()
@@ -6956,7 +6956,7 @@ class TestClassifyPartFromPlasmidPerAcceptor:
     The third-pass check in `_classify_part_from_plasmid` digests each
     configured entry vector and compares the stuffer's overhangs to
     the user's plasmid digest. This regression guards the
-    MAV-25-in-alpha-2 bug Cory reported on 2026-05-13.
+    DEMO-25-in-alpha-2 bug a user reported on 2026-05-13.
     """
 
     def test_tu_in_alpha2_classifies_via_acceptor_pair(
@@ -9584,16 +9584,16 @@ class TestRecordDisplayName:
     """`PlasmidApp._record_display_name` prefers the typed display
     name (stashed as `record._tui_display_name` when loading from
     library) over the sanitised GenBank LOCUS / id. Critical for
-    showing "MAV 32 + Test" in the title bar instead of "MAV_32_Test"
+    showing "DEMO 32 + Test" in the title bar instead of "DEMO_32_Test"
     after a round-trip through .gb serialisation.
     """
 
     def test_prefers_tui_display_name(self):
         from Bio.SeqRecord import SeqRecord
         from Bio.Seq import Seq
-        rec = SeqRecord(Seq("ATGC"), id="MAV_32", name="MAV_32")
-        rec._tui_display_name = "MAV 32 + Test"
-        assert sc.PlasmidApp._record_display_name(rec) == "MAV 32 + Test"
+        rec = SeqRecord(Seq("ATGC"), id="DEMO_32", name="DEMO_32")
+        rec._tui_display_name = "DEMO 32 + Test"
+        assert sc.PlasmidApp._record_display_name(rec) == "DEMO 32 + Test"
 
     def test_falls_back_to_record_name_when_no_tui_display(self):
         from Bio.SeqRecord import SeqRecord
@@ -9737,8 +9737,8 @@ class TestNamePlasmidModal:
         collection so the user can scan for naming collisions before
         committing."""
         sc._save_library([
-            {"id": "p1", "name": "MAV 26 some_tu", "size": 1, "n_feats": 0},
-            {"id": "p2", "name": "MAV 27 another_tu", "size": 1, "n_feats": 0},
+            {"id": "p1", "name": "DEMO 26 some_tu", "size": 1, "n_feats": 0},
+            {"id": "p2", "name": "DEMO 27 another_tu", "size": 1, "n_feats": 0},
             {"id": "p3", "name": "pUC19", "size": 1, "n_feats": 0},
         ])
         app = sc.PlasmidApp()
@@ -9750,12 +9750,12 @@ class TestNamePlasmidModal:
             modal = app.screen
             t = modal.query_one("#nameplasmid-list", sc.DataTable)
             assert t.row_count == 3
-            # Natural-sort: pUC19 lands AFTER the MAV entries.
+            # Natural-sort: pUC19 lands AFTER the DEMO entries.
             # (Names sort lexicographically here since the numbers
             # don't collide with any non-numeric prefix.)
             names = [str(t.get_row_at(i)[0])
                       for i in range(t.row_count)]
-            assert "MAV 26 some_tu" in names
+            assert "DEMO 26 some_tu" in names
             assert "pUC19" in names
 
     async def test_empty_library_shows_placeholder_row(
@@ -9784,7 +9784,7 @@ class TestNamePlasmidModal:
         status line. The user can't dismiss with a duplicate.
         """
         sc._save_library([
-            {"id": "existing_id", "name": "MAV 32 O1MOD",
+            {"id": "existing_id", "name": "DEMO 32 VARA",
              "size": 1, "n_feats": 0},
         ])
         app = sc.PlasmidApp()
@@ -9799,26 +9799,26 @@ class TestNamePlasmidModal:
                 "#btn-nameplasmid-save", sc.Button,
             )
             # Type the exact existing name → Save disabled.
-            inp.value = "MAV 32 O1MOD"
+            inp.value = "DEMO 32 VARA"
             await pilot.pause()
             assert save_btn.disabled is True
             # Case-insensitive variant ALSO disables.
-            inp.value = "mav 32 o1mod"
+            inp.value = "demo 32 vara"
             await pilot.pause()
             assert save_btn.disabled is True
             # Change to a unique name → re-enabled.
-            inp.value = "MAV 33 unique"
+            inp.value = "DEMO 33 unique"
             await pilot.pause()
             assert save_btn.disabled is False
 
     async def test_duplicate_id_collision_disables_save(
             self, isolated_library, isolated_parts_bin):
         """Two different display names can sanitise to the same id
-        (e.g. ``MAV 32`` and ``MAV/32`` both → ``MAV_32``). The dup
+        (e.g. ``DEMO 32`` and ``DEMO/32`` both → ``DEMO_32``). The dup
         check covers the id collision too so the user doesn't save
         a name that would auto-suffix on persist."""
         sc._save_library([
-            {"id": "MAV_32_O1MOD", "name": "MAV 32 O1MOD",
+            {"id": "DEMO_32_VARA", "name": "DEMO 32 VARA",
              "size": 1, "n_feats": 0},
         ])
         app = sc.PlasmidApp()
@@ -9833,7 +9833,7 @@ class TestNamePlasmidModal:
                 "#btn-nameplasmid-save", sc.Button,
             )
             # Different display name but sanitises to the same id.
-            inp.value = "MAV/32/O1MOD"
+            inp.value = "DEMO/32/VARA"
             await pilot.pause()
             assert save_btn.disabled is True
 
@@ -9877,7 +9877,7 @@ class TestNamePlasmidModal:
         names that happen to share a prefix.
         """
         sc._save_library([
-            {"id": "p1", "name": "MAV 32 O1MOD FuGFP+RUBY",
+            {"id": "p1", "name": "DEMO 32 VARA Reporter+REPORTERR",
              "size": 1, "n_feats": 0},
         ])
         app = sc.PlasmidApp()
@@ -9895,7 +9895,7 @@ class TestNamePlasmidModal:
                 "#nameplasmid-status", sc.Static,
             )
             # Prefix of the existing name.
-            inp.value = "MAV 32"
+            inp.value = "DEMO 32"
             await pilot.pause()
             assert save_btn.disabled is False
             assert "similar" in str(status.render()).lower()

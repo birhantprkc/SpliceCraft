@@ -1059,7 +1059,7 @@ class TestPartsBinSource:
     async def test_select_loads_cds(self, monkeypatch):
         """Picking a part from the dropdown loads its `sequence` as the
         CDS, sets meta with origin='parts', and enables the preview."""
-        part = self._ok_part("aeBlue")
+        part = self._ok_part("Chromo")
         monkeypatch.setattr(sc, "_load_parts_bin", lambda: [part])
         app = sc.PlasmidApp()
         async with app.run_test(size=(140, 50)) as pilot:
@@ -1079,7 +1079,7 @@ class TestPartsBinSource:
             assert modal._cds_dna == part["sequence"].upper()
             assert modal._cds_meta is not None
             assert modal._cds_meta["origin"] == "parts"
-            assert modal._cds_meta["name"] == "aeBlue"
+            assert modal._cds_meta["name"] == "Chromo"
             assert modal._cds_meta["start"] == 0
             assert modal._cds_meta["end"] == len(part["sequence"])
             assert modal._cds_meta["strand"] == 1

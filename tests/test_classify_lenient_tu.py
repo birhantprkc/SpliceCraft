@@ -8,7 +8,7 @@ candidate via backbone-marker exclusion (NEVER size — feedback
 released overhangs come from the grammar's canonical alphabet
 (positions oh5/oh3 + reverse complements).
 
-Caught by user report 2026-05-20 on the EDEN collection: MAV 25-31
+Caught by user report 2026-05-20 on the DemoColl collection: DEMO 25-31
 release TUs with `(GGAG, GTCA)` / `(GTCA, CGCT)` — valid Golden
 Braid 2.0 overhangs (`GTCA` = RC of `TGAC`, a Pos 1b operator
 overhang) — but neither matches the strict canonical TU boundary
@@ -87,16 +87,16 @@ def _classify(rec):
     )
 
 
-# ── EDEN MAV 25-31 reproduction ────────────────────────────────────────────
+# ── DemoColl DEMO 25-31 reproduction ────────────────────────────────────────────
 
 def test_pass4_classifies_tua1_style_release():
-    """The reported bug: a TU released with `(GGAG, GTCA)` (TUA1 in
-    the EDEN collection) classifies as level=1 via the lenient
+    """The reported bug: a TU released with `(GGAG, GTCA)` (TUx1 in
+    the DemoColl collection) classifies as level=1 via the lenient
     fallback. `GGAG` is canonical Pos-1 oh5; `GTCA` is RC of TGAC
     (a Pos-1b operator overhang in the GB 2.0 expanded grammar)."""
     rec = _build_l1_release_plasmid(oh5="GGAG", oh3="GTCA")
     result = _classify(rec)
-    assert result is not None, "Pass-4 must classify TUA1-style release"
+    assert result is not None, "Pass-4 must classify TUx1-style release"
     assert result["level"] == 1
     assert result["lenient"] is True
     assert result["position"]["oh5"] == "GGAG"
@@ -106,7 +106,7 @@ def test_pass4_classifies_tua1_style_release():
 
 
 def test_pass4_classifies_tua2_style_release():
-    """TUA2 in EDEN releases with `(GTCA, CGCT)`. Both overhangs are
+    """TUx2 in DemoColl releases with `(GTCA, CGCT)`. Both overhangs are
     canonical GB 2.0 (`GTCA` = RC of TGAC; `CGCT` is the canonical
     Pos-N oh3)."""
     rec = _build_l1_release_plasmid(oh5="GTCA", oh3="CGCT")
@@ -210,10 +210,10 @@ def test_grammar_canonical_overhangs_includes_rcs():
     assert "CGCT" in canon
     assert "AATG" in canon
     # RC fallbacks (sacred for non-canonical orientation matches):
-    assert "CTCC" in canon, "RC of GGAG missing — pass-4 would miss TUA1"
+    assert "CTCC" in canon, "RC of GGAG missing — pass-4 would miss TUx1"
     assert "AGCG" in canon, "RC of CGCT missing"
     # In GB 2.0 expanded, TGAC is a Pos 1b operator overhang; GTCA
-    # (RC) is what the user's TUA1 releases.
+    # (RC) is what the user's TUx1 releases.
     if "TGAC" in canon:
         assert "GTCA" in canon
 
@@ -241,24 +241,24 @@ def test_grammar_canonical_overhangs_skips_non_4bp():
     assert "NNNN" not in canon
 
 
-# ── Real EDEN MAV files (when locally present) ─────────────────────────────
+# ── Real DemoColl DEMO files (when locally present) ─────────────────────────────
 
 @pytest.mark.skipif(
     not __import__("pathlib").Path(
         "/home/seb/EdenCollection/DNA Files/"
-        "MAV 26 TUA1 PAtHsfA-AtFuGFP-THSP.dna"
+        "DEMO 26 TUx1 PAtHsfA-AtReporter-THSP.dna"
     ).exists(),
-    reason="EDEN MAV files not present on this machine — see fixture path",
+    reason="DemoColl DEMO files not present on this machine — see fixture path",
 )
-def test_eden_mav_26_classifies():
-    """End-to-end: the user's MAV 26 .dna file (TUA1 with
+def test_eden_demo_26_classifies():
+    """End-to-end: the user's DEMO 26 .dna file (TUx1 with
     `(GGAG, GTCA)` release) must classify as TU. Skipped on CI
     where the file isn't present."""
     rec = sc.load_genbank(
         "/home/seb/EdenCollection/DNA Files/"
-        "MAV 26 TUA1 PAtHsfA-AtFuGFP-THSP.dna"
+        "DEMO 26 TUx1 PAtHsfA-AtReporter-THSP.dna"
     )
     result = _classify(rec)
-    assert result is not None, "MAV 26 must classify (pass-4 lenient)"
+    assert result is not None, "DEMO 26 must classify (pass-4 lenient)"
     assert result["level"] == 1
     assert result["lenient"] is True

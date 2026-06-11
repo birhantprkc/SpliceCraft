@@ -35,14 +35,14 @@ import splicecraft as sc
 
 def _seed_two_collections(eden_n: int = 3, ffe_n: int = 0):
     """Build a {collections.json, plasmid_library.json} pair with
-    'Eden' (eden_n plasmids) + 'FFE' (ffe_n plasmids). Eden is active.
-    Returns the entry ids in Eden so tests can mark them."""
+    'DemoColl' (eden_n plasmids) + 'FFE' (ffe_n plasmids). DemoColl is active.
+    Returns the entry ids in DemoColl so tests can mark them."""
     eden_plasmids = [
         {"id": f"eden_{i}", "name": f"plasmid_{i}",
          "size": 1000 + i, "n_feats": 2,
          "status": "DESIGNING", "gb_text": f"LOCUS plasmid_{i} 1000 bp\n",
          "alignments": [],
-         "metadata_marker": f"unique-eden-{i}"}
+         "metadata_marker": f"unique-democoll-{i}"}
         for i in range(eden_n)
     ]
     ffe_plasmids = [
@@ -53,13 +53,13 @@ def _seed_two_collections(eden_n: int = 3, ffe_n: int = 0):
         for i in range(ffe_n)
     ]
     colls = [
-        {"name": "Eden", "description": "test source",
+        {"name": "DemoColl", "description": "test source",
          "plasmids": eden_plasmids},
         {"name": "FFE",  "description": "test target",
          "plasmids": ffe_plasmids},
     ]
     sc._save_collections(colls)
-    sc._set_active_collection_name("Eden")
+    sc._set_active_collection_name("DemoColl")
     sc._settings_flush_sync()
     sc._safe_save_json_mirror(sc._LIBRARY_FILE, eden_plasmids,
                                 "Plasmid library")
@@ -107,13 +107,13 @@ class TestMoveCopyCommit:
         eden_ids = _seed_two_collections(eden_n=3, ffe_n=0)
         # Move all 3.
         app._move_copy_commit(
-            source="Eden", target="FFE",
+            source="DemoColl", target="FFE",
             entry_ids=eden_ids, mode="move",
         )
         colls = sc._load_collections()
-        eden = next(c for c in colls if c["name"] == "Eden")
+        democoll = next(c for c in colls if c["name"] == "DemoColl")
         ffe  = next(c for c in colls if c["name"] == "FFE")
-        assert eden["plasmids"] == []
+        assert democoll["plasmids"] == []
         assert len(ffe["plasmids"]) == 3
         # Order preserved.
         assert [p["id"] for p in ffe["plasmids"]] == eden_ids
@@ -121,14 +121,14 @@ class TestMoveCopyCommit:
     def test_copy_basic(self, app):
         eden_ids = _seed_two_collections(eden_n=2, ffe_n=0)
         app._move_copy_commit(
-            source="Eden", target="FFE",
+            source="DemoColl", target="FFE",
             entry_ids=eden_ids, mode="copy",
         )
         colls = sc._load_collections()
-        eden = next(c for c in colls if c["name"] == "Eden")
+        democoll = next(c for c in colls if c["name"] == "DemoColl")
         ffe  = next(c for c in colls if c["name"] == "FFE")
         # Source unchanged.
-        assert len(eden["plasmids"]) == 2
+        assert len(democoll["plasmids"]) == 2
         # Target populated.
         assert len(ffe["plasmids"]) == 2
 
@@ -137,24 +137,24 @@ class TestMoveCopyCommit:
         target (sacred [PIT-17])."""
         eden_ids = _seed_two_collections(eden_n=1, ffe_n=0)
         app._move_copy_commit(
-            source="Eden", target="FFE",
+            source="DemoColl", target="FFE",
             entry_ids=eden_ids, mode="copy",
         )
         # Mutate the source entry's metadata. The target's copy must
         # NOT be affected.
         colls = sc._load_collections()
-        eden = next(c for c in colls if c["name"] == "Eden")
-        eden["plasmids"][0]["metadata_marker"] = "MUTATED"
+        democoll = next(c for c in colls if c["name"] == "DemoColl")
+        democoll["plasmids"][0]["metadata_marker"] = "MUTATED"
         sc._save_collections(colls)
         # Re-load and check FFE's copy still has the original marker.
         colls2 = sc._load_collections()
         ffe = next(c for c in colls2 if c["name"] == "FFE")
-        assert ffe["plasmids"][0]["metadata_marker"] == "unique-eden-0"
+        assert ffe["plasmids"][0]["metadata_marker"] == "unique-democoll-0"
 
     def test_copy_with_name_collision_appends_copy_suffix(self, app):
         # FFE already has a plasmid named "plasmid_0".
         sc._save_collections([
-            {"name": "Eden", "plasmids": [
+            {"name": "DemoColl", "plasmids": [
                 {"id": "eden_0", "name": "plasmid_0", "size": 100,
                  "gb_text": "x"},
             ]},
@@ -166,7 +166,7 @@ class TestMoveCopyCommit:
         sc._library_cache = None
         sc._collections_cache = None
         app._move_copy_commit(
-            source="Eden", target="FFE",
+            source="DemoColl", target="FFE",
             entry_ids=["eden_0"], mode="copy",
         )
         colls = sc._load_collections()
@@ -179,7 +179,7 @@ class TestMoveCopyCommit:
         # Pre-seed FFE with `plasmid_0`, `plasmid_0 COPY` → next
         # landing must be `plasmid_0 COPY 2`.
         sc._save_collections([
-            {"name": "Eden", "plasmids": [
+            {"name": "DemoColl", "plasmids": [
                 {"id": "eden_0", "name": "plasmid_0", "size": 100,
                  "gb_text": "x"},
             ]},
@@ -193,7 +193,7 @@ class TestMoveCopyCommit:
         sc._library_cache = None
         sc._collections_cache = None
         app._move_copy_commit(
-            source="Eden", target="FFE",
+            source="DemoColl", target="FFE",
             entry_ids=["eden_0"], mode="copy",
         )
         colls = sc._load_collections()
@@ -203,20 +203,20 @@ class TestMoveCopyCommit:
 
     def test_move_same_source_and_target_refused(self, app):
         sc._save_collections([
-            {"name": "Eden", "plasmids": [
+            {"name": "DemoColl", "plasmids": [
                 {"id": "eden_0", "name": "p", "size": 100, "gb_text": "x"},
             ]},
         ])
         sc._library_cache = None
         sc._collections_cache = None
         app._move_copy_commit(
-            source="Eden", target="Eden",
+            source="DemoColl", target="DemoColl",
             entry_ids=["eden_0"], mode="move",
         )
         # Source intact.
         colls = sc._load_collections()
-        eden = next(c for c in colls if c["name"] == "Eden")
-        assert len(eden["plasmids"]) == 1
+        democoll = next(c for c in colls if c["name"] == "DemoColl")
+        assert len(democoll["plasmids"]) == 1
         # Notify fired with warning.
         assert any("same" in m.lower()
                    for sev, m in app._notify_log)
@@ -226,7 +226,7 @@ class TestMoveCopyCommit:
         Each marked entry gets a " COPY" / " COPY 2" suffix; the
         originals stay intact under their original names + ids."""
         sc._save_collections([
-            {"name": "Eden", "plasmids": [
+            {"name": "DemoColl", "plasmids": [
                 {"id": "eden_0", "name": "plasmid_0", "size": 100,
                  "gb_text": "x"},
                 {"id": "eden_1", "name": "plasmid_1", "size": 200,
@@ -236,13 +236,13 @@ class TestMoveCopyCommit:
         sc._library_cache = None
         sc._collections_cache = None
         app._move_copy_commit(
-            source="Eden", target="Eden",
+            source="DemoColl", target="DemoColl",
             entry_ids=["eden_0", "eden_1"], mode="copy",
         )
         colls = sc._load_collections()
-        eden = next(c for c in colls if c["name"] == "Eden")
-        names = [p["name"] for p in eden["plasmids"]]
-        ids   = [p["id"]   for p in eden["plasmids"]]
+        democoll = next(c for c in colls if c["name"] == "DemoColl")
+        names = [p["name"] for p in democoll["plasmids"]]
+        ids   = [p["id"]   for p in democoll["plasmids"]]
         # Originals untouched.
         assert "plasmid_0" in names
         assert "plasmid_1" in names
@@ -266,7 +266,7 @@ class TestMoveCopyCommit:
         """A second duplicate-in-place call must produce a 'COPY 2'
         rather than re-using 'COPY'."""
         sc._save_collections([
-            {"name": "Eden", "plasmids": [
+            {"name": "DemoColl", "plasmids": [
                 {"id": "eden_0", "name": "p", "size": 100, "gb_text": "x"},
             ]},
         ])
@@ -274,7 +274,7 @@ class TestMoveCopyCommit:
         sc._collections_cache = None
         # First duplication: yields "p COPY".
         app._move_copy_commit(
-            source="Eden", target="Eden",
+            source="DemoColl", target="DemoColl",
             entry_ids=["eden_0"], mode="copy",
         )
         sc._library_cache = None
@@ -282,12 +282,12 @@ class TestMoveCopyCommit:
         # Second duplication of the SAME original: must yield
         # "p COPY 2" (the first COPY is already in the target set).
         app._move_copy_commit(
-            source="Eden", target="Eden",
+            source="DemoColl", target="DemoColl",
             entry_ids=["eden_0"], mode="copy",
         )
         colls = sc._load_collections()
-        eden = next(c for c in colls if c["name"] == "Eden")
-        names = [p["name"] for p in eden["plasmids"]]
+        democoll = next(c for c in colls if c["name"] == "DemoColl")
+        names = [p["name"] for p in democoll["plasmids"]]
         assert "p" in names
         assert "p COPY" in names
         assert "p COPY 2" in names
@@ -298,12 +298,12 @@ class TestMoveCopyCommit:
         re-stage `plasmid_library.json` so the LibraryPanel sees
         the new entries on next repopulate."""
         eden_ids = _seed_two_collections(eden_n=2, ffe_n=0)
-        # Eden is active by `_seed_two_collections`.
+        # DemoColl is active by `_seed_two_collections`.
         app._move_copy_commit(
-            source="Eden", target="Eden",
+            source="DemoColl", target="DemoColl",
             entry_ids=eden_ids, mode="copy",
         )
-        # plasmid_library.json was re-mirrored from the updated Eden.
+        # plasmid_library.json was re-mirrored from the updated DemoColl.
         mirror = json.loads(sc._LIBRARY_FILE.read_text("utf-8"))
         entries, _err = sc._extract_entries(mirror, "Plasmid library")
         assert _err is None
@@ -318,14 +318,14 @@ class TestMoveCopyCommit:
     def test_invalid_mode_refused(self, app):
         _seed_two_collections(eden_n=1, ffe_n=0)
         app._move_copy_commit(
-            source="Eden", target="FFE",
+            source="DemoColl", target="FFE",
             entry_ids=["eden_0"], mode="weirdmode",
         )
         # No state change.
         colls = sc._load_collections()
-        eden = next(c for c in colls if c["name"] == "Eden")
+        democoll = next(c for c in colls if c["name"] == "DemoColl")
         ffe = next(c for c in colls if c["name"] == "FFE")
-        assert len(eden["plasmids"]) == 1
+        assert len(democoll["plasmids"]) == 1
         assert len(ffe["plasmids"]) == 0
 
     def test_source_disappeared_mid_commit(self, app, monkeypatch):
@@ -339,7 +339,7 @@ class TestMoveCopyCommit:
         sc._library_cache = None
         sc._collections_cache = None
         app._move_copy_commit(
-            source="Eden", target="FFE",
+            source="DemoColl", target="FFE",
             entry_ids=["eden_0"], mode="move",
         )
         # FFE still empty.
@@ -366,13 +366,13 @@ class TestMoveCopyCommit:
             "custom_field": "preserved_value",
         }
         sc._save_collections([
-            {"name": "Eden", "plasmids": [rich]},
+            {"name": "DemoColl", "plasmids": [rich]},
             {"name": "FFE",  "plasmids": []},
         ])
         sc._library_cache = None
         sc._collections_cache = None
         app._move_copy_commit(
-            source="Eden", target="FFE",
+            source="DemoColl", target="FFE",
             entry_ids=["rich_0"], mode="move",
         )
         colls = sc._load_collections()
@@ -387,7 +387,7 @@ class TestMoveCopyCommit:
             )
 
     def test_mirror_re_stages_on_move_from_active(self, app):
-        # Active = Eden. After moving Eden's only plasmid away, the
+        # Active = DemoColl. After moving DemoColl's only plasmid away, the
         # active library mirror (plasmid_library.json) must reflect
         # the new empty state.
         eden_ids = _seed_two_collections(eden_n=2, ffe_n=0)
@@ -395,15 +395,15 @@ class TestMoveCopyCommit:
         lib_pre, _ = sc._safe_load_json(sc._LIBRARY_FILE, "test")
         assert len(lib_pre) == 2
         app._move_copy_commit(
-            source="Eden", target="FFE",
+            source="DemoColl", target="FFE",
             entry_ids=eden_ids, mode="move",
         )
-        # Mirror now reflects empty Eden.
+        # Mirror now reflects empty DemoColl.
         lib_post, _ = sc._safe_load_json(sc._LIBRARY_FILE, "test")
         assert lib_post == []
 
     def test_mirror_re_stages_on_copy_to_active(self, app):
-        # Active = FFE. Copy Eden plasmid INTO FFE → mirror reflects
+        # Active = FFE. Copy DemoColl plasmid INTO FFE → mirror reflects
         # the new entry.
         _seed_two_collections(eden_n=1, ffe_n=0)
         sc._set_active_collection_name("FFE")
@@ -412,7 +412,7 @@ class TestMoveCopyCommit:
         sc._safe_save_json_mirror(sc._LIBRARY_FILE, [], "Plasmid library")
         sc._library_cache = None
         app._move_copy_commit(
-            source="Eden", target="FFE",
+            source="DemoColl", target="FFE",
             entry_ids=["eden_0"], mode="copy",
         )
         lib_post, _ = sc._safe_load_json(sc._LIBRARY_FILE, "test")
@@ -423,7 +423,7 @@ class TestMoveCopyCommit:
         # Include a bogus id in the request — should be silently
         # filtered.
         app._move_copy_commit(
-            source="Eden", target="FFE",
+            source="DemoColl", target="FFE",
             entry_ids=eden_ids + ["bogus_id_that_does_not_exist"],
             mode="move",
         )
@@ -435,14 +435,14 @@ class TestMoveCopyCommit:
     def test_all_ids_filtered_to_none_refused(self, app):
         _seed_two_collections(eden_n=2, ffe_n=0)
         app._move_copy_commit(
-            source="Eden", target="FFE",
+            source="DemoColl", target="FFE",
             entry_ids=["nothing_real_1", "nothing_real_2"],
             mode="move",
         )
         # Source intact.
         colls = sc._load_collections()
-        eden = next(c for c in colls if c["name"] == "Eden")
-        assert len(eden["plasmids"]) == 2
+        democoll = next(c for c in colls if c["name"] == "DemoColl")
+        assert len(democoll["plasmids"]) == 2
 
     def test_copy_id_collision_renames_id_too(self, app):
         # If the source and target share an id (e.g. fresh copy of
@@ -451,7 +451,7 @@ class TestMoveCopyCommit:
         # would silently overwrite the existing entry on the next
         # collection-switch mirror.
         sc._save_collections([
-            {"name": "Eden", "plasmids": [
+            {"name": "DemoColl", "plasmids": [
                 {"id": "p1", "name": "P1", "size": 100, "gb_text": "x"},
             ]},
             {"name": "FFE", "plasmids": [
@@ -461,7 +461,7 @@ class TestMoveCopyCommit:
         sc._library_cache = None
         sc._collections_cache = None
         app._move_copy_commit(
-            source="Eden", target="FFE",
+            source="DemoColl", target="FFE",
             entry_ids=["p1"], mode="copy",
         )
         colls = sc._load_collections()
@@ -484,7 +484,7 @@ class TestMoveCopyConcurrency:
 
         _seed_two_collections(eden_n=10, ffe_n=0)
         # Two apps in two threads, each moving disjoint halves of
-        # Eden → FFE concurrently.
+        # DemoColl → FFE concurrently.
         app1 = sc.PlasmidApp.__new__(sc.PlasmidApp)
         app1.notify = lambda *a, **k: None
         app2 = sc.PlasmidApp.__new__(sc.PlasmidApp)
@@ -498,7 +498,7 @@ class TestMoveCopyConcurrency:
             barrier.wait()
             try:
                 app._move_copy_commit(
-                    source="Eden", target="FFE",
+                    source="DemoColl", target="FFE",
                     entry_ids=ids, mode="move",
                 )
             except Exception as exc:
@@ -511,10 +511,10 @@ class TestMoveCopyConcurrency:
         assert not errors, f"workers raised: {errors!r}"
         colls = sc._load_collections()
         ffe = next(c for c in colls if c["name"] == "FFE")
-        eden = next(c for c in colls if c["name"] == "Eden")
-        # All 10 should have landed in FFE; Eden empty.
+        democoll = next(c for c in colls if c["name"] == "DemoColl")
+        # All 10 should have landed in FFE; DemoColl empty.
         assert len(ffe["plasmids"]) == 10
-        assert len(eden["plasmids"]) == 0
+        assert len(democoll["plasmids"]) == 0
         # No dupes.
         ids = [p["id"] for p in ffe["plasmids"]]
         assert len(set(ids)) == 10
@@ -560,12 +560,12 @@ class TestMoveCopyNewCollection:
         return app.screen
 
     async def test_new_collection_creates_and_selects(self):
-        _seed_two_collections(eden_n=2, ffe_n=0)        # Eden active + FFE
+        _seed_two_collections(eden_n=2, ffe_n=0)        # DemoColl active + FFE
         app = sc.PlasmidApp()
         async with app.run_test(size=(140, 50)) as pilot:
             await pilot.pause()
             picker = await self._open_picker(
-                app, pilot, source="Eden", ids=["eden_0"], mode="move")
+                app, pilot, source="DemoColl", ids=["eden_0"], mode="move")
             assert type(picker).__name__ == "MoveCopyToCollectionModal"
             picker.query_one("#btn-movecopy-newcoll").action_press()
             await pilot.pause(0.2)
@@ -586,12 +586,12 @@ class TestMoveCopyNewCollection:
             app.exit()
 
     async def test_new_collection_rejects_duplicate(self):
-        _seed_two_collections(eden_n=1, ffe_n=0)        # Eden + FFE exist
+        _seed_two_collections(eden_n=1, ffe_n=0)        # DemoColl + FFE exist
         app = sc.PlasmidApp()
         async with app.run_test(size=(140, 50)) as pilot:
             await pilot.pause()
             picker = await self._open_picker(
-                app, pilot, source="Eden", ids=["eden_0"], mode="move")
+                app, pilot, source="DemoColl", ids=["eden_0"], mode="move")
             picker.query_one("#btn-movecopy-newcoll").action_press()
             await pilot.pause(0.2)
             name_modal = app.screen
@@ -609,7 +609,7 @@ class TestMoveCopyNewCollection:
         async with app.run_test(size=(140, 50)) as pilot:
             await pilot.pause()
             picker = await self._open_picker(
-                app, pilot, source="Eden", ids=["eden_0"], mode="move")
+                app, pilot, source="DemoColl", ids=["eden_0"], mode="move")
             before = {c.get("name") for c in sc._load_collections()}
             picker.query_one("#btn-movecopy-newcoll").action_press()
             await pilot.pause(0.2)

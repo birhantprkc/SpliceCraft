@@ -966,6 +966,84 @@ def _create_github_release(version: str) -> None:
         print(f"  Create it later with: gh release create {tag} …")
 
 
+_PRIVATE_NAMES_FILE = REPO_ROOT / ".private-names"
+
+
+def _check_private_tokens() -> None:
+    """Abort the release if any CONFIDENTIAL client name appears in a tracked
+    text file. `origin` is the PUBLIC release repo, so a leaked client
+    plasmid / construct / part name ships to every user via GitHub + the sdist.
+    Relying on a human (or an agent) to grep before each release kept failing —
+    this gate makes it impossible to forget.
+
+    Patterns (case-insensitive Python regex, one per line, `#` comments) live in
+    the GITIGNORED ``.private-names`` file — spelling the names in this tracked,
+    public-pushed script would itself leak them. When that file is absent (e.g.
+    a fresh clone on the other laptop) the gate WARNS loudly and continues, so a
+    missing list can't silently disable protection without being noticed. Set
+    SPLICECRAFT_SKIP_PRIVATE_CHECK=1 to bypass deliberately."""
+    if os.environ.get("SPLICECRAFT_SKIP_PRIVATE_CHECK", "").strip().lower() in (
+        "1", "true", "yes",
+    ):
+        print("  SPLICECRAFT_SKIP_PRIVATE_CHECK set — skipping the "
+              "confidential-name gate.")
+        return
+    _heading("Checking for confidential client names")
+    if not _PRIVATE_NAMES_FILE.is_file():
+        print("  ⚠ .private-names not found — the confidential-name gate is "
+              "DISABLED on this machine. Copy it from your other laptop "
+              "(out-of-band; it's gitignored) to re-enable. Continuing.")
+        return
+    patterns: list[re.Pattern[str]] = []
+    for raw in _PRIVATE_NAMES_FILE.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            patterns.append(re.compile(line, re.IGNORECASE))
+        except re.error as exc:
+            _die(f".private-names: bad regex {line!r}: {exc}")
+    if not patterns:
+        print("  .private-names has no patterns — gate is a no-op. Continuing.")
+        return
+    try:
+        tracked = subprocess.run(
+            ["git", "ls-files"], cwd=REPO_ROOT,
+            capture_output=True, text=True, check=True,
+        ).stdout.split()
+    except Exception as exc:                       # noqa: BLE001 — best-effort
+        _die(f"private-name gate: couldn't list tracked files ({exc}).")
+    skip_suffixes = {
+        ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".zip", ".gz",
+        ".whl", ".pyc", ".pdf", ".woff", ".woff2",
+    }
+    hits: list[str] = []
+    for rel in tracked:
+        p = REPO_ROOT / rel
+        if p.suffix.lower() in skip_suffixes or not p.is_file():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if any(pat.search(line) for pat in patterns):
+                hits.append(f"    {rel}:{lineno}: {line.strip()[:90]}")
+    if hits:
+        shown = "\n".join(hits[:40])
+        more = (f"\n    … and {len(hits) - 40} more"
+                if len(hits) > 40 else "")
+        _die(
+            "confidential client name(s) found in tracked files — `origin` is "
+            "PUBLIC, so releasing would leak them. Replace each with a generic "
+            "standin (e.g. promoter `Pdemo`, CDS `GeneX`, plasmid `Demo NN`), "
+            "or — if a name is genuinely public now — drop its pattern from "
+            ".private-names:\n" + shown + more
+        )
+    print(f"  Clean — none of the {len(patterns)} confidential pattern(s) "
+          "appear in tracked files.")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Cut a new SpliceCraft release.",
@@ -1006,6 +1084,7 @@ def main(argv: list[str] | None = None) -> int:
         _die(f"version must look like X.Y.Z (got {new_version!r}).")
 
     _summarize_pending_changes()
+    _check_private_tokens()
     _ensure_tag_unused(new_version)
     _ensure_changelog_entry(new_version)
 

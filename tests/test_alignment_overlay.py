@@ -2158,7 +2158,7 @@ class TestCircularAlignmentOffset:
     """`_find_circular_alignment_offset` rotates a circular target so
     the global pairwise align doesn't pair bp 1 of an arbitrarily-
     started Plasmidsaurus read with bp 1 of the GenBank reference.
-    Regression guard for Cory Tobin's report — pre-fix alignment of a
+    Regression guard for a user's report — pre-fix alignment of a
     700-bp-rotated read showed 66% identity + 500+ gaps; post-fix the
     same read aligns at 100% with zero gaps."""
 
@@ -2210,7 +2210,7 @@ class TestCircularAlignmentOffset:
     def test_pairwise_align_with_rotation_recovers_identity(self):
         """End-to-end: a rotated read aligned against the rotated
         target should produce near-100%% identity vs ~50-70%% without
-        rotation. This is the test that maps directly to Cory's GH #16
+        rotation. This is the test that maps directly to a user's GH #16
         screenshot."""
         import random
         rng = random.Random(20260514)
@@ -2561,22 +2561,22 @@ class TestSequencingScreen:
         from Bio.SeqRecord import SeqRecord
         # Synthesise a Plasmidsaurus-shaped zip: 2 samples with
         # consensus .gbk + summary.txt + per-base TSV.
-        rec1 = SeqRecord(Seq("ATGC" * 200), id="MAV34", name="MAV34",
+        rec1 = SeqRecord(Seq("ATGC" * 200), id="DEMO34", name="DEMO34",
                          annotations={"molecule_type": "DNA",
                                       "topology": "circular"})
-        rec2 = SeqRecord(Seq("GCAT" * 200), id="MAV35", name="MAV35",
+        rec2 = SeqRecord(Seq("GCAT" * 200), id="DEMO35", name="DEMO35",
                          annotations={"molecule_type": "DNA",
                                       "topology": "circular"})
-        gbk1 = tmp_path / "MAV34.gbk"
-        gbk2 = tmp_path / "MAV35.gbk"
+        gbk1 = tmp_path / "DEMO34.gbk"
+        gbk2 = tmp_path / "DEMO35.gbk"
         SeqIO.write(rec1, gbk1, "genbank")
         SeqIO.write(rec2, gbk2, "genbank")
         zp = tmp_path / "RUN42_results.zip"
         with zipfile.ZipFile(zp, "w") as zf:
-            zf.write(gbk1, "RUN42_genbank-files/RUN42_1_MAV34.gbk")
-            zf.write(gbk2, "RUN42_genbank-files/RUN42_2_MAV35.gbk")
+            zf.write(gbk1, "RUN42_genbank-files/RUN42_1_DEMO34.gbk")
+            zf.write(gbk2, "RUN42_genbank-files/RUN42_2_DEMO35.gbk")
             zf.writestr(
-                "RUN42_summary-files/RUN42_1_MAV34.txt",
+                "RUN42_summary-files/RUN42_1_DEMO34.txt",
                 "       1-mer (%)  2-mer (%)\n"
                 "moles       95.5        4.5\n"
                 "mass        90.1        9.9\n\n\n"
@@ -2584,7 +2584,7 @@ class TestSequencingScreen:
                 "E. coli genomic contamination: 12.3%\n",
             )
             zf.writestr(
-                "RUN42_summary-files/RUN42_2_MAV35.txt",
+                "RUN42_summary-files/RUN42_2_DEMO35.txt",
                 "       1-mer (%)  2-mer (%)\n"
                 "moles       99.9        0.1\n"
                 "mass        99.5        0.5\n\n\n"
@@ -2593,7 +2593,7 @@ class TestSequencingScreen:
             )
             # Synthetic per-base TSV: 5 rows, integer coverage.
             zf.writestr(
-                "RUN42_per-base-data/RUN42_1_MAV34.tsv",
+                "RUN42_per-base-data/RUN42_1_DEMO34.tsv",
                 "pos\tref\treads_all\n"
                 "1\tA\t30\n2\tT\t25\n3\tG\t40\n4\tC\t10\n5\tA\t50\n",
             )
@@ -2656,14 +2656,14 @@ class TestSequencingScreen:
         from Bio import SeqIO
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
-        rec = SeqRecord(Seq("ATGC" * 100), id="MAV1", name="MAV1",
+        rec = SeqRecord(Seq("ATGC" * 100), id="DEMO1", name="DEMO1",
                         annotations={"molecule_type": "DNA",
                                      "topology": "circular"})
-        gbk = tmp_path / "MAV1.gbk"
+        gbk = tmp_path / "DEMO1.gbk"
         SeqIO.write(rec, gbk, "genbank")
         zp = tmp_path / "RUN1_results.zip"
         with zipfile.ZipFile(zp, "w") as zf:
-            zf.write(gbk, "RUN1_genbank-files/RUN1_1_MAV1.gbk")
+            zf.write(gbk, "RUN1_genbank-files/RUN1_1_DEMO1.gbk")
         app = sc.PlasmidApp()
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
@@ -2710,7 +2710,7 @@ class TestSequencingScreen:
             # exercised end-to-end (verified via the button-enabled
             # state above). Static's content is private API in Textual
             # so we don't peek at it directly.
-            assert "MAV1" in str(screen._selected_member)
+            assert "DEMO1" in str(screen._selected_member)
 
     async def test_repick_same_zip_skips_reparse(
             self, tmp_path, tiny_record, isolated_library):
@@ -2721,13 +2721,13 @@ class TestSequencingScreen:
         from Bio import SeqIO
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
-        rec = SeqRecord(Seq("ATGC" * 50), id="MAV1", name="MAV1",
+        rec = SeqRecord(Seq("ATGC" * 50), id="DEMO1", name="DEMO1",
                         annotations={"molecule_type": "DNA"})
-        gbk = tmp_path / "MAV1.gbk"
+        gbk = tmp_path / "DEMO1.gbk"
         SeqIO.write(rec, gbk, "genbank")
         zp = tmp_path / "R_results.zip"
         with zipfile.ZipFile(zp, "w") as zf:
-            zf.write(gbk, "R_genbank-files/R_1_MAV1.gbk")
+            zf.write(gbk, "R_genbank-files/R_1_DEMO1.gbk")
         app = sc.PlasmidApp()
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
@@ -2843,21 +2843,21 @@ class TestPlasmidsaurusZipParser:
         return zp
 
     def test_parses_run_id_from_folder_prefix(self, tmp_path):
-        zp = self._build_zip(tmp_path, [("MAV1", None, None)],
+        zp = self._build_zip(tmp_path, [("DEMO1", None, None)],
                               run="ABC42")
         data = sc._parse_plasmidsaurus_zip(zp)
         assert data["run_id"] == "ABC42"
 
     def test_groups_files_under_one_sample(self, tmp_path):
         zp = self._build_zip(tmp_path, [
-            ("MAV1", "moles 99.0\nmass 98.0\nE. coli contamination: 5.0%\n",
+            ("DEMO1", "moles 99.0\nmass 98.0\nE. coli contamination: 5.0%\n",
              "pos\tref\treads_all\n1\tA\t30\n2\tT\t40\n"),
         ])
         data = sc._parse_plasmidsaurus_zip(zp)
         assert len(data["samples"]) == 1
         s = data["samples"][0]
         # Sample base collapses to the run_<n>_<name> stem.
-        assert s["base"].endswith("MAV1")
+        assert s["base"].endswith("DEMO1")
         # All categories landed on the same sample dict.
         assert s["gbk"]
         assert s["summary"]
@@ -2868,10 +2868,10 @@ class TestPlasmidsaurusZipParser:
         assert s["perbase_coverage"].get("mean") == 35.0
 
     def test_run_level_files_separated_from_samples(self, tmp_path):
-        zp = self._build_zip(tmp_path, [("MAV1", None, None)],
+        zp = self._build_zip(tmp_path, [("DEMO1", None, None)],
                               extra_files=[("RUN1_gel.png", b"PNG")])
         data = sc._parse_plasmidsaurus_zip(zp)
-        # Sample list has the one MAV1; run-level file shows up in
+        # Sample list has the one DEMO1; run-level file shows up in
         # `run_files`.
         assert len(data["samples"]) == 1
         run_paths = {rf["name"] for rf in data["run_files"]}
@@ -2921,7 +2921,7 @@ class TestPlasmidsaurusZipParser:
         """A malformed per-base TSV (no numeric column 2) should not
         crash the parser; the sample's `perbase_coverage` ends empty."""
         zp = self._build_zip(tmp_path, [
-            ("MAV1", None, "pos\tref\treads_all\n"
+            ("DEMO1", None, "pos\tref\treads_all\n"
                             "alpha\tbeta\tgamma\nA\tB\tC\n"),
         ])
         data = sc._parse_plasmidsaurus_zip(zp)
@@ -2934,7 +2934,7 @@ class TestPlasmidsaurusZipParser:
     def test_oversize_zip_rejected(self, tmp_path, monkeypatch):
         """A zip claiming to be larger than the cap is refused."""
         # Build a tiny zip then artificially cap to a smaller size.
-        zp = self._build_zip(tmp_path, [("MAV1", None, None)])
+        zp = self._build_zip(tmp_path, [("DEMO1", None, None)])
         monkeypatch.setattr(sc, "_PLASMIDSAURUS_ZIP_MAX_BYTES", 1)
         with pytest.raises(ValueError, match="too large"):
             sc._parse_plasmidsaurus_zip(zp)
@@ -3616,7 +3616,7 @@ class TestPlasmidsaurusLoadsTargetAsCanvas:
         """Picking a samples-table row populates `_selected_order_num`
         (1-based row index) and `_selected_gbk_basename` (.gbk leaf
         with extension stripped). These drive the alignment label."""
-        zp = self._build_min_zip(tmp_path, "RUN42_1_MAV34", "ATGC" * 50)
+        zp = self._build_min_zip(tmp_path, "RUN42_1_DEMO34", "ATGC" * 50)
         parsed = sc._parse_plasmidsaurus_zip(zp)
         screen = sc.SequencingScreen.__new__(sc.SequencingScreen)
         screen._zip_path = zp
@@ -3643,9 +3643,9 @@ class TestPlasmidsaurusLoadsTargetAsCanvas:
         # INV-73 (2026-05-25): basename is now post-processed by
         # `_display_label_for_gbk` — Plasmidsaurus run+order prefix
         # stripped, remaining underscores → spaces. Pre-fix the
-        # label was "RUN42_1_MAV34" (TUI-unfriendly per user
+        # label was "RUN42_1_DEMO34" (TUI-unfriendly per user
         # feedback).
-        assert screen._selected_gbk_basename == "MAV34"
+        assert screen._selected_gbk_basename == "DEMO34"
 
     def test_on_member_selected_resets_on_no_gbk(
             self, tmp_path, isolated_library):
@@ -3708,11 +3708,11 @@ class TestPlasmidsaurusLoadsTargetAsCanvas:
         ])
         # Plasmidsaurus zip containing one gbk that matches the target
         # exactly (so the alignment is trivially identity-100).
-        gbk = tmp_path / "RUN42_1_MAV34.gbk"
+        gbk = tmp_path / "RUN42_1_DEMO34.gbk"
         SeqIO.write(target_rec, gbk, "genbank")
         zp = tmp_path / "RUN42_results.zip"
         with zipfile.ZipFile(zp, "w") as zf:
-            zf.write(gbk, "RUN42_genbank-files/RUN42_1_MAV34.gbk")
+            zf.write(gbk, "RUN42_genbank-files/RUN42_1_DEMO34.gbk")
 
         app = sc.PlasmidApp()
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
@@ -3743,7 +3743,7 @@ class TestPlasmidsaurusLoadsTargetAsCanvas:
             assert samples, "fixture zip must contain at least one sample"
             screen._selected_member = samples[0]["gbk"]
             screen._selected_order_num = 1
-            screen._selected_gbk_basename = "RUN42_1_MAV34"
+            screen._selected_gbk_basename = "RUN42_1_DEMO34"
             # Point the target Select at our TARGET library entry.
             sel = screen.query_one("#align-target", Select)
             sel.value = "TARGET"
@@ -3760,8 +3760,8 @@ class TestPlasmidsaurusLoadsTargetAsCanvas:
             # Exactly one alignment, labelled `<order> <basename>`.
             assert len(app._alignments) == 1
             entry = app._alignments[0]
-            assert entry["name"] == "1 RUN42_1_MAV34"
-            assert entry["query_label"] == "1 RUN42_1_MAV34"
+            assert entry["name"] == "1 RUN42_1_DEMO34"
+            assert entry["query_label"] == "1 RUN42_1_DEMO34"
             # Source tag for the manager modal's batch-delete.
             assert entry.get("_stored_source") == "sequencing"
 
@@ -3785,11 +3785,11 @@ class TestPlasmidsaurusLoadsTargetAsCanvas:
              "size": len(target_seq), "n_feats": 0, "added": "2026-05-24",
              "gb_text": sc._record_to_gb_text(target_rec)},
         ])
-        gbk = tmp_path / "RUN42_1_MAV34.gbk"
+        gbk = tmp_path / "RUN42_1_DEMO34.gbk"
         SeqIO.write(target_rec, gbk, "genbank")
         zp = tmp_path / "RUN42_results.zip"
         with zipfile.ZipFile(zp, "w") as zf:
-            zf.write(gbk, "RUN42_genbank-files/RUN42_1_MAV34.gbk")
+            zf.write(gbk, "RUN42_genbank-files/RUN42_1_DEMO34.gbk")
 
         app = sc.PlasmidApp()
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
@@ -3811,7 +3811,7 @@ class TestPlasmidsaurusLoadsTargetAsCanvas:
             samples = screen._parsed_run.get("samples") or []
             screen._selected_member = samples[0]["gbk"]
             screen._selected_order_num = 1
-            screen._selected_gbk_basename = "RUN42_1_MAV34"
+            screen._selected_gbk_basename = "RUN42_1_DEMO34"
             sel = screen.query_one("#align-target", Select)
             sel.value = "TARGET2"
             screen._go(None)
@@ -3824,7 +3824,7 @@ class TestPlasmidsaurusLoadsTargetAsCanvas:
             t_entry = next(e for e in entries if e["id"] == "TARGET2")
             stored = t_entry.get("alignments") or []
             assert len(stored) == 1
-            assert stored[0]["label"] == "1 RUN42_1_MAV34"
+            assert stored[0]["label"] == "1 RUN42_1_DEMO34"
             assert stored[0]["source"] == "sequencing"
             assert stored[0]["visible"] is True
 
@@ -4520,20 +4520,20 @@ class TestExtractVariantsFromAlignment:
 
 class TestNormalizeForMatch:
     def test_strips_plasmidsaurus_prefix(self):
-        """`RUN42_1_MAV34` → `mav34` (drop run-id + order-num)."""
-        assert sc._normalize_for_match("RUN42_1_MAV34") == "mav34"
+        """`RUN42_1_DEMO34` → `demo34` (drop run-id + order-num)."""
+        assert sc._normalize_for_match("RUN42_1_DEMO34") == "demo34"
 
     def test_strips_path_and_extension(self):
         """Full zip-member path → leaf basename, no extension."""
         assert sc._normalize_for_match(
-            "RUN42_genbank-files/RUN42_1_MAV34.gbk",
-        ) == "mav34"
+            "RUN42_genbank-files/RUN42_1_DEMO34.gbk",
+        ) == "demo34"
 
     def test_strips_punctuation_and_lowercases(self):
-        """`MAV 38 CAM-cTPFuGFP+RUBY` → `mav38camctpfugfpruby`."""
+        """`DEMO 38 CAM-ctpReporter+REPORTERR` → `demo38camctpreporterreporterr`."""
         assert sc._normalize_for_match(
-            "MAV 38 CAM-cTPFuGFP+RUBY",
-        ) == "mav38camctpfugfpruby"
+            "DEMO 38 CAM-ctpReporter+REPORTERR",
+        ) == "demo38camctpreporterreporterr"
 
     def test_empty_input_returns_empty(self):
         assert sc._normalize_for_match("") == ""
@@ -4541,22 +4541,22 @@ class TestNormalizeForMatch:
 
 class TestMatchSamplesToLibrary:
     def test_exact_name_match(self):
-        """Sample `RUN42_1_MAV34` ↔ library entry `MAV 34` —
-        normalized forms are both `mav34`, exact match."""
+        """Sample `RUN42_1_DEMO34` ↔ library entry `DEMO 34` —
+        normalized forms are both `demo34`, exact match."""
         samples = [
-            {"name": "RUN42_1_MAV34",
-             "gbk": "RUN42_genbank-files/RUN42_1_MAV34.gbk"},
+            {"name": "RUN42_1_DEMO34",
+             "gbk": "RUN42_genbank-files/RUN42_1_DEMO34.gbk"},
         ]
         library = [
-            {"id": "MAV_34", "name": "MAV 34", "gb_text": ""},
-            {"id": "MAV_35", "name": "MAV 35", "gb_text": ""},
+            {"id": "DEMO_34", "name": "DEMO 34", "gb_text": ""},
+            {"id": "DEMO_35", "name": "DEMO 35", "gb_text": ""},
         ]
         out = sc._match_samples_to_library(
             samples, library, sequence_fallback=False,
         )
         assert len(out) == 1
         assert out[0]["action"] == "align"
-        assert out[0]["target_entry"]["id"] == "MAV_34"
+        assert out[0]["target_entry"]["id"] == "DEMO_34"
         assert out[0]["method"] == "name-exact"
         assert out[0]["score"] == 1.0
 
@@ -4593,18 +4593,18 @@ class TestMatchSamplesToLibrary:
         Now the matcher always computes k-mer Jaccard for every
         candidate and lets sequence beat a weak name match.
 
-        Setup: sample `CAM-2` (basename `cam2`) with one sequence.
+        Setup: sample `Cambi-2` (basename `cambi2`) with one sequence.
         Library has (a) `pCambia1300` (no sequence overlap; just
-        a name-substring coincidence), (b) `MAV 38` (the actual
+        a name-substring coincidence), (b) `DEMO 38` (the actual
         sequence source of the sample). Pre-fix the matcher picks
-        pCambia1300 because `cam2` is a substring of `cambia`-ish
-        normalisation; post-fix MAV 38 wins by k-mer Jaccard.
+        pCambia1300 because `cambi2` is a substring of `cambia`-ish
+        normalisation; post-fix DEMO 38 wins by k-mer Jaccard.
         """
         import zipfile
         from Bio import SeqIO
         from Bio.Seq import Seq
         from Bio.SeqRecord import SeqRecord
-        # The sample's sequence — also the body of MAV 38. Use a
+        # The sample's sequence — also the body of DEMO 38. Use a
         # non-repetitive seed so the canonical k-mer set has enough
         # cardinality (>= `_MIN_KMER_SET_FOR_STRONG_MATCH`, INV-73)
         # for the kmer-strong path to fire. Pre-INV-73 the test used
@@ -4619,35 +4619,35 @@ class TestMatchSamplesToLibrary:
         _rng2 = _random.Random(99999)
         decoy_seq = "".join(_rng2.choice("ACGT") for _ in range(1500))
         # Build a real zip so the matcher can extract the sample gbk.
-        gbk = tmp_path / "CAM-2.gbk"
+        gbk = tmp_path / "Cambi-2.gbk"
         SeqIO.write(
             SeqRecord(
-                Seq(true_target_seq), id="CAM-2", name="CAM-2",
+                Seq(true_target_seq), id="Cambi-2", name="Cambi-2",
                 annotations={"molecule_type": "DNA",
                               "topology": "circular"},
             ), gbk, "genbank",
         )
         zp = tmp_path / "RUN_results.zip"
         with zipfile.ZipFile(zp, "w") as zf:
-            zf.write(gbk, "RUN_genbank-files/RUN_1_CAM-2.gbk")
+            zf.write(gbk, "RUN_genbank-files/RUN_1_Cambi-2.gbk")
         samples = [{
-            "name": "RUN_1_CAM-2",
-            "gbk":  "RUN_genbank-files/RUN_1_CAM-2.gbk",
+            "name": "RUN_1_Cambi-2",
+            "gbk":  "RUN_genbank-files/RUN_1_Cambi-2.gbk",
         }]
         # Library has the decoy (name-substring trap) + the real
-        # target (sequence-only match — name doesn't substring CAM-2).
+        # target (sequence-only match — name doesn't substring Cambi-2).
         decoy_rec = SeqRecord(
             Seq(decoy_seq), id="pCambia1300", name="pCambia1300",
             annotations={"molecule_type": "DNA", "topology": "circular"},
         )
         target_rec = SeqRecord(
-            Seq(true_target_seq), id="MAV_38", name="MAV_38",
+            Seq(true_target_seq), id="DEMO_38", name="DEMO_38",
             annotations={"molecule_type": "DNA", "topology": "circular"},
         )
         library = [
             {"id": "pCambia1300", "name": "pCambia1300",
              "gb_text": sc._record_to_gb_text(decoy_rec)},
-            {"id": "MAV_38", "name": "MAV 38",
+            {"id": "DEMO_38", "name": "DEMO 38",
              "gb_text": sc._record_to_gb_text(target_rec)},
         ]
         out = sc._match_samples_to_library(
@@ -4657,10 +4657,10 @@ class TestMatchSamplesToLibrary:
             zip_path=zp,
         )
         assert len(out) == 1
-        # MAV 38 (sequence-identical) MUST win, not pCambia1300
+        # DEMO 38 (sequence-identical) MUST win, not pCambia1300
         # (name-substring coincidence).
-        assert out[0]["target_entry"]["id"] == "MAV_38", (
-            f"Expected MAV_38 (sequence-identical) but got "
+        assert out[0]["target_entry"]["id"] == "DEMO_38", (
+            f"Expected DEMO_38 (sequence-identical) but got "
             f"{out[0]['target_entry']['id']!r} — the matcher fell "
             f"back to name-substring over sequence again."
         )
@@ -5030,9 +5030,9 @@ class TestBulkAlignConfirmModalQualityColumns:
         from textual.widgets import DataTable
         from textual.coordinate import Coordinate
         matches = [{
-            "sample": {"name": "CAM4", "gbk": "cam4.gbk"},
+            "sample": {"name": "Smp4", "gbk": "smp4.gbk"},
             "action": "align",
-            "target_entry": {"id": "T", "name": "MAV40", "gb_text": "x"},
+            "target_entry": {"id": "T", "name": "DEMO40", "gb_text": "x"},
             "score": 1.0, "method": "kmer-strong", "note": "",
             "_aln": {"ident": 100.0 * 18093 / 18094, "mism": 1, "gaps": 0},
         }]
@@ -5060,9 +5060,9 @@ class TestBulkAlignConfirmModalQualityColumns:
         # aligned (no target / no consensus member / align failure); the
         # modal renders that as "?".
         matches = [{
-            "sample": {"name": "CAM4", "gbk": "cam4.gbk"},
+            "sample": {"name": "Smp4", "gbk": "smp4.gbk"},
             "action": "align",
-            "target_entry": {"id": "T", "name": "MAV40", "gb_text": "x"},
+            "target_entry": {"id": "T", "name": "DEMO40", "gb_text": "x"},
             "score": 1.0, "method": "kmer-strong", "note": "",
             "_aln": False,
         }]
@@ -5091,9 +5091,9 @@ class TestWidenedModalsAtNarrowWidth:
             self, tiny_record, isolated_library):
         from textual.widgets import DataTable
         matches = [{
-            "sample": {"name": "JP4W9V_4_MAV40-4", "gbk": "x.gbk"},
+            "sample": {"name": "JP4W9V_4_DEMO40-4", "gbk": "x.gbk"},
             "action": "align",
-            "target_entry": {"id": "T", "name": "MAV40 CAM D1var2+RUBY",
+            "target_entry": {"id": "T", "name": "DEMO40 CAM D1var2+REPORTERR",
                              "gb_text": "x"},
             "score": 1.0, "method": "kmer-strong", "note": "kmer-strong",
             "_aln": {"ident": 99.99, "mism": 1, "gaps": 0},
@@ -5119,8 +5119,8 @@ class TestWidenedModalsAtNarrowWidth:
             annotations={"molecule_type": "DNA", "topology": "linear"},
         )
         stored = [{
-            "id": "id1", "label": "JP4W9V_4_MAV40-4",
-            "query_label": "Q", "target_label": "MAV40 CAM D1var2+RUBY",
+            "id": "id1", "label": "JP4W9V_4_DEMO40-4",
+            "query_label": "Q", "target_label": "DEMO40 CAM D1var2+REPORTERR",
             "target_id": "T",
             "target_gb_text": sc._record_to_gb_text(rec),
             "axis": "query",
@@ -6048,10 +6048,10 @@ class TestBulkAlignNoGbkLogs:
         sc._log.warning(
             "BulkAlign: skipping sample %r — no .gbk member "
             "field (malformed manifest or missing consensus)",
-            "MAV34",
+            "DEMO34",
         )
         assert any(
-            "BulkAlign" in m and "MAV34" in m for m in captured
+            "BulkAlign" in m and "DEMO34" in m for m in captured
         )
 
 

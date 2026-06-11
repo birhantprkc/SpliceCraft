@@ -861,7 +861,7 @@ class TestAutosaveTimerCancel:
 
 class TestMirrorWriteHelper:
     """Regression for the 2026-05-25 live catastrophic-shrink
-    incident. Switching parts bins from Eden (26 parts) to FFE
+    incident. Switching parts bins from DemoColl (26 parts) to FFE
     (0 parts) tripped the L3 shrink guard because the bin-switch
     path used bare `_safe_save_json` instead of the mirror helper.
     User data was safe (shrink guard + lost_entries spillover

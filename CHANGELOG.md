@@ -14,6 +14,15 @@
 
 ---
 
+## [1.0.52] — 2026-06-10
+
+### Bug fixes
+
+- **A cloned plasmid keeps the name you typed — no more underscores.** After cloning via Alt+Shift+P and then editing the result on the canvas (e.g. deleting a feature), saving used to silently rewrite the plasmid's name — turning the spaces in `My Plasmid 7` into underscores (`My_Plasmid_7`) on the map title *and* the library list. The culprit: a feature delete / base edit rebuilt the record and dropped the typed display name, so the next save fell back to the GenBank LOCUS (which can't hold spaces). The typed name now rides through every edit and save, and a save can never overwrite a good library name with the underscore form.
+- **Restriction-site labels in a tight cloning site no longer overprint each other.** When several enzyme sites (e.g. SalI, BamHI, XmaI) sit within a few bases — a typical MCS — their labels could collide into a garbled readout like `(Sal())(BamHI)`. Each label now reserves its full rendered width, so labels that would overlap stack on separate rows and every site reads cleanly.
+
+---
+
 ## [1.0.51] — 2026-06-10
 
 ### Bug fixes
@@ -761,7 +770,7 @@ verified against the real code before it was touched. The full list:
 
 #### Bug fixes
 
-- **PCR amplicon names no longer get mangled with underscores.** Accepting the default name when saving an amplicon used to write something like `MAV_PCR_1200bp_1-1200` into the library row; it now reads cleanly (e.g. `MAV PCR 1200 bp (1-1200)`).
+- **PCR amplicon names no longer get mangled with underscores.** Accepting the default name when saving an amplicon used to write something like `DEMO_PCR_1200bp_1-1200` into the library row; it now reads cleanly (e.g. `DEMO PCR 1200 bp (1-1200)`).
 
 #### Hardening
 
@@ -851,7 +860,7 @@ A 4-area paranoid audit (restriction scanner, primer + PCR sim, domesticator + c
 #### Bug fixes (GB/MoClo/Gibson)
 
 - **Stale docstring** in `_assembly_fragment_from_source` claimed "smaller of the two released fragments becomes the carried insert" — directly contradicted by the actual `_pick_insert_fragment` priority ladder (backbone-marker → expected-overhang → size fallback). Rewrote to match the code and added an explicit "NEVER reintroduce size-only here" warning.
-- **Strategy-3 size-fallback now propagates to the caller** via a `_size_fallback_no_marker` flag on the returned fragment. Pre-fix the picker logged a warning when no fragment carried a backbone marker but the assembly worker silently used the smallest fragment — a multi-TU MOD that outgrew its alpha backbone (the MAV 26 case) could clone the wrong half.
+- **Strategy-3 size-fallback now propagates to the caller** via a `_size_fallback_no_marker` flag on the returned fragment. Pre-fix the picker logged a warning when no fragment carried a backbone marker but the assembly worker silently used the smallest fragment — a multi-TU MOD that outgrew its alpha backbone (the DEMO 26 case) could clone the wrong half.
 - **Gibson agent endpoint `min_overlap` floor raised to 10 bp** from 1 bp. Pre-fix `min_overlap=1` was accepted — a chain of fragments all sharing a single base at their ends would "assemble" into junk.
 
 #### Hardening
@@ -1056,7 +1065,7 @@ User feedback: alignment is the highest-stakes area in the codebase after data i
 
 #### Bug fixes
 
-- **Alignments to plasmids in a different collection no longer vanish on restart.** When you ran a Plasmidsaurus zip (or Alt+A) from one collection (say BLUE) but the target plasmid lived in another (say Eden), the alignment showed on the band during the session but was lost the moment you swapped records or quit. The flush walked only the active library, which was BLUE's snapshot — couldn't find the Eden target's id, returned silently, never wrote anywhere. Now the flush falls back to walking `collections.json` and persists into whichever collection holds the target. You get a toast telling you where it landed ("Alignment saved to "Eden" collection — switch there to see it"). For ad-hoc records that aren't in any collection at all (file open, NCBI fetch never added), a clear warning surfaces so you know to add the plasmid to a collection if you want the alignment to stick.
+- **Alignments to plasmids in a different collection no longer vanish on restart.** When you ran a Plasmidsaurus zip (or Alt+A) from one collection (say BLUE) but the target plasmid lived in another (say DemoColl), the alignment showed on the band during the session but was lost the moment you swapped records or quit. The flush walked only the active library, which was BLUE's snapshot — couldn't find the DemoColl target's id, returned silently, never wrote anywhere. Now the flush falls back to walking `collections.json` and persists into whichever collection holds the target. You get a toast telling you where it landed ("Alignment saved to "DemoColl" collection — switch there to see it"). For ad-hoc records that aren't in any collection at all (file open, NCBI fetch never added), a clear warning surfaces so you know to add the plasmid to a collection if you want the alignment to stick.
 - **Re-flushing the same alignment in one session no longer creates a duplicate row.** Pre-fix `_flush_active_alignments` minted a fresh uuid every serialize pass — so two quick `_align_worker` completions for the same target wrote the same alignment twice to disk. Now the canonical stored id is stamped back onto the in-memory entry (`_stored_id`) the moment serialise lands; the second flush matches it against the existing row by id and updates in place.
 
 #### New features
@@ -1344,7 +1353,7 @@ _(auto-generated changelog — no notable commits found since the previous relea
 
 ### Bug fixes
 
-- **Switching parts bins no longer fails with a catastrophic-shrink error.** Switching from a populated parts bin (e.g. "Eden Parts" with 26 parts) to an empty one (e.g. a freshly-created "FFE Parts") used to be refused by the catastrophic-shrink guard — your data was always safe (the guard saved every "lost" part to `lost_entries/` for triple safety), but the UI bin switch failed with no recovery path. The bin-switch save now correctly signals to the shrink guard that this is a deliberate mirror swap (the outgoing bin's parts are intact under their original name in `parts_bin_collections.json`). Same fix applied to collection-switch, project-switch (UI + agent endpoint), and project-delete-with-auto-promote.
+- **Switching parts bins no longer fails with a catastrophic-shrink error.** Switching from a populated parts bin (e.g. "DemoColl Parts" with 26 parts) to an empty one (e.g. a freshly-created "FFE Parts") used to be refused by the catastrophic-shrink guard — your data was always safe (the guard saved every "lost" part to `lost_entries/` for triple safety), but the UI bin switch failed with no recovery path. The bin-switch save now correctly signals to the shrink guard that this is a deliberate mirror swap (the outgoing bin's parts are intact under their original name in `parts_bin_collections.json`). Same fix applied to collection-switch, project-switch (UI + agent endpoint), and project-delete-with-auto-promote.
 - **Bare `@work` decorators caught at test time.** A new AST-walk test asserts every `@work(...)` decorator carries `thread=True`. A missing `thread=True` silently runs the worker on the UI thread as a coroutine — defeats the worker contract and freezes the app. Catches the next regression at test time instead of bug-report time.
 - **GFF3 strand column now validated.** Pre-sweep any string in the strand column was silently mapped to strand 0 (neither); a malformed GFF3 with embedded ANSI escape codes or HTML in the strand column would parse and could surface in toasts unescaped. Rows with strand outside `{+, -, ., ?}` are now skipped with a debug log.
 - **FASTA Open dialog can't OOM the app.** A 1 GB FASTA pasted into the Open dialog used to OOM the worker before any size check fired (`SeqIO.parse` is eager). New `_FASTA_MAX_BYTES = 64 MB` cap rejects oversized files BEFORE the parse runs, with a clear error message.
@@ -1392,7 +1401,7 @@ _(auto-generated changelog — no notable commits found since the previous relea
 
 ### Bug fixes
 
-- **Bulk-align no longer freezes the UI before the confirm modal opens.** The matcher used to run synchronously on the UI thread — for a sizeable library (e.g. Eden ~90 entries × 18 kb plasmids) it could lock the app for many seconds with no feedback, looking like a complete hang. The matcher now runs on a worker thread with a visible "Matching N samples to M library entries…" status and a rolling progress indicator.
+- **Bulk-align no longer freezes the UI before the confirm modal opens.** The matcher used to run synchronously on the UI thread — for a sizeable library (e.g. DemoColl ~90 entries × 18 kb plasmids) it could lock the app for many seconds with no feedback, looking like a complete hang. The matcher now runs on a worker thread with a visible "Matching N samples to M library entries…" status and a rolling progress indicator.
 - **Closing the Plasmidsaurus sequencing screen no longer crashes the app.** Hitting Close (or Esc) twice in quick succession, or having the screen dismissed by a callback chain mid-close, used to raise `ScreenStackError: Can't pop screen`. The cancel path is now one-shot and guards against being called when the screen is already gone.
 - **Status modal pops up reliably after rapid status changes on a large library.** Pre-fix, after a few quick `s`-key status updates on a 100+ MB library, the queued async collection-mirror writes saturated the cache lock for several seconds; subsequent `s` presses blocked silently with no modal appearing. Two fixes: the picker now reads its current-status display lock-free, and the actual save runs on a background worker (with optimistic cell repaint so you see the new status immediately). Rapid-fire status changes no longer freeze the UI thread waiting for in-flight mirror saves.
 - **Letter-mode overlay positions are now correct on rotated query alignments.** When the alignment had a non-zero query rotation (Alt+A diff against an RC'd or rotated read), the letter-mode display passed the wrong axis offset to the per-bp letter helper, shifting the rendered bases by N positions on the plasmid.
@@ -1401,7 +1410,7 @@ _(auto-generated changelog — no notable commits found since the previous relea
 
 ### New features
 
-- **Bulk-align now shows live per-sample progress.** Instead of a silent multi-minute wait, you see `Aligning 3/10: MAV34 → MAV_38…` and a filling progress bar in the Plasmidsaurus Samples tab. The progress widget activates immediately when you press Run (synchronously, before the first alignment kicks off) so there's no silent gap between confirming the batch and seeing things move. The final tally (aligned / added / add-failed / failed) stays on screen for 6 seconds after the batch completes, then auto-hides.
+- **Bulk-align now shows live per-sample progress.** Instead of a silent multi-minute wait, you see `Aligning 3/10: DEMO34 → DEMO_38…` and a filling progress bar in the Plasmidsaurus Samples tab. The progress widget activates immediately when you press Run (synchronously, before the first alignment kicks off) so there's no silent gap between confirming the batch and seeing things move. The final tally (aligned / added / add-failed / failed) stays on screen for 6 seconds after the batch completes, then auto-hides.
 - **ERROR plasmid status (red ball).** Fifth canonical workflow status next to DESIGNING / CLONING / SEQUENCING / VERIFIED. Use for plasmids whose sequencing came back showing a failed clone (wrong insert, frame-shift, contamination, etc.) that need revision. The library panel shows a red status ball; the status picker offers ERROR as a sibling of the existing options.
 
 ### Performance
@@ -1417,7 +1426,7 @@ _(auto-generated changelog — no notable commits found since the previous relea
 
 - **Bulk alignment now applies to every confirmed sample.** Previously, after you confirmed N samples in the Plasmidsaurus bulk-align modal, only the first one actually got its alignment and SEQUENCING tag applied — the rest were silently dropped. Fixed.
 - **The Seq-column ✓ no longer disappears when you change a plasmid's status.** Setting a SEQUENCING-tagged plasmid to VERIFIED used to wipe its stored alignment from the library panel. Now the ✓ stays put.
-- **Aligned plasmid rows show clean names.** Plasmidsaurus alignment labels used to read `1 RUN42_1_MAV34` with the raw run prefix and underscores. Now they read `1 MAV34` — Plasmidsaurus prefix stripped and any remaining underscores converted to spaces.
+- **Aligned plasmid rows show clean names.** Plasmidsaurus alignment labels used to read `1 RUN42_1_DEMO34` with the raw run prefix and underscores. Now they read `1 DEMO34` — Plasmidsaurus prefix stripped and any remaining underscores converted to spaces.
 - **Concurrent alignment workers no longer overwrite each other's saves.** If two alignment workers (Alt+A multi-align, Plasmidsaurus bulk, Alt+\\ diff) ran at the same time, the second one could clobber the first one's stored alignments. The flush path is now properly serialised.
 - **The verification report can't run the app out of memory anymore.** A divergent alignment (e.g., picking the wrong target) used to walk every column into a variant record — for a 200 kb mismatch, that's 200 000 dicts. Capped at 10 000 with a clear truncation indicator.
 - **Short samples no longer match the wrong plasmid by accident.** A tiny (~25 bp) Plasmidsaurus consensus could score a coincidental 100% k-mer hit against any library entry containing a primer-length match region, then get filed against the wrong plasmid. The matcher now requires a minimum-quality signal before trusting a strong sequence match.
@@ -3156,12 +3165,12 @@ are tracked for a future release.
 
 ### GitHub issues
 
-* **#9, #13, #15, #16 closed** after Cory Tobin's bug-report sweep
+* **#9, #13, #15, #16 closed** after a user's bug-report sweep
   in 0.8.1.
 * **#17 (whitespace → backslash in feature names)** has its
   defensive override regression-tested via
   `tests/test_commercialsaas_io.py::TestGH17LabelOverride` (4 new
-  tests). Awaiting Cory's retest on v0.8.2 before close.
+  tests). Awaiting a user's retest on v0.8.2 before close.
 
 ### Tests
 
@@ -3267,13 +3276,13 @@ Full suite: 2418 passed, 5 skipped (310 s on 8 cores).
 
 ---
 
-## [0.8.1] — 2026-05-14 — Cory Tobin issue sweep: F5 + alignment offset + custom enzyme list
+## [0.8.1] — 2026-05-14 — a user issue sweep: F5 + alignment offset + custom enzyme list
 
-Four threads, all driven by Cory Tobin's open GH issues:
+Four threads, all driven by a user's open GH issues:
 
 * **GH #15 — F5 muscle-memory restoration.** F5 was reassigned from
   "restore all panels" to "show construction history" in 0.7.11.0;
-  Cory reported that the new binding kept showing "No construction
+  a user reported that the new binding kept showing "No construction
   history recorded" instead of returning him to the split-window
   layout. Reverted: F5 → `focus_panel_all` (the F1-F4 inverse);
   history moves to F6 + Ctrl+H + the History menu tab. The
@@ -3310,7 +3319,7 @@ Four threads, all driven by Cory Tobin's open GH issues:
   in v0.7.9.0 is still working — `_exons` stamping in
   `PlasmidMap._parse`, splice-aware `_cds_aa_list`, and
   `_spliced_idx_to_genomic_bp` are all intact. Posted on GH asking
-  Cory to confirm so we can close.
+  a user to confirm so we can close.
 
 ### Added: `_find_circular_alignment_offset` + `_rotate_seq_record`
 
@@ -3427,7 +3436,7 @@ extraction, and overrides `feat.qualifiers["label"]` after BioPython's
 parse. Whatever the upstream parser does with whitespace, the
 displayed label now matches the source XML byte-for-byte (after only
 stripping NUL / CR / LF, which would break a single-row sidebar
-render). Defensive — Cory Tobin reported feature names with spaces
+render). Defensive — a user reported feature names with spaces
 appearing with backslashes after import (GH #17); we couldn't
 reproduce it with synthetic or real fixtures, but the override
 ensures whatever the XML actually carries is what the user sees.
@@ -3477,7 +3486,7 @@ markup parser.
   History XML's parent-label also uses the display name.
 - `LibraryPanel.add_entry` (Ctrl+Shift+A) reads
   `record._tui_display_name` if set (re-saving an already-loaded
-  entry no longer downgrades "MAV 32 + Test" to the sanitised
+  entry no longer downgrades "DEMO 32 + Test" to the sanitised
   LOCUS form).
 - `LoadPartSourceModal._resolve_match_to_record` stashes the
   library entry's `name` on the picked record as
@@ -3496,7 +3505,7 @@ markup parser.
   fallback to `record.name` for unsaved records.
 - Three callsites updated: plasmid map circular header (`_draw`),
   linear flag header (`_draw_linear_flag`), and window title in
-  `_mark_dirty` / `_mark_clean`. Reload "MAV 32 + Test" from the
+  `_mark_dirty` / `_mark_clean`. Reload "DEMO 32 + Test" from the
   library and every visible header reads it back exactly as
   typed — the underscored LOCUS form lives on the on-disk file
   only.
@@ -3526,7 +3535,7 @@ markup parser.
   * **Substring** match in either direction (typed name is a
     substring of an existing entry, or vice versa, and not an
     exact match) → yellow `⚠ similar to: ...` (up to 3) + Save
-    enabled. Catches "MAV 32" while you're typing "MAV 32 V2"
+    enabled. Catches "DEMO 32" while you're typing "DEMO 32 V2"
     without blocking the legit distinct name.
   * **Available** → bold green `✓ Name available`.
 - Cleaning-hint preview ("will save as: X") shows as the user
@@ -3551,7 +3560,7 @@ markup parser.
 Five threads land in this release: multi-bin parts storage (mirrors the
 plasmid Collections architecture), a multi-select Load Part picker
 (bulk-classify TUs in one shot), a classifier rewrite that fixes
-MAV-25-in-Alpha-2 + MoClo TUs in any acceptor (try BOTH digest
+DEMO-25-in-Alpha-2 + MoClo TUs in any acceptor (try BOTH digest
 fragments + drop enzyme-parity inference + per-acceptor stuffer-pair
 matching), `gb_text` storage on L1+ parts so the Constructor can chain
 them into MODs (with a library-fallback for existing parts-bin entries
@@ -3600,7 +3609,7 @@ library entries + refuses duplicate names in real time.
   instead of `_pick_insert_fragment`'s single guess. Library entries
   without `rep_origin` / antibiotic-resistance annotations no longer
   fall through to the wrong half when the insert outgrew the carrier
-  (the MAV 26 family in Cory's EDEN collection: 3250 bp body with
+  (the DEMO 26 family in a user's DemoColl collection: 3250 bp body with
   the correct GGAG/GTCA overhangs but a 1850 bp backbone with the
   mirrored GTCA/GGAG — pre-fix, the backbone got picked and matched
   nothing).
@@ -3618,7 +3627,7 @@ library entries + refuses duplicate names in real time.
   non-canonical boundary overhangs) classifies as
   `TU ({role})`. Cached per `(grammar_id, enzyme)` and invalidated
   by `_save_entry_vectors`.
-- Verified live on EDEN: all 7 MAV 25-31 plasmids now classify
+- Verified live on DemoColl: all 7 DEMO 25-31 plasmids now classify
   correctly with the right Alpha role surfaced.
 
 ### Fixed: Constructor assembly from Load-Part-saved TUs (MOD-from-TU chaining)
@@ -3633,7 +3642,7 @@ library entries + refuses duplicate names in real time.
   parts-bin entry has no inline gb_text, cross-reference the library
   by `id` OR `name` to recover it. Parts-bin entries saved before
   this version auto-fix on next Constructor use without re-Load.
-- Verified live on EDEN: all six possible MAV 26-31 × MAV 25 → Omega1
+- Verified live on DemoColl: all six possible DEMO 26-31 × DEMO 25 → Omega1
   MOD assemblies now succeed (each 10,409 bp or 10,730 bp depending
   on insert variant).
 
@@ -3644,7 +3653,7 @@ library entries + refuses duplicate names in real time.
   collection is empty).
 - Live duplicate-name detection on `Input.Changed`: case-folded
   match against existing display names AND against the sanitised
-  id space (catches `MAV 32` vs `MAV/32` both → `MAV_32`).
+  id space (catches `DEMO 32` vs `DEMO/32` both → `DEMO_32`).
 - Save button disabled while a duplicate is detected; red status
   line names the existing entry. Cleaning hint preview as the user
   types ("will save as: X") replaces the old 2-press confirmation
@@ -3693,8 +3702,8 @@ library entries + refuses duplicate names in real time.
   `tests/test_modal_boundaries.py::_MODAL_CASES`; fits in 160 × 48.
 - `NamePlasmidModal` CSS bumped 70 × auto → 80 × 32; still fits.
 
-**Contributors:** Cory Mozza (issue: MAV-25-in-Alpha-2 misclassification,
-EDEN collection diagnostic data).
+**Contributors:** a user Mozza (issue: DEMO-25-in-Alpha-2 misclassification,
+DemoColl collection diagnostic data).
 
 ---
 
@@ -3898,7 +3907,7 @@ tiers.
 
 ## [0.7.13.0] — 2026-05-11 — Biology audit: enzyme catalog + `codon_start` + wrap-cut highlight
 
-Cory Mozza (issue #14) led a deep biology audit that surfaced
+a user Mozza (issue #14) led a deep biology audit that surfaced
 24 cleavage-tuple errors in the enzyme catalog, a `/codon_start`
 qualifier ignored everywhere except GFF3 export, and several
 wrap-feature edge cases that flattened to whole-plasmid spans.
@@ -3953,7 +3962,7 @@ wrap-feature edge cases that flattened to whole-plasmid spans.
   users designing primers against alt-start ORFs were ending up with
   ATG-replaced inserts and didn't realise.
 
-**Contributors:** Cory Mozza (issue #14).
+**Contributors:** a user Mozza (issue #14).
 
 ---
 
@@ -4884,9 +4893,9 @@ not pytest targets — kept for future regression detection).
   synthesises an insert with the dropout's overhangs as sticky
   ends and `oh5 + insert + oh3` as the cloned content. Result:
   byte-exact correct cloned plasmids that match a real bench
-  reaction. Verified end-to-end with aeBlue (`/blueWT.fasta`)
+  reaction. Verified end-to-end with Chromo (`/blueWT.fasta`)
   cloned into `FFE 1 ENTRY UPD.dna` via Esp3I → 2433 bp plasmid
-  with FuGFP cassette excised + aeBlue in its place.
+  with Reporter cassette excised + Chromo in its place.
 - **Save-to-Collection diagnostic notify.** When a part lands in
   the collection with a stub backbone instead of the user's
   configured entry vector (no vector configured, vector lacks
@@ -4944,7 +4953,7 @@ not pytest targets — kept for future regression detection).
 - Test coverage: 4 new edge-case tests for the synthesis path
   (3-cut vector, zero-overhang part, no-cuts vector diagnostic,
   no-vector diagnostic) plus a regression test capturing the
-  exact aeBlue + FFE-1-style scenario that motivated the fix.
+  exact Chromo + FFE-1-style scenario that motivated the fix.
 
 ---
 

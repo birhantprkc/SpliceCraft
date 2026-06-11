@@ -942,7 +942,7 @@ class TestHistoryScreen:
     def test_app_has_history_and_restore_bindings(self):
         """F6 + Ctrl+H route to `show_history`; F5 restores the
         multi-panel view via `focus_panel_all`. Reverted from the
-        0.7.11.0 swap that broke Cory Tobin's muscle memory (GH #15) —
+        0.7.11.0 swap that broke a user's muscle memory (GH #15) —
         F5 returns to "all panels" again as the F1-F4 inverse. Surface
         assertions only — the click and modal-stack tests above cover
         behavior."""
@@ -2430,7 +2430,7 @@ class TestColorQualifierReadInPlasmidMap:
 
 
 class TestGH17LabelOverride:
-    """Regression guard for GH #17 (Cory Tobin, 2026-05-13): feature
+    """Regression guard for GH #17 (a user, 2026-05-13): feature
     names containing whitespace landed as `lac\\operator` instead of
     `lac operator` after .dna import. Root cause was BioPython's
     commercial SaaS format parser mangling whitespace on some payloads;
@@ -2826,7 +2826,7 @@ class TestHistoryRenderHelpers:
 
     def test_reopen_nudge_only_for_dna_sources(self):
         # Fires for .dna-sourced entries (both import paths carry .dna)…
-        assert sc._history_reopen_nudge("file:MAV 27.dna")
+        assert sc._history_reopen_nudge("file:DEMO 27.dna")
         assert sc._history_reopen_nudge("/home/x/p.DNA")     # path, any case
         # …never for hand-built constructs or non-.dna imports.
         assert sc._history_reopen_nudge("constructor:gb_l0:backbone") == ""

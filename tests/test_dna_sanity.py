@@ -281,7 +281,7 @@ class TestNEBEnzymesAgreeWithBioPython:
             )
 
     def test_every_enzyme_exists_in_rebase(self):
-        """Regression guard for issue #14 (cory-mozza, 2026-05-11):
+        """Regression guard for issue #14 (a user, 2026-05-11):
         SpliceCraft was listing enzymes that don't exist (BspLU11III) or
         have no commercial supplier (BsbI). The first crashes any wet-lab
         attempt; the second silently suggests a digest the user can never
@@ -1914,7 +1914,7 @@ class TestAnnotationTransfer:
 
 class TestCustomEnzymeListFilter:
     """`allowed_enzymes` parameter on `_scan_restriction_sites` (GH #13,
-    Cory Tobin 2026-05-14). When supplied, the scan restricts to JUST
+    a user 2026-05-14). When supplied, the scan restricts to JUST
     those enzymes — overrides `min_recognition_len` and `unique_only`
     so a hand-picked list always shows in full, regardless of cut
     count or recognition length.
