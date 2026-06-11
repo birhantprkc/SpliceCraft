@@ -2000,11 +2000,11 @@ class TestPrimerCollectionWorkflow:
             assert [pp["name"] for pp in now if pp.get("in_cart")] == ["P-C"]
 
 
-class TestPrimerFlapFlush:
-    """The 5' flap renders FLUSH against the bound bar — no space/gap before
-    the flap — in every orientation + wrap + mismatch case. The flap shares the
-    bound bar's row (BUG-G), so [arrow][bound][flap] (fwd: [flap][bound][arrow])
-    read as one continuous primer with no hole."""
+class TestPrimerFlapBumped:
+    """The unbound 5' flap renders on its OWN row, exactly ONE row farther from
+    the DNA than the bound bar — bound stays bound, the overhang lifts off it —
+    with ZERO gap: bound / flap / name are three CONSECUTIVE rows. Covers every
+    orientation + flap length + mismatch-bump + origin-wrap / linear-clip case."""
 
     SEQ = "ACGTACGTAC" * 20          # 200 bp
 
@@ -2019,23 +2019,32 @@ class TestPrimerFlapFlush:
             if cache is not None:
                 cache.clear()
 
-    def _bar_row(self, feat, arrow):
+    def _rows(self, feat):
         self._clear_seq_caches()
         txt = str(sc._build_seq_text(self.SEQ, [feat], line_width=len(self.SEQ)))
-        rows = txt.splitlines()
-        return next((r for r in rows if arrow in r), "")
+        return txt.splitlines()
 
-    def _assert_flush(self, feat, arrow, bound_len, flap_len):
-        """The primer's [arrow][bound][flap] (fwd: [flap][bound][arrow]) run is
-        ONE contiguous span — no blank cell, so no space before the flap.
-        Anchored on the arrow glyph so the bp-number row prefix doesn't matter."""
-        bar = self._bar_row(feat, arrow)
-        assert bar, f"no bound-bar row carrying {arrow!r}"
-        i = bar.index(arrow)
-        n = bound_len + flap_len + 1
-        seg = bar[i - (n - 1): i + 1] if arrow == "▶" else bar[i: i + n]
-        assert len(seg) == n and " " not in seg, \
-            f"gap/space in primer bar: {seg!r}"
+    @staticmethod
+    def _idx(rows, needle):
+        return next((i for i, r in enumerate(rows) if needle in r), -1)
+
+    def _assert_bumped(self, feat, arrow, flap_bases, label):
+        """Bound stays on its row; the flap sits EXACTLY one row farther from the
+        DNA than the bound (arrow) row; the name sits one row past the flap —
+        three consecutive rows, ZERO gap — and the flap is NOT on the bound row."""
+        rows = self._rows(feat)
+        a  = self._idx(rows, arrow)             # bound bar (arrow) row
+        f  = self._idx(rows, flap_bases)        # flap row
+        nm = self._idx(rows, label)             # name row
+        assert a >= 0 and f >= 0 and nm >= 0, \
+            f"missing row (arrow={a} flap={f} name={nm})"
+        # Bound is bound: the flap is NOT flush on the bound row.
+        assert flap_bases not in rows[a], f"flap still on the bound row: {rows[a]!r}"
+        step = -1 if arrow == "▶" else +1       # fwd lifts up, rev lifts down
+        # Flap exactly ONE row out from the bound bar — zero gap.
+        assert f == a + step, f"flap not 1 row out (arrow@{a} flap@{f})"
+        # Name immediately past the flap — three consecutive rows, zero gap.
+        assert nm == f + step, f"gap between flap and name (flap@{f} name@{nm})"
 
     @staticmethod
     def _fwd(start, end, flap_len, mism=None):
@@ -2061,53 +2070,63 @@ class TestPrimerFlapFlush:
             f["_bound_mismatch"] = mism
         return f
 
-    def test_forward_flap_flush(self):
-        self._assert_flush(self._fwd(40, 65, 11), "▶", 25, 11)
+    def test_forward_flap_bumped(self):
+        self._assert_bumped(self._fwd(40, 65, 11), "▶", "GCGCCGTCTCT", "F")
 
-    def test_reverse_flap_flush(self):
-        self._assert_flush(self._rev(40, 65, 11), "◀", 25, 11)
+    def test_reverse_flap_bumped(self):
+        self._assert_bumped(self._rev(40, 65, 11), "◀", "GCGCCGTCTCT"[::-1], "R")
 
-    def test_forward_short_flap_flush(self):
-        self._assert_flush(self._fwd(40, 65, 4), "▶", 25, 4)   # 4-bp pad-only
+    def test_forward_short_flap_bumped(self):
+        self._assert_bumped(self._fwd(40, 65, 4), "▶", "GCGC", "F")  # pad-only
 
-    def test_reverse_short_flap_flush(self):
-        self._assert_flush(self._rev(40, 65, 4), "◀", 25, 4)
+    def test_reverse_short_flap_bumped(self):
+        self._assert_bumped(self._rev(40, 65, 4), "◀", "GCGC"[::-1], "R")
 
-    def test_forward_long_flap_flush(self):
-        # full GB tail (pad+Esp3I+spacer+overhang ≈ 11+) stays flush
-        self._assert_flush(self._fwd(60, 90, 11), "▶", 30, 11)
+    def test_forward_long_flap_bumped(self):
+        self._assert_bumped(self._fwd(60, 90, 11), "▶", "GCGCCGTCTCT", "F")
 
-    def test_reverse_long_flap_flush(self):
-        self._assert_flush(self._rev(60, 90, 11), "◀", 30, 11)
+    def test_reverse_long_flap_bumped(self):
+        self._assert_bumped(self._rev(60, 90, 11), "◀", "GCGCCGTCTCT"[::-1], "R")
 
-    def test_reverse_flap_with_mismatch_flush(self):
-        # domestication-style: flap tail + an internal bump. The flap stays
-        # flush against the bound bar; the bump base shows inline on the bar.
-        self._assert_flush(self._rev(40, 65, 11, mism={50: "G"}), "◀", 25, 11)
+    def test_reverse_flap_with_mismatch_bumped(self):
+        # domestication-style: flap tail + an internal bump both ride the flap
+        # row, exactly one row off the bound bar.
+        self._assert_bumped(self._rev(40, 65, 11, mism={50: "G"}),
+                            "◀", "GCGCCGTCTCT"[::-1], "R")
 
-    def test_forward_flap_with_mismatch_flush(self):
-        self._assert_flush(self._fwd(40, 65, 11, mism={50: "G"}), "▶", 25, 11)
+    def test_forward_flap_with_mismatch_bumped(self):
+        self._assert_bumped(self._fwd(40, 65, 11, mism={50: "G"}),
+                            "▶", "GCGCCGTCTCT", "F")
 
-    def test_circular_origin_wrap_flap_renders(self):
-        # Forward primer near bp 0 on a circular molecule: the 5' flap wraps the
-        # origin (negative start). The flap painter must wrap it (mod total)
-        # without crashing or leaving a spurious blank on the bound bar.
+    def test_bump_only_primer_lifts_to_its_own_row(self):
+        # A mutagenic primer with NO 5' tail but an internal cure: the bump
+        # still lifts onto its own row, one off the bound bar (height 3 → name
+        # two rows out), zero gap.
+        f = self._fwd(40, 65, 0, mism={50: "G"})
+        for k in ("_flap_bases", "_flap_start", "_flap_end", "_flap_len"):
+            f.pop(k, None)
+        rows = self._rows(f)
+        a, nm = self._idx(rows, "▶"), self._idx(rows, "F")
+        assert a >= 0 and nm >= 0, (a, nm)
+        assert nm == a - 2, f"bump-only primer not height 3 (arrow@{a} name@{nm})"
+
+    def test_circular_origin_wrap_flap_bumped(self):
+        # Forward primer near bp 0: the 5' flap wraps the origin (negative
+        # start). It still lifts to its own row off the bound bar — no crash.
         f = self._fwd(3, 28, 11)
         f["_flap_start"] = -8           # [-8, 3) wraps the origin
-        self._clear_seq_caches()
-        txt = str(sc._build_seq_text(self.SEQ, [f], line_width=len(self.SEQ)))
-        assert "▶" in txt               # rendered, no crash
-        # The near (non-wrapped) flap part [0,3) is flush with the bound.
-        bar = self._bar_row(f, "▶")
-        i = bar.index("▶")
-        assert " " not in bar[i - (25 + 3 - 1): i + 1]
+        rows = self._rows(f)
+        a = self._idx(rows, "▶")
+        assert a >= 0                   # rendered, no crash
+        # The wrapped flap shows on the row ABOVE the bound bar, never on it.
+        assert "GCG" in rows[a - 1] and "GCG" not in rows[a], \
+            (rows[a - 1], rows[a])
 
     def test_linear_end_flap_clips_no_crash(self):
         # Reverse primer at the very END of a LINEAR fragment: the 5' flap
-        # dangles past the end and must CLIP (not wrap) without a crash.
+        # dangles past the end and CLIPS (not wraps) without a crash.
         n = len(self.SEQ)
         f = self._rev(n - 20, n, 11)    # flap [n, n+11) past the end
         f["_flap_linear"] = True
-        self._clear_seq_caches()
-        txt = str(sc._build_seq_text(self.SEQ, [f], line_width=n))
-        assert "◀" in txt               # bound bar rendered, flap clipped
+        rows = self._rows(f)
+        assert self._idx(rows, "◀") >= 0   # bound bar rendered, flap clipped

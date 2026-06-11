@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.56] — 2026-06-11
+
+### Bug fixes
+
+- **A primer's unbound overhang sits on its own row, lifted clear of the bound region.** A cloning primer's 5′ flap (the enzyme tail / fusion overhang it adds) used to render flush on the *same* row as the bound bar, so the unbound bases read as if they annealed. The overhang now lifts onto its own row one step out from the bound bar — bound bases against the DNA, overhang lifted off (up for a forward primer, down for a reverse), the name on the far side — with no gap. This applies to every primer however it reached the map, because the bound / overhang split is recomputed on each render from the stored oligo.
+
+---
+
 ## [1.0.55] — 2026-06-11
 
 ### Bug fixes
