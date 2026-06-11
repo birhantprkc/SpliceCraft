@@ -312,6 +312,103 @@ class TestMakeSyntheticFragment:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# _excise_pcr_insert — digest + gel-purify the insert (NO primer-pad carryover)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestExcisePcrInsert:
+    """The bench truth: a tailed PCR product cut with the cloning enzymes is
+    purified down to its MIDDLE fragment — the GCGC primer pad and the
+    recognition-site bases OUTSIDE the cut are off-cuts you throw away, so they
+    NEVER reach the clone. Regression for the user-reported "extra bases from
+    the GCGC SalI padding got integrated into the payload"."""
+
+    PAYLOAD = "ATGAAACGTACGGCCTTAACGTACGT"        # 26 bp, no internal sites
+
+    def test_tailed_amplicon_drops_pad_and_keeps_overhangs(self):
+        """SalI both ends (the user's enzyme — palindromic 5' overhang)."""
+        amp = "GCGC" + "GTCGAC" + self.PAYLOAD + "GTCGAC" + sc._rc("GCGC")
+        frag, err = sc._excise_pcr_insert(amp, "SalI", "SalI")
+        assert err is None, err
+        assert "GCGC" not in frag["top_seq"], "GCGC pad leaked into the insert"
+        assert self.PAYLOAD in frag["top_seq"], "payload mangled"
+        # G^TCGAC: insert retains TCGAC at the 5' end, is recessed to G at 3'.
+        assert frag["top_seq"].startswith("TCGAC")
+        assert frag["top_seq"].endswith("G")
+        assert frag["left"]["overhang_seq"] == "TCGA"
+        assert frag["right"]["overhang_seq"] == "TCGA"
+        assert frag["left"]["kind"] == "5'" and frag["right"]["kind"] == "5'"
+
+    def test_bare_payload_is_wrapped_then_purified(self):
+        """The manual 'Paste DNA' donor is the BARE region — wrap it in the
+        tails the primers would add, then digest to the same purified insert.
+        No pad, real EcoRI/BamHI overhangs."""
+        frag, err = sc._excise_pcr_insert(self.PAYLOAD, "EcoRI", "BamHI")
+        assert err is None, err
+        assert "GCGC" not in frag["top_seq"]
+        assert self.PAYLOAD in frag["top_seq"]
+        assert frag["top_seq"].startswith("AATTC")     # EcoRI G^AATTC
+        assert frag["top_seq"].endswith("G")           # BamHI G^GATCC
+        assert frag["left"]["overhang_seq"] == "AATT"
+        assert frag["right"]["overhang_seq"] == "GATC"
+
+    def test_three_prime_overhang_reforms_site(self):
+        """KpnI (GGTAC^C, 3' overhang) — the retained site bases live on the
+        OPPOSITE fragment, but the recognition site still reforms on ligation
+        and no pad survives."""
+        amp = "GCGC" + "GGTACC" + self.PAYLOAD + "GGTACC" + sc._rc("GCGC")
+        frag, err = sc._excise_pcr_insert(amp, "KpnI", "KpnI")
+        assert err is None, err
+        assert "GCGC" not in frag["top_seq"]
+        assert self.PAYLOAD in frag["top_seq"]
+        assert frag["left"]["kind"] == "3'" and frag["left"]["overhang_seq"] == "GTAC"
+
+    def test_features_land_on_payload_after_purify(self):
+        """An amplicon-local feature rides onto the purified insert at the
+        offset the retained 5' site bases imply (EcoRI keeps AATTC = 5 nt)."""
+        lead = len("GCGC") + len("GAATTC")             # 10
+        amp = "GCGC" + "GAATTC" + self.PAYLOAD + "GGATCC" + sc._rc("GCGC")
+        feats = [{"start": lead + 12, "end": lead + 21, "type": "CDS",
+                  "label": "MyGene", "strand": 1}]
+        frag, err = sc._excise_pcr_insert(amp, "EcoRI", "BamHI", features=feats)
+        assert err is None, err
+        g = [f for f in frag["features"] if f.get("label") == "MyGene"]
+        assert g, "feature dropped from purified insert"
+        assert g[0]["end"] - g[0]["start"] == 9        # length preserved
+        assert g[0]["start"] == 5 + 12                 # AATTC lead + payload off
+
+    def test_internal_site_refused(self):
+        """A copy of the enzyme site INSIDE the region would cut the amplicon
+        internally — refuse rather than ship a wrong/short clone."""
+        amp = ("GCGC" + "GAATTC" + "ATG" + "GAATTC" + "AAACGT"
+               + "GGATCC" + sc._rc("GCGC"))
+        frag, err = sc._excise_pcr_insert(amp, "EcoRI", "BamHI")
+        assert frag is None and err and "inside" in err.lower()
+
+    def test_type_iis_refused(self):
+        frag, err = sc._excise_pcr_insert(self.PAYLOAD, "BsaI", "EcoRI")
+        assert frag is None and err and "Type IIS" in err
+
+    def test_no_pad_in_final_clone_end_to_end(self):
+        """The whole point: simulate the ligation and prove the FINISHED clone
+        carries no GCGC pad and reforms the SalI site at the junction."""
+        amp = "GCGC" + "GTCGAC" + self.PAYLOAD + "GTCGAC" + sc._rc("GCGC")
+        ins, err = sc._excise_pcr_insert(amp, "SalI", "SalI")
+        assert err is None, err
+        vec = ("TTTTTTTTGTCGACAAAACCCCGGGGTTTTGTCGAC"
+               + "AAAAAAAAAAAA")                        # 2 SalI sites
+        vfrags, verr = sc._excise_fragment_pair(vec, ["SalI"], circular=True)
+        assert verr is None, verr
+        backbone = sc._pick_backbone_fragment(vfrags) or vfrags[0]
+        res = sc._simulate_traditional_cloning(ins, backbone)
+        prod = res["forward"]["top_seq"]
+        assert "GCGC" not in prod, "pad leaked into the final clone"
+        assert self.PAYLOAD in prod
+        # One SalI reforms at the internal junction; the other wraps the origin.
+        assert (prod + prod[:5]).count("GTCGAC") >= 2
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # _ligate_fragments + _close_circular (compatibility predicate)
 # ──────────────────────────────────────────────────────────────────────────────
 

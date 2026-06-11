@@ -4359,6 +4359,52 @@ class TestDeleteClearsStaleData:
             assert app._unsaved is False
 
 
+class TestFeatureDeleteRestacksCleanly:
+    """Deleting a feature must re-flow the sequence-panel feature stacking —
+    the deleted feature's lane art can't linger. The risk: a delete leaves the
+    DNA (and so `hash(seq)`) unchanged, and the replacement `feats` list can
+    land on the freed list's `id()` (CPython recycles addresses), so the
+    `_CHUNK_STATIC_CACHE` key — which keys on `id(feats)` — could collide with
+    the PRE-delete entry and paint the stale stack. The key now carries
+    `len(feats)` (matching `_BUILD_SEQ_CACHE` / `_CHUNK_LAYOUT_CACHE`), so a
+    same-sequence delete always invalidates. Mutating ONE list in place is a
+    deterministic stand-in for that id-reuse: same object id, same seq, one
+    fewer feature."""
+
+    def test_static_cache_restacks_after_same_id_delete(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        seq = "".join("ACGT"[(i * 7) % 4] for i in range(240))
+        rec = SeqRecord(Seq(seq), id="T", name="T")
+        rec.annotations.update(molecule_type="DNA", topology="circular")
+        # Four overlapping features → multiple stacked lanes.
+        spans = [(10, 120, "ALPHA"), (20, 130, "BRAVO"),
+                 (30, 140, "CHARLIE"), (40, 150, "DELTAXX")]
+        for s, e, lab in spans:
+            rec.features.append(SeqFeature(
+                FeatureLocation(s, e, strand=1),
+                type="misc_feature", qualifiers={"label": [lab]}))
+        pm = sc.PlasmidMap()
+        pm.load_record(rec)
+        feats = pm._feats
+        sc._CHUNK_STATIC_CACHE.clear()
+        before = str(sc._build_seq_text(seq, feats, line_width=120))
+        assert "CHARLIE" in before, "feature should render before delete"
+        # Delete CHARLIE on the SAME object id (the id-reuse case), seq intact.
+        same_id = id(feats)
+        feats.pop(next(i for i, f in enumerate(feats)
+                       if f["label"] == "CHARLIE"))
+        assert id(feats) == same_id
+        after = str(sc._build_seq_text(seq, feats, line_width=120))
+        assert "CHARLIE" not in after, (
+            "stale lane art: the deleted feature still renders — the "
+            "_CHUNK_STATIC_CACHE key must include len(feats) so a same-seq "
+            "delete with a reused list id can't hit the pre-delete stack")
+        for lab in ("ALPHA", "BRAVO", "DELTAXX"):
+            assert lab in after, f"survivor {lab} dropped after re-stack"
+
+
 class TestCrashRecoveryNoticeOncePerSet:
     """`_check_crash_recovery` should warn ONCE per leftover set —
     same files / same mtimes on the next launch should NOT re-fire

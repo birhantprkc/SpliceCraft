@@ -1249,6 +1249,39 @@ class TestPrimerMismatchBump:
         assert f.get("_flap_len") == 4                 # 5' overhang = first 4 bp
 
 
+class TestCloningPrimerFlapAfterPurify:
+    """The unbound 5' flap of a cloning primer renders correctly ONLY once the
+    insert digest purifies the primer pad out of the product (INV-119). With
+    the pad still in the clone (the pre-fix carryover bug) the WHOLE primer —
+    pad + binding — matches the product contiguously, so `_rederive_primer_
+    binding` returns a full-length footprint and the flap collapses to zero
+    (the primer looks fully bound). Purifying the off-cuts removes the pad, so
+    only the 3' annealing arm matches and the pad re-emerges as the flap. No
+    flap-render code changed — the flap was a symptom of the pad carryover."""
+
+    BIND = "ATGAAACGTACGGCCTTAACG"          # 21 nt that anneals
+    PRIMER = "GCGC" + "GTCGAC" + BIND        # GCGC pad + SalI + binding (31 nt)
+
+    def test_pad_laden_product_binds_whole_primer_no_flap(self):
+        # Pre-fix product still carries [pad][site] right before the binding.
+        buggy = "TTTTTTTTTT" + self.PRIMER + "CCCCCCCCCC"
+        rb = sc._rederive_primer_binding(self.PRIMER, 1, buggy, len(buggy),
+                                         hint_start=0, circular=False)
+        assert rb is not None and (rb[1] - rb[0]) == len(self.PRIMER), (
+            "pad carryover makes the whole primer match → flap would vanish")
+
+    def test_purified_product_leaves_pad_as_flap(self):
+        # Fixed product: SalI site reforms at the junction, but the GCGC pad is
+        # gone. The primer binds the reformed GTCGAC + arm; only the 4 nt pad
+        # flaps.
+        fixed = "AAAAAAAA" + "GTCGAC" + self.BIND + "TTTTTTTT"
+        rb = sc._rederive_primer_binding(self.PRIMER, 1, fixed, len(fixed),
+                                         hint_start=0, circular=False)
+        assert rb is not None
+        flap = len(self.PRIMER) - (rb[1] - rb[0])
+        assert flap == 4, f"the 4 nt GCGC pad must read as the flap, got {flap}"
+
+
 class TestRederiveStrictNotOffset:
     """`_rederive_primer_binding` must NOT slide a primer to a best-offset when
     the strict contiguous-suffix search fails — `_attach_pcr_primers_to_record`

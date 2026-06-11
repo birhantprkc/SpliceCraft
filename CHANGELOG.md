@@ -14,6 +14,16 @@
 
 ---
 
+## [1.0.51] — 2026-06-10
+
+### Bug fixes
+
+- **Traditional cloning no longer bakes the primer padding into your clone.** When you cut a PCR fragment with an enzyme to clone it into a plasmid (the Alt+Shift+P → Traditional cloning flow), the `GCGC` primer pad and the bit of the recognition site *outside* the cut used to get carried into the finished construct — extra bases that aren't biologically there (e.g. the `GCGC` ahead of a SalI site ending up inside the payload). The digest now does what the bench does: it **cuts and purifies away the off-cuts**, keeping only the middle fragment, so the clone contains *no* carried-over primer bases — just the recognition site reformed at each junction and your insert. Works whether you paste a real PCR product (with its primer tails) or the bare region you amplified, and it refuses cleanly if the enzyme's site sits *inside* your insert (which would cut the amplicon internally at the bench).
+- **Cloning primers now render their unbound 5′ flap on the clone.** Because the pad no longer leaks into the product, each cloning primer's `GCGC` tail correctly shows as an **unbound 5′ flap** hanging off where the primer anneals, instead of looking fully bound — so the sequence panel shows the real bound/unbound split.
+- **Deleting a feature now re-flows the feature stacking.** Removing a feature from a plasmid could leave its lane art behind — the deleted feature, or stale stacking from it, lingering on the circular map and the sequence panel until some unrelated redraw cleared it. Delete now always re-stacks cleanly: the deleted feature is gone and the survivors re-pack immediately, on both the map and the sequence panel.
+
+---
+
 ## [1.0.50] — 2026-06-10
 
 ### Bug fixes

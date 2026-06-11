@@ -356,10 +356,14 @@ spans, even when the highlight crosses the plasmid origin — **saves the named
 amplicon to your library** as a reusable linear PCR product (its features and
 both run primers travel with it, the primers drawn as primer-binding sites), and
 opens the Constructor's Traditional cloning tab (pre-loaded when you chose a
-vector — just Simulate). The cloned product keeps those insert features, shows
-where the cloning primers bind, and flags any vector feature your cut sites land
-inside as *(disrupted)*, so dropping an insert into a lacZα MCS reads as the
-knock-out it is. It's also where you **Migrate
+vector — just Simulate). Simulating **digests the amplicon and purifies away the
+off-cuts** — exactly like cutting and gel-purifying at the bench — so the
+recognition site reforms at each junction and *none* of the primer pad / outside-
+the-cut bases carry into the construct (no stray extra bases in your clone). The
+cloned product keeps those insert features, shows where the cloning primers bind
+(the unbound 5′ enzyme-site tail drawn as a flap), and flags any vector feature
+your cut sites land inside as *(disrupted)*, so dropping an insert into a lacZα
+MCS reads as the knock-out it is. It's also where you **Migrate
 Data** — package your *entire* setup
 (library, collections, parts, primers, features, grammars, codon tables,
 settings, lab notebook, and full construction history) into one portable,
