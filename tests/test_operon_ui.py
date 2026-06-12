@@ -252,3 +252,157 @@ class TestOperonFetchButton:
             lux = next(c for c in sc._load_protein_collections()
                        if c["name"] == "Lux")
             assert lux["proteins"] == []
+
+
+class TestNativeOperonLift:
+    """Native Operon Domestication sub-tab — lift a natural operon from the
+    canvas selection or auto-detected from a record (Phase 3)."""
+
+    async def test_native_subtab_buttons_present(self):
+        from textual.widgets import Button
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            for _ in range(4):
+                await pilot.pause()
+            screen = app.screen
+            screen.query_one("#syn-tabs", TabbedContent).active = "syn-tab-operon"
+            for _ in range(3):
+                await pilot.pause()
+            screen.query_one("#syn-operon-subtabs",
+                             TabbedContent).active = "syn-op-sub-native"
+            for _ in range(3):
+                await pilot.pause()
+            assert screen.query_one("#btn-native-lift-sel", Button)
+            assert screen.query_one("#btn-native-from-plasmid", Button)
+            assert screen.query_one("#btn-native-from-ncbi", Button)
+            assert screen.query_one("#btn-native-cure", Button)
+            assert screen.query_one("#syn-native-grammar", Select)
+
+    async def test_lift_from_record_autodetects_span(self):
+        """A picked/fetched record's operon is the first-CDS→last-CDS span,
+        features rebased to [0, span); a reverse-strand CDS keeps strand=-1."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        body = "ATGAAACCCGGGTTTAAA"
+        seq = "TT" + body * 7 + "GG" + body * 7 + "CC"
+        a_start, a_end = 2, 2 + len(body) * 7
+        b_start, b_end = a_end + 2, a_end + 2 + len(body) * 7
+        rec = SeqRecord(Seq(seq), id="recop", name="recop",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "linear"})
+        rec.features = [
+            SeqFeature(FeatureLocation(a_start, a_end, strand=1), type="CDS",
+                       qualifiers={"label": ["geneA"]}),
+            SeqFeature(FeatureLocation(b_start, b_end, strand=-1), type="CDS",
+                       qualifiers={"label": ["geneB"]}),
+        ]
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            for _ in range(4):
+                await pilot.pause()
+            screen = app.screen
+            screen._native_lift_from_record(rec, "test:recop")
+            for _ in range(3):
+                await pilot.pause()
+            op = screen._native_operon
+            assert op is not None, "auto-detect lift produced nothing"
+            assert len(op["seq"]) == b_end - a_start
+            labels = {f.get("label") for f in op["feats"]}
+            assert {"geneA", "geneB"} <= labels
+            gb = next(f for f in op["feats"] if f.get("label") == "geneB")
+            assert int(gb.get("strand", 1)) == -1
+
+    async def test_lift_selection_from_canvas(self):
+        """Lift the operon highlighted on the main canvas while the Synthesis
+        screen is pushed on top — verifies the cross-screen seq-panel/map
+        reach works (else the whole Lift-selection path is broken)."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        seq = "ATGAAACCCGGGTTT" * 30          # 450 bp
+        rec = SeqRecord(Seq(seq), id="canvasop", name="canvasop",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [SeqFeature(FeatureLocation(60, 360, strand=1),
+                                   type="CDS", qualifiers={"label": ["luxX"]})]
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app._apply_record(rec)
+            for _ in range(5):
+                await pilot.pause()
+            app.query_one("#seq-panel", sc.SequencePanel)._user_sel = (50, 400)
+            app.action_open_synthesis()
+            for _ in range(5):
+                await pilot.pause()
+            screen = app.screen
+            screen._native_lift_selection(None)
+            for _ in range(3):
+                await pilot.pause()
+            op = screen._native_operon
+            assert op is not None, "canvas Lift selection produced nothing"
+            assert len(op["seq"]) == 350
+            assert "luxX" in {f.get("label") for f in op["feats"]}
+
+    async def test_cure_and_clone_end_to_end(self):
+        """Lift → Cure & design (worker) → result clean + clone button enabled →
+        Clone into grammar saves the cured operon + its SOE primers."""
+        from textual.widgets import Button
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        cds_a = "ATG" + "AAA" * 10 + "GGTCTC" + "AAA" * 10 + "TAA"  # BsaI
+        cds_b = "ATG" + "AAA" * 10 + "CGTCTC" + "AAA" * 10 + "TAA"  # Esp3I
+        inter = "ATAATAATAATA"
+        seq = cds_a + inter + cds_b
+        rec = SeqRecord(Seq(seq), id="luxop", name="luxop",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "linear"})
+        rec.features = [
+            SeqFeature(FeatureLocation(0, len(cds_a), strand=1), type="CDS",
+                       qualifiers={"label": ["cdsA"]}),
+            SeqFeature(FeatureLocation(len(cds_a) + len(inter), len(seq),
+                                       strand=1), type="CDS",
+                       qualifiers={"label": ["cdsB"]}),
+        ]
+        forb = sc._BUILTIN_GRAMMARS["gb_l0"]["forbidden_sites"]
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            for _ in range(4):
+                await pilot.pause()
+            screen = app.screen
+            screen._native_lift_from_record(rec, "test:luxop")
+            for _ in range(2):
+                await pilot.pause()
+            assert screen._native_operon is not None
+            n_primers_before = len(sc._load_primers())
+            screen._native_cure(None)
+            await app.workers.wait_for_complete()
+            for _ in range(4):
+                await pilot.pause()
+            res = screen._native_result
+            assert res is not None and res.get("ok"), res
+            assert sc._gb_find_forbidden_hits(res["cured_seq"], forb) == []
+            assert screen.query_one("#btn-native-clone", Button).disabled is False
+            # Clone → outputs saved.
+            screen._native_clone(None)
+            for _ in range(3):
+                await pilot.pause()
+            assert len(sc._load_primers()) >= n_primers_before + len(res["primers"])
+            saved = [e for c in sc._load_collections()
+                     for e in c.get("plasmids", [])
+                     if e.get("source") == "native_operon"]
+            assert saved, "domesticated operon not saved to the library"
+            # ...and as a grammar-tagged OPERON L0 part (CDS-equivalent).
+            parts = [p for p in sc._load_parts_bin()
+                     if p.get("type") == "OPERON"]
+            assert parts, "OPERON L0 part not saved to the parts bin"
+            assert parts[-1]["oh5"] == "AATG" and parts[-1]["oh3"] == "GCTT"
+            assert parts[-1].get("grammar") == "gb_l0"

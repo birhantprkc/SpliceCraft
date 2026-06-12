@@ -14,6 +14,20 @@
 
 ---
 
+## [1.0.60] — 2026-06-12
+
+### New features
+
+- **Alt+Shift+P is now a selection→cloning hub.** Highlight any stretch of DNA and choose where it goes: Traditional restriction cloning, Golden Braid / MoClo (or any custom grammar) domestication, or Gibson assembly — each opens pre-populated with your selection *and its features*. The old Alt+Shift+P went straight to Traditional cloning; that's now one of the buttons (unchanged behaviour).
+- **Native Operon Domestication** — a new sub-tab in Synthesis ▸ Operon Design. Lift a *natural* operon from the canvas selection, a library plasmid, or an NCBI accession; cure the Type IIS sites your chosen grammar forbids — plus any extra enzymes you name in **Also cure** (e.g. EcoRI, KpnI) to scrub downstream cloning sites too; and clone it into that grammar with its features intact. Because you amplify the native DNA off a microbe (nothing is synthesized), **every cure is carried by a primer**: synonymous codon swaps inside each CDS (correct reading frame — reverse-strand and multi-CDS operons included, and a stop codon never becomes sense), plus a guided single-base fix you pick for any site outside a CDS. SpliceCraft designs the SOE-PCR primer set (a flanking cassette pair + one mutagenic pair per cure junction), refuses to proceed unless every cure is primer-encoded, and saves the cured operon as a CDS-equivalent **OPERON** L0 part — a new Golden Braid position (AATG carries the first gene's start codon, GCTT meets a terminator) so it clones between a promoter and a terminator like any CDS — plus a library copy of the construct and the primer set.
+- **The previous Operon Design workbench is now “Synthetic Operon Construction.”** The forward-design flow (proteins → tuned RBS → assembled operon) is unchanged — just renamed to sit beside Native Operon Domestication.
+
+### Hardening
+
+- **Gibson assembly now carries your fragment's features through to the product.** A region sent to Gibson — via the new hub or the Synthesis “Clone Fragment” handoff — arrives with its annotations, the way the Traditional path already did. No more featureless insert.
+
+---
+
 ## [1.0.59] — 2026-06-12
 
 ### Bug fixes

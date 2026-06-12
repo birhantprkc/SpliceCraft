@@ -241,7 +241,8 @@ whatever **features** you'd annotated on it (the optimized CDS bar, say),
 redrawn at the right bases on the amplicon. Both the DNA and Protein
 tabs also carry a **Clear** button — a mouse twin for the keyboard reset — that
 empties the editor, prompting first if you have unsaved edits.
-The **Operon Design tab** turns the codon optimizer and SpliceCraft's
+The **Operon Design tab** has two sub-tabs. **Synthetic Operon Construction**
+turns the codon optimizer and SpliceCraft's
 built-in RBS engine into an expression-tuning workbench. Keep a library of
 **protein collections** on the right (add a protein by pasting a sequence,
 grabbing a CDS from any plasmid in your library with **From feature**, or
@@ -255,6 +256,24 @@ per gene + terminator) drops into the DNA tab fully annotated, ready to add cut
 sites or **Clone Fragment**. It's all pure-Python — the RNA folding,
 cofolding, and translation-initiation model ship inside SpliceCraft with no
 external dependencies.
+
+**Native Operon Domestication** is the reverse workflow: lift a *natural* operon
+— from the canvas selection, a library plasmid, or an NCBI accession — cure the
+Type IIS sites your chosen grammar forbids (plus any extra enzymes you list in
+**Also cure**, e.g. `EcoRI, KpnI`, to scrub downstream cloning sites too), and
+clone it into that grammar with its features intact. Because you amplify native DNA off a microbe (nothing is
+synthesized), every cure is carried by a primer: synonymous substitutions inside
+each CDS (in the correct reading frame — reverse-strand and multi-CDS operons
+included, and a stop codon never becomes sense), plus a guided single-base fix
+you pick for any site that falls outside a CDS. SpliceCraft designs the
+**SOE-PCR primer set** (a flanking cassette pair plus one mutagenic pair per cure
+junction) and refuses to proceed unless *every* cure is primer-encoded. The cured
+operon is saved as a CDS-equivalent **OPERON** L0 part — a Golden Braid position
+whose AATG overhang carries the first gene's start codon and whose GCTT meets a
+terminator, so it drops into your assembly between a promoter and a terminator
+exactly like a CDS — alongside a library copy of the construct and the SOE
+primers in your primer library.
+
 **Save** (and **Save As**, which forks a copy and only lights up once the
 fragment has been saved once) let you pick which collection the fragment lands
 in, and keep editing it there.
@@ -346,10 +365,13 @@ The housekeeping. **File** opens local files, fetches from NCBI, saves,
 exports (GenBank / FASTA / GFF3), bulk-imports a folder, and restores from
 backup. Every GenBank SpliceCraft writes (library entries, exports, autosaves)
 records a `Created by SpliceCraft v… on …` line in its COMMENT, so a file's
-origin is always traceable. It also runs record-level jobs — including
-**Clone selected region** (also **Alt+Shift+P**):
-highlight any stretch of DNA in the sequence panel and name the amplicon. The
-cut-site dialog **steers you to a working enzyme pair** — it marks any enzyme
+origin is always traceable. It also runs record-level jobs — including the **selection→cloning hub**
+(**Alt+Shift+P**): highlight any stretch of DNA in the sequence panel and pick a
+pipeline — **Traditional** restriction cloning, **Golden Braid** / **MoClo** (or
+any custom grammar) domestication, or **Gibson** assembly. Each opens
+pre-populated with the selection *and its features*. The **Traditional** branch
+names the amplicon, then the cut-site dialog **steers you to a working enzyme
+pair** — it marks any enzyme
 whose site falls inside your selection (`✗`) or that's Type IIS, lists the
 usable ones first, and pre-picks a viable directional pair; pick a **destination
 vector** there too and it flags enzymes that vector can't be opened with (`⚠`),

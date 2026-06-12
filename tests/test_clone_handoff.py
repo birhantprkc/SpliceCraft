@@ -501,11 +501,12 @@ class TestCloneRegion:
                 f"region feature not carried into the donor: {pf}"
 
     def test_clone_region_shortcut_bound(self):
-        """Alt+Shift+P triggers Clone selected region, without clobbering the
-        existing Alt+Shift+C (Capture → Feature library) binding."""
+        """Alt+Shift+P opens the selection→cloning-pipeline hub, without
+        clobbering the existing Alt+Shift+C (Capture → Feature library)
+        binding."""
         binds = {(b.key, b.action) for b in sc.PlasmidApp.BINDINGS
                  if hasattr(b, "key")}
-        assert ("alt+shift+p", "clone_region") in binds
+        assert ("alt+shift+p", "send_selection_to_pipeline") in binds
         assert ("alt+shift+c", "capture_to_features") in binds
 
     def test_clone_region_modal_prefills_pcr_name(self):
@@ -1067,3 +1068,76 @@ class TestSynthesisClearButtons:
             for _ in range(5):
                 await pilot.pause()
             assert app.screen.query_one("#btn-syn-protein-clear", sc.Button) is not None
+
+
+class TestSelectionPipelineHub:
+    """Alt+Shift+P selection→cloning-pipeline hub: a chooser routes the
+    highlighted region to Traditional / Golden Braid / MoClo / Gibson, with
+    its features carried through (Phase 0 Gibson seed_amplicon + Phase 1 hub)."""
+
+    @pytest.mark.asyncio
+    async def test_hub_opens_method_chooser(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await _load_clone_region_plasmid(app, pilot)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel = (100, 400)
+            app.action_send_selection_to_pipeline()
+            for _ in range(6):
+                await pilot.pause()
+            assert isinstance(app.screen, sc.CloneMethodChooserModal)
+
+    @pytest.mark.asyncio
+    async def test_hub_traditional_routes_to_enzyme_picker(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await _load_clone_region_plasmid(app, pilot)
+            sp = app.query_one("#seq-panel", sc.SequencePanel)
+            sp._user_sel = (100, 400)
+            app._dispatch_selection_to_pipeline(
+                {"method": "traditional", "grammar_id": ""},
+                100, 400, app._record_load_counter)
+            for _ in range(6):
+                await pilot.pause()
+            assert isinstance(app.screen, sc.CloneRegionEnzymeModal)
+
+    @pytest.mark.asyncio
+    async def test_hub_gibson_carries_features_to_lane(self):
+        """Gibson branch drops the region into the Gibson lane as a fragment
+        WITH its CDS features (the Phase 0 seed_amplicon path) — region-local
+        rebasing keeps an in-range CDS, drops RE overlays."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await _load_clone_region_plasmid(app, pilot)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm._feats = [
+                {"start": 150, "end": 300, "strand": 1,
+                 "type": "CDS", "label": "demoCDS"},
+                {"start": 120, "end": 126, "strand": 1,
+                 "type": "resite", "label": "EcoRI"},      # overlay → dropped
+            ]
+            app._dispatch_selection_to_pipeline(
+                {"method": "gibson", "grammar_id": ""},
+                100, 400, app._record_load_counter)
+            for _ in range(10):
+                await pilot.pause()
+            assert isinstance(app.screen, sc.ConstructorModal)
+            pane = app.screen.query_one("#ctor-gib-pane", sc.GibsonAssemblyPane)
+            assert pane._lane, "region not seeded into the Gibson lane"
+            labels = {f.get("label") for f in pane._lane[-1]["features"]}
+            assert "demoCDS" in labels
+            assert "EcoRI" not in labels
+
+    @pytest.mark.asyncio
+    async def test_hub_record_swap_aborts_dispatch(self):
+        """A canvas swap (stale entry_counter) while the chooser blocked must
+        abort — never pair the coords with the wrong record."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await _load_clone_region_plasmid(app, pilot)
+            app._dispatch_selection_to_pipeline(
+                {"method": "gibson", "grammar_id": ""},
+                100, 400, app._record_load_counter - 1)   # simulate a swap
+            for _ in range(4):
+                await pilot.pause()
+            assert not isinstance(app.screen, sc.ConstructorModal)
