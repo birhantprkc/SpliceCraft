@@ -89,8 +89,12 @@ def _iupac_pattern(site: str) -> "re.Pattern[str]":
 
 
 _IUPAC_COMP = str.maketrans(
-    "ACGTRYWSMKBDHVN",
-    "TGCAYRWSKMVHDBN",
+    # U→A so `_rc` and minus-strand translation are correct for RNA-form
+    # bases the loaders accept (`_IUPAC_NUC_CHARS` includes U). Pre-fix a
+    # `U` passed through `.translate()` unchanged, so a minus-strand CDS
+    # over it mistranslated (the stray U survived into the codon → "?").
+    "ACGTURYWSMKBDHVN",
+    "TGCAAYRWSKMVHDBN",
 )
 
 # Case-preserving ACGT complement used by the sequence-panel renderer.

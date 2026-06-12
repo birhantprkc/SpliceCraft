@@ -72,6 +72,7 @@ class TestOperonBuilderFlow:
             pt = screen.query_one("#syn-operon-prot-table", DataTable)
             pt.move_cursor(row=0); screen._operon_add_gene(None)
             pt.move_cursor(row=1); screen._operon_add_gene(None)
+            await app.workers.wait_for_complete()   # add-gene optimize is now @work
             await pilot.pause()
             assert [g["name"] for g in screen._operon_genes] == ["luxA", "luxB"]
             g0 = screen._operon_genes[0]
@@ -133,6 +134,8 @@ class TestOperonBuilderFlow:
             pt = screen.query_one("#syn-operon-prot-table", DataTable)
             pt.move_cursor(row=0)
             screen._operon_add_gene(None)
+            await app.workers.wait_for_complete()   # add-gene optimize is now @work
+            await pilot.pause()
             screen._operon_assemble(None)
             await app.workers.wait_for_complete()   # assemble is now @work
             await pilot.pause()
@@ -150,6 +153,8 @@ class TestOperonBuilderFlow:
             pt = screen.query_one("#syn-operon-prot-table", DataTable)
             pt.move_cursor(row=0)
             screen._operon_add_gene(None)
+            await app.workers.wait_for_complete()   # add-gene optimize is now @work
+            await pilot.pause()
             screen._operon_assemble(None)
             await app.workers.wait_for_complete()   # assemble is now @work
             await pilot.pause()

@@ -1422,11 +1422,39 @@ class TestMirrorSwapShrinkSuppression:
         sc._safe_save_json(p, [{"id": str(i)} for i in range(20)], "library")
         with sc._expected_mirror_swap():
             sc._safe_save_json(p, [{"id": "0"}], "library")
-        assert sc._MIRROR_SWAP_TOKEN == 0
+        assert sc._mirror_swap_depth() == 0
         # Outside the block the guard is armed again: re-seed then shrink.
         sc._safe_save_json(p, [{"id": str(i)} for i in range(20)], "library")
         with pytest.raises(RuntimeError, match="catastrophic shrink"):
             sc._safe_save_json(p, [{"id": "0"}], "library")
+
+    def test_mirror_token_is_thread_confined(self, tmp_path):
+        """A mirror-swap armed on one thread must NOT disarm the
+        catastrophic-shrink refusal for a concurrent destructive save on
+        ANOTHER thread (2026-06-12 data-loss fix). Pre-fix the token was a
+        process-global int, so an accidental wipe coinciding with a
+        collection switch slipped past the guard built for the 2026-05-22
+        incident."""
+        import threading
+        p = tmp_path / "lib.json"
+        sc._safe_save_json(p, [{"id": str(i)} for i in range(20)], "library")
+        result: dict = {}
+        ready = threading.Barrier(2)
+
+        def _other_thread():
+            ready.wait()                      # save WHILE the main thread is armed
+            try:
+                sc._safe_save_json(p, [{"id": "0"}], "library")   # 95% shrink
+                result["refused"] = False
+            except RuntimeError:
+                result["refused"] = True
+
+        t = threading.Thread(target=_other_thread)
+        with sc._expected_mirror_swap():       # armed on THIS thread only
+            t.start()
+            ready.wait()
+            t.join()
+        assert result["refused"] is True       # other thread's guard still fires
 
     def test_safe_save_json_mirror_does_not_spill(self, tmp_path):
         p = tmp_path / "mirror.json"
@@ -1440,14 +1468,14 @@ class TestMirrorSwapShrinkSuppression:
         seen = {}
 
         def _fake_save_library(plasmids, **kw):
-            seen["token"] = sc._MIRROR_SWAP_TOKEN
+            seen["token"] = sc._mirror_swap_depth()
             seen["plasmids"] = plasmids
 
         monkeypatch.setattr(sc, "_save_library", _fake_save_library)
         sc._switch_active_collection_library([{"id": "x"}])
         assert seen["token"] >= 1                  # armed during the call
         assert seen["plasmids"] == [{"id": "x"}]
-        assert sc._MIRROR_SWAP_TOKEN == 0          # released afterwards
+        assert sc._mirror_swap_depth() == 0          # released afterwards
 
 
 class TestBackupCompression:

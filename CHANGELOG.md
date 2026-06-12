@@ -14,6 +14,36 @@
 
 ---
 
+## [1.0.58] — 2026-06-12
+
+### Bug fixes
+
+- **The catastrophic-overwrite safeguard can no longer be bypassed by a concurrent collection switch.** The guard that refuses a save which would wipe almost all of a data file kept its "this shrink is expected" flag process-wide, so a collection switch running on a background thread could briefly disarm the refusal for an *unrelated* destructive save happening at the same instant — exactly the accident the guard exists to catch. The flag is now confined to the operation that set it, so concurrent saves can't disarm each other's protection.
+- **A corrupt codon-usage table can no longer make the optimizer mistranslate.** Loading `codon_tables.json` from disk now forces every codon to its standard-genetic-code amino acid (matching the table importer), so a hand-edited or damaged table can't feed a mislabelled codon into the codon optimizer.
+- **A newly added master enzyme appears on the map immediately.** Adding an enzyme to the master catalog while a plasmid was loaded didn't repaint the restriction overlay until you left the screen and came back; its cut sites now show right away.
+- **RNA `U` bases reverse-complement and translate correctly.** A sequence containing `U` (e.g. an imported RNA FASTA) previously kept `U` unchanged when reverse-complemented, which could mistranslate a minus-strand feature; `U` is now complemented to `A`.
+
+### New features
+
+- **Traditional cloning warns when a fragment pick was a guess.** If it has to choose a digest fragment as the backbone but neither fragment carries an origin / resistance marker to tell them apart, it now says so — so a large insert can't be silently mistaken for the backbone.
+- **The Constructor warns about colliding Golden-Gate fusion sites.** If two non-adjacent junctions in a lane reuse the same 4-bp overhang (or a palindromic one) — which can scramble a one-pot assembly even when the lane otherwise looks valid — the validation panel now flags it.
+
+### Performance
+
+- **Adding a gene to the Operon Designer no longer freezes the screen.** Codon-optimizing the gene ran on the UI thread (a noticeable pause for a large protein). The gene row now appears instantly with an "optimizing…" note and fills in from the background, and "Assemble" waits for any gene still optimizing.
+
+### UI polish
+
+- **Modal titles are centered consistently across the app.** A large number of dialog title bars rendered their text against the left edge instead of centered — every modal title is now centered, button-row alignment was unified, and redundant styling rules were removed.
+
+### Hardening
+
+- **Clearer NCBI error message.** When NCBI returns an error page instead of a record (service down or rate-limited), the message now says so instead of a confusing "no records found".
+- **Bulk folder import is capped** at a sane number of files, so a pathological folder can't tie up a background worker; import the rest in smaller batches.
+- **Atomic-save directory-sync failures are now logged** for the diagnostic bundle instead of being dropped silently.
+
+---
+
 ## [1.0.57] — 2026-06-11
 
 ### Bug fixes
