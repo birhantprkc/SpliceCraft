@@ -113,6 +113,28 @@ class TestRestoreCacheBustEnumeration:
         assert "_EXPERIMENT_PROJECTS_FILE" in attr_names
         assert "_GELS_FILE" in attr_names
 
+    def test_targets_parity_with_user_data_files(self):
+        """Regression guard (2026-06-11 audit): EVERY user-data file in
+        `_USER_DATA_FILE_ATTRS` except `_SETTINGS_FILE` MUST be reachable
+        from the GUI `RestoreFromBackupModal._TARGETS`, mirroring
+        `test_agent_backup_labels_parity_with_user_data_files` for the
+        agent API.
+
+        Pre-fix `_HMM_DB_CATALOG_FILE` was present in every other
+        registry (`_USER_DATA_FILE_ATTRS`, `_MASTER_DELETE_CACHE_ATTRS`,
+        `_AGENT_BACKUP_LABELS`) but missing here, and no whole-set test
+        caught it — the existing `_TARGETS` tests were piecemeal
+        per-sweep membership checks. This closes the drift class."""
+        target_attrs = {t[1] for t in sc.RestoreFromBackupModal._TARGETS}
+        expected = set(sc._USER_DATA_FILE_ATTRS) - {"_SETTINGS_FILE"}
+        missing = expected - target_attrs
+        assert not missing, (
+            f"RestoreFromBackupModal._TARGETS missing entries for: "
+            f"{sorted(missing)}. GUI users cannot restore these files "
+            f"from backup even though they are user-data files. This "
+            f"set silently grew before the parity guard landed."
+        )
+
     def test_modal_cache_bust_covers_sweep9_caches(self):
         """The cache-bust block in `_restore_btn` enumerates every
         persisted-state cache. Sweep #25 (2026-05-23) replaced the

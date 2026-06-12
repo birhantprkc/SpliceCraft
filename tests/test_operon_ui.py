@@ -86,6 +86,7 @@ class TestOperonBuilderFlow:
             await pilot.pause()
             screen._operon_genes[0]["target"] = 50.0
             screen._operon_assemble(None)
+            await app.workers.wait_for_complete()   # assemble is now @work
             await pilot.pause()
             res = screen._operon_result
             assert res is not None
@@ -133,6 +134,7 @@ class TestOperonBuilderFlow:
             pt.move_cursor(row=0)
             screen._operon_add_gene(None)
             screen._operon_assemble(None)
+            await app.workers.wait_for_complete()   # assemble is now @work
             await pilot.pause()
             assert screen._operon_result is not None
             pt.move_cursor(row=1)               # add a second gene -> must invalidate
@@ -149,6 +151,7 @@ class TestOperonBuilderFlow:
             pt.move_cursor(row=0)
             screen._operon_add_gene(None)
             screen._operon_assemble(None)
+            await app.workers.wait_for_complete()   # assemble is now @work
             await pilot.pause()
             screen._operon_to_dna(None)
             await pilot.pause()

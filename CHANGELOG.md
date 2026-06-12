@@ -14,6 +14,34 @@
 
 ---
 
+## [1.0.57] — 2026-06-11
+
+### Bug fixes
+
+- **Master Delete clears the library panel immediately.** After wiping all data, the left-hand library / collections panel kept showing the just-deleted entries until you next clicked it. It now empties the moment the wipe finishes.
+- **Custom HMM databases can be restored from backup.** Settings → "Restore … from backup" was missing the HMM database registry, so a lost or corrupted list of your custom HMM databases couldn't be recovered through the app even though the on-disk backups existed. It's now restorable like every other data file.
+- **The Experiments project header no longer goes stale.** Renaming or deleting the *active* project and then closing the projects picker with Esc / Close left the header — and the entry list — showing the old project. Both now refresh on return.
+- **Fixed a styling clash between the "Find annotation" and "Forbidden sites" dialogs.** The two shared internal style ids, so one dialog could silently override the other's table height and title bar. Their styles are now independent.
+
+### Performance
+
+- **The Operon Designer's "Assemble" no longer freezes the screen.** Assembling a multi-gene operon ran its biophysical folding calculation on the UI thread — a 1–3 second freeze on larger operons. It now runs in the background with an "Assembling…" note.
+- **The ORF Finder opens instantly on large plasmids.** It scanned all six reading frames the moment the dialog opened; that scan now runs in the background, so opening it on a 100 kb+ plasmid no longer stutters.
+- **Transferring annotations from a large source plasmid no longer hitches the UI.** The sequence-match search now runs in the background.
+- **The Domesticator's "Design Primers" runs in the background** — no UI stall on a large region, and a second click can't double-submit the design.
+- **The traditional-cloning gel preview repaints once after you finish adjusting enzymes** instead of redrawing on every single toggle.
+
+### UI polish
+
+- **Consistent modal styling across the app.** Dialog frames are now uniformly solid (no more mismatched heavy / rounded borders), a handful of older title bars with faint, hard-to-read text were fixed, and button rows follow one convention everywhere — confirmation dialogs center their buttons, action and editor footers right-align them.
+- **Every button keeps at least one character of breathing room.** Buttons that previously rendered flush against an adjacent button, a label, or a dialog edge now have a guaranteed gap on every side.
+
+### Hardening
+
+- **The backup-restore list can't silently drift out of sync with your data files again.** A new regression test guarantees every persisted user-data file is reachable from the in-app restore UI — closing the gap that had left HMM databases unrecoverable.
+
+---
+
 ## [1.0.56] — 2026-06-11
 
 ### Bug fixes
