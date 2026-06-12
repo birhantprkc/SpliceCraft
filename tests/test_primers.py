@@ -2130,3 +2130,131 @@ class TestPrimerFlapBumped:
         f["_flap_linear"] = True
         rows = self._rows(f)
         assert self._idx(rows, "◀") >= 0   # bound bar rendered, flap clipped
+
+
+class TestPrimerSeqGenBankWrapRoundTrip:
+    """A long `/primer_seq` qualifier must survive a GenBank round-trip
+    WITHOUT a space jammed into the sequence.
+
+    BioPython's GenBank writer wraps a long qualifier value across lines
+    and its parser rejoins the continuation with a space — fine for a
+    free-text `/note`, corrupting for a DNA sequence. Any primer longer
+    than the ~58-char value-wrap width round-tripped through `.gb` with a
+    literal space mid-sequence, which the seq panel drew as a phantom gap
+    that shifted the primer off the template. `_gb_text_to_record` now
+    strips it on load (`_repair_wrapped_primer_seqs`)."""
+
+    @staticmethod
+    def _record_with_primer(primer_seq: str):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        # A template the primer binds, padded so it's a real plasmid.
+        seq = ("AGCT" * 20) + primer_seq + ("TTAA" * 20)
+        rec = SeqRecord(Seq(seq), id="rt", name="rt")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        start = 80
+        rec.features.append(SeqFeature(
+            FeatureLocation(start, start + len(primer_seq), strand=1),
+            type="primer_bind",
+            qualifiers={"label": ["p"], "primer_seq": [primer_seq]},
+        ))
+        return rec
+
+    def test_long_primer_seq_has_no_injected_space(self):
+        # 64 nt — comfortably past the GenBank value-wrap width, so the
+        # writer splits it across two lines.
+        primer = "GCGCCGTCTCAAATGAATAAATGTATTCCAATGATAATTAATGGAATGATCAGATTTTGATAA"
+        assert len(primer) > 58
+        gb = sc._record_to_gb_text(self._record_with_primer(primer))
+        # The on-disk GenBank legitimately wraps the value across lines…
+        assert "\n" in gb
+        # …but the parsed-back primer must be whitespace-free and intact.
+        rec2 = sc._gb_text_to_record(gb, cache=False)
+        pf = next(f for f in rec2.features if f.type == "primer_bind")
+        got = pf.qualifiers["primer_seq"][0]
+        assert " " not in got and "\n" not in got, repr(got)
+        assert got == primer
+
+    def test_short_primer_seq_is_unchanged(self):
+        primer = "GTAAAACGACGGCCAGT"          # 17 nt, never wraps
+        gb = sc._record_to_gb_text(self._record_with_primer(primer))
+        rec2 = sc._gb_text_to_record(gb, cache=False)
+        pf = next(f for f in rec2.features if f.type == "primer_bind")
+        assert pf.qualifiers["primer_seq"][0] == primer
+
+    def test_repair_helper_strips_internal_whitespace(self):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        rec = SeqRecord(Seq("ACGT" * 30), id="x", name="x")
+        rec.features.append(SeqFeature(
+            FeatureLocation(0, 10, strand=1), type="primer_bind",
+            qualifiers={"primer_seq": ["GCGCCGTCTCAAATG GGAA TGAT"]}))
+        sc._repair_wrapped_primer_seqs(rec)
+        assert rec.features[0].qualifiers["primer_seq"][0] == "GCGCCGTCTCAAATGGGAATGAT"
+
+
+class TestPrimerSeqRenderChokepoint:
+    """The render path (`PlasmidMap._parse`) is the universal chokepoint:
+    ANY primer that reaches the canvas — gb-loaded, in-memory, agent-built,
+    .dna-imported — must have its `/primer_seq` whitespace collapsed before
+    it drives the bound/flap split, so no source can paint a phantom gap."""
+
+    @staticmethod
+    def _record(primer_seq_with_space: str):
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        clean = "".join(primer_seq_with_space.split())
+        seq = ("AGCT" * 25) + clean + ("TTAA" * 25)
+        rec = SeqRecord(Seq(seq), id="r", name="r")
+        rec.annotations["molecule_type"] = "DNA"
+        rec.annotations["topology"] = "circular"
+        start = 100
+        # DIRTY qualifier carried directly — NOT via a GenBank round-trip — so
+        # the render guard is exercised in isolation from the load-time repair.
+        rec.features.append(SeqFeature(
+            FeatureLocation(start, start + len(clean), strand=1),
+            type="primer_bind",
+            qualifiers={"label": ["p"], "primer_seq": [primer_seq_with_space]},
+        ))
+        return rec, clean
+
+    async def _parsed_primer(self, dirty):
+        rec, clean = self._record(dirty)
+        sc.PlasmidApp._skip_seed = True
+        sc.PlasmidApp._skip_snapshot = True
+        sc.PlasmidApp._skip_update_check = True
+        sc.PlasmidApp._preload_demo_record = None
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(220, 50)) as pilot:
+            for _ in range(5):
+                await pilot.pause()
+            while len(app.screen_stack) > 1:
+                app.pop_screen()
+                await pilot.pause()
+            app._apply_record(rec, clear_undo=True)
+            for _ in range(3):
+                await pilot.pause()
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            f = next(x for x in pm._feats if x.get("type") == "primer_bind")
+            return dict(f), clean
+
+    @pytest.mark.asyncio
+    async def test_render_strips_internal_space(self):
+        dirty = "GCGCCGTCTCAAATGAATAAATGTATTCCAATGATAATTAATGGAA TGAT"
+        f, clean = await self._parsed_primer(dirty)
+        ps = f.get("_primer_seq", "")
+        assert " " not in ps and "\n" not in ps, repr(ps)
+        assert ps == clean
+        # A perfectly-matching primer must produce NO bound-bar gap.
+        assert not f.get("_bound_mismatch"), f.get("_bound_mismatch")
+
+    @pytest.mark.asyncio
+    async def test_render_strips_newline_and_tab(self):
+        dirty = "GCGCCGTCTCAAATG\tAATAAATGTATTCCAATGAT\nAATTAATGGAATGAT"
+        f, clean = await self._parsed_primer(dirty)
+        ps = f.get("_primer_seq", "")
+        assert ps == clean and not any(c.isspace() for c in ps)

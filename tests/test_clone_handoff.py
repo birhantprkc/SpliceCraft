@@ -206,6 +206,55 @@ class TestCloneDeliverables:
                    in ("luxA", "luxB"))
 
 
+class TestStampInsertFeatsAnchoring:
+    """`_stamp_insert_feats_on_part` must survive the Domesticator's
+    synonymous cures. `_design_gb_primers` returns a *mutated* insert
+    (the curing rides on the primers), so a verbatim match against the
+    source fails — pre-fix that silently stamped ZERO features and a
+    lifted operon then cloned as one block instead of its genes."""
+
+    def _src_and_feats(self, length=1000):
+        import random
+        rng = random.Random(7)
+        src = "".join(rng.choice("ACGT") for _ in range(length))
+        feats = [
+            {"start": 3, "end": length // 2, "type": "CDS",
+             "strand": 1, "label": "luxA"},
+            {"start": length // 2, "end": length - 3, "type": "CDS",
+             "strand": 1, "label": "luxB"},
+        ]
+        return src, feats
+
+    def test_exact_insert_still_stamps(self):
+        src, feats = self._src_and_feats()
+        part = {"name": "op", "sequence": src}        # uncured = exact
+        assert sc._stamp_insert_feats_on_part(part, src, feats) == 2
+
+    def test_cured_insert_is_anchored_by_near_match(self):
+        src, feats = self._src_and_feats()
+        cured = list(src)
+        for p in (120, 480, 830):                     # 3 cures, like 3 SOE junctions
+            cured[p] = "A" if cured[p] != "A" else "G"
+        cured = "".join(cured)
+        assert src.count(cured) == 0                   # verbatim match fails
+        part = {"name": "op", "sequence": cured}
+        assert sc._stamp_insert_feats_on_part(part, src, feats) == 2
+        # Anchored at offset 0 — coords unshifted.
+        got = {f["label"]: (f["start"], f["end"])
+               for f in part["insert_feats"]}
+        assert got["luxA"] == (3, 500)
+
+    def test_unrelated_lookalike_is_refused(self):
+        # An insert that's ~heavily divergent must NOT be force-anchored
+        # (catastrophic-class: never place a feature at a guessed coord).
+        src, feats = self._src_and_feats(length=300)
+        import random
+        rng = random.Random(99)
+        garbage = "".join(rng.choice("ACGT") for _ in range(300))
+        part = {"name": "op", "sequence": garbage}
+        assert sc._stamp_insert_feats_on_part(part, src, feats) == 0
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Clone Fragment handoff routing (async / Pilot)
 # ═══════════════════════════════════════════════════════════════════════════════

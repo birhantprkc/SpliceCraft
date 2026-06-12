@@ -14,6 +14,15 @@
 
 ---
 
+## [1.0.62] — 2026-06-12
+
+### Bug fixes
+
+- **Domesticated operons now keep their individual genes through the clone.** When you lifted a multi-gene region (e.g. a lux operon), domesticated it, and cloned it as an L0 part, the genes collapsed into one block on the finished plasmid. The cause: domestication rewrites a few bases (the synonymous cures that ride on the primers), so the part's sequence no longer matched the source *verbatim* and the feature-carry step gave up entirely. It now anchors the genes by near-match — tolerating the cures — so luxC, luxD, … land on the clone at their real positions (and a part too divergent to place safely still carries nothing rather than guessing).
+- **No more phantom gap in a primer's bases.** A long primer (longer than ~58 bp) that had been saved and reloaded showed a stray space spliced into its sequence on the map — shifting the bases after it one column off the template, even though the primer was a perfect match. The sequence was never actually wrong: saving to GenBank wraps a long primer across two lines, and the reader was rejoining them with a space. Long primers now reload clean, with their bases aligned exactly under the template they anneal to. Every place a primer is drawn, saved, edited, imported, or matched now passes through one sanitiser, so no workflow — clone, Gibson, traditional, operon, `.dna`/GenBank import, or the agent API — can ever paint that gap again.
+
+---
+
 ## [1.0.61] — 2026-06-12
 
 ### Bug fixes
