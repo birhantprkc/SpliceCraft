@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.61] — 2026-06-12
+
+### Bug fixes
+
+- **A lifted operon now keeps its genes in the cloned plasmid.** When you lifted a native operon and cloned it as an OPERON L0 part, the individual genes (luxC, luxD, …) showed up on the ordered PCR fragment but vanished from the final cloned plasmid — the clone collapsed them into a single operon-spanning block. The genes now carry all the way through to the clone, anchored to their real positions (and a clone with no source features to carry is left exactly as before — no invented annotations). Renaming a feature already marks the plasmid unsaved (asterisk in the title and library panel) so quitting prompts to Save or Abandon; remember to **Ctrl+S** to write a rename to disk.
+
+---
+
 ## [1.0.60] — 2026-06-12
 
 ### New features

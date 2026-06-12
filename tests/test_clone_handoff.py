@@ -162,6 +162,49 @@ class TestCloneDeliverables:
         cl = str(sc._part_to_cloned_seqrecord(part).seq).upper()
         assert len({insert, fr, cl}) == 3
 
+    def test_lifted_operon_genes_survive_into_clone(self):
+        """A lifted operon's source genes (luxC/luxD/… stamped as
+        `insert_feats`) must carry all the way into the FINAL CLONE, not
+        just the primed fragment. Pre-fix the cloned plasmid collapsed a
+        multi-gene operon into a single part-spanning block and silently
+        dropped every gene (the fragment kept them, the clone didn't) —
+        user-reported "luxC..luxG features gone after lift→clone"."""
+        part, insert = self._part_with_vector()
+        L = len(insert)
+        # Two source genes in INSERT coordinates, anchored by sequence.
+        src_feats = [
+            {"start": 3,      "end": L // 2 - 3, "type": "CDS",
+             "strand": 1, "label": "luxA"},
+            {"start": L // 2, "end": L - 3,      "type": "CDS",
+             "strand": 1, "label": "luxB"},
+        ]
+        assert sc._stamp_insert_feats_on_part(part, insert, src_feats) == 2
+
+        def _labels(rec):
+            return {(f.qualifiers.get("label") or [f.type])[0]
+                    for f in rec.features}
+
+        frag_labels = _labels(
+            sc._part_to_primed_fragment_seqrecord(part, name="F"))
+        clone_labels = _labels(sc._part_to_cloned_seqrecord(part))
+        # The fragment already carried them; the clone must too (parity).
+        assert {"luxA", "luxB"} <= frag_labels
+        assert {"luxA", "luxB"} <= clone_labels, (
+            f"clone dropped lifted genes; labels={sorted(clone_labels)}")
+
+    def test_clone_without_insert_feats_is_unchanged(self):
+        """No `insert_feats` on the part → the feature-carry step is a
+        no-op (the helper refuses to invent annotations), so a plain
+        clone still works and gains no phantom features."""
+        part, _ = self._part_with_vector()
+        assert "insert_feats" not in part
+        cl = sc._part_to_cloned_seqrecord(part)
+        # Only the part-spanning block + the two domestication primers.
+        assert sc._seq_len(cl) > 0
+        assert all(f.type != "CDS" for f in cl.features
+                   if (f.qualifiers.get("label") or [""])[0]
+                   in ("luxA", "luxB"))
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Clone Fragment handoff routing (async / Pilot)
