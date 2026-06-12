@@ -2877,11 +2877,12 @@ class TestRotationCursorSnap:
 
 
 class TestLibraryPanelLongNames:
-    """A long plasmid name stays readable: the library panel grows to fit it
-    (capped), tracks the full name in `_lib_full_names`, and surfaces it on the
-    highlighted row's tooltip — beyond the width-cap-constant test."""
+    """A long plasmid name stays readable even though the library panel is a
+    FIXED width (matched to the FeatureSidebar, 2026-06-12): the panel tracks
+    the full name in `_lib_full_names` and surfaces it on the highlighted
+    row's tooltip; the name itself pans via the table's horizontal scrollbar."""
 
-    async def test_panel_grows_and_tooltips_full_name(
+    async def test_panel_fixed_width_and_tooltips_full_name(
             self, tiny_record, isolated_library):
         from textual.widgets import DataTable
         long_name = "pVeryLongConstruct-With-Lots-Of-Descriptive-Detail-v2026"
@@ -2897,8 +2898,11 @@ class TestLibraryPanelLongNames:
             panel = app.query_one("#library", sc.LibraryPanel)
             # Full (untruncated) name tracked for the tooltip.
             assert panel._lib_full_names.get("longy") == long_name
-            # Panel grew past its narrow default to fit the long name (capped).
-            assert float(panel.styles.width.value) >= 40, panel.styles.width
+            # Panel stays at the fixed side-panel width (matched to the
+            # FeatureSidebar) — a long name no longer grows the panel; it pans
+            # via the table scrollbar and shows in full on the tooltip below.
+            assert int(panel.styles.width.value) == sc._SIDE_PANEL_WIDTH, \
+                panel.styles.width
             # Highlighting the row sets the table tooltip to the FULL name.
             t = panel.query_one("#lib-table", DataTable)
             t.move_cursor(row=0)
@@ -6730,13 +6734,13 @@ class TestShiftClickFeatureExtend:
             assert app.query_one("#sidebar").display is True
             assert app.query_one("#seq-panel").display is True
             assert app.query_one("#top-row").display is True
-            # Width restoration: library back to 25 cells (2026-05-06:
-            # was 26; shrunk to button-row width), sidebar to 32.
+            # Width restoration: both side panels restore to the shared
+            # `_SIDE_PANEL_WIDTH` (library matched to the sidebar, 2026-06-12).
             lib = app.query_one("#library")
             sb  = app.query_one("#sidebar")
             sp  = app.query_one("#seq-panel")
-            assert int(lib.styles.width.value) == 25
-            assert int(sb.styles.width.value) == 32
+            assert int(lib.styles.width.value) == sc._SIDE_PANEL_WIDTH
+            assert int(sb.styles.width.value) == sc._SIDE_PANEL_WIDTH
             # Seq-panel height also restored to the canonical 14 rows
             # (the override-to-1fr that F4 applies must not stick).
             assert int(sp.styles.height.value) == 14
@@ -6834,8 +6838,8 @@ class TestShiftClickFeatureExtend:
             for sel in ("#library", "#plasmid-map", "#sidebar",
                         "#seq-panel", "#top-row"):
                 assert app.query_one(sel).display is True, sel
-            assert int(app.query_one("#library").styles.width.value) == 25
-            assert int(app.query_one("#sidebar").styles.width.value) == 32
+            assert int(app.query_one("#library").styles.width.value) == sc._SIDE_PANEL_WIDTH
+            assert int(app.query_one("#sidebar").styles.width.value) == sc._SIDE_PANEL_WIDTH
 
     async def test_feature_edit_modal_opens_read_only(
             self, isolated_library):

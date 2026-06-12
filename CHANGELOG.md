@@ -14,6 +14,20 @@
 
 ---
 
+## [1.0.59] — 2026-06-12
+
+### Bug fixes
+
+- **Pop-up dialogs are centered on screen again.** A styling cleanup in 1.0.58 left a number of dialogs — Settings, and others that close with Esc — pinned to the top-left corner instead of centered. They're all centered again, vertically and horizontally, and a new test now measures each dialog's on-screen position so this can't slip through again.
+- **The gel simulator's lane editor is no longer cramped.** On a wide terminal the lane fields (name, source, detail) were squeezed into a third of the panel while the gel image took the rest — clipping the source dropdown. The lane editor and the gel image now share the width evenly.
+
+### UI polish
+
+- **The plasmid library panel matches the feature-list panel width.** The library panel used to grow to fit your longest plasmid name (up to ~50 columns); it's now a fixed width equal to the feature sidebar, so the two side panels are symmetric. A long name pans via the table's horizontal scrollbar and still shows in full on the highlighted row.
+- **The primer library table is tidier.** A single very long Source or Name value used to stretch its whole column wide for every row. Those columns are now capped at a generous width — typical values still show in full; only rare long ones get an ellipsis, with the full value visible when you Load the primer.
+
+---
+
 ## [1.0.58] — 2026-06-12
 
 ### Bug fixes
