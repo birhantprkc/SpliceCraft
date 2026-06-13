@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.72] — 2026-06-13
+
+### New features
+
+- **Sandboxed demo mode (groundwork for a browser demo).** Set `SPLICECRAFT_DEMO=local` (full features) or `SPLICECRAFT_DEMO=web` (a restrained public sandbox) to run SpliceCraft as a self-contained playground — the foundation for trying it in a browser via `textual serve`. A demo session always runs in a fresh, throwaway data dir (it never reads or writes your real library, and ignores `$SPLICECRAFT_DATA_DIR`), starts with an example plasmid loaded, and shows a banner. The **web** tier additionally disables anything an anonymous visitor shouldn't drive — opening files from disk, NCBI/online fetches, the agent API, self-update, and bulk data export/import/delete — with a polite "install SpliceCraft for the full tool" message, and caps sequence size so a huge paste can't bog down the host. **Dormant unless `SPLICECRAFT_DEMO` is set**, so normal installs are completely unaffected. (More polish — a worked example for every tool — is coming.)
+
+---
+
 ## [1.0.71] — 2026-06-13
 
 ### Bug fixes
