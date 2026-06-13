@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.64] — 2026-06-12
+
+### Bug fixes
+
+- **Primer Designer buttons no longer clip off the right edge.** When you opened the Primer Designer, the collection action buttons (New / Rename / Delete) and the Close button could run off the right side of the screen. Two things fixed it: the library panel has two button sets (primers-list vs collections-list) and both were being drawn at once on first open — now only the active set shows. And on a narrow terminal where the primer-list buttons still need more room than the panel has, the button row now scrolls horizontally instead of spilling off-screen, with **Close pinned to the right edge so it's always reachable**. On a normal-width terminal everything fits and nothing scrolls.
+
+---
+
 ## [1.0.63] — 2026-06-12
 
 ### Bug fixes

@@ -634,6 +634,70 @@ class TestPrimerDesignScreenLayout:
             assert screen.query_one("#pd-end",   Input).value == ""
             assert screen.query_one("#pd-part-name", Input).value == ""
 
+    @pytest.mark.asyncio
+    async def test_lib_header_does_not_clip_right_edge(self):
+        """The primer-library header must not overflow the right edge.
+        The view toggle only flips `display` on a view CHANGE, so without a
+        hidden-by-default the collections-action group rendered ALONGSIDE the
+        primers group on first open and pushed the Close button off the right
+        side of the terminal. Default (primers) view: collections buttons stay
+        hidden and Close fits within the terminal width."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(185, 50)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PrimerDesignScreen("ACGT" * 200, [], "test"))
+            for _ in range(4):
+                await pilot.pause()
+            coll = app.screen.query_one("#pd-lib-coll-btns")
+            close = app.screen.query_one("#btn-pd-close")
+            row = app.screen.query_one("#pd-lib-hdr-row")
+            assert not coll.display, \
+                "collection-action buttons must start hidden in primers view"
+            assert close.region.right <= 185, \
+                f"Close clips the right edge (right={close.region.right})"
+            assert row.region.right <= 185
+
+    @pytest.mark.asyncio
+    async def test_lib_header_close_reachable_on_narrow_terminal(self):
+        """On a narrow terminal the primer-list buttons need more room than
+        the panel has; the header scrolls horizontally and Close is docked
+        right, so Close (and the contained row) stay on-screen rather than
+        clipping off the right edge."""
+        W = 130
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(W, 50)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PrimerDesignScreen("ACGT" * 200, [], "test"))
+            for _ in range(4):
+                await pilot.pause()
+            close = app.screen.query_one("#btn-pd-close")
+            row = app.screen.query_one("#pd-lib-hdr-row")
+            assert close.region.width > 0 and close.region.right <= W, \
+                f"Close not reachable at width {W} (right={close.region.right})"
+            assert row.region.right <= W, \
+                "header row overflows the terminal instead of scrolling"
+
+    @pytest.mark.asyncio
+    async def test_lib_header_collections_view_shows_its_actions(self):
+        """Toggling to collections view must reveal its action buttons
+        (the hidden-by-default is overridden by the toggle's inline display)
+        and still fit within the terminal."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(185, 50)) as pilot:
+            await pilot.pause()
+            screen = sc.PrimerDesignScreen("ACGT" * 200, [], "test")
+            app.push_screen(screen)
+            for _ in range(4):
+                await pilot.pause()
+            screen._toggle_lib_view_mode(None)
+            for _ in range(4):
+                await pilot.pause()
+            coll = app.screen.query_one("#pd-lib-coll-btns")
+            prim = app.screen.query_one("#pd-lib-primers-btns")
+            close = app.screen.query_one("#btn-pd-close")
+            assert coll.display and not prim.display
+            assert close.region.right <= 185
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Wrap-region primer design (regression guard for 2026-04-13 fix)
