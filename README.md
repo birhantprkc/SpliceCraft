@@ -179,10 +179,14 @@ default) and SpliceCraft finds the smallest set of point changes that destroy
 each site — **silent** ones inside any coding sequence, checked against *every*
 overlapping reading frame so a protein never changes (and biased toward your
 chosen codon table's frequent synonyms when there's a choice), and minimal
-swaps elsewhere — without ever spawning a new forbidden site. You get the cured
-circular plasmid (one click to apply, fully undoable) plus primers designed off
-the cured sequence so they bind exactly where they're drawn — save them to your
-primer library or add them straight to the map. Choose how it re-circularizes:
+swaps elsewhere — without ever spawning a new forbidden site. Press **Apply
+cure** and SpliceCraft names + saves the cured circular plasmid to a collection
+you pick — with the cure primers bound where they anneal — draws those same
+primers on the **original** plasmid (each cure showing as a mismatch) so you can
+see exactly what every primer changes, and loads the result onto the canvas. The
+primers are designed off the cured sequence so they bind exactly where they're
+drawn; save them to your primer library or add them straight to the map as well.
+Choose how it re-circularizes:
 **QuikChange** — an improved-QuikChange pair per locus, PCR → DpnI → transform
 (no ligase, no assembly); or **Golden Braid** — split the plasmid at each cure
 into BsaI-tailed fragments that a one-pot Golden Gate reaction ligates back

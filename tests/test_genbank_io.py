@@ -69,6 +69,27 @@ class TestGenbankTextRoundtrip:
         rec2 = sc._gb_text_to_record(text)
         assert str(rec2.seq) == str(tiny_record.seq)
 
+    def test_spaced_locus_name_does_not_break_save(self):
+        """A spaced display name in `record.name` (e.g. leaked from
+        `_tui_display_name`) must NOT raise — the GenBank LOCUS line forbids
+        whitespace, and an unsanitised name broke EVERY save + autosave
+        (user-reported: "Invalid whitespace in '…' for LOCUS line" after a
+        scrub Add-to-Map). `_record_to_gb_text` sanitises the LOCUS on a copy."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(
+            Seq("ACGT" * 20), id="FFE_6_ENTRY_pCambia2300_GREEN",
+            name="FFE 6 ENTRY pCambia2300-GREEN",   # spaces — invalid LOCUS
+            annotations={"molecule_type": "DNA", "topology": "circular"})
+        gb = sc._record_to_gb_text(rec)              # must NOT raise
+        assert gb and gb.splitlines()[0].startswith("LOCUS")
+        # No whitespace-bearing display name leaked into the LOCUS token.
+        assert "FFE 6 ENTRY" not in gb.splitlines()[0]
+        # The caller's record is NOT mutated — the display name survives.
+        assert rec.name == "FFE 6 ENTRY pCambia2300-GREEN"
+        # Round-trips cleanly.
+        assert str(sc._gb_text_to_record(gb).seq) == str(rec.seq)
+
     def test_feature_types_preserved(self, tiny_record):
         text = sc._record_to_gb_text(tiny_record)
         rec2 = sc._gb_text_to_record(text)

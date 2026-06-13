@@ -470,7 +470,11 @@ class TestScrubTabRender:
 
 
 class TestScrubTabApply:
-    async def test_apply_to_canvas_then_undo(self):
+    async def test_apply_prompts_then_saves_and_loads(self):
+        """Apply cure now PROMPTS for a name + collection first (request H):
+        the cure is NOT applied until the user confirms; confirming applies it,
+        saves the cured plasmid to the collection (primers bound, no
+        underscores), and loads it onto the canvas."""
         seq, rec = _record_with_bsai()
         rec._tui_display_name = "Scrub Test 1"   # spaces — must survive
         app = sc.PlasmidApp()
@@ -493,22 +497,145 @@ class TestScrubTabApply:
             await pilot.pause()
             assert modal.query_one("#btn-scrub-apply", sc.Button).disabled is False
 
+            # Apply cure → NamePlasmidModal appears; cure NOT yet applied.
             modal._scrub_apply_canvas(None)
             await pilot.pause()
+            await pilot.pause(0.1)
+            assert isinstance(app.screen, sc.NamePlasmidModal)
+            assert str(app._current_record.seq) == seq, \
+                "cure must not apply until the name is confirmed"
+
+            # Confirm the name + collection → apply + save + focus.
+            app.screen.dismiss({"name": "Cured One", "collection": "Default"})
+            for _ in range(6):
+                await pilot.pause()
             cured = str(app._current_record.seq)
             assert cured == plan["cured_seq"]
-            assert cured != seq
             assert not sc._scrub_scan_targets(cured, frozenset(["BsaI"]), True)
-            # the user-typed display name (with spaces) must survive the cure
-            assert getattr(app._current_record, "_tui_display_name",
-                           None) == "Scrub Test 1"
-            # apply button re-disabled after a successful apply
-            assert modal.query_one("#btn-scrub-apply", sc.Button).disabled is True
+            # cured plasmid saved to the collection, NO underscores in the name
+            saved = [e for c in sc._load_collections()
+                     for e in c.get("plasmids", [])
+                     if e.get("source") == "scrub:cured"]
+            assert saved, "cured plasmid not saved to a collection"
+            assert saved[-1]["name"] == "Cured One"
+            assert "_" not in saved[-1]["name"]
+            assert "primer_bind" in (saved[-1].get("gb_text") or ""), \
+                "cure primers not bound to the saved cured plasmid"
 
-            # the apply is undoable
-            app._action_undo()
+    async def test_apply_cancel_leaves_canvas_untouched(self):
+        """Cancelling the name prompt is a full no-op: nothing applied, nothing
+        saved, Apply button still live for a retry."""
+        seq, rec = _record_with_bsai()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
             await pilot.pause()
-            assert str(app._current_record.seq) == seq
+            app._apply_snapshot(seq, 0, rec)
+            await pilot.pause()
+            feats = app.query_one("#plasmid-map", sc.PlasmidMap)._feats
+            app.push_screen(sc.MutagenizeModal(seq, feats, "scrubtest"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            plan = sc._scrub_design(seq, feats, ["BsaI"], circular=True)
+            rounds = [sc._scrub_qc_primers(plan["cured_seq"], c["positions"],
+                                           round_no=i)
+                      for i, c in enumerate(plan["clusters"], 1)]
+            modal._scrub_apply_result(plan, rounds)
+            await pilot.pause()
+            modal._scrub_apply_canvas(None)
+            await pilot.pause()
+            await pilot.pause(0.1)
+            app.screen.dismiss(None)        # cancel
+            for _ in range(3):
+                await pilot.pause()
+            assert str(app._current_record.seq) == seq, "cure leaked on cancel"
+            assert not [e for c in sc._load_collections()
+                        for e in c.get("plasmids", [])
+                        if e.get("source") == "scrub:cured"]
+            assert modal.query_one("#btn-scrub-apply", sc.Button).disabled is False
+
+
+class TestScrubCuredSave:
+    """`_scrub_save_cured_plasmid` (request H): the cured plasmid is saved under
+    the user-chosen name + collection with the cure primers bound, and the SAME
+    primers are written back onto the ORIGINAL (uncured) source entry so the
+    user sees where each cure edits a base. Mirrors the operon clone-save
+    coverage; calls the helper directly so the modal chain isn't in the loop."""
+
+    async def test_saves_cured_with_primers_and_annotates_source(self):
+        from copy import deepcopy
+        from Bio.Seq import Seq
+        seq, rec = _record_with_bsai()
+        rec._tui_display_name = "Source One"          # spaces
+        # Original lives in the library so the source annotate has a target.
+        src_id = "src_one"
+        libs = sc._load_library()
+        libs.append({"id": src_id, "name": "Source One", "size": len(seq),
+                     "gb_text": sc._record_to_gb_text(rec), "kind": "plasmid",
+                     "n_feats": len(rec.features)})
+        sc._save_library(libs)
+        plan = sc._scrub_design(seq, rec.features, ["BsaI"], circular=True)
+        rounds = [sc._scrub_qc_primers(plan["cured_seq"], c["positions"],
+                                       round_no=i)
+                  for i, c in enumerate(plan["clusters"], 1)]
+        primers = []
+        for r in rounds:
+            if r.get("error"):
+                continue
+            primers.append({"name": f"SCRUB-fam-{r['round']}-F",
+                            "seq": r["fwd_seq"], "strand": 1, "tm": r["fwd_tm"]})
+            primers.append({"name": f"SCRUB-fam-{r['round']}-R",
+                            "seq": r["rev_seq"], "strand": -1, "tm": r["rev_tm"]})
+        assert primers, "no scrub primers designed for the test"
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            cured_rec = deepcopy(rec)
+            cured_rec.seq = Seq(plan["cured_seq"])
+            app._apply_snapshot(plan["cured_seq"], 0, cured_rec)
+            await pilot.pause()
+            out = app._scrub_save_cured_plasmid(
+                name="Cured One", collection="Default",
+                primers=primers, src_id=src_id)
+            for _ in range(3):
+                await pilot.pause()
+        assert out is not None
+        clone_rec, final_name = out
+        assert final_name == "Cured One" and "_" not in final_name
+        saved = [e for c in sc._load_collections()
+                 for e in c.get("plasmids", [])
+                 if e.get("source") == "scrub:cured"]
+        assert saved and saved[-1]["name"] == "Cured One"
+        assert "primer_bind" in (saved[-1].get("gb_text") or ""), \
+            "cure primers not bound to the cured plasmid"
+        # The ORIGINAL source entry now ALSO carries the cure primers.
+        src_entry = sc._find_library_entry_by_id(src_id)
+        assert src_entry and "primer_bind" in (src_entry.get("gb_text") or ""), \
+            "cure primers not written back onto the original plasmid"
+
+    async def test_no_src_id_skips_source_but_saves_cured(self):
+        from copy import deepcopy
+        from Bio.Seq import Seq
+        seq, rec = _record_with_bsai()
+        plan = sc._scrub_design(seq, rec.features, ["BsaI"], circular=True)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            cured_rec = deepcopy(rec)
+            cured_rec.seq = Seq(plan["cured_seq"])
+            app._apply_snapshot(plan["cured_seq"], 0, cured_rec)
+            await pilot.pause()
+            # Empty primer list + no source id must not crash; cured still saves.
+            out = app._scrub_save_cured_plasmid(
+                name="Cured No Src", collection="Default",
+                primers=[], src_id=None)
+            for _ in range(2):
+                await pilot.pause()
+        assert out is not None
+        saved = [e for c in sc._load_collections()
+                 for e in c.get("plasmids", [])
+                 if e.get("name") == "Cured No Src"]
+        assert saved, "cured plasmid not saved when src_id is None"
 
 
 # ── agent endpoint: scrub-plasmid ────────────────────────────────────────────

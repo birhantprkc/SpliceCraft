@@ -14,6 +14,22 @@
 
 ---
 
+## [1.0.69] — 2026-06-13
+
+### Bug fixes
+
+- **Saving a plasmid whose name contains spaces no longer fails.** A plasmid whose name held spaces (e.g. `FFE 6 ENTRY pCambia2300-GREEN`) made *every* save — Ctrl+S **and** autosave — abort with an "Invalid whitespace … for LOCUS line" error, so edits couldn't be persisted at all. The internal GenBank LOCUS line (which forbids spaces) is now sanitized at save time, independently of the display name you see, so any name saves cleanly while the library keeps showing it spaced. (This is the "applying primers after a scrub broke the plasmid's name and the save" report.)
+
+### New features
+
+- **"Apply cure" now saves the cured plasmid for you.** Pressing **Apply cure** on the Scrub tab now asks you to name the cured plasmid and pick a collection, then saves it there with the cure primers bound where they anneal. The **original, uncured plasmid** also gets those primers drawn on it (each cure shown as a mismatch) so you can see exactly what they change and why. The cured name keeps your spaces — no underscores — and once saved it's loaded onto the canvas and highlighted in the library. Cancelling the name prompt leaves the canvas untouched.
+
+### Hardening
+
+- **The Save-primers dialog is centered and matches the other dialogs.** The dialog used after a scrub, a mutagenesis run, or a single-primer save had no frame and stretched the full width of the screen; it's now a tidy, centered, bordered box styled like every other naming dialog.
+
+---
+
 ## [1.0.68] — 2026-06-13
 
 ### New features

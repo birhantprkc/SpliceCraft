@@ -188,6 +188,31 @@ class TestPrimerSaveModalExists:
         assert len(modal._oligos) == 1
         assert modal._default_collection == "Main"
 
+    async def test_modal_is_centered_box(self):
+        """G (2026-06-13): the dialog must render as a centered, bordered box
+        like the other naming modals — not the old frameless full-width block.
+        The `#primer-save-dlg` width:80 rule only exists because of G, so a
+        fixed 80-wide bordered box proves the harmonized chrome applied."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PrimerSaveModal(
+                [{"label": "Fwd", "default_name": "test-F"}],
+                default_collection="Main"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            assert isinstance(modal, sc.PrimerSaveModal)
+            # centered on the screen (ModalScreen align)
+            assert str(modal.styles.align_horizontal) == "center"
+            assert str(modal.styles.align_vertical) == "middle"
+            # the harmonized box chrome: fixed 80-wide, bordered
+            dlg = modal.query_one("#primer-save-dlg")
+            assert int(dlg.styles.width.value) == 80, \
+                f"dialog not the harmonized 80-wide box: {dlg.styles.width}"
+            assert dlg.styles.border_top and dlg.styles.border_top[0], \
+                "dialog box has no border (frameless — G chrome not applied)"
+
 
 class TestPrimerSaveModalPreservesSpaces:
     """User-typed names with spaces flow through verbatim."""
