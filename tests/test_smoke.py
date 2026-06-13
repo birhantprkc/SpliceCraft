@@ -4807,6 +4807,43 @@ class TestSidebarSortOrder:
                 assert sidebar._feat_idx_to_row[feat_idx] == row
 
 
+class TestFeatureSidebarAutosize:
+    """The Features sidebar sizes its columns to the CURRENT content on every
+    populate, so short names reclaim width and a rename / delete / reload to
+    shorter content never leaves a stale-wide column. Regression guard: before
+    the fix, DataTable.clear() kept the prior (wider) column width, so the bp
+    column stayed pushed off the 32-wide panel (user-reported)."""
+
+    async def test_label_column_shrinks_not_stale(self, isolated_library):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.1)
+            sidebar = app.query_one("#sidebar", sc.FeatureSidebar)
+            table = sidebar.query_one("#feat-table")
+
+            def label_width():
+                return list(table.columns.values())[1].width
+
+            long_feats = [{"type": "CDS", "start": 0, "end": 90, "strand": 1,
+                           "color": "white", "label": "operon-DOM-1-F"}]
+            short_feats = [{"type": "CDS", "start": 0, "end": 90, "strand": 1,
+                            "color": "white", "label": "luxC"}]
+
+            sidebar.populate(long_feats)
+            await pilot.pause()
+            w_long = label_width()
+            assert w_long >= len("operon-DOM-1-F")     # sized to fit the label
+
+            # Repopulating with a shorter label must SHRINK the column — the
+            # staleness bug left it stuck at w_long.
+            sidebar.populate(short_feats)
+            await pilot.pause()
+            w_short = label_width()
+            assert w_short < w_long, (w_short, w_long)
+            assert w_short == max(len("Label"), len("luxC"))
+
+
 class TestOriginRotationCascade:
     """When the user rotates the plasmid map's origin, the change
     cascades through the OriginChanged message: the sidebar

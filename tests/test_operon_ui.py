@@ -391,16 +391,34 @@ class TestNativeOperonLift:
             assert res is not None and res.get("ok"), res
             assert sc._gb_find_forbidden_hits(res["cured_seq"], forb) == []
             assert screen.query_one("#btn-native-clone", Button).disabled is False
-            # Clone → outputs saved.
-            screen._native_clone(None)
+            # Clone → four artifacts saved. Call the save helper directly with
+            # explicit names so the test doesn't drive the two naming modals
+            # (`_native_clone` just chains `NamePlasmidModal`s to gather these).
+            summary = screen._native_save_outputs(
+                screen._native_operon, res,
+                plasmid_name="luxop clone", plasmid_coll="Default",
+                pcr_name="PCR-luxop", pcr_coll="Default",
+            )
             for _ in range(3):
                 await pilot.pause()
+            # (1) SOE primers in the primer library.
             assert len(sc._load_primers()) >= n_primers_before + len(res["primers"])
-            saved = [e for c in sc._load_collections()
-                     for e in c.get("plasmids", [])
-                     if e.get("source") == "native_operon"]
-            assert saved, "domesticated operon not saved to the library"
-            # ...and as a grammar-tagged OPERON L0 part (CDS-equivalent).
+            # (2) The cured PCR amplicon saved to the library, primers BOUND to it
+            #     and an amplify-history recorded.
+            amplicons = [e for c in sc._load_collections()
+                         for e in c.get("plasmids", [])
+                         if e.get("source") == "native_operon"]
+            assert amplicons, "domesticated operon PCR amplicon not saved"
+            assert "primer_bind" in amplicons[-1].get("gb_text", ""), \
+                "SOE primers not bound to the saved PCR fragment"
+            assert amplicons[-1].get("history_xml"), "PCR fragment missing history"
+            # (3) The cloned plasmid saved to a collection (clone-during-save).
+            assert summary["cloned"], "operon part was not cloned during save"
+            clones = [e for c in sc._load_collections()
+                      for e in c.get("plasmids", [])
+                      if e.get("source") == "native_operon:l0"]
+            assert clones, "cloned operon plasmid not saved to a collection"
+            # (4) ...and the grammar-tagged OPERON L0 part (CDS-equivalent).
             parts = [p for p in sc._load_parts_bin()
                      if p.get("type") == "OPERON"]
             assert parts, "OPERON L0 part not saved to the parts bin"

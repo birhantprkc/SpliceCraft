@@ -2272,3 +2272,52 @@ class TestConstructorMultiGrammarTabs:
         assert sc._get_entry_vector("gb_l0", "Alpha1") is None
         assert sc._get_entry_vector("gb_l0")["name"] == "L0_singleton"
         assert sc._get_entry_vector("gb_l0", "Omega1")["name"] == "omega1_vec"
+
+
+class TestClonePartWrapperFeature:
+    """INV-121: a part carrying lifted sub-features (a native operon's
+    individual genes) clones WITHOUT the redundant whole-part wrapper that
+    spans the entire insert — only the genes show. A part with NO
+    sub-features keeps its single span so the cloned insert isn't an
+    unannotated black box (user-reported: a cloned operon carried both the
+    genes AND a feature named after the plasmid spanning the whole operon)."""
+
+    def test_wrapper_dropped_when_genes_attach(self):
+        # 5' "TTT" leader so the body doesn't start with ATG (avoids the
+        # AATG-overhang start-codon collapse) — the insert anchors verbatim.
+        body = ("TTT" + "ATG" + "GCT" * 60 + "TAA"   # geneA
+                + "AAACCCGGGTTT"                      # spacer
+                + "ATG" + "GCA" * 60 + "TGA")         # geneB
+        g1_start, g1_end = 3, 3 + 3 + 180 + 3
+        g2_start = g1_end + 12
+        part = {
+            "name": "myOperon", "type": "OPERON", "position": "Pos 3-4",
+            "oh5": "AATG", "oh3": "GCTT", "sequence": body,
+            "grammar": "gb_l0", "level": 0,
+            "insert_feats": [
+                {"start": g1_start, "end": g1_end, "strand": 1,
+                 "type": "CDS", "label": "geneA"},
+                {"start": g2_start, "end": len(body), "strand": 1,
+                 "type": "CDS", "label": "geneB"},
+            ],
+        }
+        rec = sc._part_to_cloned_seqrecord(part)
+        labels = [str(f.qualifiers.get("label", [""])[0]) for f in rec.features]
+        notes = [str(n) for f in rec.features
+                 for n in (f.qualifiers.get("note") or [])]
+        assert "geneA" in labels and "geneB" in labels       # genes carried
+        assert not any(n.startswith("GB part type:") for n in notes), \
+            f"whole-operon wrapper not dropped: {notes!r}"
+
+    def test_wrapper_kept_without_subfeatures(self):
+        part = {
+            "name": "plainCDS", "type": "CDS", "position": "Pos 2-3",
+            "oh5": "AATG", "oh3": "GCTT",
+            "sequence": "TTTGCT" + "GCA" * 40 + "TAA",
+            "grammar": "gb_l0", "level": 0,
+        }
+        rec = sc._part_to_cloned_seqrecord(part)
+        notes = [str(n) for f in rec.features
+                 for n in (f.qualifiers.get("note") or [])]
+        assert any(n.startswith("GB part type:") for n in notes), \
+            "featureless part lost its single-span wrapper"

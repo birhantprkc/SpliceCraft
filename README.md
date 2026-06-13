@@ -267,12 +267,21 @@ each CDS (in the correct reading frame — reverse-strand and multi-CDS operons
 included, and a stop codon never becomes sense), plus a guided single-base fix
 you pick for any site that falls outside a CDS. SpliceCraft designs the
 **SOE-PCR primer set** (a flanking cassette pair plus one mutagenic pair per cure
-junction) and refuses to proceed unless *every* cure is primer-encoded. The cured
-operon is saved as a CDS-equivalent **OPERON** L0 part — a Golden Braid position
-whose AATG overhang carries the first gene's start codon and whose GCTT meets a
-terminator, so it drops into your assembly between a promoter and a terminator
-exactly like a CDS — alongside a library copy of the construct and the SOE
-primers in your primer library.
+junction) and refuses to proceed unless *every* cure is primer-encoded.
+
+**Clone into grammar** saves the whole job in one step, with you naming and filing
+each piece. The cured operon becomes a CDS-equivalent **OPERON** L0 part in your
+parts bin — a Golden Braid position whose AATG overhang carries the first gene's
+start codon and whose GCTT meets a terminator, so it drops into an assembly between
+a promoter and a terminator exactly like a CDS. The part is then **cloned into its
+entry vector** and saved to a plasmid collection you choose (named how you like),
+and the **cured PCR amplicon** is saved to your library under a name you pick
+(prefilled `PCR-…`) in the collection you choose; the SOE primers land in your
+primer library. The primers are drawn **bound** to both the PCR fragment and the
+cloned plasmid (re-derived against each sequence so they sit where they anneal),
+and both record how they were made in their **History** tab. The individual genes
+carry all the way through to the clone — no whole-operon band stacked on top of
+them. Cancelling either name prompt cancels the whole save.
 
 **Save** (and **Save As**, which forks a copy and only lights up once the
 fragment has been saved once) let you pick which collection the fragment lands

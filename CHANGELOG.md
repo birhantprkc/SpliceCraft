@@ -14,6 +14,19 @@
 
 ---
 
+## [1.0.66] — 2026-06-13
+
+### New features
+
+- **Saving a domesticated operon now saves the whole job — and you name every piece.** Pressing **Clone into grammar** on the Operon workbench persists four things in one step: the **OPERON part** to the parts bin, the part **cloned into its entry vector** to a plasmid collection, and the **cured PCR amplicon** to the library. It prompts you to name the cloned plasmid and the PCR fragment (prefilled `PCR-…`) and to choose a collection for each. The SOE primers that built it are drawn **bound** to *both* the PCR fragment and the cloned plasmid — re-derived against each sequence, so each primer sits exactly where it anneals — and both the PCR fragment and the plasmid record how they were made in their **History** tab. Cancelling either name prompt cancels the whole save (nothing is half-written).
+
+### Bug fixes
+
+- **A cloned operon no longer carries a giant feature spanning the whole operon.** The clone used to show the individual genes *and* a single feature named after the plasmid laid across the entire operon on top of them. That redundant whole-operon band is now dropped once the individual genes land — you see just the genes. (A part with no internal features still gets its single span, so it's never an unlabelled blank.)
+- **The Features list resizes itself and never shows stale columns.** The sidebar's columns now size to the current content every time they're drawn, so short names (luxC, luxD…) no longer leave the position column pushed off the edge — and renaming, deleting a feature, or reloading a plasmid no longer leaves a too-wide column behind.
+
+---
+
 ## [1.0.65] — 2026-06-13
 
 ### Bug fixes
