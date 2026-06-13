@@ -2882,7 +2882,7 @@ class TestLibraryPanelLongNames:
     the full name in `_lib_full_names` and surfaces it on the highlighted
     row's tooltip; the name itself pans via the table's horizontal scrollbar."""
 
-    async def test_panel_fixed_width_and_tooltips_full_name(
+    async def test_panel_fixed_width_and_no_row_hover_bubble(
             self, tiny_record, isolated_library):
         from textual.widgets import DataTable
         long_name = "pVeryLongConstruct-With-Lots-Of-Descriptive-Detail-v2026"
@@ -2896,18 +2896,20 @@ class TestLibraryPanelLongNames:
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause(); await pilot.pause(0.05)
             panel = app.query_one("#library", sc.LibraryPanel)
-            # Full (untruncated) name tracked for the tooltip.
+            # Full (untruncated) name still tracked (used by post-save focus).
             assert panel._lib_full_names.get("longy") == long_name
             # Panel stays at the fixed side-panel width (matched to the
             # FeatureSidebar) — a long name no longer grows the panel; it pans
-            # via the table scrollbar and shows in full on the tooltip below.
+            # via the table scrollbar.
             assert int(panel.styles.width.value) == sc._SIDE_PANEL_WIDTH, \
                 panel.styles.width
-            # Highlighting the row sets the table tooltip to the FULL name.
+            # Row hover NO LONGER pops a full-name tooltip bubble (removed
+            # 2026-06-13, user found it noisy) — `_on_lib_row_highlighted`
+            # clears the table tooltip instead of setting the full name.
             t = panel.query_one("#lib-table", DataTable)
             t.move_cursor(row=0)
             await pilot.pause(); await pilot.pause()
-            assert t.tooltip == long_name
+            assert t.tooltip is None
 
 
 class TestResiteLabelClickOwnership:

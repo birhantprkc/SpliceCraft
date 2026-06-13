@@ -14,6 +14,22 @@
 
 ---
 
+## [1.0.71] — 2026-06-13
+
+### Bug fixes
+
+- **Your primer cart no longer drops marked primers on export.** Marking a primer `$` for the order cart writes the flag to your primer library, but the cart-CSV export was only gathering from collections (while the post-export reset cleared *both*) — so a marked primer that wasn't in a scanned collection got silently cleared without ever reaching the CSV. On top of that, the `$` toggle wrote the whole primer list back without a lock, so a background save (e.g. while scrub/operon primers were being saved) could clobber a just-set mark. Both are fixed: the export now gathers from the library too, and marking is a locked, per-primer write. (This is the "I tagged 15+ but only 14 were saved" report.)
+
+### New features
+
+- **Hover tooltips on every button.** Every button in SpliceCraft now shows a concise tooltip explaining what it does when you hover it — across all the workbenches, pickers, and dialogs. A new **Settings → "Show button tooltips"** toggle turns them all off (or back on) instantly if you'd rather not see them.
+
+### Changes
+
+- **The plasmid-library hover bubble is gone.** Hovering a library row no longer pops a full-name tooltip bubble (it was noisy); the row name is still readable in the map title + window header once a plasmid is loaded.
+
+---
+
 ## [1.0.70] — 2026-06-13
 
 ### Bug fixes

@@ -2353,6 +2353,37 @@ class TestCartReset:
         assert sc._clear_all_cart_marks() == 0
         assert sc._collect_cart_primers() == []
 
+    def test_collect_includes_library_marks_not_just_collections(
+            self, isolated_primers):
+        """Regression (2026-06-13): the $ mark is set on the primer LIBRARY, so
+        the export must collect from the library too — not only collections —
+        else a marked primer that isn't in a scanned collection silently drops
+        from the CSV (yet `_clear_all_cart_marks` would still clear it, so the
+        mark just vanished). Now symmetric with the clear."""
+        sc._save_primer_collections([])
+        sc._set_active_primer_collection_name("")          # no mirror
+        sc._save_primers([
+            {"name": "L1", "sequence": "ACGTACGTACGTACGTACGT", "in_cart": True},
+            {"name": "L2", "sequence": "TTTTGGGGCCCCAAAATTTT"},
+        ])
+        assert {p["name"] for p in sc._collect_cart_primers()} == {"L1"}, \
+            "library $ mark not collected (collections-only scan regressed)"
+
+    def test_set_primer_cart_flag_atomic_by_sequence(self, isolated_primers):
+        """`_set_primer_cart_flag` sets/clears the $ flag BY SEQUENCE (case-
+        insensitive), persists it, and surfaces it in the cart; unknown
+        sequence → False. This is the race-safe persist behind the Space-cycle
+        $ toggle (a stale whole-list save could clobber a concurrent mark)."""
+        sc._save_primer_collections([])
+        sc._set_active_primer_collection_name("")
+        sc._save_primers([{"name": "A", "sequence": "ACGTACGTACGTACGTACGT"}])
+        assert sc._set_primer_cart_flag("acgtacgtacgtacgtacgt", True) is True
+        assert {p["name"] for p in sc._collect_cart_primers()} == {"A"}
+        assert any(p.get("in_cart") for p in sc._load_primers())
+        assert sc._set_primer_cart_flag("ACGTACGTACGTACGTACGT", False) is True
+        assert sc._collect_cart_primers() == []
+        assert sc._set_primer_cart_flag("NOSUCHSEQUENCE", True) is False
+
 
 class TestPrimerSearchAndMarks:
     """Primer-library search bar (#pd-lib-search): fuzzy name filter, marks

@@ -429,7 +429,9 @@ when you genuinely want a clean slate (typed `YES`, a default-No confirm, and
 a cool-down on the button; no shortcut, no API). **Settings** collapses every
 toggle (restriction overlay, primer-binding length, and more) into one dialog,
 with launchers for the grammar, entry-vector, enzyme-collection, and
-codon-table editors.
+codon-table editors. Every button has a concise hover tooltip explaining what
+it does; a **Show button tooltips** switch in Settings turns them all off if
+you'd rather not see them.
 
 Want to drive all of this from a script or an agent? There's a 100+ endpoint
 localhost JSON API (`splicecraft --agent`) and a stdlib-only CLI sidecar
