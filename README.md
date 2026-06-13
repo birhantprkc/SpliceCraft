@@ -277,11 +277,17 @@ a promoter and a terminator exactly like a CDS. The part is then **cloned into i
 entry vector** and saved to a plasmid collection you choose (named how you like),
 and the **cured PCR amplicon** is saved to your library under a name you pick
 (prefilled `PCR-…`) in the collection you choose; the SOE primers land in your
-primer library. The primers are drawn **bound** to both the PCR fragment and the
-cloned plasmid (re-derived against each sequence so they sit where they anneal),
-and both record how they were made in their **History** tab. The individual genes
-carry all the way through to the clone — no whole-operon band stacked on top of
-them. Cancelling either name prompt cancels the whole save.
+primer library. You also name the **primer family** in the save dialog — that one
+name labels the whole SOE set as `{family}-DOM-#-F/R` (the `-DOM-` domesticator tag,
+the positional pair number, and forward/reverse) everywhere they appear. The primers
+are drawn **bound** to the PCR fragment, the cloned plasmid, **and the original
+source plasmid you lifted from** — re-derived against each sequence so they sit where
+they anneal, with each synonymous cure showing as a mismatch on the source, so you
+can see exactly what every primer changes and why. Both the fragment and the clone
+record how they were made in their **History** tab, and the individual genes carry
+all the way through to the clone — no whole-operon band stacked on top of them.
+Cancelling either name prompt cancels the whole save; when it completes, the finished
+clone is loaded onto the canvas and highlighted in the library.
 
 **Save** (and **Save As**, which forks a copy and only lights up once the
 fragment has been saved once) let you pick which collection the fragment lands

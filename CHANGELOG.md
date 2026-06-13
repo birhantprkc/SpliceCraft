@@ -14,6 +14,25 @@
 
 ---
 
+## [1.0.67] — 2026-06-13
+
+### Bug fixes
+
+- **A domesticated operon's saved PCR fragment now has the correct 3′ end.** The fragment was appending the reverse primer's 5′ tail (the `GCGC` pad + Esp3I site + spacer) to the 3′ end **unreversed**, so it didn't actually end in the reverse-complement of the reverse primer and its Esp3I site pointed the wrong way. The fragment now ends in `RC(reverse primer)` — exactly what a tailed-primer PCR yields — so it cuts correctly in the assembly reaction. (This is the "3′ end shows a reversal of the reverse primer's 5′ end" report.)
+
+### New features
+
+- **Name the primer family when you save a domesticated operon.** The save dialog has a new "Primer Family Name" box; whatever you enter names the whole SOE primer set as `{family}-DOM-#-F/R` (the `-DOM-` domesticator tag, the positional pair number, and `F`/`R`) — consistently on the PCR fragment, the cloned plasmid, and the primer library.
+- **The domestication primers are now drawn on the original source plasmid too.** Lift an operon from a library plasmid and domesticate it, and the SOE primers are written back onto that source plasmid — bound where they anneal, with each synonymous cure showing as a mismatch — so you can see on the source exactly what each primer changes and why. Re-domesticating the same operon doesn't pile up duplicates.
+- **After saving, the new plasmid is brought front-and-centre.** Saving a domesticated operon now closes the workbench, loads the cloned plasmid onto the canvas, and scrolls the library to highlight it — so you land on the finished construct instead of hunting for it.
+
+### Hardening
+
+- The plasmid and PCR-fragment names you choose are kept verbatim (spaces / hyphens) on the loaded record and the library row — no underscored LOCUS names leaking into the display.
+- The save dialog's fields are spaced cleanly: a minimum width so nothing clips, and one blank line between each label + box.
+
+---
+
 ## [1.0.66] — 2026-06-13
 
 ### New features

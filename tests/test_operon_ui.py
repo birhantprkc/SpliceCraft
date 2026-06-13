@@ -378,10 +378,20 @@ class TestNativeOperonLift:
             for _ in range(4):
                 await pilot.pause()
             screen = app.screen
-            screen._native_lift_from_record(rec, "test:luxop")
+            # Put the source in the library so the save can write the SOE
+            # primers back onto it (7a) — lift WITH its library id.
+            src_id = "luxop_src"
+            _libs = sc._load_library()
+            _libs.append({"id": src_id, "name": "luxop src", "size": len(seq),
+                          "gb_text": sc._record_to_gb_text(rec), "kind": "plasmid",
+                          "n_feats": len(rec.features)})
+            sc._save_library(_libs)
+            screen._native_lift_from_record(rec, "plasmid:luxop src",
+                                            source_id=src_id)
             for _ in range(2):
                 await pilot.pause()
             assert screen._native_operon is not None
+            assert screen._native_operon.get("source_id") == src_id
             n_primers_before = len(sc._load_primers())
             screen._native_cure(None)
             await app.workers.wait_for_complete()
@@ -398,20 +408,38 @@ class TestNativeOperonLift:
                 screen._native_operon, res,
                 plasmid_name="luxop clone", plasmid_coll="Default",
                 pcr_name="PCR-luxop", pcr_coll="Default",
+                primer_family="VhLux",
             )
             for _ in range(3):
                 await pilot.pause()
-            # (1) SOE primers in the primer library.
-            assert len(sc._load_primers()) >= n_primers_before + len(res["primers"])
+            # (1) SOE primers in the primer library, FAMILY-rebased names
+            #     ({family}-DOM-#-F/R) — no leftover "operon-DOM-".
+            saved_primers = sc._load_primers()
+            assert len(saved_primers) >= n_primers_before + len(res["primers"])
+            fam_names = [p["name"] for p in saved_primers
+                         if str(p.get("source", "")).startswith("native_operon")]
+            assert fam_names and all(n.startswith("VhLux-DOM-") for n in fam_names), \
+                f"primer family not applied: {fam_names!r}"
             # (2) The cured PCR amplicon saved to the library, primers BOUND to it
             #     and an amplify-history recorded.
             amplicons = [e for c in sc._load_collections()
                          for e in c.get("plasmids", [])
                          if e.get("source") == "native_operon"]
             assert amplicons, "domesticated operon PCR amplicon not saved"
-            assert "primer_bind" in amplicons[-1].get("gb_text", ""), \
+            amp_gb = amplicons[-1].get("gb_text", "")
+            assert "primer_bind" in amp_gb, \
                 "SOE primers not bound to the saved PCR fragment"
             assert amplicons[-1].get("history_xml"), "PCR fragment missing history"
+            # (2b) Amplicon 3' end == reverse-complement of the reverse primer
+            #      (the tailed-primer PCR product). Guards the forward-tail bug
+            #      where the rev primer's 5' tail landed unreversed at the 3' end.
+            import re as _re
+            m = _re.search(r"\nORIGIN(.*?)//", amp_gb, _re.S)
+            amp_seq = _re.sub(r"[^ACGTacgt]", "", m.group(1)).upper() if m else ""
+            rev = next((p["seq"] for p in res["primers"]
+                        if str(p.get("kind", "")) == "flank-rev"), "")
+            assert amp_seq and rev and amp_seq.endswith(sc._rc(rev)), \
+                "amplicon 3' end is not the reverse-complement of the reverse primer"
             # (3) The cloned plasmid saved to a collection (clone-during-save).
             assert summary["cloned"], "operon part was not cloned during save"
             clones = [e for c in sc._load_collections()
@@ -424,3 +452,27 @@ class TestNativeOperonLift:
             assert parts, "OPERON L0 part not saved to the parts bin"
             assert parts[-1]["oh5"] == "AATG" and parts[-1]["oh3"] == "GCTT"
             assert parts[-1].get("grammar") == "gb_l0"
+            # (5) Post-save focus: closes the workbench + loads the saved clone
+            #     onto the canvas (best-effort UI helper `_native_clone` calls).
+            assert app.screen is screen      # workbench still open before focus
+            screen._native_focus_saved_clone(summary["clone_rec"],
+                                              summary["plasmid_name"])
+            for _ in range(4):
+                await pilot.pause()
+            assert app.screen is not screen, "workbench not closed after save focus"
+            assert (app._current_record is not None
+                    and sc._seq_len(app._current_record)
+                    == sc._seq_len(summary["clone_rec"])), \
+                "saved clone not loaded onto the canvas"
+            # (6) 7a: the SOURCE plasmid now carries the SOE primers (family-
+            #     rebased), so the user sees what/why each cure changes.
+            assert summary.get("source_annotated"), "source plasmid not annotated"
+            src_entry = sc._find_library_entry_by_id(src_id)
+            assert src_entry and "VhLux-DOM-" in (src_entry.get("gb_text") or ""), \
+                "SOE primers not written onto the source plasmid"
+            # (7) No underscores forced into the user's names (INV-98): the
+            #     loaded clone + the saved names keep their spaced/hyphenated form.
+            assert "_" not in app._record_display_name(app._current_record), \
+                "loaded clone shows an underscored display name"
+            assert summary["pcr_name"] == "PCR-luxop"
+            assert "_" not in summary["plasmid_name"]
