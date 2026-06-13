@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.73] — 2026-06-13
+
+### New features
+
+- **Demo mode now opens with worked examples.** A demo session is seeded with three example plasmids — a general one (map / sequence / features / restriction overlay / primers / Simulator / BLAST), a Golden-Braid-scrubbable plasmid (BsaI + Esp3I sites in a CDS — try **Mutato ▸ Scrub**), and a two-gene operon (try **Synthesis ▸ lift + domesticate**) — so each major tool has something to try out of the box. The demo banner now shows the version so you can see which build you're on.
+
+---
+
 ## [1.0.72] — 2026-06-13
 
 ### New features

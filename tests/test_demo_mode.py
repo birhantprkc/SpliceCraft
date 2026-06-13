@@ -152,6 +152,50 @@ class TestWebDemoComputeCap:
             assert "small" in str(getattr(app._current_record, "id", ""))
 
 
+class TestDemoModeQA:
+    """Capstone walkthrough: LOCAL is fully open; WEB locks exactly the
+    high-risk surfaces (egress / host-FS / agent / destructive / oversize)
+    while the pure-compute tools — Scrub, operon, translate, etc. — STILL
+    work on the seed (that's the demo's whole point)."""
+
+    def test_local_mode_blocks_nothing(self, monkeypatch):
+        monkeypatch.setattr(sc, "_DEMO_MODE", "local")
+        sc._demo_block_network("x")                          # no raise
+        assert sc._demo_web_refuse(_FakeApp(), "open") is False
+        assert sc._start_agent_api is not None               # not demo-gated
+        # local master-delete is NOT short-circuited by the demo guard
+        # (it still requires the sentinel; we don't actually run a wipe here).
+
+    def test_web_locks_surfaces(self, monkeypatch):
+        import urllib.error
+        import pytest as _pt
+        monkeypatch.setattr(sc, "_DEMO_MODE", "web")
+        with _pt.raises(urllib.error.URLError):
+            sc.fetch_genbank("L09137")
+        assert sc._demo_web_refuse(_FakeApp(), "Opening files") is True
+        assert sc._start_agent_api(_FakeApp()) is None
+        assert sc._perform_master_delete(
+            _FakeApp(), sentinel=sc._MASTER_DELETE_SENTINEL)["files_removed"] == 0
+
+    def test_web_tools_still_run_on_seed(self, monkeypatch):
+        # The locked surfaces are network/FS/destructive — the SCIENCE tools are
+        # pure compute and must keep working so the demo is actually usable.
+        monkeypatch.setattr(sc, "_DEMO_MODE", "web")
+        scrub = sc._make_demo_scrub_plasmid()
+        cds = next(f for f in scrub.features if f.type == "CDS")
+        plan = sc._scrub_gb_design(
+            str(scrub.seq),
+            [{"type": "CDS", "start": int(cds.location.start),
+              "end": int(cds.location.end), "strand": 1}],
+            ["BsaI", "Esp3I"], circular=True)
+        assert plan["ok"] and plan["verified"], "Scrub broke in web demo"
+        op = sc._make_demo_operon_plasmid()
+        for f in [f for f in op.features if f.type == "CDS"]:
+            prot = sc._translate_cds(str(op.seq), int(f.location.start),
+                                     int(f.location.end), 1)
+            assert prot.count("*") == 1, prot
+
+
 class TestDemoSeed:
     async def test_seed_populates_demo_library(self):
         app = sc.PlasmidApp()
@@ -166,3 +210,31 @@ class TestDemoSeed:
         demo = next(c for c in colls if c.get("name") == "Demo plasmids")
         assert demo.get("plasmids"), "demo collection empty"
         assert sc._get_active_collection_name() == "Demo plasmids"
+        # A worked example for the marquee tools: general + Scrub + operon.
+        sources = {e.get("source") for e in demo["plasmids"]}
+        assert sources == {"demo"}
+        assert len(demo["plasmids"]) >= 3, "expected general + scrub + operon"
+        names = {e.get("name") for e in demo["plasmids"]}
+        assert "Demo Scrub Plasmid" in names and "Demo Operon" in names, names
+
+    def test_seed_builders_are_valid_and_scrubbable(self):
+        # The scrub demo plasmid must actually Golden-Braid-scrub clean, and the
+        # operon's two genes must be valid ORFs — else the demo's worked
+        # examples wouldn't exercise the tools.
+        scrub = sc._make_demo_scrub_plasmid()
+        cds = next(f for f in scrub.features if f.type == "CDS")
+        s, e = int(cds.location.start), int(cds.location.end)
+        plan = sc._scrub_gb_design(str(scrub.seq),
+                                   [{"type": "CDS", "start": s, "end": e,
+                                     "strand": 1, "label": "demoReporter"}],
+                                   ["BsaI", "Esp3I"], circular=True)
+        assert plan["ok"] and plan["verified"], plan.get("errors")
+        assert not sc._scrub_scan_targets(plan["cured_seq"],
+                                          frozenset(["BsaI", "Esp3I"]), True)
+        op = sc._make_demo_operon_plasmid()
+        cdss = [f for f in op.features if f.type == "CDS"]
+        assert len(cdss) == 2
+        for f in cdss:
+            prot = sc._translate_cds(str(op.seq), int(f.location.start),
+                                     int(f.location.end), 1)
+            assert prot.startswith("M") and prot.count("*") == 1, prot
