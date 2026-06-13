@@ -177,6 +177,20 @@ class TestDemoModeQA:
         assert sc._perform_master_delete(
             _FakeApp(), sentinel=sc._MASTER_DELETE_SENTINEL)["files_removed"] == 0
 
+    async def test_open_file_action_refused_in_web(self, monkeypatch):
+        # The host-FS browser never opens in the web demo — every push site
+        # (Ctrl+O action, Parts Bin ▸ Open file, entry-vector ▸ Open file) is
+        # gated, so the OpenFileModal is never pushed.
+        monkeypatch.setattr(sc, "_DEMO_MODE", "web")
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.action_open_file()
+            for _ in range(3):
+                await pilot.pause()
+            assert not isinstance(app.screen, sc.OpenFileModal), \
+                "file dialog opened in the web demo"
+
     def test_web_tools_still_run_on_seed(self, monkeypatch):
         # The locked surfaces are network/FS/destructive — the SCIENCE tools are
         # pure compute and must keep working so the demo is actually usable.

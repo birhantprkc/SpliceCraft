@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.74] — 2026-06-13
+
+### Hardening
+
+- **Web demo: the file-open / import / export lockdown now covers every entry point.** Beyond the top-level file-open and the four format exports, the web demo also blocks opening files from inside the Parts Bin and Entry-Vector pickers, the feature-library FASTA export, attaching images, and the Sequencing/Plasmidsaurus import — each with the same polite "install SpliceCraft for the full tool" message. (Dormant unless `SPLICECRAFT_DEMO=web`.)
+
+---
+
 ## [1.0.73] — 2026-06-13
 
 ### New features
