@@ -146,14 +146,18 @@ working, right alongside the plasmid it belongs to.
 
 The library beside the designer organises primers into **collections** (new /
 rename / delete, like the plasmid side, with destructive prompts defaulting to
-**No**): press **Space** to cycle a primer's mark — ★ select → $ cart → M move →
-none — then **MOVE** the M-marked primers to another collection, or bulk-delete /
-re-status the ★-marked set (the warning names exactly how many go). When it's
-time to order, **export** a collection — or your order **Cart** (the $-marked
-primers) — to a paste-ready **CSV** (name, sequence, length, Tm)
-for the synthesis company, and **import** a CSV back for a full round-trip.
-Exports refuse a malformed oligo and imports skip + report invalid rows, so a
-wrong sequence never reaches your order or your library.
+**No**), with a **search bar** above the list that filters by name (fuzzy, like
+the plasmid library). Press **Space** to cycle a primer's mark — ★ select → $
+cart → M move → none — then **MOVE** the M-marked primers to another collection,
+or bulk-delete / re-status the ★-marked set (the warning names exactly how many
+go); marks are tracked by the primer itself, so searching/filtering never moves
+a mark onto the wrong one, and **CLEAR** wipes every mark at once. When it's time
+to order, **export** a collection — or your order **Cart** (the $-marked primers)
+— to a paste-ready **CSV** (name, sequence, length, Tm) for the synthesis
+company; a successful cart export **clears the $ marks** so the next order starts
+empty. **Import** a CSV back for a full round-trip. Exports refuse a malformed
+oligo and imports skip + report invalid rows, so a wrong sequence never reaches
+your order or your library.
 
 ### Mutato
 

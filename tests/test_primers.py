@@ -2322,3 +2322,84 @@ class TestPrimerSeqRenderChokepoint:
         f, clean = await self._parsed_primer(dirty)
         ps = f.get("_primer_seq", "")
         assert ps == clean and not any(c.isspace() for c in ps)
+
+
+class TestCartReset:
+    """A successful cart-CSV export resets the cart: `_clear_all_cart_marks`
+    strips every $ (in_cart) flag — across all collections (the cart source)
+    and the primer library — so the next order starts empty. Idempotent."""
+
+    def test_clears_cart_marks_and_is_idempotent(self, isolated_primers):
+        sc._save_primer_collections([
+            {"name": "Main", "primers": [
+                {"name": "P1", "sequence": "AAAACCCCGGGGTTTT", "in_cart": True},
+                {"name": "P3", "sequence": "GGGGTTTTAAAACCCC", "in_cart": True},
+                {"name": "P2", "sequence": "TTTTGGGGCCCCAAAA"},   # not in cart
+            ]},
+        ])
+        assert len(sc._collect_cart_primers()) == 2     # the pending order
+        n = sc._clear_all_cart_marks()
+        assert n == 2                                    # distinct cleared
+        assert sc._collect_cart_primers() == []          # cart now empty
+        for c in sc._load_primer_collections():
+            assert all(not p.get("in_cart") for p in (c.get("primers") or []))
+        # Idempotent — clearing an already-empty cart is a no-op.
+        assert sc._clear_all_cart_marks() == 0
+
+    def test_empty_cart_is_noop(self, isolated_primers):
+        sc._save_primer_collections([
+            {"name": "Main", "primers": [
+                {"name": "P1", "sequence": "AAAACCCCGGGGTTTT"}]}])
+        assert sc._clear_all_cart_marks() == 0
+        assert sc._collect_cart_primers() == []
+
+
+class TestPrimerSearchAndMarks:
+    """Primer-library search bar (#pd-lib-search): fuzzy name filter, marks
+    (★ select / M move — full-list-index keyed) survive filtering with no
+    staleness, and CLEAR resets every mark."""
+
+    async def test_search_filters_marks_survive_and_clear(self, isolated_primers):
+        sc._save_primers([
+            {"name": "alpha-DOM-1-F", "sequence": "AAAACCCCGGGGTTTTAAAA"},
+            {"name": "beta-DOM-1-F",  "sequence": "CCCCGGGGTTTTAAAACCCC"},
+            {"name": "gamma-DOM-1-F", "sequence": "GGGGTTTTAAAACCCCGGGG"},
+        ])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.PrimerDesignScreen("ACGT" * 50, [], "t"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            screen = app.screen
+            screen._refresh_library_table()
+            await pilot.pause()
+            t = screen.query_one("#pd-lib-table", sc.DataTable)
+            assert t.row_count == 3
+            # Mark "alpha" (★) by its FULL-list index, then filter it OUT.
+            primers = sc._load_primers()
+            alpha_idx = next(i for i, p in enumerate(primers)
+                             if p["name"] == "alpha-DOM-1-F")
+            screen._lib_selected = {alpha_idx}
+            screen._filter_text = "beta"
+            screen._refresh_library_table()
+            await pilot.pause()
+            assert t.row_count == 1                 # only beta shows
+            assert alpha_idx in screen._lib_selected  # mark survived the filter
+            # Clearing the filter brings alpha back, STILL marked (no staleness).
+            screen._filter_text = ""
+            screen._refresh_library_table()
+            await pilot.pause()
+            assert t.row_count == 3
+            assert alpha_idx in screen._lib_selected
+            # A 0-match filter is safe (no out-of-range cursor move).
+            screen._filter_text = "zzzznomatch"
+            screen._refresh_library_table()
+            await pilot.pause()
+            assert t.row_count == 0
+            # CLEAR resets the transient marks.
+            screen._filter_text = ""
+            screen._move_marked = {alpha_idx}
+            screen._clear_primer_marks(None)
+            await pilot.pause()
+            assert screen._lib_selected == set() and screen._move_marked == set()

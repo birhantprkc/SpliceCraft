@@ -654,7 +654,7 @@ class TestScrubToMap:
                 f for f in app._current_record.features
                 if f.type == "primer_bind"
                 and (f.qualifiers.get("label", [""]) or [""])[0].startswith(
-                    "SCRUB_")]
+                    "SCRUB-")]
             # one round → a fwd + a rev primer_bind feature, each with seq
             assert len(scrub_primers) >= 2
             assert all("primer_seq" in f.qualifiers for f in scrub_primers)
@@ -923,7 +923,7 @@ class TestScrubGoldenBraidUI:
             gbp = [f for f in app._current_record.features
                    if f.type == "primer_bind"
                    and (f.qualifiers.get("label", [""]) or [""])[0].startswith(
-                       "GB_F")]
+                       "SCRUB-")]
             assert len(gbp) >= 2
             assert all("primer_seq" in f.qualifiers for f in gbp)
             # the user-typed display name (with spaces) survives the add.
@@ -1124,3 +1124,56 @@ class TestScrubQuikChangeVerify:
                                          "method": "quikchange"})
         assert res["method"] == "quikchange"
         assert res["verified"] is True
+
+
+class TestScrubSourceAnnotation:
+    """`Save primers` also draws the family-named (no-underscore) scrub primers
+    onto the ORIGINAL source plasmid (the library entry the scrub ran on), so
+    the cures are visible on the source. Also verifies the active-library
+    lookup works from inside the modal."""
+
+    async def test_save_primers_annotates_source(self):
+        seq, rec = _record_with_bsai()
+        rec._tui_display_name = "Src Plasmid 1"      # spaces — must stay clean
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(171, 43)) as pilot:
+            await pilot.pause()
+            src_id = "srcplasmid1"
+            libs = sc._load_library()
+            libs.append({"id": src_id, "name": "Src Plasmid 1", "size": len(seq),
+                         "gb_text": sc._record_to_gb_text(rec), "kind": "plasmid",
+                         "n_feats": len(rec.features)})
+            sc._save_library(libs)
+            app._apply_snapshot(seq, 0, rec)
+            app.query_one("#library", sc.LibraryPanel).set_active(src_id)
+            await pilot.pause()
+            feats = app.query_one("#plasmid-map", sc.PlasmidMap)._feats
+            app.push_screen(sc.MutagenizeModal(seq, feats, "Src Plasmid 1",
+                                               show_tab="scrub"))
+            await pilot.pause()
+            await pilot.pause(0.1)
+            modal = app.screen
+            plan = sc._scrub_design(seq, feats, ["BsaI"], circular=True)
+            rounds = [sc._scrub_qc_primers(plan["cured_seq"], c["positions"],
+                                           round_no=i)
+                      for i, c in enumerate(plan["clusters"], 1)]
+            modal._scrub_apply_result(plan, rounds)
+            await pilot.pause()
+            primers = modal._scrub_primer_list()
+            # family-named SCRUB-{family}-#-F/R, never an underscore
+            assert primers and all(
+                p["name"].startswith("SCRUB-") and "_" not in p["name"]
+                for p in primers)
+            oligos = [{"label": p["name"], "default_name": p["name"],
+                       "sequence": p["seq"], "tm": p["tm"],
+                       "_strand": p["strand"], "_ptype": p["ptype"]}
+                      for p in primers]
+            modal._scrub_commit_primers_with_names(
+                oligos, [o["default_name"] for o in oligos])
+            await pilot.pause()
+            src = sc._find_library_entry_by_id(src_id)
+            assert src and "primer_bind" in (src.get("gb_text") or ""), \
+                "scrub primers not written onto the source plasmid"
+            assert "SCRUB-" in (src.get("gb_text") or "")
+            # no underscores forced into the source display name (INV-98)
+            assert "_" not in (src.get("name") or "")

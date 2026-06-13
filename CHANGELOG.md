@@ -14,6 +14,20 @@
 
 ---
 
+## [1.0.68] — 2026-06-13
+
+### New features
+
+- **Scrub primers are now a named family, drawn on both plasmids.** When you scrub a plasmid's restriction sites, name the **primer family** in the new box on the Scrub tab — the whole set becomes `SCRUB-{family}-#-F/R` (positional pair number, then `F`/`R`), with no underscores, across QuikChange *and* Golden Braid. "Save primers" stores them in the primer collection you choose **and** draws them onto the **original source plasmid** (bound where they anneal, each cure shown as a mismatch) so you can see what every primer changes; "Add to Map" draws them on the scrubbed plasmid as before. (Re-scrubbing the same plasmid won't pile up duplicate primers.)
+- **Exporting your primer cart now resets it.** After a successful "Export cart → CSV", the `$` cart marks are cleared from every collection so your next order starts from an empty cart. If the reset can't be saved for any reason, you're told and the marks stay (the CSV is already written either way).
+- **Search the primer library + a Clear-marks button.** A search bar above the primer list filters by name (fuzzy, like the plasmid library); the `$` / `★` / `M` marks are kept by primer identity, so filtering never moves a mark onto the wrong primer (and a no-match search is safe). The new **CLEAR** button wipes every mark at once — the `$` cart, the `★` select and the `M` move marks — across all collections.
+
+### Bug fixes
+
+- **No underscores in the scrub plasmid naming.** The Scrub / Mutagenize tools were taking the plasmid's underscored GenBank LOCUS as its name (e.g. `FFE_6_ENTRY_pCambia2300`); they now use the clean display name you gave it, so the primer family default and any name they show stay hyphenated/spaced.
+
+---
+
 ## [1.0.67] — 2026-06-13
 
 ### Bug fixes
