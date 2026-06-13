@@ -14,6 +14,19 @@
 
 ---
 
+## [1.0.70] — 2026-06-13
+
+### Bug fixes
+
+- **Long library names no longer flash truncated after a save or edit.** A plasmid with a long name (e.g. `FFE 6 ENTRY pCambia2300-GREEN`) showed correctly in the list, but the moment you edited or saved it the active row re-rendered clipped to ~14 characters (`FFE 6 ENTRY pC`) — the saved name was always intact, the row just refreshed at the wrong width. The active-row refresh now uses the real column width, so the name stays full.
+- **Switching between a cured plasmid and its near-identical source now works.** After making a cured plasmid (e.g. scrubbing `FFE 6` into `pNeoCambia-GREEN`), clicking back to the original in the library wouldn't switch the canvas — you had to load a third plasmid and come back. The cured plasmid had inherited the source's internal identifier, so the "this entry is already loaded" check mistook the two for the same molecule. The cured plasmid now carries its own identifier, so the canvas switches normally.
+
+### New features
+
+- **Scrub "Apply cure" now simulates the real assembly and shows it in History.** For a **Golden Braid** scrub, Apply cure no longer jumps straight to a finished plasmid — it builds each fragment's real PCR amplicon, saves them to your chosen collection as `PCR-<primer-pair name>` (e.g. `PCR-SCRUB-FFE6-1`, each with its two primers bound and its own amplify history), then genuinely **BsaI-digests and ligates** those amplicons back into the cured circle. The cured plasmid's **History tab** now reads as an actual assembly — an *assemble* step whose parents are those PCR amplicons, each showing the primers that made it. If the fragments don't reassemble into the cured sequence, the cure is **not** saved (you're told). **QuikChange** scrubs (which aren't a fragment assembly — they're mutagenic PCR + recircularization) get a faithful mutagenesis history instead, with the cure primers recorded and the original plasmid as the parent; no whole-plasmid "amplicons" are saved.
+
+---
+
 ## [1.0.69] — 2026-06-13
 
 ### Bug fixes

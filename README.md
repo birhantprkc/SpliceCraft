@@ -194,7 +194,11 @@ together, the native 4 nt junction overhangs making reassembly seamless so the
 only net change is the cured sites. (BsaI being the assembly enzyme, every BsaI
 site is force-cured, and the design proves itself by a digest-and-ligate
 simulation before you order.) Sites it can't remove silently are reported,
-never forced.
+never forced. On a Golden Braid cure, **Apply cure** doesn't shortcut to the
+finished plasmid — it saves each fragment's PCR amplicon to your library as
+`PCR-<primer-pair name>` and genuinely BsaI-digests + ligates them back together,
+so the cured plasmid's **History** reads as a real assembly with those amplicons
+as its parents.
 
 ### Synthesis
 

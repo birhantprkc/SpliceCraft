@@ -600,8 +600,9 @@ class TestScrubCuredSave:
             for _ in range(3):
                 await pilot.pause()
         assert out is not None
-        clone_rec, final_name = out
+        clone_rec, final_name, amp_names = out
         assert final_name == "Cured One" and "_" not in final_name
+        assert amp_names == []            # QuikChange path saves no amplicons
         saved = [e for c in sc._load_collections()
                  for e in c.get("plasmids", [])
                  if e.get("source") == "scrub:cured"]
@@ -636,6 +637,180 @@ class TestScrubCuredSave:
                  for e in c.get("plasmids", [])
                  if e.get("name") == "Cured No Src"]
         assert saved, "cured plasmid not saved when src_id is None"
+
+    async def test_golden_braid_saves_amplicons_and_assembly_history(self):
+        """GB Apply-cure save SIMULATES THE STEPS: each fragment amplicon is
+        saved as `PCR-SCRUB-…` (primers bound + amplify history), the amplicons
+        are genuinely BsaI-digested + ligated, and the cured plasmid carries an
+        ASSEMBLY history whose parents are those amplicons."""
+        from copy import deepcopy
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        seq = TestScrubGoldenBraid()._seq_with(
+            400, [(100, "GAATTC"), (260, "GAATTC")], seed=7)
+        rec = SeqRecord(Seq(seq), id="gbsrc", name="gbsrc",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec._tui_display_name = "GB Source"
+        src_id = "gb_src"
+        libs = sc._load_library()
+        libs.append({"id": src_id, "name": "GB Source", "size": len(seq),
+                     "gb_text": sc._record_to_gb_text(rec), "kind": "plasmid",
+                     "n_feats": 0})
+        sc._save_library(libs)
+        plan = sc._scrub_gb_design(seq, [], ["EcoRI"])
+        assert plan["ok"] and plan["verified"], plan.get("errors")
+        primers = []
+        for fr in plan["fragments"]:
+            i = fr["index"] + 1
+            primers.append({"name": f"SCRUB-FAM-{i}-F", "seq": fr["fwd_seq"],
+                            "strand": 1, "tm": fr["fwd_tm"]})
+            primers.append({"name": f"SCRUB-FAM-{i}-R", "seq": fr["rev_seq"],
+                            "strand": -1, "tm": fr["rev_tm"]})
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            cured_rec = deepcopy(rec)
+            cured_rec.seq = Seq(plan["cured_seq"])
+            app._apply_snapshot(plan["cured_seq"], 0, cured_rec)
+            await pilot.pause()
+            out = app._scrub_save_cured_plasmid(
+                name="GB Cured", collection="Default", primers=primers,
+                src_id=src_id, plan=plan, source_name="GB Source")
+            for _ in range(3):
+                await pilot.pause()
+        assert out is not None
+        clone_rec, final_name, amp_names = out
+        assert final_name == "GB Cured" and "_" not in final_name
+        # one PCR- amplicon per fragment, named PCR-SCRUB-FAM-#
+        assert len(amp_names) == len(plan["fragments"]) >= 2
+        assert all(a.startswith("PCR-SCRUB-FAM-") for a in amp_names), amp_names
+        amplicons = [e for c in sc._load_collections()
+                     for e in c.get("plasmids", [])
+                     if e.get("source") == "scrub_gb:amplicon"]
+        assert len(amplicons) == len(amp_names)
+        assert all("primer_bind" in (e.get("gb_text") or "") for e in amplicons)
+        assert all("amplifyFragment" in (e.get("history_xml") or "")
+                   for e in amplicons)
+        # the cured plasmid has an ASSEMBLY history with amplicons as parents
+        cured = [e for c in sc._load_collections()
+                 for e in c.get("plasmids", [])
+                 if e.get("source") == "scrub_gb:cured"]
+        assert cured, "GB cured plasmid not saved"
+        hist = cured[-1].get("history_xml") or ""
+        assert "insertFragment" in hist and "goldenBraidAssembly" in hist
+        node = sc._parse_commercialsaas_history(hist)
+        assert node is not None and len(node.parents) == len(amp_names), \
+            "assembly history parents != saved amplicons"
+
+    async def test_quikchange_history_has_no_amplicons(self):
+        """QuikChange Apply-cure save: the cured plasmid gets a mutagenesis
+        (`editSequence`) history with the primers + the source as parent, and
+        NO whole-plasmid amplicons are saved (faithful, no clutter)."""
+        from copy import deepcopy
+        from Bio.Seq import Seq
+        seq, rec = _record_with_bsai()
+        rec._tui_display_name = "QC Source"
+        src_id = "qc_src"
+        libs = sc._load_library()
+        libs.append({"id": src_id, "name": "QC Source", "size": len(seq),
+                     "gb_text": sc._record_to_gb_text(rec), "kind": "plasmid",
+                     "n_feats": 0})
+        sc._save_library(libs)
+        plan = sc._scrub_design(seq, rec.features, ["BsaI"], circular=True)
+        rounds = [sc._scrub_qc_primers(plan["cured_seq"], c["positions"],
+                                       round_no=i)
+                  for i, c in enumerate(plan["clusters"], 1)]
+        primers = []
+        for r in rounds:
+            if r.get("error"):
+                continue
+            primers.append({"name": f"SCRUB-QC-{r['round']}-F",
+                            "seq": r["fwd_seq"], "strand": 1, "tm": r["fwd_tm"]})
+            primers.append({"name": f"SCRUB-QC-{r['round']}-R",
+                            "seq": r["rev_seq"], "strand": -1, "tm": r["rev_tm"]})
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            cured_rec = deepcopy(rec)
+            cured_rec.seq = Seq(plan["cured_seq"])
+            app._apply_snapshot(plan["cured_seq"], 0, cured_rec)
+            await pilot.pause()
+            out = app._scrub_save_cured_plasmid(
+                name="QC Cured", collection="Default", primers=primers,
+                src_id=src_id, plan=plan, source_name="QC Source")
+            for _ in range(3):
+                await pilot.pause()
+        assert out is not None
+        _clone, _final, amp_names = out
+        assert amp_names == []          # no fragment amplicons for QuikChange
+        assert not [e for c in sc._load_collections()
+                    for e in c.get("plasmids", [])
+                    if e.get("source") == "scrub_gb:amplicon"]
+        cured = [e for c in sc._load_collections()
+                 for e in c.get("plasmids", [])
+                 if e.get("source") == "scrub:cured"]
+        assert cured, "QuikChange cured plasmid not saved"
+        hist = cured[-1].get("history_xml") or ""
+        assert "editSequence" in hist and "QuikChange" in hist
+
+    async def test_cured_plasmid_has_own_id_so_canvas_can_switch_back(self):
+        """Bug B regression (2026-06-13): the cured plasmid is a `deepcopy` of
+        its source, so it used to INHERIT the source's `record.id`.
+        `_library_load`'s "already loaded (record.id == entry_id)" guard then
+        refused to switch the canvas from the cured plasmid back to its
+        near-identical source. The cured plasmid now gets its OWN id."""
+        from copy import deepcopy
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        seq = TestScrubGoldenBraid()._seq_with(
+            400, [(100, "GAATTC"), (260, "GAATTC")], seed=7)
+        # Source's RECORD id == its ENTRY id (as a library round-trip yields) —
+        # the exact condition that tripped the stale-id guard.
+        src_id = "FFE_SRC"
+        rec = SeqRecord(Seq(seq), id=src_id, name=src_id,
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec._tui_display_name = "FFE Source"
+        libs = sc._load_library()
+        libs.append({"id": src_id, "name": "FFE Source", "size": len(seq),
+                     "gb_text": sc._record_to_gb_text(rec), "kind": "plasmid",
+                     "n_feats": 0})
+        sc._save_library(libs)
+        plan = sc._scrub_gb_design(seq, [], ["EcoRI"])
+        assert plan["ok"] and plan["verified"], plan.get("errors")
+        primers = []
+        for fr in plan["fragments"]:
+            i = fr["index"] + 1
+            primers.append({"name": f"SCRUB-FAM-{i}-F", "seq": fr["fwd_seq"],
+                            "strand": 1, "tm": fr["fwd_tm"]})
+            primers.append({"name": f"SCRUB-FAM-{i}-R", "seq": fr["rev_seq"],
+                            "strand": -1, "tm": fr["rev_tm"]})
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_BASELINE) as pilot:
+            await pilot.pause()
+            cured_rec = deepcopy(rec)
+            cured_rec.seq = Seq(plan["cured_seq"])
+            app._apply_snapshot(plan["cured_seq"], 0, cured_rec)
+            await pilot.pause()
+            out = app._scrub_save_cured_plasmid(
+                name="FFE Cured", collection="Default", primers=primers,
+                src_id=src_id, plan=plan, source_name="FFE Source")
+            assert out is not None
+            clone_rec, _final, _amps = out
+            assert clone_rec.id != src_id, \
+                "cured plasmid still inherits the source's record id"
+            # Load the cured plasmid (as the post-save focus does), then select
+            # the SOURCE via _library_load — the canvas MUST switch to it.
+            app._apply_record(clone_rec)
+            await pilot.pause()
+            assert app._current_record.id != src_id
+            src_entry = sc._find_library_entry_by_id(src_id)
+            app._library_load(sc.LibraryPanel.PlasmidLoad(src_entry))
+            await pilot.pause()
+            await pilot.pause()
+            assert str(app._current_record.seq) == seq, \
+                "canvas did not switch back to the source (stale-id load guard)"
 
 
 # ── agent endpoint: scrub-plasmid ────────────────────────────────────────────
@@ -837,6 +1012,32 @@ class TestScrubGoldenBraid:
         """Wrap-aware presence of `site` or its RC in circular `seq`."""
         aug = seq + seq[:len(site) - 1]
         return site in aug or sc._rc(site) in aug
+
+    def test_real_digest_ligation_reassembles_cured(self):
+        """Apply cure's assembly path (`_assemble_scrub_amplicons_real`)
+        GENUINELY BsaI-digests + ligates the fragment amplicons back into the
+        cured plasmid — the real digest+ligation primitives, not the design-time
+        string-chaining shortcut. Guards the overhang-canonicalisation risk:
+        `_ligate_fragments` matches overhangs by equality, so this proves the
+        scrub amplicons actually close through the real machinery."""
+        seq = self._seq_with(400, [(100, "GAATTC"), (260, "GAATTC")], seed=7)
+        plan = sc._scrub_gb_design(seq, [], ["EcoRI"])
+        assert plan["ok"] and plan["verified"], plan.get("errors")
+        frags = plan["fragments"]
+        n = len(plan["cured_seq"])
+        amps = sc._scrub_gb_build_amplicons(
+            plan["orig_seq"], plan["cured_seq"], frags, n,
+            single=(len(frags) == 1))
+        assert len(amps) == len(frags) and len(frags) >= 2
+        product = sc._assemble_scrub_amplicons_real(amps)
+        assert product is not None, \
+            "real BsaI digest+ligation failed to close the circle"
+        assert len(product) == n
+        # circular rotation equality with the cured plasmid
+        assert plan["cured_seq"] in (product + product), \
+            "assembled product is not a rotation of the cured plasmid"
+        # the assembled product is BsaI-clean (wrap-aware)
+        assert not sc._scrub_scan_targets(product, frozenset(["BsaI"]), True)
 
     def test_overhang_ok_rejects_palindrome_and_homopolymer(self):
         assert sc._scrub_gb_overhang_ok("GGAG")          # clean, asymmetric

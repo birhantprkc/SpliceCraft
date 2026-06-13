@@ -9949,6 +9949,43 @@ class TestShiftClickFeatureExtend:
         assert panel2._compute_name_col_width() == \
             sc.LibraryPanel._NAME_COL_FLOOR
 
+    async def test_refresh_active_row_keeps_full_name(self, isolated_library):
+        """Regression (2026-06-13): `_refresh_active_row` (fired on a save /
+        dirty-toggle via `set_dirty`) must render the active row's Name at the
+        real column width, not a hardcoded 14-char clip — which turned
+        "FFE 6 ENTRY pCambia2300-GREEN" into "FFE 6 ENTRY pC" the instant the
+        row refreshed after a save, even though the saved name is intact."""
+        from textual.coordinate import Coordinate
+        from textual.widgets import DataTable
+        long_name = "FFE 6 ENTRY pCambia2300-GREEN"
+        entry = {"id": "ffe6", "name": long_name, "size": 100, "n_feats": 0,
+                 "source": "test", "added": "2026-06-13", "gb_text": "",
+                 "status": ""}
+        sc._save_collections([{"name": "Default", "plasmids": [entry],
+                               "saved": "2026-06-13"}])
+        sc._set_active_collection_name("Default")
+        sc._save_library([entry])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(180, 48)) as pilot:
+            await pilot.pause()
+            lib = app.query_one("#library", sc.LibraryPanel)
+            lib._view_mode = "plasmids"
+            lib._apply_view_mode()
+            lib._repopulate()
+            await pilot.pause()
+            lib.set_active("ffe6")
+            lib.set_dirty(True)     # clean → dirty fires _refresh_active_row
+            lib.set_dirty(False)    # dirty → clean (the save case) fires it again
+            await pilot.pause()
+            t = lib.query_one("#lib-table", DataTable)
+            val = None
+            for i, rk in enumerate(t.rows.keys()):
+                if getattr(rk, "value", None) == "ffe6":
+                    val = str(t.get_cell_at(Coordinate(i, 1)))
+                    break
+            assert val == long_name, \
+                f"active-row name truncated on refresh: {val!r}"
+
     def test_changelog_section_parser_round_trip(self):
         """`_parse_changelog_sections` splits a mock CHANGELOG into
         (version, body) pairs preserving source order."""
