@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.75] — 2026-06-13
+
+### New features
+
+- **Command palette (`Ctrl+P`).** Press `Ctrl+P` to fuzzy-search and jump straight to any major tool — type "scrub", "blast", "operon", "primers", "simulator" — without hunting the menu bar. A fast way to discover what SpliceCraft can do, alongside the `?` Help shortcut list.
+
+---
+
 ## [1.0.74] — 2026-06-13
 
 ### Hardening
