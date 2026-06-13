@@ -1233,3 +1233,100 @@ class TestSelectionPipelineHub:
             for _ in range(4):
                 await pilot.pause()
             assert not isinstance(app.screen, sc.ConstructorModal)
+
+
+class TestCloneNamingAndRowCarry:
+    """Guards for the parts-bin → Save-to-Collection clone path:
+      * the clone keeps the part's HUMAN (spaced) display name, not the
+        underscored GenBank LOCUS (the "still producing underscores" bug);
+      * the clone carries the part's `insert_feats` (the genes), which the
+        parts-bin table-row projection (`_all_rows`) MUST include — dropping
+        it there silently fused a lifted operon into one block."""
+
+    def _vector(self):
+        sc._set_entry_vector("gb_l0", {
+            "name": "TESTUPD", "size": 0, "source": "test",
+            "id": "TESTUPD", "gb_text": _make_acceptor_gb(2),
+        })
+
+    def _part(self, name="My Operon (domesticated) COPY 3"):
+        self._vector()
+        g = sc._BUILTIN_GRAMMARS["gb_l0"]
+        ct = next((p["type"] for p in g["positions"]
+                   if p["type"] in (g.get("coding_types") or [])),
+                  g["positions"][0]["type"])
+        d = sc._design_gb_primers(_INSERT, 0, len(_INSERT), ct,
+                                  codon_raw=None, grammar=g)
+        L = len(d["insert_seq"])
+        part = {
+            "name": name, "type": d["part_type"], "position": d["position"],
+            "oh5": d["oh5"], "oh3": d["oh3"], "sequence": d["insert_seq"],
+            "fwd_primer": d["fwd_full"], "rev_primer": d["rev_full"],
+            "fwd_tm": d["fwd_tm"], "rev_tm": d["rev_tm"], "grammar": "gb_l0",
+            "insert_feats": [
+                {"start": 3, "end": L // 2 - 3, "type": "CDS",
+                 "strand": 1, "label": "geneA"},
+                {"start": L // 2, "end": L - 3, "type": "CDS",
+                 "strand": 1, "label": "geneB"},
+            ],
+        }
+        return part
+
+    def test_clone_keeps_spaced_display_name(self):
+        cl = sc._part_to_cloned_seqrecord(self._part())
+        # The SeqRecord LOCUS is sanitised (underscores), but the display
+        # name the library/canvas show must be the original spaced name.
+        assert "_" in cl.name              # LOCUS is sanitised
+        assert getattr(cl, "_tui_display_name", None) == \
+            "My Operon (domesticated) COPY 3"
+
+    def test_clone_carries_insert_feats_genes(self):
+        cl = sc._part_to_cloned_seqrecord(self._part())
+        labels = {(f.qualifiers.get("label") or [f.type])[0]
+                  for f in cl.features}
+        assert {"geneA", "geneB"} <= labels
+
+    def test_row_projection_includes_insert_feats(self):
+        # The exact regression: a part saved with insert_feats must surface
+        # them in the parts-bin row projection, or the row-driven clone
+        # drops the genes. Drives the real `_all_rows` via the bin file.
+        part = self._part(name="RowOperon")
+        sc._save_parts_bin([part])
+        screen = sc.PartsBinModal()
+        screen._active_level = 0          # L0 tab
+        rows = screen._all_rows()
+        match = next((r for r in rows if r.get("name") == "RowOperon"), None)
+        assert match is not None
+        assert match.get("insert_feats"), \
+            "row projection dropped insert_feats — genes will fuse on clone"
+        assert len(match["insert_feats"]) == 2
+
+    def test_clone_carries_all_run_primers(self):
+        # Every primer that built the plasmid — the flank pair AND the
+        # internal SOE/cure primers — must land on the clone, not just the
+        # two flanks. Internal primers bind the cured insert body.
+        part = self._part(name="OperonAllPrimers")
+        ins = part["sequence"]
+        part["run_primers"] = [
+            {"name": "DOM-1-F", "seq": "GCGCCGTCTCA" + ins[:25], "strand": 1},
+            {"name": "DOM-1-R", "seq": "GCGCCGTCTCA" + sc._rc(ins[-25:]),
+             "strand": -1},
+            {"name": "DOM-2-F", "seq": ins[30:55], "strand": 1},   # internal
+            {"name": "DOM-2-R", "seq": sc._rc(ins[30:55]), "strand": -1},
+        ]
+        cl = sc._part_to_cloned_seqrecord(part)
+        names = {(f.qualifiers.get("label") or [""])[0]
+                 for f in cl.features if f.type == "primer_bind"}
+        assert {"DOM-1-F", "DOM-1-R", "DOM-2-F", "DOM-2-R"} <= names, names
+
+    def test_row_projection_includes_run_primers(self):
+        part = self._part(name="RowRunPrimers")
+        part["run_primers"] = [{"name": "p1", "seq": "ACGT" * 6, "strand": 1}]
+        sc._save_parts_bin([part])
+        screen = sc.PartsBinModal()
+        screen._active_level = 0
+        rows = screen._all_rows()
+        match = next((r for r in rows if r.get("name") == "RowRunPrimers"), None)
+        assert match is not None
+        assert match.get("run_primers"), \
+            "row projection dropped run_primers — only flanks reach the clone"

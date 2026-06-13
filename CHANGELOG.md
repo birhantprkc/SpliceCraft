@@ -14,6 +14,17 @@
 
 ---
 
+## [1.0.63] — 2026-06-12
+
+### Bug fixes
+
+- **Saving an operon part to a collection now keeps its genes — for real this time.** The previous fix carried the genes when cloning a part *directly*, but the **Save to Collection** button (and Copy Cloned) clone from the parts-bin table row, and that row was rebuilt from a fixed field list that quietly left `insert_feats` out — so the genes never reached the clone and the operon landed as one fused feature bar. The row now carries them, so every clone path produces the individual genes.
+- **Cloned parts keep their real name instead of an underscored LOCUS.** A part saved as "pJE202 2472-8888 (domesticated) COPY 3" was landing in the library as `pJE202_2472_8888__domesticated__COPY_3`. The cloned record now stamps its human (spaced) display name, so the library and the map title show the name you gave it.
+- **A domesticated operon's amplicon now saves to your active collection, not "Default".** It was being filed into "Default" via a lookup that never resolved, so the name-collision "COPY 2 / COPY 3 …" counter kept climbing off a hidden pile there — and deleting the clone + part from your real collection did nothing to stop it. The amplicon now lands in the active collection alongside the clone, so the COPY count reflects what you can actually see and delete. (Existing stray amplicons already in "Default" can be deleted from that collection.)
+- **Every primer that built a domesticated operon now appears on the cloned plasmid.** Previously only the two outer flank primers landed on the clone; the internal SOE/mutagenic cure primers (the ones that introduce each domestication edit) were missing. All of them — flank pair plus every junction primer — now show as primer_bind features, each drawn at the site it anneals to (and any that doesn't bind the finished sequence is left off rather than placed at a guess).
+
+---
+
 ## [1.0.62] — 2026-06-12
 
 ### Bug fixes
