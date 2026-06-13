@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.65] — 2026-06-13
+
+### Bug fixes
+
+- **A lifted operon's genes now appear as distinct genes — not one fused block — for real this time.** The previous fixes made the individual genes *survive* the lift → domesticate → clone trip, but they still rendered as one indistinguishable block. The real culprit: feature labels were clipped to 28 characters *before being saved*, and a gene annotated the ENA way ("unnamed protein product; luxC", "…; luxD", …) is identical for its first 28 characters — so the distinguishing gene letter (the C, D, A, B, E, G) got chopped and all six genes ended up with the exact same label. Labels are now stored in full (the 28-character limit applies only to on-screen drawing), and a generic "unnamed protein product; luxC" is shown as just "luxC" — so the six lux genes appear as luxC, luxD, luxA, luxB, luxE, luxG on the map, in the sidebar, and on the cloned plasmid. (An operon you already cloned needs to be re-cloned from its source to pick up the distinct names — the old clone's labels were chopped on disk.)
+
+---
+
 ## [1.0.64] — 2026-06-12
 
 ### Bug fixes

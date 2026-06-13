@@ -436,6 +436,90 @@ class TestFeatLabelFallback:
         assert sc._feat_label(f) == "β-galactosidase"
 
 
+class TestFeatLabelFull:
+    """`_feat_label_full` is the CANONICAL (untruncated) feature label —
+    the value `PlasmidMap._parse` stores and that cloning / export carry
+    forward. The 28-char cap lives only in the `_feat_label` display
+    wrapper. Regression: an ENA-style operon ("unnamed protein product;
+    luxC" … "luxG") collapsed to six identical "unnamed protein product;
+    lux" bars on the clone because the gene letter sat at char 29, past
+    the cap, and the truncated label was what got persisted."""
+
+    @staticmethod
+    def _cds(note):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        return SeqFeature(FeatureLocation(0, 99), type="CDS",
+                          qualifiers={"note": [note]})
+
+    def test_full_label_not_truncated(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        f = SeqFeature(FeatureLocation(0, 10), type="gene",
+                       qualifiers={"label": ["a" * 50]})
+        assert sc._feat_label_full(f) == "a" * 50      # full extractor keeps it
+        assert sc._feat_label(f) == "a" * 28           # display wrapper still caps
+
+    def test_placeholder_gene_surfaced_full(self):
+        # The reported operon: each gene's distinguishing letter survives.
+        for gene in ("luxC", "luxD", "luxA", "luxB", "luxE", "luxG"):
+            f = self._cds(f"unnamed protein product; {gene}")
+            assert sc._feat_label_full(f) == gene
+            assert sc._feat_label(f) == gene          # short → no truncation
+
+    def test_sibling_operon_genes_stay_distinct(self):
+        # The crux: six sibling CDS no longer collapse to one label.
+        genes = ["luxC", "luxD", "luxA", "luxB", "luxE", "luxG"]
+        labels = [sc._feat_label_full(self._cds(f"unnamed protein product; {g}"))
+                  for g in genes]
+        assert labels == genes
+        assert len(set(labels)) == 6                  # all distinct
+
+    def test_bare_placeholder_unchanged(self):
+        f = self._cds("unnamed protein product")
+        assert sc._feat_label_full(f) == "unnamed protein product"
+
+    def test_placeholder_case_insensitive_and_separators(self):
+        assert sc._surface_placeholder_gene(
+            "Unnamed Protein Product: luxC") == "luxC"
+        assert sc._surface_placeholder_gene(
+            "unnamed protein product - luxD") == "luxD"
+        assert sc._surface_placeholder_gene("luxC") == "luxC"      # no placeholder
+        assert sc._surface_placeholder_gene(
+            "ribosome binding site; weak") == "ribosome binding site; weak"
+
+    def test_full_label_collapses_whitespace(self):
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        f = SeqFeature(FeatureLocation(0, 10), type="CDS",
+                       qualifiers={"product": ["Line one\nLine two"]})
+        assert sc._feat_label_full(f) == "Line one Line two"
+
+    def test_clone_lift_preserves_distinct_gene_labels(self):
+        """End-to-end on the modal pipeline the bug travels through:
+        `_stamp_insert_feats_on_part` (source feats → part insert_feats)
+        then `_attach_insert_feats_to_record` (insert_feats → clone). The
+        six lifted operon genes must land as six DISTINCT CDS labels, not
+        one collapsed block."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        genes = ["luxC", "luxD", "luxA", "luxB", "luxE", "luxG"]
+        # Source feats as `PlasmidMap._parse` would emit them (full labels).
+        feats, pos = [], 0
+        for g in genes:
+            feats.append({"start": pos, "end": pos + 90, "strand": 1,
+                          "type": "CDS", "label": g, "color": "white"})
+            pos += 100
+        insert = "ATG" + "GCT" * 199          # 600 bp, covers all 6 genes
+        part = {"name": "pJE-Operon", "sequence": insert}
+        n = sc._stamp_insert_feats_on_part(part, insert, feats)
+        assert n == 6 and len(part["insert_feats"]) == 6
+        rec = SeqRecord(Seq(insert), id="clone", name="clone",
+                        annotations={"molecule_type": "DNA"})
+        sc._attach_insert_feats_to_record(rec, insert, part["insert_feats"])
+        got = [str(f.qualifiers.get("label", [""])[0])
+               for f in rec.features if f.type == "CDS"]
+        assert sorted(got) == sorted(genes)           # all six survive
+        assert len(set(got)) == 6                     # and stay distinct
+
+
 class TestParseClamping:
     """Features with out-of-range coordinates are clamped to
     [0, len(seq)] rather than rendered past the end of the map."""
