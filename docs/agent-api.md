@@ -2,7 +2,10 @@
 
 `splicecraft --agent` (alias `--agent-api`) exposes a localhost JSON
 HTTP API with bearer-token auth, covering every GUI action external
-AI agents need.
+AI agents need. The server binds `127.0.0.1` only and rejects any
+request whose `Host` header isn't loopback (`127.0.0.1` / `localhost`
+/ `::1`) — a DNS-rebinding defense, so a browser page can't reach the
+API even to enumerate endpoints.
 
 ## Why it exists
 

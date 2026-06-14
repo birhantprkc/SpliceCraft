@@ -47,6 +47,13 @@ compiles at install, so install a C toolchain first:
 `sudo apt install build-essential python3-dev` (Linux) or
 `xcode-select --install` (macOS), then `pipx install splicecraft`.
 
+On **Windows**, run SpliceCraft in **Windows Terminal** (the Windows 11
+default) for the braille map — it auto-configures the console for UTF-8 +
+ANSI at startup, so the map renders instead of garbling. If braille shows as
+boxes (a font without those glyphs), toggle **'ASCII plasmid map'** in
+Settings → Display. See [`docs/PLATFORMS.md`](docs/PLATFORMS.md) for the full
+terminal matrix.
+
 Press `?` once running for the full keyboard-shortcut reference. See
 [`docs/install.md`](docs/install.md) for pip / uv / conda / source installs.
 

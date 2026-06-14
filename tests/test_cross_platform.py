@@ -494,3 +494,123 @@ class TestPlatformCachedAtImport:
         monkeypatch.setattr(_platform, "platform", _no_platform)
         # Accessing the cache must not re-call platform.platform().
         assert sc._RUNTIME_PLATFORM  # still the cached string
+
+
+class TestSelectRenderTierForcedFlag:
+    """`_select_render_tier` also sets `_ASCII_FORCED`: True when ASCII was
+    forced by capability/env (so a saved `ascii_map=False` can't restore
+    braille over a terminal that can't render it), False on a clean UTF-8
+    terminal (where `main()` honours the saved preference)."""
+
+    def test_clean_utf8_not_forced(self, monkeypatch):
+        monkeypatch.setattr(sc, "_ASCII_MODE", True)
+        monkeypatch.setattr(sc, "_ASCII_FORCED", True)
+        monkeypatch.delenv("SPLICECRAFT_ASCII", raising=False)
+        monkeypatch.setattr(sc, "_ensure_utf8_stdout", lambda: True)
+        sc._select_render_tier()
+        assert sc._ASCII_MODE is False
+        assert sc._ASCII_FORCED is False
+
+    def test_env_force_sets_forced(self, monkeypatch):
+        monkeypatch.setattr(sc, "_ASCII_MODE", False)
+        monkeypatch.setattr(sc, "_ASCII_FORCED", False)
+        monkeypatch.setenv("SPLICECRAFT_ASCII", "1")
+        sc._select_render_tier()
+        assert sc._ASCII_MODE is True
+        assert sc._ASCII_FORCED is True
+
+    def test_unfixable_encoding_sets_forced(self, monkeypatch):
+        monkeypatch.setattr(sc, "_ASCII_MODE", False)
+        monkeypatch.setattr(sc, "_ASCII_FORCED", False)
+        monkeypatch.delenv("SPLICECRAFT_ASCII", raising=False)
+        monkeypatch.setattr(sc, "_ensure_utf8_stdout", lambda: False)
+        sc._select_render_tier()
+        assert sc._ASCII_MODE is True
+        assert sc._ASCII_FORCED is True
+
+
+class TestWindowsConsoleUtf8:
+    """`_windows_enable_utf8_console` — the programmatic `chcp 65001` +
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING that stops a Windows console (even
+    inside Windows Terminal on Win 11) from garbling the UTF-8 braille map
+    against its legacy OEM output code page. No-op off Windows; NEVER raises."""
+
+    def test_noop_off_windows(self):
+        if sc.sys.platform == "win32":
+            pytest.skip("on a real Windows host the call configures the console")
+        assert sc._windows_enable_utf8_console() == []
+
+    def test_graceful_when_kernel32_unavailable(self, monkeypatch):
+        # Force the win32 branch on a non-Windows host: ctypes has no `windll`,
+        # so the body raises AttributeError internally — which MUST be swallowed
+        # (a ctypes quirk can never block launch) and leave the flag False.
+        monkeypatch.setattr(sc.sys, "platform", "win32")
+        monkeypatch.setattr(sc, "_WIN_UTF8_CONSOLE", False)
+        notes = sc._windows_enable_utf8_console()   # must not raise
+        assert isinstance(notes, list)
+        assert sc._WIN_UTF8_CONSOLE is False
+
+    def test_sets_codepage_and_vt_on_windows(self, monkeypatch):
+        import ctypes
+        calls = {"out_cp": None, "in_cp": None, "vt": False}
+
+        class _Fn:
+            """Mimic a ctypes _FuncPtr: callable + settable restype/argtypes
+            (the hardened code pins these so a 64-bit HANDLE isn't truncated)."""
+            def __init__(self, impl): self._impl = impl
+            def __call__(self, *a): return self._impl(*a)
+
+        def _set_out(cp): calls["out_cp"] = cp; return 1
+        def _set_in(cp): calls["in_cp"] = cp; return 1
+        def _set_mode(_h, mode): calls["vt"] = bool(mode & 0x0004); return 1
+
+        class _K32:
+            GetConsoleOutputCP = _Fn(lambda: 437)         # legacy OEM page
+            GetConsoleCP       = _Fn(lambda: 437)
+            SetConsoleOutputCP = _Fn(_set_out)
+            SetConsoleCP       = _Fn(_set_in)
+            GetStdHandle       = _Fn(lambda _h: 7)
+            GetConsoleMode     = _Fn(lambda _h, _ref: 1)  # mode stays 0 → VT off
+            SetConsoleMode     = _Fn(_set_mode)
+
+        class _WinDLL:
+            kernel32 = _K32()
+
+        monkeypatch.setattr(sc.sys, "platform", "win32")
+        monkeypatch.setattr(ctypes, "windll", _WinDLL(), raising=False)
+        monkeypatch.setattr("atexit.register", lambda *_a, **_k: None)
+        monkeypatch.setattr(sc, "_WIN_UTF8_CONSOLE", False)
+        notes = sc._windows_enable_utf8_console()
+        assert calls["out_cp"] == 65001, "must set console OUTPUT code page to UTF-8"
+        assert calls["in_cp"] == 65001
+        assert calls["vt"] is True, "must enable VIRTUAL_TERMINAL_PROCESSING"
+        assert sc._WIN_UTF8_CONSOLE is True
+        assert any("65001" in n for n in notes)
+
+
+class TestAsciiMapToggle:
+    """The live, persisted braille⇄ASCII map toggle — the in-app escape hatch
+    (Settings → Display, or `action_toggle_ascii_map`) for a terminal whose
+    font draws braille as boxes, so the fix needs no env var or restart."""
+
+    def test_set_ascii_mode_flips_global(self, monkeypatch):
+        monkeypatch.setattr(sc, "_ASCII_MODE", False)
+        sc._set_ascii_mode(True)
+        assert sc._ASCII_MODE is True
+        sc._set_ascii_mode(False)
+        assert sc._ASCII_MODE is False
+
+    def test_ascii_mode_in_braille_draw_cache_key_source(self):
+        # The live toggle relies on `_ASCII_MODE` being part of the PlasmidMap
+        # draw-cache key so a flip repaints. Guard that the global is read in
+        # `PlasmidMap.render` (the key builder) so the wiring can't silently
+        # regress to a stale-cache live toggle.
+        import inspect
+        src = inspect.getsource(sc.PlasmidMap.render)
+        assert "_ASCII_MODE" in src
+
+    def test_ascii_map_setting_roundtrips(self):
+        sc._set_setting("ascii_map", True)
+        assert sc._get_setting("ascii_map", None) is True
+        sc._set_setting("ascii_map", False)
+        assert sc._get_setting("ascii_map", None) is False

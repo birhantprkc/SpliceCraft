@@ -193,7 +193,8 @@ example copy must avoid `.private-names` tokens (a guarded reporter-gene name sl
 The demo serves whatever `pipx` has, so "never behind the terminal build" has two
 layers. **Primary: `release.py` refreshes it on every release** — after the tag is
 pushed and PyPI is publishing, `_refresh_web_demo()` waits for the sdist to go
-live, then `ssh root@splicecraft.bio 'sc-update'` and verifies `version.txt` +
+live, then `ssh root@147.182.141.165 'sc-update'` (the droplet IP — connecting by
+the domain trips host-key verification under BatchMode) and verifies `version.txt` +
 a 200 from the demo. It's **non-fatal** (the release is already shipped; a failure
 just prints the manual command) and opt-out via `SPLICECRAFT_SKIP_DEMO_REFRESH=1`
 (offline, or a laptop without the droplet's SSH key). Override the SSH target with

@@ -969,10 +969,12 @@ def _create_github_release(version: str) -> None:
 # ── Web-demo droplet refresh ─────────────────────────────────────────────────
 # After PyPI publishes, push the new version to the live demo (splicecraft.bio)
 # right away instead of waiting for the droplet's nightly `sc-update` cron. The
-# SSH host defaults to the apex domain (its A record points at the droplet);
-# override with SPLICECRAFT_DEMO_HOST, or skip the whole step with
-# SPLICECRAFT_SKIP_DEMO_REFRESH=1 (offline, or a laptop without the droplet key).
-DEMO_SSH_HOST    = os.environ.get("SPLICECRAFT_DEMO_HOST", "root@splicecraft.bio")
+# SSH host defaults to the droplet's IP — NOT the apex domain: known_hosts is
+# keyed by hostname, and the maintainer connects by IP, so SSHing the domain
+# trips "Host key verification failed" under BatchMode (v1.0.81). Override with
+# SPLICECRAFT_DEMO_HOST, or skip the whole step with SPLICECRAFT_SKIP_DEMO_REFRESH=1
+# (offline, or a laptop without the droplet key).
+DEMO_SSH_HOST    = os.environ.get("SPLICECRAFT_DEMO_HOST", "root@147.182.141.165")
 DEMO_VERSION_URL = "https://splicecraft.bio/version.txt"
 DEMO_LIVE_URL    = "https://demo.splicecraft.bio/"
 
@@ -1007,7 +1009,11 @@ def _run_sc_update() -> "int | None":
     version.txt). Returns the remote exit code, or None if ssh couldn't run."""
     try:
         return subprocess.run(
+            # accept-new TOFUs an unknown host key (a fresh laptop) but still
+            # rejects a CHANGED key, so a never-connected machine doesn't fail
+            # the way the domain did under plain BatchMode (v1.0.81).
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+             "-o", "StrictHostKeyChecking=accept-new",
              DEMO_SSH_HOST, "sc-update"],
             timeout=420,
         ).returncode
@@ -1048,13 +1054,13 @@ def _refresh_web_demo(version: str) -> None:
     print("  Waiting for PyPI before refreshing the demo…")
     _wait_for_pypi(version)
     attempts = 4
+    last_rc: "int | None" = None
     for i in range(1, attempts + 1):
         rc = _run_sc_update()
+        last_rc = rc
         if rc is None:
-            print(f"  Non-fatal — run later once PyPI has settled: {manual}")
+            print(f"  ssh isn't available here — run later: {manual}")
             return
-        if rc != 0:
-            print(f"  `sc-update` exited {rc} on the droplet (non-fatal).")
         served = _demo_served_version()
         if served == version:
             code = _demo_http_code()
@@ -1063,12 +1069,20 @@ def _refresh_web_demo(version: str) -> None:
                   f"HTTP {code or '???'}{ok}")
             return
         if i < attempts:
-            print(f"  demo still on {served or '?'} (PyPI Simple-index skew) "
-                  f"— retrying sc-update in 30s ({i}/{attempts - 1})…")
+            # Distinguish a connection / sc-update failure (rc != 0 — e.g. a
+            # host-key or auth problem) from a real PyPI Simple-index skew
+            # (rc 0 but the demo still serves the old version).
+            reason = (f"sc-update couldn't run (rc {rc})" if rc != 0
+                      else f"demo still on {served or '?'} (PyPI index skew)")
+            print(f"  {reason} — retrying in 30s ({i}/{attempts - 1})…")
             time.sleep(30)
-    print(f"  Demo still on {_demo_served_version() or '?'} after {attempts} "
-          "tries — PyPI's Simple index is lagging. The nightly sc-update cron "
-          f"will catch it; or re-run later: {manual}")
+    if last_rc not in (0, None):
+        print(f"  sc-update kept failing (rc {last_rc}) — couldn't reach or "
+              f"update the droplet (check SSH access). Run manually: {manual}")
+    else:
+        print(f"  Demo still on {_demo_served_version() or '?'} after "
+              f"{attempts} tries — PyPI's Simple index is lagging. The nightly "
+              f"sc-update cron will catch it; or re-run later: {manual}")
 
 
 _PRIVATE_NAMES_FILE = REPO_ROOT / ".private-names"

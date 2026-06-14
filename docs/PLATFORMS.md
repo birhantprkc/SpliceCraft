@@ -6,7 +6,7 @@ clipboard, signal handling, file paths). This page lists every
 tested OS × terminal pairing, known issues, and the env-var fixes
 the launcher recommends when a capability is missing.
 
-Last update: 2026-05-19 (SpliceCraft 0.9.7+).
+Last update: 2026-06-14 (SpliceCraft 1.0.81+).
 
 ---
 
@@ -27,9 +27,9 @@ Last update: 2026-05-19 (SpliceCraft 0.9.7+).
 | **WSL** | Windows Terminal | ✅ Fully supported | Pillow clipboard image grab disabled (Linux side) — use file picker |
 | WSL | VS Code integrated | ✅ Works | VS Code's terminal handles OSC 52 |
 | WSL | tmux inside WSL | ✅ Works under | Same OSC 52 caveat |
-| **Windows native** | Windows Terminal | ✅ Supported | Pillow clipboard image grab available. Local HMMscan unavailable (`pyhmmer` is POSIX-only — use WSL2); BLASTN/BLASTP + everything else work natively |
-| Windows native | ConPTY (cmd, PowerShell) | ⚠ Limited | Some Textual mouse modes unreliable; recommend Windows Terminal |
-| Windows native | conhost.exe (legacy) | ❌ Unsupported | No true-color, no mouse — Textual will refuse to launch |
+| **Windows native** | Windows Terminal | ✅ Supported | **Recommended Windows terminal.** The launcher auto-sets the console to UTF-8 (`SetConsoleOutputCP(65001)`) + enables VT processing at startup, so the braille map renders instead of garbling. Cascadia (the default font) has braille glyphs. Pillow clipboard image grab available. Local HMMscan unavailable (`pyhmmer` is POSIX-only — use WSL2); BLASTN/BLASTP + everything else work natively |
+| Windows native | cmd.exe / PowerShell (modern ConPTY) | ✅ Works | Same auto UTF-8/VT setup (this is what fixes the "garbled mess" reports — see below). The default font draws braille; if you see boxes, pick a braille-capable font or toggle **'ASCII plasmid map'** in Settings. Some Textual mouse modes are less reliable than in Windows Terminal |
+| Windows native | conhost.exe (legacy console host) | ⚠ Limited | The auto UTF-8/VT fix prevents mojibake, but the legacy raster / Consolas fonts can't draw braille → the map shows boxes. Use Windows Terminal, or enable **'ASCII plasmid map'** in Settings for a font-free map |
 
 ---
 
@@ -37,16 +37,30 @@ Last update: 2026-05-19 (SpliceCraft 0.9.7+).
 
 SpliceCraft hard-requires:
 
-* **UTF-8 stdout encoding** — the plasmid map uses U+2800-U+28FF braille
-  dots. As of 1.0.3 a non-UTF-8 terminal **no longer refuses to launch**:
-  the launcher first tries to reconfigure stdout to UTF-8 (a `LANG=C`
-  shell often mislabels an otherwise-capable terminal), and only if that
-  genuinely fails does it fall back to a **7-bit-ASCII density-ramp map**
-  that renders on any ANSI terminal. For the richer braille map, prefer a
-  UTF-8 locale (`LANG=C.UTF-8` / `LANG=en_US.UTF-8`) or
-  `PYTHONIOENCODING=utf-8` / `PYTHONUTF8=1`. If your terminal *reports*
-  UTF-8 but the font can't draw braille (boxes / blanks), force the ASCII
-  map with `SPLICECRAFT_ASCII=1`.
+* **UTF-8 output** — the plasmid map uses U+2800-U+28FF braille dots. As of
+  1.0.3 a non-UTF-8 terminal **no longer refuses to launch**: the launcher
+  reconfigures Python's stdout to UTF-8 (a `LANG=C` shell often mislabels an
+  otherwise-capable terminal), and only if that genuinely fails does it fall
+  back to a **7-bit-ASCII density-ramp map** that renders on any ANSI terminal.
+  For the braille map on POSIX, prefer a UTF-8 locale (`LANG=C.UTF-8`) or
+  `PYTHONUTF8=1`.
+  **On Windows** the launcher additionally runs the programmatic equivalent of
+  `chcp 65001` (`SetConsoleOutputCP/SetConsoleCP(65001)`) + enables ANSI/VT
+  processing at startup. This is the fix for the "garbled mess" reports: a
+  Windows console defaults its OUTPUT code page to the legacy OEM page
+  (437 / 850 / 932 / …) **even inside Windows Terminal on Win 11**, so the
+  braille UTF-8 bytes get decoded as that page → mojibake. (Python's own
+  `print` dodges this via the Unicode console API; a TUI's byte output doesn't.)
+  The previous code page is restored on exit.
+* **A font that has braille glyphs** — UTF-8 is necessary but *not sufficient*:
+  the font must actually include U+2800-U+28FF. Windows Terminal's Cascadia and
+  virtually every modern monospace font do; the legacy conhost raster / Consolas
+  fonts do **not** (the map shows boxes / blanks). If you see boxes instead of
+  the map, switch to a braille-capable font (or to Windows Terminal), **or flip
+  'ASCII plasmid map' in Settings → Display** — it switches the map to a 7-bit
+  density ramp live (no restart) and the choice persists. `SPLICECRAFT_ASCII=1`
+  forces the ASCII map from launch. **SpliceCraft never auto-downscales a
+  capable terminal to ASCII** — braille stays the default; the toggle is yours.
 * **256-color ANSI** — feature colors degrade visibly without it.
   Every modern terminal supports this; only ancient `vt100` doesn't.
 * **Mouse events** — required for click-to-select, drag-select on
@@ -185,6 +199,23 @@ storage.
 ---
 
 ## Known issues
+
+### Windows: "the map is a garbled mess"
+
+Two distinct failure modes, with two distinct fixes:
+
+* **Mojibake** (random accented characters / symbols where the map should be).
+  Cause: the console's OUTPUT code page is the legacy OEM page, not UTF-8 — so
+  the braille UTF-8 bytes are mis-decoded. **Fixed automatically** at startup
+  (`SetConsoleOutputCP(65001)` + VT processing); if you somehow still see it,
+  run `chcp 65001` before launching, or use Windows Terminal. Confirm the fix
+  fired: `grep startup.terminal_capabilities` in the log shows
+  `"win_utf8_console": true`.
+* **Boxes / blanks** (uniform `□` or empty cells). Cause: UTF-8 is fine but the
+  **font** lacks braille glyphs (legacy conhost raster / Consolas). Fix: use
+  Windows Terminal (Cascadia has them) **or** enable 'ASCII plasmid map' in
+  Settings → Display (live, persists). If no Windows Terminal session is
+  detected, the launcher prints a one-line hint to this effect on stderr.
 
 ### Windows ConPTY / legacy `conhost.exe`
 

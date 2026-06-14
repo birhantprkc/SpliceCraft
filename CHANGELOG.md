@@ -14,6 +14,26 @@
 
 ---
 
+## [1.0.82] — 2026-06-14
+
+### Bug fixes
+
+- **Windows: the plasmid map no longer renders as a garbled mess.** On Windows, the console's output code page defaults to a legacy page (even inside Windows Terminal on Windows 11), so the map's UTF-8 braille bytes were being mis-decoded into mojibake. SpliceCraft now switches the console to UTF-8 (`chcp 65001`) and turns on ANSI/VT processing at startup — automatically, before anything is drawn — and restores your console on exit. If braille still shows as **boxes**, that's a font without braille glyphs (the legacy console host): use Windows Terminal, or the new toggle below. (SpliceCraft never silently downgrades a capable terminal to ASCII — braille stays the default.)
+
+### New features
+
+- **'ASCII plasmid map' toggle (Settings → Display).** A live, persisted switch that draws the map with plain 7-bit-ASCII characters instead of braille dots — the instant fix if your terminal's font shows braille as boxes. No restart, no environment variable; flip it and the map repaints. (The `SPLICECRAFT_ASCII=1` env var still forces it from launch.)
+
+### Hardening
+
+- **Across-the-board input sterilization.** Plasmid names, primer names, custom-enzyme names, and imported names are now stripped of invisible control characters and terminal-escape codes before they're saved or shown — so a name from an odd source (or a crafted file/zip) can't smuggle hidden codes into the title bar, a table, or the diagnostic log.
+- **Spell-check stays fast on pathological text.** A specially-crafted Experiments notebook body can no longer bog down the background spell-checker.
+- **Safer file and archive imports.** Opening an oversized GenBank/.dna/GFF3 file is now capped (256 MB) so a single huge file can't exhaust memory; sequencing and migrate `.zip` archives are guarded against decompression bombs by the bytes actually written (not the archive's self-reported sizes); and archive entries with control-character names are refused.
+- **Local agent API tightened.** The built-in agent HTTP server now rejects requests that don't originate from your own machine (a DNS-rebinding defense) and sterilizes more of the names it accepts.
+- **Network fetches fail faster.** A stalled NCBI server can no longer keep a fetch hanging far longer than intended.
+
+---
+
 ## [1.0.81] — 2026-06-14
 
 ### New features
