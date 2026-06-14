@@ -14,6 +14,22 @@
 
 ---
 
+## [1.0.81] — 2026-06-14
+
+### New features
+
+- **Copy a primer's sequence with Ctrl+C.** In the Primers screen, highlight a primer in the library and press **Ctrl+C** to copy its sequence to the clipboard — a toast confirms the copy and how many bases it was.
+
+### Improvements
+
+- **Tidier Primer Check tab.** The scan options now sit under their own labels with roomier boxes, so the **Max amplicon** field is no longer cramped.
+
+### Hardening
+
+- **Ctrl+C primer copy is sanitized.** The copied sequence is filtered to valid DNA bases before it reaches the clipboard, so a malformed library entry can never push stray control characters onto your clipboard.
+
+---
+
 ## [1.0.80] — 2026-06-14
 
 ### New features

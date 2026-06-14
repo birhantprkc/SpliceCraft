@@ -966,6 +966,111 @@ def _create_github_release(version: str) -> None:
         print(f"  Create it later with: gh release create {tag} …")
 
 
+# ── Web-demo droplet refresh ─────────────────────────────────────────────────
+# After PyPI publishes, push the new version to the live demo (splicecraft.bio)
+# right away instead of waiting for the droplet's nightly `sc-update` cron. The
+# SSH host defaults to the apex domain (its A record points at the droplet);
+# override with SPLICECRAFT_DEMO_HOST, or skip the whole step with
+# SPLICECRAFT_SKIP_DEMO_REFRESH=1 (offline, or a laptop without the droplet key).
+DEMO_SSH_HOST    = os.environ.get("SPLICECRAFT_DEMO_HOST", "root@splicecraft.bio")
+DEMO_VERSION_URL = "https://splicecraft.bio/version.txt"
+DEMO_LIVE_URL    = "https://demo.splicecraft.bio/"
+
+
+def _demo_served_version() -> "str | None":
+    """The version string the live demo publishes at ``/version.txt`` (written
+    by ``sc-update``), or None if it can't be read."""
+    try:
+        r = subprocess.run(["curl", "-sfL", DEMO_VERSION_URL],
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode == 0:
+            return r.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _demo_http_code() -> "str | None":
+    """HTTP status from the live demo root, or None on a transport error."""
+    try:
+        return (subprocess.run(
+            ["curl", "-sL", "-o", "/dev/null", "-w", "%{http_code}",
+             DEMO_LIVE_URL],
+            capture_output=True, text=True, timeout=25,
+        ).stdout.strip() or None)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _run_sc_update() -> "int | None":
+    """SSH the droplet and run ``sc-update`` (pipx upgrade + restart + refresh
+    version.txt). Returns the remote exit code, or None if ssh couldn't run."""
+    try:
+        return subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+             DEMO_SSH_HOST, "sc-update"],
+            timeout=420,
+        ).returncode
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"  ssh sc-update failed to run ({exc}).")
+        return None
+
+
+def _refresh_web_demo(version: str) -> None:
+    """Refresh the live web demo so it serves ``version`` now, rather than at
+    the droplet's nightly cron. Waits for PyPI, SSHes the droplet, runs
+    ``sc-update``, and re-runs it until the demo actually publishes ``version``.
+
+    Why the retry loop: ``sc-update`` does ``pipx upgrade``, which resolves
+    against PyPI's **Simple index** — and right after a publish that index lags
+    the sdist file (and the JSON metadata) by a minute or two, so the first
+    upgrade can no-op on the OLD version (the same skew the `splicecraft update`
+    CLI documents). We retry until ``/version.txt`` reports the target.
+
+    NON-FATAL like the GitHub-Release step: the tag is pushed and PyPI is
+    publishing by the time we get here, so any failure just prints the manual
+    command — the droplet's nightly ``sc-update`` cron is the backstop. Skip
+    with SPLICECRAFT_SKIP_DEMO_REFRESH=1; override the host with
+    SPLICECRAFT_DEMO_HOST."""
+    import time
+    manual = f"ssh {DEMO_SSH_HOST} 'sc-update'"
+    if os.environ.get("SPLICECRAFT_SKIP_DEMO_REFRESH", "").strip().lower() in (
+        "1", "true", "yes",
+    ):
+        print("  SPLICECRAFT_SKIP_DEMO_REFRESH set — skipping the web-demo "
+              f"refresh. Run it later with: {manual}")
+        return
+    if shutil.which("ssh") is None:
+        print(f"  ssh not found — skipping web-demo refresh. Run later: {manual}")
+        return
+    # Gate on the sdist being downloadable first (1–3 min typical) so the first
+    # upgrade attempt isn't wasted; the loop below covers the Simple-index skew.
+    print("  Waiting for PyPI before refreshing the demo…")
+    _wait_for_pypi(version)
+    attempts = 4
+    for i in range(1, attempts + 1):
+        rc = _run_sc_update()
+        if rc is None:
+            print(f"  Non-fatal — run later once PyPI has settled: {manual}")
+            return
+        if rc != 0:
+            print(f"  `sc-update` exited {rc} on the droplet (non-fatal).")
+        served = _demo_served_version()
+        if served == version:
+            code = _demo_http_code()
+            ok = " ✓" if code == "200" else ""
+            print(f"  version.txt → {served} ✓ · {DEMO_LIVE_URL} → "
+                  f"HTTP {code or '???'}{ok}")
+            return
+        if i < attempts:
+            print(f"  demo still on {served or '?'} (PyPI Simple-index skew) "
+                  f"— retrying sc-update in 30s ({i}/{attempts - 1})…")
+            time.sleep(30)
+    print(f"  Demo still on {_demo_served_version() or '?'} after {attempts} "
+          "tries — PyPI's Simple index is lagging. The nightly sc-update cron "
+          f"will catch it; or re-run later: {manual}")
+
+
 _PRIVATE_NAMES_FILE = REPO_ROOT / ".private-names"
 
 
@@ -1215,6 +1320,12 @@ def main(argv: list[str] | None = None) -> int:
     _heading("Creating GitHub Release")
     _create_github_release(new_version)
 
+    # Push the new version to the live web demo (splicecraft.bio) once PyPI is
+    # serving it — no more manual `sc-update`. Optional + non-fatal (the
+    # droplet's nightly cron is the backstop); see `_refresh_web_demo`.
+    _heading("Refreshing the web demo (splicecraft.bio)")
+    _refresh_web_demo(new_version)
+
     print()
     print("═" * 61)
     print(f" Release v{new_version} pushed.")
@@ -1223,6 +1334,7 @@ def main(argv: list[str] | None = None) -> int:
     print(" Verify:  https://pypi.org/project/splicecraft/")
     print(f" Release: https://github.com/Binomica-Labs/SpliceCraft/"
           f"releases/tag/v{new_version}")
+    print(" Demo:    https://demo.splicecraft.bio/")
     print(" (Bioconda PR step skipped — run `./release.py "
           "--bioconda-only` to re-submit the recipe manually.)")
     print("═" * 61)

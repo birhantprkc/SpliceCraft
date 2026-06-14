@@ -496,6 +496,111 @@ class TestPrimerCheckTab:
             assert hit["ident"] == 100.0
             assert hit["foot_start"] == 100
 
+    async def test_ctrl_c_copies_selected_primer_seq(self, monkeypatch):
+        from textual.widgets import DataTable
+        captured = {}
+        outcomes = []
+
+        def _fake_copy(app, text, label="copy"):
+            captured["text"] = text
+            captured["label"] = label
+            return ("clipboard", None)
+
+        monkeypatch.setattr(sc, "_copy_to_clipboard_with_fallback", _fake_copy)
+        monkeypatch.setattr(sc, "_load_primers", lambda: [
+            {"name": "MyPrimer", "sequence": " acgtACGTacgtACGT ",
+             "tm": 55.0, "primer_type": "detection", "status": "Designed"}])
+
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            screen = sc.PrimerDesignScreen("ACGT" * 200, [], "test")
+            app.push_screen(screen)
+            await pilot.pause()
+            t = screen.query_one("#pd-lib-table", DataTable)
+            screen.set_focus(t)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            monkeypatch.setattr(
+                app, "_notify_copy_outcome",
+                lambda n, what, mode, detail: outcomes.append(
+                    (n, what, mode, detail)))
+            screen.action_copy_primer_seq()
+            await pilot.pause()
+        # Sequence copied verbatim (normalised: trimmed + upper-cased).
+        assert captured.get("text") == "ACGTACGTACGTACGT"
+        assert "MyPrimer" in captured.get("label", "")
+        # Toast reports it was copied + the base count.
+        assert outcomes == [(16, "bases", "clipboard", None)]
+
+    async def test_ctrl_c_skips_while_typing_in_an_input(self, monkeypatch):
+        from textual.widgets import Input
+        captured = {}
+        monkeypatch.setattr(
+            sc, "_copy_to_clipboard_with_fallback",
+            lambda app, text, label="copy": captured.setdefault("text", text)
+            or ("clipboard", None))
+        monkeypatch.setattr(sc, "_load_primers", lambda: [
+            {"name": "P", "sequence": "ACGTACGTACGTACGT"}])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            screen = sc.PrimerDesignScreen("ACGT" * 200, [], "test")
+            app.push_screen(screen)
+            await pilot.pause()
+            screen.set_focus(screen.query_one("#pd-pc-p1", Input))
+            await pilot.pause()
+            screen.action_copy_primer_seq()
+            await pilot.pause()
+        assert "text" not in captured        # editing not hijacked
+
+    async def test_ctrl_c_strips_control_chars_from_sequence(self, monkeypatch):
+        from textual.widgets import DataTable
+        captured = {}
+
+        def _fake_copy(app, text, label="copy"):
+            captured["text"] = text
+            return ("clipboard", None)
+
+        monkeypatch.setattr(sc, "_copy_to_clipboard_with_fallback", _fake_copy)
+        # A crafted entry whose 'sequence' carries escape / control bytes,
+        # whitespace and digits around the real bases (e.g. from a malicious
+        # /primer_seq qualifier). Only IUPAC bases must reach the clipboard.
+        monkeypatch.setattr(sc, "_load_primers", lambda: [
+            {"name": "Crafted", "sequence": "acgt\x1b[2J\x07ACGT 123"}])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            screen = sc.PrimerDesignScreen("ACGT" * 200, [], "test")
+            app.push_screen(screen)
+            await pilot.pause()
+            t = screen.query_one("#pd-lib-table", DataTable)
+            screen.set_focus(t)
+            t.move_cursor(row=0)
+            await pilot.pause()
+            screen.action_copy_primer_seq()
+            await pilot.pause()
+        got = captured.get("text", "")
+        assert got == "ACGTACGT"
+        assert "\x1b" not in got and "\x07" not in got and " " not in got
+
+    async def test_ctrl_c_no_primer_selected_is_safe(self, monkeypatch):
+        monkeypatch.setattr(sc, "_load_primers", lambda: [])
+        copied = {}
+        monkeypatch.setattr(
+            sc, "_copy_to_clipboard_with_fallback",
+            lambda app, text, label="copy": copied.setdefault("text", text)
+            or ("clipboard", None))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            screen = sc.PrimerDesignScreen("ACGT" * 200, [], "test")
+            app.push_screen(screen)
+            await pilot.pause()
+            screen.action_copy_primer_seq()    # empty library — must not crash
+            await pilot.pause()
+        assert "text" not in copied
+
     async def test_scan_two_primers_reports_amplicon(self, monkeypatch):
         from textual.widgets import Input
         T = _rand_dna(600, seed=1)

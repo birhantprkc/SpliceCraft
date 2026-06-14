@@ -190,12 +190,22 @@ example copy must avoid `.private-names` tokens (a guarded reporter-gene name sl
 
 ## Staleguard — keeping the demo 1-to-1
 
-The demo serves whatever `pipx` has, so "never behind the terminal build" is a
-**nightly redeploy**:
+The demo serves whatever `pipx` has, so "never behind the terminal build" has two
+layers. **Primary: `release.py` refreshes it on every release** — after the tag is
+pushed and PyPI is publishing, `_refresh_web_demo()` waits for the sdist to go
+live, then `ssh root@splicecraft.bio 'sc-update'` and verifies `version.txt` +
+a 200 from the demo. It's **non-fatal** (the release is already shipped; a failure
+just prints the manual command) and opt-out via `SPLICECRAFT_SKIP_DEMO_REFRESH=1`
+(offline, or a laptop without the droplet's SSH key). Override the SSH target with
+`SPLICECRAFT_DEMO_HOST`.
+
+**Backstop: a nightly redeploy** catches anything the release-time refresh missed
+(skipped, SSH down, PyPI slow):
 ```cron
 30 4 * * * root /usr/local/bin/sc-update   # pipx upgrade splicecraft + restart demo + refresh /version.txt
 ```
-After `release.py` ships X.Y.Z, the next run (or a manual `sc-update`) pulls it;
+After `release.py` ships X.Y.Z it pulls it automatically (or the next cron run /
+a manual `sc-update` does);
 the banner shows `v{__version__}` so drift is visible at a glance. `sc-update`
 also writes the live version to `/var/www/splicecraft/version.txt`, which the
 landing page's nav **version chip** fetches same-origin (allowed by the apex CSP
