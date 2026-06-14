@@ -1291,6 +1291,21 @@ class TestLogEventEncodingRobustness:
     def test_log_info_with_surrogate_does_not_raise(self):
         sc._log.info("weird OS path: %s", "/x/\udc80\udcff/y.gb")
 
+    def test_surrogate_scrub_filter_makes_record_utf8_safe(self):
+        # The scrub filter must leave every record UTF-8-encodable so
+        # pytest-xdist can serialise the report — a lone surrogate in the
+        # captured record crashes execnet → the whole CI run INTERNALERRORs
+        # (pytest 9.1, undetectable on the floor pin local devs run).
+        rec = sc._log.makeRecord(
+            "splicecraft", 20, "f", 1, "weird %s",
+            ("/x/\udc80\udcff/y.gb",), None)
+        sc._SurrogateScrubFilter().filter(rec)
+        rec.getMessage().encode("utf-8")  # must NOT raise
+
+    def test_surrogate_filter_attached_to_logger(self):
+        assert any(isinstance(f, sc._SurrogateScrubFilter)
+                   for f in sc._log.filters)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 2026-06-03 disk-hygiene + integrity sweep: backup byte cap, dedup,
