@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.79] — 2026-06-14
+
+### Hardening
+
+- **Diagnostic logs stay clean on exotic locales.** A filename or path your OS can't fully decode — a lone surrogate from a non-UTF-8 locale — is now escaped on every diagnostic log record, so it can never drop a log line or surface a stray error.
+
+---
+
 ## [1.0.78] — 2026-06-14
 
 ### Bug fixes

@@ -87,7 +87,10 @@ from textual_serve.server import Server
 
 server = Server(
     # `exec` is load-bearing (see gotchas)
-    command="exec env SPLICECRAFT_DEMO=web PATH=/home/demo/.local/bin:/usr/local/bin:/usr/bin:/bin /home/demo/.local/bin/splicecraft",
+    # SPLICECRAFT_MAP_ASPECT pins the circular-map cell ratio — xterm.js
+    # doesn't answer the CSI 16t self-query, so the web needs the explicit
+    # pin or the map renders as a tall ellipse (see gotchas).
+    command="exec env SPLICECRAFT_DEMO=web SPLICECRAFT_MAP_ASPECT=2.35 PATH=/home/demo/.local/bin:/usr/local/bin:/usr/bin:/bin /home/demo/.local/bin/splicecraft",
     host="127.0.0.1",                              # behind Caddy; never exposed directly
     port=8000,
     title="SpliceCraft — live demo",
