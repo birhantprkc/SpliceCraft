@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.78] — 2026-06-14
+
+### Bug fixes
+
+- **Round map on more terminals, automatically.** Drawing a true circle needs your terminal's character-cell shape. SpliceCraft already read it from the OS where available; now it also **asks the terminal directly** (a small escape-sequence query at startup), which succeeds on many terminals that don't expose it to the OS — so the map auto-rounds on more setups with zero configuration. For the few terminals that still can't report it (notably the browser-based web demo), pin the shape with the **`SPLICECRAFT_MAP_ASPECT`** environment variable: tap `.` / `,` until the circle looks round, read the *Aspect* value it shows, and `export SPLICECRAFT_MAP_ASPECT=<that value>`. Also fixed the `.` / `,` hint toast, which had *wider* and *taller* backwards.
+
+---
+
 ## [1.0.77] — 2026-06-14
 
 ### Bug fixes
