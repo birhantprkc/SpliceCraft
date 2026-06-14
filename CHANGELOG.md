@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.76] — 2026-06-13
+
+### New features
+
+- **Demo mode opens with a full Golden-Braid / MoClo library.** A demo session (`SPLICECRAFT_DEMO`) is now seeded with a real cloning workbench — the Golden-Braid L0 entry vectors (UPD + Alpha/Omega), a "Demo parts" bin of L0 parts (J23100 / J23114 promoters, FuGFP / eforCP / cscA / cscB coding sequences, the LambdaT0 terminator), two assembled transcription units (J23100-cscA-T0, J23114-cscB-T0), and the cscA / cscB + pCambia-GREEN plasmids — so the Constructor, Parts Bin, and Scrub tools all have worked examples to explore out of the box.
+
+---
+
 ## [1.0.75] — 2026-06-13
 
 ### New features

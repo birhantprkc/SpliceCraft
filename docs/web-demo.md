@@ -50,6 +50,50 @@ The **science tools stay fully usable** on the seed (Scrub, operon
 domestication, primer design, the Simulator, BLAST, codon optimisation) — they
 are pure compute, not gated.
 
+## DigitalOcean + textual-web relay — step by step (the chosen launch route)
+
+The relay (`textual-web`) tunnels OUT to Textualize's proxy and serves a public
+URL; you just need a small always-on box to run it.
+
+1. **Droplet:** DO console → Ubuntu 24.04 LTS, Basic $12/mo (2 GB) [or $6/1 GB],
+   add your SSH key, note the IP.
+2. **Base (root):**
+   ```bash
+   ssh root@<IP>
+   adduser --disabled-password --gecos "" demo
+   apt update && apt install -y pipx
+   ufw allow OpenSSH && ufw --force enable     # relay tunnels out; only SSH inbound
+   ```
+3. **Install + sign up (user `demo`):**
+   ```bash
+   su - demo
+   pipx install splicecraft
+   pipx install textual-web
+   textual-web --signup     # open the printed URL in your browser → writes ~/ganglion.toml
+   ```
+4. **`~/ganglion.toml`:**
+   ```toml
+   [account]
+   api_key = "…"                                    # filled by --signup
+   [app.SpliceCraft]
+   command = "env SPLICECRAFT_DEMO=web splicecraft" # web tier: sandboxed + locked
+   slug = "splicecraft"
+   ```
+5. **systemd** `/etc/systemd/system/splicecraft-demo.service` (root): `User=demo`,
+   `ExecStart=/home/demo/.local/bin/textual-web --config /home/demo/ganglion.toml`,
+   `Restart=always`, `MemoryMax=1800M`; then
+   `systemctl enable --now splicecraft-demo` and
+   `journalctl -u splicecraft-demo -f` to read the public URL.
+6. **GoDaddy:** splicecraft.bio → Domain Settings → Forwarding → forward to the
+   `…textual-web.io/splicecraft` URL (301).
+7. **Stay current (staleguard):** nightly cron as `demo`:
+   `0 4 * * * pipx upgrade splicecraft && sudo systemctl restart splicecraft-demo`.
+   The banner shows the running version.
+
+Caveat: textual-web runs each visitor as a subprocess (not a container) — the
+demo-mode sandbox + web lockdown + `MemoryMax` are the protection; add the
+per-session containers below if traffic/abuse grows.
+
 ## Per-session isolation (self-host)
 
 `textual serve` runs one Python process per browser session. For a public host:

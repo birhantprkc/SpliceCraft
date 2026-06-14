@@ -216,20 +216,39 @@ class TestDemoSeed:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             app._seed_demo_data()
-            for _ in range(3):
+            try:
+                await app.workers.wait_for_complete()
+            except Exception:
+                pass
+            for _ in range(5):
                 await pilot.pause()
+        # --- plasmids → "Demo plasmids" collection (the FFE MoClo set) ---
         colls = sc._load_collections()
         names = {c.get("name") for c in colls}
         assert "Demo plasmids" in names, names
         demo = next(c for c in colls if c.get("name") == "Demo plasmids")
-        assert demo.get("plasmids"), "demo collection empty"
+        plas = demo.get("plasmids") or []
+        assert plas, "demo collection empty"
         assert sc._get_active_collection_name() == "Demo plasmids"
-        # A worked example for the marquee tools: general + Scrub + operon.
-        sources = {e.get("source") for e in demo["plasmids"]}
-        assert sources == {"demo"}
-        assert len(demo["plasmids"]) >= 3, "expected general + scrub + operon"
-        names = {e.get("name") for e in demo["plasmids"]}
-        assert "Demo Scrub Plasmid" in names and "Demo Operon" in names, names
+        assert {e.get("source") for e in plas} == {"demo"}
+        assert len(plas) == 10, len(plas)
+        pnames = {e.get("name") for e in plas}
+        for want in ("FFE 6 ENTRY pCambia2300-GREEN", "FFE 1 ENTRY UPD",
+                     "FFE 10 CDS cscA", "FFE 13 TU J23100-cscA-T0"):
+            assert want in pnames, (want, sorted(pnames))
+        # display names stay space-form, never the underscored LOCUS (INV-98)
+        assert all("_" not in (e.get("name") or "") for e in plas), pnames
+        # --- L0 parts → "Demo parts" bin ---
+        bnames = {b.get("name") for b in sc._load_parts_bin_collections()}
+        assert "Demo parts" in bnames, bnames
+        parts = sc._load_parts_bin()
+        assert len(parts) == 7, len(parts)
+        assert {"Promoter", "CDS", "Terminator"} <= {p.get("type") for p in parts}
+        # --- Golden Braid L0 entry vectors (UPD + Alpha/Omega) ---
+        evs = sc._load_entry_vectors()
+        assert len(evs) == 5, len(evs)
+        assert {"Alpha1", "Alpha2", "Omega1", "Omega2"} <= {
+            e.get("role") for e in evs}
 
     def test_seed_builders_are_valid_and_scrubbable(self):
         # The scrub demo plasmid must actually Golden-Braid-scrub clean, and the

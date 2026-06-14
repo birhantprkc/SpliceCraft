@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name            = "splicecraft"
-version         = "1.0.75"
+version         = "1.0.76"
 description     = "Terminal-based circular plasmid map viewer, sequence editor, and Primer3/Golden Braid primer design workbench"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -178,6 +178,10 @@ only-include = [
     # criteria. Must ship in the wheel or `import splicecraft`
     # fails at the import-back step.
     "splicecraft_biology.py",
+    # Demo-mode seed data (FFE Golden-Braid / MoClo set) — imported by
+    # PlasmidApp._seed_demo_data; must ship in the wheel or the demo seed
+    # silently falls back to an empty library.
+    "splicecraft_demo_plasmids.py",
     "CHANGELOG.md",
 ]
 
@@ -186,6 +190,7 @@ include = [
     "splicecraft.py",
     "splicecraft_biology.py",
     "splicecraft_cli.py",
+    "splicecraft_demo_plasmids.py",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
@@ -253,6 +258,7 @@ include = [
     "splicecraft.py",
     "splicecraft_biology.py",
     "splicecraft_cli.py",
+    "splicecraft_demo_plasmids.py",
     "tests",
 ]
 exclude = [
