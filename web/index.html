@@ -2,11 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><g fill='%230178D4'><circle cx='27' cy='16' r='2.2'/><circle cx='23.8' cy='23.8' r='2.2'/><circle cx='16' cy='27' r='2.2'/><circle cx='8.2' cy='23.8' r='2.2'/><circle cx='5' cy='16' r='2.2'/><circle cx='8.2' cy='8.2' r='2.2'/><circle cx='16' cy='5' r='2.2'/><circle cx='23.8' cy='8.2' r='2.2'/></g></svg>">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SpliceCraft — the in-terminal plasmid workbench</title>
-<meta name="description" content="SpliceCraft is a terminal-based plasmid engineering workbench: restriction analysis, Golden Braid & MoClo assembly, mutagenesis, primer design, and in-process BLAST — all driven by your keyboard. Local-first.">
+<meta name="description" content="SpliceCraft is a terminal-based plasmid engineering workbench: restriction analysis, Golden Braid & MoClo assembly, mutagenesis, primer design, and in-process BLAST — mouse-friendly and keyboard-fast, and it all runs on your own computer.">
 <meta property="og:title" content="SpliceCraft — the in-terminal plasmid workbench">
-<meta property="og:description" content="Design, clone & mutate plasmids from one keyboard-driven workbench in your terminal. Local-first, no cloud.">
+<meta property="og:description" content="Design, clone & mutate plasmids in a mouse-friendly terminal workbench. Everything runs on your own computer — no cloud, no account.">
 <meta property="og:type" content="website">
 <meta name="theme-color" content="#000000">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -14,51 +15,57 @@
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 :root{
-  --bg:#000000; --bg0:#070707; --panel:#0d0d0d; --inset:#060606;
-  --line:#1b1b1b; --edge:#2c2c2c;
-  --ink:#f4f3ef; --soft:#cdccc6; --dim:#8a8984; --faint:#494844;
-  --gold:#FFD700; --gold-b:#ffe66e; --gold-d:#b8941f; --white:#ffffff;
+  --black:#000000; --void:#070707; --surface:#1c1c1c; --surface-2:#151515; --inset:#101010;
+  --line:#2a2a2a; --line-2:#383838; --edge:#454545;
+  --ink:#e0e0e0; --bright:#ffffff; --soft:#b6b6b6; --dim:#7d7d7d; --faint:#4a4a4a;
+  --blue:#0178D4; --blue-lt:#3ea1ed; --blue-dk:#004578;
+  --amber:#ffa62b; --amber-lt:#ffc163; --amber-dk:#b8741a;
+  --green:#4EBF71; --rose:#ba3c5b;
 }
 *{box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{ margin:0; background:var(--bg); color:var(--ink);
+body{ margin:0; background:var(--black); color:var(--ink);
   font-family:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
   font-size:15px; line-height:1.7; letter-spacing:.1px; -webkit-font-smoothing:antialiased; overflow-x:hidden; }
+/* clean atmosphere — faint braille-dot field + a soft blue top-glow, no heavy CRT */
 body::before{ content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
   background:
-    radial-gradient(120% 75% at 50% -8%, #15130c 0, transparent 55%),
-    radial-gradient(130% 120% at 50% 50%, transparent 60%, #000 100%),
-    radial-gradient(circle, #ffffff09 1px, transparent 1.5px);
-  background-size:auto,auto,23px 23px; }
-body::after{ content:""; position:fixed; inset:0; z-index:9998; pointer-events:none;
-  background:
-    repeating-linear-gradient(0deg, #ffffff09 0 1px, transparent 1px 3px),
-    radial-gradient(120% 120% at 50% 50%, transparent 66%, #000000bb 100%);
-  opacity:.6; animation:flick 5s steps(60) infinite; }
-@keyframes flick{ 0%,100%{opacity:.6} 7%{opacity:.5} 9%{opacity:.66} 41%{opacity:.54} 43%{opacity:.62} }
-a{color:var(--gold); text-decoration:none; transition:color .15s}
-a:hover{color:var(--white)}
+    radial-gradient(105% 60% at 50% -6%, rgba(1,120,212,.10) 0, transparent 60%),
+    radial-gradient(130% 130% at 50% 50%, transparent 62%, #000 100%),
+    radial-gradient(circle, rgba(255,255,255,.045) 1px, transparent 1.5px);
+  background-size:auto,auto,24px 24px; }
+a{color:var(--blue-lt); text-decoration:none; transition:color .15s}
+a:hover{color:var(--bright)}
 .wrap{max-width:1140px; margin:0 auto; padding:0 24px; position:relative; z-index:1}
 
-.bar0{position:sticky; top:0; z-index:50; background:#000000cc; backdrop-filter:blur(8px); border-bottom:1px solid var(--line)}
-.bar0 .wrap{display:flex; align-items:center; justify-content:space-between; height:48px; font-size:.85rem}
-.b-brand{font-weight:700; letter-spacing:.06em; color:var(--ink)}
-.b-brand i{color:var(--gold); font-style:normal}
+/* status bar */
+.bar0{position:sticky; top:0; z-index:50; background:rgba(0,0,0,.72); backdrop-filter:blur(10px); border-bottom:1px solid var(--line)}
+.bar0 .wrap{display:flex; align-items:center; justify-content:space-between; height:50px; font-size:.85rem}
+.b-brand{font-weight:700; letter-spacing:.06em; color:var(--bright)}
+.b-brand i{color:var(--blue); font-style:normal; margin-right:3px; font-size:1.08em}
+.b-brand .ver{margin-left:9px; font-size:.62rem; font-weight:600; letter-spacing:.06em; color:var(--blue); text-decoration:none; vertical-align:middle; padding:2px 7px; border:1px solid var(--line); border-radius:999px; background:rgba(1,120,212,.09); transition:border-color .15s,color .15s}
+.b-brand .ver:hover{border-color:var(--blue); color:var(--bright)}
+.b-brand .b-home{color:inherit; text-decoration:none; transition:color .15s}
+.b-brand .b-home:hover{color:#fff}
 .b-nav{display:flex; gap:24px; align-items:center}
-.b-nav a{color:var(--dim)} .b-nav a:hover{color:var(--gold)}
+.b-nav a{color:var(--dim)} .b-nav a:hover{color:var(--blue-lt)}
 .b-nav .lv{display:inline-flex; gap:7px; align-items:center; color:var(--soft)}
-.b-nav .lv::before{content:""; width:7px; height:7px; border-radius:50%; background:var(--gold); box-shadow:0 0 8px var(--gold); animation:blink 2s ease-in-out infinite}
+.b-nav .lv::before{content:""; width:7px; height:7px; border-radius:50%; background:var(--faint)}
+.b-nav .lv.up::before{background:var(--green); box-shadow:0 0 9px var(--green); animation:blink 2s ease-in-out infinite}
+.b-nav .lv.down::before{background:var(--rose); box-shadow:0 0 7px rgba(186,60,91,.6)}
+.b-nav .lv.down{color:var(--dim)}
 @keyframes blink{50%{opacity:.3}}
 @media(max-width:680px){.b-nav a:not(.gh){display:none}}
 
-.hero{text-align:center; padding:56px 0 24px}
-.hero .kick{color:var(--gold-d); font-size:.74rem; letter-spacing:.42em; text-transform:uppercase; margin-bottom:24px}
+/* hero */
+.hero{text-align:center; padding:58px 0 26px}
+.hero .kick{color:var(--blue); font-size:.74rem; letter-spacing:.42em; text-transform:uppercase; margin-bottom:24px; font-weight:600}
 .wmwrap{width:100vw; margin-left:calc(50% - 50vw); overflow-x:auto; overflow-y:hidden; padding:2px 24px}
 .wmwrap::-webkit-scrollbar{display:none}
 .wm{display:inline-block; white-space:pre; margin:0 auto; line-height:1.04; font-weight:600;
-  background:linear-gradient(178deg,#ffffff,#efefe9 55%,#ccccc6);
+  background:linear-gradient(178deg,#ffffff,#f0f0f0 55%,#cfcfcf);
   -webkit-background-clip:text; background-clip:text; color:transparent;
-  filter:drop-shadow(0 0 17px #ffffff3b) drop-shadow(0 0 3px #ffffff66)}
+  filter:drop-shadow(0 0 18px rgba(255,255,255,.22)) drop-shadow(0 0 3px rgba(255,255,255,.4))}
 .wm-cosmic{font-size:clamp(7px,calc((100vw - 64px)/82),22px)}
 .wm-big{display:none; font-size:clamp(9px,2.6vw,17px)}
 @media(max-width:780px){.wm-cosmic{display:none}.wm-big{display:inline-block}}
@@ -66,100 +73,121 @@ a:hover{color:var(--white)}
 .helix{display:inline-block; white-space:pre; line-height:1.05; font-size:clamp(8px,1.6vw,17px); margin:22px auto 10px;
   background:linear-gradient(90deg,#FF2626,#FF5C26,#FF9326,#FFC926,#FFFF26,#C9FF26,#93FF26,#5CFF26,#26FF26,#26FF5C,#26FF93,#26FFC9,#26FFFF,#26C9FF,#2693FF,#265CFF,#2626FF,#5C26FF,#9326FF,#C926FF,#FF26FF,#FF26C9,#FF2693,#FF265C,#FF2626); background-size:220% 100%;
   -webkit-background-clip:text; background-clip:text; color:transparent;
-  filter:drop-shadow(0 0 12px #ffffff1a); animation:flow 8s linear infinite}
+  filter:drop-shadow(0 0 14px rgba(255,255,255,.12)); animation:flow 8s linear infinite}
 @keyframes flow{to{background-position:-220% 0}}
-.subt{font-weight:500; letter-spacing:.34em; text-transform:uppercase; color:var(--white); font-size:clamp(.66rem,1.7vw,.84rem); text-shadow:0 0 12px #ffffff33}
+.subt{font-weight:500; letter-spacing:.34em; text-transform:uppercase; color:var(--bright); font-size:clamp(.66rem,1.7vw,.85rem); text-shadow:0 0 14px rgba(255,255,255,.2)}
 .lede{max-width:64ch; margin:22px auto 30px; color:var(--soft)}
-.lede b{color:var(--white); font-weight:600}
-.cta{display:flex; gap:13px; justify-content:center; flex-wrap:wrap}
-.btn{font-weight:700; font-size:.9rem; padding:13px 22px; border-radius:9px; border:1px solid transparent; cursor:pointer; display:inline-flex; gap:9px; align-items:center; transition:.15s}
-.btn-p{background:linear-gradient(180deg,#ffe863,#e8c020); color:#241c00; box-shadow:0 0 0 1px #ffd70044, 0 12px 30px -10px #ffd70066}
-.btn-p:hover{transform:translateY(-2px); color:#241c00; box-shadow:0 0 0 1px #ffd700aa, 0 18px 42px -10px #ffd70077}
-.btn-g{background:#0d0d0d; border-color:var(--edge); color:var(--ink)}
-.btn-g:hover{border-color:var(--gold); color:var(--gold); transform:translateY(-2px)}
+.lede b{color:var(--bright); font-weight:600}
+.cta{display:flex; gap:14px; justify-content:center; flex-wrap:wrap}
+.btn{font-weight:700; font-size:.92rem; padding:14px 24px; border-radius:10px; border:1px solid transparent; cursor:pointer; display:inline-flex; gap:9px; align-items:center; transition:.16s}
+.btn-p{background:linear-gradient(180deg,var(--blue-lt),var(--blue)); color:#ffffff; box-shadow:0 0 0 1px rgba(1,120,212,.4), 0 14px 34px -12px rgba(1,120,212,.6)}
+.btn-p:hover{transform:translateY(-2px); color:#ffffff; box-shadow:0 0 0 1px rgba(1,120,212,.8), 0 20px 46px -12px rgba(1,120,212,.65)}
+.btn-g{background:var(--surface); border-color:var(--line-2); color:var(--ink)}
+.btn-g:hover{border-color:var(--blue); color:var(--blue-lt); transform:translateY(-2px)}
 
-.spec{display:flex; flex-wrap:wrap; justify-content:center; gap:7px 0; margin-top:34px; border-top:1px solid var(--line); border-bottom:1px solid var(--line); background:var(--bg0); padding:13px 10px; font-size:.77rem; color:var(--dim)}
+/* spec strip */
+.spec{display:flex; flex-wrap:wrap; justify-content:center; gap:7px 0; margin-top:30px; padding:2px 10px; font-size:.77rem; color:var(--dim)}
 .spec span{padding:0 16px; white-space:nowrap}
 .spec span+span{border-left:1px solid var(--line)}
-.spec b{color:var(--soft); font-weight:500} .spec em{color:var(--gold-d); font-style:normal}
+.spec b{color:var(--soft); font-weight:500} .spec em{color:var(--blue); font-style:normal; font-weight:600}
 
-.tui{background:var(--inset); border:1px solid var(--edge); border-radius:11px; overflow:hidden; box-shadow:0 28px 64px -32px #000d, inset 0 0 0 1px #ffffff05, inset 0 0 70px #00000088}
-.tbar{display:flex; align-items:center; gap:8px; padding:9px 14px; background:#0a0a0a; border-bottom:1px solid var(--line); font-size:.78rem; color:var(--dim)}
-.tbar i{width:10px;height:10px;border-radius:50%}
-.tbar i:nth-child(1){background:#e2625b}.tbar i:nth-child(2){background:var(--gold)}.tbar i:nth-child(3){background:#46d6a0}
+/* tui windows + surfaces */
+.tui{background:var(--surface); border:1px solid var(--line-2); border-radius:12px; overflow:hidden;
+  box-shadow:0 30px 70px -34px rgba(0,0,0,.9), inset 0 1px 0 rgba(255,255,255,.04)}
+.tbar{display:flex; align-items:center; gap:8px; padding:10px 15px; background:var(--surface-2); border-bottom:1px solid var(--line); font-size:.78rem; color:var(--dim)}
 .tbar span{margin-left:6px}
 .tbar .rt{margin-left:auto; color:var(--faint); letter-spacing:.1em}
 
-section{padding:60px 0; position:relative}
-.shead{display:flex; align-items:center; gap:14px; margin-bottom:26px}
-.shead b{color:var(--gold); font-weight:700; font-size:.82rem; letter-spacing:.1em}
-.shead h2{font-weight:700; font-size:clamp(1.3rem,3.4vw,1.8rem); margin:0; color:var(--ink)}
-.shead .ln{flex:1; height:0; border-top:1px dashed var(--edge); min-width:24px}
+/* sections */
+section{padding:62px 0; position:relative}
+.shead{display:flex; align-items:center; gap:14px; margin-bottom:28px}
+.shead b{color:var(--blue); font-weight:700; font-size:.82rem; letter-spacing:.1em}
+.shead h2{font-weight:700; font-size:clamp(1.32rem,3.4vw,1.85rem); margin:0; color:var(--bright)}
+.shead .ln{flex:1; height:0; border-top:1px solid var(--line); min-width:24px}
 
+/* session: map + log */
 .sesh{display:grid; grid-template-columns:.85fr 1.15fr; gap:0}
-.sesh .map-c{display:flex; align-items:center; justify-content:center; padding:24px; border-right:1px solid var(--line); position:relative}
-.sesh .map{white-space:pre; line-height:1.02; font-size:clamp(6px,1.35vw,12px); color:#e6e6e2; text-shadow:0 0 9px #ffffff26}
+.sesh .map-c{display:flex; align-items:center; justify-content:center; padding:24px; border-right:1px solid var(--line); position:relative; background:var(--inset)}
+.sesh .map{white-space:pre; line-height:1.02; font-size:clamp(6px,1.35vw,12px); color:var(--blue-lt); text-shadow:0 0 10px rgba(62,161,237,.35)}
 .sesh .hub{position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; pointer-events:none}
-.sesh .hub .n{font-weight:700; color:var(--white); font-size:1rem} .sesh .hub .bp{color:var(--gold); font-size:.76rem} .sesh .hub .c{color:var(--dim); font-size:.62rem; letter-spacing:.16em; text-transform:uppercase}
+.sesh .hub .n{font-weight:700; color:var(--bright); font-size:1rem} .sesh .hub .bp{color:var(--amber); font-size:.76rem} .sesh .hub .c{color:var(--dim); font-size:.62rem; letter-spacing:.16em; text-transform:uppercase}
 .log{margin:0; padding:20px 22px; font-size:clamp(.74rem,1.5vw,.92rem); line-height:1.85; overflow-x:auto; white-space:pre}
-.log .p{color:var(--gold)} .log .w{color:var(--ink)} .log .o{color:var(--dim)} .log .ok{color:#46d6a0}
-.log .cur{color:var(--gold); animation:blink 1.05s steps(1) infinite}
+.log .p{color:var(--amber)} .log .w{color:var(--bright)} .log .o{color:var(--dim)} .log .ok{color:var(--green)}
+.log .cur{color:var(--amber); animation:blink 1.05s steps(1) infinite}
 @media(max-width:760px){.sesh{grid-template-columns:1fr}.sesh .map-c{border-right:0; border-bottom:1px solid var(--line)}}
 
-.bench{padding:6px 0}
-.brow{display:grid; grid-template-columns:170px 1fr; gap:18px; align-items:baseline; padding:13px 24px; border-bottom:1px solid var(--line); transition:background .15s}
+/* the bench */
+.bench{padding:4px 0}
+.brow{display:grid; grid-template-columns:172px 1fr; gap:18px; align-items:baseline; padding:14px 24px; border-bottom:1px solid var(--line); transition:background .15s}
 .brow:last-child{border-bottom:0}
-.brow:hover{background:#0c0c0c}
-.brow .bn{color:var(--gold); font-weight:600; display:flex; gap:9px; align-items:baseline}
-.brow .bn::before{content:"\25B8"; color:var(--gold-d); font-size:.8em}
+.brow:hover{background:rgba(1,120,212,.06)}
+.brow .bn{color:var(--blue-lt); font-weight:600; display:flex; gap:9px; align-items:baseline}
+.brow .bn::before{content:"\25B8"; color:var(--blue); font-size:.8em}
 .brow .bd{color:var(--soft); font-size:.9rem}
 .brow .bd em{color:var(--dim); font-style:normal}
-@media(max-width:560px){.brow{grid-template-columns:1fr; gap:3px; padding:12px 18px}}
+@media(max-width:560px){.brow{grid-template-columns:1fr; gap:3px; padding:13px 18px}}
 
-.demo{padding:34px 30px; text-align:center}
-.demo h3{font-weight:700; font-size:1.3rem; margin:0 0 8px; color:var(--ink)}
-.demo p.s{color:var(--soft); max-width:56ch; margin:0 auto 20px}
-.demo .btn-p{font-size:1rem; padding:14px 28px}
-.warn{display:flex; gap:12px; text-align:left; max-width:680px; margin:24px auto 0; background:#1a1405; border:1px solid #5a4416; border-radius:10px; padding:14px 17px; color:#e7cd93; font-size:.85rem; line-height:1.6}
-.warn .i{color:var(--gold); flex:0 0 auto; font-size:1rem} .warn b{color:#ffe9b0}
+/* demo */
+.demo{padding:36px 30px; text-align:center}
+.demo h3{font-weight:700; font-size:1.32rem; margin:0 0 8px; color:var(--bright)}
+.demo p.s{color:var(--soft); max-width:56ch; margin:0 auto 22px}
+.demo .btn-p{font-size:1rem; padding:15px 30px}
+.warn{display:flex; gap:13px; text-align:left; max-width:680px; margin:24px auto 0; background:rgba(255,166,43,.07); border:1px solid var(--amber-dk); border-radius:11px; padding:15px 18px; color:#e9cfa0; font-size:.85rem; line-height:1.6}
+.warn .i{color:var(--amber); flex:0 0 auto; font-size:1.05rem} .warn b{color:var(--amber-lt)}
 
+/* install */
 .inst pre{margin:0; padding:24px; font-size:1rem; line-height:1.85; overflow-x:auto; white-space:pre}
-.inst .p{color:var(--gold); user-select:none} .inst .w{color:var(--ink)} .inst .o{color:var(--dim)}
-.copy{position:absolute; top:11px; right:12px; background:#141008; border:1px solid var(--edge); color:var(--soft); border-radius:7px; padding:5px 12px; font-size:.74rem; cursor:pointer; font-family:inherit; transition:.15s}
-.copy:hover{border-color:var(--gold); color:var(--gold)}
-.imeta{display:flex; gap:20px; flex-wrap:wrap; color:var(--dim); font-size:.84rem; margin-top:16px}
+.inst .p{color:var(--amber); user-select:none} .inst .w{color:var(--bright)} .inst .o{color:var(--dim)}
+.copy{position:absolute; top:12px; right:13px; background:var(--surface-2); border:1px solid var(--line-2); color:var(--soft); border-radius:8px; padding:6px 13px; font-size:.75rem; cursor:pointer; font-family:inherit; transition:.15s}
+.copy:hover{border-color:var(--blue); color:var(--blue-lt)}
+.imeta{display:flex; gap:22px; flex-wrap:wrap; color:var(--dim); font-size:.84rem; margin-top:17px}
 .imeta b{color:var(--soft); font-weight:500}
 
-.os{display:grid; grid-template-columns:1fr 1fr; gap:15px}
-.os a{display:flex; flex-direction:column; gap:5px; padding:22px; border:1px solid var(--line); border-radius:11px; background:linear-gradient(180deg,var(--panel),#070707); transition:.2s}
-.os a:hover{border-color:var(--gold-d); transform:translateY(-3px)}
-.os .t{font-weight:700; color:var(--ink); font-size:1.02rem} .os .d{color:var(--dim); font-size:.85rem} .os .u{color:var(--gold-d); font-size:.77rem; margin-top:3px}
+/* open source */
+.os{display:grid; grid-template-columns:1fr 1fr; gap:16px}
+.os a{display:flex; flex-direction:column; gap:5px; padding:24px; border:1px solid var(--line-2); border-radius:12px; background:var(--surface); transition:.2s}
+.os a:hover{border-color:var(--blue); transform:translateY(-3px); box-shadow:0 18px 40px -24px rgba(1,120,212,.5)}
+.os .t{font-weight:700; color:var(--bright); font-size:1.04rem} .os .d{color:var(--dim); font-size:.86rem} .os .u{color:var(--blue); font-size:.78rem; margin-top:4px}
 @media(max-width:560px){.os{grid-template-columns:1fr}}
 
-footer{border-top:1px solid var(--line); padding:38px 0 54px; text-align:center}
-.fhelix{display:inline-block; white-space:pre; font-size:clamp(7px,1.1vw,13px); line-height:1; margin-bottom:16px;
+footer{border-top:1px solid var(--line); padding:40px 0 56px; text-align:center}
+.fhelix{display:inline-block; white-space:pre; font-size:clamp(7px,1.1vw,13px); line-height:1; margin-bottom:17px;
   background:linear-gradient(90deg,#FF2626,#FF5C26,#FF9326,#FFC926,#FFFF26,#C9FF26,#93FF26,#5CFF26,#26FF26,#26FF5C,#26FF93,#26FFC9,#26FFFF,#26C9FF,#2693FF,#265CFF,#2626FF,#5C26FF,#9326FF,#C926FF,#FF26FF,#FF26C9,#FF2693,#FF265C,#FF2626); background-size:220% 100%; -webkit-background-clip:text; background-clip:text; color:transparent; opacity:.9; animation:flow 10s linear infinite}
-footer .m{color:var(--dim); font-size:.83rem} footer .m a{color:var(--soft)} footer .m a:hover{color:var(--gold)}
-footer .sig{margin-top:9px; color:var(--faint); font-size:.74rem; letter-spacing:.06em}
+footer .m{color:var(--dim); font-size:.83rem} footer .m a{color:var(--soft)} footer .m a:hover{color:var(--blue-lt)}
+footer .sig{margin-top:10px; color:var(--faint); font-size:.74rem; letter-spacing:.06em}
 
 .reveal{opacity:0; transform:translateY(16px); transition:opacity .7s cubic-bezier(.2,.7,.2,1), transform .7s cubic-bezier(.2,.7,.2,1)}
 .reveal.in{opacity:1; transform:none}
 @media(prefers-reduced-motion:reduce){*{animation:none!important} .reveal{opacity:1; transform:none}}
+
+
+.isteps{padding:22px 24px 6px; display:flex; flex-direction:column; gap:11px}
+.istep{display:grid; grid-template-columns:72px 1fr auto; gap:14px; align-items:center}
+.ifoot .istep,.istep.nofb{grid-template-columns:1fr auto}
+.ilabel{color:var(--blue); font-size:.7rem; letter-spacing:.16em; text-transform:uppercase; font-weight:700; text-align:right}
+.iline{font-size:1rem; background:var(--inset); border:1px solid var(--line); border-radius:8px; padding:11px 15px; color:var(--bright); white-space:pre; overflow-x:auto}
+.iline .p{color:var(--blue); user-select:none; margin-right:8px} .iline .o{color:var(--dim)}
+.istep .copy{position:static; top:auto; right:auto}
+.ifoot{padding:4px 24px 22px; border-top:1px solid var(--line); margin-top:10px}
+.iflbl{color:var(--soft); font-size:.86rem; margin:16px 0 10px} .iflbl b{color:var(--blue-lt)}
+.inote{color:var(--dim); font-size:.82rem; margin-top:13px} .inote b{color:var(--soft); font-weight:500}
+@media(max-width:560px){.istep{grid-template-columns:1fr; gap:6px} .ilabel{text-align:left}}
+.tbar .acc{color:var(--blue); font-size:1.02rem; line-height:1; margin-left:0; margin-right:3px}
 </style>
 </head>
 <body>
 
 <div class="bar0"><div class="wrap">
-  <div class="b-brand"><i>▚</i> SpliceCraft</div>
+  <div class="b-brand"><a class="b-home" href="https://github.com/Binomica-Labs/SpliceCraft"><i>◌</i> SpliceCraft</a><a class="ver" id="ver" href="https://pypi.org/project/splicecraft/" target="_blank" rel="noopener">v1.0.76</a></div>
   <nav class="b-nav">
-    <a href="#bench">the bench</a><a href="#demo">demo</a><a href="#install">install</a>
-    <a class="gh" href="https://github.com/Binomica-Labs/SpliceCraft">github&nbsp;↗</a><span class="lv">live</span>
+    <a href="#demo">demo</a><a href="#install">install</a>
+    <a class="gh" href="https://github.com/Binomica-Labs/SpliceCraft">github&nbsp;↗</a><span class="lv" id="lv">checking</span>
   </nav>
 </div></div>
 
 <header class="hero">
   <div class="wrap">
-    <div class="kick reveal">Binomica&nbsp;Labs&nbsp;·&nbsp;bioinformatics</div>
+    <div class="kick reveal">Binomica&nbsp;Labs&nbsp;Presents</div>
     <div class="wmwrap reveal" style="transition-delay:.05s">
 <pre class="wm wm-cosmic" aria-label="SpliceCraft"> .::::::.   ::::::::::.    :::       :::    .,-:::::    .,::::::      .,-:::::    :::::::..       :::.       .-:::::'  ::::::::::::
 ;;;`    `    `;;;```.;;;   ;;;       ;;;  ,;;;'````'    ;;;;''''    ,;;;'````'    ;;;;``;;;;      ;;`;;      ;;;''''   ;;;;;;;;''''
@@ -183,77 +211,22 @@ footer .sig{margin-top:9px; color:var(--faint); font-size:.74rem; letter-spacing
 ⠀⠀⠑⠤⣀⣂⠤⠊⠀⠀⠀⠈⠪⢄⣀⡢⠔⠁⠀⠀⠈⠒⢔⣀⣀⠥⠊⠀⠀⠀⠑⠤⣐⣀⡠⠕⠁⠀⠀⠈⠢⢄⣐⣀⠔⠊⠀⠀⠀⠑⠥⣀⣐⠤⠊⠁⠀⠀⠈⠢⢅⣀⡨⠔⠁⠀</pre></div>
   <div class="wrap">
     <div class="subt reveal" style="transition-delay:.13s">· In-Terminal Plasmid Workbench ·</div>
-    <p class="lede reveal" style="transition-delay:.18s">Design, clone, and mutate plasmids from one keyboard-driven workbench — restriction analysis, Golden&nbsp;Braid &amp; MoClo assembly, primer design, and in-process BLAST, all in your terminal. <b>Local-first. No mouse, no browser, no cloud.</b></p>
+    <p class="lede reveal" style="transition-delay:.18s">A plasmid-engineering suite that lives in your terminal — design, clone, mutate, and assemble. <b>Fully mouse-friendly</b> despite being a pure-Python TUI, and everything runs on your own computer.</p>
     <div class="cta reveal" style="transition-delay:.22s">
       <a class="btn btn-p" href="https://demo.splicecraft.bio">▶ Try the live demo</a>
       <a class="btn btn-g" href="#install">⤓ Install locally</a>
     </div>
   </div>
   <div class="spec reveal" style="transition-delay:.27s">
-    <span><b>Python</b> <em>3.10+</em></span><span><b>in-process</b> BLAST + HMMER</span><span><b>Golden Braid</b> + MoClo</span><span><b>Primer3</b> + Mutato</span><span><em>local-first</em> · no cloud</span>
+    <span><em>MIT</em>-licensed</span><span><b>Python</b> <em>3.10+</em></span><span><b>Linux</b> / <b>macOS</b> / <b>Windows</b></span><span><em>no account</em>, no telemetry</span>
   </div>
 </header>
 
-<section id="session">
-  <div class="wrap">
-    <div class="shead reveal"><b>01</b><h2>a real session</h2><span class="ln"></span></div>
-    <div class="tui reveal">
-      <div class="tbar"><i></i><i></i><i></i><span>splicecraft</span><span class="rt">~/lab</span></div>
-      <div class="sesh">
-        <div class="map-c">
-          <pre class="map">⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣠⠤⠤⠤⠤⠤⠤⢤⣀⡀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⢀⡠⠖⠋⠁⠴⠒⠒⠒⠓⠒⠒⠲⠤⣉⠓⠦⣀⠀⠀⠀⠀⠀
-⠀⠀⠀⢀⡴⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⠢⣌⠳⣄⠀⠀⠀
-⠀⠀⢠⠎⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢦⠀⠀
-⠀⢠⠏⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢧⠀
-⠀⡞⢰⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⡆
-⠀⡇⢸⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡇
-⠀⡇⢹⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡇
-⠀⣇⢸⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡇
-⠀⠸⡄⢣⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡼⠀
-⠀⠀⠹⡄⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡰⠃⡼⠁⠀
-⠀⠀⠀⠘⢦⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡠⠞⣡⠞⠀⠀⠀
-⠀⠀⠀⠀⠀⠙⠢⣄⡀⠀⠀⠀⠀⣀⣀⣀⣀⣠⠤⠒⣉⡤⠚⠁⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠉⠓⠲⠤⠤⠤⠥⠤⠤⠴⠒⠋⠁⠀⠀⠀⠀⠀⠀⠀</pre>
-          <div class="hub"><div class="n">pUC19</div><div class="bp">2,686 bp</div><div class="c">○ circular</div></div>
-        </div>
-<pre class="log"><span class="p">~ $</span> <span class="w">splicecraft L09137</span>
-<span class="o">  &#8627; fetched &#183; pUC19 &#183; 2,686 bp &#183; circular &#183; 4 features</span>
-<span class="p">~ $</span> <span class="w">restriction BsaI BsmBI</span>
-<span class="o">  BsaI &#215;0   BsmBI &#215;0   &#8594; </span><span class="ok">domestication-clean &#10003;</span>
-<span class="p">~ $</span> <span class="w">constructor golden-braid</span>
-<span class="o">  digest &#9656; ligate &#9656; close &#8230;  pGB&#183;cscA-T0 &#183; 3,114 bp </span><span class="ok">&#10003;</span>
-<span class="p">~ $</span> <span class="w">mutato A124V</span>
-<span class="o">  mutagenic PCR &#9656; recircularize &#8230;  saved </span><span class="ok">&#10003;</span>
-<span class="p">~ $</span> <span class="cur">&#9608;</span></pre>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section id="bench">
-  <div class="wrap">
-    <div class="shead reveal"><b>02</b><h2>the bench</h2><span class="ln"></span></div>
-    <div class="tui reveal">
-      <div class="tbar"><i></i><i></i><i></i><span>tools</span><span class="rt">[/] palette</span></div>
-      <div class="bench">
-        <div class="brow"><span class="bn">Constructor</span><span class="bd">Golden Braid L0 + MoClo &#183; real digest / ligation, every step simulated</span></div>
-        <div class="brow"><span class="bn">Mutato</span><span class="bd">SOE-PCR &amp; QuikChange &#183; builds the real amplicons + assembles them</span></div>
-        <div class="brow"><span class="bn">Primers</span><span class="bd">Primer3 design &#183; topology-aware binding &#183; displayed where they anneal</span></div>
-        <div class="brow"><span class="bn">BLAST &#183; HMMER</span><span class="bd">in-process BLASTN / BLASTP &amp; pyhmmer &#183; <em>no external servers</em></span></div>
-        <div class="brow"><span class="bn">Synthesis</span><span class="bd">codon optimization &#183; operon &#916;G model &#183; protein-motif scans</span></div>
-        <div class="brow"><span class="bn">Map &#183; Sequence</span><span class="bd">circular &amp; linear maps &#183; per-base editor &#183; restriction overlays</span></div>
-        <div class="brow"><span class="bn">Library</span><span class="bd"><em>local-first</em> &#183; collections, parts, primers, gels &#8212; all on your machine</span></div>
-      </div>
-    </div>
-  </div>
-</section>
-
 <section id="demo">
   <div class="wrap">
-    <div class="shead reveal"><b>03</b><h2>live demo</h2><span class="ln"></span></div>
+    <div class="shead reveal"><h2>live demo</h2><span class="ln"></span></div>
     <div class="tui reveal">
-      <div class="tbar"><i></i><i></i><i></i><span>demo.splicecraft.bio &#8212; sandboxed session</span></div>
+      <div class="tbar"><span class="acc">◌</span><span>demo.splicecraft.bio</span><span class="rt">sandboxed</span></div>
       <div class="demo">
         <h3>Run the real thing, in your browser</h3>
         <p class="s">The demo streams an actual SpliceCraft session to a browser terminal &#8212; same tools, same maps, same keystrokes.</p>
@@ -266,27 +239,27 @@ footer .sig{margin-top:9px; color:var(--faint); font-size:.74rem; letter-spacing
 
 <section id="install" class="inst">
   <div class="wrap">
-    <div class="shead reveal"><b>04</b><h2>install locally</h2><span class="ln"></span></div>
+    <div class="shead reveal"><h2>install locally</h2><span class="ln"></span></div>
     <div class="tui reveal">
-      <div class="tbar"><i></i><i></i><i></i><span>your terminal &#8212; the full experience</span></div>
-      <div style="position:relative">
-        <button class="copy" onclick="cp(this)">copy</button>
-<pre><span class="p">$</span> <span class="w">pipx install splicecraft</span>
-<span class="p">$</span> <span class="w">splicecraft</span>
-
-<span class="o"># open a local plasmid</span>
-<span class="p">$</span> <span class="w">splicecraft myplasmid.gb</span>
-<span class="o"># or pull one straight from NCBI</span>
-<span class="p">$</span> <span class="w">splicecraft L09137</span></pre>
+      <div class="tbar"><span class="acc">◌</span><span>your terminal</span></div>
+      <div class="isteps">
+        <div class="istep"><span class="ilabel">install</span><span class="iline"><span class="p">$</span>pipx install splicecraft</span><button class="copy" data-cmd="pipx install splicecraft" onclick="cp(this)">copy</button></div>
+        <div class="istep"><span class="ilabel">run</span><span class="iline"><span class="p">$</span>splicecraft</span></div>
+        <div class="istep"><span class="ilabel">update</span><span class="iline"><span class="p">$</span>splicecraft update</span></div>
+      </div>
+      <div class="ifoot">
+        <div class="iflbl">Don't have <b>pipx</b>? One line — installs pipx, then SpliceCraft:</div>
+        <div class="istep nofb"><span class="iline"><span class="p">$</span>sudo apt install -y pipx &amp;&amp; pipx install splicecraft</span><button class="copy" data-cmd="sudo apt install -y pipx &amp;&amp; pipx install splicecraft" onclick="cp(this)">copy</button></div>
+        <div class="inote">Debian / Ubuntu · on macOS use <b>brew install pipx</b> · or plain <a href="https://pypi.org/project/splicecraft/">pip install splicecraft</a></div>
       </div>
     </div>
-    <div class="imeta reveal"><span><b>Python 3.10+</b></span><span>no pipx? <a href="https://pypi.org/project/splicecraft/">pip install splicecraft</a></span><span>Linux &#183; macOS &#183; Windows terminals</span></div>
+    <div class="imeta reveal"><span><b>Python 3.10+</b></span><span>Linux · macOS · Windows</span><span>MIT-licensed</span></div>
   </div>
 </section>
 
 <section id="src">
   <div class="wrap">
-    <div class="shead reveal"><b>05</b><h2>open source</h2><span class="ln"></span></div>
+    <div class="shead reveal"><h2>open source</h2><span class="ln"></span></div>
     <div class="os">
       <a class="reveal" href="https://github.com/Binomica-Labs/SpliceCraft"><span class="t">&#9733; GitHub</span><span class="d">Source, issues &amp; ideas. Stars welcome.</span><span class="u">github.com/Binomica-Labs/SpliceCraft &#8599;</span></a>
       <a class="reveal" style="transition-delay:.06s" href="https://pypi.org/project/splicecraft/"><span class="t">&#10515; PyPI</span><span class="d">Published releases, install-ready.</span><span class="u">pypi.org/project/splicecraft &#8599;</span></a>
@@ -304,12 +277,14 @@ footer .sig{margin-top:9px; color:var(--faint); font-size:.74rem; letter-spacing
 </div></footer>
 
 <script>
-function cp(b){navigator.clipboard.writeText("pipx install splicecraft").then(function(){var t=b.textContent;b.textContent="copied ✓";setTimeout(function(){b.textContent=t},1400)})}
+function cp(b){var c=b.dataset.cmd||"pipx install splicecraft";navigator.clipboard.writeText(c).then(function(){var o=b.textContent;b.textContent="copied ✓";setTimeout(function(){b.textContent=o},1400)})}
 (function(){var els=document.querySelectorAll('.reveal');
 if(!('IntersectionObserver'in window)){els.forEach(function(e){e.classList.add('in')});return;}
 var io=new IntersectionObserver(function(en){en.forEach(function(e){if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target)}})},{threshold:.1,rootMargin:'0px 0px -7% 0px'});
 els.forEach(function(e){io.observe(e)});
 window.addEventListener('load',function(){document.querySelectorAll('.hero .reveal').forEach(function(e){e.classList.add('in')})});})();
 </script>
+<script>fetch("/version.txt",{cache:"no-store"}).then(function(r){return r.ok?r.text():null;}).then(function(t){if(!t)return;t=t.trim().replace(/^v/i,"");if(/^\d+\.\d+\.\d+$/.test(t)){var e=document.getElementById("ver");if(e)e.textContent="v"+t;}}).catch(function(){});</script>
+<script>(function(){var lv=document.getElementById("lv");if(!lv)return;fetch("/demo-status.json",{cache:"no-store"}).then(function(r){if(!r.ok)throw 0;var lm=Date.parse(r.headers.get("last-modified")),dt=Date.parse(r.headers.get("date"));var stale=(lm&&dt)?(dt-lm>300000):false;return r.json().then(function(j){return j.demo==="up"&&!stale;});}).then(function(up){lv.className=up?"lv up":"lv down";lv.textContent=up?"live":"demo offline";}).catch(function(){lv.className="lv down";lv.textContent="demo offline";});})();</script>
 </body>
 </html>

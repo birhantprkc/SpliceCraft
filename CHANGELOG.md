@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.77] — 2026-06-14
+
+### Bug fixes
+
+- **The circular map keeps itself round.** SpliceCraft now re-fits the circle to your terminal automatically — when you resize the window, drag the map/sequence divider, or switch to a fullscreen view — so it no longer drifts into an ellipse you had to straighten by hand with `,` / `.`. The manual keys still nudge it, and on terminals that don't report their cell size your chosen shape is left alone instead of being reset.
+
+---
+
 ## [1.0.76] — 2026-06-13
 
 ### New features

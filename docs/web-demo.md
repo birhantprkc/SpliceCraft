@@ -1,133 +1,229 @@
 # Hosting the SpliceCraft web demo (splicecraft.bio)
 
 The web demo is **the real `splicecraft.py`**, run server-side and streamed to a
-browser terminal via Textual Web. There is no separate web codebase, so the
-browser demo is **1-to-1 with the terminal tool by construction** — same braille
-maps, same black theme, same behaviour. What makes it safe + public-ready is
-**demo mode** (`SPLICECRAFT_DEMO`, see `[INV-131]`) plus per-session container
-isolation.
+browser terminal via **[`textual-serve`](https://github.com/Textualize/textual-serve)**.
+There is no separate web codebase, so the browser demo is **1-to-1 with the
+terminal tool by construction** — same braille maps, same theme, same behaviour.
+What makes it safe + public-ready is **demo mode** (`SPLICECRAFT_DEMO`) plus the
+in-app web-tier lockdown.
 
-## TL;DR
+> **Not `textual-web`.** Textualize's hosted `textual-web.io` relay was
+> decommissioned (~2025 — the domain no longer resolves), so the old "tunnel out
+> to a relay + `--signup`" route is a dead end. We self-host with `textual-serve`
+> (its supported replacement) behind Caddy — cleaner anyway: the demo runs on our
+> own domain with our own TLS and no third-party dependency.
 
-```bash
-pip install splicecraft textual-web        # pin the EXACT released version (see staleguard)
-SPLICECRAFT_DEMO=web textual serve "python3 -m splicecraft"   # or: textual serve "splicecraft"
+## Architecture
+
+```
+splicecraft.bio / www  ──▶ Caddy (file_server) ─────────▶ /var/www/splicecraft/index.html   (static landing page)
+demo.splicecraft.bio   ──▶ Caddy (reverse_proxy, TLS) ──▶ textual-serve :8000
+                                                            └─▶ spawns `SPLICECRAFT_DEMO=web splicecraft` per session
 ```
 
-Point a CNAME from `splicecraft.bio` at the host. For a quick public URL with
-no ops, `textual-web` (Textualize's hosted relay) works too; for control over
-isolation + limits, self-host as below.
+- **Apex** (`splicecraft.bio` / `www`) serves the marketing **landing page**
+  (`web/index.html` in this repo).
+- **`demo.splicecraft.bio`** is the live demo. textual-serve must own a domain
+  root, so the demo gets its own subdomain; the landing page's "Try the live
+  demo" button links there.
 
 ## The two tiers
 
-| Env | Use | Behaviour |
+| `SPLICECRAFT_DEMO` | Use | Behaviour |
 |---|---|---|
-| `SPLICECRAFT_DEMO=local` | previewing the demo build on your own machine | **full features**, sandboxed data dir + seeded examples |
-| `SPLICECRAFT_DEMO=web` | the public deployment | **restrained** — see lockdown below |
+| `local` | previewing the demo build on your own machine | **full features**, sandboxed data dir + seeded examples |
+| `web`   | the public deployment | **restrained** — see lockdown below |
 
 Both force a **fresh ephemeral data dir per process** (`/tmp/splicecraft-demo-…`)
-and ignore `$SPLICECRAFT_DATA_DIR`/`$XDG`, so a session can never read or write a
-real library. Each launch seeds three worked examples (general plasmid,
-Golden-Braid-scrubbable plasmid, two-gene operon) and shows a version banner.
+and ignore `$SPLICECRAFT_DATA_DIR` / `$XDG`, so a session can never read or write a
+real library. Each launch seeds the FFE Golden-Braid / MoClo worked set (see
+**Seed**) and shows a version banner.
 
 ## What the `web` tier locks (defence-in-depth, in-app)
 
-These are enforced in-process *on top of* the container boundary:
+Enforced in-process, regardless of UI path:
 
-- **No network egress** — every fetch helper (`fetch_genbank`, PyPI update
-  check, NCBI taxid, Kazusa, genome datasets, HMM-DB / arbitrary-URL opener)
-  raises, so no SSRF / outbound abuse regardless of UI path.
+- **No network egress** — every fetch helper (`fetch_genbank`, PyPI update check,
+  NCBI taxid, Kazusa, genome datasets, HMM-DB / arbitrary-URL opener) raises, so
+  no SSRF / outbound abuse.
 - **No host-FS reads** — open-file, load-part-from-file, entry-vector-from-file,
-  image-attach, etc. (the main open is gated; the rest are container-contained).
+  image-attach, sequencing import, etc. are all gated.
 - **No agent HTTP API** — `_start_agent_api` refuses even if `--agent` is passed.
 - **No destructive / bulk-data ops** — data export/import (migrate), master
-  delete, and the per-format exports (GenBank / FASTA / GFF / CommercialSaaS)
-  all show a polite "install SpliceCraft for the full tool" message.
-- **Sequence-size cap** — `_apply_record` refuses sequences > 100 kb so a
-  megabase paste can't bog down the host.
+  delete, and the per-format exports (GenBank / FASTA / GFF / CommercialSaaS) show
+  a polite "install SpliceCraft for the full tool" message.
+- **Sequence-size cap** — `_apply_record` refuses sequences > 100 kb.
 
-The **science tools stay fully usable** on the seed (Scrub, operon
-domestication, primer design, the Simulator, BLAST, codon optimisation) — they
-are pure compute, not gated.
+The **science tools stay fully usable** on the seed (Scrub, operon domestication,
+primer design, Simulator, BLAST, codon optimisation) — pure compute, not gated.
 
-## DigitalOcean + textual-web relay — step by step (the chosen launch route)
+## Deploying (DigitalOcean + textual-serve + Caddy)
 
-The relay (`textual-web`) tunnels OUT to Textualize's proxy and serves a public
-URL; you just need a small always-on box to run it.
+A small always-on Linux box runs textual-serve; Caddy fronts it with automatic
+HTTPS. An *idle* session costs ~0 % CPU and ~120 MB RAM, so 1 vCPU / 2 GB is
+plenty for a demo (≈10 concurrent before memory is the ceiling).
 
-1. **Droplet:** DO console → Ubuntu 24.04 LTS, Basic $12/mo (2 GB) [or $6/1 GB],
-   add your SSH key, note the IP.
-2. **Base (root):**
-   ```bash
-   ssh root@<IP>
-   adduser --disabled-password --gecos "" demo
-   apt update && apt install -y pipx
-   ufw allow OpenSSH && ufw --force enable     # relay tunnels out; only SSH inbound
-   ```
-3. **Install + sign up (user `demo`):**
-   ```bash
-   su - demo
-   pipx install splicecraft
-   pipx install textual-web
-   textual-web --signup     # open the printed URL in your browser → writes ~/ganglion.toml
-   ```
-4. **`~/ganglion.toml`:**
-   ```toml
-   [account]
-   api_key = "…"                                    # filled by --signup
-   [app.SpliceCraft]
-   command = "env SPLICECRAFT_DEMO=web splicecraft" # web tier: sandboxed + locked
-   slug = "splicecraft"
-   ```
-5. **systemd** `/etc/systemd/system/splicecraft-demo.service` (root): `User=demo`,
-   `ExecStart=/home/demo/.local/bin/textual-web --config /home/demo/ganglion.toml`,
-   `Restart=always`, `MemoryMax=1800M`; then
-   `systemctl enable --now splicecraft-demo` and
-   `journalctl -u splicecraft-demo -f` to read the public URL.
-6. **GoDaddy:** splicecraft.bio → Domain Settings → Forwarding → forward to the
-   `…textual-web.io/splicecraft` URL (301).
-7. **Stay current (staleguard):** nightly cron as `demo`:
-   `0 4 * * * pipx upgrade splicecraft && sudo systemctl restart splicecraft-demo`.
-   The banner shows the running version.
+### 1 — Droplet
+DO console → **Ubuntu 24.04 LTS**, Basic **$12/mo (2 GB)**. Enable Monitoring +
+IPv6 (free). Add your SSH key, note `<DROPLET_IP>`.
 
-Caveat: textual-web runs each visitor as a subprocess (not a container) — the
-demo-mode sandbox + web lockdown + `MemoryMax` are the protection; add the
-per-session containers below if traffic/abuse grows.
+### 2 — Base + install
+```bash
+ssh root@<DROPLET_IP>
+adduser --disabled-password --gecos "" demo
+apt-get update && apt-get install -y pipx python3-venv
+ufw allow OpenSSH && ufw allow 80/tcp && ufw allow 443/tcp && ufw --force enable
+su - demo -c 'pipx install splicecraft'
+python3 -m venv /home/demo/serve-venv && /home/demo/serve-venv/bin/pip install textual-serve
+fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+```
+`splicecraft` and `textual-serve` live in separate envs — textual-serve only
+*spawns* the `splicecraft` CLI, so their deps never entangle.
 
-## Per-session isolation (self-host)
+### 3 — Launcher: `/home/demo/serve_splicecraft.py`
+```python
+from textual_serve.server import Server
 
-`textual serve` runs one Python process per browser session. For a public host:
+server = Server(
+    # `exec` is load-bearing (see gotchas)
+    command="exec env SPLICECRAFT_DEMO=web PATH=/home/demo/.local/bin:/usr/local/bin:/usr/bin:/bin /home/demo/.local/bin/splicecraft",
+    host="127.0.0.1",                              # behind Caddy; never exposed directly
+    port=8000,
+    title="SpliceCraft — live demo",
+    public_url="https://demo.splicecraft.bio",     # emit wss://demo…/ws, not 127.0.0.1
+    templates_path="/home/demo/sc-templates",      # custom template → quit redirects (gotchas)
+)
+server.serve()
+```
 
-- Run each session in a **minimal container** (no real data, no host mounts) so
-  even the container-contained surfaces (in-container file reads/writes) expose
-  nothing. The container is the primary boundary; demo mode is defence-in-depth.
-- Apply **resource limits** (CPU/mem via cgroups, `ulimit`, a wall-clock idle
-  timeout) and a **concurrency cap** (N sessions = N processes) with a queue.
-- TLS + a reverse proxy (nginx/Caddy) in front; rate-limit new connections.
+### 4 — systemd: `/etc/systemd/system/splicecraft-demo.service`
+```ini
+[Unit]
+Description=SpliceCraft web demo (textual-serve)
+After=network-online.target
+Wants=network-online.target
 
-## Version staleguard — keeping the demo 1-to-1 / never stale
+[Service]
+User=demo
+WorkingDirectory=/home/demo
+ExecStart=/home/demo/serve-venv/bin/python /home/demo/serve_splicecraft.py
+Restart=always
+RestartSec=3
+MemoryMax=1400M
+NoNewPrivileges=true
+PrivateTmp=true
 
-The demo serves whatever version is installed, so "never behind the terminal
-build" is guaranteed by **pinning + redeploy on release**:
+[Install]
+WantedBy=multi-user.target
+```
+`systemctl enable --now splicecraft-demo`.
 
-1. The deploy installs an **exact** version: `pip install splicecraft==X.Y.Z`
-   (never a floating range), so the served build is reproducible.
-2. **Redeploy on each release.** After `release.py` ships X.Y.Z to PyPI, the
-   demo host re-pulls that exact version (a webhook on the PyPI publish, or a
-   `release.py` post-publish hook that pokes the host, or a nightly that
-   compares the installed version to PyPI's latest and redeploys on drift).
-3. The **banner shows `v{__version__}`** so a session is self-identifying and
-   drift is visible at a glance.
+### 5 — Caddy: `/etc/caddy/Caddyfile`
+```caddy
+{
+    email you@example.com          # REQUIRED — see gotchas
+}
 
-> Because demo mode blocks egress, the *in-app* "is there a newer version"
-> check is intentionally off in the web tier — the staleguard lives at the
-> **deploy** layer (steps 1–2), not in the sandboxed process.
+splicecraft.bio, www.splicecraft.bio {
+    encode zstd gzip
+    root * /var/www/splicecraft
+    file_server
+}
 
-## Still to wire when you stand up hosting
+demo.splicecraft.bio {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:8000
+}
+```
+Copy `web/index.html` → `/var/www/splicecraft/index.html`, then
+`systemctl reload caddy`. Caddy auto-issues Let's Encrypt certs once DNS points
+at the box and 80/443 are open.
 
-- The redeploy automation (step 2) — depends on where you host.
-- A manual click-through of every modal in both tiers as a final human QA
-  (the automated `test_demo_mode.py::TestDemoModeQA` covers the lockdown
-  contract + that the core tools run on the seed).
-- Optionally richer seed content (parts / primers / a Sanger read) so the
-  primer + alignment tools also have a worked example out of the box.
+### 6 — DNS (at the registrar, e.g. GoDaddy)
+| Type | Name | Value |
+|---|---|---|
+| A | `@` | `<DROPLET_IP>` |
+| A | `demo` | `<DROPLET_IP>` |
+| CNAME | `www` | `splicecraft.bio` |
+
+## Load-bearing gotchas (each was a real bug)
+
+- **`exec` in the launch command.** textual-serve runs `sh -c "<cmd>"`; without
+  `exec`, `splicecraft` is a *grandchild* of that shell. On disconnect the shell
+  dies but splicecraft is orphaned (reparented to init) and **spins ~90 % CPU
+  forever**. `exec` makes splicecraft replace the shell so it's killed cleanly.
+- **Orphan reaper.** Belt-and-suspenders cron — `/etc/cron.d/sc-reap` running
+  `*/2 * * * * root` a one-liner that `kill -9`s any `ppid==1` splicecraft (a hard
+  network drop can still orphan one).
+- **Terminal font size.** SpliceCraft requires ≥ 100×30. textual-serve's 16 px
+  default web terminal can dip under 100 cols on small/split windows. Patch
+  `textual_serve/server.py`'s `font_size` default 16 → 13 (or append
+  `?fontsize=13`). A nightly `splicecraft` upgrade does **not** touch textual-serve,
+  so the patch persists.
+- **Valid ACME `email` in the Caddyfile.** With none, Caddy tries to register a
+  Let's Encrypt account with the literal contact `default` → LE rejects it
+  (`invalidContact`) and **new** certs fail (already-cached certs keep working,
+  which hides the cause). Set a real email in the global block.
+- **`public_url`.** Behind Caddy/HTTPS this makes textual-serve emit
+  `wss://demo.splicecraft.bio/ws` + `https://…/static` instead of `127.0.0.1:8000`.
+- **Quit → website.** `templates_path` points at a copy of textual-serve's
+  templates (Jinja vars preserved) whose `app_index.html` adds a `MutationObserver`
+  that runs `window.location.replace("https://splicecraft.bio")` when the session
+  closes (`document.body` gains `-closed`).
+- **Stale DNS after repointing.** Repointing the apex away from a parked page
+  leaves local caches serving the old site — `resolvectl flush-caches` and clear
+  the browser's `chrome://net-internals/#dns`.
+
+## Seed
+
+A demo session is seeded offline with the FFE Golden-Braid / MoClo worked set
+from **`splicecraft_demo_plasmids.py`** (bundled in the wheel, loaded via
+`json.loads`): L0 entry vectors (UPD + α/ω), a "Demo parts" bin of L0 parts, two
+transcription units, and the cscA/cscB + pCambia plasmids — so Constructor /
+Parts Bin / Scrub all have worked examples. Regenerate the sidecar from a source
+library; never hand-edit. **Mind the private-name guard** — landing-page /
+example copy must avoid `.private-names` tokens (a guarded reporter-gene name slipped into the landing-page session text and tripped `release.py` once).
+
+## Staleguard — keeping the demo 1-to-1
+
+The demo serves whatever `pipx` has, so "never behind the terminal build" is a
+**nightly redeploy**:
+```cron
+30 4 * * * root /usr/local/bin/sc-update   # pipx upgrade splicecraft + restart demo + refresh /version.txt
+```
+After `release.py` ships X.Y.Z, the next run (or a manual `sc-update`) pulls it;
+the banner shows `v{__version__}` so drift is visible at a glance. `sc-update`
+also writes the live version to `/var/www/splicecraft/version.txt`, which the
+landing page's nav **version chip** fetches same-origin (allowed by the apex CSP
+`connect-src 'self'`) so the chip always shows the deployed version. The in-app
+"newer version?" check is off in the web tier (egress is blocked), so the
+staleguard lives at the **deploy** layer.
+
+## Live-status light
+
+The landing nav's **"live" dot is a real end-to-end health check**, not a CSS
+animation. `/etc/cron.d/sc-health` runs `/usr/local/bin/sc-health` every minute;
+it probes `https://demo.splicecraft.bio/` (a genuine HTTP 200 means DNS + Caddy +
+TLS + textual-serve are all answering) and writes
+`/var/www/splicecraft/demo-status.json`. The landing page fetches that
+same-origin (allowed by the apex CSP `connect-src 'self'`) and shows a green
+pulse only on `"demo":"up"`, otherwise a red **demo offline** dot. A staleness
+guard compares the response's `Date` and `Last-Modified` headers (both
+server-provided, so no client-clock dependency); if the file is > 5 min stale —
+i.e. the probe cron died — the light fails to **offline** rather than showing
+false-live.
+
+## Per-session isolation (if traffic grows)
+
+textual-serve runs one subprocess per visitor (not a container). Today's
+protection is **demo-mode sandbox + web lockdown + `MemoryMax` + the orphan
+reaper**. If abuse / scale demands more, run each session in a minimal container
+(no real data, no host mounts) + cgroup limits + a concurrency cap, behind the
+same Caddy.
+
+## Final human QA
+
+`test_demo_mode.py` covers the lockdown contract, that the seed loads (plasmids +
+parts bin + entry vectors), and that the core tools run. Still worth a manual
+click-through of every modal in both tiers after a deploy.
