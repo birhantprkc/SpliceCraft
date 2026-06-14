@@ -144,6 +144,16 @@ generic primers — each with a persistent **Designed → Ordered → Validated*
 lifecycle, so you can see at a glance what's been ordered and what came back
 working, right alongside the plasmid it belongs to.
 
+A fifth **Primer Check** tab runs in-silico PCR across your whole library (or
+just the active collection): paste one primer to see every plasmid it anneals
+to with the **% identity** of the match, its strand and position; paste a second
+primer to get the **amplicon length** each plasmid yields and the **feature it
+amplifies**. Results are ranked by confidence (✓ / ⚠ / ~ / ✗) — binding needs an
+exact match over the primer's 3′ end (the priming end), so a 5′ cloning tail
+that doesn't anneal just shows as lower identity rather than vanishing. Click any
+result to open that plasmid on the canvas with the binding site (or amplicon
+span) selected.
+
 The library beside the designer organises primers into **collections** (new /
 rename / delete, like the plasmid side, with destructive prompts defaulting to
 **No**), with a **search bar** above the list that filters by name (fuzzy, like

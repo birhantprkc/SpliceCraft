@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.80] — 2026-06-14
+
+### New features
+
+- **Primer Check — find which plasmids your primers hit.** A new tab in the Primers screen (open with **Ctrl+P**, then pick **Primer Check**) runs in-silico PCR across your whole library — or just the active collection. Paste **one primer** to get a ranked list of every plasmid it anneals to, each with the **percent identity** of the match, the strand, and the position. Paste **two primers** to see the **amplicon length** each plasmid would yield and the **feature it amplifies**. Results are ranked by confidence (✓ / ⚠ / ~ / ✗); binding is judged on an exact match over the primer's 3′ end (the priming end), so a 5′ cloning tail that doesn't anneal shows up as lower identity instead of disappearing — and a pair where only one primer carries a tail is still found. Click any result to jump straight to that plasmid on the canvas with the binding site (or amplicon span) selected.
+
+---
+
 ## [1.0.79] — 2026-06-14
 
 ### Hardening
