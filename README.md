@@ -81,8 +81,10 @@ HMMscan against your own library in-process — powered by `pyhmmer`, so there's
 no external `blast+` to install — with a one-click Pfam-A / NCBIfam (or any
 HMMER3 URL) downloader. **Online** sends DNA / protein — or a whole plasmid or
 single feature — to NCBI or EMBL-EBI Pfam and tables the hits, with a live
-poll counter and a Cancel that really stops. (Native Windows: HMMscan needs
-WSL2; BLASTN/BLASTP run in-process.)
+poll counter and a Cancel that really stops. **Add to collection** pulls a
+highlighted nucleotide hit's full GenBank record straight from NCBI into a
+plasmid collection you pick. (Native Windows: HMMscan needs WSL2; BLASTN/BLASTP
+run in-process.)
 
 ### Enzymes
 

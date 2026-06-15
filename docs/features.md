@@ -167,6 +167,15 @@ What you can do without leaving the terminal.
     invalidated on `_save_collections`.
 - **Six-frame ORF indexing** (opt-in checkbox) for BLASTP against
   unannotated regions of plasmid backbones.
+- **Online BLAST / HMM** (second tab) — submit DNA / protein, a whole
+  library plasmid, or a single feature to NCBI BLAST (blastn / blastp /
+  blastx / tblastn / tblastx) or EMBL-EBI Pfam (hmmscan), with a live
+  poll counter and a real Cancel. **Add to collection** fetches a
+  highlighted nucleotide hit's full GenBank record (efetch) and saves it
+  as a plasmid into a collection you pick — name + destination prompt,
+  collision-safe via the universal commit helper. Enabled only for
+  nucleotide-subject hits (blastn / tblastn / tblastx); a protein or
+  Pfam hit has no DNA record to land in a plasmid collection.
 - **Cross-collection plasmid search** — Edit → Find plasmid… opens a
   fuzzy / substring search over every plasmid in every collection,
   natural-sorted by `(collection, plasmid)` so `pBin2` lands before

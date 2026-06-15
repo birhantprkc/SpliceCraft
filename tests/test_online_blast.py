@@ -622,3 +622,216 @@ class TestOnlineTabUI:
                 if not run_btn.disabled:
                     break
             assert not run_btn.disabled
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# "Add to collection" — pull a BLAST hit's full record into a collection
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestOnlineAddToCollection:
+    async def test_button_present_and_disabled_initially(
+            self, tiny_record, isolated_library):
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.BlastModal())
+            await pilot.pause()
+            modal = app.screen
+            btn = modal.query_one("#btn-online-add-collection", sc.Button)
+            # No results yet → nothing to add.
+            assert btn.disabled is True
+
+    async def test_button_enabled_for_nucleotide_hit(
+            self, tiny_record, isolated_library):
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.BlastModal())
+            await pilot.pause()
+            modal = app.screen
+            hits = sc._ncbi_blast_parse_xml(_BLAST_XML, 50)
+            modal._online_blast_done("blastn", hits, None)
+            await pilot.pause()   # let the auto-RowHighlighted settle
+            btn = modal.query_one("#btn-online-add-collection", sc.Button)
+            assert btn.disabled is False
+            assert modal._online_result_program == "blastn"
+
+    async def test_button_disabled_for_protein_subject(
+            self, tiny_record, isolated_library):
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.BlastModal())
+            await pilot.pause()
+            modal = app.screen
+            # Same canned hits, but a protein-subject program — the
+            # accession is a protein, so it can't become a plasmid.
+            hits = sc._ncbi_blast_parse_xml(_BLAST_XML, 50)
+            modal._online_blast_done("blastp", hits, None)
+            await pilot.pause()
+            btn = modal.query_one("#btn-online-add-collection", sc.Button)
+            assert btn.disabled is True
+
+    async def test_button_disabled_for_pfam_hit(
+            self, tiny_record, isolated_library):
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.BlastModal())
+            await pilot.pause()
+            modal = app.screen
+            modal.query_one("#online-program", sc.Select).value = "hmmscan"
+            await pilot.pause()
+            rows = sc._hmmer_web_parse_json(
+                {"result": {"hits": [
+                    {"acc": "PF00069", "name": "Pkinase", "desc": "kinase",
+                     "evalue": "1e-9", "score": "55", "ndom": 1}]}}, 50)
+            modal._online_hmm_done(rows, None)
+            await pilot.pause()
+            btn = modal.query_one("#btn-online-add-collection", sc.Button)
+            assert btn.disabled is True
+
+    async def test_commit_worker_saves_into_chosen_collection(
+            self, tiny_record, isolated_library):
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.BlastModal())
+            await pilot.pause()
+            modal = app.screen
+            # Drive the commit worker directly with a fetched record.
+            modal._online_commit_to_collection(
+                tiny_record, "L09137", "my pUC hit", "Cloned hits")
+            for _ in range(50):
+                await pilot.pause()
+                if sc._find_collection("Cloned hits") is not None:
+                    break
+            coll = sc._find_collection("Cloned hits")
+            assert coll is not None
+            names = [p.get("name") for p in coll.get("plasmids", [])]
+            assert "my pUC hit" in names
+            entry = next(p for p in coll["plasmids"]
+                         if p.get("name") == "my pUC hit")
+            assert entry.get("source") == "ncbi:L09137"
+            assert entry.get("gb_text")
+
+    async def test_full_press_path_fetches_and_commits(
+            self, monkeypatch, tiny_record, isolated_library):
+        # Stub the network efetch so the press → fetch worker → name
+        # modal → commit worker path runs without touching NCBI.
+        monkeypatch.setattr(sc, "fetch_genbank",
+                            lambda acc, *a, **k: tiny_record)
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.BlastModal())
+            await pilot.pause()
+            modal = app.screen
+            hits = sc._ncbi_blast_parse_xml(_BLAST_XML, 50)
+            modal._online_blast_done("blastn", hits, None)
+            await pilot.pause()
+            modal.query_one("#btn-online-add-collection", sc.Button).press()
+            # Wait for the fetch worker to push the NamePlasmidModal.
+            name_modal = None
+            for _ in range(50):
+                await pilot.pause()
+                if isinstance(app.screen, sc.NamePlasmidModal):
+                    name_modal = app.screen
+                    break
+            assert name_modal is not None
+            # Accept the default name (the accession) into the active
+            # collection by dismissing with the modal's payload shape.
+            active = sc._get_active_collection_name() or "Default"
+            name_modal.dismiss({"name": "L09137", "collection": active})
+            for _ in range(50):
+                await pilot.pause()
+                coll = sc._find_collection(active)
+                if coll and any(p.get("name") == "L09137"
+                                for p in coll.get("plasmids", [])):
+                    break
+            coll = sc._find_collection(active)
+            assert coll is not None
+            assert any(p.get("name") == "L09137"
+                       for p in coll.get("plasmids", []))
+
+    async def test_fetch_failure_shows_error(
+            self, monkeypatch, tiny_record, isolated_library):
+        def _boom(acc, *a, **k):
+            raise ValueError("NCBI is down")
+
+        monkeypatch.setattr(sc, "fetch_genbank", _boom)
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.BlastModal())
+            await pilot.pause()
+            modal = app.screen
+            hits = sc._ncbi_blast_parse_xml(_BLAST_XML, 50)
+            modal._online_blast_done("blastn", hits, None)
+            await pilot.pause()
+            modal.query_one("#btn-online-add-collection", sc.Button).press()
+            for _ in range(50):
+                await pilot.pause()
+                if not modal._online_fetching:
+                    break
+            # Flag reset, error surfaced, no name modal pushed.
+            assert modal._online_fetching is False
+            txt = str(modal.query_one("#online-status", sc.Static).render())
+            assert "Fetch failed" in txt
+            assert not isinstance(app.screen, sc.NamePlasmidModal)
+
+    async def test_empty_sequence_record_refused(
+            self, monkeypatch, tiny_record, isolated_library):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        empty = SeqRecord(Seq(""), id="EMPTY", name="EMPTY",
+                          description="master record, no bases")
+        monkeypatch.setattr(sc, "fetch_genbank",
+                            lambda acc, *a, **k: empty)
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.BlastModal())
+            await pilot.pause()
+            modal = app.screen
+            hits = sc._ncbi_blast_parse_xml(_BLAST_XML, 50)
+            modal._online_blast_done("blastn", hits, None)
+            await pilot.pause()
+            modal.query_one("#btn-online-add-collection", sc.Button).press()
+            for _ in range(50):
+                await pilot.pause()
+                if not modal._online_fetching:
+                    break
+            # No prompt — an empty record can't become a plasmid.
+            assert not isinstance(app.screen, sc.NamePlasmidModal)
+            txt = str(modal.query_one("#online-status", sc.Static).render())
+            assert "no sequence" in txt
+
+    async def test_program_switch_clears_add_gate(
+            self, tiny_record, isolated_library):
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.BlastModal())
+            await pilot.pause()
+            modal = app.screen
+            hits = sc._ncbi_blast_parse_xml(_BLAST_XML, 50)
+            modal._online_blast_done("blastn", hits, None)
+            await pilot.pause()
+            assert modal.query_one(
+                "#btn-online-add-collection", sc.Button).disabled is False
+            # Switching program clears the results table + the add gate.
+            modal.query_one("#online-program", sc.Select).value = "blastx"
+            await pilot.pause()
+            assert modal._online_result_program == ""
+            assert modal.query_one(
+                "#btn-online-add-collection", sc.Button).disabled is True

@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.83] — 2026-06-14
+
+### New features
+
+- **Save an online BLAST hit straight into a collection.** The Online BLAST / HMM tab now has an **Add to collection** button: highlight a nucleotide hit, click it, and SpliceCraft fetches that accession's full record from NCBI and saves it as a plasmid into whichever collection you pick (with a name prompt). It's enabled only for nucleotide hits (blastn / tblastn / tblastx) — a protein or Pfam hit has no DNA record to become a plasmid, so the button stays greyed out there.
+
+---
+
 ## [1.0.82] — 2026-06-14
 
 ### Bug fixes
