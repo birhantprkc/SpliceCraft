@@ -1959,8 +1959,12 @@ class TestProteinEditorAsync:
             assert "ATG" not in rendered
 
     async def test_codon_table_switch_updates_render(self):
-        """Picking a different codon table should re-render the DNA
-        codons under the AA letters."""
+        """Picking a different codon table should re-render the DNA codons
+        under the AA letters. Uses two tables that disagree on the preferred
+        Lys codon (AAA vs AAG) — both valid synonyms — so the switch is
+        observable WITHOUT remapping a codon to a non-canonical amino acid
+        (which `_codon_build_aa_map` now correctly ignores, deriving the AA
+        from the standard genetic code)."""
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
@@ -1973,18 +1977,21 @@ class TestProteinEditorAsync:
             )
             pe.load("MK")
             await pilot.pause()
-            first_codon_m = pe._codon_cache.get("M")
-            # Synthesise an alternate codon table: M = GTG (not ATG).
-            alt_raw = {
-                "ATG": ("M", 1), "GTG": ("M", 99),
-                "AAA": ("K", 50), "AAG": ("K", 50),
+            # Table A: Lys prefers AAA.
+            pe.set_codon_table({
+                "ATG": ("M", 1), "AAA": ("K", 99), "AAG": ("K", 1),
                 "TAA": ("*", 1),
-            }
-            pe.set_codon_table(alt_raw)
+            })
             await pilot.pause()
-            # M now resolves to GTG.
-            assert pe._codon_cache["M"] == "GTG"
-            assert pe._codon_cache["M"] != first_codon_m
+            assert pe._codon_cache["K"] == "AAA"
+            # Switch to Table B: Lys prefers AAG — the render must follow.
+            pe.set_codon_table({
+                "ATG": ("M", 1), "AAA": ("K", 1), "AAG": ("K", 99),
+                "TAA": ("*", 1),
+            })
+            await pilot.pause()
+            assert pe._codon_cache["K"] == "AAG"
+            assert pe._codon_cache["K"] != "AAA"
 
 
 class TestSynthesisTabbing:

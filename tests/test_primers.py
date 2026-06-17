@@ -737,6 +737,45 @@ class TestWrapRegionGeneric:
         assert r["fwd_seq"]
         assert r["rev_seq"]
 
+
+class TestPrimerTemplateRepickInv98:
+    """[INV-98] Re-picking a library plasmid as the primer-design template
+    must take the clean display name from the library entry, not the
+    underscored GenBank LOCUS — else default primer names carry underscores."""
+
+    _TERM = (180, 50)
+
+    @pytest.mark.asyncio
+    async def test_repick_uses_entry_name_not_locus(self, monkeypatch):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        gb = ("LOCUS       MY_PLASMID  12 bp ds-DNA circular SYN 01-JAN-2026\n"
+              "ORIGIN\n        1 atgcatgcatgc\n//\n")
+        entry = {"id": "p1", "name": "MY PLASMID", "gb_text": gb, "size": 12}
+        monkeypatch.setattr(sc, "_load_library", lambda: [entry])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=self._TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            # A current record is required for the designer to open.
+            app._current_record = SeqRecord(Seq("ATGC" * 20), id="cur", name="cur")
+            app._open_primer_design_impl(show_picker=False)
+            await pilot.pause()
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, sc.PrimerDesignScreen)
+            # Drive the picker callback directly with our entry id.
+            orig_push = app.push_screen
+            app.push_screen = lambda modal, callback=None, *a, **k: (
+                callback("p1") if callback else None)
+            try:
+                screen._pick_plasmid(None)
+                await pilot.pause()
+            finally:
+                app.push_screen = orig_push
+            assert screen._plasmid_name == "MY PLASMID"
+            assert "_" not in screen._plasmid_name
+
     def test_wrap_region_fwd_pos_starts_before_origin(self):
         import random
         rng = random.Random(0xBEEF)

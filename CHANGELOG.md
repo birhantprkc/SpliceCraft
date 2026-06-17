@@ -14,6 +14,24 @@
 
 ---
 
+## [1.0.84] — 2026-06-17
+
+### Bug fixes
+
+- **Underscores no longer creep into names from two more places.** When a plasmid's name came from a GenBank file — where the LOCUS line turns spaces into underscores — opening the **PCR / gel simulator** would seed saved amplicon names with that underscored form (`MY_PLASMID PCR 500 bp` instead of `MY PLASMID PCR 500 bp`). Re-picking a plasmid as a **primer-design template** had the same issue in the default primer names. Both now use the plasmid's clean display name, like the rest of the app.
+
+### Hardening
+
+- **Codon optimizer: an extra guard against a malformed codon table.** The optimizer now always reads each codon's amino acid from the standard genetic code instead of trusting a label carried inside a usage table — so a hand-edited or corrupt table can never make it silently emit a codon for the wrong amino acid. Tables loaded the normal way were already safe; this closes the gap for unusual or hand-built inputs.
+- **Clearer save-failure message in the entry-vector editor.** Binding or clearing an entry vector when the save can't be written (read-only disk, etc.) now shows a friendly "save failed" message instead of an abrupt error dialog — matching how every other save surface already behaves. A couple of internal save paths were also tightened to catch the full range of save refusals.
+- **The translation-strength tool caps very long inputs**, in line with the other RNA-folding tools, so an extreme sequence can't run memory up.
+
+### Docs
+
+- **Honest Windows status.** The platform-support table now marks native Windows as **"unverified on hardware"**: the UTF-8 console fix that should make the braille map render is implemented and exercised in CI via mocks, but hasn't yet been confirmed on a real Windows machine.
+
+---
+
 ## [1.0.83] — 2026-06-14
 
 ### New features

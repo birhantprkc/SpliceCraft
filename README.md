@@ -49,7 +49,10 @@ compiles at install, so install a C toolchain first:
 
 On **Windows**, run SpliceCraft in **Windows Terminal** (the Windows 11
 default) for the braille map — it auto-configures the console for UTF-8 +
-ANSI at startup, so the map renders instead of garbling. If braille shows as
+ANSI at startup, so the map *should* render instead of garbling. (This
+native-Windows path is implemented and CI-tested via mocks, but not yet
+confirmed on real Windows hardware — see [`docs/PLATFORMS.md`](docs/PLATFORMS.md).)
+If braille shows as
 boxes (a font without those glyphs), toggle **'ASCII plasmid map'** in
 Settings → Display. See [`docs/PLATFORMS.md`](docs/PLATFORMS.md) for the full
 terminal matrix.

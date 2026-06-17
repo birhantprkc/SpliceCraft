@@ -1243,6 +1243,15 @@ def _rbs_spacing_penalty(d):
     return 0.05 * (d - _RBS_OPT_SPACING) ** 2
 
 
+_RBS_STRENGTH_MAX_LEN = 100000          # mRNA length cap. The fold window is
+#                                          bounded (≤2·_RBS_WINDOW) so compute is
+#                                          ~constant in length, but cap the O(n)
+#                                          normalize/scan so a pathological input
+#                                          can't balloon memory. Matches the cap
+#                                          discipline of _rna_fold / _rna_cofold /
+#                                          _rbs_design.
+
+
 def _rbs_strength(mrna, start_pos):
     """Relative E. coli translation-initiation strength of the ribosome
     binding site preceding the start codon at `start_pos` (0-based) in
@@ -1263,6 +1272,8 @@ def _rbs_strength(mrna, start_pos):
     bad = set(s) - {'A', 'C', 'G', 'U'}
     if bad:
         raise ValueError(f"mRNA needs unambiguous A/C/G/U; got {sorted(bad)}")
+    if len(s) > _RBS_STRENGTH_MAX_LEN:
+        raise ValueError(f"mRNA too long ({len(s)} > {_RBS_STRENGTH_MAX_LEN} nt cap)")
     if (not isinstance(start_pos, int) or isinstance(start_pos, bool)
             or not (0 <= start_pos <= len(s) - 3)):
         raise ValueError(f"start_pos {start_pos!r} out of range for length {len(s)}")

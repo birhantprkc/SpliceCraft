@@ -216,6 +216,23 @@ class TestOptimize:
         assert counts["CTG"] >= 40
         assert counts["CTG"] == max(counts.values())
 
+    def test_optimize_ignores_mislabeled_table_aa(self):
+        """Codon-integrity defense-in-depth: `_codon_build_aa_map` derives
+        each codon's amino acid from the standard genetic code, NOT the label
+        stored in the table — so a table that mislabels a codon can't make
+        `_codon_optimize` emit a wrong-residue codon (a silent wrong-protein
+        round-trip). Unreachable via the real loaders (they already sanitize
+        labels); this guards hand-built / in-memory tables."""
+        import copy
+        bad = copy.deepcopy(sc._CODON_BUILTIN_K12)
+        bad["TTT"] = ("L", 9999)          # TTT is Phe; mislabel it Leu, dominant
+        aa_codons, _ = sc._codon_build_aa_map(bad)
+        assert "TTT" in [c for c, _f in aa_codons.get("F", [])]
+        assert "TTT" not in [c for c, _f in aa_codons.get("L", [])]
+        aa = "MFLFLF"
+        dna = sc._codon_optimize(aa, bad)
+        assert sc._mut_translate(dna) == aa
+
 
 # ── Restriction-site fixer ────────────────────────────────────────────────────
 

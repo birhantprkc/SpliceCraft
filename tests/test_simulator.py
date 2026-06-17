@@ -1627,3 +1627,33 @@ class TestDemoPlasmid:
             lib = sc._load_library()
             names = {e.get("name", "") for e in lib}
             assert sc._DEMO_PLASMID_NAME not in names
+
+
+class TestSimulatorInv98Naming:
+    """[INV-98] The PCR/gel simulator must seed amplicon names from the clean
+    display name, never the underscored GenBank LOCUS — otherwise accepting a
+    default amplicon name plants underscores in the saved library row."""
+
+    _TERM = (180, 50)
+
+    async def test_simulator_uses_display_name_not_locus(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        app = sc.PlasmidApp()
+        async with app.run_test(size=self._TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            rec = SeqRecord(Seq("ATGC" * 30), id="MY_PLASMID", name="MY_PLASMID")
+            rec.annotations["topology"] = "circular"
+            rec._tui_display_name = "MY PLASMID"      # spaces — the real name
+            app._current_record = rec
+            app.action_open_simulator()
+            await pilot.pause()
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, sc.SimulatorScreen)
+            assert screen._plasmid_name == "MY PLASMID"
+            assert "_" not in screen._plasmid_name
+            # The auto amplicon name inherits the clean base (no underscore).
+            assert "_" not in screen._default_amplicon_name(
+                {"length": 500, "start": 0, "end": 500})

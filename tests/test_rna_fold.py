@@ -210,6 +210,12 @@ class TestRbsStrength:
             with pytest.raises(ValueError):
                 bio._rbs_strength(seq, st)
 
+    def test_overlength_mrna_raises(self):
+        # Caps the O(n) normalize/scan (the fold window itself is bounded),
+        # mirroring the _rna_fold / _rna_cofold / _rbs_design length caps.
+        with pytest.raises(ValueError):
+            bio._rbs_strength("A" * (bio._RBS_STRENGTH_MAX_LEN + 1), 3)
+
 
 class TestRbsDesign:
     """Reverse RBS design (`_rbs_design`) — search SD/spacer space for a

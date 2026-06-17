@@ -476,3 +476,22 @@ class TestNativeOperonLift:
                 "loaded clone shows an underscored display name"
             assert summary["pcr_name"] == "PCR-luxop"
             assert "_" not in summary["plasmid_name"]
+
+
+class TestSynthesisPaneIds:
+    async def test_body_split_ids_are_distinct(self):
+        """Regression: the DNA and Protein panes shared id='syn-body-split'
+        (a #fsm-class duplicate-id collision on two co-mounted widgets).
+        They're now 'syn-dna-body-split' / 'syn-protein-body-split'."""
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause()
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, sc.SynthesisScreen)
+            assert len(screen.query("#syn-dna-body-split")) == 1
+            assert len(screen.query("#syn-protein-body-split")) == 1
+            assert len(screen.query("#syn-body-split")) == 0
