@@ -22,6 +22,7 @@ so a new sibling cannot silently appear without an explicit layer decision.
 from __future__ import annotations
 
 import ast
+import tomllib
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -156,3 +157,23 @@ def test_no_import_cycles_among_siblings():
 
     for m in list(graph):
         visit(m)
+
+
+def test_all_siblings_are_packaged():
+    """Every splicecraft_*.py sibling the hub re-imports MUST appear in
+    pyproject.toml's wheel `only-include` AND sdist `include`, or the released
+    package breaks: `import splicecraft` fails at the re-import step for end
+    users (it works in the source tree, so the rest of the suite wouldn't catch
+    it). Guards the broken-wheel bug the flat-sibling refactor could introduce."""
+    pyproject = tomllib.loads((_REPO / "pyproject.toml").read_text(encoding="utf-8"))
+    siblings = {p.name for p in _REPO.glob("splicecraft_*.py")}
+    targets = pyproject["tool"]["hatch"]["build"]["targets"]
+    wheel = set(targets["wheel"]["only-include"])
+    sdist = set(targets["sdist"]["include"])
+    assert not (siblings - wheel), (
+        "siblings missing from pyproject wheel only-include (would ship a broken "
+        f"wheel): {sorted(siblings - wheel)}"
+    )
+    assert not (siblings - sdist), (
+        f"siblings missing from pyproject sdist include: {sorted(siblings - sdist)}"
+    )

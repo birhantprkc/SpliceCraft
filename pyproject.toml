@@ -182,6 +182,14 @@ only-include = [
     # PlasmidApp._seed_demo_data; must ship in the wheel or the demo seed
     # silently falls back to an empty library.
     "splicecraft_demo_plasmids.py",
+    # Modularization siblings (flat-sibling refactor) — the hub re-imports each,
+    # so every one MUST ship in the wheel or `import splicecraft` fails at the
+    # re-import step. tests/test_import_layers.py guards this list stays complete.
+    "splicecraft_errors.py",
+    "splicecraft_state.py",
+    "splicecraft_logging.py",
+    "splicecraft_render.py",
+    "splicecraft_history.py",
     "CHANGELOG.md",
 ]
 
@@ -191,6 +199,11 @@ include = [
     "splicecraft_biology.py",
     "splicecraft_cli.py",
     "splicecraft_demo_plasmids.py",
+    "splicecraft_errors.py",
+    "splicecraft_state.py",
+    "splicecraft_logging.py",
+    "splicecraft_render.py",
+    "splicecraft_history.py",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
