@@ -118,13 +118,13 @@ class TestTerminalCapabilities:
         The warning still points at the UTF-8 locale fix. (Pre-1.0.3
         this raised a hard blocker; the new contract is graceful
         degradation so SpliceCraft runs on any ANSI terminal.)"""
-        monkeypatch.setattr(sc, "_ASCII_MODE", False)
+        monkeypatch.setattr(sc._state, "_ASCII_MODE", False)
         class _FakeStdout:
             encoding = "latin-1"   # and no `reconfigure` → unfixable
         monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
         blocking, warning = sc._check_terminal_capabilities()
         assert blocking == [], "non-UTF-8 must no longer block launch"
-        assert sc._ASCII_MODE is True, "should fall back to the ASCII map"
+        assert sc._state._ASCII_MODE is True, "should fall back to the ASCII map"
         blob = " ".join(warning).lower()
         assert "ascii" in blob
         assert "utf-8" in blob or "utf8" in blob
@@ -247,36 +247,36 @@ class TestSelectRenderTier:
     monkeypatch so it can't leak into other suites."""
 
     def test_utf8_terminal_uses_braille(self, monkeypatch):
-        monkeypatch.setattr(sc, "_ASCII_MODE", True)   # ensure it flips back
+        monkeypatch.setattr(sc._state, "_ASCII_MODE", True)   # ensure it flips back
         monkeypatch.delenv("SPLICECRAFT_ASCII", raising=False)
         class _FakeStdout:
             encoding = "utf-8"
         monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
         ascii_mode, warnings = sc._select_render_tier()
         assert ascii_mode is False
-        assert sc._ASCII_MODE is False
+        assert sc._state._ASCII_MODE is False
         assert warnings == []
 
     def test_unfixable_nonutf8_selects_ascii(self, monkeypatch):
-        monkeypatch.setattr(sc, "_ASCII_MODE", False)
+        monkeypatch.setattr(sc._state, "_ASCII_MODE", False)
         monkeypatch.delenv("SPLICECRAFT_ASCII", raising=False)
         class _FakeStdout:
             encoding = "latin-1"   # no reconfigure → unfixable
         monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
         ascii_mode, warnings = sc._select_render_tier()
         assert ascii_mode is True
-        assert sc._ASCII_MODE is True
+        assert sc._state._ASCII_MODE is True
         assert warnings and "ascii" in " ".join(warnings).lower()
 
     def test_env_force_ascii_overrides_capable_utf8(self, monkeypatch):
-        monkeypatch.setattr(sc, "_ASCII_MODE", False)
+        monkeypatch.setattr(sc._state, "_ASCII_MODE", False)
         monkeypatch.setenv("SPLICECRAFT_ASCII", "1")
         class _FakeStdout:
             encoding = "utf-8"   # capable, but forced to ASCII anyway
         monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
         ascii_mode, warnings = sc._select_render_tier()
         assert ascii_mode is True
-        assert sc._ASCII_MODE is True
+        assert sc._state._ASCII_MODE is True
         assert warnings and "splicecraft_ascii" in " ".join(warnings).lower()
 
     def test_env_force_accepts_truthy_variants(self, monkeypatch):
@@ -284,7 +284,7 @@ class TestSelectRenderTier:
             encoding = "utf-8"
         monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
         for val in ("1", "true", "TRUE", "Yes", "on", "  on  "):
-            monkeypatch.setattr(sc, "_ASCII_MODE", False)
+            monkeypatch.setattr(sc._state, "_ASCII_MODE", False)
             monkeypatch.setenv("SPLICECRAFT_ASCII", val)
             ascii_mode, _ = sc._select_render_tier()
             assert ascii_mode is True, f"{val!r} should force ASCII"
@@ -294,7 +294,7 @@ class TestSelectRenderTier:
             encoding = "utf-8"
         monkeypatch.setattr(sc.sys, "stdout", _FakeStdout())
         for val in ("0", "false", "no", "off", "", "garbage"):
-            monkeypatch.setattr(sc, "_ASCII_MODE", True)
+            monkeypatch.setattr(sc._state, "_ASCII_MODE", True)
             monkeypatch.setenv("SPLICECRAFT_ASCII", val)
             ascii_mode, _ = sc._select_render_tier()
             assert ascii_mode is False, f"{val!r} should NOT force ASCII"
@@ -332,7 +332,7 @@ class TestAsciiMapFallback:
 
     @staticmethod
     def _render(ascii_mode, monkeypatch):
-        monkeypatch.setattr(sc, "_ASCII_MODE", ascii_mode)
+        monkeypatch.setattr(sc._state, "_ASCII_MODE", ascii_mode)
         canvas = sc._Canvas(4, 1)         # all-blank text cells
         bc = sc._BrailleCanvas(4, 1)
         bc.set_pixel(0, 0)                # 1 dot in cell 0 (sparse)
@@ -361,7 +361,7 @@ class TestAsciiMapFallback:
         # The map overlays Unicode glyphs on the text canvas (block
         # fills, arrowheads, ⚠, crosshair). ASCII mode must fold those
         # to 7-bit equivalents too — not just the braille dot layer.
-        monkeypatch.setattr(sc, "_ASCII_MODE", True)
+        monkeypatch.setattr(sc._state, "_ASCII_MODE", True)
         canvas = sc._Canvas(5, 1)
         bc = sc._BrailleCanvas(5, 1)
         canvas.put(0, 0, "█", "")    # block fill   → '#'
@@ -375,7 +375,7 @@ class TestAsciiMapFallback:
     def test_ascii_mode_unmapped_glyph_becomes_question(self, monkeypatch):
         # A glyph not in the map (e.g. an accented label letter) folds
         # to '?' rather than leaking raw UTF-8.
-        monkeypatch.setattr(sc, "_ASCII_MODE", True)
+        monkeypatch.setattr(sc._state, "_ASCII_MODE", True)
         canvas = sc._Canvas(2, 1)
         bc = sc._BrailleCanvas(2, 1)
         canvas.put(0, 0, "β", "")    # not in _ASCII_GLYPH_MAP
@@ -385,7 +385,7 @@ class TestAsciiMapFallback:
 
     def test_braille_mode_preserves_overlay_glyphs(self, monkeypatch):
         # Default (UTF-8) mode leaves overlay glyphs untouched.
-        monkeypatch.setattr(sc, "_ASCII_MODE", False)
+        monkeypatch.setattr(sc._state, "_ASCII_MODE", False)
         canvas = sc._Canvas(3, 1)
         bc = sc._BrailleCanvas(3, 1)
         canvas.put(0, 0, "▶", "")
@@ -503,30 +503,30 @@ class TestSelectRenderTierForcedFlag:
     terminal (where `main()` honours the saved preference)."""
 
     def test_clean_utf8_not_forced(self, monkeypatch):
-        monkeypatch.setattr(sc, "_ASCII_MODE", True)
-        monkeypatch.setattr(sc, "_ASCII_FORCED", True)
+        monkeypatch.setattr(sc._state, "_ASCII_MODE", True)
+        monkeypatch.setattr(sc._state, "_ASCII_FORCED", True)
         monkeypatch.delenv("SPLICECRAFT_ASCII", raising=False)
         monkeypatch.setattr(sc, "_ensure_utf8_stdout", lambda: True)
         sc._select_render_tier()
-        assert sc._ASCII_MODE is False
-        assert sc._ASCII_FORCED is False
+        assert sc._state._ASCII_MODE is False
+        assert sc._state._ASCII_FORCED is False
 
     def test_env_force_sets_forced(self, monkeypatch):
-        monkeypatch.setattr(sc, "_ASCII_MODE", False)
-        monkeypatch.setattr(sc, "_ASCII_FORCED", False)
+        monkeypatch.setattr(sc._state, "_ASCII_MODE", False)
+        monkeypatch.setattr(sc._state, "_ASCII_FORCED", False)
         monkeypatch.setenv("SPLICECRAFT_ASCII", "1")
         sc._select_render_tier()
-        assert sc._ASCII_MODE is True
-        assert sc._ASCII_FORCED is True
+        assert sc._state._ASCII_MODE is True
+        assert sc._state._ASCII_FORCED is True
 
     def test_unfixable_encoding_sets_forced(self, monkeypatch):
-        monkeypatch.setattr(sc, "_ASCII_MODE", False)
-        monkeypatch.setattr(sc, "_ASCII_FORCED", False)
+        monkeypatch.setattr(sc._state, "_ASCII_MODE", False)
+        monkeypatch.setattr(sc._state, "_ASCII_FORCED", False)
         monkeypatch.delenv("SPLICECRAFT_ASCII", raising=False)
         monkeypatch.setattr(sc, "_ensure_utf8_stdout", lambda: False)
         sc._select_render_tier()
-        assert sc._ASCII_MODE is True
-        assert sc._ASCII_FORCED is True
+        assert sc._state._ASCII_MODE is True
+        assert sc._state._ASCII_FORCED is True
 
 
 class TestWindowsConsoleUtf8:
@@ -594,11 +594,11 @@ class TestAsciiMapToggle:
     font draws braille as boxes, so the fix needs no env var or restart."""
 
     def test_set_ascii_mode_flips_global(self, monkeypatch):
-        monkeypatch.setattr(sc, "_ASCII_MODE", False)
+        monkeypatch.setattr(sc._state, "_ASCII_MODE", False)
         sc._set_ascii_mode(True)
-        assert sc._ASCII_MODE is True
+        assert sc._state._ASCII_MODE is True
         sc._set_ascii_mode(False)
-        assert sc._ASCII_MODE is False
+        assert sc._state._ASCII_MODE is False
 
     def test_ascii_mode_in_braille_draw_cache_key_source(self):
         # The live toggle relies on `_ASCII_MODE` being part of the PlasmidMap
