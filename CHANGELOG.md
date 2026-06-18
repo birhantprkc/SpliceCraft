@@ -14,6 +14,12 @@
 
 ---
 
+## [unreleased]
+
+### Under the hood
+
+- **Started modularizing the codebase.** Several focused layers — terminal rendering, logging, the `.dna`-history model, and small UI widgets — now live in their own separately-loadable modules that the main program imports, rather than all in one giant file. This is a maintainability and AI-assistability improvement only: **nothing about how SpliceCraft works changes.** Every feature, keyboard shortcut, saved-file format, and the agent API are byte-for-byte identical — locked down by a public-surface snapshot test so the move can't quietly alter behavior.
+
 ## [1.0.84] — 2026-06-17
 
 ### Bug fixes

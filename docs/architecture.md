@@ -2,16 +2,34 @@
 
 How SpliceCraft is organized, why, and how to navigate it.
 
-## The single-file rule
+## Hub + layered siblings
 
-SpliceCraft is a single-file Python app (`splicecraft.py`,
-~61,000 lines) on Textual + Biopython, with a stdlib-only sidecar
-`splicecraft_cli.py` for agent-API clients. The single-file layout is
-**intentional** — no import puzzles, everything is greppable from one
-place, one totally-ordered source of truth for behaviour.
+SpliceCraft began as a single-file app and is now a **hub + layered-siblings**
+layout on Textual + Biopython. `splicecraft.py` is the ~130k-line **hub**
+(`PlasmidApp`, the persistence/data-safety core, CLI, agent-API, screens, most
+modals — the deeply-coupled application core, deliberately kept together;
+extracting it would cascade into the data-safety core). The cleanly-separable
+layers live in flat `splicecraft_*.py` siblings the hub imports and re-exports:
+`splicecraft_biology`, `splicecraft_state`, `splicecraft_logging`,
+`splicecraft_render`, `splicecraft_history`, `splicecraft_widgets`,
+`splicecraft_errors` (plus the stdlib-only `splicecraft_cli` sidecar and
+`splicecraft_demo_plasmids` seed).
 
-`grep -n "^class \|^def " splicecraft.py` gives an authoritative live
-map.
+The hub stays greppable as one totally-ordered file; the siblings are bounded,
+independently-loadable units (the goal: a context-limited model can hold one
+whole). Siblings are layered L0→L3 with **no upward imports** and re-exported so
+`import splicecraft as sc; sc.<name>` resolves unchanged. Mutable-state siblings
+are accessed by attribute (`_state.X`) so hub, siblings, and tests share one
+copy — a by-value `from splicecraft_state import X` binds a stale copy and is
+forbidden.
+
+Guards: `tests/test_import_layers.py` (no cycles / upward imports; every sibling
+packaged in `pyproject.toml`), `tests/public_surface_baseline.json` (surface
+byte-for-byte), `tests/test_state_module.py` + the per-sibling behaviour tests.
+A new sibling MUST be added to `pyproject.toml`'s wheel + sdist lists or the
+released wheel breaks at the re-import step.
+
+`grep -rn "^class \|^def " splicecraft*.py` gives an authoritative live map.
 
 Test files are 1:1 named after the subsystem they cover.
 

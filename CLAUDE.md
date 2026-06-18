@@ -45,7 +45,17 @@ The project's Claude memory lives in `.claude/memory/`, which is its **own priva
 
 ---
 
-Bioinformatician + Claude. **Near-single-file architecture** — `splicecraft.py` (~105k lines) + extracted biology module `splicecraft_biology.py` + stdlib-only sidecar `splicecraft_cli.py`. Single-file constraint is intentional (greppable); biology extraction is the first deliberate exception (pure functions/constants, no `PlasmidApp` coupling). See `CONTRIBUTING.md` three-test rule.
+Bioinformatician + Claude. **Hub + layered-siblings architecture** — `splicecraft.py` is still the ~130k-line **hub** (`PlasmidApp`, the persistence/data-safety core, CLI, agent-API, screens, most modals — deeply coupled, deliberately kept together; extracting them would cascade into the data-safety core). It imports and re-exports flat `splicecraft_*.py` siblings holding the cleanly-separable layers:
+
+- `splicecraft_biology` (pure biology — `_rc`, `_iupac_pattern`, `_feat_len`, …)
+- `splicecraft_state` (shared mutable process state — capability flags etc.; **access `_state.X`, NEVER `from splicecraft_state import X`** — a by-value import binds a stale copy that desyncs from runtime writes + monkeypatches)
+- `splicecraft_logging` (`_log` / `_log_event` / filters; `_action_log`/`_timed` stay hub-side so the `_log_event` monkeypatch path survives)
+- `splicecraft_render` (`_Canvas` / `_BrailleCanvas` + glyph LUTs)
+- `splicecraft_history` (`.dna` `_CommercialSaaSHistoryNode` model + provenance date helpers)
+- `splicecraft_widgets` (pure Textual primitives), `splicecraft_errors`
+- stdlib-only `splicecraft_cli` sidecar + `splicecraft_demo_plasmids` seed data
+
+Siblings are layered L0→L3 (no upward imports) and re-exported so `import splicecraft as sc; sc.<name>` resolves unchanged. **Guards:** `tests/test_import_layers.py` (no cycles/upward imports + every sibling packaged in `pyproject.toml` wheel/sdist), `tests/public_surface_baseline.json` (surface byte-for-byte), `tests/test_state_module.py` (migrated-state single-source-of-truth, no stale hub shadow). A new sibling MUST be added to the pyproject lists or the wheel ships broken. See `CONTRIBUTING.md` three-test rule + `docs/architecture.md`.
 
 ## What is SpliceCraft?
 
