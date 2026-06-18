@@ -190,6 +190,7 @@ only-include = [
     "splicecraft_logging.py",
     "splicecraft_render.py",
     "splicecraft_history.py",
+    "splicecraft_widgets.py",
     "CHANGELOG.md",
 ]
 
@@ -204,6 +205,7 @@ include = [
     "splicecraft_logging.py",
     "splicecraft_render.py",
     "splicecraft_history.py",
+    "splicecraft_widgets.py",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
