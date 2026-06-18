@@ -1,0 +1,156 @@
+"""Layered-import guardrail for the flat-sibling refactor.
+
+The monolith is being carved into top-level ``splicecraft_*.py`` sibling
+modules (continuing the ``splicecraft_biology.py`` / ``splicecraft_cli.py``
+precedent). ``splicecraft.py`` stays the hub: it imports the siblings and
+re-exports their public surface. The one architectural invariant is:
+
+    A sibling may import only same-or-lower layers. Never a higher layer,
+    and NEVER the ``splicecraft`` hub itself (that is a guaranteed cycle).
+
+This is the static guard. It catches three failure modes before they become
+runtime ``ImportError``s (often surfacing as confusing "partially initialized
+module" errors):
+
+  1. a sibling importing the ``splicecraft`` hub (cycle: hub imports sibling),
+  2. an upward import (e.g. a widget importing a screen),
+  3. any import cycle among siblings.
+
+It also fails if a ``splicecraft_*`` module is not classified into a layer --
+so a new sibling cannot silently appear without an explicit layer decision.
+"""
+from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+_REPO = Path(__file__).resolve().parent.parent
+
+# Layer assignment by module-name prefix, lowest first. Longest matching prefix
+# wins. Add a rule here when you introduce a new sibling family -- an
+# unclassified ``splicecraft_*`` module is a hard failure (see test below).
+_LAYER_RULES = [
+    ("splicecraft_errors", 0),
+    ("splicecraft_logging", 0),
+    ("splicecraft_constants", 0),
+    ("splicecraft_paths", 0),
+    ("splicecraft_persistence", 0),
+    ("splicecraft_cli_parser", 0),
+    ("splicecraft_biology", 0),
+    ("splicecraft_cli", 0),        # stdlib-only sidecar (standalone client)
+    ("splicecraft_demo_plasmids", 0),  # pure seed-data module (demo mode)
+    ("splicecraft_render", 1),
+    ("splicecraft_history", 2),
+    ("splicecraft_widgets", 3),
+    ("splicecraft_modals", 4),
+    ("splicecraft_cloning", 5),
+    ("splicecraft_screens", 6),
+    ("splicecraft_agent", 7),
+    ("splicecraft_live_ref", 8),
+    ("splicecraft_app", 8),
+]
+
+
+def _sibling_modules() -> "list[str]":
+    """Every top-level ``splicecraft_*.py`` module name in the repo root."""
+    return sorted(
+        p.stem
+        for p in _REPO.glob("splicecraft_*.py")
+        if not p.stem.endswith("_baseline")
+    )
+
+
+def _layer_of(module: str) -> "int | None":
+    best = None
+    for prefix, layer in _LAYER_RULES:
+        if (module == prefix or module.startswith(prefix)) and (
+            best is None or len(prefix) > best[0]
+        ):
+            best = (len(prefix), layer)
+    return None if best is None else best[1]
+
+
+def _sibling_imports(module: str) -> "set[str]":
+    """All ``splicecraft*`` modules imported by ``module`` (top-level or nested,
+    including the bare ``splicecraft`` hub)."""
+    src = (_REPO / f"{module}.py").read_text(encoding="utf-8")
+    tree = ast.parse(src, filename=f"{module}.py")
+    found: "set[str]" = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root == "splicecraft" or root.startswith("splicecraft_"):
+                    found.add(root)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:  # relative import -- siblings must use absolute
+                raise AssertionError(
+                    f"{module}.py uses a relative import (level={node.level}); "
+                    "top-level siblings must import absolutely."
+                )
+            if node.module:
+                root = node.module.split(".")[0]
+                if root == "splicecraft" or root.startswith("splicecraft_"):
+                    found.add(root)
+    return found
+
+
+def test_every_sibling_is_classified():
+    unclassified = [m for m in _sibling_modules() if _layer_of(m) is None]
+    assert not unclassified, (
+        f"Unclassified splicecraft_* sibling(s): {unclassified}. Add a layer "
+        "rule in tests/test_import_layers.py::_LAYER_RULES -- every sibling "
+        "needs an explicit layer."
+    )
+
+
+def test_no_sibling_imports_the_hub():
+    """Siblings must never import the ``splicecraft`` hub: the hub imports them,
+    so this is always a cycle."""
+    offenders = {m: i for m in _sibling_modules() if "splicecraft" in (i := _sibling_imports(m))}
+    assert not offenders, (
+        "Sibling(s) import the `splicecraft` hub, creating an import cycle: "
+        f"{sorted(offenders)}. Move the needed symbol down into a lower-layer "
+        "sibling, or pass it in -- never import the hub from a sibling."
+    )
+
+
+def test_no_upward_imports():
+    violations = []
+    for m in _sibling_modules():
+        lm = _layer_of(m)
+        for dep in _sibling_imports(m):
+            if dep == "splicecraft":
+                continue  # reported by test_no_sibling_imports_the_hub
+            ld = _layer_of(dep)
+            if ld is not None and ld > lm:
+                violations.append(f"{m} (L{lm}) imports {dep} (L{ld})")
+    assert not violations, (
+        "Upward import(s) violate the layer rule (a module may import only "
+        f"same-or-lower layers):\n  " + "\n  ".join(violations)
+    )
+
+
+def test_no_import_cycles_among_siblings():
+    graph = {m: {d for d in _sibling_imports(m) if d != "splicecraft"}
+             for m in _sibling_modules()}
+    visiting, done = set(), set()
+    stack: "list[str]" = []
+
+    def visit(node: str):
+        if node in done:
+            return
+        if node in visiting:
+            cycle = stack[stack.index(node):] + [node]
+            raise AssertionError("Import cycle among siblings: " + " -> ".join(cycle))
+        visiting.add(node)
+        stack.append(node)
+        for nxt in graph.get(node, ()):  # ignore deps that aren't local siblings
+            if nxt in graph:
+                visit(nxt)
+        stack.pop()
+        visiting.discard(node)
+        done.add(node)
+
+    for m in list(graph):
+        visit(m)
