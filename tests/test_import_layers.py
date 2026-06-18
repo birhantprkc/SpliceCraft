@@ -40,6 +40,7 @@ _LAYER_RULES = [
     ("splicecraft_cli", 0),        # stdlib-only sidecar (standalone client)
     ("splicecraft_demo_plasmids", 0),  # pure seed-data module (demo mode)
     ("splicecraft_state", 0),          # shared mutable process state (flags/caches)
+    ("splicecraft_logging", 0),        # logging primitives (_log, _log_event, filters)
     ("splicecraft_render", 1),
     ("splicecraft_history", 2),
     ("splicecraft_widgets", 3),
