@@ -23,6 +23,8 @@ import splicecraft_state
 _MIGRATED = [
     "_ASCII_MODE",
     "_ASCII_FORCED",
+    "_WIN_UTF8_CONSOLE",
+    "_ESCAPE_ASPECT",
 ]
 
 

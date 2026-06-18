@@ -545,10 +545,10 @@ class TestWindowsConsoleUtf8:
         # so the body raises AttributeError internally — which MUST be swallowed
         # (a ctypes quirk can never block launch) and leave the flag False.
         monkeypatch.setattr(sc.sys, "platform", "win32")
-        monkeypatch.setattr(sc, "_WIN_UTF8_CONSOLE", False)
+        monkeypatch.setattr(sc._state, "_WIN_UTF8_CONSOLE", False)
         notes = sc._windows_enable_utf8_console()   # must not raise
         assert isinstance(notes, list)
-        assert sc._WIN_UTF8_CONSOLE is False
+        assert sc._state._WIN_UTF8_CONSOLE is False
 
     def test_sets_codepage_and_vt_on_windows(self, monkeypatch):
         import ctypes
@@ -579,12 +579,12 @@ class TestWindowsConsoleUtf8:
         monkeypatch.setattr(sc.sys, "platform", "win32")
         monkeypatch.setattr(ctypes, "windll", _WinDLL(), raising=False)
         monkeypatch.setattr("atexit.register", lambda *_a, **_k: None)
-        monkeypatch.setattr(sc, "_WIN_UTF8_CONSOLE", False)
+        monkeypatch.setattr(sc._state, "_WIN_UTF8_CONSOLE", False)
         notes = sc._windows_enable_utf8_console()
         assert calls["out_cp"] == 65001, "must set console OUTPUT code page to UTF-8"
         assert calls["in_cp"] == 65001
         assert calls["vt"] is True, "must enable VIRTUAL_TERMINAL_PROCESSING"
-        assert sc._WIN_UTF8_CONSOLE is True
+        assert sc._state._WIN_UTF8_CONSOLE is True
         assert any("65001" in n for n in notes)
 
 

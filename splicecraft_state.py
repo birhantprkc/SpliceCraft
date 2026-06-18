@@ -42,3 +42,15 @@ _ASCII_MODE: bool = False
 # can't render (mojibake), but it may when the only problem was a font missing
 # the glyphs (UTF-8 fine, dots show as boxes).
 _ASCII_FORCED: bool = False
+
+# ── Terminal capability ──────────────────────────────────────────────────────
+# `_WIN_UTF8_CONSOLE`: set True when `_windows_enable_utf8_console()` switched the
+# Windows console output code page to UTF-8 (chcp 65001). Surfaced in the
+# `startup.terminal_capabilities` event for diagnostics.
+_WIN_UTF8_CONSOLE: bool = False
+
+# `_ESCAPE_ASPECT`: the terminal's measured character-cell pixel ratio, set once
+# at startup by main() (before Textual owns stdin) from a CSI 16t/14t self-report.
+# Preferred over TIOCGWINSZ because many terminals answer the query yet leave the
+# ioctl pixel fields at zero. None until measured (caller keeps the 2:1 default).
+_ESCAPE_ASPECT: "float | None" = None

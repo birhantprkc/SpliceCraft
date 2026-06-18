@@ -30,7 +30,7 @@ def _no_aspect_env(monkeypatch):
     # escape-query result reset; the override / escape tests set them explicitly
     # via monkeypatch AFTER this fixture clears them.
     monkeypatch.delenv("SPLICECRAFT_MAP_ASPECT", raising=False)
-    monkeypatch.setattr(sc, "_ESCAPE_ASPECT", None)
+    monkeypatch.setattr(sc._state, "_ESCAPE_ASPECT", None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -209,22 +209,22 @@ class TestEscapeQueryParse:
 
 class TestMeasuredCellAspectPrecedence:
     def test_prefers_escape_over_ioctl(self, monkeypatch):
-        monkeypatch.setattr(sc, "_ESCAPE_ASPECT", 2.3)
+        monkeypatch.setattr(sc._state, "_ESCAPE_ASPECT", 2.3)
         monkeypatch.setattr(sc, "_detect_char_aspect_raw", lambda: 1.9)
         assert sc._measured_cell_aspect() == 2.3
 
     def test_falls_back_to_ioctl_when_no_escape(self, monkeypatch):
-        monkeypatch.setattr(sc, "_ESCAPE_ASPECT", None)
+        monkeypatch.setattr(sc._state, "_ESCAPE_ASPECT", None)
         monkeypatch.setattr(sc, "_detect_char_aspect_raw", lambda: 1.9)
         assert sc._measured_cell_aspect() == 1.9
 
     def test_none_when_neither_available(self, monkeypatch):
-        monkeypatch.setattr(sc, "_ESCAPE_ASPECT", None)
+        monkeypatch.setattr(sc._state, "_ESCAPE_ASPECT", None)
         monkeypatch.setattr(sc, "_detect_char_aspect_raw", lambda: None)
         assert sc._measured_cell_aspect() is None
 
     def test_resize_uses_escape_measurement(self, monkeypatch):
-        monkeypatch.setattr(sc, "_ESCAPE_ASPECT", 2.3)
+        monkeypatch.setattr(sc._state, "_ESCAPE_ASPECT", 2.3)
         pm = sc.PlasmidMap()
         pm._aspect = 2.0
         pm.on_resize(None)
