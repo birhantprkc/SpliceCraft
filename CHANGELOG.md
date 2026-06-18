@@ -14,7 +14,7 @@
 
 ---
 
-## [unreleased]
+## [1.0.85] — 2026-06-18
 
 ### Under the hood
 
