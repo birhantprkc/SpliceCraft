@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 
+from pathlib import Path
 from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
@@ -31,11 +32,13 @@ from textual.coordinate import Coordinate as _Coordinate
 from textual.css.query import NoMatches
 from textual.events import Click
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, DataTable, Input, Label, ListItem, ListView, RadioButton, RadioSet, Select, Static, TextArea
+from textual.widgets import Button, DataTable, DirectoryTree, Input, Label, ListItem, ListView, RadioButton, RadioSet, Select, Static, TextArea
 
-from splicecraft_dataaccess import _load_primer_collections
+from splicecraft_dataaccess import _iter_library_readonly, _load_library, _load_primer_collections
 from splicecraft_logging import _log, _log_event
-from splicecraft_widgets import _InstantPressButton
+from splicecraft_util import _cursor_row_key, _natural_sort_key, _sanitize_label
+from splicecraft_widgets import _ExtensionAwareDirectoryTree, _FastaAwareDirectoryTree, _InstantPressButton, _PICKER_PLASMID_STYLE, _ZipAwareDirectoryTree
+
 
 
 # ── Unsaved-changes quit dialog ────────────────────────────────────────────────
@@ -4361,3 +4364,941 @@ class LibraryDeleteConfirmModal(ModalScreen):
 
     def action_cancel(self) -> None:
         self._dismiss_once(False)
+
+
+class FastaFilePickerModal(_OneShotDismissScreen, ModalScreen):
+    """Modal file browser that returns the path to a selected FASTA file.
+
+    Dismisses with ``str`` (absolute path) on Open, or ``None`` on Cancel /
+    Escape. FASTA files are painted lime green in the tree; other files
+    are white so the user can scan a mixed directory quickly. The tree
+    starts in ``start_path`` when given (and readable), else ``$HOME``."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, start_path: "str | None" = None) -> None:
+        super().__init__()
+        start = Path(start_path).expanduser() if start_path else Path.home()
+        try:
+            if not start.is_dir():
+                start = Path.home()
+        except OSError:
+            start = Path.home()
+        self._start = str(start)
+        self._selected: "str | None" = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="fasta-box"):
+            yield Static(" Open FASTA File ", id="fasta-title")
+            yield Static(
+                f"[dim]{self._start}[/dim]", id="fasta-header", markup=True
+            )
+            yield _FastaAwareDirectoryTree(self._start, id="fasta-tree")
+            yield Static(
+                "[dim]FASTA files are highlighted in lime green. "
+                "Click a file, then Open.[/dim]",
+                id="fasta-hint", markup=True,
+            )
+            yield Static("", id="fasta-status", markup=True)
+            with Horizontal(id="fasta-btns"):
+                yield Button("Open", id="btn-fasta-open",
+                             variant="primary", disabled=True)
+                yield Button("Cancel", id="btn-fasta-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#fasta-tree", _FastaAwareDirectoryTree).focus()
+        except NoMatches:
+            pass
+
+    @on(DirectoryTree.FileSelected)
+    def _on_file_selected(self, event) -> None:
+        self._selected = str(event.path)
+        try:
+            self.query_one("#fasta-header", Static).update(
+                f"[dim]{self._selected}[/dim]"
+            )
+            self.query_one("#btn-fasta-open", Button).disabled = False
+            self.query_one("#fasta-status", Static).update("")
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-fasta-open")
+    def _open(self) -> None:
+        if self._selected:
+            self.dismiss(self._selected)
+            return
+        try:
+            self.query_one("#fasta-status", Static).update(
+                "[red]Pick a file first.[/red]"
+            )
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-fasta-cancel")
+    def _cancel_btn(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class GroupNamePromptModal(ModalScreen):
+    """Sweep #29: simple name prompt for "Save group as library
+    entry". Returns `{"name": <str>}` on Save, `None` on Cancel.
+
+    Sweep #30 (2026-05-26): generalized — accepts custom title,
+    prompt label, placeholder, and an `allow_empty` flag so the
+    same modal serves both the original library-entry-naming
+    use case AND the per-segment rename flow (where empty label
+    is a legitimate "clear the label" intent)."""
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter",  "submit", "Save"),
+    ]
+
+    DEFAULT_CSS = """
+    #gname-dlg {
+        width: 70; height: auto;
+        background: $surface; border: solid $primary;
+        padding: 1 2;
+    }
+    #gname-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; margin-bottom: 1;
+        text-align: center; text-style: bold;
+    }
+    #gname-dlg Label { color: $text-muted; margin-top: 1; }
+    #gname-input  { margin-top: 1; }
+    #gname-status { height: 1; margin-top: 1; color: $text-muted; }
+    #gname-btns   { height: 3; margin-top: 1;
+                    align: right middle; }
+    #gname-btns Button { margin-right: 1; min-width: 12; }
+    """
+
+    def __init__(
+        self,
+        default_name: str = "",
+        *,
+        title: str = " Save group as library entry ",
+        prompt: str = "Name for the new feature-library group entry:",
+        placeholder: str = "e.g. Esp3I → AATG adapter",
+        allow_empty: bool = False,
+    ) -> None:
+        super().__init__()
+        self._default     = str(default_name or "")
+        self._title       = str(title)
+        self._prompt      = str(prompt)
+        self._placeholder = str(placeholder)
+        self._allow_empty = bool(allow_empty)
+        self._dismissed: bool = False
+
+    def _dismiss_once(self, result) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(result)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="gname-dlg"):
+            yield Static(self._title, id="gname-title")
+            yield Label(self._prompt)
+            yield Input(value=self._default,
+                         placeholder=self._placeholder,
+                         id="gname-input")
+            yield Static("", id="gname-status", markup=True)
+            with Horizontal(id="gname-btns"):
+                yield Button("Save", id="btn-gname-save",
+                             variant="primary")
+                yield Button("Cancel", id="btn-gname-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            inp = self.query_one("#gname-input", Input)
+            inp.focus()
+            # Select-all so the user can immediately type to
+            # overwrite the prefilled default — matches the
+            # SplitPositionPromptModal UX.
+            try:
+                inp.action_select_all()
+            except (AttributeError, NoMatches):
+                pass
+        except NoMatches:
+            pass
+
+    def action_submit(self) -> None:
+        self._save(None)
+
+    @on(Button.Pressed, "#btn-gname-save")
+    def _save(self, _) -> None:
+        try:
+            raw = self.query_one("#gname-input", Input).value
+        except NoMatches:
+            return
+        # Sweep #29 hardening (2026-05-26): scrub control chars +
+        # cap length so a pasted name with ANSI escapes / newlines
+        # / null bytes can't corrupt the library JSON or downstream
+        # Rich Text rendering. Same `_sanitize_label` used elsewhere
+        # in the codebase for feature labels.
+        name = _sanitize_label(raw, max_len=200)
+        if not name and not self._allow_empty:
+            try:
+                self.query_one("#gname-status", Static).update(
+                    "[red]Name cannot be empty (after stripping "
+                    "control characters).[/red]"
+                )
+            except NoMatches:
+                pass
+            return
+        self._dismiss_once({"name": name})
+
+    @on(Button.Pressed, "#btn-gname-cancel")
+    def _cancel(self, _) -> None:
+        self._dismiss_once(None)
+
+    def action_cancel(self) -> None:
+        self._dismiss_once(None)
+
+
+class MigrateImportPickerModal(_OneShotDismissScreen, ModalScreen):
+    """Browse for a SpliceCraft data ``.zip`` to import. ``.zip`` files
+    are highlighted lime-green. Dismisses with the path or ``None``."""
+
+    _blocks_undo: bool = True
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    DEFAULT_CSS = """
+    #migimp-box { width: 96; max-width: 95%; height: auto; max-height: 92%;
+        background: $surface; border: solid $primary; padding: 1 2; }
+    #migimp-title { background: $primary-darken-2; color: $text;
+        padding: 0 1; margin-bottom: 1; text-align: center; }
+    #migimp-tree { height: 15; border: solid $primary-darken-2; }
+    #migimp-status { height: 1; margin-top: 1; }
+    #migimp-btns { height: 3; margin-top: 1; align: right middle; }
+    #migimp-btns Button { margin-left: 1; }
+    """
+
+    def __init__(self, start_path: "str | None" = None) -> None:
+        super().__init__()
+        start = Path(start_path).expanduser() if start_path else Path.home()
+        try:
+            if not start.is_dir():
+                start = Path.home()
+        except OSError:
+            start = Path.home()
+        self._start = str(start)
+        self._selected: "str | None" = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="migimp-box"):
+            yield Static(" Import a data file (.zip) ", id="migimp-title")
+            yield Static(f"[dim]{self._start}[/dim]", id="migimp-header",
+                         markup=True)
+            yield _ZipAwareDirectoryTree(self._start, id="migimp-tree")
+            yield Static(
+                "[dim].zip files are highlighted. Pick your exported data "
+                "file, then Import.[/dim]", id="migimp-hint", markup=True)
+            yield Static("", id="migimp-status", markup=True)
+            with Horizontal(id="migimp-btns"):
+                yield Button("Import", id="btn-migimp", variant="primary",
+                             disabled=True)
+                yield Button("Cancel", id="btn-migimp-cancel")
+
+    @on(DirectoryTree.FileSelected)
+    def _sel(self, event) -> None:
+        self._selected = str(event.path)
+        try:
+            self.query_one("#migimp-header", Static).update(
+                f"[dim]{self._selected}[/dim]")
+            self.query_one("#btn-migimp", Button).disabled = False
+            self.query_one("#migimp-status", Static).update("")
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-migimp")
+    def _go(self, _) -> None:
+        if self._selected:
+            self.dismiss(self._selected)
+            return
+        try:
+            self.query_one("#migimp-status", Static).update(
+                "[red]Pick a .zip first.[/red]")
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-migimp-cancel")
+    def _cxl(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class MultiAlignPickerModal(_OneShotDismissScreen, ModalScreen):
+    """Modal: pick multiple library plasmids to align against the
+    currently-loaded record. Each pick becomes one row on the linear-
+    map alignment overlay.
+
+    Layout: leading checkbox column + standard library columns. Space
+    toggles the cursor row's selection; Align runs all picks. Filters
+    the current plasmid out of the list (no self-self alignment).
+
+    Dismiss payload:
+      ``None``         — cancelled (Esc / Cancel)
+      ``list[str]``    — selected entry IDs (may be empty if user
+                          hit Align with nothing selected)
+    """
+
+    # Sweep #26: dispatches `_align_worker` on dismiss which mutates
+    # per-target library mirrors. Block app-level Ctrl+Z while the
+    # picker is open so the user can't accidentally roll back the
+    # canvas between picking + running.
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("space",  "toggle_selection",         "Toggle"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    #mam-dlg {
+        width: 96;
+        /* Was rigid `height: 36;`; switched to flex height + cap so
+           a short library list doesn't leave half a screen of dead
+           space below the table (2026-05-20 UX audit). */
+        height: 90%; max-height: 36; min-height: 18;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #mam-title {
+        text-align: center;
+        background: $primary-darken-2;
+        color: $text;
+        padding: 0 1;
+    }
+    #mam-help { color: $text-muted; padding: 0 1; margin-top: 1; }
+    #mam-table { height: 1fr; margin-top: 1; }
+    #mam-status { color: $text-muted; padding: 0 1; }
+    /* `margin-top` adds breathing room ABOVE the container so the
+       inner h=3 budget stays available for the buttons themselves.
+       The old `padding-top: 1` ate one of those three rows, leaving
+       only 2 for the h=3 button widget — its bottom border bled into
+       the dialog's padding-bottom and got clipped (user report
+       2026-05-23: "buttons cut off at the bottom"). */
+    #mam-btns { height: 3; align: right middle; margin-top: 1; }
+    """
+
+    _CHECK_ON  = "[bold green]✓[/]"
+    _CHECK_OFF = "[dim]·[/]"
+
+    # Hard cap so a user with a 500-entry library can't kick off a
+    # 500-target pairwise sweep in one click. The notify still
+    # surfaces a count.
+    _MAX_TARGETS = 20
+
+    def __init__(self, current_id: "str | None" = None):
+        super().__init__()
+        self._current_id = current_id
+        self._selected_ids: set[str] = set()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="mam-dlg"):
+            yield Static(" Align with library plasmids ", id="mam-title")
+            yield Static(
+                "Space toggles selection · Align runs pairwise "
+                "alignments against the current plasmid · Esc cancels",
+                id="mam-help", markup=False,
+            )
+            yield DataTable(id="mam-table", cursor_type="row",
+                            zebra_stripes=True)
+            yield Static("0 selected", id="mam-status")
+            with Horizontal(id="mam-btns"):
+                yield Button("Align", id="btn-mam-ok", variant="primary")
+                yield Button("Cancel", id="btn-mam-cancel")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#mam-table", DataTable)
+        t.add_columns("", "Name", "ID", "Size", "Features")
+        # Natural-sort by display name; current plasmid (if any)
+        # filtered out so the picker never offers self-self alignment.
+        entries = sorted(
+            (
+                e for e in _iter_library_readonly()
+                if e.get("id") and e.get("id") != self._current_id
+            ),
+            key=lambda e: _natural_sort_key(
+                e.get("name") or e.get("id") or ""
+            ),
+        )
+        for e in entries:
+            t.add_row(
+                Text.from_markup(self._CHECK_OFF),
+                Text(e.get("name", "?"), style="bold"),
+                e.get("id", "?"),
+                f"{e.get('size', 0):,} bp",
+                f"{e.get('n_feats', 0)}",
+                key=e.get("id"),
+            )
+        if entries:
+            t.move_cursor(row=0)
+            t.focus()
+        else:
+            try:
+                self.query_one("#mam-status", Static).update(
+                    "No other plasmids in the active collection."
+                )
+            except NoMatches:
+                pass
+
+    def action_toggle_selection(self) -> None:
+        """Flip the cursor row's selection state. Updates the column-0
+        marker and the running count line. Named distinctly from
+        Textual's base ``DOMNode.action_toggle(attribute_name)`` (which
+        expects an arg) so the override doesn't trip
+        ``reportIncompatibleMethodOverride`` — the binding above routes
+        to this method by name."""
+        t = self.query_one("#mam-table", DataTable)
+        key = _cursor_row_key(t)
+        if not key:
+            return
+        if key in self._selected_ids:
+            self._selected_ids.remove(key)
+            mark = self._CHECK_OFF
+        else:
+            if len(self._selected_ids) >= self._MAX_TARGETS:
+                self.app.notify(
+                    f"At most {self._MAX_TARGETS} targets per batch — "
+                    "deselect one first.",
+                    severity="warning", timeout=4,
+                )
+                return
+            self._selected_ids.add(key)
+            mark = self._CHECK_ON
+        # Update the marker cell at the cursor row.
+        try:
+            from textual.coordinate import Coordinate
+            row_idx = t.cursor_row
+            t.update_cell_at(
+                Coordinate(row_idx, 0), Text.from_markup(mark),
+            )
+        except Exception:
+            _log.exception("MultiAlignPickerModal: cell update failed")
+        # Refresh the running count.
+        try:
+            self.query_one("#mam-status", Static).update(
+                f"{len(self._selected_ids)} selected"
+            )
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-mam-ok")
+    def _ok(self, _):
+        # Empty-selection guard: closing with [] would silently no-op
+        # the action handler. Surface a notify and keep the modal open
+        # so the user can fix their pick.
+        if not self._selected_ids:
+            try:
+                self.app.notify(
+                    "Select at least one plasmid (space toggles the "
+                    "cursor row), then press Align.",
+                    severity="warning", timeout=4,
+                )
+            except Exception:
+                pass
+            return
+        # Stale-id filter: if a library mutation happened while the
+        # modal was open (agent endpoint deletion, external file edit,
+        # collection switch from a sibling pane), `_selected_ids` may
+        # carry entry ids that no longer resolve. Drop them silently
+        # rather than dismissing with ghost ids that downstream
+        # `_action_open_align_picker` would just `continue` past with
+        # a "not found" warning per target. Use the readonly-iter
+        # helper to skip the per-call deepcopy.
+        try:
+            live_ids = {
+                e.get("id") for e in _iter_library_readonly()
+                if isinstance(e, dict) and e.get("id")
+            }
+        except Exception:
+            _log.exception(
+                "MultiAlignPickerModal: live-id filter failed; "
+                "dismissing with the full selection",
+            )
+            live_ids = None
+        if live_ids is not None:
+            picked = [i for i in self._selected_ids if i in live_ids]
+            n_dropped = len(self._selected_ids) - len(picked)
+            if n_dropped:
+                try:
+                    self.app.notify(
+                        f"{n_dropped} selected target(s) were removed "
+                        "from the library while this picker was open — "
+                        "aligning the remaining {n}.".format(n=len(picked))
+                        if picked else
+                        f"All {n_dropped} selected target(s) were "
+                        "removed from the library while this picker "
+                        "was open — nothing to align.",
+                        severity="warning", timeout=5,
+                    )
+                except Exception:
+                    pass
+                if not picked:
+                    return
+            self.dismiss(picked)
+            return
+        self.dismiss(list(self._selected_ids))
+
+    @on(Button.Pressed, "#btn-mam-cancel")
+    def _cancel_btn(self, _):
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class PlasmidPickerModal(_OneShotDismissScreen, ModalScreen):
+    """Scrollable plasmid-picker modal. Shows all entries from the library.
+    Dismisses with the selected entry's id, or None on cancel.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel",     "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, current_id: "str | None" = None):
+        super().__init__()
+        self._current_id = current_id
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="pick-dlg"):
+            yield Static(" Select plasmid from library ", id="pick-title")
+            yield DataTable(id="pick-table", cursor_type="row",
+                            zebra_stripes=True)
+            with Horizontal(id="pick-btns"):
+                yield Button("Select",  id="btn-pick-ok",     variant="primary")
+                yield Button("Cancel",  id="btn-pick-cancel")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#pick-table", DataTable)
+        t.add_columns("Name", "ID", "Size", "Features")
+        cursor = 0
+        # Natural-sort by display name so `pBin2` lands before
+        # `pBin10` rather than the lexicographic disk order.
+        entries = sorted(
+            _load_library(),
+            key=lambda e: _natural_sort_key(
+                e.get("name") or e.get("id") or ""
+            ),
+        )
+        for i, e in enumerate(entries):
+            t.add_row(
+                Text(e.get("name", "?"), style="bold"),
+                e.get("id", "?"),
+                f"{e.get('size', 0):,} bp",
+                f"{e.get('n_feats', 0)}",
+                key=e.get("id"),
+            )
+            if self._current_id and e.get("id") == self._current_id:
+                cursor = i
+        if entries:
+            t.move_cursor(row=cursor)
+            t.focus()
+
+    @on(Button.Pressed, "#btn-pick-ok")
+    def _select(self, _):
+        self.dismiss(_cursor_row_key(self.query_one("#pick-table", DataTable)))
+
+    @on(DataTable.RowSelected, "#pick-table")
+    def _row_selected(self, event):
+        # Enter-key selection = same as clicking Select
+        if event.row_key and event.row_key.value:
+            self.dismiss(event.row_key.value)
+
+    @on(Button.Pressed, "#btn-pick-cancel")
+    def _cancel_btn(self, _):
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class PrimerCsvImportModal(_OneShotDismissScreen, ModalScreen):
+    """File browser → returns the path of a primer-order CSV to import.
+    Dismisses with the selected ``str`` path or ``None`` on cancel; the caller
+    runs `_import_primers_from_csv` (which validates + reports skips)."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab", "app.focus_next", "Next", show=False),
+    ]
+    DEFAULT_CSS = """
+    #pcsvimp-box { width: 86; height: auto; max-height: 90%;
+                   background: $surface; border: solid $accent; padding: 1 2; }
+    #pcsvimp-title { background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; text-align: center; }
+    #pcsvimp-header { color: $text-muted; }
+    #pcsvimp-tree { height: 16; border: solid $primary-darken-2; margin: 1 0; }
+    #pcsvimp-btns { height: 3; align: right middle; margin-top: 1; }
+    #pcsvimp-btns Button { margin-left: 2; }
+    """
+
+    def __init__(self, start_path: "str | None" = None) -> None:
+        super().__init__()
+        start = Path(start_path).expanduser() if start_path else Path.home()
+        try:
+            if not start.is_dir():
+                start = Path.home()
+        except OSError:
+            start = Path.home()
+        self._start = str(start)
+        self._selected: "str | None" = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="pcsvimp-box"):
+            yield Static(" Import primers from CSV ", id="pcsvimp-title")
+            yield Static(f"[dim]{self._start}[/dim]",
+                         id="pcsvimp-header", markup=True)
+            yield _ExtensionAwareDirectoryTree(
+                self._start,
+                highlight_map={".csv": _PICKER_PLASMID_STYLE},
+                id="pcsvimp-tree")
+            yield Static(
+                "[dim]Pick a CSV (Name, Sequence[, Tm]), then Open. "
+                "Invalid oligos are skipped + reported.[/dim]",
+                id="pcsvimp-hint", markup=True)
+            yield Static("", id="pcsvimp-status", markup=True)
+            with Horizontal(id="pcsvimp-btns"):
+                yield Button("Open", id="btn-pcsvimp-open",
+                             variant="primary", disabled=True)
+                yield Button("Cancel", id="btn-pcsvimp-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#pcsvimp-tree",
+                           _ExtensionAwareDirectoryTree).focus()
+        except NoMatches:
+            pass
+
+    @on(DirectoryTree.FileSelected, "#pcsvimp-tree")
+    def _file_sel(self, event) -> None:
+        self._selected = str(event.path)
+        try:
+            self.query_one("#pcsvimp-header", Static).update(
+                f"[dim]{self._selected}[/dim]")
+            self.query_one("#btn-pcsvimp-open", Button).disabled = False
+            self.query_one("#pcsvimp-status", Static).update("")
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-pcsvimp-open")
+    def _open(self) -> None:
+        if self._selected:
+            self.dismiss(self._selected)
+            return
+        try:
+            self.query_one("#pcsvimp-status", Static).update(
+                "[red]Pick a file first.[/red]")
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-pcsvimp-cancel")
+    def _cancel_btn(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class PrimerPlasmidsModal(_OneShotDismissScreen, ModalScreen):
+    """Surfaces every plasmid (across every collection) that carries a
+    `primer_bind` feature matching a given primer-library entry's
+    sequence. Lets the user pick one to jump to — the dismiss handler
+    on `PrimerDesignScreen` then closes the primer-design screen and
+    `PlasmidApp._goto_primer_in_plasmid` navigates to the chosen
+    plasmid + scrolls the seq-panel cursor to the primer's binding
+    region, mirroring the click-a-feature UX.
+
+    Dismiss payload:
+      ``None`` — cancelled (Escape / Close button)
+      ``dict`` — chosen usage entry with keys
+        ``collection``, ``plasmid_id``, ``plasmid_name``,
+        ``start``, ``end``, ``strand``.
+    """
+
+    _blocks_undo: bool = True   # caller may swap `_current_record`
+
+    BINDINGS = [
+        Binding("escape",     "cancel",             "Cancel"),
+        Binding("tab",        "app.focus_next",     "Next",  show=False),
+        Binding("shift+tab",  "app.focus_previous", "Prev",  show=False),
+    ]
+
+    DEFAULT_CSS = """
+    #pmp-dlg {
+        width: 92;
+        height: auto; max-height: 40;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #pmp-title {
+        text-align: center;
+        background: $primary-darken-2;
+        color: $text;
+        padding: 0 1;
+        height: 1;
+    }
+    #pmp-info {
+        margin: 1 0;
+        padding: 0 1;
+        color: $text;
+        height: auto;
+    }
+    #pmp-table { height: 1fr; margin-top: 1; }
+    /* `min-height: 3` + `height: auto` so the buttons get the height
+       they declare even on terminals where the dialog box is the
+       minimum size — previous fixed `height: 3` could clip on tiny
+       terminals where the dialog box itself wasn't quite tall enough.
+       The Vertical above (#pmp-dlg) is 40 rows fixed, so the table
+       absorbs the slack. */
+    #pmp-btns {
+        height: auto;
+        min-height: 3;
+        align: right middle;
+        padding-top: 1;
+    }
+    #pmp-btns Button { margin-left: 1; }
+    """
+
+    def __init__(self, primer_entry: dict, usages: list[dict]):
+        super().__init__()
+        self._primer = primer_entry
+        # Sort once at construction (natural sort by collection, then
+        # plasmid name) so cursor-row → usage mapping is stable.
+        self._sorted_usages = sorted(
+            usages,
+            key=lambda u: (
+                _natural_sort_key(u.get("collection") or ""),
+                _natural_sort_key(u.get("plasmid_name") or ""),
+            ),
+        )
+
+    def compose(self) -> ComposeResult:
+        seq = (self._primer.get("sequence") or "")
+        seq_preview = seq[:80] + ("…" if len(seq) > 80 else "")
+        tm = self._primer.get("tm")
+        tm_str = (f"{float(tm):.1f}°C"
+                  if isinstance(tm, (int, float)) else "—")
+        name = self._primer.get("name", "?")
+        n_usages = len(self._sorted_usages)
+        with Vertical(id="pmp-dlg"):
+            yield Static(f" Plasmids using primer '{name}' ", id="pmp-title")
+            yield Static(
+                f"Sequence (5'→3'):  {seq_preview}\n"
+                f"Length: {len(seq)} nt    Tm: {tm_str}    "
+                f"Found in {n_usages} plasmid"
+                f"{'s' if n_usages != 1 else ''}",
+                id="pmp-info",
+                markup=False,
+            )
+            yield DataTable(id="pmp-table", cursor_type="row",
+                              zebra_stripes=True)
+            with Horizontal(id="pmp-btns"):
+                yield Button("Open plasmid", id="btn-pmp-open",
+                              variant="primary")
+                yield Button("Cancel", id="btn-pmp-cancel")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#pmp-table", DataTable)
+        t.add_columns("Collection", "Plasmid", "Position", "Strand")
+        for u in self._sorted_usages:
+            start = int(u.get("start") or 0)
+            end = int(u.get("end") or 0)
+            # 1-based inclusive for display (matches GenBank
+            # convention); wrap-aware features (end < start) render
+            # as "S..0..E" to match `_feat_span_label` style.
+            if end < start:
+                pos_str = f"{start + 1}..0..{end}"
+            else:
+                pos_str = f"{start + 1}–{end}"
+            strand = int(u.get("strand") or 0)
+            strand_str = ("+" if strand == 1
+                            else "-" if strand == -1 else ".")
+            t.add_row(
+                u.get("collection") or "",
+                u.get("plasmid_name") or "?",
+                pos_str,
+                strand_str,
+            )
+        t.focus()
+
+    @on(DataTable.RowSelected, "#pmp-table")
+    def _row_selected(self, event: DataTable.RowSelected) -> None:
+        row = event.cursor_row
+        if 0 <= row < len(self._sorted_usages):
+            self.dismiss(self._sorted_usages[row])
+
+    @on(Button.Pressed, "#btn-pmp-open")
+    def _btn_open(self, _) -> None:
+        try:
+            t = self.query_one("#pmp-table", DataTable)
+        except NoMatches:
+            return
+        row = t.cursor_row
+        if 0 <= row < len(self._sorted_usages):
+            self.dismiss(self._sorted_usages[row])
+
+    @on(Button.Pressed, "#btn-pmp-cancel")
+    def _btn_cancel(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class SynthesisLoadModal(_OneShotDismissScreen, ModalScreen):
+    """Picker for loading a linear-topology library entry into the
+    synthesis editor. Filters the active library to entries whose
+    parsed topology is ``linear`` (circular plasmids don't belong in
+    the synthesis editor — they have an origin invariant the linear
+    editor can't represent).
+
+    Dismiss payload:
+      * ``str`` — the entry id to load.
+      * ``None`` — user cancelled."""
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter",  "pick",   "Load"),
+    ]
+
+    DEFAULT_CSS = """
+    #sl-dlg {
+        width: 70%; max-width: 90; height: 80%; max-height: 38;
+        background: $surface; padding: 1 2; border: solid $primary-darken-2;
+    }
+    #sl-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; height: 1; text-align: center;
+    }
+    #sl-search { height: 3; margin-top: 1; }
+    #sl-table  { height: 1fr; border: solid $primary-darken-2;
+                 margin-top: 1; }
+    #sl-hint   { height: 1; color: $text-muted; margin-top: 1; }
+    #sl-btns   { height: 3; align: right middle; margin-top: 1; }
+    #sl-btns Button { margin-left: 1; min-width: 10; }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._rows: list[tuple[str, str, int]] = []  # (id, name, size)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="sl-dlg"):
+            yield Static(" Load fragment from library ",
+                          id="sl-title")
+            yield Input(placeholder="filter by name or id",
+                          id="sl-search")
+            yield DataTable(id="sl-table",
+                              cursor_type="row",
+                              zebra_stripes=True)
+            yield Static(
+                "[dim]Only linear-topology entries shown. "
+                "Saving back overwrites the same entry (document model).[/]",
+                id="sl-hint", markup=True,
+            )
+            with Horizontal(id="sl-btns"):
+                yield Button("Load", id="btn-sl-load", variant="primary")
+                yield Button("Cancel", id="btn-sl-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            t = self.query_one("#sl-table", DataTable)
+            t.add_columns("Name", "ID", "bp")
+        except NoMatches:
+            return
+        # Filter library to linear entries via a cheap LOCUS-line peek
+        # (avoids parsing every gb_text just to read topology).
+        # Sweep #26: readonly iter — loop body only `.get()`s fields
+        # then appends to a fresh `rows` list.
+        rows: list[tuple[str, str, int]] = []
+        for e in _iter_library_readonly():
+            if not isinstance(e, dict):
+                continue
+            gb_text = e.get("gb_text", "") or ""
+            # LOCUS line in GenBank carries the topology word; cheap
+            # substring test beats a full BioPython parse.
+            first_line = gb_text.split("\n", 1)[0] if gb_text else ""
+            if "linear" not in first_line.lower():
+                continue
+            rows.append((
+                e.get("id", "") or "",
+                e.get("name", "") or e.get("id", "") or "(unnamed)",
+                int(e.get("size", 0) or 0),
+            ))
+        rows.sort(key=lambda r: _natural_sort_key(r[1]))
+        self._rows = rows
+        self._repopulate("")
+        try:
+            self.query_one("#sl-search", Input).focus()
+        except NoMatches:
+            pass
+
+    def _repopulate(self, needle: str) -> None:
+        try:
+            t = self.query_one("#sl-table", DataTable)
+        except NoMatches:
+            return
+        t.clear()
+        needle_lo = needle.strip().lower()
+        for eid, name, size in self._rows:
+            if needle_lo and needle_lo not in name.lower() \
+                    and needle_lo not in eid.lower():
+                continue
+            t.add_row(name, eid, f"{size:,}", key=eid)
+
+    @on(Input.Changed, "#sl-search")
+    def _on_search(self, event: Input.Changed) -> None:
+        self._repopulate(event.value)
+
+    @on(Input.Submitted, "#sl-search")
+    def _on_search_submit(self, _) -> None:
+        self.action_pick()
+
+    @on(Button.Pressed, "#btn-sl-load")
+    def _btn_load(self, _) -> None:
+        self.action_pick()
+
+    @on(Button.Pressed, "#btn-sl-cancel")
+    def _btn_cancel(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_pick(self) -> None:
+        try:
+            t = self.query_one("#sl-table", DataTable)
+        except NoMatches:
+            self.dismiss(None)
+            return
+        if t.cursor_row < 0 or t.row_count == 0:
+            return
+        try:
+            row_key = t.coordinate_to_cell_key(
+                _Coordinate(t.cursor_row, 0)
+            ).row_key
+        except (LookupError, AttributeError):
+            self.dismiss(None)
+            return
+        eid = row_key.value if hasattr(row_key, "value") else str(row_key)
+        self.dismiss(eid)
