@@ -1251,3 +1251,88 @@ def _save_parts_bin_collections(entries: list[dict]) -> None:
     _after = getattr(_state, "_after_parts_bin_collections_save_hook", None)
     if _after is not None:
         _after()
+
+
+# ── Feature library ──────────────────────────────────────────────────────────
+# Clean cluster (no migration / mirror / cache-bust): just the cache + the
+# `_state._features_generation` counter consumers watch to rebuild derived
+# indices. The upsert / scan helpers stay hub-side.
+def _load_features() -> list[dict]:
+    """Return an independent (deep-copied) list of feature library
+    entries. Callers can mutate the returned dicts freely without
+    poisoning the cache — important for ``FeatureLibraryScreen``
+    which buffers in-place edits (rename / color / strand / etc.) and
+    then either persists or abandons. A shallow ``list(_state._features_cache)``
+    used to share dict refs with the cache, so an abandoned mutation
+    would survive in the cache and leak into the next ``_load_features``
+    consumer (a freshly opened FeatureLibraryScreen, the
+    DomesticatorModal feature picker, etc.) as if it had been saved.
+    """
+    # Sweep #26: double-checked locking — cache-hit fast path is lock-free.
+    cached = _state._features_cache
+    if cached is not None:
+        return _typed_clone(cached)
+    with _state._cache_lock:
+        if _state._features_cache is None:
+            entries, warning = _safe_load_json(_state._FEATURES_FILE, "Feature library")
+            if warning:
+                _log.warning(warning)
+            entries = [e for e in entries if isinstance(e, dict)]
+            _state._features_cache = entries
+            # A fresh disk read is the result of either first-load or an
+            # external invalidation (test harness setting `_state._features_cache =
+            # None`, or a hand-edit of features.json). Either way the contents
+            # may have changed since the last write, so bump the generation so
+            # consumers know to rebuild any derived indices.
+            _state._features_generation += 1
+        return _typed_clone(_state._features_cache)
+
+
+def _save_features(entries: list[dict]) -> None:
+    """Persist `entries` and seed the in-memory cache with a deepcopy
+    so subsequent caller-side mutations of `entries` (or any dict
+    inside it) cannot leak into the cache after the save returns.
+    Without the deepcopy, the dicts in `_state._features_cache` would alias
+    the dicts in the caller's list — so e.g. a FeatureLibraryScreen
+    that saved, then made another change, then abandoned, would leave
+    the post-save mutations stuck in the cache.
+    """
+    with _state._cache_lock:
+        _safe_save_json(_state._FEATURES_FILE, entries, "Feature library")
+        _state._features_cache = _typed_clone(entries)
+        _state._features_generation += 1
+
+
+# ── Protein collections ──────────────────────────────────────────────────────
+# Clean cluster: `_ensure_*` is a pure disk-load+filter (no GenBank backfill /
+# migration), its only caller is `_load_protein_collections`, so it moves
+# wholesale — no hook. Save is a plain write+reseat. The add/scan helpers stay
+# hub-side.
+def _ensure_protein_collections_cache() -> None:
+    if _state._protein_collections_cache is not None:
+        return
+    with _state._cache_lock:
+        if _state._protein_collections_cache is None:
+            entries, warning = _safe_load_json(
+                _state._PROTEIN_COLLECTIONS_FILE, "Protein collections")
+            if warning:
+                _log.warning(warning)
+            _state._protein_collections_cache = [
+                e for e in (entries or []) if isinstance(e, dict)]
+
+
+def _load_protein_collections() -> list[dict]:
+    """Return a deepcopy of the protein-collections list so callers can
+    mutate freely without poisoning the in-memory cache ([PIT-17])."""
+    _ensure_protein_collections_cache()
+    assert _state._protein_collections_cache is not None
+    return _typed_clone(_state._protein_collections_cache)
+
+
+def _save_protein_collections(entries: list[dict]) -> None:
+    """Persist the full protein-collections list (envelope via
+    `_safe_save_json` — `.bak` + atomic replace, re-raises on failure)
+    and reseat the cache, under `_cache_lock`."""
+    with _state._cache_lock:
+        _safe_save_json(_state._PROTEIN_COLLECTIONS_FILE, entries, "Protein collections")
+        _state._protein_collections_cache = _typed_clone(entries)
