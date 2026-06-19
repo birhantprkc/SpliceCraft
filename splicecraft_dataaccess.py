@@ -1674,3 +1674,513 @@ def _collection_name_taken(name: str) -> bool:
             if isinstance(c, dict) and c.get("name") == name:
                 return True
     return False
+
+
+# ── Golden Braid / MoClo grammar + enzyme data + derived accessors (Phase D) ─
+# Pure GB grammar/enzyme definition constants + `_all_grammars` (merges builtin
+# with `_load_custom_grammars`) + `_get_entry_vector` (walks `_load_entry_vectors`).
+# Heavily referenced across the constructor/domestication hub code (re-exported).
+_NEB_ENZYMES: dict[str, tuple[str, int, int]] = {
+
+    # ── Common Type IIP — 6-bp palindromic cutters ─────────────────────────────
+    "EcoRI":     ("GAATTC",       1,  5),  # G^AATTC   / CTTAA^G     5' overhang
+    "EcoRV":     ("GATATC",       3,  3),  # GAT^ATC   / GAT^ATC     blunt
+    "BamHI":     ("GGATCC",       1,  5),  # G^GATCC   / CCTAG^G     5' overhang
+    "HindIII":   ("AAGCTT",       1,  5),  # A^AGCTT   / TTCGA^A     5' overhang
+    "NcoI":      ("CCATGG",       1,  5),  # C^CATGG   / GGTAC^C     5' overhang
+    "NdeI":      ("CATATG",       2,  4),  # CA^TATG   / GTAT^AC     5' overhang
+    "XhoI":      ("CTCGAG",       1,  5),  # C^TCGAG   / GAGCT^C     5' overhang
+    "SalI":      ("GTCGAC",       1,  5),  # G^TCGAC   / CAGCT^G     5' overhang
+    "KpnI":      ("GGTACC",       5,  1),  # GGTAC^C   / G^GTACC     3' overhang
+    "SacI":      ("GAGCTC",       5,  1),  # GAGCT^C   / G^AGCTC     3' overhang
+    "SacII":     ("CCGCGG",       4,  2),  # CCGC^GG   / CC^GCGG     3' overhang
+    "SpeI":      ("ACTAGT",       1,  5),  # A^CTAGT   / TGATC^A     5' overhang
+    "XbaI":      ("TCTAGA",       1,  5),  # T^CTAGA   / AGATC^T     5' overhang
+    "NotI":      ("GCGGCCGC",     2,  6),  # GC^GGCCGC / CGCCGG^CG   5' overhang (8-cutter)
+    "PstI":      ("CTGCAG",       5,  1),  # CTGCA^G   / G^CTGCA     3' overhang
+    "SphI":      ("GCATGC",       5,  1),  # GCATG^C   / C^GCATG     3' overhang
+    "ClaI":      ("ATCGAT",       2,  4),  # AT^CGAT   / CGAT^AT     5' overhang
+    "NheI":      ("GCTAGC",       1,  5),  # G^CTAGC   / CGATC^G     5' overhang
+    "AvaI":      ("CYCGRG",       1,  5),  # C^YCGRG                 5' overhang (degenerate)
+    "AvaII":     ("GGWCC",        1,  4),  # G^GWCC    / CCWG^G      5' overhang
+    "AvrII":     ("CCTAGG",       1,  5),  # C^CTAGG   / GGATC^C     5' overhang
+    "BclI":      ("TGATCA",       1,  5),  # T^GATCA   / AGTCA^T     5' overhang (dam-sensitive)
+    "BglII":     ("AGATCT",       1,  5),  # A^GATCT   / TCTAG^A     5' overhang
+    "BsiWI":     ("CGTACG",       1,  5),  # C^GTACG   / GCATG^C     5' overhang
+    "BspEI":     ("TCCGGA",       1,  5),  # T^CCGGA   / AGGCC^T     5' overhang
+    "BsrGI":     ("TGTACA",       1,  5),  # T^GTACA   / ACATG^T     5' overhang
+    "BssHII":    ("GCGCGC",       1,  5),  # G^CGCGC   / CGCGC^G     5' overhang
+    "BstBI":     ("TTCGAA",       2,  4),  # TT^CGAA   / AAGC^TT     5' overhang
+    "BstEII":    ("GGTNACC",      1,  6),  # G^GTNACC / CCANTG^G  5-nt 5' overhang GTNAC
+    "BstXI":     ("CCANNNNNNTGG", 8,  4),  # CCANNNNN^NTGG  4-nt 3' overhang (12-bp recog)
+    "BstYI":     ("RGATCY",       1,  5),  # R^GATCY   / YCTAG^R     5' overhang
+    "CpoI":      ("CGGWCCG",      2,  5),  # CG^GWCCG  / CGCC^WGG    5' overhang
+    "DraI":      ("TTTAAA",       3,  3),  # TTT^AAA   / TTT^AAA     blunt
+    "DraIII":    ("CACNNNGTG",    6,  3),  # CACNNN^GTG/ GTG^NNNGTG  3' overhang
+    "EagI":      ("CGGCCG",       1,  5),  # C^GGCCG   / GCCGG^C     5' overhang (NotI subset)
+    "Eco47III":  ("AGCGCT",       3,  3),  # AGC^GCT                 blunt
+    "Eco53kI":   ("GAGCTC",       3,  3),  # GAG^CTC                 blunt (SacI neoschizomer)
+    "EcoNI":     ("CCTNNNNNAGG",  5,  6),  # CCTNN^NNNAGG            5' overhang
+    "FseI":      ("GGCCGGCC",     6,  2),  # GGCCGG^CC / CC^GGCCGG   3' overhang (8-cutter)
+    "FspI":      ("TGCGCA",       3,  3),  # TGC^GCA                 blunt
+    "HaeII":     ("RGCGCY",       5,  1),  # RGCGC^Y   / R^GCGCY     3' overhang
+    "HaeIII":    ("GGCC",         2,  2),  # GG^CC                   blunt (4-cutter)
+    "HincII":    ("GTYRAC",       3,  3),  # GTY^RAC                 blunt
+    "HindII":    ("GTYRAC",       3,  3),  # GTY^RAC                 blunt (HincII isoschizomer)
+    "HpaI":      ("GTTAAC",       3,  3),  # GTT^AAC                 blunt
+    "HpaII":     ("CCGG",         1,  3),  # C^CGG     / CGG^C        5' overhang (4-cutter)
+    "MfeI":      ("CAATTG",       1,  5),  # C^AATTG   / GTTAA^C     EcoRI-compatible ends
+    "MluI":      ("ACGCGT",       1,  5),  # A^CGCGT   / TGCGC^A     5' overhang
+    "MscI":      ("TGGCCA",       3,  3),  # TGG^CCA                 blunt
+    "MspI":      ("CCGG",         1,  3),  # C^CGG     / CGG^C        5' overhang (HpaII isoschizomer)
+    "MunI":      ("CAATTG",       1,  5),  # C^AATTG                 MfeI isoschizomer
+    "NarI":      ("GGCGCC",       2,  4),  # GG^CGCC   / CGCG^CC     3' overhang
+    "NruI":      ("TCGCGA",       3,  3),  # TCG^CGA                 blunt
+    "NsiI":      ("ATGCAT",       5,  1),  # ATGCA^T   / T^ATGCA     PstI-compatible ends
+    "NspI":      ("RCATGY",       5,  1),  # RCATG^Y   / R^CATGY     3' overhang
+    "PacI":      ("TTAATTAA",     5,  3),  # TTAAT^TAA / TTA^ATTAA   3' overhang (8-cutter)
+    "PaeR7I":    ("CTCGAG",       1,  5),  # C^TCGAG                 XhoI isoschizomer
+    "PciI":      ("ACATGT",       1,  5),  # A^CATGT   / TGTAC^A     5' overhang
+    "PmeI":      ("GTTTAAAC",     4,  4),  # GTTT^AAAC               blunt (8-cutter)
+    "PmlI":      ("CACGTG",       3,  3),  # CAC^GTG                 blunt
+    "PscI":      ("ACATGT",       1,  5),  # A^CATGT                 PciI isoschizomer
+    "PvuI":      ("CGATCG",       4,  2),  # CGATC^G   / G^CGATC     3' overhang
+    "PvuII":     ("CAGCTG",       3,  3),  # CAG^CTG                 blunt
+    "RsrII":     ("CGGWCCG",      2,  5),  # CG^GWCCG                CpoI isoschizomer
+    "SbfI":      ("CCTGCAGG",     6,  2),  # CCTGCA^GG / CC^TGCAGG   PstI-compatible (8-cutter)
+    "ScaI":      ("AGTACT",       3,  3),  # AGT^ACT                 blunt
+    "SfiI":      ("GGCCNNNNNGGCC",8,  5),  # GGCCN^NNN^NGGCC         3-nt 3' overhang (13-bp)
+    "SgrAI":     ("CRCCGGYG",     2,  6),  # CR^CCGGYG / GCCGGR^C    5' overhang
+    "SmaI":      ("CCCGGG",       3,  3),  # CCC^GGG                 blunt
+    "SnaBI":     ("TACGTA",       3,  3),  # TAC^GTA                 blunt
+    "SrfI":      ("GCCCGGGC",     4,  4),  # GCCC^GGGC               blunt (8-cutter)
+    "StuI":      ("AGGCCT",       3,  3),  # AGG^CCT                 blunt
+    "SwaI":      ("ATTTAAAT",     4,  4),  # ATTT^AAAT               blunt (8-cutter)
+    "Tth111I":   ("GACNNNGTC",    4,  5),  # GACN^NNGTC              1-base 3' overhang
+    "XmaI":      ("CCCGGG",       1,  5),  # C^CCGGG   / GGGCC^C     5' overhang (SmaI isoschizomer)
+    "XmnI":      ("GAANNNNTTC",   5,  5),  # GAANN^NNTTC             blunt
+
+    # ── Rare 8-cutters ─────────────────────────────────────────────────────────
+    "AscI":      ("GGCGCGCC",     2,  6),  # GG^CGCGCC / CGCGCC^GG   5' overhang
+    "AsiSI":     ("GCGATCGC",     5,  3),  # GCGAT^CGC / GCG^ATCGC   3' overhang
+
+    # ── Degenerate / IUPAC recognition sequences ───────────────────────────────
+    "AccI":      ("GTMKAC",       2,  4),  # GT^MKAC / CAKM^TG       2-nt 5' overhang
+    "AclI":      ("AACGTT",       2,  4),  # AA^CGTT / TTGC^AA       2-nt 5' overhang CG
+    "AfeI":      ("AGCGCT",       3,  3),  # AGC^GCT                 blunt (Eco47III isoschizomer)
+    "AflII":     ("CTTAAG",       1,  5),  # C^TTAAG                 MfeI-compatible ends
+    "AflIII":    ("ACRYGT",       1,  5),  # A^CRYGT                 MluI-compatible ends
+    "AgeI":      ("ACCGGT",       1,  5),  # A^CCGGT   / TGGCC^A     5' overhang
+    "AhdI":      ("GACNNNNNGTC",  6,  5),  # GACNNNN^NGTC            1-base 3' overhang
+    "AluI":      ("AGCT",         2,  2),  # AG^CT                   blunt (4-cutter)
+    "ApaI":      ("GGGCCC",       5,  1),  # GGGCC^C   / G^GGCCC     3' overhang
+    "ApaLI":     ("GTGCAC",       1,  5),  # G^TGCAC                 SphI-compatible ends
+    "ApoI":      ("RAATTY",       1,  5),  # R^AATTY                 EcoRI isoschizomer (degenerate)
+    "AatII":     ("GACGTC",       5,  1),  # GACGT^C   / G^ACGTC     3' overhang
+    "BaeGI":     ("GKGCMC",       5,  1),  # GKGCM^C   / G^KGCMC     3' overhang
+    "BglI":      ("GCCNNNNNGGC",  7,  4),  # GCCNNNN^NGGC            3' overhang
+    "BmgBI":     ("CACGTC",       3,  3),  # CAC^GTC                 blunt
+    "BsaAI":     ("YACGTR",       3,  3),  # YAC^GTR                 blunt
+    "BsaBI":     ("GATNNNNATC",   5,  5),  # GATN4^ATC               blunt
+    "BsaHI":     ("GRCGYC",       2,  4),  # GR^CGYC                 3' overhang
+    "BsaWI":     ("WCCGGW",       1,  5),  # W^CCGGW                 5' overhang
+    "BseYI":     ("CCCAGC",       1,  5),  # C^CCAGC   / GCTGG^G     5' overhang
+    "BsiEI":     ("CGRYCG",       4,  2),  # CGRY^CG                 3' overhang
+    "BsiHKAI":   ("GWGCWC",       5,  1),  # GWGCW^C                 3' overhang
+    "BsrFI":     ("RCCGGY",       1,  5),  # R^CCGGY                 5' overhang
+    "Bsp1286I":  ("GDGCHC",       5,  1),  # GDGCH^C                 3' overhang
+    "BspHI":     ("TCATGA",       1,  5),  # T^CATGA                 NcoI-compatible ends
+    "BsrI":      ("ACTGG",        6,  4),  # ACTGGN^/^NCCAGT 2-nt 3' overhang Type IIS
+    "BstAPI":    ("GCANNNNNTGC",  7,  4),  # GCAN^NNN^NTGC           3-nt 3' overhang
+    "BstNI":     ("CCWGG",        2,  3),  # CC^WGG    / WGG^CC      3' overhang
+    "BstUI":     ("CGCG",         2,  2),  # CG^CG                   blunt (4-cutter; methylation-sensitive)
+    "BstZ17I":   ("GTATAC",       3,  3),  # GTA^TAC                 blunt
+    "BtgI":      ("CCRYGG",       1,  5),  # C^CRYGG                 5' overhang
+    "Cac8I":     ("GCNNGC",       3,  3),  # GCN^NGC                 blunt
+    "CviAII":    ("CATG",         1,  3),  # C^ATG                   NcoI-compatible ends (4-cutter)
+    "CviQI":     ("GTAC",         1,  3),  # G^TAC                   KpnI subset (4-cutter)
+    "DpnI":      ("GATC",         2,  2),  # GA^TC                   blunt; cuts only methylated
+    "DpnII":     ("GATC",         0,  4),  # ^GATC     / GATC^       5' overhang (4-cutter)
+    "DrdI":      ("GACNNNNNNGTC", 7,  5),  # GACNNNNN^NGTC           3' overhang
+    "EcoO109I":  ("RGGNCCY",      2,  5),  # RG^GNCCY                5' overhang
+    "HphI":      ("GGTGA",       13, 12),  # GGTGA(8/7) downstream   Type IIS
+    "KasI":      ("GGCGCC",       1,  5),  # G^GCGCC                 5' overhang (NarI isoschizomer)
+    "MboI":      ("GATC",         0,  4),  # ^GATC                   DpnII isoschizomer
+    "MboII":     ("GAAGA",       13, 12),  # GAAGA(8/7) downstream   Type IIS
+    "MlyI":      ("GAGTC",       10, 10),  # GAGTC(5/5) downstream   blunt, Type IIS
+    "MmeI":      ("TCCRAC",      26, 24),  # TCCRAC(20/18)           Type IIS far-cutter
+    "MspA1I":    ("CMGCKG",       3,  3),  # CMG^CKG                 blunt
+    "NgoMIV":    ("GCCGGC",       1,  5),  # G^CCGGC                 5' overhang (EagI-compatible)
+    "NmeAIII":   ("GCCGAG",      27, 25),  # GCCGAG(21/19)           Type IIS far-cutter
+    "PflMI":     ("CCANNNNNTGG",  7,  4),  # CCANN4^NTGG             3' overhang (BstXI isoschizomer)
+    "PspOMI":    ("GGGCCC",       1,  5),  # G^GGCCC                 ApaI isoschizomer (5' overhang)
+    "Sau3AI":    ("GATC",         0,  4),  # ^GATC                   BamHI-compatible ends (4-cutter)
+    "SfcI":      ("CTRYAG",       1,  5),  # C^TRYAG                 5' overhang
+    "SspI":      ("AATATT",       3,  3),  # AAT^ATT                 blunt
+    "TaqI":      ("TCGA",         1,  3),  # T^CGA     / CGT^A       5' overhang (heat-stable)
+    "Van91I":    ("CCANNNNNTGG",  7,  4),  # PflMI isoschizomer
+    "ZraI":      ("GACGTC",       3,  3),  # GAC^GTC                 blunt (AatII-related)
+
+    # ── Type IIS — cut outside recognition sequence ────────────────────────────
+    # fwd/rev positions are still offsets from start of recognition seq.
+    # For an n-bp recognition sequence cutting d1/d2 downstream:
+    #   fwd = n + d1,  rev = n + d2
+    "BaeI":      ("ACNNNNGTAYC", -10,-15), # (10/15)…(12/7): upstream pair only — downstream cut not represented (11-bp recog)
+    "BbsI":      ("GAAGAC",       8, 12),  # GAAGAC(2/6)  BpiI isoschizomer
+    "BcoDI":     ("GTCTC",        6, 10),  # GTCTC(1/5)   BsaI 5-bp variant
+    "BceAI":     ("ACGGC",       17, 19),  # ACGGC(12/14)            Type IIS far-cutter
+    "BciVI":     ("GTATCC",      12, 11),  # GTATCC(6/5)             1-nt 3' overhang
+    "BfuAI":     ("ACCTGC",      10, 14),  # ACCTGC(4/8)  BspMI isoschizomer
+    "BmrI":      ("ACTGGG",      11, 10),  # ACTGGG(5/4)             1-nt 3' overhang Type IIS
+    "BpiI":      ("GAAGAC",       8, 12),  # BbsI isoschizomer
+    "BsaI":      ("GGTCTC",       7, 11),  # GGTCTC(1/5)  Golden Gate workhorse
+    "BsaXI":     ("ACNNNNNCTCC", -9,-12),  # (9/12)…(10/7): upstream pair only — downstream cut not represented
+    # BsbI removed 2026-05-11 (issue #14, a user): real REBASE id 329
+    # but no commercial supplier — users can't actually buy or order this
+    # enzyme. Showing it on the map suggests a digest option that doesn't
+    # exist in any wet lab. Keep removed unless a vendor starts producing.
+    # BseJI removed 2026-05-11: previous entry claimed BbsI-isoschizomer
+    # behaviour with site GAAGAC, but real BseJI recognises GATNNNNATC
+    # (blunt) per REBASE/NEB. Users who want BbsI behaviour should use
+    # `BbsI` / `BpiI` (already in this catalog). If a real BseJI entry
+    # is requested, add it back as: ("GATNNNNATC", 5, 5) — blunt 5-bp
+    # 5'-OH cut after the 5th base of recognition.
+    "BseLI":     ("CCNNNNNNNGG",  7,  4),  # 3' overhang
+    "BseMII":    ("CTCAG",       15, 13),  # CTCAG(10/8)             Type IIS far-cutter
+    "BseRI":     ("GAGGAG",      16, 14),  # GAGGAG(10/8)            2-nt 3' overhang
+    "BsgI":      ("GTGCAG",      22, 20),  # GTGCAG(16/14) far-cutter
+    "BslI":      ("CCNNNNNNNGG",  7,  4),  # 3' overhang (BseLI variant)
+    "BsmAI":     ("GTCTC",        6, 10),  # GTCTC(1/5)   BsaI isoschizomer (5-bp)
+    "BsmBI":     ("CGTCTC",       7, 11),  # CGTCTC(1/5)  Esp3I isoschizomer
+    "BsmFI":     ("GGGAC",       15, 19),  # GGGAC(10/14)
+    "BsmI":      ("GAATGC",       7,  5),  # GAATGC(1/-1)            2-nt 3' overhang Type IIS
+    # BspLU11III removed 2026-05-11: not a real enzyme. Closest REBASE
+    # match is BspLU11I (site ACATGT) — PciI isoschizomer — but BspLU11I
+    # also has no commercial supplier, and PciI itself is already in this
+    # catalog with the correct (1, 5) tuple.
+    "BspMI":     ("ACCTGC",      10, 14),  # ACCTGC(4/8)
+    "BspQI":     ("GCTCTTC",      8, 11),  # SapI isoschizomer
+    "BspTNI":    ("GGTCTC",       7, 11),  # BsaI isoschizomer
+    "BsrBI":     ("CCGCTC",       3,  3),  # cuts within recog (special case)
+    "BsrDI":     ("GCAATG",       8,  6),  # GCAATG(2/0)
+    "BssSI":     ("CACGAG",       1,  5),  # C^ACGAG / GTGCT^C       4-nt 5' overhang
+    "BtgZI":     ("GCGATG",      16, 20),  # GCGATG(10/14)
+    "BtsCI":     ("GGATG",        7,  5),  # GGATG(2/0)              2-nt 3' overhang
+    "BtsI":      ("GCAGTG",       8,  6),  # GCAGTG(2/0)
+    "BtsIMutI":  ("CAGTG",        7,  5),  # CAGTG(2/0)              2-nt 3' overhang (canonical REBASE/NEB capitalisation)
+    "EarI":      ("CTCTTC",       7, 10),  # CTCTTC(1/4)  SapI-related 3-nt 5' overhang
+    "Esp3I":     ("CGTCTC",       7, 11),  # BsmBI isoschizomer
+    "PaqCI":     ("CACCTGC",     11, 15),  # CACCTGC(4/8)
+    "SapI":      ("GCTCTTC",      8, 11),  # GCTCTTC(1/4)
+    "BsmBI-v2":  ("CGTCTC",       7, 11),  # v2/HF variant
+
+    # ── High-Fidelity (HF) and v2 variants — same recognition/cut as canonical ─
+    "AgeI-HF":   ("ACCGGT",       1,  5),
+    "BamHI-HF":  ("GGATCC",       1,  5),
+    "BclI-HF":   ("TGATCA",       1,  5),
+    "BmtI":      ("GCTAGC",       5,  1),  # GCTAG^C / G^CTAGC       3' overhang CTAG (NheI neoschizomer)
+    "BsiWI-HF":  ("CGTACG",       1,  5),
+    "BsrFI-v2":  ("RCCGGY",       1,  5),
+    "BsrGI-HF":  ("TGTACA",       1,  5),
+    "BssSI-v2":  ("CACGAG",       1,  5),
+    "BstEII-HF": ("GGTNACC",      1,  6),
+    "BstZ17I-HF":("GTATAC",       3,  3),
+    "DraIII-HF": ("CACNNNGTG",    6,  3),
+    "EcoRI-HF":  ("GAATTC",       1,  5),
+    "EcoRV-HF":  ("GATATC",       3,  3),
+    "HindIII-HF":("AAGCTT",       1,  5),
+    "KpnI-HF":   ("GGTACC",       5,  1),
+    "MfeI-HF":   ("CAATTG",       1,  5),
+    "MluI-HF":   ("ACGCGT",       1,  5),
+    "MunI-HF":   ("CAATTG",       1,  5),
+    "NcoI-HF":   ("CCATGG",       1,  5),
+    "NheI-HF":   ("GCTAGC",       1,  5),
+    "NotI-HF":   ("GCGGCCGC",     2,  6),
+    "NruI-HF":   ("TCGCGA",       3,  3),
+    "NsiI-HF":   ("ATGCAT",       5,  1),
+    "PstI-HF":   ("CTGCAG",       5,  1),
+    "PvuI-HF":   ("CGATCG",       4,  2),
+    "PvuII-HF":  ("CAGCTG",       3,  3),
+    "SacI-HF":   ("GAGCTC",       5,  1),
+    "SalI-HF":   ("GTCGAC",       1,  5),
+    "SbfI-HF":   ("CCTGCAGG",     6,  2),
+    "ScaI-HF":   ("AGTACT",       3,  3),
+    "SpeI-HF":   ("ACTAGT",       1,  5),
+    "SphI-HF":   ("GCATGC",       5,  1),
+    "TaqI-v2":   ("TCGA",         1,  3),
+    "XhoI-HF":   ("CTCGAG",       1,  5),
+}
+
+
+_GB_L0_PARTS: list[tuple] = [
+    # ── Promoters (Pos 1, combined Promoter+5'UTR: GGAG → AATG) ───────
+    ("CaMV 35S",          "Promoter",   "Pos 1",   "GGAG", "AATG", "pUPD2", "Spectinomycin"),
+    ("Nos",               "Promoter",   "Pos 1",   "GGAG", "AATG", "pUPD2", "Spectinomycin"),
+    ("AtUBQ10",           "Promoter",   "Pos 1",   "GGAG", "AATG", "pUPD2", "Spectinomycin"),
+    ("ZmUBI1",            "Promoter",   "Pos 1",   "GGAG", "AATG", "pUPD2", "Spectinomycin"),
+    ("AtRPS5a",           "Promoter",   "Pos 1",   "GGAG", "AATG", "pUPD2", "Spectinomycin"),
+    # ── CDS with stop (Positions 3-4: AATG → GCTT) ─────────────────────
+    ("eGFP",              "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("mCherry",           "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("mVenus",            "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("mTurquoise2",       "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("GUS (uidA)",        "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("Luciferase (LUC+)", "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("NptII (KanR)",      "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("hptII (HygR)",      "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("Bar (BastaR)",      "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("Cas9 (SpCas9)",     "CDS",        "Pos 3-4", "AATG", "GCTT", "pUPD2", "Spectinomycin"),
+    # ── CDS without stop (Position 3: AATG → TTCG) ─────────────────────
+    ("eGFP (no stop)",    "CDS-NS",     "Pos 3",   "AATG", "TTCG", "pUPD2", "Spectinomycin"),
+    ("mCherry (no stop)", "CDS-NS",     "Pos 3",   "AATG", "TTCG", "pUPD2", "Spectinomycin"),
+    # ── C-terminal tags (Position 4: TTCG → GCTT) ──────────────────────
+    ("GFP C-tag",         "C-tag",      "Pos 4",   "TTCG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("HA tag",            "C-tag",      "Pos 4",   "TTCG", "GCTT", "pUPD2", "Spectinomycin"),
+    ("6xHis tag",         "C-tag",      "Pos 4",   "TTCG", "GCTT", "pUPD2", "Spectinomycin"),
+    # ── Terminators (Position 5: GCTT → CGCT) ──────────────────────────
+    ("Nos terminator",    "Terminator", "Pos 5",   "GCTT", "CGCT", "pUPD2", "Spectinomycin"),
+    ("CaMV 35S term",     "Terminator", "Pos 5",   "GCTT", "CGCT", "pUPD2", "Spectinomycin"),
+    ("OCS terminator",    "Terminator", "Pos 5",   "GCTT", "CGCT", "pUPD2", "Spectinomycin"),
+    ("rbcS terminator",   "Terminator", "Pos 5",   "GCTT", "CGCT", "pUPD2", "Spectinomycin"),
+    ("HSP18.2 term",      "Terminator", "Pos 5",   "GCTT", "CGCT", "pUPD2", "Spectinomycin"),
+]
+
+
+_GB_TYPE_COLORS: dict[str, str] = {
+    # Legacy slots:
+    "Promoter":         "green",
+    "Promoter-only":    "green",
+    "5' UTR":           "cyan",
+    "CDS":              "yellow",
+    "OPERON":           "yellow",      # whole operon as a CDS-equivalent part
+    "CDS-NS":           "dark_orange",
+    "C-tag":            "magenta",
+    "Terminator":       "blue",
+    # GB 2.0 canonical additions (2026-05-10) — pick colors that group
+    # with their nearest legacy equivalent so the palette stays
+    # readable (5'NT shades of green, 5'UTR shades of cyan, translated
+    # shades of yellow/orange, 3'NT shades of blue).
+    "Operator-A":       "dark_green",   # OP-PROM 5'NT variant
+    "Operator-B":       "dark_green",
+    "Min Promoter":     "green",
+    "Distal 5' UTR":    "cyan",
+    "Signal peptide":   "dark_orange",  # N-terminal coding extension
+    "CDS-NS (CT)":      "dark_orange",  # canonical no-stop CDS
+    "CT-tag":           "magenta",      # canonical C-tag
+    "CDS-after-SP":     "yellow",       # full CDS after SP cleavage
+    "3' UTR":           "blue",
+    "Terminator-only":  "blue",
+}
+
+
+_GB_POSITIONS: dict[str, tuple[str, str, str]] = {
+    # ── 5' Non-Transcribed (combined Promoter + 5'UTR + Link) ─────────
+    # Combined Promoter+5'UTR+ATG (GB 2.0 PromUTR; the common BASIC form).
+    # Legacy position label "Pos 1" preserved for back-compat with
+    # existing user parts in `parts_bin.json` that were stored under
+    # this label string.
+    "Promoter":         ("Pos 1",     "GGAG", "AATG"),
+    # Separate Promoter (no LINK/+ATG) — pairs with a `5' UTR` part.
+    "Promoter-only":    ("Pos 1a",    "GGAG", "CCAT"),
+    # ── Operator/Promoter variants (OP-PROM-A/B workflow) ─────────────
+    "Operator-A":       ("Pos 01-02", "GGAG", "TCCC"),  # OP-PROM-A operator
+    "Operator-B":       ("Pos 02",    "TGAC", "TCCC"),  # OP-PROM-B operator
+    "Min Promoter":     ("Pos 03-12", "TCCC", "AATG"),  # pairs with either Operator
+    # ── 5' UTR ────────────────────────────────────────────────────────
+    # Historical "5' UTR" slot — technically the LINK position (Pos 12)
+    # in canonical GB 2.0. Kept under this name for backward compat.
+    "5' UTR":           ("Pos 1b",    "CCAT", "AATG"),
+    # Canonical GB 2.0 5'UTR (Pos 03-11), distinct from the LINK above.
+    "Distal 5' UTR":    ("Pos 03-11", "TCCC", "CCAT"),
+    # ── Translated region ─────────────────────────────────────────────
+    # Signal peptide (SECRETED workflow N-terminal extension; coding).
+    "Signal peptide":   ("Pos 13",    "AATG", "AGCC"),
+    # Full CDS with stop codon (BASIC workflow).
+    "CDS":              ("Pos 3-4",   "AATG", "GCTT"),
+    # A whole NATIVE OPERON as one CDS-equivalent L0 part — same fusion-site
+    # slot + overhangs as CDS (Pos 3-4, AATG→GCTT): the AATG overhang carries
+    # the FIRST gene's start codon (ATG-fusion, exactly like a CDS) and GCTT
+    # meets a downstream terminator after the LAST gene's stop. Used by the
+    # Native Operon Domestication workbench so a cured operon clones straight
+    # into Golden Braid between a promoter and a terminator.
+    "OPERON":           ("Pos 3-4",   "AATG", "GCTT"),
+    # Legacy 2-part CDS split (splits at TL2/TL3 boundary, non-canonical
+    # but kept for backward compat with existing user parts).
+    "CDS-NS":           ("Pos 3",     "AATG", "TTCG"),
+    "C-tag":            ("Pos 4",     "TTCG", "GCTT"),
+    # Canonical GB 2.0 CDS variants (added 2026-05-10):
+    # CDS-no-stop for CT-FUSION (positions 13-15; pairs with `CT-tag`).
+    "CDS-NS (CT)":      ("Pos 13-15", "AATG", "GCAG"),
+    "CT-tag":           ("Pos 16",    "GCAG", "GCTT"),  # canonical C-term tag
+    # CDS body for SECRETED workflow (after Signal peptide, full to stop).
+    "CDS-after-SP":     ("Pos 14-16", "AGCC", "GCTT"),
+    # ── 3' Non-Translated ─────────────────────────────────────────────
+    # Combined 3'UTR+Terminator (BASIC workflow).
+    "Terminator":       ("Pos 5",     "GCTT", "CGCT"),
+    # Canonical split variants (added 2026-05-10):
+    "3' UTR":           ("Pos 17",    "GCTT", "GGTA"),
+    "Terminator-only":  ("Pos 21",    "GGTA", "CGCT"),
+}
+
+
+_GB_CODING_PART_TYPES: frozenset[str] = frozenset({
+    # Legacy splits:
+    "CDS", "CDS-NS", "C-tag",
+    # GB 2.0 canonical translational parts (added 2026-05-10):
+    "Signal peptide", "CDS-NS (CT)", "CT-tag", "CDS-after-SP",
+    # A whole native operon cloned as one CDS-equivalent L0 part — "coding" so
+    # the AATG overhang carries the first gene's ATG (the ATG-fusion skip in
+    # `_atg_offset_for_part`); curing itself is per-CDS in the SOE designer.
+    "OPERON",
+})
+
+
+_GB_PART_TYPE_TO_INSDC: dict[str, str] = {
+    # Legacy slots:
+    "Promoter":         "promoter",
+    "Promoter-only":    "promoter",
+    "5' UTR":           "5'UTR",
+    "CDS":              "CDS",
+    "OPERON":           "operon",
+    "CDS-NS":           "CDS",
+    "C-tag":            "CDS",
+    "Terminator":       "terminator",
+    # GB 2.0 canonical additions (2026-05-10):
+    "Operator-A":       "promoter",   # operator+promoter assembled together
+    "Operator-B":       "promoter",
+    "Min Promoter":     "promoter",
+    "Distal 5' UTR":    "5'UTR",
+    "Signal peptide":   "sig_peptide",
+    "CDS-NS (CT)":      "CDS",
+    "CT-tag":           "CDS",
+    "CDS-after-SP":     "CDS",
+    "3' UTR":           "3'UTR",
+    "Terminator-only":  "terminator",
+}
+
+
+_GB_L0_ENZYME_NAME = "Esp3I"       # Esp3I is the isoschizomer of BsmBI
+
+
+_GB_L0_ENZYME_SITE = "CGTCTC"      # recognition; rc = "GAGACG"
+
+
+_GB_SPACER         = "A"           # 1 nt between recognition and the overhang
+
+
+_GB_PAD            = "GCGC"        # 4 nt of extra bases for efficient end-cutting
+
+
+_GB_DOMESTICATION_FORBIDDEN: dict[str, str] = {
+    # Esp3I self-cuts during L0 domestication; BsaI would re-cut during any
+    # downstream L1 assembly — both must be absent from the final part.
+    "BsaI":  "GGTCTC",
+    "Esp3I": "CGTCTC",
+}
+
+
+_BUILTIN_GRAMMARS: dict[str, dict] = {
+    "gb_l0": {
+        "id":              "gb_l0",
+        "name":            "Golden Braid L0",
+        "enzyme":          _GB_L0_ENZYME_NAME,
+        # Iterative GB cycle: L0 → L1 cuts with Esp3I (`enzyme`); L1 →
+        # L2 cuts with BsaI (`level_up_enzyme`); L2 → L3 wraps around
+        # to Esp3I again (parity on source level — see
+        # `_enzyme_for_level_up`). The two enzymes alternate each
+        # level so the assembled product survives the next cut.
+        "level_up_enzyme": "BsaI",
+        "site":            _GB_L0_ENZYME_SITE,
+        "spacer":          _GB_SPACER,
+        "pad":             _GB_PAD,
+        "forbidden_sites": dict(_GB_DOMESTICATION_FORBIDDEN),
+        "positions": [
+            {"name": pos, "type": ptype, "oh5": oh5, "oh3": oh3,
+             "color": _GB_TYPE_COLORS.get(ptype, "white")}
+            for ptype, (pos, oh5, oh3) in _GB_POSITIONS.items()
+        ],
+        "coding_types":    sorted(_GB_CODING_PART_TYPES),
+        "type_to_insdc":   dict(_GB_PART_TYPE_TO_INSDC),
+        "catalog":         list(_GB_L0_PARTS),
+        "editable":        False,
+    },
+    # Plant MoClo (Weber et al. 2011, Engler et al. 2014). BsaI at L0,
+    # BpiI/BbsI at L1 — both scrubbed during domestication. Ships
+    # without a built-in catalog because Plant MoClo's reference parts
+    # depend heavily on the user's host system; users seed via "New
+    # Part" or by duplicating into a custom grammar.
+    "moclo_plant": {
+        "id":              "moclo_plant",
+        "name":            "MoClo Plant (Weber 2011)",
+        "enzyme":          "BsaI",
+        "level_up_enzyme": "BpiI",
+        "site":            "GGTCTC",
+        "spacer":          "A",
+        "pad":             "GCGC",
+        # BsaI for the current L0 cut; BpiI (= BbsI) for the next-level
+        # MoClo assembly, which uses a different Type IIS site so the
+        # L0 part survives the L1 reaction without re-cutting.
+        "forbidden_sites": {"BsaI": "GGTCTC", "BpiI": "GAAGAC"},
+        "positions": [
+            {"name": "Pos 1", "type": "Promoter",   "oh5": "GGAG", "oh3": "AATG", "color": "green"},
+            {"name": "Pos 2", "type": "5' UTR",     "oh5": "AATG", "oh3": "AGGT", "color": "cyan"},
+            {"name": "Pos 3", "type": "CDS",        "oh5": "AGGT", "oh3": "GCTT", "color": "yellow"},
+            {"name": "Pos 4", "type": "C-tag",      "oh5": "GCTT", "oh3": "GGTA", "color": "magenta"},
+            {"name": "Pos 5", "type": "Terminator", "oh5": "GGTA", "oh3": "CGCT", "color": "blue"},
+        ],
+        "coding_types":    ["CDS", "C-tag"],
+        "type_to_insdc": {
+            "Promoter":   "promoter",
+            "5' UTR":     "5'UTR",
+            "CDS":        "CDS",
+            "C-tag":      "CDS",
+            "Terminator": "terminator",
+        },
+        "catalog":         [],
+        "editable":        False,
+    },
+}
+
+
+def _all_grammars() -> dict[str, dict]:
+    """Return all grammars (built-in + user-defined) keyed by id.
+
+    Built-ins come first; user-defined grammars override builtin IDs
+    if they ever collide (defensive — UI prevents this on save). The
+    returned dicts are independent copies, so callers may mutate them
+    without poisoning the cache.
+    """
+    out: dict[str, dict] = {gid: deepcopy(g) for gid, g in _BUILTIN_GRAMMARS.items()}
+    for g in _load_custom_grammars():
+        gid = g.get("id")
+        if isinstance(gid, str):
+            # Custom grammars are always editable regardless of what
+            # the JSON file says — stops a mis-flagged file from
+            # locking the user out of their own definitions.
+            g = dict(g)
+            g["editable"] = True
+            out[gid] = g
+    return out
+
+
+def _get_entry_vector(
+    grammar_id: str, role: str = "",
+) -> "dict | None":
+    """Return the entry-vector dict for ``(grammar_id, role)``, or
+    None if none has been assigned yet.
+
+    `role` is the per-grammar slot — for Golden Braid the Constructor
+    has four roles (``Alpha1``, ``Alpha2``, ``Omega1``, ``Omega2``)
+    so a single grammar carries multiple L1 acceptors. The empty
+    role (default) is the singleton L0 entry vector used by the
+    Domesticator / `_clone_part_into_entry_vector` workflow — kept
+    backward-compat with pre-2026-05-07 entry_vectors.json files
+    where every entry has no `role` field.
+    """
+    if not isinstance(grammar_id, str) or not grammar_id:
+        return None
+    role = role or ""
+    for e in _load_entry_vectors():
+        if e.get("grammar_id") == grammar_id and (e.get("role") or "") == role:
+            return e
+    return None
