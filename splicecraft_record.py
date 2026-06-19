@@ -1,0 +1,256 @@
+"""splicecraft_record — GenBank <-> SeqRecord serialization (Phase D, layer L1).
+
+The hub's record serialization core, extracted so the modal/screen siblings that
+parse/serialise records can import it instead of calling it bare on the hub. This
+is MISSION-CRITICAL (INV-98: the GenBank LOCUS must never carry the human/display
+name; the .dna + library round-trips depend on byte-faithful parse/serialise), so
+it moved as one self-contained unit with its own LRU parse cache. Biopython is
+imported lazily inside the two entry points (`from Bio import SeqIO`) exactly as
+in the hub. The SpliceCraft version stamped into the GenBank COMMENT is read from
+`_state._sc_version` (the hub sets it from `__version__`, which must stay in
+splicecraft.py for release.py's bump regex). Re-exported by the hub so `sc.<name>`
++ every existing call site resolves unchanged.
+"""
+from __future__ import annotations
+
+import re
+import threading
+from collections import OrderedDict as _OD
+from copy import copy as _shallow_copy, deepcopy
+from io import StringIO
+
+import splicecraft_state as _state
+
+
+_SC_STRAND_QUAL = "SpliceCraft_strand"
+
+_GB_TEXT_MAX_BYTES = 64 * 1024 * 1024
+
+_GB_PARSE_CACHE: "_OD" = _OD()
+
+_GB_PARSE_CACHE_MAX = 16
+
+_GB_PARSE_CACHE_LOCK = threading.RLock()
+
+_GB_LOCUS_NAME_MAX = 28  # NCBI relaxed LOCUS name length (spec is 16)
+
+
+def _normalize_primer_seq(raw: object) -> str:
+    """Canonical primer-sequence sanitiser: whitespace-strip + uppercase.
+    THE single function every primer string routes through before it is
+    rendered, stored, indexed, or compared.
+
+    A primer is a pure DNA oligo — every space / tab / newline in it is an
+    artifact, never data. Sources that inject one:
+      * BioPython's GenBank wrap-rejoin of a long ``/primer_seq`` (a value
+        wrapped at the ~58-col boundary reloads as ``…GGAA TGAT``) — the
+        original "phantom gap in the primer" report;
+      * a hand-edited ``.gb`` / ``.dna`` qualifier or a pasted oligo with a
+        stray space / trailing newline;
+      * a multi-line qualifier from any external importer.
+    Drawn verbatim, any of these becomes a phantom one-column gap that shifts
+    the primer's bases off the template it anneals to — catastrophic for a tool
+    whose primers must DISPLAY exactly where they bind
+    ([[project_primer_design_catastrophic]]). Routing every read-for-render
+    (`PlasmidMap._parse`), every load (`_gb_text_to_record` →
+    `_repair_wrapped_primer_seqs`), every qualifier write, the primer editor,
+    and the usage index (`_index_primer_usage_in_collections` /
+    `_find_primer_plasmid_usages`) through here means no workflow or insertion
+    point can leak a dirty primer onto the canvas. Non-string input → ``""``.
+    """
+    if not isinstance(raw, str):
+        return ""
+    return re.sub(r"\s+", "", raw).upper()
+
+
+def _arrowless_encode_features(features):
+    """Return a features list in which every strand-0 / strand-None feature
+    carries ``SpliceCraft_strand=["none"]`` (so the GenBank writer's plain
+    location round-trips as arrowless, not forward). Pure: the input features
+    are never mutated — only the tagged ones are replaced with shallow copies
+    bearing a fresh qualifiers dict. Features that already carry a
+    ``SpliceCraft_strand`` value (the double-strand ``["double"]`` marker) and
+    the ``source`` feature are left untouched. Returns the SAME list object
+    when nothing needs encoding (common case → zero allocation)."""
+    feats = features or []
+    out: list = []
+    changed = False
+    for f in feats:
+        loc = getattr(f, "location", None)
+        strand = getattr(loc, "strand", None) if loc is not None else None
+        quals = getattr(f, "qualifiers", None) or {}
+        if (strand in (0, None) and getattr(f, "type", "") != "source"
+                and _SC_STRAND_QUAL not in quals):
+            nf = _shallow_copy(f)
+            nf.qualifiers = {**quals, _SC_STRAND_QUAL: ["none"]}
+            out.append(nf)
+            changed = True
+        else:
+            out.append(f)
+    return out if changed else features
+
+
+def _arrowless_decode_features(record):
+    """Inverse of `_arrowless_encode_features`, applied to a freshly-parsed
+    record we own: any feature tagged ``SpliceCraft_strand=["none"]`` has its
+    location strand restored to 0 (arrowless) and the marker stripped, so the
+    live record is both faithful (location.strand == 0) and clean (no leftover
+    marker to confuse a later edit or re-export). The strand setter propagates
+    to every part of a compound/wrap location. Mutates in place; returns the
+    record."""
+    for f in getattr(record, "features", None) or []:
+        quals = getattr(f, "qualifiers", None)
+        if not isinstance(quals, dict):
+            continue
+        q = quals.get(_SC_STRAND_QUAL)
+        if isinstance(q, list) and q and str(q[0]).strip().lower() == "none":
+            loc = getattr(f, "location", None)
+            if loc is not None:
+                try:
+                    loc.strand = 0
+                except (AttributeError, ValueError, TypeError):
+                    pass
+            quals.pop(_SC_STRAND_QUAL, None)
+    return record
+
+
+def _repair_wrapped_primer_seqs(record):
+    """Strip embedded whitespace from every ``/primer_seq`` qualifier on a
+    freshly-parsed record.
+
+    A primer sequence is pure DNA — it never contains spaces. But BioPython's
+    GenBank writer WRAPS a long qualifier value across lines, and its parser
+    rejoins the continuation line with a SPACE (the right thing for free-text
+    ``/note``, the wrong thing for a sequence). So any primer longer than the
+    GenBank value-wrap width (~58 chars) round-trips through ``.gb`` with a
+    literal space jammed mid-sequence:
+
+        /primer_seq="GCGCCGTCTCAAATGAATAAATGTATTCCAATGATAATTAATGGAA
+                     TGAT"           →  "…GGAA TGAT"
+
+    The seq panel faithfully drew that space as a one-column gap, shifting the
+    primer's 3' bases off the template (user-reported "gap in the primer that
+    isn't a real mismatch"). Stripping on load keeps the in-memory primer clean
+    for the bound-bar renderer, the primer editor, the binding re-derivation,
+    and any re-export. Idempotent: a re-save re-wraps the value, the next load
+    strips it again. Mutates in place; returns the record.
+    [primer display is catastrophic-class — project_primer_design_catastrophic]
+    """
+    for f in getattr(record, "features", None) or []:
+        if getattr(f, "type", "") != "primer_bind":
+            continue
+        quals = getattr(f, "qualifiers", None)
+        if not isinstance(quals, dict):
+            continue
+        ps = quals.get("primer_seq")
+        if isinstance(ps, list) and ps:
+            cleaned = [_normalize_primer_seq(v) for v in ps]
+            if cleaned != [str(v) for v in ps]:
+                quals["primer_seq"] = cleaned
+    return record
+
+
+def _record_to_gb_text(record) -> str:
+    """Serialize a SeqRecord to GenBank format text.
+
+    Biopython's genbank writer requires `molecule_type` in annotations
+    — if the record came from elsewhere and doesn't have it, default to
+    "DNA" rather than crashing. The fill-in happens on a shallow
+    SeqRecord copy so the caller's record is never mutated (avoids
+    subtle races with concurrent readers and surprise side effects for
+    callers that compare records by annotation contents).
+
+    Arrowless (strand 0) features are tagged with `SpliceCraft_strand=["none"]`
+    here so they survive the round-trip (`_arrowless_encode_features`); the
+    parse side restores them. No-op when nothing is arrowless.
+    """
+    from Bio import SeqIO
+    anns = dict(getattr(record, "annotations", None) or {})
+    anns.setdefault("molecule_type", "DNA")
+    # Provenance: stamp which SpliceCraft version + date first wrote this file
+    # into the GenBank COMMENT, so "which version made this?" is answerable
+    # from the file alone (a legacy fragment's origin was otherwise
+    # unknowable). Preserve an EXISTING stamp — the date reflects CREATION,
+    # not the most recent re-save — and never duplicate it on round-trips.
+    _prov = anns.get("comment", "")
+    if isinstance(_prov, (list, tuple)):
+        _prov = "\n".join(str(x) for x in _prov)
+    _prov = str(_prov or "")
+    if "Created by SpliceCraft v" not in _prov:
+        from datetime import date
+        _stamp = (f"Created by SpliceCraft v{_state._sc_version} "
+                  f"on {date.today().isoformat()}")
+        anns["comment"] = f"{_prov}\n{_stamp}".strip() if _prov else _stamp
+    rec = _shallow_copy(record)
+    rec.annotations = anns
+    # The GenBank LOCUS line forbids whitespace and caps length — Biopython
+    # raises "Invalid whitespace in '…' for LOCUS line" otherwise, which then
+    # breaks EVERY save + autosave (user-reported after a scrub Add-to-Map: a
+    # spaced display name had leaked into `record.name`). The human/display
+    # name lives in `_tui_display_name` + the library entry, NOT the LOCUS, so
+    # sanitise the LOCUS here on the COPY (never mutating the caller's record):
+    # collapse whitespace to `_`, fall back to the id, cap to the INSDC max.
+    _loc = re.sub(r"\s+", "_", str(getattr(rec, "name", "") or "").strip())
+    if not _loc:
+        _loc = re.sub(r"\s+", "_", str(getattr(rec, "id", "") or "").strip())
+    rec.name = _loc[:_GB_LOCUS_NAME_MAX] or "PLASMID"
+    rec.features = _arrowless_encode_features(getattr(record, "features", None))
+    buf = StringIO()
+    SeqIO.write(rec, buf, "genbank")
+    return buf.getvalue()
+
+
+def _gb_text_to_record(text: str, *, cache: bool = True):
+    """Parse GenBank format text back to a SeqRecord.
+
+    Defence-in-depth: cap input length at 64 MB before handing to
+    BioPython's parser. Library entries are gated through
+    `_safe_load_json`'s 1 GB cap and zip extracts through the 50 MB
+    member cap, but the GenBank parser itself is unbounded internally;
+    a single record line that happens to slip past upstream caps would
+    otherwise allocate intermediate parser objects without ceiling.
+
+    Results are LRU-cached (`_GB_PARSE_CACHE`, capped at
+    `_GB_PARSE_CACHE_MAX`) keyed on `hash(text)`. Returned records are
+    deepcopies of the cache value so callers can mutate freely (pitfall
+    #17 contract). Empty-string / oversize inputs bypass the cache.
+
+    Sweep #26 (2026-05-23) — pass ``cache=False`` for one-shot batch
+    parses (Plasmidsaurus zip ingest, bulk-import folder walk) where
+    the cache would absorb the entire batch's parsed records before
+    eviction. A 50-sample run × 5 MB assemblies = ~250 MB cache
+    pressure on a single click; the records are consumed immediately
+    so caching them has no payoff.
+    """
+    if not text:
+        # Explicit, clean error instead of handing "" to SeqIO.read (whose
+        # "No records found in handle" ValueError is opaque). Callers already
+        # pre-check or catch ValueError; this just makes the message legible.
+        raise ValueError("empty GenBank text")
+    if len(text) > _GB_TEXT_MAX_BYTES:
+        raise ValueError(
+            f"GenBank text too large to parse "
+            f"({len(text):,} bytes > "
+            f"{_GB_TEXT_MAX_BYTES:,} cap)"
+        )
+    if cache:
+        key = hash(text)
+        with _GB_PARSE_CACHE_LOCK:
+            hit = _GB_PARSE_CACHE.get(key)
+            if hit is not None:
+                _GB_PARSE_CACHE.move_to_end(key)
+                return deepcopy(hit)
+    from Bio import SeqIO
+    rec = SeqIO.read(StringIO(text), "genbank")
+    # Restore arrowless (strand 0) features tagged on the write side before
+    # the result is cached, so every caller sees a faithful + clean record.
+    _arrowless_decode_features(rec)
+    # Undo BioPython's wrap-rejoin space corruption of long `/primer_seq`
+    # qualifiers BEFORE caching, so the renderer never paints a phantom gap.
+    _repair_wrapped_primer_seqs(rec)
+    if cache:
+        with _GB_PARSE_CACHE_LOCK:
+            _GB_PARSE_CACHE[hash(text)] = deepcopy(rec)
+            while len(_GB_PARSE_CACHE) > _GB_PARSE_CACHE_MAX:
+                _GB_PARSE_CACHE.popitem(last=False)
+    return rec

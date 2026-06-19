@@ -37,6 +37,7 @@ _LAYER_RULES = [
     ("splicecraft_paths", 0),
     ("splicecraft_persistence", 0),
     ("splicecraft_util", 0),        # pure cross-cutting helpers (natural sort, sanitise, ...)
+    ("splicecraft_record", 1),      # GenBank <-> SeqRecord serialization (+ LRU parse cache)
     ("splicecraft_dataaccess", 1),  # _typed_clone + (Phase D) the domain _load_X/_save_X accessors
     ("splicecraft_cli_parser", 0),
     ("splicecraft_biology", 0),
