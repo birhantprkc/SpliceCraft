@@ -34,9 +34,9 @@ from textual.events import Click
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, DataTable, DirectoryTree, Input, Label, ListItem, ListView, RadioButton, RadioSet, Select, Static, TextArea
 
-from splicecraft_dataaccess import _iter_library_readonly, _load_library, _load_primer_collections
+from splicecraft_dataaccess import _NEB_ENZYMES, _get_active_collection_name, _grammar_dropdown_options, _iter_collections_readonly, _iter_library_readonly, _load_library, _load_primer_collections
 from splicecraft_logging import _log, _log_event
-from splicecraft_util import _cursor_row_key, _natural_sort_key, _sanitize_label
+from splicecraft_util import _cursor_row_key, _natural_sort_key, _sanitize_label, _sanitize_plasmid_name
 from splicecraft_widgets import _ExtensionAwareDirectoryTree, _FastaAwareDirectoryTree, _InstantPressButton, _PICKER_PLASMID_STYLE, _ZipAwareDirectoryTree
 
 
@@ -5302,3 +5302,659 @@ class SynthesisLoadModal(_OneShotDismissScreen, ModalScreen):
             return
         eid = row_key.value if hasattr(row_key, "value") else str(row_key)
         self.dismiss(eid)
+
+
+class CloneMethodChooserModal(_OneShotDismissScreen, ModalScreen):
+    """Shown the moment the Synthesis screen's "Clone Fragment" button is
+    pressed. The user picks HOW to clone the composed fragment — no save
+    and no name prompt happen here (naming is deferred to the
+    destination's own save step, where the user names the primed
+    fragment + the cloned plasmid independently).
+
+    Choices:
+      * a modular-cloning GRAMMAR (Golden Braid L0, MoClo Plant, or any
+        custom grammar from `_grammar_dropdown_options`) → routes to the
+        Parts Domesticator, prefilled with the fragment, which designs
+        domestication primers and produces the two L0 deliverables
+        (primed linear fragment + cloned plasmid in the entry vector);
+      * **Gibson assembly** → opens the Constructor's Gibson tab with the
+        fragment pre-pasted into the lane's paste box;
+      * **Traditional (restriction / ligation)** → opens the
+        Constructor's Traditional tab, fragment pre-pasted.
+
+    Dismisses with ``{"method": "grammar"|"gibson"|"traditional",
+    "grammar_id": <id or "">}`` or ``None`` on cancel."""
+
+    _blocks_undo: bool = True
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    DEFAULT_CSS = """
+    #cmc-dlg {
+        width: 76; height: auto; max-height: 90%;
+        background: #1c1c1c; border: solid $primary; padding: 1 2;
+    }
+    #cmc-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; margin-bottom: 1; text-align: center;
+    }
+    #cmc-hint { color: $text-muted; margin-bottom: 1; }
+    #cmc-list { height: auto; max-height: 20; }
+    #cmc-list Button { width: 100%; margin-bottom: 1; }
+    #cmc-cancel-row { height: 3; margin-top: 1; align: right middle; }
+    """
+
+    def __init__(self, *, title: str = "", hint: str = "") -> None:
+        super().__init__()
+        # Snapshot the grammar list once so the button-id → grammar-id
+        # map stays stable for the modal's lifetime (a grammar added in
+        # another screen mid-modal can't shift the indices).
+        self._grammars: "list[tuple[str, str]]" = _grammar_dropdown_options()
+        # Optional caller wording so the same chooser serves both the Synthesis
+        # "Clone Fragment" handoff (default) and the Alt+Shift+P selection→
+        # pipeline hub ("Send selection to…").
+        self._title: str = title or " Clone Fragment — choose a method "
+        self._hint: str = hint or (
+            "How should this fragment be cloned? Modular grammars "
+            "domesticate it into an L0 part (primed fragment + cloned "
+            "plasmid). Gibson / Traditional open the Constructor with "
+            "the fragment pre-filled.")
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="cmc-dlg"):
+            yield Static(self._title, id="cmc-title")
+            yield Static(self._hint, id="cmc-hint", markup=False)
+            with VerticalScroll(id="cmc-list"):
+                for i, (label, _gid) in enumerate(self._grammars):
+                    yield Button(label, id=f"cmc-g{i}", variant="primary",
+                                 tooltip="Build an assembly with this grammar")
+                yield Button("Gibson assembly", id="cmc-gibson")
+                yield Button(
+                    "Traditional (restriction / ligation)",
+                    id="cmc-traditional",
+                )
+            with Horizontal(id="cmc-cancel-row"):
+                yield Button("Cancel", id="cmc-cancel")
+
+    @on(Button.Pressed)
+    def _on_button(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        if bid == "cmc-cancel":
+            self.dismiss(None)
+        elif bid == "cmc-gibson":
+            self.dismiss({"method": "gibson", "grammar_id": ""})
+        elif bid == "cmc-traditional":
+            self.dismiss({"method": "traditional", "grammar_id": ""})
+        elif bid.startswith("cmc-g"):
+            try:
+                idx = int(bid[len("cmc-g"):])
+            except ValueError:
+                return
+            if 0 <= idx < len(self._grammars):
+                self.dismiss({
+                    "method": "grammar",
+                    "grammar_id": self._grammars[idx][1],
+                })
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class NamePlasmidModal(_OneShotDismissScreen, ModalScreen):
+    """Prompt the user to name a freshly-assembled plasmid before
+    it lands in the library.
+
+    Default value is the auto-generated ``vector · part1+part2…``
+    string from `ConstructorModal._compose_assembly_name`. The user
+    can edit it freely; the dismiss flow re-runs
+    ``_sanitize_plasmid_name`` so even a hand-pasted weird character
+    can't reach the library.
+
+    Shows a reference table of every plasmid already in the active
+    collection so the user can pick a non-colliding name at a glance.
+    Live duplicate-name check on `Input.Changed`: when the sanitised
+    name matches an existing entry's name (case-insensitive) the Save
+    button is disabled and the status line flags the collision.
+
+    Dismiss payload:
+      ``str``  — the sanitised name (always non-empty, non-duplicate).
+      ``None`` — user cancelled; caller should NOT save.
+    """
+
+    _blocks_undo: bool = True   # Input editing; result becomes library entry name
+
+    DEFAULT_CSS = """
+    /* Tidy spacing: a min width so neither the inputs nor the optional
+       "Primer Family Name" box clip, and one blank line between each
+       stacked element so the labels + textboxes read cleanly. */
+    #nameplasmid-dlg { min-width: 62; }
+    #nameplasmid-input, #nameplasmid-collection,
+    #nameplasmid-primer-family, #nameplasmid-status {
+        margin-bottom: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, default_name: str,
+                 *, target_label: str = "plasmid",
+                 default_collection: "str | None" = None,
+                 primer_family: "str | None" = None) -> None:
+        super().__init__()
+        self._default_name = _sanitize_plasmid_name(
+            default_name or "", fallback="assembly",
+        )
+        # ``target_label`` ("TU", "MOD", or just "plasmid") shows up
+        # in the title so the user knows which level they're naming.
+        self._target_label = target_label or "plasmid"
+        # Opt-in "Primer Family Name" box: when given, the modal shows a
+        # single labelled textbox and the dismiss dict carries
+        # ``"primer_family"``. The operon save uses it to name the SOE
+        # primer set ``{family}-DOM-{#}-{F|R}``. None → no box (every other
+        # caller unaffected).
+        self._primer_family_mode = primer_family is not None
+        self._default_primer_family = (
+            _sanitize_plasmid_name(primer_family or "", fallback="primers")
+            if primer_family is not None else ""
+        )
+        # Opt-in collection picker: when ``default_collection`` is given
+        # the modal shows a "Save to collection" Select and dismisses
+        # with ``{"name": str, "collection": str}``; when it's None the
+        # modal keeps its legacy contract (dismiss with a bare ``str``)
+        # so existing callers are unaffected. The universal save flow
+        # (Constructor / Gibson / Traditional / amplicon) passes the
+        # active collection here so the user can redirect the save.
+        self._collection_mode = default_collection is not None
+        self._collections: list[str] = []
+        self._default_collection = ""
+        if self._collection_mode:
+            names: list[str] = []
+            try:
+                for c in _iter_collections_readonly():
+                    if not isinstance(c, dict):
+                        continue
+                    nm = (c.get("name") or "").strip()
+                    if nm and nm not in names:
+                        names.append(nm)
+            except Exception:
+                _log.exception("NamePlasmidModal: collection enum failed")
+            active = (default_collection or "").strip()
+            # Active collection first + guaranteed present so the Select
+            # (allow_blank=False) always mounts with a valid value.
+            ordered = ([active] if active else []) + [
+                n for n in names if n != active
+            ]
+            if not ordered:
+                ordered = [active or "Default"]
+            self._collections = ordered
+            self._default_collection = ordered[0]
+        # Snapshot existing names / ids at modal-construct time —
+        # the library doesn't mutate while the modal is open so a
+        # one-shot read is enough and keeps the dup-check O(1) on
+        # every keystroke. Names are case-folded so a user typing
+        # "Demo 26" still flags the existing "DEMO 26".
+        self._existing_names: dict[str, str] = {}
+        self._existing_ids:   dict[str, str] = {}
+        seen_name_keys: set[str] = set()
+        dup_name_log: list[str] = []
+        # Sweep #26: readonly walk — building maps is read-only over the
+        # cache view, no deepcopy needed.
+        for e in _iter_library_readonly():
+            if not isinstance(e, dict):
+                continue
+            nm = (e.get("name") or "").strip()
+            eid = (e.get("id") or "").strip()
+            if nm:
+                key = nm.casefold()
+                if key in seen_name_keys:
+                    dup_name_log.append(nm)
+                seen_name_keys.add(key)
+                self._existing_names[key] = nm
+            if eid:
+                # Map id → DISPLAY name (fall back to id when name is
+                # empty) so the dup-warning surfaces what the user sees
+                # in the library row, not the bare stale id. After a
+                # rename `e["id"]` is the OLD sanitised name (immutable
+                # by design) while `e["name"]` is the user's new label
+                # — showing the id confused users into thinking the
+                # warning referenced a phantom old plasmid.
+                self._existing_ids[eid.casefold()] = nm or eid
+        # Surface data-integrity oddities: two library entries that
+        # case-fold to the same display name are likely the
+        # downstream of an unintended duplicate-save. The modal
+        # itself prevents new duplicates; this log lets a user
+        # diagnose existing ones via the diagnostic bundle.
+        if dup_name_log:
+            _log.warning(
+                "NamePlasmidModal: library contains %d case-fold "
+                "duplicate name(s): %s — first/last wins for dup-check",
+                len(dup_name_log), dup_name_log[:5],
+            )
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="nameplasmid-dlg"):
+            yield Static(
+                f" Name your {self._target_label} ",
+                id="nameplasmid-title",
+            )
+            yield Label(
+                "This name lands on the SeqRecord, the library row, "
+                "and the Parts Bin entry. You can rename later.",
+            )
+            yield Input(
+                value=self._default_name,
+                placeholder="enter a name (default shown)",
+                id="nameplasmid-input",
+            )
+            yield Static("", id="nameplasmid-status", markup=True)
+            if self._collection_mode:
+                yield Label("Save to collection:")
+                yield Select(
+                    [(c, c) for c in self._collections],
+                    value=self._default_collection,
+                    allow_blank=False,
+                    id="nameplasmid-collection",
+                )
+            if self._primer_family_mode:
+                yield Label("Primer Family Name:")
+                yield Input(
+                    value=self._default_primer_family,
+                    placeholder="primer family (e.g. VhLux)",
+                    id="nameplasmid-primer-family",
+                )
+            # Reference table of existing plasmids in the active
+            # collection — read-only, sorted alphabetically (natural-
+            # sort) so the user can scan for collisions at a glance.
+            active_coll = _get_active_collection_name() or "library"
+            yield Label(
+                f"Existing plasmids in '{active_coll}' "
+                f"({len(self._existing_names)}):",
+                id="nameplasmid-list-label",
+            )
+            yield DataTable(
+                id="nameplasmid-list",
+                cursor_type="row",
+                zebra_stripes=True,
+                show_header=False,
+            )
+            with Horizontal(id="nameplasmid-btns"):
+                yield Button("Save",   id="btn-nameplasmid-save",
+                             variant="primary")
+                yield Button("Cancel", id="btn-nameplasmid-cancel")
+
+    def on_mount(self) -> None:
+        # Populate the reference table — natural-sort by name so
+        # `DEMO 2` lands before `DEMO 10`. Use the underlying display
+        # names (not the case-folded keys) for visual fidelity.
+        try:
+            t = self.query_one("#nameplasmid-list", DataTable)
+        except NoMatches:
+            t = None
+        if t is not None:
+            t.add_columns("Name")
+            display_names = sorted(
+                set(self._existing_names.values()),
+                key=_natural_sort_key,
+            )
+            if display_names:
+                for nm in display_names:
+                    t.add_row(
+                        Text(nm, no_wrap=True, overflow="ellipsis"),
+                    )
+            else:
+                # Empty-collection placeholder — better than a bare
+                # empty DataTable which reads as "loading" or "broken".
+                t.add_row(Text(
+                    "(no plasmids yet in this collection)",
+                    style="dim italic",
+                ))
+        try:
+            inp = self.query_one("#nameplasmid-input", Input)
+        except NoMatches:
+            return
+        inp.focus()
+        # Run the dup check once on the default value so the user
+        # sees the warning + the Save button reflects state without
+        # having to type a character first.
+        self._refresh_dup_state(inp.value)
+
+    @on(Input.Changed, "#nameplasmid-input")
+    def _on_input_changed(self, event: Input.Changed) -> None:
+        # Live dup-check on every keystroke. `event.value` is the
+        # post-keystroke string. Status-line update covers exact
+        # match (red) AND substring near-miss (yellow) — see
+        # `_refresh_dup_state` for the policy. The reference table
+        # below the Input stays unfiltered so the user can scan all
+        # existing names regardless of what they've typed.
+        _log.debug(
+            "NamePlasmidModal: Input.Changed value=%r len(value)=%d",
+            event.value, len(event.value),
+        )
+        self._refresh_dup_state(event.value)
+
+    def _refresh_dup_state(self, raw_value: str) -> "str | None":
+        """Run the sanitise + duplicate check against the current
+        Input value. Updates the status line + Save button. Returns
+        the cleaned name when valid + non-duplicate, else ``None``.
+        Centralised so `on_mount`, `Input.Changed`, and `_try_submit`
+        all see consistent state without re-implementing the logic.
+
+        Three severity levels:
+          * **Exact dup** (case-folded name OR sanitised id matches an
+            existing entry) → red status, Save disabled.
+          * **Soft warning** (typed string is a substring of an
+            existing name, OR an existing name is a substring of the
+            typed string) → yellow status, Save enabled. User has to
+            confirm by pressing Save anyway — soft warnings catch
+            near-misses without blocking legitimate distinct names
+            that happen to share a prefix.
+          * **Available** → green status, Save enabled.
+        """
+        try:
+            status = self.query_one("#nameplasmid-status", Static)
+            save_btn = self.query_one(
+                "#btn-nameplasmid-save", Button,
+            )
+        except NoMatches:
+            return None
+        cleaned = _sanitize_plasmid_name(
+            raw_value, fallback=self._default_name,
+        )
+        if not cleaned:
+            status.update("[bold red]Name cannot be empty.[/bold red]")
+            save_btn.disabled = True
+            return None
+        # Markup-escape every user-controlled string that interpolates
+        # into a `markup=True` Static. Without this, a saved entry
+        # named "TU [draft]" would render the trailing "[draft]" as a
+        # Rich-markup tag — visually broken at best, malformed-string
+        # exception at worst. Sacred hygiene rule the History viewer
+        # already follows (CLAUDE.md invariant #11). `cleaned` itself
+        # comes from `_sanitize_plasmid_name` which strips paths and
+        # control chars BUT preserves `[`, `]`, `<`, `>`, `&` so the
+        # display side has to escape.
+        from rich.markup import escape as _md_escape
+        cleaned_safe = _md_escape(cleaned)
+        # Detect leading / trailing whitespace separately from other
+        # cleaning (illegal chars, length cap). Trailing whitespace
+        # is the silent-cascade-breaker case (`'DEMO 27 ….dna'` → name
+        # with trailing space → delete-cascade `==` miss against the
+        # parts_bin row). Surface it as a distinct warning chip so the
+        # user notices BEFORE saving, even though save will strip it
+        # for them anyway.
+        has_lead_ws = raw_value != raw_value.lstrip()
+        has_trail_ws = raw_value != raw_value.rstrip()
+        whitespace_warning = ""
+        if has_lead_ws or has_trail_ws:
+            sides = []
+            if has_lead_ws:
+                sides.append("leading")
+            if has_trail_ws:
+                sides.append("trailing")
+            whitespace_warning = (
+                f"[yellow]⚠ {' + '.join(sides)} whitespace will be "
+                f"stripped[/yellow] — saved as [b]{cleaned_safe}[/b]"
+            )
+        # Cleaning-only mismatch (whitespace / illegal chars stripped).
+        # Not an error — surface as info so the user can confirm.
+        # When the only diff is leading/trailing whitespace, the
+        # standalone `whitespace_warning` above already covers it;
+        # otherwise (illegal chars, length cap) the generic hint
+        # appended after status messages tells the user the final form.
+        cleaning_hint = ""
+        if cleaned != raw_value.strip():
+            cleaning_hint = (
+                f" [yellow](will save as[/yellow] [b]{cleaned_safe}[/b]"
+                f"[yellow])[/yellow]"
+            )
+        # Case-fold for matching — typing "Demo 26" still flags the
+        # existing "DEMO 26". Check both name and sanitised id space
+        # since the library disambiguates by id.
+        cleaned_cf = cleaned.casefold()
+        cleaned_id = re.sub(r"[^A-Za-z0-9_]+", "_", cleaned)
+        cleaned_id_cf = cleaned_id.casefold()
+        if cleaned_cf in self._existing_names:
+            actual = _md_escape(self._existing_names[cleaned_cf])
+            status.update(
+                f"[bold red]✗ DUPLICATE — already in use:[/bold red] "
+                f"[b]{actual}[/b]{cleaning_hint}"
+            )
+            save_btn.disabled = True
+            return None
+        if cleaned_id_cf in self._existing_ids:
+            actual = _md_escape(self._existing_ids[cleaned_id_cf])
+            sanitised_safe = _md_escape(cleaned_id)
+            status.update(
+                f"[bold red]✗ Sanitised id[/bold red] [b]{sanitised_safe}[/b] "
+                f"[bold red]clashes with[/bold red] [b]{actual}[/b] "
+                f"(would auto-rename on save){cleaning_hint}"
+            )
+            save_btn.disabled = True
+            return None
+        # Soft warning: substring overlap with an existing name.
+        # Either direction matters — a user typing "DEMO 32" sees the
+        # existing "DEMO 32 VARA" as a near-match, and a user typing
+        # "DEMO 32 NEW CDS" sees the existing "DEMO 32" as a near-match.
+        # Save stays enabled — the names are distinct so the user can
+        # legitimately commit. Just keeps near-misses visible.
+        soft_hits: list[str] = []
+        for existing_name in self._existing_names.values():
+            ecf = existing_name.casefold()
+            if (cleaned_cf in ecf or ecf in cleaned_cf) \
+                    and cleaned_cf != ecf:
+                soft_hits.append(existing_name)
+                if len(soft_hits) >= 3:
+                    break
+        if soft_hits:
+            preview = ", ".join(
+                f"[b]{_md_escape(n)}[/b]" for n in soft_hits[:3]
+            )
+            status.update(
+                f"[yellow]⚠ similar to:[/yellow] {preview}"
+                f"{cleaning_hint}"
+            )
+            save_btn.disabled = False
+            return cleaned
+        if whitespace_warning:
+            # Leading/trailing-space-only case gets the dedicated
+            # warning chip (more prominent than the generic
+            # "Will save as" hint).
+            status.update(whitespace_warning)
+        elif cleaning_hint:
+            status.update(
+                f"[yellow]Will save as[/yellow] [b]{cleaned_safe}[/b]"
+            )
+        else:
+            status.update("[bold green]✓ Name available.[/bold green]")
+        save_btn.disabled = False
+        return cleaned
+
+    @on(Button.Pressed, "#btn-nameplasmid-save")
+    def _save(self, _) -> None:
+        self._try_submit()
+
+    @on(Input.Submitted, "#nameplasmid-input")
+    def _submitted(self, _) -> None:
+        self._try_submit()
+
+    def _try_submit(self) -> None:
+        try:
+            inp = self.query_one("#nameplasmid-input", Input)
+        except NoMatches:
+            return
+        # Final guard — `_refresh_dup_state` already disables Save on
+        # dup / empty cases, but pressing Enter on the Input bypasses
+        # the button so we re-validate here. Same dup-check the
+        # button uses; returns None when not OK, in which case the
+        # status line already shows why.
+        cleaned = self._refresh_dup_state(inp.value)
+        if cleaned is None:
+            return
+        # If sanitisation reshaped the user's input, reflect that
+        # back into the field before dismiss so the next caller (rare
+        # but possible — e.g. an agent inspecting the modal's last
+        # value) sees the canonical form.
+        try:
+            if cleaned != inp.value:
+                inp.value = cleaned
+        except Exception:
+            pass
+        if self._collection_mode or self._primer_family_mode:
+            payload: dict = {"name": cleaned}
+            if self._collection_mode:
+                payload["collection"] = self._selected_collection()
+            if self._primer_family_mode:
+                payload["primer_family"] = self._selected_primer_family()
+            self.dismiss(payload)
+        else:
+            self.dismiss(cleaned)
+
+    def _selected_primer_family(self) -> str:
+        """Currently-entered primer family (primer-family mode only),
+        sanitised; falls back to the default when blank / missing."""
+        try:
+            v = self.query_one("#nameplasmid-primer-family", Input).value
+        except NoMatches:
+            return self._default_primer_family or "primers"
+        v = _sanitize_plasmid_name(v or "", fallback="primers")
+        return v or self._default_primer_family or "primers"
+
+    def _selected_collection(self) -> str:
+        """Currently-picked collection (collection mode only). Falls back
+        to the default if the Select is missing / blank."""
+        try:
+            v = self.query_one("#nameplasmid-collection", Select).value
+        except NoMatches:
+            return self._default_collection
+        return v if isinstance(v, str) and v.strip() else \
+            self._default_collection
+
+    @on(Button.Pressed, "#btn-nameplasmid-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class RestrictionInsertModal(_OneShotDismissScreen, ModalScreen):
+    """Searchable picker for inserting a restriction-enzyme recognition
+    site at the synthesis cursor.
+
+    Dismiss payload:
+      * ``str`` — the enzyme name (caller looks up the recognition
+        site via ``_site_for_enzyme`` and inserts at cursor).
+      * ``None`` — user cancelled."""
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("enter",  "pick",   "Insert"),
+    ]
+
+    DEFAULT_CSS = """
+    #ri-dlg {
+        width: 60%; max-width: 80; height: 80%; max-height: 36;
+        background: $surface; padding: 1 2; border: solid $primary-darken-2;
+    }
+    #ri-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; height: 1; text-align: center;
+    }
+    #ri-search { height: 3; margin-top: 1; }
+    #ri-table  { height: 1fr; border: solid $primary-darken-2;
+                 margin-top: 1; }
+    #ri-btns   { height: 3; align: right middle; margin-top: 1; }
+    #ri-btns Button { margin-left: 1; min-width: 10; }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Pre-build the full enzyme list once so search re-filtering
+        # is cheap. (name, site, n_bp).
+        self._all_rows: list[tuple[str, str, int]] = sorted(
+            (
+                (name, info[0], len(info[0].replace("N", "")))
+                for name, info in _NEB_ENZYMES.items()
+                if isinstance(info, tuple) and info
+            ),
+            key=lambda r: _natural_sort_key(r[0]),
+        )
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ri-dlg"):
+            yield Static(" Insert restriction site at cursor ",
+                          id="ri-title")
+            yield Input(placeholder="filter by name or site "
+                         "(e.g. EcoRI, GAATTC, BsaI)",
+                          id="ri-search")
+            yield DataTable(id="ri-table",
+                              cursor_type="row",
+                              zebra_stripes=True)
+            with Horizontal(id="ri-btns"):
+                yield Button("Insert", id="btn-ri-insert", variant="primary")
+                yield Button("Cancel", id="btn-ri-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            t = self.query_one("#ri-table", DataTable)
+            t.add_columns("Enzyme", "Recognition", "bp")
+        except NoMatches:
+            return
+        self._repopulate("")
+        try:
+            self.query_one("#ri-search", Input).focus()
+        except NoMatches:
+            pass
+
+    def _repopulate(self, needle: str) -> None:
+        try:
+            t = self.query_one("#ri-table", DataTable)
+        except NoMatches:
+            return
+        t.clear()
+        needle_up = needle.strip().upper()
+        for name, site, n_bp in self._all_rows:
+            if needle_up and needle_up not in name.upper() \
+                    and needle_up not in site.upper():
+                continue
+            t.add_row(name, site, str(n_bp), key=name)
+
+    @on(Input.Changed, "#ri-search")
+    def _on_search(self, event: Input.Changed) -> None:
+        self._repopulate(event.value)
+
+    @on(Input.Submitted, "#ri-search")
+    def _on_search_submit(self, _) -> None:
+        self.action_pick()
+
+    @on(Button.Pressed, "#btn-ri-insert")
+    def _btn_insert(self, _) -> None:
+        self.action_pick()
+
+    @on(Button.Pressed, "#btn-ri-cancel")
+    def _btn_cancel(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_pick(self) -> None:
+        try:
+            t = self.query_one("#ri-table", DataTable)
+        except NoMatches:
+            self.dismiss(None)
+            return
+        if t.cursor_row < 0 or t.row_count == 0:
+            return
+        try:
+            row_key = t.coordinate_to_cell_key(
+                _Coordinate(t.cursor_row, 0)
+            ).row_key
+        except (LookupError, AttributeError):
+            self.dismiss(None)
+            return
+        enzyme = row_key.value if hasattr(row_key, "value") else str(row_key)
+        self.dismiss(enzyme)

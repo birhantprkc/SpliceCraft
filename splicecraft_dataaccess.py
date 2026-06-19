@@ -18,6 +18,8 @@ site resolve unchanged.
 """
 from __future__ import annotations
 
+import re
+
 from copy import deepcopy
 from datetime import date as _date
 from typing import Any as _Any, TypeVar as _TypeVar
@@ -25,6 +27,7 @@ from typing import Any as _Any, TypeVar as _TypeVar
 import splicecraft_state as _state
 from splicecraft_logging import _log, _log_event, _repr_for_log
 from splicecraft_persistence import _safe_load_json, _safe_save_json
+from splicecraft_record import _gb_text_to_record
 
 # Immutable types `_typed_clone` returns as-is (no copy needed). Everything else
 # recurses (dict / list / tuple) or falls through to `deepcopy` for any
@@ -2184,3 +2187,116 @@ def _get_entry_vector(
         if e.get("grammar_id") == grammar_id and (e.get("role") or "") == role:
             return e
     return None
+
+
+# ── Selection-marker detection + grammar dropdown options (moved, Phase D) ──
+# `_detect_selection_marker` parses gb_text via `_gb_text_to_record` (record sibling,
+# same layer); `_grammar_dropdown_options` reads `_all_grammars`/`_BUILTIN_GRAMMARS`.
+_SELECTION_MARKER_KEYWORDS: "tuple[tuple[str, str], ...]" = (
+    ("ampicillin",     "Ampicillin"),
+    ("ampr",           "Ampicillin"),
+    ("kanamycin",      "Kanamycin"),
+    ("kanr",           "Kanamycin"),
+    ("neomycin",       "Kanamycin"),
+    ("neor",           "Kanamycin"),
+    ("spectinomycin",  "Spectinomycin"),
+    ("specr",          "Spectinomycin"),
+    ("aada",           "Spectinomycin"),
+    ("smr",            "Spectinomycin"),
+    ("chloramphenicol", "Chloramphenicol"),
+    ("cmr",            "Chloramphenicol"),
+    ("cat",            "Chloramphenicol"),
+    ("tetracycline",   "Tetracycline"),
+    ("tetr",           "Tetracycline"),
+    ("hygromycin",     "Hygromycin"),
+    ("hygr",           "Hygromycin"),
+    ("zeocin",         "Zeocin"),
+    ("zeor",           "Zeocin"),
+    ("gentamicin",     "Gentamicin"),
+    ("gmr",            "Gentamicin"),
+    ("erythromycin",   "Erythromycin"),
+    ("ermr",           "Erythromycin"),
+    ("bla",            "Ampicillin"),   # last — matches "bla" alone
+)
+
+
+def _detect_selection_marker(gb_text: str) -> "str | None":
+    """Scan a plasmid's GenBank text for a feature whose
+    label / gene / product / note contains one of
+    ``_SELECTION_MARKER_KEYWORDS`` and return the matching display
+    name (e.g. ``"Kanamycin"``). Returns ``None`` when no recognised
+    marker is found. Used by the Domesticator's part-save path so
+    the saved `marker` field reflects the user's configured entry
+    vector instead of the historical pUPD2 / Spectinomycin defaults.
+
+    Conservative on parse failure: malformed or empty `gb_text`
+    yields ``None`` so the caller can fall back to a placeholder
+    rather than asserting a marker we can't actually verify.
+    """
+    if not isinstance(gb_text, str) or not gb_text.strip():
+        return None
+    try:
+        rec = _gb_text_to_record(gb_text)
+    except Exception:
+        return None
+    qual_keys = ("label", "gene", "product", "note", "standard_name")
+    # Sweep #34 (2026-05-26): word-boundary match instead of bare
+    # substring. Pre-fix a CDS labelled `"category"` would hit
+    # `"cat" in "category"` → returned "Chloramphenicol" silently.
+    # Same false-positive vector with `"bla"` inside `"blast"`,
+    # `"smr"` inside `"smrt-seq"`, etc. Tokenise on non-alnum
+    # separators so the match needs an isolated word — false-
+    # positives shrink to near-zero while real labels (`cat`,
+    # `bla`, `kanR-cat-tet`) still resolve.
+    for feat in getattr(rec, "features", []) or []:
+        bag: list[str] = []
+        for k in qual_keys:
+            vals = feat.qualifiers.get(k) if hasattr(feat, "qualifiers") \
+                else None
+            if isinstance(vals, list):
+                bag.extend(str(v) for v in vals)
+            elif isinstance(vals, str):
+                bag.append(vals)
+        for s in bag:
+            tokens = {
+                t.lower()
+                for t in re.split(r"[^A-Za-z0-9]+", s)
+                if t
+            }
+            if not tokens:
+                continue
+            for kw, display in _SELECTION_MARKER_KEYWORDS:
+                if kw in tokens:
+                    return display
+    return None
+
+
+def _grammar_dropdown_options() -> list[tuple[str, str]]:
+    """Return ``[(display_name, id), …]`` for every grammar, in the
+    canonical order used wherever a Select dropdown lists grammars
+    (DomesticatorModal "Grammar" picker today; future menus likely):
+
+      1. **Golden Braid L0 first** — the default reference grammar.
+         Pinned at position 1 regardless of any other ordering
+         shenanigans (e.g., a custom grammar id-sorted before
+         ``gb_l0``).
+      2. Other built-in grammars (MoClo Plant, etc.) in
+         ``_BUILTIN_GRAMMARS`` insertion order.
+      3. Custom grammars from ``cloning_grammars.json`` last, tagged
+         ``(custom)`` for visual disambiguation.
+    """
+    grammars = _all_grammars()
+    out: list[tuple[str, str]] = []
+    if "gb_l0" in grammars:
+        g = grammars["gb_l0"]
+        out.append((f"{g.get('name', 'Golden Braid L0')}", "gb_l0"))
+    for gid in _BUILTIN_GRAMMARS:
+        if gid == "gb_l0" or gid not in grammars:
+            continue
+        g = grammars[gid]
+        out.append((f"{g.get('name', gid)}", gid))
+    for gid, g in grammars.items():
+        if gid in _BUILTIN_GRAMMARS:
+            continue
+        out.append((f"{g.get('name', gid)}  (custom)", gid))
+    return out

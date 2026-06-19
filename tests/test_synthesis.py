@@ -2809,7 +2809,11 @@ class TestSynthesisRenderExceptNarrowed:
         # known column depth.
         synth_start = src.find("class SynthesisEditor(")
         protein_start = src.find("class ProteinEditor(")
-        protein_end = src.find("class RestrictionInsertModal(")
+        # End ProteinEditor's body at the next TOP-LEVEL class (was anchored on
+        # `class RestrictionInsertModal(`, which moved to splicecraft_modals in
+        # Phase D — use the generic next-class boundary so the anchor survives
+        # future relocations).
+        protein_end = src.find("\nclass ", protein_start + 1)
         assert synth_start > 0 and protein_start > 0 and protein_end > 0
         synth_body = src[synth_start:protein_start]
         protein_body = src[protein_start:protein_end]

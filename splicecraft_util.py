@@ -285,3 +285,80 @@ def _sanitize_plasmid_name(raw: str, *,
     if len(cleaned) > max_len:
         cleaned = cleaned[:max_len].rstrip()
     return cleaned or fallback
+
+
+# ── More pure helpers (moved from hub, Phase D) ─────────────────────────────
+def _feat_bounds(feat, total: int) -> "tuple[int, int, int] | None":
+    """Wrap-aware extraction of `(start, end, strand)` from a Biopython
+    `SeqFeature`. The returned `(start, end)` follows the dict-feature
+    convention: `end < start` signals an origin-spanning wrap; otherwise
+    `end > start`. Returns `None` if the location has non-integer coords
+    (UnknownPosition / BetweenPosition).
+
+    For a `CompoundLocation` of exactly two parts whose outer bounds are
+    `[0, ..)` and `[.., total)`, re-encodes as `(tail_start, head_end)`
+    so callers can slice with `_slice_circular` and length with `_feat_len`.
+    Other compound shapes flatten to outer bounds.
+
+    Callers that read `int(feat.location.start)` / `int(feat.location.end)`
+    directly silently flatten wrap features (Biopython returns `min(part.start)`
+    for a CompoundLocation), so any code that later does `seq[s:e]` returns
+    the BACKBONE GAP rather than the feature. Always route through this
+    helper instead. See sacred invariant #9.
+    """
+    loc = getattr(feat, "location", None)
+    if loc is None:
+        return None
+    # Preserve `loc.strand == None` (BioPython's "no strand info") as
+    # 0 (arrowless) rather than coercing to 1. See `PlasmidMap._parse`
+    # for the same fix and rationale.
+    try:
+        _raw_strand = getattr(loc, "strand", None)
+        strand = int(_raw_strand) if _raw_strand is not None else 0
+    except (TypeError, ValueError):
+        strand = 0
+    try:
+        from Bio.SeqFeature import CompoundLocation
+    except ImportError:
+        CompoundLocation = None
+    if CompoundLocation is not None and isinstance(loc, CompoundLocation):
+        try:
+            parts = sorted(loc.parts, key=lambda p: int(p.start))
+            if (
+                total > 0 and len(parts) == 2
+                and int(parts[0].start) == 0
+                and int(parts[-1].end) == total
+                and int(parts[0].end) < int(parts[-1].start)
+            ):
+                # Origin wrap → (tail_start, head_end) so end < start.
+                return int(parts[-1].start), int(parts[0].end), strand
+            # Other compound shapes: outer bounds, lossy but oriented.
+            return int(parts[0].start), int(parts[-1].end), strand
+        except (TypeError, ValueError):
+            return None
+    try:
+        return int(loc.start), int(loc.end), strand
+    except (TypeError, ValueError):
+        return None
+
+
+def _name_modal_result(result: "_Any",
+                       default_collection: str) -> "tuple[str, str] | None":
+    """Normalise a `NamePlasmidModal` dismiss payload into
+    ``(name, collection)`` — or ``None`` for cancel / empty.
+
+    Accepts BOTH the collection-mode dict ``{"name", "collection"}`` and a
+    bare name ``str`` (legacy callers + direct-dismiss tests), so the
+    universal save callbacks stay robust regardless of how the modal was
+    dismissed. ``collection`` defaults to ``default_collection`` when the
+    payload doesn't carry one."""
+    if isinstance(result, dict):
+        nm = (result.get("name") or "").strip()
+        if not nm:
+            return None
+        coll = (result.get("collection") or "").strip() or default_collection
+        return (nm, coll)
+    if isinstance(result, str):
+        nm = result.strip()
+        return (nm, default_collection) if nm else None
+    return None
