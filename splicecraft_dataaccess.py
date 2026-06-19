@@ -523,3 +523,209 @@ def _codon_tables_save(entries: list[dict]) -> None:
     with _state._cache_lock:
         _safe_save_json(_state._CODON_TABLES_FILE, serializable, "Codon table library")
         _state._codon_tables_cache = _typed_clone(entries)
+
+
+# ── HMM database catalog (pyhmmer profile DBs) ──────────────────────────────
+# Builtin catalog + id/url sanitisers + entry normaliser + load/save. The
+# sanitisers + normaliser are also used by the hub HMM-management handlers
+# (via the re-export).
+
+
+# Custom URL accepted only if it parses as http/https with a host;
+# the protocol allowlist matches `[INV-36]`'s `$SPLICECRAFT_PYPI_URL`
+# override pattern.
+_HMM_DB_URL_MAX_LEN = 2048
+
+
+_BUILTIN_HMM_DB_CATALOG: "tuple[dict, ...]" = (
+    {
+        "id":          "pfam-a",
+        "name":        "Pfam-A",
+        "url":         "https://ftp.ebi.ac.uk/pub/databases/Pfam/"
+                       "current_release/Pfam-A.hmm.gz",
+        "version_url": "https://ftp.ebi.ac.uk/pub/databases/Pfam/"
+                       "current_release/Pfam.version.gz",
+        "format":      "hmm-gz",
+        "builtin":     True,
+        "description": "Pfam-A: curated protein family HMMs from EBI "
+                       "(~300 MB download, ~3 GB on disk after hmmpress).",
+    },
+    {
+        "id":          "ncbifam",
+        "name":        "NCBIfam",
+        "url":         "https://ftp.ncbi.nlm.nih.gov/hmm/current/"
+                       "NCBIfam.HMM.gz",
+        # NCBIfam doesn't publish a one-line version file; we use
+        # the source file's HTTP Last-Modified header as the version
+        # signature via the version-check helper's fallback path.
+        "version_url": "",
+        "format":      "hmm-gz",
+        "builtin":     True,
+        "description": "NCBIfam: HMMs for prokaryotic protein families "
+                       "(~600 MB download, ~4 GB on disk).",
+    },
+)
+
+
+def _typed_clone_hmm_catalog(entries: "list | None") -> list:
+    """Deepcopy-on-read for the catalog cache. Mirrors the pattern
+    every other persisted-list helper uses (cf. `[PIT-17]`)."""
+    if entries is None:
+        return []
+    return [dict(e) for e in entries if isinstance(e, dict)]
+
+
+def _sanitize_hmm_db_id(raw: object) -> "str | None":
+    """Return a sanitised id, or None on reject. Same rule set as
+    `_sanitize_experiment_id` / `_sanitize_gel_id`: non-empty, no NUL,
+    no path separators / shell metas, no `..`, ≤64 chars. The id
+    doubles as the on-disk directory name."""
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s or len(s) > 64:
+        return None
+    if "\x00" in s or ".." in s:
+        return None
+    if "/" in s or "\\" in s:
+        return None
+    for ch in s:
+        # Allow ASCII letters, digits, underscore, hyphen ONLY.
+        # Python's `str.isalnum()` is Unicode-permissive (accepts
+        # `é`, `ñ`, CJK, etc.) — we explicitly check the codepoint
+        # range so the id stays safe as a filesystem path component
+        # on every OS. Sweep #28 hardening: a unicode-looking id
+        # could pass cross-platform path checks on one OS but break
+        # on another, or differ between the bytes-on-disk and what
+        # the user typed (NFC vs NFD normalisation).
+        cp = ord(ch)
+        is_lower = (0x61 <= cp <= 0x7A)   # a-z
+        is_upper = (0x41 <= cp <= 0x5A)   # A-Z
+        is_digit = (0x30 <= cp <= 0x39)   # 0-9
+        is_safe  = (ch == "_" or ch == "-")
+        if not (is_lower or is_upper or is_digit or is_safe):
+            return None
+    return s
+
+
+def _sanitize_hmm_db_url(raw: object) -> "str | None":
+    """http(s) URL ≤ `_HMM_DB_URL_MAX_LEN`, otherwise None. Mirrors
+    `[INV-36]`'s `$SPLICECRAFT_PYPI_URL` validator.
+
+    Sweep #28: reject if the RAW input carries any whitespace /
+    control char ANYWHERE — even at the trailing edge. A leading /
+    trailing newline on a copy-pasted URL could trick a downstream
+    parser into header-smuggling. The check fires before `.strip()`
+    so we surface "you pasted a URL with hidden whitespace" rather
+    than silently scrubbing it."""
+    if not isinstance(raw, str):
+        return None
+    if any(ch.isspace() or ord(ch) < 0x20 for ch in raw):
+        return None
+    if not raw or len(raw) > _HMM_DB_URL_MAX_LEN:
+        return None
+    if not (raw.startswith("http://") or raw.startswith("https://")):
+        return None
+    return raw
+
+
+def _normalise_hmm_db_entry(entry: dict, *, builtin_default: bool = False
+                              ) -> "dict | None":
+    """Return a fresh dict shaped to the catalog schema, or None if
+    the entry is unsalvageable. Idempotent — safe to apply to entries
+    loaded from disk and to entries built in-process."""
+    if not isinstance(entry, dict):
+        return None
+    entry_id = _sanitize_hmm_db_id(entry.get("id"))
+    if entry_id is None:
+        return None
+    url = _sanitize_hmm_db_url(entry.get("url"))
+    if url is None:
+        return None
+    name_raw = entry.get("name")
+    if not isinstance(name_raw, str) or not name_raw.strip():
+        name = entry_id
+    else:
+        name = name_raw.strip()[:200]
+    version_url_raw = entry.get("version_url")
+    if isinstance(version_url_raw, str) and version_url_raw.strip():
+        version_url = _sanitize_hmm_db_url(version_url_raw) or ""
+    else:
+        version_url = ""
+    fmt = entry.get("format") or "hmm-gz"
+    if fmt not in ("hmm-gz", "hmm"):
+        fmt = "hmm-gz"
+    desc_raw = entry.get("description")
+    description = (desc_raw.strip()[:500]
+                   if isinstance(desc_raw, str) else "")
+    return {
+        "id":          entry_id,
+        "name":        name,
+        "url":         url,
+        "version_url": version_url,
+        "format":      fmt,
+        "builtin":     bool(entry.get("builtin", builtin_default)),
+        "description": description,
+    }
+
+
+def _load_hmm_db_catalog() -> list:
+    """Return the registered HMM-DB catalog (builtins + user-added).
+    Deep-clone on read so callers can freely mutate without affecting
+    the cache (cf. `[PIT-17]`).
+
+    First-load merges the built-in defaults into whatever is on disk;
+    subsequent loads return whatever was saved. Built-ins are still
+    re-injected if the user has removed them (defensive — the user
+    UI doesn't let you delete a builtin, but a hand-edited
+    catalog.json shouldn't permanently nuke them either).
+    """
+    with _state._cache_lock:
+        if _state._hmm_db_catalog_cache is None:
+            entries, warning = _safe_load_json(
+                _state._HMM_DB_CATALOG_FILE, "HMM database catalog",
+            )
+            if warning:
+                _log.warning("HMM database catalog: %s", warning)
+            normalised: list[dict] = []
+            seen_ids: set[str] = set()
+            for entry in entries:
+                norm = _normalise_hmm_db_entry(entry)
+                if norm is None:
+                    continue
+                if norm["id"] in seen_ids:
+                    continue
+                seen_ids.add(norm["id"])
+                normalised.append(norm)
+            # Re-inject any built-in the user removed (or that wasn't
+            # there on first launch). User overrides for builtin URL
+            # are preserved.
+            for builtin in _BUILTIN_HMM_DB_CATALOG:
+                if builtin["id"] not in seen_ids:
+                    normalised.append(
+                        _normalise_hmm_db_entry(
+                            dict(builtin), builtin_default=True,
+                        ) or {}
+                    )
+                    seen_ids.add(builtin["id"])
+            _state._hmm_db_catalog_cache = normalised
+        return _typed_clone_hmm_catalog(_state._hmm_db_catalog_cache)
+
+
+def _save_hmm_db_catalog(entries: list) -> None:
+    """Persist the catalog. Routed through `_safe_save_json` for the
+    L2 chokepoint + atomic-write + .bak chain. Cache reseat under
+    `_cache_lock` per `[INV-50]`."""
+    cleaned: list[dict] = []
+    seen: set[str] = set()
+    for entry in entries:
+        n = _normalise_hmm_db_entry(entry)
+        if n is None or n["id"] in seen:
+            continue
+        seen.add(n["id"])
+        cleaned.append(n)
+    with _state._cache_lock:
+        _safe_save_json(
+            _state._HMM_DB_CATALOG_FILE, cleaned, "HMM database catalog",
+        )
+        _state._hmm_db_catalog_cache = _typed_clone_hmm_catalog(cleaned)
