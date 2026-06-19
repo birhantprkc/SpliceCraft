@@ -192,6 +192,7 @@ only-include = [
     # data-safety chokepoint). SACRED: if this is missing from the wheel,
     # `import splicecraft` fails at the re-import step and NO save path works.
     "splicecraft_persistence.py",
+    "splicecraft_dataaccess.py",
     "splicecraft_render.py",
     "splicecraft_history.py",
     "splicecraft_widgets.py",
@@ -208,6 +209,7 @@ include = [
     "splicecraft_state.py",
     "splicecraft_logging.py",
     "splicecraft_persistence.py",
+    "splicecraft_dataaccess.py",
     "splicecraft_render.py",
     "splicecraft_history.py",
     "splicecraft_widgets.py",
