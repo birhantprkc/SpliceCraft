@@ -1743,7 +1743,7 @@ class TestSaveToLibraryFlow:
                     "description": "",
                 },
             })
-            assert sc._FEATURES_FILE.exists()
+            assert sc._state._FEATURES_FILE.exists()
             entries = sc._load_features()
             assert len(entries) == 1
             assert entries[0]["name"] == "lacZ-alpha"

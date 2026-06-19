@@ -1342,7 +1342,7 @@ class TestHTTPRegistration:
         """`_start_agent_api` writes (port, token) to the token file
         and `_stop_agent_api` removes it."""
         token_path = tmp_path / "agent_token"
-        monkeypatch.setattr(sc, "_AGENT_TOKEN_FILE", token_path)
+        monkeypatch.setattr(sc._state, "_AGENT_TOKEN_FILE", token_path)
         port = _free_port()
         app = MockApp()
         srv = sc._start_agent_api(app, port=port)

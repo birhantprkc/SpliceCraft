@@ -4845,7 +4845,7 @@ class TestPartsBinEdit:
         rewriting parts_bin.json. Verifies via the parts-bin file's
         mtime — if the no-op short-circuit fires, mtime stays put."""
         sc._save_parts_bin([self._stub_part()])
-        before_mtime = sc._PARTS_BIN_FILE.stat().st_mtime_ns
+        before_mtime = sc._state._PARTS_BIN_FILE.stat().st_mtime_ns
         app = sc.PlasmidApp()
         async with app.run_test(size=_BASELINE) as pilot:
             await pilot.pause()
@@ -4865,7 +4865,7 @@ class TestPartsBinEdit:
             edit_modal.query_one("#btn-partedit-save", sc.Button).press()
             await pilot.pause()
             await pilot.pause(0.1)
-        after_mtime = sc._PARTS_BIN_FILE.stat().st_mtime_ns
+        after_mtime = sc._state._PARTS_BIN_FILE.stat().st_mtime_ns
         assert after_mtime == before_mtime
 
     async def test_primer_tm_appears_in_label(self, isolated_parts_bin):
@@ -8767,7 +8767,7 @@ class TestMigratePartsBinMarkersFromVector:
         next launch skips the scan instead of re-running it."""
         sc._save_parts_bin([])
         sc._migrate_parts_bin_markers_from_vector()
-        marker_file = sc._PARTS_BIN_FILE.parent / ".markers_redetected"
+        marker_file = sc._state._PARTS_BIN_FILE.parent / ".markers_redetected"
         assert marker_file.exists()
 
 

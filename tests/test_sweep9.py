@@ -74,8 +74,8 @@ class TestRestoreModalCoversNewFiles:
         """The second tuple element is the attribute name on the
         module — confirm each resolves to a real Path constant."""
         for _label, attr in sc.RestoreFromBackupModal._TARGETS:
-            assert hasattr(sc, attr), f"{attr} missing from module"
-            val = getattr(sc, attr)
+            val = sc._resolve_state_or_hub(attr)
+            assert val is not None, f"{attr} missing from hub or _state"
             assert isinstance(val, Path), f"{attr} not a Path"
 
 

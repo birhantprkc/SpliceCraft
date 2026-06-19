@@ -177,7 +177,7 @@ class TestPreUpdateSha256Mandatory:
             '{"_schema_version": 1, "entries": []}',
             encoding="utf-8",
         )
-        monkeypatch.setattr(sc, "_LIBRARY_FILE", live_lib)
+        monkeypatch.setattr(sc._state, "_LIBRARY_FILE", live_lib)
         monkeypatch.setattr(
             sc, "_resolve_pre_update_backup_dir",
             lambda *_a, **_k: backup_root,
@@ -209,7 +209,7 @@ class TestPreUpdateSha256Mandatory:
             '{"_schema_version": 1, "entries": []}',
             encoding="utf-8",
         )
-        monkeypatch.setattr(sc, "_LIBRARY_FILE", live_lib)
+        monkeypatch.setattr(sc._state, "_LIBRARY_FILE", live_lib)
         monkeypatch.setattr(
             sc, "_resolve_pre_update_backup_dir",
             lambda *_a, **_k: backup_root,

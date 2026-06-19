@@ -116,7 +116,7 @@ class TestExperimentsPersistence:
                 "id": "exp-test1234", "title": "t", "body_md": "b",
             }, fresh=True),
         ])
-        raw = json.loads(sc._EXPERIMENTS_FILE.read_text())
+        raw = json.loads(sc._state._EXPERIMENTS_FILE.read_text())
         assert "_schema_version" in raw
         assert raw["_schema_version"] >= 1
         assert "entries" in raw
@@ -130,8 +130,8 @@ class TestExperimentsPersistence:
                     "body_md": f"body {i}",
                 }, fresh=True),
             ])
-        bak = sc._EXPERIMENTS_FILE.with_suffix(
-            sc._EXPERIMENTS_FILE.suffix + ".bak",
+        bak = sc._state._EXPERIMENTS_FILE.with_suffix(
+            sc._state._EXPERIMENTS_FILE.suffix + ".bak",
         )
         assert bak.exists()
         bak_data = json.loads(bak.read_text())
@@ -176,7 +176,7 @@ class TestExperimentsPersistence:
                 None,
             ],
         }
-        sc._EXPERIMENTS_FILE.write_text(json.dumps(raw))
+        sc._state._EXPERIMENTS_FILE.write_text(json.dumps(raw))
         sc._state._experiments_cache = None
         out = sc._load_experiments()
         assert len(out) == 1

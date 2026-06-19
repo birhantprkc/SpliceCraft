@@ -1118,7 +1118,7 @@ def _seed_collections(active="Default", others=None, seed_entries=None):
     sc._set_active_collection_name(active)
     sc._settings_flush_sync()
     sc._safe_save_json_mirror(
-        sc._LIBRARY_FILE, list(seed_entries or []), "Plasmid library")
+        sc._state._LIBRARY_FILE, list(seed_entries or []), "Plasmid library")
     sc._state._library_cache = None
 
 

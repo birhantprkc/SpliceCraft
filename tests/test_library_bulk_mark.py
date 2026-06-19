@@ -61,7 +61,7 @@ def _seed_two_collections(eden_n: int = 3, ffe_n: int = 0):
     sc._save_collections(colls)
     sc._set_active_collection_name("DemoColl")
     sc._settings_flush_sync()
-    sc._safe_save_json_mirror(sc._LIBRARY_FILE, eden_plasmids,
+    sc._safe_save_json_mirror(sc._state._LIBRARY_FILE, eden_plasmids,
                                 "Plasmid library")
     sc._state._library_cache = None
     return [e["id"] for e in eden_plasmids]
@@ -304,7 +304,7 @@ class TestMoveCopyCommit:
             entry_ids=eden_ids, mode="copy",
         )
         # plasmid_library.json was re-mirrored from the updated DemoColl.
-        mirror = json.loads(sc._LIBRARY_FILE.read_text("utf-8"))
+        mirror = json.loads(sc._state._LIBRARY_FILE.read_text("utf-8"))
         entries, _err = sc._extract_entries(mirror, "Plasmid library")
         assert _err is None
         assert entries is not None
@@ -392,14 +392,14 @@ class TestMoveCopyCommit:
         # the new empty state.
         eden_ids = _seed_two_collections(eden_n=2, ffe_n=0)
         # Verify the mirror has 2 entries pre-move.
-        lib_pre, _ = sc._safe_load_json(sc._LIBRARY_FILE, "test")
+        lib_pre, _ = sc._safe_load_json(sc._state._LIBRARY_FILE, "test")
         assert len(lib_pre) == 2
         app._move_copy_commit(
             source="DemoColl", target="FFE",
             entry_ids=eden_ids, mode="move",
         )
         # Mirror now reflects empty DemoColl.
-        lib_post, _ = sc._safe_load_json(sc._LIBRARY_FILE, "test")
+        lib_post, _ = sc._safe_load_json(sc._state._LIBRARY_FILE, "test")
         assert lib_post == []
 
     def test_mirror_re_stages_on_copy_to_active(self, app):
@@ -409,13 +409,13 @@ class TestMoveCopyCommit:
         sc._set_active_collection_name("FFE")
         sc._settings_flush_sync()
         # Re-mirror to FFE state.
-        sc._safe_save_json_mirror(sc._LIBRARY_FILE, [], "Plasmid library")
+        sc._safe_save_json_mirror(sc._state._LIBRARY_FILE, [], "Plasmid library")
         sc._state._library_cache = None
         app._move_copy_commit(
             source="DemoColl", target="FFE",
             entry_ids=["eden_0"], mode="copy",
         )
-        lib_post, _ = sc._safe_load_json(sc._LIBRARY_FILE, "test")
+        lib_post, _ = sc._safe_load_json(sc._state._LIBRARY_FILE, "test")
         assert len(lib_post) == 1
 
     def test_partial_id_match_only_operates_on_existing(self, app):

@@ -190,8 +190,7 @@ class TestSetEntryVectorsBatchSemantics:
     """
 
     def test_batch_round_trip(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            sc, "_ENTRY_VECTORS_FILE", tmp_path / "ev.json",
+        monkeypatch.setattr(sc._state, "_ENTRY_VECTORS_FILE", tmp_path / "ev.json",
         )
         sc._state._entry_vectors_cache = None
         # 3 updates, one save call.
@@ -214,8 +213,7 @@ class TestSetEntryVectorsBatchSemantics:
         assert sc._set_entry_vectors_batch([]) == 0
 
     def test_batch_skip_invalid_grammar_id(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            sc, "_ENTRY_VECTORS_FILE", tmp_path / "ev.json",
+        monkeypatch.setattr(sc._state, "_ENTRY_VECTORS_FILE", tmp_path / "ev.json",
         )
         sc._state._entry_vectors_cache = None
         updates = [
@@ -248,7 +246,7 @@ class TestFindLibraryEntryByIdHelper:
         assert sc._find_library_entry_by_id(42) is None  # type: ignore[arg-type]
 
     def test_no_match_returns_none(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_path / "lib.json")
+        monkeypatch.setattr(sc._state, "_LIBRARY_FILE", tmp_path / "lib.json")
         sc._state._library_cache = None
         # Empty library
         sc._save_library([])
@@ -258,7 +256,7 @@ class TestFindLibraryEntryByIdHelper:
         # Test data uses `id == sanitize(name)` so the post-2026-05-24
         # id-name backfill (PIT-36) is a no-op and lookup by id stays
         # stable across the load.
-        monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_path / "lib.json")
+        monkeypatch.setattr(sc._state, "_LIBRARY_FILE", tmp_path / "lib.json")
         sc._state._library_cache = None
         sc._save_library([
             {"id": "P1", "name": "P1", "gb_text": "LOCUS p1"},

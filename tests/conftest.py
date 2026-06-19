@@ -76,9 +76,9 @@ def _protect_user_data(tmp_path, monkeypatch):
 
     for file_attr, cache_attr in _DATA_FILES:
         # Redirect the file path to a temp location
-        real_path = getattr(sc, file_attr)
+        real_path = getattr(sc._state, file_attr)
         tmp_file = tmp_path / real_path.name
-        monkeypatch.setattr(sc, file_attr, tmp_file)
+        _patch(file_attr, tmp_file)
         # Clear the in-memory cache so the next load reads from the tmp file
         if cache_attr:
             _patch(cache_attr, None)
@@ -107,8 +107,7 @@ def _protect_user_data(tmp_path, monkeypatch):
     # Data-version stamp file: same reasoning — keeps every test from
     # competing for / racing on the real ~/.local/share/.../.splicecraft-
     # data-version file.
-    monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
-                          tmp_path / ".splicecraft-data-version")
+    _patch("_DATA_VERSION_FILE", tmp_path / ".splicecraft-data-version")
     # UI snapshot directory (Alt+D in the running app + the
     # `splicecraft logs --bundle` CLI command both write here):
     # redirect so tests of the snapshot system don't litter the
@@ -348,7 +347,7 @@ def isolated_library(tmp_path, monkeypatch):
     this automatically, so this fixture is now redundant but harmless."""
     import splicecraft as sc
     tmp_lib = tmp_path / "plasmid_library.json"
-    monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_lib)
+    monkeypatch.setattr(sc._state, "_LIBRARY_FILE", tmp_lib)
     monkeypatch.setattr(sc._state, "_library_cache", None)
     return tmp_lib
 
@@ -361,7 +360,7 @@ def isolated_parts_bin(tmp_path, monkeypatch):
     inspect the redirected path can request it explicitly."""
     import splicecraft as sc
     tmp_bin = tmp_path / "parts_bin.json"
-    monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_bin)
+    monkeypatch.setattr(sc._state, "_PARTS_BIN_FILE", tmp_bin)
     monkeypatch.setattr(sc._state, "_parts_bin_cache", None)
     return tmp_bin
 
@@ -372,6 +371,6 @@ def isolated_primers(tmp_path, monkeypatch):
     pattern as `isolated_library`."""
     import splicecraft as sc
     tmp_p = tmp_path / "primers.json"
-    monkeypatch.setattr(sc, "_PRIMERS_FILE", tmp_p)
+    monkeypatch.setattr(sc._state, "_PRIMERS_FILE", tmp_p)
     monkeypatch.setattr(sc._state, "_primers_cache", None)
     return tmp_p

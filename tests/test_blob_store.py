@@ -311,7 +311,7 @@ class TestLibraryBoundaryIntegration:
         gb = "LOCUS       p1         5 bp\nORIGIN\n1 acgta\n//\n"
         sc._save_library([{"id": "P1", "name": "p one", "gb_text": gb}])
         # On disk: dehydrated (gb_ref, no inline gb_text).
-        raw = json.loads(sc._LIBRARY_FILE.read_text())
+        raw = json.loads(sc._state._LIBRARY_FILE.read_text())
         disk = raw["entries"][0]
         assert "gb_text" not in disk
         assert disk["gb_ref"] == sc._blob_hash(gb)
@@ -326,14 +326,14 @@ class TestLibraryBoundaryIntegration:
     def test_backward_compat_loads_old_inline_format(self):
         gb = "LOCUS       p2         5 bp\nORIGIN\n1 acgta\n//\n"
         # Old-format file: inline gb_text, no gb_ref, no blob.
-        sc._LIBRARY_FILE.write_text(json.dumps(
+        sc._state._LIBRARY_FILE.write_text(json.dumps(
             {"_schema_version": 1, "entries": [{"id": "P2", "gb_text": gb}]}))
         sc._state._library_cache = None
         loaded = sc._load_library()
         assert loaded[0]["gb_text"] == gb            # inline still resolves
         # A subsequent save migrates it to the blob format on disk.
         sc._save_library(loaded)
-        raw = json.loads(sc._LIBRARY_FILE.read_text())
+        raw = json.loads(sc._state._LIBRARY_FILE.read_text())
         assert "gb_text" not in raw["entries"][0]
         assert raw["entries"][0]["gb_ref"] == sc._blob_hash(gb)
         assert sc._blob_path(sc._blob_hash(gb)).is_file()
@@ -358,7 +358,7 @@ class TestLibraryBoundaryIntegration:
         ])
         # Two entries, identical gb_text → exactly one blob on disk.
         assert len(list(sc._plasmid_blob_dir().glob("*.gb"))) == 1
-        raw = json.loads(sc._LIBRARY_FILE.read_text())
+        raw = json.loads(sc._state._LIBRARY_FILE.read_text())
         refs = {e["gb_ref"] for e in raw["entries"]}
         assert refs == {sc._blob_hash(gb)}
 
@@ -367,7 +367,7 @@ class TestLibraryBoundaryIntegration:
         sc._save_collections([
             {"name": "C1", "plasmids": [{"id": "P1", "gb_text": gb}]},
         ])
-        raw = json.loads(sc._COLLECTIONS_FILE.read_text())
+        raw = json.loads(sc._state._COLLECTIONS_FILE.read_text())
         plas = raw["entries"][0]["plasmids"][0]
         assert "gb_text" not in plas
         assert plas["gb_ref"] == sc._blob_hash(gb)
@@ -377,7 +377,7 @@ class TestLibraryBoundaryIntegration:
 
 
 def _write_lib_refs(refs):
-    sc._LIBRARY_FILE.write_text(json.dumps({
+    sc._state._LIBRARY_FILE.write_text(json.dumps({
         "_schema_version": 1,
         "entries": [{"id": f"e{i}", "gb_ref": r} for i, r in enumerate(refs)],
     }))
@@ -407,7 +407,7 @@ class TestOrphanBlobGC:
     def test_keeps_blob_referenced_by_collection(self):
         ref = sc._blob_write(GB)
         _age(sc._blob_path(ref), sc._BLOB_GC_GRACE_SECONDS + 100)
-        sc._COLLECTIONS_FILE.write_text(json.dumps({
+        sc._state._COLLECTIONS_FILE.write_text(json.dumps({
             "_schema_version": 1,
             "entries": [{"name": "C",
                          "plasmids": [{"id": "p", "gb_ref": ref}]}],
@@ -418,8 +418,8 @@ class TestOrphanBlobGC:
     def test_keeps_blob_referenced_only_by_backup(self):
         ref = sc._blob_write(GB)
         _age(sc._blob_path(ref), sc._BLOB_GC_GRACE_SECONDS + 100)
-        bak = sc._LIBRARY_FILE.with_name(
-            sc._LIBRARY_FILE.name + ".bak.20260101-000000")
+        bak = sc._state._LIBRARY_FILE.with_name(
+            sc._state._LIBRARY_FILE.name + ".bak.20260101-000000")
         bak.write_text(json.dumps(
             {"_schema_version": 1, "entries": [{"id": "e", "gb_ref": ref}]}))
         assert sc._gc_orphan_blobs() == 0                  # rollback-protected
@@ -455,7 +455,7 @@ class TestOrphanBlobGC:
     def test_aborts_when_current_metadata_corrupt(self):
         ref = sc._blob_write(GB)
         _age(sc._blob_path(ref), sc._BLOB_GC_GRACE_SECONDS + 100)
-        sc._LIBRARY_FILE.write_text("{ corrupt json not closeable")
+        sc._state._LIBRARY_FILE.write_text("{ corrupt json not closeable")
         # Eligible orphan, but an unreadable current file → ABORT, touch nothing.
         assert sc._gc_orphan_blobs() == 0
         assert sc._blob_path(ref).is_file()

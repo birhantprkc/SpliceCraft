@@ -1800,7 +1800,7 @@ def isolated_parts_bin(tmp_path, monkeypatch):
     palette tests don't touch the real parts_bin.json. Mirrors the
     fixture in test_domesticator.py."""
     tmp_bin = tmp_path / "parts_bin.json"
-    monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_bin)
+    monkeypatch.setattr(sc._state, "_PARTS_BIN_FILE", tmp_bin)
     monkeypatch.setattr(sc._state, "_parts_bin_cache", None)
     return tmp_bin
 
@@ -2046,7 +2046,7 @@ class TestConstructorMultiGrammarTabs:
         # a backbone via `_select_backbone`, the banner-style
         # summary reflects the active role's bound vector.
         ev_file = tmp_path / "entry_vectors.json"
-        monkeypatch.setattr(sc, "_ENTRY_VECTORS_FILE", ev_file)
+        monkeypatch.setattr(sc._state, "_ENTRY_VECTORS_FILE", ev_file)
         monkeypatch.setattr(sc._state, "_entry_vectors_cache", None)
         for role, name in (
             ("Alpha1", "FFE2_test"),
@@ -2167,7 +2167,7 @@ class TestConstructorMultiGrammarTabs:
         # bound vector's name (truncated for the column width). With
         # no binding the label reads "(none)".
         ev_file = tmp_path / "entry_vectors.json"
-        monkeypatch.setattr(sc, "_ENTRY_VECTORS_FILE", ev_file)
+        monkeypatch.setattr(sc._state, "_ENTRY_VECTORS_FILE", ev_file)
         monkeypatch.setattr(sc._state, "_entry_vectors_cache", None)
         sc._set_entry_vector("gb_l0", {
             "name":   "MyAcceptor", "size": 3000, "source": "test",
@@ -2207,7 +2207,7 @@ class TestConstructorMultiGrammarTabs:
         # `_pick_acceptor_for_role` and checking it gets called with
         # the right role + activate flag.
         ev_file = tmp_path / "entry_vectors.json"
-        monkeypatch.setattr(sc, "_ENTRY_VECTORS_FILE", ev_file)
+        monkeypatch.setattr(sc._state, "_ENTRY_VECTORS_FILE", ev_file)
         monkeypatch.setattr(sc._state, "_entry_vectors_cache", None)
         from tests.test_smoke import _build_app, TERMINAL_SIZE
         app = _build_app(tiny_record, isolated_library)
@@ -2248,7 +2248,7 @@ class TestConstructorMultiGrammarTabs:
         # Setting a vector for Alpha1 doesn't disturb Alpha2 / Omega1
         # / Omega2 / the legacy singleton (role="").
         ev_file = tmp_path / "entry_vectors.json"
-        monkeypatch.setattr(sc, "_ENTRY_VECTORS_FILE", ev_file)
+        monkeypatch.setattr(sc._state, "_ENTRY_VECTORS_FILE", ev_file)
         monkeypatch.setattr(sc._state, "_entry_vectors_cache", None)
         sc._set_entry_vector("gb_l0", {
             "name": "L0_singleton", "size": 1, "source": "t",

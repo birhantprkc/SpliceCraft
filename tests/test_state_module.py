@@ -53,8 +53,15 @@ _MIGRATED = [
     "_primers_name_trim_done",
     # Phase A2c: the save-authorization chokepoint flag
     "_SAVES_AUTHORIZED", "_SAVES_AUTHORIZED_REASON",
-    # Phase B-prep: the data directory (computed by the hub at import)
+    # Phase B-prep: the data directory + the persisted-file path constants
     "_DATA_DIR",
+    "_AGENT_TOKEN_FILE", "_CODON_TABLES_FILE", "_COLLECTIONS_FILE",
+    "_CUSTOM_ENZYMES_FILE", "_DATA_VERSION_FILE", "_ENTRY_VECTORS_FILE",
+    "_ENZYME_COLLECTIONS_FILE", "_EXPERIMENTS_FILE", "_EXPERIMENT_PROJECTS_FILE",
+    "_FEATURES_FILE", "_FEATURE_COLORS_FILE", "_GELS_FILE", "_GRAMMARS_FILE",
+    "_HMM_DB_CATALOG_FILE", "_LIBRARY_FILE", "_PARTS_BIN_COLLECTIONS_FILE",
+    "_PARTS_BIN_FILE", "_PRIMERS_FILE", "_PRIMER_COLLECTIONS_FILE",
+    "_PROTEIN_COLLECTIONS_FILE", "_PROTEIN_MOTIFS_FILE", "_SETTINGS_FILE",
 ]
 
 

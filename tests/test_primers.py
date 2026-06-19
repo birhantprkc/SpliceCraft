@@ -576,7 +576,7 @@ class TestPrimerDesignScreenLayout:
         # Redirect primers.json to a tmp path (conftest's autouse
         # fixture already does this, but be explicit.)
         p = tmp_path / "primers.json"
-        monkeypatch.setattr(sc, "_PRIMERS_FILE", p)
+        monkeypatch.setattr(sc._state, "_PRIMERS_FILE", p)
         monkeypatch.setattr(sc._state, "_primers_cache", None, raising=False)
 
         app = sc.PlasmidApp()

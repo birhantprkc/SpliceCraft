@@ -44,13 +44,13 @@ class TestCollectionsPersistence:
 
     def test_envelope_schema_on_disk(self):
         sc._save_collections([{"name": "t", "plasmids": []}])
-        raw = json.loads(sc._COLLECTIONS_FILE.read_text())
+        raw = json.loads(sc._state._COLLECTIONS_FILE.read_text())
         assert raw.get("_schema_version") == 1
         assert isinstance(raw.get("entries"), list)
 
     def test_legacy_bare_list_loads(self):
         """Pre-envelope save format must still load (sacred invariant #7)."""
-        sc._COLLECTIONS_FILE.write_text(
+        sc._state._COLLECTIONS_FILE.write_text(
             json.dumps([{"name": "legacy", "plasmids": []}])
         )
         sc._state._collections_cache = None
@@ -59,7 +59,7 @@ class TestCollectionsPersistence:
         assert out[0]["name"] == "legacy"
 
     def test_non_dict_entries_dropped(self):
-        sc._COLLECTIONS_FILE.write_text(json.dumps({
+        sc._state._COLLECTIONS_FILE.write_text(json.dumps({
             "_schema_version": 1,
             "entries": [{"name": "ok", "plasmids": []}, "garbage", 42, None],
         }))

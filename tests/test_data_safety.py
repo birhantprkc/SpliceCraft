@@ -684,7 +684,7 @@ class TestSafeSaveJsonRaisesOnFailure:
 
 class TestPersistenceIntegration:
     def test_library_save_creates_bak(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_path / "lib.json")
+        monkeypatch.setattr(sc._state, "_LIBRARY_FILE", tmp_path / "lib.json")
         monkeypatch.setattr(sc._state, "_library_cache", None)
         sc._save_library([{"id": "A", "name": "first"}])
         sc._save_library([{"id": "B", "name": "second"}])
@@ -693,7 +693,7 @@ class TestPersistenceIntegration:
         assert json.loads(bak.read_text())["entries"][0]["id"] == "A"
 
     def test_parts_bin_save_creates_bak(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_path / "parts.json")
+        monkeypatch.setattr(sc._state, "_PARTS_BIN_FILE", tmp_path / "parts.json")
         monkeypatch.setattr(sc._state, "_parts_bin_cache", None)
         sc._save_parts_bin([{"name": "p1"}])
         sc._save_parts_bin([{"name": "p2"}])
@@ -701,7 +701,7 @@ class TestPersistenceIntegration:
         assert bak.exists()
 
     def test_primers_save_creates_bak(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sc, "_PRIMERS_FILE", tmp_path / "primers.json")
+        monkeypatch.setattr(sc._state, "_PRIMERS_FILE", tmp_path / "primers.json")
         monkeypatch.setattr(sc._state, "_primers_cache", None)
         sc._save_primers([{"name": "pr1"}])
         sc._save_primers([{"name": "pr2"}])
@@ -712,18 +712,18 @@ class TestPersistenceIntegration:
         """If user deletes plasmid_library.json manually, load must return []
         without crashing."""
         p = tmp_path / "lib.json"
-        monkeypatch.setattr(sc, "_LIBRARY_FILE", p)
+        monkeypatch.setattr(sc._state, "_LIBRARY_FILE", p)
         monkeypatch.setattr(sc._state, "_library_cache", None)
         # File doesn't exist — should return []
         assert sc._load_library() == []
 
     def test_parts_bin_load_survives_deleted_file(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_path / "nope.json")
+        monkeypatch.setattr(sc._state, "_PARTS_BIN_FILE", tmp_path / "nope.json")
         monkeypatch.setattr(sc._state, "_parts_bin_cache", None)
         assert sc._load_parts_bin() == []
 
     def test_primers_load_survives_deleted_file(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sc, "_PRIMERS_FILE", tmp_path / "nope.json")
+        monkeypatch.setattr(sc._state, "_PRIMERS_FILE", tmp_path / "nope.json")
         monkeypatch.setattr(sc._state, "_primers_cache", None)
         assert sc._load_primers() == []
 
@@ -732,7 +732,7 @@ class TestPersistenceIntegration:
         dicts (qualifiers, primer pairs). The previous shallow-copy `list(...)`
         let caller mutations of the nested dicts poison the cache for every
         subsequent reader. Sacred invariant #17."""
-        monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_path / "p.json")
+        monkeypatch.setattr(sc._state, "_PARTS_BIN_FILE", tmp_path / "p.json")
         monkeypatch.setattr(sc._state, "_parts_bin_cache", None)
         sc._save_parts_bin([{"name": "p1", "primers": {"fwd": "GAATTC"}}])
         first = sc._load_parts_bin()
@@ -745,7 +745,7 @@ class TestPersistenceIntegration:
 
     def test_primers_load_deepcopies_nested_dicts(self, tmp_path, monkeypatch):
         """Same guard for the primer library."""
-        monkeypatch.setattr(sc, "_PRIMERS_FILE", tmp_path / "pr.json")
+        monkeypatch.setattr(sc._state, "_PRIMERS_FILE", tmp_path / "pr.json")
         monkeypatch.setattr(sc._state, "_primers_cache", None)
         sc._save_primers([{"name": "pr1", "qualifiers": {"note": "ok"}}])
         first = sc._load_primers()
@@ -772,7 +772,7 @@ class TestPersistenceIntegration:
         bak = tmp_path / "lib.json.bak"
         p.write_text("{bad}")
         bak.write_text(json.dumps([{"id": "X", "name": "saved"}]))
-        monkeypatch.setattr(sc, "_LIBRARY_FILE", p)
+        monkeypatch.setattr(sc._state, "_LIBRARY_FILE", p)
         monkeypatch.setattr(sc._state, "_library_cache", None)
         entries = sc._load_library()
         assert len(entries) == 1
@@ -789,9 +789,9 @@ class TestStartupDataCheck:
     ):
         """First-run scenario: no files exist. App must mount without
         crashing and without showing corruption warnings."""
-        monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_path / "lib.json")
-        monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_path / "parts.json")
-        monkeypatch.setattr(sc, "_PRIMERS_FILE", tmp_path / "primers.json")
+        monkeypatch.setattr(sc._state, "_LIBRARY_FILE", tmp_path / "lib.json")
+        monkeypatch.setattr(sc._state, "_PARTS_BIN_FILE", tmp_path / "parts.json")
+        monkeypatch.setattr(sc._state, "_PRIMERS_FILE", tmp_path / "primers.json")
         monkeypatch.setattr(sc._state, "_library_cache", None)
         monkeypatch.setattr(sc._state, "_parts_bin_cache", None)
         monkeypatch.setattr(sc._state, "_primers_cache", None)
@@ -813,9 +813,9 @@ class TestStartupDataCheck:
         on startup, not a crash."""
         p = tmp_path / "lib.json"
         p.write_text("{corrupt}")
-        monkeypatch.setattr(sc, "_LIBRARY_FILE", p)
-        monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_path / "parts.json")
-        monkeypatch.setattr(sc, "_PRIMERS_FILE", tmp_path / "primers.json")
+        monkeypatch.setattr(sc._state, "_LIBRARY_FILE", p)
+        monkeypatch.setattr(sc._state, "_PARTS_BIN_FILE", tmp_path / "parts.json")
+        monkeypatch.setattr(sc._state, "_PRIMERS_FILE", tmp_path / "primers.json")
         monkeypatch.setattr(sc._state, "_library_cache", None)
         monkeypatch.setattr(sc._state, "_parts_bin_cache", None)
         monkeypatch.setattr(sc._state, "_primers_cache", None)
@@ -845,32 +845,32 @@ class TestRealFilesNeverTouched:
 
     def test_library_file_is_redirected(self):
         """_LIBRARY_FILE must NOT point to the repo root during tests."""
-        assert "/tmp" in str(sc._LIBRARY_FILE) or "pytest" in str(sc._LIBRARY_FILE), (
-            f"_LIBRARY_FILE points to {sc._LIBRARY_FILE} — "
+        assert "/tmp" in str(sc._state._LIBRARY_FILE) or "pytest" in str(sc._state._LIBRARY_FILE), (
+            f"_LIBRARY_FILE points to {sc._state._LIBRARY_FILE} — "
             f"expected a tmp dir, not the real repo!"
         )
 
     def test_parts_bin_file_is_redirected(self):
-        assert "/tmp" in str(sc._PARTS_BIN_FILE) or "pytest" in str(sc._PARTS_BIN_FILE), (
-            f"_PARTS_BIN_FILE points to {sc._PARTS_BIN_FILE} — "
+        assert "/tmp" in str(sc._state._PARTS_BIN_FILE) or "pytest" in str(sc._state._PARTS_BIN_FILE), (
+            f"_PARTS_BIN_FILE points to {sc._state._PARTS_BIN_FILE} — "
             f"expected a tmp dir!"
         )
 
     def test_primers_file_is_redirected(self):
-        assert "/tmp" in str(sc._PRIMERS_FILE) or "pytest" in str(sc._PRIMERS_FILE), (
-            f"_PRIMERS_FILE points to {sc._PRIMERS_FILE} — "
+        assert "/tmp" in str(sc._state._PRIMERS_FILE) or "pytest" in str(sc._state._PRIMERS_FILE), (
+            f"_PRIMERS_FILE points to {sc._state._PRIMERS_FILE} — "
             f"expected a tmp dir!"
         )
 
     def test_features_file_is_redirected(self):
-        assert "/tmp" in str(sc._FEATURES_FILE) or "pytest" in str(sc._FEATURES_FILE), (
-            f"_FEATURES_FILE points to {sc._FEATURES_FILE} — "
+        assert "/tmp" in str(sc._state._FEATURES_FILE) or "pytest" in str(sc._state._FEATURES_FILE), (
+            f"_FEATURES_FILE points to {sc._state._FEATURES_FILE} — "
             f"expected a tmp dir!"
         )
 
     def test_collections_file_is_redirected(self):
-        assert "/tmp" in str(sc._COLLECTIONS_FILE) or "pytest" in str(sc._COLLECTIONS_FILE), (
-            f"_COLLECTIONS_FILE points to {sc._COLLECTIONS_FILE} — "
+        assert "/tmp" in str(sc._state._COLLECTIONS_FILE) or "pytest" in str(sc._state._COLLECTIONS_FILE), (
+            f"_COLLECTIONS_FILE points to {sc._state._COLLECTIONS_FILE} — "
             f"expected a tmp dir!"
         )
 
@@ -878,33 +878,33 @@ class TestRealFilesNeverTouched:
         """Actually call _save_library and verify the write landed in /tmp,
         not in the repo directory."""
         sc._save_library([{"id": "SAFETY_TEST", "name": "safety"}])
-        assert sc._LIBRARY_FILE.exists()
-        assert "/tmp" in str(sc._LIBRARY_FILE) or "pytest" in str(sc._LIBRARY_FILE)
+        assert sc._state._LIBRARY_FILE.exists()
+        assert "/tmp" in str(sc._state._LIBRARY_FILE) or "pytest" in str(sc._state._LIBRARY_FILE)
         import json
-        data = json.loads(sc._LIBRARY_FILE.read_text())
+        data = json.loads(sc._state._LIBRARY_FILE.read_text())
         assert data["entries"][0]["id"] == "SAFETY_TEST"
 
     def test_save_parts_bin_writes_to_tmp(self):
         sc._save_parts_bin([{"name": "SAFETY_TEST"}])
-        assert sc._PARTS_BIN_FILE.exists()
-        assert "/tmp" in str(sc._PARTS_BIN_FILE) or "pytest" in str(sc._PARTS_BIN_FILE)
+        assert sc._state._PARTS_BIN_FILE.exists()
+        assert "/tmp" in str(sc._state._PARTS_BIN_FILE) or "pytest" in str(sc._state._PARTS_BIN_FILE)
 
     def test_save_primers_writes_to_tmp(self):
         sc._save_primers([{"name": "SAFETY_TEST"}])
-        assert sc._PRIMERS_FILE.exists()
-        assert "/tmp" in str(sc._PRIMERS_FILE) or "pytest" in str(sc._PRIMERS_FILE)
+        assert sc._state._PRIMERS_FILE.exists()
+        assert "/tmp" in str(sc._state._PRIMERS_FILE) or "pytest" in str(sc._state._PRIMERS_FILE)
 
     def test_save_features_writes_to_tmp(self):
         sc._save_features([{"name": "SAFETY_TEST",
                             "feature_type": "CDS",
                             "sequence": "ATG"}])
-        assert sc._FEATURES_FILE.exists()
-        assert "/tmp" in str(sc._FEATURES_FILE) or "pytest" in str(sc._FEATURES_FILE)
+        assert sc._state._FEATURES_FILE.exists()
+        assert "/tmp" in str(sc._state._FEATURES_FILE) or "pytest" in str(sc._state._FEATURES_FILE)
 
     def test_save_collections_writes_to_tmp(self):
         sc._save_collections([{"name": "SAFETY_TEST", "plasmids": []}])
-        assert sc._COLLECTIONS_FILE.exists()
-        assert "/tmp" in str(sc._COLLECTIONS_FILE) or "pytest" in str(sc._COLLECTIONS_FILE)
+        assert sc._state._COLLECTIONS_FILE.exists()
+        assert "/tmp" in str(sc._state._COLLECTIONS_FILE) or "pytest" in str(sc._state._COLLECTIONS_FILE)
 
     def test_real_repo_files_untouched(self):
         """The actual files in the repo root must NOT contain SAFETY_TEST
@@ -1613,7 +1613,7 @@ class TestDataDirHousekeeping:
 
     def test_compresses_and_prunes(self, tmp_path, monkeypatch):
         import os
-        lib = sc._LIBRARY_FILE   # redirected to tmp_path by conftest
+        lib = sc._state._LIBRARY_FILE   # redirected to tmp_path by conftest
         for ts in ["20260101-000000", "20260102-000000", "20260103-000000"]:
             lib.with_name(f"{lib.name}.bak.{ts}").write_text(
                 json.dumps({"_schema_version": 1, "entries": []}))

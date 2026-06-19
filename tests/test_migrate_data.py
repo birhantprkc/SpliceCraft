@@ -46,14 +46,15 @@ def _seed() -> None:
 
 def _bust() -> None:
     for c in sc._MASTER_DELETE_CACHE_ATTRS:
-        if hasattr(sc, c):
-            setattr(sc, c, None)
+        owner = sc._state if hasattr(sc._state, c) else sc
+        if hasattr(owner, c):
+            setattr(owner, c, None)
 
 
 def _fingerprint() -> dict:
     fp = {}
     for attr in sc._USER_DATA_FILE_ATTRS:
-        p = getattr(sc, attr, None)
+        p = sc._resolve_state_or_hub(attr)
         if isinstance(p, sc.Path) and p.is_file():
             fp[attr] = hashlib.sha256(p.read_bytes()).hexdigest()
     bd = sc._plasmid_blob_dir()
@@ -66,7 +67,7 @@ def _fingerprint() -> dict:
 
 def _wipe() -> None:
     for attr in sc._USER_DATA_FILE_ATTRS:
-        p = getattr(sc, attr, None)
+        p = sc._resolve_state_or_hub(attr)
         if isinstance(p, sc.Path) and p.is_file():
             p.unlink()
     bd = sc._plasmid_blob_dir()
@@ -85,7 +86,7 @@ class TestMigrateRoundTrip:
         assert summ["bytes"] > 0
         assert zipfile.is_zipfile(zp)
         _wipe()
-        assert not sc._COLLECTIONS_FILE.is_file()
+        assert not sc._state._COLLECTIONS_FILE.is_file()
         isumm = sc._import_migrate_archive(zp)
         assert isumm.get("pre_restore_snapshot"), "import must take a backup"
         assert not isumm.get("failed"), isumm.get("failed")
@@ -100,7 +101,7 @@ class TestMigrateRoundTrip:
         sc._import_migrate_archive(zp)
         _bust()
         colls = sc._extract_entries(
-            json.loads(sc._COLLECTIONS_FILE.read_text()), "c")[0] or []
+            json.loads(sc._state._COLLECTIONS_FILE.read_text()), "c")[0] or []
         plasmids = next((c["plasmids"] for c in colls
                          if c.get("name") == "Default"), [])
         assert plasmids
@@ -195,7 +196,7 @@ class TestMigrateRegistryInvariant:
         for attr in sc._USER_DATA_FILE_ATTRS:
             if attr in sc._MIGRATE_DEFAULT_EXCLUDE_ATTRS:
                 continue
-            p = getattr(sc, attr, None)
+            p = sc._resolve_state_or_hub(attr)
             if isinstance(p, sc.Path) and p.is_file():
                 assert attr in manifest_attrs, (
                     f"{attr} is in the user-data registry but missing from the "

@@ -31,7 +31,7 @@ class TestFeatureLibraryRoundtrip:
     def test_save_creates_file(self):
         sc._save_features([{"name": "x", "feature_type": "CDS",
                             "sequence": "ATG"}])
-        assert sc._FEATURES_FILE.exists()
+        assert sc._state._FEATURES_FILE.exists()
 
     def test_roundtrip_preserves_entry(self):
         entries = [{"name": "lacZ-alpha", "feature_type": "CDS",
@@ -40,7 +40,7 @@ class TestFeatureLibraryRoundtrip:
                     "description": ""}]
         sc._save_features(entries)
         # Bypass the cache to read raw JSON
-        raw = json.loads(sc._FEATURES_FILE.read_text())
+        raw = json.loads(sc._state._FEATURES_FILE.read_text())
         assert raw["entries"] == entries
 
     def test_roundtrip_multiple_entries(self):
@@ -62,7 +62,7 @@ class TestFeatureLibraryRoundtrip:
         """Features file uses the shared schema envelope (sacred invariant #7)."""
         sc._save_features([{"name": "x", "feature_type": "CDS",
                             "sequence": "ATG"}])
-        raw = json.loads(sc._FEATURES_FILE.read_text())
+        raw = json.loads(sc._state._FEATURES_FILE.read_text())
         assert raw["_schema_version"] == sc._CURRENT_SCHEMA_VERSION
         assert isinstance(raw["entries"], list)
 
@@ -71,7 +71,7 @@ class TestFeatureLibraryRoundtrip:
                             "sequence": "A"}])
         sc._save_features([{"name": "second", "feature_type": "CDS",
                             "sequence": "T"}])
-        bak_path = sc._FEATURES_FILE.with_suffix(sc._FEATURES_FILE.suffix + ".bak")
+        bak_path = sc._state._FEATURES_FILE.with_suffix(sc._state._FEATURES_FILE.suffix + ".bak")
         assert bak_path.exists()
         assert json.loads(bak_path.read_text())["entries"][0]["name"] == "first"
 
@@ -89,14 +89,14 @@ class TestFeatureLibraryCorruptionRecovery:
         assert sc._load_features() == []
 
     def test_corrupt_json_returns_empty(self):
-        sc._FEATURES_FILE.write_text("{bad json")
+        sc._state._FEATURES_FILE.write_text("{bad json")
         sc._state._features_cache = None
         # No valid main or bak → empty list
         assert sc._load_features() == []
 
     def test_non_dict_entries_filtered(self):
         """A hand-edited file with garbage entries must not crash `.get()` callers."""
-        sc._FEATURES_FILE.write_text(json.dumps({
+        sc._state._FEATURES_FILE.write_text(json.dumps({
             "_schema_version": 1,
             "entries": [
                 {"name": "good", "feature_type": "CDS", "sequence": "ATG"},
@@ -120,7 +120,7 @@ class TestFeatureLibraryCorruptionRecovery:
         sc._save_features([{"name": "second", "feature_type": "CDS",
                             "sequence": "TAA"}])
         # Now corrupt main; .bak holds the 'first' version
-        sc._FEATURES_FILE.write_text("!!!corrupt!!!")
+        sc._state._FEATURES_FILE.write_text("!!!corrupt!!!")
         sc._state._features_cache = None
         entries = sc._load_features()
         assert len(entries) == 1
@@ -138,7 +138,7 @@ class TestFeatureLibraryCache:
         sc._save_features([{"name": "x", "feature_type": "CDS",
                             "sequence": "ATG"}])
         # Next load should return the saved entries without hitting disk
-        sc._FEATURES_FILE.unlink()  # disk gone, but cache populated
+        sc._state._FEATURES_FILE.unlink()  # disk gone, but cache populated
         assert sc._load_features() == [{"name": "x", "feature_type": "CDS",
                                         "sequence": "ATG"}]
 
@@ -237,13 +237,13 @@ class TestFeatureColorsPersistence:
 
     def test_envelope_schema_version(self):
         sc._save_feature_colors({"CDS": "#FF0000"})
-        raw = json.loads(sc._FEATURE_COLORS_FILE.read_text())
+        raw = json.loads(sc._state._FEATURE_COLORS_FILE.read_text())
         assert raw["_schema_version"] == sc._CURRENT_SCHEMA_VERSION
         assert isinstance(raw["entries"], list)
         assert raw["entries"][0] == {"feature_type": "CDS", "color": "#FF0000"}
 
     def test_non_dict_entries_filtered(self):
-        sc._FEATURE_COLORS_FILE.write_text(json.dumps({
+        sc._state._FEATURE_COLORS_FILE.write_text(json.dumps({
             "_schema_version": 1,
             "entries": [
                 {"feature_type": "CDS",      "color": "#FF0000"},

@@ -1385,7 +1385,7 @@ class TestLibraryIdBackfill:
         entries (in memory + on disk) on first read; second read
         sees the aligned state without further work."""
         tmp_lib = tmp_path / "library.json"
-        monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_lib)
+        monkeypatch.setattr(sc._state, "_LIBRARY_FILE", tmp_lib)
         monkeypatch.setattr(sc._state, "_library_cache", None)
         monkeypatch.setattr(sc._state, "_id_name_backfill_done", False)
         # Write a legacy v1 envelope where id doesn't match name.
@@ -12153,7 +12153,7 @@ class TestUpdateDataSafety:
         seeded: dict[str, str] = {}
         import json as _json
         for attr in sc._USER_DATA_FILE_ATTRS:
-            p = getattr(sc, attr, None)
+            p = sc._resolve_state_or_hub(attr)
             if not isinstance(p, sc.Path):
                 continue
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -12233,7 +12233,7 @@ class TestUpdateDataSafety:
         )
         names_in_manifest = {entry["name"] for entry in manifest["files"]}
         for attr, content in seeded.items():
-            real = getattr(sc, attr)
+            real = sc._resolve_state_or_hub(attr)
             assert real.name in names_in_manifest, (
                 f"{attr} ({real.name}) missing from manifest"
             )
@@ -12513,14 +12513,14 @@ class TestUpdateDataSafety:
         snap = sc._create_pre_update_snapshot("0.0.0-test")
         # Corrupt every seeded file with garbage.
         for attr in seeded:
-            getattr(sc, attr).write_text("[CORRUPTED]", encoding="utf-8")
-            assert getattr(sc, attr).read_text(encoding="utf-8") == "[CORRUPTED]"
+            sc._resolve_state_or_hub(attr).write_text("[CORRUPTED]", encoding="utf-8")
+            assert sc._resolve_state_or_hub(attr).read_text(encoding="utf-8") == "[CORRUPTED]"
         # Restore.
         summary = sc._restore_pre_update_snapshot(snap)
         assert summary["failed"] == [], summary
         # Every seeded attr should be byte-for-byte recovered.
         for attr, original in seeded.items():
-            recovered = getattr(sc, attr).read_text(encoding="utf-8")
+            recovered = sc._resolve_state_or_hub(attr).read_text(encoding="utf-8")
             assert recovered == original, (
                 f"{attr} not recovered: got {recovered!r}, "
                 f"expected {original!r}"
@@ -12565,7 +12565,7 @@ class TestUpdateDataSafety:
         sc._create_pre_update_snapshot("0.0.0-new")
         # Modify data after both snapshots.
         for attr in sc._USER_DATA_FILE_ATTRS:
-            p = getattr(sc, attr, None)
+            p = sc._resolve_state_or_hub(attr)
             if isinstance(p, sc.Path) and p.is_file():
                 p.write_text("modified", encoding="utf-8")
         summary = sc._restore_pre_update_snapshot("latest")
@@ -12612,7 +12612,7 @@ class TestUpdateDataSafety:
         snap = sc._create_pre_update_snapshot("0.0.0-test")
         # Corrupt data
         for attr in sc._USER_DATA_FILE_ATTRS:
-            p = getattr(sc, attr, None)
+            p = sc._resolve_state_or_hub(attr)
             if isinstance(p, sc.Path) and p.is_file():
                 p.write_text("garbage", encoding="utf-8")
         rc = sc._run_update_subcommand(
@@ -12659,7 +12659,7 @@ class TestUpdateDataSafetyHardening:
         import json as _json
         seeded: dict[str, str] = {}
         for attr in sc._USER_DATA_FILE_ATTRS:
-            p = getattr(sc, attr, None)
+            p = sc._resolve_state_or_hub(attr)
             if not isinstance(p, sc.Path):
                 continue
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -12826,7 +12826,7 @@ class TestUpdateDataSafetyHardening:
         assert summary["failed"]
         # And critically: the live library file (if it existed
         # before) was not corrupted with the secret content.
-        lib = sc._LIBRARY_FILE
+        lib = sc._state._LIBRARY_FILE
         if lib.is_file():
             assert lib.read_text(encoding="utf-8") != "system file"
 
@@ -12859,23 +12859,23 @@ class TestUpdateDataSafetyHardening:
         snap = sc._create_pre_update_snapshot("0.0.0-test")
         # Corrupt the snapshot's library copy AFTER the manifest's
         # sha256 was computed.
-        copy_path = snap / sc._LIBRARY_FILE.name
+        copy_path = snap / sc._state._LIBRARY_FILE.name
         copy_path.write_text("CORRUPTED", encoding="utf-8")
         # Modify the live file to a known value so we can detect
         # whether restore wrongly overwrote it.
-        sc._LIBRARY_FILE.write_text("LIVE-AFTER-SNAPSHOT", encoding="utf-8")
+        sc._state._LIBRARY_FILE.write_text("LIVE-AFTER-SNAPSHOT", encoding="utf-8")
         summary = sc._restore_pre_update_snapshot(snap)
         # The corrupted library entry must be in `failed`.
         names_failed = {n for n, _ in summary["failed"]}
-        assert sc._LIBRARY_FILE.name in names_failed, (
-            f"expected sha256 mismatch for {sc._LIBRARY_FILE.name} in "
+        assert sc._state._LIBRARY_FILE.name in names_failed, (
+            f"expected sha256 mismatch for {sc._state._LIBRARY_FILE.name} in "
             f"failed list; got {summary['failed']}"
         )
         # The live file is untouched (still the live-after value).
         # Pre-restore logic took its own snapshot of "LIVE-AFTER…"
         # before restore began, so we expect the live file to either
         # be the live value (corrupted entry skipped) — verify.
-        assert sc._LIBRARY_FILE.read_text(encoding="utf-8") == \
+        assert sc._state._LIBRARY_FILE.read_text(encoding="utf-8") == \
             "LIVE-AFTER-SNAPSHOT"
         # Sanity: the manifest's other (uncorrupted) files DID restore.
         # (At least some of the other seeded files should be in the
@@ -13145,7 +13145,7 @@ class TestUpdateRegistryFutureProofing:
         silently ignored at snapshot time → user data would not be
         backed up. Catches typos and post-rename drift."""
         for attr in sc._USER_DATA_FILE_ATTRS:
-            value = getattr(sc, attr, None)
+            value = sc._resolve_state_or_hub(attr)
             assert isinstance(value, sc.Path), (
                 f"{attr!r} from _USER_DATA_FILE_ATTRS is not a Path; "
                 f"got {type(value).__name__}"
@@ -13153,14 +13153,14 @@ class TestUpdateRegistryFutureProofing:
 
     def test_user_data_dir_attrs_all_resolve_to_paths(self):
         for attr in sc._USER_DATA_DIR_ATTRS:
-            value = getattr(sc, attr, None)
+            value = sc._resolve_state_or_hub(attr)
             assert isinstance(value, sc.Path), (
                 f"{attr!r} from _USER_DATA_DIR_ATTRS is not a Path"
             )
 
     def test_operational_file_attrs_all_resolve_to_paths(self):
         for attr in sc._OPERATIONAL_FILE_ATTRS:
-            value = getattr(sc, attr, None)
+            value = sc._resolve_state_or_hub(attr)
             assert isinstance(value, sc.Path), (
                 f"{attr!r} from _OPERATIONAL_FILE_ATTRS is not a Path"
             )
@@ -13489,7 +13489,7 @@ class TestFutureProofingFeatures:
 
     def test_stamp_creates_file_on_first_run(self, monkeypatch, tmp_path):
         monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
-        monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
+        monkeypatch.setattr(sc._state, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
         monkeypatch.setattr(sc, "_PLUGINS_DIR",
                               tmp_path / "data" / "plugins")
@@ -13502,7 +13502,7 @@ class TestFutureProofingFeatures:
 
     def test_stamp_warns_on_downgrade(self, monkeypatch, tmp_path):
         monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
-        monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
+        monkeypatch.setattr(sc._state, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
         monkeypatch.setattr(sc, "_PLUGINS_DIR",
                               tmp_path / "data" / "plugins")
@@ -13522,7 +13522,7 @@ class TestFutureProofingFeatures:
         # Older stamp + newer running version → no warning, just
         # silent overwrite.
         monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
-        monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
+        monkeypatch.setattr(sc._state, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
         monkeypatch.setattr(sc, "_PLUGINS_DIR",
                               tmp_path / "data" / "plugins")
@@ -13539,7 +13539,7 @@ class TestFutureProofingFeatures:
         # mustn't crash; treat as "unknown previous version" and
         # silently overwrite.
         monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
-        monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
+        monkeypatch.setattr(sc._state, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
         monkeypatch.setattr(sc, "_PLUGINS_DIR",
                               tmp_path / "data" / "plugins")
@@ -13557,7 +13557,7 @@ class TestFutureProofingFeatures:
         # 1 MB of garbage in the stamp file. Function caps the read
         # at 128 bytes so memory is bounded.
         monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
-        monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
+        monkeypatch.setattr(sc._state, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
         monkeypatch.setattr(sc, "_PLUGINS_DIR",
                               tmp_path / "data" / "plugins")
@@ -13572,7 +13572,7 @@ class TestFutureProofingFeatures:
         # Plugin namespace should be reserved (created empty) at the
         # same checkpoint.
         monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
-        monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
+        monkeypatch.setattr(sc._state, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
         monkeypatch.setattr(sc, "_PLUGINS_DIR",
                               tmp_path / "data" / "plugins")
@@ -13584,7 +13584,7 @@ class TestFutureProofingFeatures:
         # than crashing the launch.
         monkeypatch.setattr(sc._state, "_DATA_DIR",
                               tmp_path / "nonexistent-readonly")
-        monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
+        monkeypatch.setattr(sc._state, "_DATA_VERSION_FILE",
                               tmp_path / "nonexistent-readonly" / "x")
         monkeypatch.setattr(sc, "_PLUGINS_DIR",
                               tmp_path / "nonexistent-readonly" / "p")
@@ -13610,8 +13610,8 @@ class TestFutureProofingFeatures:
                 "another": {"nested": {"deep": True}},
             },
         }]
-        sc._safe_save_json(sc._LIBRARY_FILE, original, "Plasmid library")
-        loaded, warning = sc._safe_load_json(sc._LIBRARY_FILE,
+        sc._safe_save_json(sc._state._LIBRARY_FILE, original, "Plasmid library")
+        loaded, warning = sc._safe_load_json(sc._state._LIBRARY_FILE,
                                                 "Plasmid library")
         assert warning is None
         assert loaded == original, (
@@ -13698,7 +13698,7 @@ class TestFutureProofingFeatures:
         # there. But if a test explicitly calls the check, it should
         # be idempotent (creating an existing dir is a no-op).
         monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
-        monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
+        monkeypatch.setattr(sc._state, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
         monkeypatch.setattr(sc, "_PLUGINS_DIR",
                               tmp_path / "data" / "plugins")

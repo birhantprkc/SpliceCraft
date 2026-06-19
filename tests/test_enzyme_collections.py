@@ -402,7 +402,7 @@ def test_enzyme_collections_writes_schema_envelope():
     ``{"_schema_version": 1, "entries": [...]}``."""
     import json
     sc._save_enzyme_collections([{"name": "Foo", "enzymes": ["EcoRI"]}])
-    raw = sc._ENZYME_COLLECTIONS_FILE.read_text(encoding="utf-8")
+    raw = sc._state._ENZYME_COLLECTIONS_FILE.read_text(encoding="utf-8")
     obj = json.loads(raw)
     assert isinstance(obj, dict)
     assert obj.get("_schema_version") == 1
@@ -415,7 +415,7 @@ def test_custom_enzymes_writes_schema_envelope():
         {"name": "EnvX", "site": "GAATTC",
          "fwd_cut": 1, "rev_cut": 5, "type": "II_5overhang", "supplier": ""},
     ])
-    obj = json.loads(sc._CUSTOM_ENZYMES_FILE.read_text(encoding="utf-8"))
+    obj = json.loads(sc._state._CUSTOM_ENZYMES_FILE.read_text(encoding="utf-8"))
     assert obj.get("_schema_version") == 1
     assert obj["entries"][0]["name"] == "EnvX"
 
@@ -424,7 +424,7 @@ def test_enzyme_collections_accepts_legacy_bare_list():
     """Pre-0.3.1 back-compat — `_extract_entries` must accept a bare
     list payload (no envelope)."""
     import json
-    sc._ENZYME_COLLECTIONS_FILE.write_text(
+    sc._state._ENZYME_COLLECTIONS_FILE.write_text(
         json.dumps([{"name": "Legacy", "enzymes": ["BamHI"]}]),
         encoding="utf-8",
     )
@@ -437,7 +437,7 @@ def test_enzyme_collections_accepts_legacy_bare_list():
 def test_enzyme_collections_corrupted_json_returns_empty():
     """`_safe_load_json` recovers from corruption by returning ``None``
     so `_load_enzyme_collections` falls back to ``[]``."""
-    sc._ENZYME_COLLECTIONS_FILE.write_text("{not-json", encoding="utf-8")
+    sc._state._ENZYME_COLLECTIONS_FILE.write_text("{not-json", encoding="utf-8")
     sc._state._enzyme_collections_cache = None
     out = sc._load_enzyme_collections()
     assert out == []

@@ -221,9 +221,8 @@ class TestSaveChainAtomicMirror:
     def test_save_library_runs_mirror(self, tmp_path, monkeypatch):
         # Smoke: the path still works end-to-end (mirror inside lock
         # mustn't break the contract; RLock re-entry must succeed).
-        monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_path / "lib.json")
-        monkeypatch.setattr(
-            sc, "_COLLECTIONS_FILE", tmp_path / "coll.json",
+        monkeypatch.setattr(sc._state, "_LIBRARY_FILE", tmp_path / "lib.json")
+        monkeypatch.setattr(sc._state, "_COLLECTIONS_FILE", tmp_path / "coll.json",
         )
         sc._state._library_cache = None
         sc._state._collections_cache = None
@@ -238,11 +237,9 @@ class TestSaveChainAtomicMirror:
         assert loaded[0]["id"] == "p1"
 
     def test_save_parts_bin_runs_mirror(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            sc, "_PARTS_BIN_FILE", tmp_path / "parts_bin.json",
+        monkeypatch.setattr(sc._state, "_PARTS_BIN_FILE", tmp_path / "parts_bin.json",
         )
-        monkeypatch.setattr(
-            sc, "_PARTS_BIN_COLLECTIONS_FILE",
+        monkeypatch.setattr(sc._state, "_PARTS_BIN_COLLECTIONS_FILE",
             tmp_path / "parts_bin_coll.json",
         )
         sc._state._parts_bin_cache = None
@@ -265,8 +262,7 @@ class TestEntryVectorSavesLocked:
     """
 
     def test_set_entry_vector_round_trip(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            sc, "_ENTRY_VECTORS_FILE", tmp_path / "ev.json",
+        monkeypatch.setattr(sc._state, "_ENTRY_VECTORS_FILE", tmp_path / "ev.json",
         )
         sc._state._entry_vectors_cache = None
         sc._set_entry_vector(
@@ -279,8 +275,7 @@ class TestEntryVectorSavesLocked:
         assert ev.get("name") == "MyVec"
 
     def test_clear_grammar_clears_all_roles(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            sc, "_ENTRY_VECTORS_FILE", tmp_path / "ev.json",
+        monkeypatch.setattr(sc._state, "_ENTRY_VECTORS_FILE", tmp_path / "ev.json",
         )
         sc._state._entry_vectors_cache = None
         sc._set_entry_vector(

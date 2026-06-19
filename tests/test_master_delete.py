@@ -31,35 +31,35 @@ def test_sentinel_mismatch_refused_before_any_disk_op():
     this is one of them."""
     # Plant a file that would be wiped if the sentinel check were
     # bypassed; assert it's still there after the refusal.
-    sc._LIBRARY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    sc._LIBRARY_FILE.write_text('{"_schema_version": 1, "entries": []}')
-    assert sc._LIBRARY_FILE.exists()
+    sc._state._LIBRARY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    sc._state._LIBRARY_FILE.write_text('{"_schema_version": 1, "entries": []}')
+    assert sc._state._LIBRARY_FILE.exists()
 
     with pytest.raises(RuntimeError, match="sentinel mismatch"):
         sc._perform_master_delete(None, sentinel=object())
     # The wrong-sentinel call must NOT have touched the planted file.
-    assert sc._LIBRARY_FILE.exists()
+    assert sc._state._LIBRARY_FILE.exists()
 
     # Other sentinel-shaped values are also refused — None, "yes",
     # the string "_MASTER_DELETE_SENTINEL", a random uuid, etc.
     for bad in (None, "yes", "_MASTER_DELETE_SENTINEL", 42, ""):
         with pytest.raises(RuntimeError, match="sentinel mismatch"):
             sc._perform_master_delete(None, sentinel=bad)
-    assert sc._LIBRARY_FILE.exists()
+    assert sc._state._LIBRARY_FILE.exists()
 
 
 def test_sentinel_passing_actually_wipes():
     """Sanity check: with the correct sentinel, the file IS removed.
     Proves the refusal in the test above is exercising the sentinel
     branch and not some unrelated guard."""
-    sc._LIBRARY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    sc._LIBRARY_FILE.write_text('{"_schema_version": 1, "entries": []}')
-    assert sc._LIBRARY_FILE.exists()
+    sc._state._LIBRARY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    sc._state._LIBRARY_FILE.write_text('{"_schema_version": 1, "entries": []}')
+    assert sc._state._LIBRARY_FILE.exists()
 
     summary = sc._perform_master_delete(
         None, sentinel=sc._MASTER_DELETE_SENTINEL,
     )
-    assert not sc._LIBRARY_FILE.exists()
+    assert not sc._state._LIBRARY_FILE.exists()
     assert summary["files_removed"] >= 1
     assert summary["errors"] == 0
 
@@ -98,7 +98,7 @@ def _plant_everything():
     paths: list = []
     # User-data JSON files + a .bak sibling for each.
     for attr in sc._USER_DATA_FILE_ATTRS:
-        p = getattr(sc, attr)
+        p = sc._resolve_state_or_hub(attr)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("PLANTED")
         bak = p.with_suffix(p.suffix + ".bak")
@@ -108,7 +108,7 @@ def _plant_everything():
         paths.extend([p, bak, ts_bak])
     # Operational files.
     for attr in sc._OPERATIONAL_FILE_ATTRS:
-        p = getattr(sc, attr)
+        p = sc._resolve_state_or_hub(attr)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("PLANTED")
         paths.append(p)
@@ -116,7 +116,7 @@ def _plant_everything():
     # rmtree has work to do (an empty dir would also be removed but
     # the test is stronger with content).
     for attr in sc._USER_DATA_DIR_ATTRS:
-        d = getattr(sc, attr)
+        d = sc._resolve_state_or_hub(attr)
         d.mkdir(parents=True, exist_ok=True)
         (d / "marker.txt").write_text("PLANTED")
         paths.append(d / "marker.txt")
@@ -178,8 +178,8 @@ def test_wipe_resets_every_cache_to_none():
     # Plant a small set of files so the wipe has at least one
     # dimension to act on (otherwise it'd no-op and the cache reset
     # test wouldn't prove the actual wipe path is taken).
-    sc._LIBRARY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    sc._LIBRARY_FILE.write_text("{}")
+    sc._state._LIBRARY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    sc._state._LIBRARY_FILE.write_text("{}")
 
     sc._perform_master_delete(
         None, sentinel=sc._MASTER_DELETE_SENTINEL,
@@ -543,13 +543,13 @@ async def test_full_pilot_flow_wipes_planted_library(monkeypatch):
     # Plant a library entry on disk. Has every field the LibraryPanel
     # _refresh_table path reads (`size`, `circular`, etc.) so the app
     # boots cleanly with the entry visible.
-    sc._LIBRARY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    sc._LIBRARY_FILE.write_text(
+    sc._state._LIBRARY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    sc._state._LIBRARY_FILE.write_text(
         '{"_schema_version": 1, "entries": ['
         '{"id": "PLANT", "name": "planted", "size": 100, '
         '"circular": true, "gb_text": "DUMMY"}]}'
     )
-    assert sc._LIBRARY_FILE.exists()
+    assert sc._state._LIBRARY_FILE.exists()
 
     app = sc.PlasmidApp()
     async with app.run_test(size=(160, 48)) as pilot:
@@ -586,7 +586,7 @@ async def test_full_pilot_flow_wipes_planted_library(monkeypatch):
 
         # Stage 3: result modal shows up; library file is gone.
         assert isinstance(app.screen, sc.MasterDeleteResultModal)
-        assert not sc._LIBRARY_FILE.exists()
+        assert not sc._state._LIBRARY_FILE.exists()
         await pilot.click("#btn-mdr-ok")
         await pilot.pause()
 
@@ -605,7 +605,7 @@ def test_file_target_enumeration_covers_every_user_data_attr():
     targets = sc._master_delete_file_targets()
     target_set = {str(p) for p in targets}
     for attr in sc._USER_DATA_FILE_ATTRS + sc._OPERATIONAL_FILE_ATTRS:
-        expected = getattr(sc, attr)
+        expected = sc._resolve_state_or_hub(attr)
         assert str(expected) in target_set, (
             f"{attr} ({expected}) not enumerated by "
             "`_master_delete_file_targets`"
@@ -617,7 +617,7 @@ def test_dir_target_enumeration_covers_every_user_data_attr():
     targets = sc._master_delete_dir_targets()
     target_set = {str(p) for p in targets}
     for attr in sc._USER_DATA_DIR_ATTRS:
-        expected = getattr(sc, attr)
+        expected = sc._resolve_state_or_hub(attr)
         assert str(expected) in target_set, (
             f"{attr} ({expected}) not enumerated by "
             "`_master_delete_dir_targets`"
