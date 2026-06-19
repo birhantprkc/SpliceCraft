@@ -37,8 +37,8 @@ from textual.widgets import Button, DataTable, DirectoryTree, Input, Label, List
 
 from splicecraft_dataaccess import _NEB_ENZYMES, _collection_name_taken, _find_collection, _find_hmm_db_entry, _get_active_collection_name, _grammar_dropdown_options, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _load_collections, _load_feature_colors, _load_library, _load_primer_collections, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_collections
 from splicecraft_logging import _log, _log_event
-from splicecraft_util import _CONTROL_CHARS_RE, _cursor_row_key, _natural_sort_key, _normalize_collection_name, _notify_save_failure, _sanitize_label, _sanitize_plasmid_name, _scrub_path, _validate_group_members
-from splicecraft_widgets import _DEFAULT_TYPE_COLORS, _ExtensionAwareDirectoryTree, _FastaAwareDirectoryTree, _HEX6_RE, _InstantPressButton, _PICKER_PLASMID_STYLE, _XtermColorGrid, _ZipAwareDirectoryTree, _markup_safe_color, _normalise_color_input, _xterm_index_to_hex
+from splicecraft_util import _CONTROL_CHARS_RE, _PLASMID_STATUS_VALUES, _cursor_row_key, _natural_sort_key, _normalize_collection_name, _notify_save_failure, _sanitize_label, _sanitize_plasmid_name, _sanitize_plasmid_status, _scrub_path, _validate_group_members
+from splicecraft_widgets import _DEFAULT_TYPE_COLORS, _ExtensionAwareDirectoryTree, _FastaAwareDirectoryTree, _HEX6_RE, _InstantPressButton, _PICKER_PLASMID_STYLE, _PLASMID_STATUS_COLORS, _XtermColorGrid, _ZipAwareDirectoryTree, _markup_safe_color, _normalise_color_input, _xterm_index_to_hex
 
 
 
@@ -7181,3 +7181,113 @@ class SplitFeatureModal(ModalScreen):
 
     def action_cancel(self) -> None:
         self._dismiss_once(None)
+
+
+class PlasmidStatusPickerModal(_OneShotDismissScreen, ModalScreen):
+    """Tiny modal to set the workflow status on a library entry.
+
+    Five RadioButtons (the four canonical statuses + "no status").
+    Dismisses with the chosen status string (one of
+    `_PLASMID_STATUS_VALUES` or "" for cleared) or None on cancel.
+
+    The picker doesn't persist on its own — caller is responsible
+    for routing the result through `_save_library` so the on-disk
+    entry + active-collection mirror stay in sync.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    #status-dlg {
+        width: 56; height: auto; max-height: 22;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #status-title {
+        height: 1;
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 1; text-align: center;
+    }
+    #status-current { color: $text-muted; margin-bottom: 1; }
+    #status-radios { height: auto; padding: 0 1; }
+    #status-btns { height: 3; margin-top: 1; align: right middle; }
+    #status-btns Button { margin-right: 1; }
+    """
+
+    def __init__(self, plasmid_name: str, current_status: str = "") -> None:
+        super().__init__()
+        self._plasmid_name = str(plasmid_name or "")
+        self._current      = _sanitize_plasmid_status(current_status)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="status-dlg"):
+            yield Static(
+                f"Set status: {self._plasmid_name or '(unnamed)'}",
+                id="status-title",
+            )
+            yield Static(
+                f"Current: {self._current or '(none)'}",
+                id="status-current",
+            )
+            with RadioSet(id="status-radios"):
+                # Order: workflow-natural (designing → verified) plus
+                # an explicit "(none)" sentinel so the user can clear
+                # a previous assignment without leaving the modal.
+                yield RadioButton(
+                    "(none)", id="status-radio-none",
+                    value=(self._current == ""),
+                )
+                for s in _PLASMID_STATUS_VALUES:
+                    color = _PLASMID_STATUS_COLORS.get(s, "white")
+                    # Embed the colour swatch in the label so the
+                    # radio reads as the colour the user will see
+                    # in the library table.
+                    yield RadioButton(
+                        f"[{color}]●[/]  {s}",
+                        id=f"status-radio-{s.lower()}",
+                        value=(self._current == s),
+                    )
+            with Horizontal(id="status-btns"):
+                yield Button("Save",   id="btn-status-save",
+                             variant="primary")
+                yield Button("Cancel", id="btn-status-cancel")
+
+    def on_mount(self) -> None:
+        # Focus the radio set so up/down navigates immediately.
+        try:
+            self.query_one("#status-radios", RadioSet).focus()
+        except NoMatches:
+            pass
+
+    def _read_status(self) -> str:
+        for s in ("",) + _PLASMID_STATUS_VALUES:
+            rid = ("status-radio-none" if s == ""
+                    else f"status-radio-{s.lower()}")
+            try:
+                if self.query_one(f"#{rid}", RadioButton).value:
+                    return s
+            except NoMatches:
+                continue
+        return self._current
+
+    @on(Button.Pressed, "#btn-status-save")
+    def _save(self, _) -> None:
+        chosen = _sanitize_plasmid_status(self._read_status())
+        if chosen == self._current:
+            # No-op — same as cancel so the caller doesn't bother
+            # re-writing the library.
+            self.dismiss(None)
+            return
+        self.dismiss(chosen)
+
+    @on(Button.Pressed, "#btn-status-cancel")
+    def _cancel(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)

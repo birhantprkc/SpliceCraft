@@ -17,7 +17,7 @@ from textual.events import MouseDown
 from textual.widgets import Button, DataTable, DirectoryTree, Input, Static
 
 from splicecraft_logging import _log
-from splicecraft_util import _is_fasta_path, _is_seq_zip_path, _natural_sort_key
+from splicecraft_util import _FASTA_EXTS, _is_fasta_path, _is_seq_zip_path, _natural_sort_key
 from splicecraft_dataaccess import _load_feature_colors
 
 
@@ -674,3 +674,31 @@ def _normalise_color_input(raw: str) -> "str | None":
         if 0 <= idx <= 255:
             return _xterm_index_to_hex(idx)
     return None
+
+
+# ── Plasmid-picker highlight / status / ext maps (moved from hub, Phase D) ──
+_PLASMID_TEXT_EXTS: frozenset[str] = frozenset(
+    {".gb", ".gbk", ".genbank"}
+)
+
+
+_PICKER_DNA_STYLE     = "bold #FFA500"   # orange    — .dna (binary plasmid)
+
+
+_PICKER_FASTA_STYLE   = "bold #FF69B4"   # hot pink  — .fa / .fasta / .fna / …
+
+
+_PLASMID_PICKER_HIGHLIGHT_MAP: dict[str, str] = {
+    **{e: _PICKER_PLASMID_STYLE for e in _PLASMID_TEXT_EXTS},
+    ".dna": _PICKER_DNA_STYLE,
+    **{e: _PICKER_FASTA_STYLE for e in _FASTA_EXTS},
+}
+
+
+_PLASMID_STATUS_COLORS: dict[str, str] = {
+    "DESIGNING":  "#B975FF",   # purple
+    "CLONING":    "#FFA62B",   # orange (matches the app's accent)
+    "SEQUENCING": "#5FB3FF",   # blue
+    "VERIFIED":   "#4EBF71",   # green (matches success accent)
+    "ERROR":      "#FF5C5C",   # red  (matches error/divergent accent)
+}
