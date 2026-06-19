@@ -207,3 +207,15 @@ _dehydrate_collections_hook: "_Callable[[list], list] | None" = None
 # as `_state._cache_lock`; the hub keeps a same-object alias `_cache_lock` so its
 # 129 `with _cache_lock:` sites + the inspect.getsource assertions stay valid.
 _cache_lock = threading.RLock()
+
+
+# ── Post-save side-effect hooks (Phase D) ──────────────────────────────────
+# Some `_save_X` accessors trigger DOMAIN side-effects beyond the disk write +
+# cache reseat — e.g. saving custom enzymes rebuilds the restriction
+# `_SCAN_CATALOG` + busts the enzyme caches so the new enzyme shows up in
+# scans. Those effects stay hub-side (they reach the scanner + hub caches); the
+# hub registers them here at import, and the now-in-sibling accessor fires the
+# hook after its write. None until registered; an accessor that finds None (the
+# import window) just skips the side-effect — no save runs before registration,
+# and test_enzyme_collections guards the registration so a regression is loud.
+_after_custom_enzyme_save_hook: "_Callable[[], None] | None" = None

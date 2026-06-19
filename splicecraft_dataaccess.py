@@ -729,3 +729,45 @@ def _save_hmm_db_catalog(entries: list) -> None:
             _state._HMM_DB_CATALOG_FILE, cleaned, "HMM database catalog",
         )
         _state._hmm_db_catalog_cache = _typed_clone_hmm_catalog(cleaned)
+
+
+# ── Custom restriction enzymes ──────────────────────────────────────────────
+# `_save_custom_enzymes` triggers a DOMAIN side-effect — rebuild the restriction
+# `_SCAN_CATALOG` + bust the enzyme caches so a new / redefined custom enzyme
+# shows up in scans (a silent-biology hazard if skipped). That side-effect lives
+# hub-side (it reaches the scanner) and runs via the registered hook below.
+
+
+def _load_custom_enzymes() -> list[dict]:
+    """Deep-copy on read (pitfall #17).
+
+    Sweep #26: double-checked locking — cache-hit fast path is
+    lock-free so an unrelated lock-holder can't freeze UI reads."""
+    cached = _state._custom_enzymes_cache
+    if cached is not None:
+        return _typed_clone(cached)
+    with _state._cache_lock:
+        if _state._custom_enzymes_cache is None:
+            entries, warning = _safe_load_json(
+                _state._CUSTOM_ENZYMES_FILE, "Custom enzymes",
+            )
+            if warning:
+                _log.warning(warning)
+            _state._custom_enzymes_cache = [
+                e for e in entries if isinstance(e, dict)
+            ]
+        return _typed_clone(_state._custom_enzymes_cache)
+
+
+def _save_custom_enzymes(entries: list[dict]) -> None:
+    with _state._cache_lock:
+        _safe_save_json(
+            _state._CUSTOM_ENZYMES_FILE, entries, "Custom enzymes",
+        )
+        _state._custom_enzymes_cache = _typed_clone(entries)
+    # Rebuild `_SCAN_CATALOG` + bust the enzyme caches so the new custom enzyme
+    # shows up in the next restriction scan — hub-side effect, fired via the
+    # registered hook. None only during the import window (no save runs then).
+    hook = getattr(_state, "_after_custom_enzyme_save_hook", None)
+    if hook is not None:
+        hook()

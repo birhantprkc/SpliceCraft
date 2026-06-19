@@ -74,6 +74,26 @@ def test_all_enzymes_includes_custom():
     assert "EcoRI" in combined
 
 
+def test_save_custom_enzyme_rebuilds_scan_catalog():
+    """Saving a custom enzyme must rebuild `_SCAN_CATALOG` so the new enzyme is
+    immediately scannable. Pre-Phase-D this side-effect was inline in
+    `_save_custom_enzymes`; after the accessor moved to splicecraft_dataaccess it
+    runs via the hub-side `_after_custom_enzyme_save`, registered as
+    `_state._after_custom_enzyme_save_hook` and fired by the sibling save. A
+    regression (hook unregistered, or the moved save not firing it) would leave
+    custom enzymes SILENTLY invisible to restriction scans — this guards it."""
+    assert sc._state._after_custom_enzyme_save_hook is sc._after_custom_enzyme_save
+    sc._save_custom_enzymes([
+        {"name": "ZzScanGuard", "site": "GAATTC",
+         "fwd_cut": 1, "rev_cut": 5, "type": "II_5overhang", "supplier": ""},
+    ])
+    names = {rec[0] for rec in sc._SCAN_CATALOG}
+    assert "ZzScanGuard" in names, (
+        "saved custom enzyme not in _SCAN_CATALOG — the post-save hook did not "
+        "rebuild it; custom enzymes would be silently invisible to scans"
+    )
+
+
 def test_custom_overrides_builtin_on_name_collision():
     """User-added enzyme with same name as built-in overrides — gives
     the user the last word on cut definitions."""
