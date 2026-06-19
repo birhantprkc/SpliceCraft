@@ -222,3 +222,6 @@ _after_custom_enzyme_save_hook: "_Callable[[], None] | None" = None
 # Saving entry vectors busts the EV digest + acceptor-TU caches (a reconfigured
 # vector set changes which overhangs/stuffers match) — hub-side, via this hook.
 _after_entry_vectors_save_hook: "_Callable[[], None] | None" = None
+# Saving cloning grammars busts the assembly-fragment + EV-role-detect caches (a
+# grammar enzyme change shifts fragment overhangs / role detection) — hub-side.
+_after_custom_grammars_save_hook: "_Callable[[], None] | None" = None

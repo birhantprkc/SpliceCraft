@@ -853,3 +853,35 @@ def _save_entry_vectors(entries: list[dict]) -> None:
     hook = getattr(_state, "_after_entry_vectors_save_hook", None)
     if hook is not None:
         hook()
+
+
+# ── Cloning grammars (Golden-Braid L0 / MoClo level rules) ──────────────────
+# `_save_custom_grammars`' post-save side-effect (bust the assembly-fragment +
+# EV-role-detect caches) stays hub-side via `_state._after_custom_grammars_save_hook`.
+
+
+def _load_custom_grammars() -> list[dict]:
+    """Sweep #26: double-checked locking — cache-hit fast path is lock-free."""
+    cached = _state._grammars_cache
+    if cached is not None:
+        return _typed_clone(cached)
+    with _state._cache_lock:
+        if _state._grammars_cache is None:
+            entries, warning = _safe_load_json(_state._GRAMMARS_FILE, "Cloning grammars")
+            if warning:
+                _log.warning(warning)
+            entries = [e for e in entries if isinstance(e, dict) and isinstance(e.get("id"), str)]
+            _state._grammars_cache = entries
+        return _typed_clone(_state._grammars_cache)
+
+
+def _save_custom_grammars(entries: list[dict]) -> None:
+    with _state._cache_lock:
+        _safe_save_json(_state._GRAMMARS_FILE, entries, "Cloning grammars")
+        _state._grammars_cache = _typed_clone(entries)
+    # Bust the assembly-fragment digest + EV-role-detect caches (hub-side: a
+    # grammar enzyme / level_up_enzyme change shifts fragment overhangs + role
+    # detection) via the registered hook.
+    hook = getattr(_state, "_after_custom_grammars_save_hook", None)
+    if hook is not None:
+        hook()
