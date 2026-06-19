@@ -21,6 +21,10 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import TypeVar as _TypeVar
 
+import splicecraft_state as _state
+from splicecraft_logging import _log
+from splicecraft_persistence import _safe_load_json, _safe_save_json
+
 # Immutable types `_typed_clone` returns as-is (no copy needed). Everything else
 # recurses (dict / list / tuple) or falls through to `deepcopy` for any
 # unexpected type, so the sacred-#17 contract ("caller-side mutations can't
@@ -40,3 +44,61 @@ def _typed_clone(obj: _TC) -> _TC:
     if isinstance(obj, _IMMUTABLE_CLONE_TYPES):
         return obj
     return deepcopy(obj)
+
+
+# ── Feature colours (type → colour map) ─────────────────────────────────────
+# First domain accessor cluster moved off the hub (Phase D). Clean closure:
+# splicecraft_state (cache + file path + the save lock), splicecraft_persistence
+# (safe load/save), the logger, and `_typed_clone` above. No migration / mirror
+# / schema validation, so it's the proving cut for the accessor-extraction
+# pattern. The save lock is reached as `_state._cache_lock` (the hub keeps a
+# same-object `_cache_lock` alias for its own sites).
+
+
+def _load_feature_colors() -> dict[str, str]:
+    """Return the user's customised type → colour map. Missing file / empty
+    entries → empty dict. Callers should combine this with
+    ``_DEFAULT_TYPE_COLORS`` — that precedence is handled by
+    ``_resolve_feature_color`` (hub-side).
+
+    Uses ``_typed_clone`` on read so the cache contract matches every
+    other library (invariant #17). Values are ``str`` (immutable) today,
+    so the practical risk is nil — but using the canonical helper keeps
+    the pattern honest in case a future schema bump adds a nested
+    structure to the value side.
+    """
+    # Sweep #26: double-checked locking — cache-hit fast path is lock-free.
+    cached = _state._feature_colors_cache
+    if cached is not None:
+        return _typed_clone(cached)
+    with _state._cache_lock:
+        if _state._feature_colors_cache is None:
+            entries, warning = _safe_load_json(_state._FEATURE_COLORS_FILE, "Feature colors")
+            if warning:
+                _log.warning(warning)
+            result: dict[str, str] = {}
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                ft  = e.get("feature_type")
+                col = e.get("color")
+                if isinstance(ft, str) and ft and isinstance(col, str) and col:
+                    result[ft] = col
+            _state._feature_colors_cache = _typed_clone(result)
+        return _typed_clone(_state._feature_colors_cache)
+
+
+def _save_feature_colors(mapping: dict[str, str]) -> None:
+    """Persist the type → colour map. Written as a list of ``{"feature_type":
+    ..., "color": ...}`` dicts so it shares the schema-envelope shape with
+    the other libraries (sacred invariant #7).
+
+    Re-seats the cache via ``_typed_clone`` so a caller that keeps
+    mutating its mapping after the save doesn't leak post-save edits
+    into the next reader (invariant #17, full deepcopy-on-save side).
+    """
+    entries = [{"feature_type": ft, "color": col}
+               for ft, col in mapping.items()]
+    with _state._cache_lock:
+        _safe_save_json(_state._FEATURE_COLORS_FILE, entries, "Feature colors")
+        _state._feature_colors_cache = _typed_clone(mapping)

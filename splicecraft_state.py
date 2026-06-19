@@ -25,6 +25,8 @@ from any layer.
 """
 from __future__ import annotations
 
+import threading
+
 # ── Render tier ──────────────────────────────────────────────────────────────
 # Set by `_select_render_tier()` / `_set_ascii_mode()` in splicecraft.py; read
 # by the map + helix renderers (fresh every frame) and folded into the
@@ -191,3 +193,17 @@ _SNAPSHOT_DIR_NAME: str = "snapshots"
 # registration regression is caught loudly by test_blob_store, not silently.
 _dehydrate_entries_hook: "_Callable[[list], list] | None" = None
 _dehydrate_collections_hook: "_Callable[[list], list] | None" = None
+
+
+# ── The data-layer save lock (Phase D) ─────────────────────────────────────
+# Every `_save_*` JSON helper grabs this around its disk-write + cache-
+# reassignment pair. The disk write alone is atomic (POSIX rename) and the
+# Python assignment alone is atomic (GIL), but the PAIR is not — without the
+# lock two concurrent saves could land their `os.replace`s in order A→B while
+# their cache reassignments land B→A, leaving a `_*_cache` pointing at older
+# state than disk. RLock (not Lock) because save chains nest re-entrantly
+# (`_save_library` → `_sync_active_collection_plasmids` → `_save_collections`).
+# Lives here (the canonical home) so the dataaccess sibling's accessors reach it
+# as `_state._cache_lock`; the hub keeps a same-object alias `_cache_lock` so its
+# 129 `with _cache_lock:` sites + the inspect.getsource assertions stay valid.
+_cache_lock = threading.RLock()
