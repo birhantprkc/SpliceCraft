@@ -25,6 +25,19 @@ _MIGRATED = [
     "_ASCII_FORCED",
     "_WIN_UTF8_CONSOLE",
     "_ESCAPE_ASPECT",
+    # Phase A1: caches, generation counters, background-write coordination
+    "_BLAST_CACHE_GENERATION",
+    "_DANGLING_ACTIVE_COLLECTION_NAME",
+    "_SPELLCHECK_ENGINE",
+    "_WHATS_NEW_CACHE",
+    "_collection_sync_pending",
+    "_collection_sync_thread",
+    "_feature_library_index_cache",
+    "_features_generation",
+    "_primer_usage_cache",
+    "_primer_usage_cache_gen",
+    "_settings_flush_pending",
+    "_settings_flush_running",
 ]
 
 

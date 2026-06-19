@@ -3564,22 +3564,22 @@ class TestFeatureLibraryGenerationCounter:
 
     def test_save_features_bumps_generation(self, isolated_library):
         sc._save_features([])
-        before = sc._features_generation
+        before = sc._state._features_generation
         sc._save_features([{
             "name": "foo", "feature_type": "CDS",
             "sequence": "ATG", "strand": 1,
         }])
-        assert sc._features_generation > before
+        assert sc._state._features_generation > before
 
     def test_disk_reload_bumps_generation(self, isolated_library):
         sc._save_features([])
-        before = sc._features_generation
+        before = sc._state._features_generation
         # Simulate an external invalidation (test harness, hand-edit of
         # features.json, etc.). _load_features re-reads from disk and
         # bumps the counter so any cached index is treated as stale.
         sc._features_cache = None
         sc._load_features()
-        assert sc._features_generation > before
+        assert sc._state._features_generation > before
 
 
 class TestBuildFeatureLibraryIndex:
@@ -3826,7 +3826,7 @@ class TestPartsBinFeatLibIndexCache:
             assert modal._feat_lib_index == {("lacZ", "CDS"): "ATGCATGCATGC"}
             # Generation snapshot recorded so subsequent populates skip
             # the rebuild.
-            assert modal._feat_lib_gen_seen == sc._features_generation
+            assert modal._feat_lib_gen_seen == sc._state._features_generation
 
     async def test_index_not_rebuilt_when_generation_unchanged(
         self, isolated_parts_bin, isolated_library,

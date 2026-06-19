@@ -186,7 +186,8 @@ def test_wipe_resets_every_cache_to_none():
     )
 
     for cache_attr in sc._MASTER_DELETE_CACHE_ATTRS:
-        assert getattr(sc, cache_attr) is None, (
+        owner = sc._state if hasattr(sc._state, cache_attr) else sc
+        assert getattr(owner, cache_attr) is None, (
             f"{cache_attr} was not reset after Master Delete"
         )
 

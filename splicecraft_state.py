@@ -54,3 +54,19 @@ _WIN_UTF8_CONSOLE: bool = False
 # Preferred over TIOCGWINSZ because many terminals answer the query yet leave the
 # ioctl pixel fields at zero. None until measured (caller keeps the 2:1 default).
 _ESCAPE_ASPECT: "float | None" = None
+
+
+# ── Caches, generation counters, background-write coordination (Phase A1) ──
+# Migrated out of the hub; accessed `_state.<name>`. Not conftest-patched.
+_BLAST_CACHE_GENERATION: int = 0
+_DANGLING_ACTIVE_COLLECTION_NAME: "str | None" = None
+_SPELLCHECK_ENGINE: "_Any | None" = None
+_WHATS_NEW_CACHE: "tuple[str, float, str] | None" = None  # (path, mtime, body_md)
+_collection_sync_pending: "tuple[str, list[dict]] | None" = None
+_collection_sync_thread: "threading.Thread | None" = None
+_feature_library_index_cache: "tuple[int, dict[tuple[str, str], str]] | None" = None
+_features_generation: int = 0
+_primer_usage_cache: "dict[str, int] | None" = None
+_primer_usage_cache_gen: int = 0
+_settings_flush_pending: "dict | None" = None
+_settings_flush_running: bool = False

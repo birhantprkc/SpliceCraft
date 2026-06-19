@@ -54,9 +54,9 @@ class TestMasterDeleteCacheAttrsCoverage:
         """Every name in `_MASTER_DELETE_CACHE_ATTRS` must resolve to a
         real module attribute. Catches typos + name drift."""
         for attr in sc._MASTER_DELETE_CACHE_ATTRS:
-            assert hasattr(sc, attr), (
+            assert hasattr(sc, attr) or hasattr(sc._state, attr), (
                 f"_MASTER_DELETE_CACHE_ATTRS references missing "
-                f"global: {attr!r}"
+                f"attribute (hub or _state): {attr!r}"
             )
 
     def test_no_persisted_data_cache_missing(self):

@@ -95,9 +95,9 @@ class TestCacheBustParity:
         # (one of the cache globals). Pre-fix this list was hand-
         # maintained and drifted.
         for attr in sc._MASTER_DELETE_CACHE_ATTRS:
-            assert hasattr(sc, attr), (
+            assert hasattr(sc, attr) or hasattr(sc._state, attr), (
                 f"{attr!r} is in _MASTER_DELETE_CACHE_ATTRS but does "
-                f"not exist as a module attribute — typo / removed?"
+                f"not exist as a module attribute (hub or _state) — typo / removed?"
             )
 
     def test_master_delete_includes_sweep24_caches(self):
