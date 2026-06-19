@@ -29,7 +29,7 @@ from splicecraft_logging import _log, _log_event, _repr_for_log
 from splicecraft_persistence import _safe_load_json, _safe_save_json
 from splicecraft_record import _gb_text_to_record
 from splicecraft_biology import _rc
-from splicecraft_util import _feat_label
+from splicecraft_util import _feat_label, _sanitize_gel_id
 
 # Immutable types `_typed_clone` returns as-is (no copy needed). Everything else
 # recurses (dict / list / tuple) or falls through to `deepcopy` for any
@@ -2443,3 +2443,67 @@ def _gel_name_taken(name: str) -> bool:
         if (g.get("name") or "").strip() == needle:
             return True
     return False
+
+
+# ── Gel finder (moved from hub, Phase D) ────────────────────────────────────
+def _find_gel(gel_id: str) -> "dict | None":
+    safe = _sanitize_gel_id(gel_id)
+    if safe is None:
+        return None
+    for g in _load_gels():
+        if g.get("id") == safe:
+            return g
+    return None
+
+
+# ── Entry-vector setter + parts-bin readonly view (moved from hub, Phase D) ─
+def _set_entry_vector(
+    grammar_id: str, vector: "dict | None", role: str = "",
+) -> None:
+    """Replace (or remove, with ``vector=None``) the entry vector
+    bound to ``(grammar_id, role)``. Persists via `_safe_save_json`.
+
+    Only the matching ``(grammar_id, role)`` entry is replaced —
+    other roles for the same grammar (e.g. Alpha2 / Omega1 / Omega2
+    when setting Alpha1) survive untouched.
+
+    Sweep #10 (2026-05-20): full load-modify-save sequence runs under
+    `_cache_lock` so concurrent rapid clicks across grammar tabs (or
+    `_auto_bind_entry_vectors_from_entries` looping per-role) can't
+    lose updates via classic RMW racing. RLock allows re-entry from
+    the nested `_save_entry_vectors` lock acquisition.
+    """
+    if not isinstance(grammar_id, str) or not grammar_id:
+        return
+    role = role or ""
+    with _state._cache_lock:
+        entries = [
+            e for e in _load_entry_vectors()
+            if not (
+                e.get("grammar_id") == grammar_id
+                and (e.get("role") or "") == role
+            )
+        ]
+        if vector is not None:
+            v = dict(vector)
+            v["grammar_id"] = grammar_id
+            v["role"]       = role
+            entries.append(v)
+        _save_entry_vectors(entries)
+
+
+def _iter_parts_bin_readonly() -> list[dict]:
+    """Read-only view of the parts-bin cache — returns the cached list
+    directly without cloning. Callers MUST NOT mutate (pitfall #17).
+    Use for hot read paths (Constructor palette repop, classifier
+    probes) where the per-row deepcopy of qualifier dicts is wasted
+    when the caller only reads fields. For any path that mutates
+    entries, use ``_load_parts_bin()``. Added by sweep #25
+    (2026-05-23) mirroring ``_iter_library_readonly`` /
+    ``_iter_collections_readonly``.
+    """
+    _ensure = _state._ensure_parts_bin_hook
+    if _ensure is not None:
+        _ensure()
+    assert _state._parts_bin_cache is not None
+    return _state._parts_bin_cache

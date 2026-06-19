@@ -701,3 +701,260 @@ def _identity_pct_color(pct: "float | int | None") -> str:
     if v >= 11.0:
         return "red"
     return "grey50"
+
+
+# ── Status/fuzzy/gel/feat sanitisers (moved from hub, Phase D) ──────────────
+_GEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{0,63}$")
+
+
+_PLASMID_STATUS_VALUES: tuple[str, ...] = (
+    "DESIGNING", "CLONING", "SEQUENCING", "VERIFIED", "ERROR",
+)
+
+
+def _fuzzy_match(query: str, name: str) -> bool:
+    """Case-insensitive subsequence match: True if every char of `query`
+    appears in `name` in order (not necessarily contiguous). Empty query
+    matches everything. Used by LibraryPanel's search filter and by
+    `_search_collections_library` (cross-collection search).
+
+    Performance: O(len(query) * len(name)) worst case via repeated
+    `str.find`. Early-rejects when ``len(query) > len(name)`` (no
+    subsequence can be longer than its container) — saves the
+    full lower() + scan on huge libraries where most names are
+    shorter than a typical fuzzy query. The lower() call is the hot
+    spot for very long names; the early reject runs on the original
+    strings before any allocation.
+    """
+    if not query:
+        return True
+    if not name:
+        return False
+    # Subsequence membership requires `len(query) <= len(name)`. Skip
+    # the lower() + scan entirely when impossible. This is the hot
+    # exit on huge libraries where typical names are short and the
+    # user's filter has 5+ chars.
+    if len(query) > len(name):
+        return False
+    q, n = query.lower(), name.lower()
+    i = 0
+    for ch in q:
+        i = n.find(ch, i)
+        if i < 0:
+            return False
+        i += 1
+    return True
+
+
+def _sanitize_gel_id(raw: object) -> "str | None":
+    """Mirror `_sanitize_experiment_id` — a gel id is filesystem-safe
+    (it shows up in tag tokens + JSON path keys + log events).
+    Rejects empty / NUL / `..` / `/` / `\\` / >64 chars."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    if "\x00" in raw or ".." in raw or "/" in raw or "\\" in raw:
+        return None
+    if not _GEL_ID_RE.match(raw):
+        return None
+    return raw
+
+
+def _sanitize_feat_type(s: "str | None", *,
+                         max_len: int = 50,
+                         default: str = "misc_feature") -> str:
+    """Clean a GenBank feature-type string. Empty / None / non-string
+    input → ``default``. INSDC types are short alpha words with
+    underscore — non-strict here (we accept anything printable) since
+    users may legitimately add custom types not in the curated list."""
+    if not isinstance(s, str) or not s:
+        return default
+    s = _CONTROL_CHARS_RE.sub("", s).strip()
+    return (s or default)[:max_len]
+
+
+def _sanitize_plasmid_status(s) -> str:
+    """Type-strict acceptance of the four canonical workflow status
+    strings. Anything else — including None, empty string, dicts,
+    leading/trailing whitespace variants of recognised values, or
+    case mismatches — collapses to empty (the "no status" sentinel).
+
+    Strict matching is intentional: a hand-edited library JSON with
+    `"status": "Designing"` (mixed case) silently degrades to no
+    status rather than being normalised, because we want the on-
+    disk value to round-trip through this function exactly. Callers
+    that want lenient parsing should upper-case + strip themselves
+    before passing through.
+    """
+    if not isinstance(s, str):
+        return ""
+    return s if s in _PLASMID_STATUS_VALUES else ""
+
+
+# ── Group-member validation (moved from hub, Phase D) ──────────────────────
+_MAX_GROUP_MEMBERS = 64
+
+
+_MAX_GROUP_LABEL_LEN = 200
+
+
+_MAX_GROUP_COLOR_LEN = 32
+
+
+def _validate_group_members(
+    members: list,
+    sequence_len: int,
+) -> "list[dict]":
+    """Normalise + validate a group entry's `members` list. Returns
+    a fresh list of well-formed member dicts in `rel_start` order
+    (stable sort, so duplicate-start members preserve input order).
+
+    Raises `ValueError` for unrecoverable shape errors so the save
+    / load paths surface a clear error to the user rather than
+    persisting a half-broken entry that later trips the annotate
+    path with a NoneType / KeyError deep in the rendering call
+    stack.
+
+    Validation rules:
+      * `members` must be a non-empty list of dicts.
+      * Each member needs int `rel_start`, `rel_end` with
+        `0 <= rel_start < rel_end <= sequence_len`. The closed-open
+        half-interval matches the existing single-feature
+        convention used by `_annotate_with_feature_impl`.
+      * `feature_type` defaults to `"misc_feature"` if missing /
+        empty (matches `_annotate_with_feature_impl`).
+      * `strand` defaults to 1, clamped to `{-1, 0, 1, 2}`.
+      * `color` defaults to `None` (Auto / palette fallback);
+        non-hex strings are passed through unmodified for
+        forward-compat (Rich may accept named colours).
+      * `qualifiers` defaults to `{}`; non-dict values are
+        replaced with `{}` rather than raising.
+      * `label` defaults to `""`; non-str values are stringified.
+      * `description` defaults to `""`; same coercion.
+
+    Members CAN overlap (rare but legitimate — e.g. a parent CDS
+    with a sub-feature like an active site marker) and CAN leave
+    gaps (= unannotated bases inside the group's sequence). The
+    validator deliberately does NOT enforce tiling so the user
+    can model real biology."""
+    if not isinstance(members, list) or not members:
+        raise ValueError(
+            "group entry must have a non-empty `members` list"
+        )
+    if len(members) > _MAX_GROUP_MEMBERS:
+        # Hardening (2026-05-26): defends against pasted JSON /
+        # textarea content with thousands of rows. A real Golden
+        # Gate adapter has 4 members; biology rarely exceeds 8.
+        # `_MAX_GROUP_MEMBERS = 64` leaves comfortable headroom.
+        raise ValueError(
+            f"too many members ({len(members)} > "
+            f"{_MAX_GROUP_MEMBERS}) — split into multiple groups "
+            "or raise `_MAX_GROUP_MEMBERS` if you really need "
+            "this many sub-features"
+        )
+    if not isinstance(sequence_len, int) or sequence_len < 1:
+        raise ValueError(
+            f"group sequence_len must be a positive int "
+            f"(got {sequence_len!r})"
+        )
+    out: list[dict] = []
+    for i, m in enumerate(members):
+        if not isinstance(m, dict):
+            raise ValueError(
+                f"member {i} must be a dict (got {type(m).__name__})"
+            )
+        rs_raw = m.get("rel_start")
+        re_raw = m.get("rel_end")
+        if rs_raw is None or re_raw is None:
+            raise ValueError(
+                f"member {i}: rel_start / rel_end must be ints "
+                f"(missing)"
+            )
+        try:
+            rs = int(rs_raw)
+            re = int(re_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"member {i}: rel_start / rel_end must be ints "
+                f"({exc})"
+            )
+        if not (0 <= rs < re <= sequence_len):
+            raise ValueError(
+                f"member {i}: rel_start={rs}, rel_end={re} not in "
+                f"[0, {sequence_len}] half-open"
+            )
+        raw_strand = m.get("strand", 1)
+        try:
+            strand = int(raw_strand)
+        except (TypeError, ValueError):
+            strand = 1
+        if strand not in (-1, 0, 1, 2):
+            strand = 1
+        # Sweep #29 hardening (2026-05-26): every user-supplied
+        # string field is scrubbed of control chars + length-
+        # capped. Paste of a binary blob or ANSI-escape-laden
+        # text can't smuggle escape sequences into Rich Text /
+        # `.gb` qualifier values via the group library route.
+        raw_ftype = m.get("feature_type") or ""
+        if not isinstance(raw_ftype, str):
+            raw_ftype = str(raw_ftype) if raw_ftype is not None else ""
+        ftype = _sanitize_feat_type(raw_ftype) or "misc_feature"
+        color = m.get("color")
+        if not isinstance(color, str):
+            color = None
+        else:
+            color = _CONTROL_CHARS_RE.sub("", color).strip()
+            if not color:
+                color = None
+            elif len(color) > _MAX_GROUP_COLOR_LEN:
+                # Suspiciously long "colour" → drop, palette
+                # fallback applies at render time.
+                color = None
+        raw_label = m.get("label")
+        if not isinstance(raw_label, str):
+            raw_label = str(raw_label) if raw_label is not None else ""
+        label = _sanitize_label(raw_label, max_len=_MAX_GROUP_LABEL_LEN)
+        raw_desc = m.get("description")
+        if not isinstance(raw_desc, str):
+            raw_desc = str(raw_desc) if raw_desc is not None else ""
+        desc = _sanitize_note(raw_desc)
+        quals = m.get("qualifiers")
+        if not isinstance(quals, dict):
+            quals = {}
+        # Sanitize qualifier values too — they round-trip to
+        # `.gb` exports, so a control char in a value would
+        # corrupt the file. Keys are not user-input in practice
+        # (they come from GenBank spec / the library JSON)
+        # but we cap their length defensively.
+        clean_quals: dict = {}
+        for qk, qv in quals.items():
+            if not isinstance(qk, str):
+                continue
+            qk_clean = _CONTROL_CHARS_RE.sub("", qk).strip()
+            if not qk_clean or len(qk_clean) > 64:
+                continue
+            if isinstance(qv, (list, tuple)):
+                clean_vals = []
+                for v in qv:
+                    if isinstance(v, str):
+                        cv = _CONTROL_CHARS_RE.sub("", v)
+                        if len(cv) > 8192:
+                            cv = cv[:8192]
+                        clean_vals.append(cv)
+                clean_quals[qk_clean] = clean_vals
+            elif isinstance(qv, str):
+                cv = _CONTROL_CHARS_RE.sub("", qv)
+                if len(cv) > 8192:
+                    cv = cv[:8192]
+                clean_quals[qk_clean] = [cv]
+        out.append({
+            "rel_start":    rs,
+            "rel_end":      re,
+            "feature_type": ftype,
+            "label":        label,
+            "color":        color,
+            "strand":       strand,
+            "qualifiers":   clean_quals,
+            "description":  desc,
+        })
+    out.sort(key=lambda m: (m["rel_start"], m["rel_end"]))
+    return out

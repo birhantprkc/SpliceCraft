@@ -37,7 +37,7 @@ from textual.widgets import Button, DataTable, DirectoryTree, Input, Label, List
 
 from splicecraft_dataaccess import _NEB_ENZYMES, _collection_name_taken, _find_collection, _find_hmm_db_entry, _get_active_collection_name, _grammar_dropdown_options, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _load_collections, _load_feature_colors, _load_library, _load_primer_collections, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_collections
 from splicecraft_logging import _log, _log_event
-from splicecraft_util import _cursor_row_key, _natural_sort_key, _normalize_collection_name, _notify_save_failure, _sanitize_label, _sanitize_plasmid_name, _scrub_path
+from splicecraft_util import _CONTROL_CHARS_RE, _cursor_row_key, _natural_sort_key, _normalize_collection_name, _notify_save_failure, _sanitize_label, _sanitize_plasmid_name, _scrub_path, _validate_group_members
 from splicecraft_widgets import _DEFAULT_TYPE_COLORS, _ExtensionAwareDirectoryTree, _FastaAwareDirectoryTree, _HEX6_RE, _InstantPressButton, _PICKER_PLASMID_STYLE, _XtermColorGrid, _ZipAwareDirectoryTree, _markup_safe_color, _normalise_color_input, _xterm_index_to_hex
 
 
@@ -6891,6 +6891,292 @@ class MoveCopyToCollectionModal(ModalScreen):
 
     @on(Button.Pressed, "#btn-movecopy-cancel")
     def _cancel_btn(self, _) -> None:
+        self._dismiss_once(None)
+
+    def action_cancel(self) -> None:
+        self._dismiss_once(None)
+
+
+class SplitFeatureModal(ModalScreen):
+    """Sweep #29: divide one feature into N sub-features that
+    share a `feature_group=<uuid>` qualifier.
+
+    The user types a per-line breakdown into a multi-line input:
+      ``<rel_start>-<rel_end> <label> <color> <strand>``
+
+    e.g.:
+      ``0-4 GCGC #888888 0``
+      ``4-10 Esp3I #FF3333 1``
+      ``10-11 N #666666 0``
+      ``11-15 AATG #00CC66 1``
+
+    Preset templates (button row above the input) pre-fill the
+    text area with common Golden Gate adapter shapes so users
+    don't have to remember the rel coords. On Save, the lines
+    are parsed + validated; failures surface inline status text
+    and DON'T dismiss — the user keeps editing.
+
+    Returns `{"members": [<validated member dicts>]}` on Save,
+    `None` on Cancel."""
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    #split-dlg {
+        width: 100; height: auto; max-height: 90%;
+        background: $surface; border: solid $primary;
+        padding: 1 2;
+    }
+    #split-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; margin-bottom: 1;
+        text-align: center; text-style: bold;
+    }
+    #split-dlg Label { color: $text-muted; margin-top: 1; }
+    #split-presets { height: 3; margin-top: 0; }
+    #split-presets Button { margin-right: 1; min-width: 16; }
+    #split-rows { height: 12; min-height: 6; margin-top: 0; }
+    #split-help { color: $text-muted; padding: 0 1;
+                  height: auto; margin-top: 1; }
+    #split-status { height: auto; margin-top: 1; padding: 0 1; }
+    #split-btns { height: 3; margin-top: 1; align: right middle; }
+    #split-btns Button { margin-right: 1; min-width: 12; }
+    """
+
+    def __init__(self, feat_label: str, span: int,
+                 *, base_color: "str | None" = None,
+                 base_strand: int = 1,
+                 base_type: str = "misc_feature") -> None:
+        super().__init__()
+        self._feat_label  = str(feat_label or "")
+        self._span        = int(span)
+        self._base_color  = base_color
+        self._base_strand = base_strand
+        self._base_type   = base_type
+        self._dismissed: bool = False
+
+    def _dismiss_once(self, result) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(result)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="split-dlg"):
+            yield Static(
+                f" Split '{self._feat_label or '(unnamed)'}' "
+                f"into sub-features ({self._span} bp total) ",
+                id="split-title",
+            )
+            yield Label("Presets:")
+            with Horizontal(id="split-presets"):
+                yield Button(
+                    "Equal thirds", id="btn-split-preset-thirds",
+                    tooltip=(
+                        "Pre-fill the rows with 3 equal-sized "
+                        "sub-features sharing the parent's type."
+                    ),
+                )
+                yield Button(
+                    "5'-Esp3I-AATG adapter",
+                    id="btn-split-preset-esp3i",
+                    tooltip=(
+                        "Pre-fill with GCGC pad + Esp3I + N + "
+                        "AATG overhang (Golden Gate 5'-adapter "
+                        "shape). Requires the feature to be "
+                        "exactly 15 bp."
+                    ),
+                )
+                yield Button(
+                    "Clear", id="btn-split-preset-clear",
+                    tooltip="Erase the rows.",
+                )
+            yield Label(
+                "Sub-features  (one per line: "
+                "`<rel_start>-<rel_end> <label> <color> <strand>`):"
+            )
+            yield TextArea("", id="split-rows")
+            yield Static(
+                "[dim]Strand: `1` = forward, `-1` = reverse, "
+                "`0` = arrowless, `2` = double. Color: `#RRGGBB` "
+                "or leave empty for the type default. "
+                "Rel coords are within `[0, span)` half-open. "
+                "Members CAN overlap and CAN leave gaps "
+                "(unannotated bases stay unannotated).[/dim]",
+                id="split-help", markup=True,
+            )
+            yield Static("", id="split-status", markup=True)
+            with Horizontal(id="split-btns"):
+                yield Button("Save", id="btn-split-save",
+                             variant="primary")
+                yield Button("Cancel", id="btn-split-cancel")
+
+    @on(Button.Pressed, "#btn-split-preset-thirds")
+    def _preset_thirds(self, _) -> None:
+        n = self._span
+        if n < 3:
+            self._set_status(
+                "[red]Span too short for 3 equal thirds "
+                "(need ≥ 3 bp).[/red]"
+            )
+            return
+        third = n // 3
+        rows = [
+            f"0-{third} part_1 #888888 {self._base_strand}",
+            f"{third}-{2 * third} part_2 #BBBBBB "
+            f"{self._base_strand}",
+            f"{2 * third}-{n} part_3 #EEEEEE {self._base_strand}",
+        ]
+        self._set_rows("\n".join(rows))
+
+    @on(Button.Pressed, "#btn-split-preset-esp3i")
+    def _preset_esp3i(self, _) -> None:
+        if self._span != 15:
+            self._set_status(
+                f"[red]Esp3I→AATG preset wants exactly 15 bp; "
+                f"this feature is {self._span} bp.[/red]"
+            )
+            return
+        rows = [
+            "0-4 GCGC #888888 0",
+            "4-10 Esp3I #FF3333 1",
+            "10-11 N #666666 0",
+            "11-15 AATG #00CC66 1",
+        ]
+        self._set_rows("\n".join(rows))
+
+    @on(Button.Pressed, "#btn-split-preset-clear")
+    def _preset_clear(self, _) -> None:
+        self._set_rows("")
+        self._set_status("")
+
+    def _set_rows(self, text: str) -> None:
+        try:
+            ta = self.query_one("#split-rows", TextArea)
+        except NoMatches:
+            return
+        ta.text = text
+
+    def _set_status(self, msg: str) -> None:
+        try:
+            self.query_one("#split-status", Static).update(msg)
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-split-save")
+    def _save(self, _) -> None:
+        try:
+            text = self.query_one("#split-rows", TextArea).text
+        except NoMatches:
+            return
+        # Sweep #29 hardening (2026-05-26): copy-paste of a huge
+        # blob into the TextArea (binary file, syslog, etc.) is a
+        # real risk. Cap input size before splitting on newlines
+        # so the parser can't be DoS'd; cap line count downstream
+        # via `_MAX_GROUP_MEMBERS`.
+        if len(text) > 32_768:
+            self._set_status(
+                "[red]Input too long (>32 KB) — paste a smaller "
+                "breakdown or split into multiple groups.[/red]"
+            )
+            return
+        # Parse each non-empty line into a member dict. Format:
+        # `<rel_start>-<rel_end> <label> [color] [strand]`. Color
+        # and strand are optional; missing color → palette
+        # default (None), missing strand → base_strand.
+        members: list[dict] = []
+        for lineno, raw in enumerate(text.splitlines(), 1):
+            # Strip control chars on the way in so a paste with
+            # ANSI escape sequences / tabs / nulls can't smuggle
+            # into the parser. Tabs collapse to spaces below.
+            cleaned = _CONTROL_CHARS_RE.sub("", raw)
+            line = cleaned.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Cap individual line length too — a line of
+            # 100 KB of "label" text shouldn't be tolerated.
+            if len(line) > 1024:
+                self._set_status(
+                    f"[red]Line {lineno} too long "
+                    f"({len(line)} chars > 1024) — wrap or "
+                    f"shorten.[/red]"
+                )
+                return
+            # Split on whitespace; first token is the rel range.
+            parts = line.split()
+            if not parts:
+                continue
+            rng = parts[0]
+            if "-" not in rng:
+                self._set_status(
+                    f"[red]Line {lineno}: expected "
+                    f"`<rel_start>-<rel_end>`, got '{rng}'.[/red]"
+                )
+                return
+            try:
+                rs_str, re_str = rng.split("-", 1)
+                rs = int(rs_str)
+                re_ = int(re_str)
+            except ValueError:
+                self._set_status(
+                    f"[red]Line {lineno}: rel coords must be "
+                    f"ints (got '{rng}').[/red]"
+                )
+                return
+            if not (0 <= rs < re_ <= self._span):
+                self._set_status(
+                    f"[red]Line {lineno}: range {rs}-{re_} "
+                    f"out of `[0, {self._span}]`.[/red]"
+                )
+                return
+            # Remaining tokens: label, color, strand (in order).
+            tail = parts[1:]
+            label = tail[0] if len(tail) >= 1 else ""
+            color = tail[1] if len(tail) >= 2 else ""
+            strand_str = tail[2] if len(tail) >= 3 else str(
+                self._base_strand,
+            )
+            try:
+                strand = int(strand_str)
+            except ValueError:
+                strand = self._base_strand
+            if strand not in (-1, 0, 1, 2):
+                strand = self._base_strand
+            members.append({
+                "rel_start": rs,
+                "rel_end":   re_,
+                "feature_type": self._base_type,
+                "label":     label,
+                "color":     color if color else None,
+                "strand":    strand,
+                "qualifiers": {},
+                "description": "",
+            })
+        if not members:
+            self._set_status(
+                "[red]No sub-features defined — type at least "
+                "one row first (or use a preset).[/red]"
+            )
+            return
+        # Re-validate via the shared helper so the same rules
+        # apply as for library entries. Catches any edge case
+        # the line-by-line parse missed.
+        try:
+            members = _validate_group_members(members, self._span)
+        except ValueError as exc:
+            self._set_status(
+                f"[red]Validation failed: {exc}[/red]"
+            )
+            return
+        self._dismiss_once({"members": members})
+
+    @on(Button.Pressed, "#btn-split-cancel")
+    def _cancel(self, _) -> None:
         self._dismiss_once(None)
 
     def action_cancel(self) -> None:
