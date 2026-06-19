@@ -28,6 +28,8 @@ import splicecraft_state as _state
 from splicecraft_logging import _log, _log_event, _repr_for_log
 from splicecraft_persistence import _safe_load_json, _safe_save_json
 from splicecraft_record import _gb_text_to_record
+from splicecraft_biology import _rc
+from splicecraft_util import _feat_label
 
 # Immutable types `_typed_clone` returns as-is (no copy needed). Everything else
 # recurses (dict / list / tuple) or falls through to `deepcopy` for any
@@ -2300,3 +2302,59 @@ def _grammar_dropdown_options() -> list[tuple[str, str]]:
             continue
         out.append((f"{g.get('name', gid)}  (custom)", gid))
     return out
+
+
+# ── Feature-entry extraction from a record (moved from hub, Phase D) ────────
+def _extract_feature_entries_from_record(record) -> list[dict]:
+    """Return one feature-library entry dict per non-source feature.
+
+    Wrap features (origin-spanning CompoundLocations) are flattened into the
+    forward-strand genomic sequence before export, so the entry's ``sequence``
+    is always the 5'→3' DNA that would be re-inserted. Reverse-strand
+    features store the revcomp (i.e. the 5'→3' of the feature as read), which
+    matches how the Add Feature modal expects input.
+    """
+    try:
+        from Bio.SeqFeature import CompoundLocation
+    except ImportError:
+        CompoundLocation = tuple()  # type: ignore[assignment]
+    seq = str(getattr(record, "seq", "") or "").upper()
+    total = len(seq)
+    entries: list[dict] = []
+    for feat in getattr(record, "features", []) or []:
+        if feat.type == "source":
+            continue
+        loc = feat.location
+        strand = getattr(loc, "strand", 1) or 1
+        # Assemble the forward-strand genomic sequence under the feature,
+        # respecting wrap/compound locations.
+        if isinstance(loc, CompoundLocation):
+            parts_seq = []
+            for part in loc.parts:
+                s = int(part.start) % total if total else 0
+                e = int(part.end)   % (total or 1) if total else 0
+                if total and e <= s:
+                    parts_seq.append(seq[s:] + seq[:e])
+                else:
+                    parts_seq.append(seq[s:e])
+            fwd = "".join(parts_seq)
+        else:
+            s = int(loc.start)
+            e = int(loc.end)
+            fwd = seq[s:e]
+        # Store 5'→3' of the feature as read. For reverse-strand CDS that is
+        # the revcomp of the genomic slice.
+        if strand == -1 and fwd:
+            feat_seq = _rc(fwd)
+        else:
+            feat_seq = fwd
+        entries.append({
+            "name":         _feat_label(feat),
+            "feature_type": feat.type,
+            "sequence":     feat_seq,
+            "strand":       1 if strand != -1 else -1,
+            "qualifiers":   {k: list(v) if isinstance(v, (list, tuple)) else [v]
+                             for k, v in (feat.qualifiers or {}).items()},
+            "description":  "",
+        })
+    return entries

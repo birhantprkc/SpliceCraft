@@ -10,6 +10,7 @@ existing call site resolves unchanged.
 from __future__ import annotations
 
 import re
+import functools as _functools
 from pathlib import Path
 
 from splicecraft_logging import _log, _log_event
@@ -577,3 +578,46 @@ def _surface_placeholder_gene(s: str) -> str:
             rest = s[len(ph):].lstrip(" \t;:,-/|")
             return rest if rest else s
     return s
+
+
+# ── Primer-Tm + single-record-pick pure helpers (moved, Phase D) ────────────
+@_functools.lru_cache(maxsize=512)
+def _primer_tm_safe(seq: str) -> "float | None":
+    """Memoized, defensive primer3 Tm calculation. Returns None if
+    primer3 is unavailable, the seq is outside the calc's useful
+    range (5..200 bp), or the underlying call raises. Caller
+    renders a `—` placeholder for None.
+
+    Cached because `PrimerEditModal._seq_changed` repaints the
+    stats line on every keystroke — a user typing/backspacing
+    re-hits the same intermediate strings, and the nearest-
+    neighbor thermodynamics is the slow part of the path.
+    """
+    s = (seq or "").upper()
+    if not (5 <= len(s) <= 200):
+        return None
+    try:
+        import primer3
+        return float(primer3.calc_tm(s))
+    except (ImportError, OSError, ValueError, RuntimeError, TypeError):
+        return None
+
+
+def _pick_single_record(records: list, source: str):
+    """Given a list of SeqRecords, return the single one if there's exactly
+    one, else raise ValueError with a user-friendly message. Used by both
+    NCBI fetch and file load so the error text is consistent.
+    """
+    if not records:
+        raise ValueError(
+            f"{source} contained no GenBank records. Is it a valid .gb/.gbk file?"
+        )
+    if len(records) > 1:
+        ids = ", ".join(r.id for r in records[:3])
+        more = f" (and {len(records) - 3} more)" if len(records) > 3 else ""
+        raise ValueError(
+            f"{source} contains {len(records)} records — SpliceCraft loads "
+            f"one plasmid at a time. Split the file or extract a single "
+            f"record first (found: {ids}{more})."
+        )
+    return records[0]

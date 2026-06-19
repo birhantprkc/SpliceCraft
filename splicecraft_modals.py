@@ -27,17 +27,17 @@ from textual import on
 from textual.app import ComposeResult
 from textual.await_complete import AwaitComplete
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Horizontal, ScrollableContainer, Vertical, VerticalScroll
 from textual.coordinate import Coordinate as _Coordinate
 from textual.css.query import NoMatches
-from textual.events import Click
+from textual.events import Click, MouseDown, MouseMove, MouseUp
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, DataTable, DirectoryTree, Input, Label, ListItem, ListView, RadioButton, RadioSet, Select, Static, TextArea
 
-from splicecraft_dataaccess import _NEB_ENZYMES, _collection_name_taken, _get_active_collection_name, _grammar_dropdown_options, _iter_collections_readonly, _iter_library_readonly, _load_library, _load_primer_collections
+from splicecraft_dataaccess import _NEB_ENZYMES, _collection_name_taken, _get_active_collection_name, _grammar_dropdown_options, _iter_collections_readonly, _iter_library_readonly, _load_feature_colors, _load_library, _load_primer_collections
 from splicecraft_logging import _log, _log_event
 from splicecraft_util import _cursor_row_key, _natural_sort_key, _normalize_collection_name, _sanitize_label, _sanitize_plasmid_name
-from splicecraft_widgets import _ExtensionAwareDirectoryTree, _FastaAwareDirectoryTree, _InstantPressButton, _PICKER_PLASMID_STYLE, _ZipAwareDirectoryTree
+from splicecraft_widgets import _DEFAULT_TYPE_COLORS, _ExtensionAwareDirectoryTree, _FastaAwareDirectoryTree, _HEX6_RE, _InstantPressButton, _PICKER_PLASMID_STYLE, _XtermColorGrid, _ZipAwareDirectoryTree, _markup_safe_color, _normalise_color_input, _xterm_index_to_hex
 
 
 
@@ -6122,6 +6122,328 @@ class MultiRecordFastaModal(_OneShotDismissScreen, ModalScreen):
 
     @on(Button.Pressed, "#btn-multi-fasta-cancel")
     def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ColorPickerModal(_OneShotDismissScreen, ModalScreen):
+    """Pick a display color for a feature-library entry.
+
+    Returns via ``dismiss``:
+      * ``None`` — user cancelled.
+      * ``{"color": "#RRGGBB", "set_default": False}`` — set entry color.
+      * ``{"color": "#RRGGBB", "set_default": True}`` — also save as the
+        default for this feature type.
+      * ``{"color": None, "set_default": False}`` — clear the override and
+        fall back to the type default.
+
+    Three ways to pick a color:
+
+      1. **Curated quick-picks** — the 20-color ``_SWATCHES`` that reuse
+         the main map palette.
+      2. **xterm 256-color grid** — full 256-cell grid (16 ANSI + 216 cube
+         + 24 grayscale). Renders as tiny colored buttons; click one to
+         load into the preview.
+      3. **Custom hex / index input** — free-form ``#RGB`` / ``#RRGGBB`` /
+         ``0..255`` / ``color(N)``. Validated via ``_normalise_color_input``
+         which also converts xterm indices to their RGB equivalent so the
+         stored value is always a canonical uppercase hex string.
+
+    If the terminal only supports 8/16 colors (``console.color_system`` is
+    ``"standard"`` or ``None``), a yellow warning explains that truecolor
+    choices will be approximated. The picker still works — you just can't
+    visually distinguish similar hex colors on that terminal.
+    """
+
+    _blocks_undo: bool = True   # Hex Input editing; Ctrl+Z = input undo
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    # Curated quick-picks — hex-encoded so they round-trip through JSON.
+    _SWATCHES: list[str] = [
+        "#FF6347", "#FFA500", "#FFD700", "#FFFF00", "#ADFF2F",
+        "#7CFC00", "#00FF7F", "#00CED1", "#1E90FF", "#4169E1",
+        "#9370DB", "#BA55D3", "#FF69B4", "#FF1493", "#DC143C",
+        "#A0522D", "#CD853F", "#20B2AA", "#708090", "#2F4F4F",
+    ]
+
+    def __init__(self, feature_type: str, current_color: "str | None") -> None:
+        super().__init__()
+        self._feature_type = feature_type
+        self._current      = current_color or ""
+        self._pending:  "str | None" = current_color or None
+        self._drag_active: bool = False
+
+    def compose(self) -> ComposeResult:
+        type_default = _DEFAULT_TYPE_COLORS.get(self._feature_type, "")
+        user_default = _load_feature_colors().get(self._feature_type, "")
+        effective_default = _markup_safe_color(
+            user_default or type_default or "#808080")
+
+        with Vertical(id="colorpick-dlg"):
+            yield Static(f" Pick color for {self._feature_type} ",
+                         id="colorpick-title")
+            yield Label(
+                f"Current: {self._current or '[dim](auto — using type default)[/]'}   "
+                f"Type default: [{effective_default}]███[/]",
+                markup=True, id="colorpick-current",
+            )
+            yield Static("", id="colorpick-capability", markup=True)
+
+            with Horizontal(id="colorpick-preview-row"):
+                yield Static("", id="colorpick-preview-swatch")
+                yield Static("", id="colorpick-preview-label", markup=True)
+
+            with ScrollableContainer(id="colorpick-scroll"):
+                yield Label("Curated", classes="colorpick-section-hdr")
+                with Horizontal(id="colorpick-row"):
+                    # Sweep #36 (2026-05-27): swatches + action
+                    # buttons use `_InstantPressButton` so a single
+                    # mouse-down fires `Pressed` immediately,
+                    # bypassing the Textual focus-transition gate
+                    # that swallowed the first click in a real
+                    # terminal. User-reported: picking a swatch +
+                    # clicking "Auto (clear override)" both took
+                    # two physical clicks because the modal wasn't
+                    # focused on open. Drop-in replacement — the
+                    # `@on(Button.Pressed, ...)` handlers below see
+                    # the same `Pressed` message, so dispatch
+                    # wiring is unchanged. Same fix that sweep #31
+                    # applied to `StrandPickerModal`.
+                    for i, hex_col in enumerate(self._SWATCHES):
+                        yield _InstantPressButton(
+                            "  ", id=f"colorpick-swatch-{i}",
+                            classes="colorpick-swatch",
+                        )
+
+                yield Label("xterm 256  (click + drag any cell)",
+                            classes="colorpick-section-hdr")
+                # Single Static replaces the 256 individual Button
+                # widgets that used to make up this grid (~2 s mount
+                # time → ~70 ms after the swap). Click + drag still
+                # work through `on_mouse_down` / `on_mouse_move` →
+                # `_cell_index_at`, which now does integer math
+                # against the grid's region instead of a widget-tree
+                # `get_widget_at` lookup.
+                yield _XtermColorGrid(id="colorpick-xterm-grid")
+
+                yield Label("Custom", classes="colorpick-section-hdr")
+                with Horizontal(id="colorpick-custom-row"):
+                    yield Label("Hex / xterm idx:",
+                                id="colorpick-custom-label")
+                    yield Input(
+                        value=(self._current if _HEX6_RE.match(self._current)
+                               else ""),
+                        placeholder="#FF6347, F63, 208, or color(208)",
+                        id="colorpick-hex-input",
+                    )
+                    yield _InstantPressButton(
+                        "Apply", id="btn-colorpick-apply",
+                        variant="primary",
+                    )
+
+            yield Static("", id="colorpick-status", markup=True)
+            with Horizontal(id="colorpick-btns"):
+                yield _InstantPressButton(
+                    "Auto (clear override)",
+                    id="btn-colorpick-auto",
+                )
+                yield _InstantPressButton(
+                    "Save",
+                    id="btn-colorpick-save",
+                    variant="primary",
+                )
+                yield _InstantPressButton(
+                    "Save + set as type default",
+                    id="btn-colorpick-default",
+                    variant="success",
+                )
+                yield _InstantPressButton(
+                    "Cancel", id="btn-colorpick-cancel",
+                )
+
+    def on_mount(self) -> None:
+        # Paint curated swatches with their own background so the
+        # palette is visible at a glance. The xterm grid is now a
+        # single `_XtermColorGrid` Static that paints itself in its
+        # own `render()` — no per-cell button-style iteration here.
+        for i, hex_col in enumerate(self._SWATCHES):
+            try:
+                btn = self.query_one(f"#colorpick-swatch-{i}", Button)
+            except NoMatches:
+                continue
+            btn.styles.background = hex_col
+        self._refresh_capability_warning()
+        self._refresh_status()
+
+    def _refresh_capability_warning(self) -> None:
+        """Warn the user if the terminal is 8/16-color — they can still
+        pick truecolor hex, it'll just be approximated to the nearest
+        ANSI when rendered."""
+        try:
+            cap = self.query_one("#colorpick-capability", Static)
+        except NoMatches:
+            return
+        try:
+            sys_name = (self.app.console.color_system or "").lower()
+        except Exception:       # noqa: BLE001
+            sys_name = ""
+        if sys_name in ("truecolor", "256"):
+            cap.update(
+                f"[dim]Terminal palette: {sys_name} — full range available.[/]"
+            )
+        else:
+            label = sys_name or "unknown / 8-color"
+            cap.update(
+                f"[yellow]Terminal palette: {label}. Truecolor choices "
+                f"will be approximated to the nearest ANSI color.[/]"
+            )
+
+    def _refresh_status(self) -> None:
+        """Repaint the big preview swatch + hex label. Called whenever
+        ``self._pending`` changes — including during a live drag across
+        xterm cells."""
+        try:
+            swatch = self.query_one("#colorpick-preview-swatch", Static)
+            label  = self.query_one("#colorpick-preview-label",  Static)
+        except NoMatches:
+            return
+        if self._pending:
+            swatch.styles.background = self._pending
+            t = Text()
+            t.append("Selected: ", style="bold")
+            t.append(self._pending, style=self._pending)
+            label.update(t)
+        else:
+            swatch.styles.background = "transparent"
+            label.update("[dim]Selected: Auto (use type default)[/]")
+
+    def _set_pending(self, value: "str | None") -> None:
+        """Central entry point for any source that changes the pending
+        color — keeps the preview swatch in lock-step and clears any
+        stale error message in #colorpick-status."""
+        if value == self._pending:
+            return
+        self._pending = value
+        self._refresh_status()
+        try:
+            self.query_one("#colorpick-status", Static).update("")
+        except NoMatches:
+            pass
+
+    def _cell_index_at(self, sx: int, sy: int) -> "int | None":
+        """Hit-test screen coords against the xterm grid. Returns the
+        xterm index (0..255) under the cursor, or ``None`` if the point
+        is outside any cell. Used by the live-drag preview so the user
+        can sweep across the grid with a held click. Integer math
+        against the grid's screen region — no widget-tree lookup,
+        unlike the legacy 256-button implementation that called
+        `self.get_widget_at` on every mouse-move event."""
+        try:
+            grid = self.query_one("#colorpick-xterm-grid", _XtermColorGrid)
+        except NoMatches:
+            return None
+        region = grid.region
+        if region.width == 0 or region.height == 0:
+            return None
+        if not (region.x <= sx < region.x + region.width
+                and region.y <= sy < region.y + region.height):
+            return None
+        return grid.cell_at(sx - region.x, sy - region.y)
+
+    def on_mouse_down(self, event: MouseDown) -> None:
+        """Entering a drag: if the mouse-down lands on an xterm cell,
+        arm drag-mode and load that cell's color into the preview
+        immediately. Other targets are left alone so regular button
+        clicks (Save, Cancel, Apply) still work."""
+        if event.button != 1:
+            return
+        idx = self._cell_index_at(event.screen_x, event.screen_y)
+        if idx is not None:
+            self._drag_active = True
+            self._set_pending(_xterm_index_to_hex(idx))
+
+    def on_mouse_move(self, event: MouseMove) -> None:
+        """During a drag, follow the cursor across xterm cells and keep
+        the preview in sync. No effect outside of drag-mode."""
+        if not self._drag_active:
+            return
+        idx = self._cell_index_at(event.screen_x, event.screen_y)
+        if idx is not None:
+            self._set_pending(_xterm_index_to_hex(idx))
+
+    def on_mouse_up(self, event: MouseUp) -> None:
+        self._drag_active = False
+
+    @on(Button.Pressed, ".colorpick-swatch")
+    def _swatch(self, event: Button.Pressed) -> None:
+        btn_id = event.button.id or ""
+        if not btn_id.startswith("colorpick-swatch-"):
+            return
+        try:
+            idx = int(btn_id.rsplit("-", 1)[1])
+        except ValueError:
+            return
+        if 0 <= idx < len(self._SWATCHES):
+            self._set_pending(self._SWATCHES[idx])
+
+    @on(Click, "#colorpick-xterm-grid")
+    def _xterm_grid_click(self, event: Click) -> None:
+        """Click on the new single-Static grid — convert to a cell
+        index and set the pending color. Mirrors the legacy
+        per-button `Button.Pressed` handler that the old design used
+        before the 256-button grid was replaced. `on_mouse_down` also
+        handles initial click-down for drag continuity, so this
+        handler is the keyboard-friendly path for terminals that don't
+        deliver a clean MouseDown chain.
+        """
+        idx = self._cell_index_at(event.screen_x, event.screen_y)
+        if idx is not None:
+            self._set_pending(_xterm_index_to_hex(idx))
+
+    @on(Button.Pressed, "#btn-colorpick-apply")
+    def _apply_custom(self, _) -> None:
+        try:
+            inp = self.query_one("#colorpick-hex-input", Input)
+            status = self.query_one("#colorpick-status", Static)
+        except NoMatches:
+            return
+        raw = inp.value.strip()
+        canonical = _normalise_color_input(raw)
+        if canonical is None:
+            status.update(
+                f"[red]Invalid color '{raw}' — use #RGB, #RRGGBB, or 0..255.[/]"
+            )
+            return
+        self._set_pending(canonical)
+
+    @on(Input.Submitted, "#colorpick-hex-input")
+    def _hex_submitted(self, _) -> None:
+        self._apply_custom(None)
+
+    @on(Button.Pressed, "#btn-colorpick-auto")
+    def _auto(self, _) -> None:
+        self._set_pending(None)
+
+    @on(Button.Pressed, "#btn-colorpick-save")
+    def _save(self, _) -> None:
+        self.dismiss({"color": self._pending, "set_default": False})
+
+    @on(Button.Pressed, "#btn-colorpick-default")
+    def _save_default(self, _) -> None:
+        if not self._pending:
+            self.query_one("#colorpick-status", Static).update(
+                "[yellow]Pick a specific color before setting as default.[/]"
+            )
+            return
+        self.dismiss({"color": self._pending, "set_default": True})
+
+    @on(Button.Pressed, "#btn-colorpick-cancel")
+    def _cancel(self, _) -> None:
         self.dismiss(None)
 
     def action_cancel(self) -> None:
