@@ -262,3 +262,9 @@ _after_parts_bin_collections_save_hook: "_Callable[[], None] | None" = None
 # lock — sweep #9: RLock re-entry, no experiments.json/projects.json drift).
 _migrate_experiment_body_hook: "_Callable[[str], str] | None" = None
 _sync_active_project_experiments_hook: "_Callable[..., None] | None" = None
+# settings — `_load_settings` type-validates via `_validate_settings` (+ its
+# schema / safe-identifier web) and `_set_setting` schedules the coalesced
+# background disk flush (`_settings_flush_worker` daemon thread). Both stay
+# hub-side (hot path + a write subsystem + UI-failure notify), reached via these.
+_validate_settings_hook: "_Callable[[dict], tuple[dict, list[str]]] | None" = None
+_settings_schedule_flush_hook: "_Callable[[dict], None] | None" = None

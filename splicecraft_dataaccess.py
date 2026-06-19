@@ -20,10 +20,10 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date as _date
-from typing import TypeVar as _TypeVar
+from typing import Any as _Any, TypeVar as _TypeVar
 
 import splicecraft_state as _state
-from splicecraft_logging import _log, _log_event
+from splicecraft_logging import _log, _log_event, _repr_for_log
 from splicecraft_persistence import _safe_load_json, _safe_save_json
 
 # Immutable types `_typed_clone` returns as-is (no copy needed). Everything else
@@ -1398,3 +1398,134 @@ def _save_experiments(entries: "list[dict]") -> None:
         _mirror = getattr(_state, "_sync_active_project_experiments_hook", None)
         if _mirror is not None:
             _mirror(entries)
+
+
+# ── Settings ─────────────────────────────────────────────────────────────────
+# The hot path (`_get_setting`/`_set_setting` fire on every keystroke / render).
+# Only these 4 accessors move; the type-validation web (`_validate_settings` +
+# `_SETTINGS_SCHEMA` + safe-identifier check) and the coalesced background disk-
+# flush subsystem (`_settings_flush_worker` daemon + `_settings_flush_sync` +
+# UI-failure notify) stay hub-side, reached via `_state._validate_settings_hook`
+# / `_state._settings_schedule_flush_hook`.
+def _load_settings() -> dict:
+    """Return the persistent settings dict. Stored on disk as a list of
+    ``{"key": ..., "value": ...}`` envelope entries so it shares the
+    schema layout (sacred invariant #7) with every other JSON file.
+
+    Type-validates against `_SETTINGS_SCHEMA` (hub-side, via the validate
+    hook) so a hand-edited settings.json (or a partial restore from a
+    future-version snapshot) can't propagate wrong-type values into the
+    reactive UI. Unknown keys are preserved for forward-compat.
+    """
+    # Sweep #26: double-checked locking — the cache-hit fast path is lock-free.
+    cached = _state._settings_cache
+    if cached is not None:
+        return _typed_clone(cached)
+    with _state._cache_lock:
+        if _state._settings_cache is None:
+            entries, warning = _safe_load_json(_state._SETTINGS_FILE, "Settings")
+            if warning:
+                _log.warning(warning)
+            settings: dict = {}
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                k, v = e.get("key"), e.get("value")
+                if isinstance(k, str):
+                    settings[k] = v
+            _validate = getattr(_state, "_validate_settings_hook", None)
+            if _validate is not None:
+                cleaned, warns = _validate(settings)
+                for w in warns:
+                    _log.warning(w)
+            else:
+                cleaned = settings
+            _state._settings_cache = cleaned
+        return _typed_clone(_state._settings_cache)
+
+
+def _save_settings(settings: dict) -> None:
+    """Synchronous write — kept for the few callsites (tests, migrations)
+    that want the disk state visible immediately on return. UI toggles
+    use `_set_setting`, which mirrors to `_state._settings_cache` synchronously
+    and defers the disk write to a background thread."""
+    entries = [{"key": k, "value": v} for k, v in settings.items()]
+    with _state._cache_lock:
+        _safe_save_json(_state._SETTINGS_FILE, entries, "Settings")
+        _state._settings_cache = _typed_clone(settings)
+
+
+def _get_setting(key: str, default: "_Any" = None) -> "_Any":
+    """Return the persisted value for ``key``, or ``default`` if absent.
+    Typed as ``Any`` so callers like ``_active_grammar_id`` can declare
+    a narrower return type (`-> str`) without a cast — pyright treats
+    ``Any`` as universally assignable, sidestepping the
+    ``Unknown | None`` propagation from the loose `_load_settings()`
+    return.
+
+    Sweep #25 (2026-05-23): reads the cache directly instead of paying
+    a full ``_load_settings()`` deepcopy on every call. With 59 call-
+    sites — including 4 per ``EditCustomizeModal`` open and 24 per
+    ``_get_active_collection_name()`` — the per-call full-dict clone
+    burned ~3–5 ms across the app per second of typical use. Settings
+    values are JSON primitives (str/int/float/bool/None) for ~99% of
+    keys; ``_typed_clone`` of an immutable returns the same object,
+    so the cost is negligible. The handful of container values
+    (e.g. ``experiments_custom_dict``) still clone defensively so a
+    caller mutation can't poison the cache.
+    """
+    if _state._settings_cache is None:
+        # Trigger cache populate (one-time per session).
+        _load_settings()
+    with _state._cache_lock:
+        cache = _state._settings_cache
+        if cache is None:
+            return default
+        if key not in cache:
+            return default
+        return _typed_clone(cache[key])
+
+
+def _set_setting(key: str, value) -> None:
+    """Update one setting key. Cache is updated synchronously so a
+    subsequent `_load_settings()` (in this process) sees the new value
+    immediately. The disk write is scheduled on a daemon thread (hub-side
+    via the schedule-flush hook) so a keypress that toggles a setting
+    doesn't block the UI on fsync; bursts of toggles coalesce into fewer
+    disk writes.
+
+    Set ``SPLICECRAFT_SKIP_SETTINGS_FLUSH=1`` to bypass the daemon
+    thread and write synchronously — used by tests so they get
+    deterministic disk state without a trailing daemon thread on exit.
+    """
+    # Sweep #26 (2026-05-25): hold `_state._cache_lock` across the RMW so
+    # two concurrent `_set_setting(...)` calls from agent threads can't both
+    # load the same pre-mutation cache, each mutate a local copy with a
+    # different key, and the second reseat the global cache — silently
+    # losing the first writer's key.
+    with _state._cache_lock:
+        settings = _load_settings()
+        # Log only when the value actually changes — avoids spamming the log
+        # when callers re-set the same value on settings hydration. Values
+        # run through `_repr_for_log` to truncate over-long lists / cap any
+        # accidental sequence content.
+        prev = settings.get(key, "<unset>")
+        if prev != value:
+            _log.info("setting changed: %s = %r (was %r)",
+                        key, _repr_for_log(value), _repr_for_log(prev))
+            _log_event(
+                "settings.changed",
+                key=key, value=_repr_for_log(value),
+                prev=_repr_for_log(prev),
+            )
+        settings[key] = value
+        # Sweep #9: `_typed_clone` (deepcopy), not shallow `dict(...)` — a
+        # nested-list value would otherwise share the caller's reference and a
+        # later caller-side mutation would leak into the cache (invariant #17).
+        _state._settings_cache = _typed_clone(settings)
+    # Schedule the coalesced background disk flush — hub-side via the hook
+    # (keeps the daemon worker + SKIP_FLUSH env handling + UI-failure notify
+    # off the data layer).
+    _schedule = getattr(_state, "_settings_schedule_flush_hook", None)
+    if _schedule is not None:
+        _schedule(settings)
