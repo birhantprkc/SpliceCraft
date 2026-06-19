@@ -225,3 +225,8 @@ _after_entry_vectors_save_hook: "_Callable[[], None] | None" = None
 # Saving cloning grammars busts the assembly-fragment + EV-role-detect caches (a
 # grammar enzyme change shifts fragment overhangs / role detection) — hub-side.
 _after_custom_grammars_save_hook: "_Callable[[], None] | None" = None
+# Resolver returning the active primer-collection NAME (stored in settings, read
+# hub-side via `_get_setting`). The sibling's `_sync_active_primer_collection_primers`
+# mirror needs it but must not pull the settings layer in, so the hub registers
+# its `_get_active_primer_collection_name` here. None → mirror is a no-op.
+_active_primer_collection_name_hook: "_Callable[[], object] | None" = None

@@ -885,3 +885,237 @@ def _save_custom_grammars(entries: list[dict]) -> None:
     hook = getattr(_state, "_after_custom_grammars_save_hook", None)
     if hook is not None:
         hook()
+
+
+# ── Primers + primer collections (re-entrant mirror, INV-50) ────────────────
+# The primer library + its collections layer + the active-collection mirror +
+# the dedup/name-trim helpers move as ONE group: `_save_primers` mirrors into
+# the active collection INSIDE the `_state._cache_lock` block (so the mirror
+# can't drift, sweep #10 / INV-50) and the mirror re-enters `_save_primer_
+# collections` via the re-entrant RLock — which only works with the whole
+# group sibling-internal. The active-collection NAME (a setting) is resolved
+# hub-side via `_state._active_primer_collection_name_hook` to avoid pulling
+# the settings layer in.
+
+
+def _backfill_primer_names(
+        entries: list[dict]) -> "tuple[list[dict], int]":
+    """Trim leading / trailing whitespace from each primer entry's
+    `name` field. Returns `(entries, n_changed)`. Idempotent.
+    Sequence + tm fields are left untouched — only `name` is the
+    user-facing label that participates in `==` matching.
+
+    **Hardening:** only mutates entries that already HAVE a `name`
+    key — never adds the field where missing. Skips non-dict entries
+    + non-string names (defensive against hand-edited JSON)."""
+    n_changed = 0
+    for e in entries:
+        if not isinstance(e, dict) or "name" not in e:
+            continue
+        raw = e["name"]
+        if not isinstance(raw, str):
+            continue
+        trimmed = raw.strip()
+        if trimmed != raw:
+            e["name"] = trimmed
+            n_changed += 1
+    return entries, n_changed
+
+
+def _load_primers() -> list[dict]:
+    """Load + cache primers, with one-shot name-trim backfill on
+    first read (PIT-36 whitespace-trim invariant applied to the
+    primer subsystem too). Deep-copy on read per invariant #17."""
+    with _state._cache_lock:
+        if _state._primers_cache is None:
+            entries, warning = _safe_load_json(
+                _state._PRIMERS_FILE, "Primer library",
+            )
+            if warning:
+                _log.warning(warning)
+            _state._primers_cache = [e for e in entries if isinstance(e, dict)]
+        if not _state._primers_name_trim_done:
+            _state._primers_cache, n_changed = _backfill_primer_names(
+                _state._primers_cache,
+            )
+            _state._primers_name_trim_done = True
+            if n_changed > 0:
+                _log.info(
+                    "primers: name trim backfill cleaned %d entries",
+                    n_changed,
+                )
+                _log_event(
+                    "primers.name_trim_backfill", n_changed=n_changed,
+                )
+                save_target = _state._primers_cache
+            else:
+                save_target = None
+        else:
+            save_target = None
+    if save_target is not None:
+        try:
+            _save_primers(save_target)
+        except (OSError, RuntimeError):
+            _log.exception(
+                "primers: name trim backfill save failed",
+            )
+    assert _state._primers_cache is not None
+    return _typed_clone(_state._primers_cache)
+
+
+def _dedupe_primers_by_sequence(entries: list[dict]) -> list[dict]:
+    """Collapse primer entries whose ``sequence`` field duplicates an
+    earlier entry's sequence (case-insensitive). The first entry of
+    each unique sequence wins — callers that prepend MRU at index 0
+    therefore keep their newest copy, while older duplicates are
+    silently dropped.
+
+    The primer-library policy across the app has always been "one entry
+    per unique sequence":
+
+      * ``PrimerDesignScreen._save_primers_btn`` rejects a designed
+        primer when its sequence already exists.
+      * ``_apply_record`` and ``_bulk_import_folder`` dedupe
+        .dna-imported primers against the existing library before
+        appending.
+
+    Pre-2026-05-10 those dedupe paths only filtered NEW additions —
+    duplicates that snuck into ``primers.json`` from earlier sessions
+    (manual edits, imports before the dedupe landed, etc.) stayed
+    forever. Calling this helper on every save means the next write
+    of ``primers.json`` cleans up legacy duplicates without the user
+    having to do anything.
+
+    Entries lacking a usable ``sequence`` (None / empty / non-string)
+    are kept verbatim — losing them silently would be worse than
+    leaving the user with a one-off "unknown" row to investigate.
+    """
+    seen: set[str] = set()
+    out: list[dict] = []
+    for e in entries:
+        if not isinstance(e, dict):
+            out.append(e)
+            continue
+        raw_seq = e.get("sequence")
+        if not isinstance(raw_seq, str):
+            out.append(e)
+            continue
+        key = raw_seq.strip().upper()
+        if not key:
+            out.append(e)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(e)
+    return out
+
+
+def _save_primers(entries: list[dict]) -> None:
+    # Dedupe by sequence on every save (sacred policy: one entry per
+    # unique sequence). See `_dedupe_primers_by_sequence`. Note that
+    # NAME collisions are NOT auto-collapsed here — `.dna` imports
+    # legitimately stash same-name different-sequence variants, and
+    # silently dropping any would lose primer data. Name-collision
+    # cleanup is opt-in via `PrimerDuplicatesModal` at startup.
+    # The primer-usage cache stays valid here because adding/removing
+    # primer-library entries doesn't change which plasmids carry
+    # `primer_bind` features — that's `_save_library`/`_save_collections`'
+    # job to invalidate.
+    deduped = _dedupe_primers_by_sequence(entries)
+    with _state._cache_lock:
+        _safe_save_json(_state._PRIMERS_FILE, deduped, "Primer library")
+        # Deep-copy on save so the cache is independent of the caller's
+        # reference — pre-fix `list(entries)` shared dict refs with the
+        # caller, so subsequent caller mutations (e.g. an aborted modal)
+        # leaked back into the next `_load_primers`.
+        _state._primers_cache = _typed_clone(deduped)
+        # Mirror into the active primer collection (collections layer
+        # for primers, same pattern as plasmid library →
+        # collections.json mirror, pitfall #10). Inside the lock so
+        # the mirror file can't drift from the live file (sweep #10,
+        # [INV-50]). _save_primer_collections re-acquires the RLock.
+        _sync_active_primer_collection_primers(deduped)
+
+
+def _load_primer_collections() -> list[dict]:
+    """Deep-copy on read so callers can mutate freely; pitfall #17.
+    One-shot name-trim backfill on first load: walks every collection
+    and applies `_backfill_primer_names` to its embedded `primers`
+    list (parallel to `_ensure_collections_cache_populated_and_migrated`
+    for the library, and to the same backfill applied to the live
+    `primers.json` in `_load_primers`).
+    """
+    with _state._cache_lock:
+        if _state._primer_collections_cache is None:
+            entries, warning = _safe_load_json(
+                _state._PRIMER_COLLECTIONS_FILE, "Primer collections",
+            )
+            if warning:
+                _log.warning(warning)
+            _state._primer_collections_cache = [
+                e for e in entries if isinstance(e, dict)
+            ]
+        if not _state._primer_collections_backfill_done:
+            n_changed_total = 0
+            for pc in _state._primer_collections_cache:
+                if not isinstance(pc, dict):
+                    continue
+                primers = pc.get("primers")
+                if not isinstance(primers, list):
+                    continue
+                _, n = _backfill_primer_names(primers)
+                n_changed_total += n
+            _state._primer_collections_backfill_done = True
+            if n_changed_total > 0:
+                _log.info(
+                    "primer-collections: name trim backfill cleaned "
+                    "%d embedded primer(s)", n_changed_total,
+                )
+                _log_event(
+                    "primer_collections.name_trim_backfill",
+                    n_changed=n_changed_total,
+                )
+                save_target = _state._primer_collections_cache
+            else:
+                save_target = None
+        else:
+            save_target = None
+    if save_target is not None:
+        try:
+            _save_primer_collections(save_target)
+        except (OSError, RuntimeError):
+            _log.exception(
+                "primer-collections: name trim backfill save failed",
+            )
+    assert _state._primer_collections_cache is not None
+    return _typed_clone(_state._primer_collections_cache)
+
+
+def _save_primer_collections(entries: list[dict]) -> None:
+    with _state._cache_lock:
+        _safe_save_json(
+            _state._PRIMER_COLLECTIONS_FILE, entries, "Primer collections",
+        )
+        _state._primer_collections_cache = _typed_clone(entries)
+
+
+def _sync_active_primer_collection_primers(entries: list[dict]) -> None:
+    """Mirror the live primer library into the active collection so the
+    on-disk record never drifts from `primers.json`. Silent no-op if no
+    collection is active or the active name has been deleted. Caller
+    MUST already hold `_cache_lock` (this re-acquires via RLock for
+    `_save_primer_collections`). See `[INV-50]` for the save-chain
+    lock-release gap that this design avoids.
+    """
+    _get_name = getattr(_state, "_active_primer_collection_name_hook", None)
+    name = _get_name() if _get_name is not None else None
+    if not name:
+        return
+    snapshot = [_typed_clone(e) for e in entries if isinstance(e, dict)]
+    colls = _load_primer_collections()
+    for c in colls:
+        if c.get("name") == name:
+            c["primers"] = snapshot
+            _save_primer_collections(colls)
+            return
