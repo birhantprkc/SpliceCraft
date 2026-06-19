@@ -354,6 +354,9 @@ class TestMigrationCoverageEveryLoadPath:
             _hook_target = {
                 "_load_library": "_ensure_library_cache_populated_and_migrated",
                 "_load_collections": "_ensure_collections_cache_populated_and_migrated",
+                "_load_parts_bin": "_ensure_parts_bin_cache_populated_and_migrated",
+                "_load_parts_bin_collections":
+                    "_ensure_parts_bin_collections_cache_populated_and_migrated",
             }.get(name)
             if _hook_target is not None:
                 ensure_fn = getattr(sc, _hook_target, None)

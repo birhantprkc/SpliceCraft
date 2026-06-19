@@ -1185,3 +1185,69 @@ def _save_collections(entries: list[dict]) -> None:
     _after = getattr(_state, "_after_collections_save_hook", None)
     if _after is not None:
         _after()
+
+
+# ── Parts bin / parts-bin collections (multi-bin part storage) ───────────────
+# Same architecture as library/collections: `parts_bin.json` holds the ACTIVE
+# bin's parts; `parts_bin_collections.json` is the canonical multi-bin record.
+# These 4 accessors are THIN — the `_ensure_*` migration + sequence backfill,
+# the active-parts-bin mirror (`_sync_active_parts_bin_parts`, synchronous since
+# bins are small), and the assembly-fragment-cache bust all STAY hub-side and
+# are reached via `_state` hooks (registered by the hub after every target is
+# defined). `_iter_parts_bin_readonly`, `_find_parts_bin`, the active-name
+# getter/setter, and `_switch_active_parts_bin` stay hub-side.
+def _load_parts_bin() -> list[dict]:
+    # Deep-copy on read (sacred invariant #17): parts entries carry nested dicts
+    # (qualifiers, primer pairs, mutation lists) — caller-side mutation would
+    # otherwise poison the cache for every subsequent reader.
+    hook = _state._ensure_parts_bin_hook
+    if hook is not None:
+        hook()
+    assert _state._parts_bin_cache is not None, "parts-bin cache unpopulated (ensure hook not registered?)"
+    return _typed_clone(_state._parts_bin_cache)
+
+
+def _save_parts_bin(entries: list[dict]) -> None:
+    """Persist the live parts bin + mirror it into the active parts-bin
+    collection. The mirror runs INSIDE `_state._cache_lock` (sweep #10: the RLock
+    lets the mirror's own `_save_parts_bin_collections` chain re-enter, and stops
+    a concurrent save from drifting parts_bin.json vs parts_bin_collections.json).
+    The migration + mirror + assembly-fragment-cache bust stay hub-side via the
+    `_state` hooks."""
+    with _state._cache_lock:
+        _safe_save_json(_state._PARTS_BIN_FILE, entries, "Parts bin")
+        # Deep-copy into the cache so it's independent of the caller's reference.
+        _state._parts_bin_cache = _typed_clone(entries)
+        # Mirror into the active parts-bin collection — hub-side, INSIDE the lock
+        # so the mirror file can't drift from parts_bin.json.
+        _mirror = getattr(_state, "_sync_active_parts_bin_parts_hook", None)
+        if _mirror is not None:
+            _mirror(entries)
+    # Post-lock: a part edit shifts what `_assembly_fragment_from_source` yields,
+    # so invalidate the assembly-fragment digest cache — hub-side.
+    _after = getattr(_state, "_after_parts_bin_save_hook", None)
+    if _after is not None:
+        _after()
+
+
+def _load_parts_bin_collections() -> list[dict]:
+    """Return a deepcopy of the parts-bin collections list so callers can mutate
+    entries (rename, edit parts list) without poisoning the in-memory cache (#17)."""
+    hook = _state._ensure_parts_bin_collections_hook
+    if hook is not None:
+        hook()
+    assert _state._parts_bin_collections_cache is not None, "parts-bin collections cache unpopulated (ensure hook not registered?)"
+    return _typed_clone(_state._parts_bin_collections_cache)
+
+
+def _save_parts_bin_collections(entries: list[dict]) -> None:
+    """Persist the full parts-bin collections list. Deepcopies into the cache so
+    caller mutations after save can't poison subsequent loaders (#17)."""
+    with _state._cache_lock:
+        _safe_save_json(_state._PARTS_BIN_COLLECTIONS_FILE, entries, "Parts-bin collections")
+        _state._parts_bin_collections_cache = _typed_clone(entries)
+    # Post-save: a bin add/delete/rename/parts-edit shifts the active bin's parts
+    # identity → invalidate the assembly-fragment digest cache — hub-side.
+    _after = getattr(_state, "_after_parts_bin_collections_save_hook", None)
+    if _after is not None:
+        _after()

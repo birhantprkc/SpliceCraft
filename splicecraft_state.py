@@ -246,3 +246,12 @@ _ensure_collections_hook: "_Callable[[], None] | None" = None
 _sync_active_collection_plasmids_hook: "_Callable[..., None] | None" = None
 _after_library_save_hook: "_Callable[[], None] | None" = None
 _after_collections_save_hook: "_Callable[[], None] | None" = None
+# parts_bin / parts_bin_collections — identical shape to library/collections
+# (`_ensure_*` migration + sequence backfill, the active-parts-bin mirror
+# `_sync_active_parts_bin_parts` (synchronous — bins are small), and the
+# assembly-fragment-cache bust) all STAY hub-side; reached via these hooks.
+_ensure_parts_bin_hook: "_Callable[[], None] | None" = None
+_ensure_parts_bin_collections_hook: "_Callable[[], None] | None" = None
+_sync_active_parts_bin_parts_hook: "_Callable[..., None] | None" = None
+_after_parts_bin_save_hook: "_Callable[[], None] | None" = None
+_after_parts_bin_collections_save_hook: "_Callable[[], None] | None" = None
