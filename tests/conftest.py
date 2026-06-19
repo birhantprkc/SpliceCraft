@@ -41,6 +41,15 @@ def _protect_user_data(tmp_path, monkeypatch):
     """
     import splicecraft as sc
 
+    # Phase A2: caches / flags / the save-authorization flag migrate from the
+    # hub into splicecraft_state over time. Patch each where it ACTUALLY lives
+    # so this data-safety fixture keeps isolating real user data regardless of
+    # which module owns the attribute. No-op while a name is still hub-resident
+    # (`hasattr(sc._state, name)` is False → patches sc, exactly as before).
+    def _patch(name, value):
+        owner = sc._state if hasattr(sc._state, name) else sc
+        monkeypatch.setattr(owner, name, value)
+
     _DATA_FILES = [
         ("_LIBRARY_FILE",         "_library_cache"),
         ("_PARTS_BIN_FILE",       "_parts_bin_cache"),
@@ -72,7 +81,7 @@ def _protect_user_data(tmp_path, monkeypatch):
         monkeypatch.setattr(sc, file_attr, tmp_file)
         # Clear the in-memory cache so the next load reads from the tmp file
         if cache_attr:
-            monkeypatch.setattr(sc, cache_attr, None)
+            _patch(cache_attr, None)
 
     # Force the active-collection mirror to write SYNCHRONOUSLY in tests.
     # Its async path uses a persistent background daemon whose deferred
