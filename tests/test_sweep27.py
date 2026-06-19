@@ -242,13 +242,13 @@ class TestUiSnapshotChokepoint:
                                                      monkeypatch):
         """When the authorisation gate is False, `_save_ui_snapshot`
         must raise rather than write."""
-        monkeypatch.setattr(sc, "_SAVES_AUTHORIZED", False)
+        monkeypatch.setattr(sc._state, "_SAVES_AUTHORIZED", False)
         with pytest.raises(RuntimeError, match="not authorised"):
             sc._save_ui_snapshot("body", dest_dir=tmp_path / "snaps")
 
     def test_save_ui_snapshot_allowed_when_authorized(self, tmp_path,
                                                        monkeypatch):
-        monkeypatch.setattr(sc, "_SAVES_AUTHORIZED", True)
+        monkeypatch.setattr(sc._state, "_SAVES_AUTHORIZED", True)
         path = sc._save_ui_snapshot("body", dest_dir=tmp_path / "snaps")
         assert path.exists()
         assert path.read_text() == "body"
@@ -544,7 +544,7 @@ class TestDeleteChokepoint:
 
     def test_refuse_unauthorized_delete_raises_when_off(self, monkeypatch,
                                                           tmp_path):
-        monkeypatch.setattr(sc, "_SAVES_AUTHORIZED", False)
+        monkeypatch.setattr(sc._state, "_SAVES_AUTHORIZED", False)
         with pytest.raises(RuntimeError, match="not authorised"):
             sc._refuse_unauthorized_delete(
                 tmp_path / "fake.json", "test",
@@ -552,7 +552,7 @@ class TestDeleteChokepoint:
 
     def test_refuse_unauthorized_delete_passes_when_on(self, monkeypatch,
                                                         tmp_path):
-        monkeypatch.setattr(sc, "_SAVES_AUTHORIZED", True)
+        monkeypatch.setattr(sc._state, "_SAVES_AUTHORIZED", True)
         # Must not raise.
         sc._refuse_unauthorized_delete(
             tmp_path / "fake.json", "test",

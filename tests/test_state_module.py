@@ -51,6 +51,8 @@ _MIGRATED = [
     "_origin_history_backfill_done", "_parts_bin_collections_backfill_done",
     "_parts_bin_sequence_backfill_done", "_primer_collections_backfill_done",
     "_primers_name_trim_done",
+    # Phase A2c: the save-authorization chokepoint flag
+    "_SAVES_AUTHORIZED", "_SAVES_AUTHORIZED_REASON",
 ]
 
 

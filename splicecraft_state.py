@@ -107,3 +107,12 @@ _parts_bin_collections_backfill_done: bool = False
 _parts_bin_sequence_backfill_done: bool = False
 _primer_collections_backfill_done: bool = False
 _primers_name_trim_done: bool = False
+
+
+# ── The save-authorization chokepoint flag (Phase A2c) ──
+# Flipped by `_authorize_writes` / `_authorize_writes_for_sandbox`; checked
+# by `_refuse_unauthorized_write` / `_refuse_unauthorized_delete` (gating
+# every _save_*). The single guard protecting real user data from an
+# unsandboxed import. Writer + checks both go through _state → always in sync.
+_SAVES_AUTHORIZED: bool = False
+_SAVES_AUTHORIZED_REASON: str = ""

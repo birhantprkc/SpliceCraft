@@ -151,9 +151,8 @@ def _protect_user_data(tmp_path, monkeypatch):
     # flag automatically resets to False on test teardown — function-
     # scoped, so a subsequent test starts fresh and the gate cannot
     # leak into a non-test that imports splicecraft post-pytest.
-    monkeypatch.setattr(sc, "_SAVES_AUTHORIZED", True)
-    monkeypatch.setattr(sc, "_SAVES_AUTHORIZED_REASON",
-                          "pytest _protect_user_data")
+    _patch("_SAVES_AUTHORIZED", True)
+    _patch("_SAVES_AUTHORIZED_REASON", "pytest _protect_user_data")
     # One-shot backfill flags (2026-05-24 sweep). Default to TRUE in
     # tests so the load-triggered migrations are SKIPPED — most tests
     # seed handcrafted entries with `id != sanitize(name)` and would

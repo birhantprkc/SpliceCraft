@@ -456,7 +456,7 @@ class TestSavesAuthorizedChokepoint:
         # Temporarily un-authorise (the autouse fixture flipped it
         # True; flip back to False here to simulate an ad-hoc script
         # that imported splicecraft without sandboxing).
-        monkeypatch.setattr(sc, "_SAVES_AUTHORIZED", False)
+        monkeypatch.setattr(sc._state, "_SAVES_AUTHORIZED", False)
         with pytest.raises(RuntimeError, match="not authorised"):
             sc._safe_save_json(tmp_path / "x.json", [], "test")
 
