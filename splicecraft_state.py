@@ -230,3 +230,19 @@ _after_custom_grammars_save_hook: "_Callable[[], None] | None" = None
 # mirror needs it but must not pull the settings layer in, so the hub registers
 # its `_get_active_primer_collection_name` here. None → mirror is a no-op.
 _active_primer_collection_name_hook: "_Callable[[], object] | None" = None
+
+# ── Library + collections hooks (Phase D — the 160 MB collections.json path) ──
+# The thin `_load_library`/`_save_library`/`_load_collections`/`_save_collections`
+# accessors move to splicecraft_dataaccess, but the DANGEROUS logic stays
+# hub-side and is reached through these hooks: the `_ensure_*` migration (its
+# backfills pull GenBank parse/serialise — not movable), the async active-
+# collection mirror (`_sync_active_collection_plasmids` + its `_collection_sync_*`
+# worker subsystem), and the post-save cache-busts (primer-usage / k-mer). The
+# hub registers each at import. The sibling `_load_*` fire the ensure hook then
+# return `_typed_clone(_state._X_cache)`; the sibling `_save_*` write + reseat +
+# fire the mirror (in-lock) + after-save (post-lock) hooks.
+_ensure_library_hook: "_Callable[[], None] | None" = None
+_ensure_collections_hook: "_Callable[[], None] | None" = None
+_sync_active_collection_plasmids_hook: "_Callable[..., None] | None" = None
+_after_library_save_hook: "_Callable[[], None] | None" = None
+_after_collections_save_hook: "_Callable[[], None] | None" = None

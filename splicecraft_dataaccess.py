@@ -1119,3 +1119,69 @@ def _sync_active_primer_collection_primers(entries: list[dict]) -> None:
             c["primers"] = snapshot
             _save_primer_collections(colls)
             return
+
+
+# ── Plasmid library + collections (the 160 MB SACRED path) ──────────────────
+# Thin accessors only. The DANGEROUS logic stays hub-side and is reached via
+# _state hooks: the `_ensure_*` migration (its backfills pull GenBank parse/
+# serialise — not movable), the async active-collection mirror, and the post-
+# save cache-busts. `_load_*` fire the ensure hook then return a clone of the
+# `_state` cache the hub populated; `_save_*` write + reseat + fire the mirror
+# (in-lock, re-enters `_save_collections` via the re-entrant RLock) + the
+# after-save hook (post-lock). The data-safety chokepoint is unchanged — it
+# lives in `_safe_save_json`. See `_iter_*_readonly` (hub-side) for hot reads.
+
+
+def _load_library() -> list[dict]:
+    # Deep-copy on read (sacred invariant #17): library entries carry nested
+    # dicts (qualifiers, history, primer-pair info) — caller-side mutation would
+    # otherwise poison the cache for every subsequent reader.
+    hook = _state._ensure_library_hook
+    if hook is not None:
+        hook()
+    assert _state._library_cache is not None, "library cache unpopulated (ensure hook not registered?)"
+    return _typed_clone(_state._library_cache)
+
+
+def _save_library(entries: list[dict], *, async_sync: bool = False) -> None:
+    """Persist the live library + mirror it into the active collection.
+    ``async_sync=True`` (LibraryPanel delete path) defers the mirror to a
+    background worker so a 100+ MB collections.json doesn't hang the UI. The
+    mirror runs INSIDE `_state._cache_lock` (sweep #10 / INV-50: the RLock lets
+    the mirror's own `_save_collections` chain re-enter, and stops a concurrent
+    save from drifting library.json vs collections.json). The migration + mirror
+    + cache-busts stay hub-side via `_state` hooks."""
+    with _state._cache_lock:
+        _safe_save_json(_state._LIBRARY_FILE, entries, "Plasmid library")
+        # Deep-copy into the cache so it's independent of the caller's reference.
+        _state._library_cache = _typed_clone(entries)
+        # Mirror into the active collection — hub-side (async worker subsystem),
+        # INSIDE the lock so the mirror file can't drift from library.json.
+        _mirror = getattr(_state, "_sync_active_collection_plasmids_hook", None)
+        if _mirror is not None:
+            _mirror(entries, async_write=async_sync)
+    # Post-lock cache invalidations (primer-usage + bulk-align k-mer) — hub-side.
+    _after = getattr(_state, "_after_library_save_hook", None)
+    if _after is not None:
+        _after()
+
+
+def _load_collections() -> list[dict]:
+    """Return a deepcopy of the collections list so callers can mutate entries
+    (rename, edit plasmids list) without poisoning the in-memory cache (#17)."""
+    hook = _state._ensure_collections_hook
+    if hook is not None:
+        hook()
+    assert _state._collections_cache is not None, "collections cache unpopulated (ensure hook not registered?)"
+    return _typed_clone(_state._collections_cache)
+
+
+def _save_collections(entries: list[dict]) -> None:
+    with _state._cache_lock:
+        _safe_save_json(_state._COLLECTIONS_FILE, entries, "Plasmid collections")
+        _state._collections_cache = _typed_clone(entries)
+    # Post-save: invalidate the primer-usage cache (the plasmid set changed) —
+    # hub-side via the after-save hook.
+    _after = getattr(_state, "_after_collections_save_hook", None)
+    if _after is not None:
+        _after()

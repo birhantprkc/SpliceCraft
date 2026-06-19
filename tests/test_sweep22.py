@@ -345,6 +345,20 @@ class TestMigrationCoverageEveryLoadPath:
             src = inspect.getsource(fn)
             if "_safe_load_json" in src:
                 continue
+            # Phase D: `_load_library` / `_load_collections` moved to
+            # splicecraft_dataaccess and are now thin accessors that route
+            # through `_state._ensure_*_hook` (registered to the hub
+            # `_ensure_*_cache_populated_and_migrated`). The token-walk below
+            # can't follow a `hook()` local, so follow the registered hook to
+            # the migration helper that does the `_safe_load_json`.
+            _hook_target = {
+                "_load_library": "_ensure_library_cache_populated_and_migrated",
+                "_load_collections": "_ensure_collections_cache_populated_and_migrated",
+            }.get(name)
+            if _hook_target is not None:
+                ensure_fn = getattr(sc, _hook_target, None)
+                if ensure_fn is not None and "_safe_load_json" in inspect.getsource(ensure_fn):
+                    continue
             # Follow one level of indirection: find any helper called
             # in the body that itself routes through _safe_load_json.
             found = False
