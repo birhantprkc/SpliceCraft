@@ -45,6 +45,12 @@ _MIGRATED = [
     "_grammars_cache", "_hmm_db_catalog_cache", "_library_cache", "_parts_bin_cache",
     "_parts_bin_collections_cache", "_primer_collections_cache", "_primers_cache",
     "_protein_collections_cache", "_protein_motifs_cache", "_settings_cache",
+    # Phase A2b: one-shot backfill / name-trim flags
+    "_collections_backfill_done", "_collections_origin_history_backfill_done",
+    "_entry_vectors_name_trim_done", "_id_name_backfill_done",
+    "_origin_history_backfill_done", "_parts_bin_collections_backfill_done",
+    "_parts_bin_sequence_backfill_done", "_primer_collections_backfill_done",
+    "_primers_name_trim_done",
 ]
 
 

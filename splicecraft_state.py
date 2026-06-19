@@ -95,3 +95,15 @@ _primers_cache: "list | None" = None
 _protein_collections_cache: "list | None" = None
 _protein_motifs_cache: "list | None" = None
 _settings_cache: "dict | None" = None
+
+
+# ── One-shot backfill / name-trim flags (Phase A2b) ──
+_collections_backfill_done: bool = False
+_collections_origin_history_backfill_done: bool = False
+_entry_vectors_name_trim_done: bool = False
+_id_name_backfill_done: bool = False
+_origin_history_backfill_done: bool = False
+_parts_bin_collections_backfill_done: bool = False
+_parts_bin_sequence_backfill_done: bool = False
+_primer_collections_backfill_done: bool = False
+_primers_name_trim_done: bool = False

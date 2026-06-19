@@ -1298,7 +1298,7 @@ class TestRenameUpdatesId:
             {"id": "DEMO_33",   "name": "DEMO 33",   "size": 1, "n_feats": 0},
         ])
         sc._state._library_cache = None
-        sc._id_name_backfill_done = True   # skip backfill (already aligned)
+        sc._state._id_name_backfill_done = True   # skip backfill (already aligned)
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
@@ -1387,7 +1387,7 @@ class TestLibraryIdBackfill:
         tmp_lib = tmp_path / "library.json"
         monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_lib)
         monkeypatch.setattr(sc._state, "_library_cache", None)
-        monkeypatch.setattr(sc, "_id_name_backfill_done", False)
+        monkeypatch.setattr(sc._state, "_id_name_backfill_done", False)
         # Write a legacy v1 envelope where id doesn't match name.
         import json
         tmp_lib.write_text(json.dumps({

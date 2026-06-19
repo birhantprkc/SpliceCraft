@@ -162,23 +162,17 @@ def _protect_user_data(tmp_path, monkeypatch):
     # exercise a backfill (or need the migrated post-state) opt in
     # by setting the relevant flag back to False before triggering
     # the load — see `TestLibraryIdBackfill` for the pattern.
-    monkeypatch.setattr(sc, "_id_name_backfill_done", True)
-    monkeypatch.setattr(sc, "_parts_bin_sequence_backfill_done", True)
-    monkeypatch.setattr(sc, "_collections_backfill_done", True)
+    _patch("_id_name_backfill_done", True)
+    _patch("_parts_bin_sequence_backfill_done", True)
+    _patch("_collections_backfill_done", True)
     # Origin-history backfill ([INV-93]) — skip by default; tests that
     # exercise it flip the relevant flag to False before loading.
-    monkeypatch.setattr(sc, "_origin_history_backfill_done", True)
-    monkeypatch.setattr(
-        sc, "_collections_origin_history_backfill_done", True,
-    )
-    monkeypatch.setattr(
-        sc, "_parts_bin_collections_backfill_done", True,
-    )
-    monkeypatch.setattr(sc, "_entry_vectors_name_trim_done", True)
-    monkeypatch.setattr(sc, "_primers_name_trim_done", True)
-    monkeypatch.setattr(
-        sc, "_primer_collections_backfill_done", True,
-    )
+    _patch("_origin_history_backfill_done", True)
+    _patch("_collections_origin_history_backfill_done", True)
+    _patch("_parts_bin_collections_backfill_done", True)
+    _patch("_entry_vectors_name_trim_done", True)
+    _patch("_primers_name_trim_done", True)
+    _patch("_primer_collections_backfill_done", True)
 
     # Skip the launch splash for every test by default — the splash modal
     # blocks input until dismissed, which would break every `pilot.click`

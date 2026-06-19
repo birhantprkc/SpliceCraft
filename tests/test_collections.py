@@ -35,7 +35,7 @@ class TestCollectionsPersistence:
         ]
         sc._save_collections(sample)
         sc._state._collections_cache = None  # force a cold reload from disk
-        sc._collections_backfill_done = False
+        sc._state._collections_backfill_done = False
         out = sc._load_collections()
         assert len(out) == 2
         assert out[0]["name"] == "yeast"

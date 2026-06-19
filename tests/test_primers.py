@@ -2070,7 +2070,7 @@ class TestPrimerCollectionWorkflow:
                     "primer_type": "generic", "source": "t", "pos_start": -1,
                     "pos_end": -1, "strand": 1, "date": "2026-06-11",
                     "status": "Designed"}
-        monkeypatch.setattr(sc, "_primers_name_trim_done", True)
+        monkeypatch.setattr(sc._state, "_primers_name_trim_done", True)
         monkeypatch.setattr(sc._state, "_primers_cache", [
             _p("P-A", "TTTTTTTTTTTTTTTTTTTT"),
             _p("P-DUP", dup),
