@@ -409,9 +409,9 @@ class TestFindSequenceFlow:
                 {"start": 5, "end": 8, "strand": "+", "mismatches": 0},
                 {"start": 40, "end": 43, "strand": "+", "mismatches": 0},
             ]
-            app._on_seq_search(self._result(hits))
-            assert app._seq_search is not None
-            assert app._seq_search["idx"] == 0
+            app.search._on_seq_search(self._result(hits))
+            assert app.search._seq_search is not None
+            assert app.search._seq_search["idx"] == 0
             assert sp._cursor_pos == 5
 
     async def test_next_and_prev_wrap(self, tiny_record, isolated_library):
@@ -424,16 +424,16 @@ class TestFindSequenceFlow:
                 {"start": 5, "end": 8, "strand": "+", "mismatches": 0},
                 {"start": 40, "end": 43, "strand": "+", "mismatches": 0},
             ]
-            app._on_seq_search(self._result(hits))
-            assert app._seq_search["idx"] == 0
+            app.search._on_seq_search(self._result(hits))
+            assert app.search._seq_search["idx"] == 0
             app.action_find_next()
-            assert app._seq_search["idx"] == 1
+            assert app.search._seq_search["idx"] == 1
             assert sp._cursor_pos == 40
             app.action_find_next()           # wraps back to 0
-            assert app._seq_search["idx"] == 0
+            assert app.search._seq_search["idx"] == 0
             assert sp._cursor_pos == 5
             app.action_find_prev()           # wraps to last
-            assert app._seq_search["idx"] == 1
+            assert app.search._seq_search["idx"] == 1
             assert sp._cursor_pos == 40
 
     async def test_next_with_no_search_is_safe(self, tiny_record,
@@ -442,10 +442,10 @@ class TestFindSequenceFlow:
         app._preload_record = tiny_record
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
-            app._seq_search = None
+            app.search._seq_search = None
             app.action_find_next()          # notify, no crash
             app.action_find_prev()
-            assert app._seq_search is None
+            assert app.search._seq_search is None
 
     async def test_stale_sequence_invalidates_search(self, tiny_record,
                                                      isolated_library):
@@ -454,12 +454,12 @@ class TestFindSequenceFlow:
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             hits = [{"start": 5, "end": 8, "strand": "+", "mismatches": 0}]
-            app._on_seq_search(self._result(hits))
-            assert app._seq_search is not None
+            app.search._on_seq_search(self._result(hits))
+            assert app.search._seq_search is not None
             # Simulate an edit: the recorded seq_len no longer matches.
-            app._seq_search["seq_len"] = 999999
-            app._goto_search_hit()
-            assert app._seq_search is None   # dropped rather than mis-jump
+            app.search._seq_search["seq_len"] = 999999
+            app.search._goto_search_hit()
+            assert app.search._seq_search is None   # dropped rather than mis-jump
 
     async def test_start_idx_picks_hit_after_cursor(self, tiny_record,
                                                     isolated_library):
@@ -473,9 +473,9 @@ class TestFindSequenceFlow:
                 {"start": 5, "end": 8, "strand": "+", "mismatches": 0},
                 {"start": 40, "end": 43, "strand": "+", "mismatches": 0},
             ]
-            app._on_seq_search(self._result(hits))
+            app.search._on_seq_search(self._result(hits))
             # Search continues from where the user was looking → hit @40.
-            assert app._seq_search["idx"] == 1
+            assert app.search._seq_search["idx"] == 1
             assert sp._cursor_pos == 40
 
     async def test_n_and_N_keystrokes_fire(self, tiny_record,
@@ -495,15 +495,15 @@ class TestFindSequenceFlow:
                 {"start": 5, "end": 8, "strand": "+", "mismatches": 0},
                 {"start": 40, "end": 43, "strand": "+", "mismatches": 0},
             ]
-            app._on_seq_search(self._result(hits))
-            assert app._seq_search["idx"] == 0
+            app.search._on_seq_search(self._result(hits))
+            assert app.search._seq_search["idx"] == 0
             await pilot.press("n")
             await pilot.pause()
-            assert app._seq_search["idx"] == 1
+            assert app.search._seq_search["idx"] == 1
             assert sp._cursor_pos == 40
             await pilot.press("N")          # standard-terminal Shift+n
             await pilot.pause()
-            assert app._seq_search["idx"] == 0
+            assert app.search._seq_search["idx"] == 0
             assert sp._cursor_pos == 5
 
     async def test_record_swap_clears_search(self, tiny_record,
@@ -513,11 +513,11 @@ class TestFindSequenceFlow:
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             hits = [{"start": 5, "end": 8, "strand": "+", "mismatches": 0}]
-            app._on_seq_search(self._result(hits))
-            assert app._seq_search is not None
+            app.search._on_seq_search(self._result(hits))
+            assert app.search._seq_search is not None
             # Loading a fresh plasmid must invalidate the stale search.
             app._apply_record(tiny_record)
-            assert app._seq_search is None
+            assert app.search._seq_search is None
 
     async def test_ctrl_f_does_not_stack_modals(self, tiny_record,
                                                 isolated_library):
