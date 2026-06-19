@@ -11,8 +11,12 @@ from __future__ import annotations
 import functools as _functools
 
 from rich.text import Text
+from textual.coordinate import Coordinate as _Coordinate
 from textual.events import MouseDown
-from textual.widgets import Button, Static
+from textual.widgets import Button, DataTable, DirectoryTree, Input, Static
+
+from splicecraft_logging import _log
+from splicecraft_util import _is_fasta_path, _is_seq_zip_path, _natural_sort_key
 
 
 class _InstantPressButton(Button):
@@ -142,3 +146,391 @@ class _XtermColorGrid(Static):
         if y == 7:
             return 232 + col if 0 <= col < 24 else None
         return None
+
+
+# ── File-picker / search widget styling (moved from hub, Phase D) ───────────
+_PICKER_PLASMID_STYLE = "bold #BFFF00"   # lime green — .gb / .gbk / .genbank
+_PICKER_OTHER_STYLE   = "#FFFFFF"        # plain white for everything else
+_FASTA_PICKER_FASTA_STYLE = "bold #FF69B4"
+_FASTA_PICKER_OTHER_STYLE = "#FFFFFF"
+_SEQ_ZIP_HIGHLIGHT_STYLE = "bold #BFFF00"
+_SEQ_ZIP_OTHER_STYLE     = "#FFFFFF"
+
+
+# ── Custom file-picker / search / table widgets (moved from hub, Phase D) ────
+class _SearchInput(Input):
+    """Reusable search-bar Input.
+
+    Three reusable behaviours that every search bar in the app wants
+    consistently:
+
+    1. **Prefill / placeholder hybrid.** ``PREFILL`` is shown when the
+       field is unfocused + empty; clicking into the field clears it
+       so the user types into a fresh cursor. Blurring an empty field
+       restores the prefill. The PREFILL string also counts as
+       "empty" in `query()` so a user mashing Enter without focusing
+       first doesn't search for the literal word "Search".
+
+    2. **Optional live-filter debouncing.** When the parent passes
+       ``debounce_s=<seconds>`` + ``on_filter=<callable>``, every
+       keystroke schedules a single timer; rapid typing coalesces
+       into one call. With ``debounce_s=None`` (default) the widget
+       behaves identically to plain ``Input`` and the parent listens
+       to ``Input.Submitted`` for Enter-to-apply UX. The debounce
+       timer is cancelled on unmount so a queued tick can't fire
+       against a disposed widget tree.
+
+    3. **Length cap.** Defaults to ``DEFAULT_MAX_LEN = 200``. Longer
+       pastes (e.g. an accidental clipboard dump) are silently
+       truncated. The fuzzy matcher is O(query × name); without a
+       cap a 100k-char paste against a 5k-plasmid library would lock
+       the UI for seconds before any debounce fires.
+
+    Pre-2026-05-10 this class had only the focus-clear behaviour and
+    every site that wanted debounce / cleanup / cap rolled its own.
+    The four search bars in the app (LibraryPanel, LibrarySearchModal,
+    LoadPartSourceModal, SpeciesPickerModal) used 4 slightly-different
+    patterns; the consolidated widget is the one place to fix
+    behaviour bugs going forward.
+    """
+    PREFILL = "Search"
+    DEFAULT_MAX_LEN = 200
+
+    def __init__(
+        self,
+        *args,
+        prefill: "str | None" = None,
+        debounce_s: "float | None" = None,
+        max_len: int = DEFAULT_MAX_LEN,
+        on_filter=None,
+        **kwargs,
+    ):
+        # Default prefill to the class constant; allow opt-out by
+        # passing ``prefill=""`` so a caller that wants placeholder-
+        # only behaviour gets a plain Input visually.
+        if prefill is None:
+            prefill = self.PREFILL
+        # Use the prefill as the initial value if the caller didn't
+        # pass one explicitly. ``None`` is the sentinel for "use the
+        # prefill"; ``""`` is the sentinel for "start empty".
+        if "value" not in kwargs:
+            kwargs["value"] = prefill
+        super().__init__(*args, **kwargs)
+        self._prefill = prefill
+        self._debounce_s = debounce_s
+        self._max_len = max(1, int(max_len))
+        self._on_filter = on_filter
+        self._filter_timer = None
+
+    def on_focus(self, _event) -> None:
+        # Always blank the field on focus gain — matches the spec
+        # "clicking into … the textbox clears and a cursor appears".
+        if self.value == self._prefill:
+            self.value = ""
+
+    def on_blur(self, _event) -> None:
+        # Restoring the prefill on blur (empty field only) keeps the
+        # idle UI readable — without this, a user who clicked away
+        # without typing would see an empty field with no affordance
+        # cue. Whitespace-only counts as empty.
+        if not self.value.strip():
+            try:
+                self.value = self._prefill
+            except Exception:
+                # Defensive — Input.value setter could fail mid-
+                # teardown; the next on_focus / clear() will recover.
+                pass
+
+    def on_input_changed(self, event) -> None:
+        # Length cap is a hard truncate. Setting `self.value` here
+        # re-triggers Input.Changed; the second pass reads the
+        # truncated value, hits the equality check, and skips the
+        # truncate path. So we don't need an explicit re-entrancy
+        # guard — but we DO need to bail before scheduling a debounce
+        # for the truncate-pass, since we'll be back here in 1 µs.
+        if len(self.value) > self._max_len:
+            self.value = self.value[: self._max_len]
+            return
+        # No callback / no debounce → behave like a plain Input.
+        if self._on_filter is None or self._debounce_s is None:
+            return
+        # Cancel any pending tick before scheduling a fresh one;
+        # without this a burst of N keystrokes spawns N timers and
+        # the filter callback fires N times after debounce_s.
+        if self._filter_timer is not None:
+            try:
+                self._filter_timer.stop()
+            except Exception:
+                pass
+        try:
+            self._filter_timer = self.set_timer(
+                self._debounce_s, self._fire_filter,
+            )
+        except Exception:
+            # Timer setup can race with unmount; fall back to a
+            # synchronous fire so the user's keystroke isn't lost.
+            self._filter_timer = None
+            self._fire_filter()
+
+    def _fire_filter(self) -> None:
+        """Invoke the ``on_filter`` callback with the sanitised query.
+        Wrapped in try/except so a callback that raises (e.g. a stale
+        widget query during unmount) doesn't poison the timer."""
+        if self._on_filter is None:
+            return
+        try:
+            self._on_filter(self.current_query())
+        except Exception:
+            _log.exception(
+                "_SearchInput: on_filter callback raised on query %r",
+                self.value,
+            )
+
+    def current_query(self) -> str:
+        """Return the sanitised query string. Strips outer whitespace
+        and treats the prefill as empty so a user who didn't focus
+        the field doesn't search for the placeholder text.
+
+        Named ``current_query`` (not ``query``) to avoid colliding
+        with ``Widget.query(selector)`` from Textual's DOMNode API,
+        which would otherwise be shadowed by the same-name override.
+        """
+        v = (self.value or "").strip()
+        if v == self._prefill:
+            return ""
+        return v
+
+    def clear(self) -> None:
+        """Reset the input to prefill state and cancel any pending
+        debounce. Idempotent — safe to call from a parent's
+        view-mode-switch path that also fires `on_unmount` shortly
+        afterward."""
+        try:
+            self.value = self._prefill
+        except Exception:
+            pass
+        if self._filter_timer is not None:
+            try:
+                self._filter_timer.stop()
+            except Exception:
+                pass
+            self._filter_timer = None
+
+    def on_unmount(self) -> None:
+        # Cancel the pending debounce so a queued tick doesn't fire
+        # against a disposed widget tree — the callback typically
+        # `query_one`s into the parent's table, which would raise
+        # NoMatches (caught) but log a noisy warning. Wiping the
+        # slot keeps the tear-down clean.
+        if self._filter_timer is not None:
+            try:
+                self._filter_timer.stop()
+            except Exception:
+                pass
+            self._filter_timer = None
+
+
+class _SingleClickDataTable(DataTable):
+    """Sweep #30 (2026-05-26): DataTable variant that fires
+    `CellSelected` on the FIRST click of any data cell, instead
+    of requiring two clicks (cursor-move + select). Textual's
+    stock `DataTable._on_click` moves the cursor on first click
+    and only posts `CellSelected` on the second click of an
+    already-highlighted cell — that's confusing in the members
+    table where the strand / color / label cells are meant to be
+    direct one-click affordances. User-reported: "still no
+    change to the segment list after trying to change arrow"
+    because the picker never opened on single click.
+
+    Header / row-label clicks fall through to the parent
+    implementation so sort + label-click semantics are preserved.
+    """
+
+    async def _on_click(self, event) -> None:
+        meta = event.style.meta
+        if "row" not in meta or "column" not in meta:
+            return
+        if (self.cursor_type != "row"
+                and meta.get("out_of_bounds", False)):
+            return
+        row_index = meta["row"]
+        column_index = meta["column"]
+        is_header_click = (self.show_header and row_index == -1)
+        is_row_label_click = (self.show_row_labels
+                              and column_index == -1)
+        if is_header_click or is_row_label_click:
+            # Defer to the stock handler for header / label
+            # clicks so HeaderSelected / RowLabelSelected fire
+            # exactly as Textual ships them.
+            await super()._on_click(event)
+            return
+        if self.show_cursor and self.cursor_type != "none":
+            new_coordinate = _Coordinate(row_index, column_index)
+            self.cursor_coordinate = new_coordinate
+            # The key change vs stock Textual: always post the
+            # selected message, regardless of whether the cell
+            # was already the cursor's location. Single-click
+            # opens the picker.
+            self._post_selected_message()
+            self._scroll_cursor_into_view(animate=True)
+            event.stop()
+
+
+class _ExtensionAwareDirectoryTree(DirectoryTree):
+    """DirectoryTree that highlights files per-extension via a colour map.
+
+    Construction options (mutually compatible — `highlight_map` wins
+    when both are supplied):
+
+      `highlight_map: dict[str, str]` — explicit ``{".ext": "style"}``.
+        Lets a single tree colour different formats with different
+        styles (e.g. pink for FASTA, orange for .dna, green for .gb).
+      `highlight_exts: frozenset[str]` + `highlight_style: str` — legacy
+        single-colour API. Every extension in the set renders in
+        `highlight_style`; everything else in `other_style`.
+
+    Files that don't match any rule render in `other_style` (white by
+    default). Directories keep Textual's default styling so folder
+    navigation cues stay obvious.
+
+    Replaces the per-modal `_FastaAwareDirectoryTree` /
+    `_ZipAwareDirectoryTree` triplet — each modal just constructs this
+    with the highlight rules it cares about.
+    """
+
+    def __init__(self, path, *,
+                  highlight_map: "dict[str, str] | None" = None,
+                  highlight_exts: "frozenset[str] | None" = None,
+                  highlight_style: str = _PICKER_PLASMID_STYLE,
+                  other_style:     str = _PICKER_OTHER_STYLE,
+                  **kwargs) -> None:
+        super().__init__(path, **kwargs)
+        # Lower-case once on construction so the per-render check is a
+        # single dict lookup; lets callers write the literal {".gb": ...}
+        # without worrying about case variants on the input side.
+        if highlight_map is not None:
+            self._highlight_map: dict[str, str] = {
+                k.lower(): v for k, v in highlight_map.items()
+            }
+        elif highlight_exts is not None:
+            self._highlight_map = {
+                e.lower(): highlight_style for e in highlight_exts
+            }
+        else:
+            self._highlight_map = {}
+        self._other_style = other_style
+
+    def render_label(self, node, base_style, style):
+        label = super().render_label(node, base_style, style)
+        data = node.data
+        if data is None:
+            return label
+        p = getattr(data, "path", None)
+        if p is None:
+            return label
+        try:
+            if not p.is_file():
+                return label
+        except OSError:
+            return label
+        styled = label.copy()
+        suffix = (getattr(p, "suffix", "") or "").lower()
+        styled.stylize(self._highlight_map.get(suffix, self._other_style))
+        return styled
+
+    def _populate_node(self, node, content):
+        """Re-sort directory contents with `_natural_sort_key` before
+        the base populates the tree, so ``FFE 2`` sorts before
+        ``FFE 10`` (numerical-aware), not after (lexicographic).
+
+        The base ``DirectoryTree._load_directory`` sorts by
+        ``(not is_dir, name.lower())`` — directories first, files
+        alphabetically by case-insensitive name. We keep the
+        directories-first half but swap the file-name comparator
+        to the same natural-sort key the plasmid library panel uses,
+        so a folder full of `FFE 2 ENTRY A1.dna` / `FFE 10 …` sorts
+        as a human would expect.
+        """
+        sorted_content = sorted(
+            content,
+            key=lambda p: (
+                not self._safe_is_dir(p),
+                _natural_sort_key(p.name),
+            ),
+        )
+        super()._populate_node(node, sorted_content)
+
+
+class _FastaAwareDirectoryTree(DirectoryTree):
+    """DirectoryTree variant that colours FASTA files lime green and
+    every other file white. Directories are left alone so Textual's
+    default folder styling still applies. Sorts via the natural-key
+    comparator so ``FFE 2`` precedes ``FFE 10`` — same convention
+    the plasmid library panel uses."""
+
+    def render_label(self, node, base_style, style):
+        label = super().render_label(node, base_style, style)
+        data = node.data
+        if data is None:
+            return label
+        p = getattr(data, "path", None)
+        if p is None:
+            return label
+        try:
+            if not p.is_file():
+                return label
+        except OSError:
+            return label
+        styled = label.copy()
+        if _is_fasta_path(p):
+            styled.stylize(_FASTA_PICKER_FASTA_STYLE)
+        else:
+            styled.stylize(_FASTA_PICKER_OTHER_STYLE)
+        return styled
+
+    def _populate_node(self, node, content):
+        sorted_content = sorted(
+            content,
+            key=lambda p: (
+                not self._safe_is_dir(p),
+                _natural_sort_key(p.name),
+            ),
+        )
+        super()._populate_node(node, sorted_content)
+
+
+class _ZipAwareDirectoryTree(DirectoryTree):
+    """DirectoryTree variant that colours .zip archives lime green so
+    the user can scan a downloads folder for the Plasmidsaurus run.
+    Mirrors `_FastaAwareDirectoryTree`'s contract — including the
+    natural-key sort so `run_2.zip` precedes `run_10.zip`."""
+
+    def render_label(self, node, base_style, style):
+        label = super().render_label(node, base_style, style)
+        data = node.data
+        if data is None:
+            return label
+        p = getattr(data, "path", None)
+        if p is None:
+            return label
+        try:
+            if not p.is_file():
+                return label
+        except OSError:
+            return label
+        styled = label.copy()
+        if _is_seq_zip_path(p):
+            styled.stylize(_SEQ_ZIP_HIGHLIGHT_STYLE)
+        else:
+            styled.stylize(_SEQ_ZIP_OTHER_STYLE)
+        return styled
+
+    def _populate_node(self, node, content):
+        sorted_content = sorted(
+            content,
+            key=lambda p: (
+                not self._safe_is_dir(p),
+                _natural_sort_key(p.name),
+            ),
+        )
+        super()._populate_node(node, sorted_content)
