@@ -188,6 +188,10 @@ only-include = [
     "splicecraft_errors.py",
     "splicecraft_state.py",
     "splicecraft_logging.py",
+    # The domain-agnostic save/load engine (safe_save_json + backups + the
+    # data-safety chokepoint). SACRED: if this is missing from the wheel,
+    # `import splicecraft` fails at the re-import step and NO save path works.
+    "splicecraft_persistence.py",
     "splicecraft_render.py",
     "splicecraft_history.py",
     "splicecraft_widgets.py",
@@ -203,6 +207,7 @@ include = [
     "splicecraft_errors.py",
     "splicecraft_state.py",
     "splicecraft_logging.py",
+    "splicecraft_persistence.py",
     "splicecraft_render.py",
     "splicecraft_history.py",
     "splicecraft_widgets.py",

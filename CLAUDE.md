@@ -45,11 +45,12 @@ The project's Claude memory lives in `.claude/memory/`, which is its **own priva
 
 ---
 
-Bioinformatician + Claude. **Hub + layered-siblings architecture** — `splicecraft.py` is still the ~130k-line **hub** (`PlasmidApp`, the persistence/data-safety core, CLI, agent-API, screens, most modals — deeply coupled, deliberately kept together; extracting them would cascade into the data-safety core). It imports and re-exports flat `splicecraft_*.py` siblings holding the cleanly-separable layers:
+Bioinformatician + Claude. **Hub + layered-siblings architecture** — `splicecraft.py` is still the ~129k-line **hub** (`PlasmidApp`, the data-safety POLICY (`_authorize_writes*` + the sandbox gate), the domain `_save_X`/`_load_X` wrappers, the blob store, CLI, agent-API, screens, most modals — deeply coupled, deliberately kept together). The domain-agnostic save/load ENGINE was extracted to `splicecraft_persistence` (Phase B-main) — the feared cascade into the data-safety core was avoided by keeping the chokepoint flag + blob-dehydration as `_state` registrations. It imports and re-exports flat `splicecraft_*.py` siblings holding the cleanly-separable layers:
 
 - `splicecraft_biology` (pure biology — `_rc`, `_iupac_pattern`, `_feat_len`, …)
 - `splicecraft_state` (shared mutable process state — capability flags etc.; **access `_state.X`, NEVER `from splicecraft_state import X`** — a by-value import binds a stale copy that desyncs from runtime writes + monkeypatches)
 - `splicecraft_logging` (`_log` / `_log_event` / filters; `_action_log`/`_timed` stay hub-side so the `_log_event` monkeypatch path survives)
+- `splicecraft_persistence` (the SACRED save/load engine — `_safe_save_json` + atomic write + backup rotation + lost-entries spillover + `_safe_load_json` + the `_refuse_unauthorized_write` chokepoint enforcement; reads paths/caches/flags/tunables from `_state`, blob dehydration via `_state._dehydrate_*_hook`. Domain `_save_X`/`_load_X` wrappers stay hub-side and call this. **Internal engine→engine calls resolve in the sibling's namespace** — to intercept one in a test, patch `splicecraft_persistence.X`, not `sc.X`.)
 - `splicecraft_render` (`_Canvas` / `_BrailleCanvas` + glyph LUTs)
 - `splicecraft_history` (`.dna` `_CommercialSaaSHistoryNode` model + provenance date helpers)
 - `splicecraft_widgets` (pure Textual primitives), `splicecraft_errors`

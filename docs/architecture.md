@@ -11,7 +11,8 @@ modals — the deeply-coupled application core, deliberately kept together;
 extracting it would cascade into the data-safety core). The cleanly-separable
 layers live in flat `splicecraft_*.py` siblings the hub imports and re-exports:
 `splicecraft_biology`, `splicecraft_state`, `splicecraft_logging`,
-`splicecraft_render`, `splicecraft_history`, `splicecraft_widgets`,
+`splicecraft_persistence` (the domain-agnostic save/load engine + data-safety
+chokepoint), `splicecraft_render`, `splicecraft_history`, `splicecraft_widgets`,
 `splicecraft_errors` (plus the stdlib-only `splicecraft_cli` sidecar and
 `splicecraft_demo_plasmids` seed).
 

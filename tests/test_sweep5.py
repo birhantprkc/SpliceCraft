@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 import splicecraft as sc
+import splicecraft_persistence as _sp
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -118,7 +119,11 @@ class TestBakRecoveryAtomic:
             calls.append(path)
             return original(path, data)
 
-        monkeypatch.setattr(sc, "_atomic_write_bytes", tracking)
+        # `_safe_load_json` lives in splicecraft_persistence and resolves its
+        # internal `_atomic_write_bytes` call in THAT module's namespace, so the
+        # tracking wrapper must be installed on the sibling (patching the hub
+        # re-export would not intercept the engine-internal call).
+        monkeypatch.setattr(_sp, "_atomic_write_bytes", tracking)
         entries, warning = sc._safe_load_json(p, "test")
         # Recovery returned the .bak content (the first save).
         assert entries == [{"id": "first"}]
