@@ -23,7 +23,7 @@ from datetime import date as _date
 from typing import TypeVar as _TypeVar
 
 import splicecraft_state as _state
-from splicecraft_logging import _log
+from splicecraft_logging import _log, _log_event
 from splicecraft_persistence import _safe_load_json, _safe_save_json
 
 # Immutable types `_typed_clone` returns as-is (no copy needed). Everything else
@@ -769,5 +769,87 @@ def _save_custom_enzymes(entries: list[dict]) -> None:
     # shows up in the next restriction scan — hub-side effect, fired via the
     # registered hook. None only during the import window (no save runs then).
     hook = getattr(_state, "_after_custom_enzyme_save_hook", None)
+    if hook is not None:
+        hook()
+
+
+# ── Entry vectors (Golden-Braid / MoClo acceptor plasmids) ──────────────────
+# `_save_entry_vectors`' post-save side-effect (bust the EV digest + acceptor-TU
+# caches) stays hub-side via `_state._after_entry_vectors_save_hook`. The
+# name-trim backfill is a pure helper that travels with the cluster.
+
+
+def _backfill_entry_vector_names(
+        entries: list[dict]) -> "tuple[list[dict], int]":
+    """Trim leading / trailing whitespace from each entry vector's
+    `name` field. Returns `(entries, n_changed)`. Idempotent.
+
+    **Hardening:** only mutates entries that already HAVE a `name`
+    key — never adds the field where missing. Skips non-dict entries
+    + non-string names (defensive against hand-edited JSON)."""
+    n_changed = 0
+    for e in entries:
+        if not isinstance(e, dict) or "name" not in e:
+            continue
+        raw = e["name"]
+        if not isinstance(raw, str):
+            continue
+        trimmed = raw.strip()
+        if trimmed != raw:
+            e["name"] = trimmed
+            n_changed += 1
+    return entries, n_changed
+
+
+def _load_entry_vectors() -> list[dict]:
+    with _state._cache_lock:
+        if _state._entry_vectors_cache is None:
+            entries, warning = _safe_load_json(
+                _state._ENTRY_VECTORS_FILE, "Entry vectors",
+            )
+            if warning:
+                _log.warning(warning)
+            _state._entry_vectors_cache = [
+                e for e in entries
+                if isinstance(e, dict)
+                and isinstance(e.get("grammar_id"), str)
+            ]
+        if not _state._entry_vectors_name_trim_done:
+            _state._entry_vectors_cache, n_changed = (
+                _backfill_entry_vector_names(_state._entry_vectors_cache)
+            )
+            _state._entry_vectors_name_trim_done = True
+            if n_changed > 0:
+                _log.info(
+                    "entry-vectors: name trim backfill cleaned %d "
+                    "entries", n_changed,
+                )
+                _log_event(
+                    "entry_vectors.name_trim_backfill",
+                    n_changed=n_changed,
+                )
+                save_target = _state._entry_vectors_cache
+            else:
+                save_target = None
+        else:
+            save_target = None
+    if save_target is not None:
+        try:
+            _save_entry_vectors(save_target)
+        except (OSError, RuntimeError):
+            _log.exception(
+                "entry-vectors: name trim backfill save failed",
+            )
+    assert _state._entry_vectors_cache is not None
+    return _typed_clone(_state._entry_vectors_cache)
+
+
+def _save_entry_vectors(entries: list[dict]) -> None:
+    with _state._cache_lock:
+        _safe_save_json(_state._ENTRY_VECTORS_FILE, entries, "Entry vectors")
+        _state._entry_vectors_cache = _typed_clone(entries)
+    # Bust the EV digest + acceptor-TU caches (hub-side: a reconfigured vector
+    # set changes which overhangs/stuffers match) via the registered hook.
+    hook = getattr(_state, "_after_entry_vectors_save_hook", None)
     if hook is not None:
         hook()

@@ -219,3 +219,6 @@ _cache_lock = threading.RLock()
 # import window) just skips the side-effect — no save runs before registration,
 # and test_enzyme_collections guards the registration so a regression is loud.
 _after_custom_enzyme_save_hook: "_Callable[[], None] | None" = None
+# Saving entry vectors busts the EV digest + acceptor-TU caches (a reconfigured
+# vector set changes which overhangs/stuffers match) — hub-side, via this hook.
+_after_entry_vectors_save_hook: "_Callable[[], None] | None" = None
