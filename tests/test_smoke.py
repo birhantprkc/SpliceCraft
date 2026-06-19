@@ -12196,7 +12196,7 @@ class TestUpdateDataSafety:
         backup = tmp_path / "backups"
         data.mkdir()
         backup.mkdir()
-        monkeypatch.setattr(sc, "_DATA_DIR", data)
+        monkeypatch.setattr(sc._state, "_DATA_DIR", data)
         monkeypatch.setenv("SPLICECRAFT_UPDATE_BACKUP_DIR", str(backup))
         path = sc._create_pre_update_snapshot("0.0.0-test")
         snap_resolved = path.resolve()
@@ -12212,7 +12212,7 @@ class TestUpdateDataSafety:
         # wipe of `_DATA_DIR` doesn't take the recovery copy down).
         data = tmp_path / "data"
         data.mkdir()
-        monkeypatch.setattr(sc, "_DATA_DIR", data)
+        monkeypatch.setattr(sc._state, "_DATA_DIR", data)
         monkeypatch.delenv("SPLICECRAFT_UPDATE_BACKUP_DIR", raising=False)
         resolved = sc._resolve_pre_update_backup_dir()
         # Sibling: same parent, related-but-distinct name.
@@ -12336,7 +12336,7 @@ class TestUpdateDataSafety:
         bad_data = install_path / "data"
         bad_data.mkdir()
         monkeypatch.setattr(sc, "__file__", str(fake_module))
-        monkeypatch.setattr(sc, "_DATA_DIR", bad_data)
+        monkeypatch.setattr(sc._state, "_DATA_DIR", bad_data)
         assert sc._data_dir_inside_install_path() is True
 
     # ── Sacred invariant: snapshot before subprocess ───────────────
@@ -12694,7 +12694,7 @@ class TestUpdateDataSafetyHardening:
         (foreign / "important_file").write_text("DO NOT DELETE")
         # Create more snapshots than the retention limit so pruning
         # actually fires.
-        monkeypatch.setattr(sc, "_DATA_DIR", tmp_path / "data")
+        monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
         (tmp_path / "data").mkdir()
         monkeypatch.setenv("SPLICECRAFT_UPDATE_BACKUP_DIR", str(backup))
         for i in range(3):
@@ -12996,7 +12996,7 @@ class TestUpdateDataSafetyHardening:
         # If `_DATA_DIR` is configured at filesystem root (or its
         # parent equals itself), refuse to derive a backup location.
         monkeypatch.delenv("SPLICECRAFT_UPDATE_BACKUP_DIR", raising=False)
-        monkeypatch.setattr(sc, "_DATA_DIR", sc.Path("/"))
+        monkeypatch.setattr(sc._state, "_DATA_DIR", sc.Path("/"))
         with pytest.raises(OSError, match="Refusing"):
             sc._resolve_pre_update_backup_dir()
 
@@ -13488,7 +13488,7 @@ class TestFutureProofingFeatures:
     # ── (5) Data-dir version stamp ─────────────────────────────────
 
     def test_stamp_creates_file_on_first_run(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(sc, "_DATA_DIR", tmp_path / "data")
+        monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
         monkeypatch.setattr(sc, "_PLUGINS_DIR",
@@ -13501,7 +13501,7 @@ class TestFutureProofingFeatures:
         assert stamp_file.read_text(encoding="utf-8").strip() == sc.__version__
 
     def test_stamp_warns_on_downgrade(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(sc, "_DATA_DIR", tmp_path / "data")
+        monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
         monkeypatch.setattr(sc, "_PLUGINS_DIR",
@@ -13521,7 +13521,7 @@ class TestFutureProofingFeatures:
     def test_stamp_silent_on_upgrade(self, monkeypatch, tmp_path):
         # Older stamp + newer running version → no warning, just
         # silent overwrite.
-        monkeypatch.setattr(sc, "_DATA_DIR", tmp_path / "data")
+        monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
         monkeypatch.setattr(sc, "_PLUGINS_DIR",
@@ -13538,7 +13538,7 @@ class TestFutureProofingFeatures:
         # Garbage stamp content (e.g. binary, malformed) — function
         # mustn't crash; treat as "unknown previous version" and
         # silently overwrite.
-        monkeypatch.setattr(sc, "_DATA_DIR", tmp_path / "data")
+        monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
         monkeypatch.setattr(sc, "_PLUGINS_DIR",
@@ -13556,7 +13556,7 @@ class TestFutureProofingFeatures:
     def test_stamp_handles_oversize_existing(self, monkeypatch, tmp_path):
         # 1 MB of garbage in the stamp file. Function caps the read
         # at 128 bytes so memory is bounded.
-        monkeypatch.setattr(sc, "_DATA_DIR", tmp_path / "data")
+        monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
         monkeypatch.setattr(sc, "_PLUGINS_DIR",
@@ -13571,7 +13571,7 @@ class TestFutureProofingFeatures:
     def test_stamp_creates_plugins_dir(self, monkeypatch, tmp_path):
         # Plugin namespace should be reserved (created empty) at the
         # same checkpoint.
-        monkeypatch.setattr(sc, "_DATA_DIR", tmp_path / "data")
+        monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
         monkeypatch.setattr(sc, "_PLUGINS_DIR",
@@ -13582,7 +13582,7 @@ class TestFutureProofingFeatures:
     def test_stamp_swallows_oserror(self, monkeypatch, tmp_path):
         # Read-only data dir: function logs + returns None rather
         # than crashing the launch.
-        monkeypatch.setattr(sc, "_DATA_DIR",
+        monkeypatch.setattr(sc._state, "_DATA_DIR",
                               tmp_path / "nonexistent-readonly")
         monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
                               tmp_path / "nonexistent-readonly" / "x")
@@ -13697,7 +13697,7 @@ class TestFutureProofingFeatures:
         # never go through main(), so the dir is not auto-created
         # there. But if a test explicitly calls the check, it should
         # be idempotent (creating an existing dir is a no-op).
-        monkeypatch.setattr(sc, "_DATA_DIR", tmp_path / "data")
+        monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(sc, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
         monkeypatch.setattr(sc, "_PLUGINS_DIR",

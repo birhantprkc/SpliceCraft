@@ -1617,7 +1617,7 @@ class TestDataDirHousekeeping:
         for ts in ["20260101-000000", "20260102-000000", "20260103-000000"]:
             lib.with_name(f"{lib.name}.bak.{ts}").write_text(
                 json.dumps({"_schema_version": 1, "entries": []}))
-        ld = sc._DATA_DIR / "lost_entries"
+        ld = sc._state._DATA_DIR / "lost_entries"
         ld.mkdir(parents=True, exist_ok=True)
         monkeypatch.setattr(sc, "_LOST_ENTRIES_RETENTION_COUNT", 1)
         monkeypatch.setattr(sc, "_LOST_ENTRIES_TOTAL_SIZE_CAP_BYTES", 10 ** 9)
@@ -1625,7 +1625,7 @@ class TestDataDirHousekeeping:
             f = ld / f"plasmid_library-2026010{i}-000000.json"
             f.write_text("x" * 50)
             os.utime(f, (1000 + i, 1000 + i))
-        sc._run_data_dir_housekeeping(sc._DATA_DIR)
+        sc._run_data_dir_housekeeping(sc._state._DATA_DIR)
         assert lib.with_name(f"{lib.name}.bak.20260101-000000.gz").exists()
         assert lib.with_name(f"{lib.name}.bak.20260103-000000").exists()  # newest plain
         assert len(list(ld.iterdir())) == 1   # lost_entries pruned to retention

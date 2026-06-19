@@ -2,7 +2,7 @@
 
 `import splicecraft as sc` is the public surface the *entire* test suite, the
 `splicecraft_cli.py` sidecar, the agent API, `release.py`, and the CLAUDE.md
-sandbox protocol all depend on: ``sc._DATA_DIR``, ``sc._save_collections``,
+sandbox protocol all depend on: ``sc._state._DATA_DIR``, ``sc._save_collections``,
 ``sc._authorize_writes_for_sandbox``, ``sc._rc``, the ``_h_*`` endpoints, and
 every modal / screen / widget class.
 
@@ -33,8 +33,8 @@ _BASELINE = json.loads(
 # Kept explicit so a drop here yields an obvious message instead of one line
 # buried in a 1800-name diff.
 _SACRED = [
-    # data-dir safety / persistence chokepoint
-    "_DATA_DIR", "_safe_save_json", "_authorize_writes",
+    # data-dir safety / persistence chokepoint (_DATA_DIR now in _state)
+    "_safe_save_json", "_authorize_writes",
     "_authorize_writes_for_sandbox",
     "_save_collections", "_save_library", "_save_primers", "_save_parts_bin",
     "_save_features", "_save_custom_grammars", "_save_entry_vectors",

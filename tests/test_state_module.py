@@ -53,6 +53,8 @@ _MIGRATED = [
     "_primers_name_trim_done",
     # Phase A2c: the save-authorization chokepoint flag
     "_SAVES_AUTHORIZED", "_SAVES_AUTHORIZED_REASON",
+    # Phase B-prep: the data directory (computed by the hub at import)
+    "_DATA_DIR",
 ]
 
 

@@ -142,7 +142,7 @@ def _protect_user_data(tmp_path, monkeypatch):
     # writable, isolated directory).
     monkeypatch.setenv("SPLICECRAFT_UPDATE_BACKUP_DIR",
                          str(tmp_path / "update-backups"))
-    monkeypatch.setattr(sc, "_DATA_DIR", tmp_path)
+    _patch("_DATA_DIR", tmp_path)
 
     # L2 chokepoint authorisation (2026-05-22). Every `_save_*` flows
     # through `_safe_save_json` which now refuses unauthorised writes.

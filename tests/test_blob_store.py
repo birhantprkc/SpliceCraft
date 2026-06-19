@@ -428,7 +428,7 @@ class TestOrphanBlobGC:
     def test_keeps_blob_referenced_only_by_daily_snapshot(self):
         ref = sc._blob_write(GB)
         _age(sc._blob_path(ref), sc._BLOB_GC_GRACE_SECONDS + 100)
-        snap = sc._DATA_DIR / sc._SNAPSHOT_DIR_NAME
+        snap = sc._state._DATA_DIR / sc._SNAPSHOT_DIR_NAME
         snap.mkdir(parents=True, exist_ok=True)
         (snap / "plasmid_library-2026-06-03.json").write_text(json.dumps(
             {"_schema_version": 1, "entries": [{"id": "e", "gb_ref": ref}]}))
@@ -438,7 +438,7 @@ class TestOrphanBlobGC:
     def test_keeps_blob_referenced_only_by_lost_entries_spill(self):
         ref = sc._blob_write(GB)
         _age(sc._blob_path(ref), sc._BLOB_GC_GRACE_SECONDS + 100)
-        ld = sc._DATA_DIR / sc._LOST_ENTRIES_DIR_NAME
+        ld = sc._state._DATA_DIR / sc._LOST_ENTRIES_DIR_NAME
         ld.mkdir(parents=True, exist_ok=True)
         (ld / "collections-20260603-000000.json").write_text(json.dumps(
             {"_schema_version": 1,

@@ -122,7 +122,7 @@ def _plant_everything():
         paths.append(d / "marker.txt")
     # Ad-hoc subdirs created inline elsewhere in the codebase.
     for name in ("snapshots", "lost_entries", "clipboard"):
-        d = sc._DATA_DIR / name
+        d = sc._state._DATA_DIR / name
         d.mkdir(parents=True, exist_ok=True)
         (d / "marker.txt").write_text("PLANTED")
         paths.append(d / "marker.txt")
@@ -137,8 +137,8 @@ def _plant_everything():
     (pre / "marker.txt").write_text("PLANTED")
     paths.append(pre / "marker.txt")
     # Legacy migration marker.
-    (sc._DATA_DIR / ".migrated").write_text("PLANTED")
-    paths.append(sc._DATA_DIR / ".migrated")
+    (sc._state._DATA_DIR / ".migrated").write_text("PLANTED")
+    paths.append(sc._state._DATA_DIR / ".migrated")
     return paths
 
 
@@ -198,10 +198,10 @@ def test_residual_sweep_catches_unregistered_file():
     be wiped via the residual-sweep pass. Without this, a future
     contributor who adds a new persisted file and forgets to
     register it could quietly leak data past Master Delete."""
-    sc._DATA_DIR.mkdir(parents=True, exist_ok=True)
-    stray_file = sc._DATA_DIR / "rogue_future_file.json"
+    sc._state._DATA_DIR.mkdir(parents=True, exist_ok=True)
+    stray_file = sc._state._DATA_DIR / "rogue_future_file.json"
     stray_file.write_text('{"contributor": "forgot to register me"}')
-    stray_dir = sc._DATA_DIR / "rogue_future_dir"
+    stray_dir = sc._state._DATA_DIR / "rogue_future_dir"
     stray_dir.mkdir()
     (stray_dir / "inner.txt").write_text("inside")
 
@@ -220,10 +220,10 @@ def test_residual_sweep_preserves_lockfile_and_log_dir():
     directory (containing the active RotatingFileHandler target)
     must survive the wipe. Deleting them mid-process is unsafe on
     Windows and produces orphan-inode writes on POSIX."""
-    sc._DATA_DIR.mkdir(parents=True, exist_ok=True)
-    lockfile = sc._DATA_DIR / "splicecraft.lock"
+    sc._state._DATA_DIR.mkdir(parents=True, exist_ok=True)
+    lockfile = sc._state._DATA_DIR / "splicecraft.lock"
     lockfile.write_text(str(12345))  # PID-style content
-    log_dir = sc._DATA_DIR / "logs"
+    log_dir = sc._state._DATA_DIR / "logs"
     log_dir.mkdir()
     active_log = log_dir / "splicecraft.log"
     active_log.write_text("session bytes")
@@ -630,7 +630,7 @@ def test_dir_target_enumeration_covers_adhoc_subdirs():
     targets = sc._master_delete_dir_targets()
     target_set = {str(p) for p in targets}
     for name in ("snapshots", "lost_entries", "clipboard"):
-        expected = sc._DATA_DIR / name
+        expected = sc._state._DATA_DIR / name
         assert str(expected) in target_set, (
             f"{name}/ subdir not enumerated"
         )

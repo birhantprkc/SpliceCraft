@@ -48,7 +48,7 @@ class TestDemoDataDirSandbox:
         # ignore it and resolve `_DATA_DIR` to a tempdir instead.
         code = (
             "import splicecraft as sc, tempfile, pathlib, sys\n"
-            "dd = pathlib.Path(sc._DATA_DIR).resolve()\n"
+            "dd = pathlib.Path(sc._state._DATA_DIR).resolve()\n"
             "tmp = pathlib.Path(tempfile.gettempdir()).resolve()\n"
             "assert sc._DEMO_MODE in ('local','web'), sc._DEMO_MODE\n"
             "assert dd.is_relative_to(tmp), ('not under tmp', dd)\n"

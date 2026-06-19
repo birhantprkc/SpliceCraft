@@ -436,7 +436,7 @@ class TestOrphanTmpSweepCoversExperiments:
         import time as _time
         # Redirect both _DATA_DIR and _EXPERIMENTS_DIR so the sweep
         # walks our tmp_path instead of the user's actual data dir.
-        monkeypatch.setattr(sc, "_DATA_DIR", tmp_path)
+        monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path)
         exp_root = tmp_path / "experiments"
         exp_root.mkdir()
         monkeypatch.setattr(sc, "_EXPERIMENTS_DIR", exp_root)

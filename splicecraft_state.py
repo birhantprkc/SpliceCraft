@@ -116,3 +116,10 @@ _primers_name_trim_done: bool = False
 # unsandboxed import. Writer + checks both go through _state → always in sync.
 _SAVES_AUTHORIZED: bool = False
 _SAVES_AUTHORIZED_REASON: str = ""
+
+
+# ── Data directory (Phase B-prep) ──────────────────────────────────
+# The resolved user-data dir. COMPUTED by the hub at import time
+# (`_state._DATA_DIR = _user_data_dir()`); placeholder here so readers + the
+# conftest sandbox patch resolve it. Everything path-related hangs off this.
+_DATA_DIR: "Path | None" = None
