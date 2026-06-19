@@ -59,7 +59,7 @@ class TestHmmDbCatalogPersistence:
             "description": "test entry",
         })
         sc._save_hmm_db_catalog(catalog)
-        sc._hmm_db_catalog_cache = None    # force reload from disk
+        sc._state._hmm_db_catalog_cache = None    # force reload from disk
         loaded = sc._load_hmm_db_catalog()
         ids = {e["id"] for e in loaded}
         assert "custom-x" in ids
@@ -73,7 +73,7 @@ class TestHmmDbCatalogPersistence:
         catalog = [e for e in sc._load_hmm_db_catalog()
                    if e["id"] != "pfam-a"]
         sc._save_hmm_db_catalog(catalog)
-        sc._hmm_db_catalog_cache = None
+        sc._state._hmm_db_catalog_cache = None
         loaded = sc._load_hmm_db_catalog()
         assert any(e["id"] == "pfam-a" for e in loaded)
 
@@ -82,7 +82,7 @@ class TestHmmDbCatalogPersistence:
             {"id": "dup", "name": "First", "url": "https://a/x.hmm.gz"},
             {"id": "dup", "name": "Second", "url": "https://b/x.hmm.gz"},
         ])
-        sc._hmm_db_catalog_cache = None
+        sc._state._hmm_db_catalog_cache = None
         loaded = [e for e in sc._load_hmm_db_catalog()
                   if e["id"] == "dup"]
         assert len(loaded) == 1
@@ -94,7 +94,7 @@ class TestHmmDbCatalogPersistence:
             {"id": "broken", "name": "X"},   # no url
             {"id": "good",   "name": "Y", "url": "https://x/x.hmm.gz"},
         ])
-        sc._hmm_db_catalog_cache = None
+        sc._state._hmm_db_catalog_cache = None
         loaded = sc._load_hmm_db_catalog()
         ids = {e["id"] for e in loaded}
         assert "good" in ids

@@ -214,7 +214,7 @@ class TestPrimerPersistence:
 
     def test_corrupted_file_returns_empty(self, isolated_primers):
         isolated_primers.write_text("{bad")
-        sc._primers_cache = None
+        sc._state._primers_cache = None
         assert sc._load_primers() == []
 
 
@@ -577,7 +577,7 @@ class TestPrimerDesignScreenLayout:
         # fixture already does this, but be explicit.)
         p = tmp_path / "primers.json"
         monkeypatch.setattr(sc, "_PRIMERS_FILE", p)
-        monkeypatch.setattr(sc, "_primers_cache", None, raising=False)
+        monkeypatch.setattr(sc._state, "_primers_cache", None, raising=False)
 
         app = sc.PlasmidApp()
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
@@ -2071,7 +2071,7 @@ class TestPrimerCollectionWorkflow:
                     "pos_end": -1, "strand": 1, "date": "2026-06-11",
                     "status": "Designed"}
         monkeypatch.setattr(sc, "_primers_name_trim_done", True)
-        monkeypatch.setattr(sc, "_primers_cache", [
+        monkeypatch.setattr(sc._state, "_primers_cache", [
             _p("P-A", "TTTTTTTTTTTTTTTTTTTT"),
             _p("P-DUP", dup),
             _p("P-B", dup),                    # duplicate sequence of P-DUP

@@ -170,11 +170,11 @@ def test_wipe_resets_every_cache_to_none():
     contents."""
     # Force every cache to a non-None value first (the loaders
     # populate caches as a side effect of being called).
-    sc._library_cache = [{"id": "junk"}]
-    sc._collections_cache = [{"name": "junk"}]
-    sc._settings_cache = {"junk": True}
-    sc._experiments_cache = [{"id": "junk"}]
-    sc._gels_cache = [{"id": "junk"}]
+    sc._state._library_cache = [{"id": "junk"}]
+    sc._state._collections_cache = [{"name": "junk"}]
+    sc._state._settings_cache = {"junk": True}
+    sc._state._experiments_cache = [{"id": "junk"}]
+    sc._state._gels_cache = [{"id": "junk"}]
     # Plant a small set of files so the wipe has at least one
     # dimension to act on (otherwise it'd no-op and the cache reset
     # test wouldn't prove the actual wipe path is taken).

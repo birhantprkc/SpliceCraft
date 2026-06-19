@@ -397,7 +397,7 @@ class TestPartsBinPersistence:
 
     def test_corrupted_file_returns_empty(self, isolated_parts_bin):
         isolated_parts_bin.write_text("{bad json")
-        sc._parts_bin_cache = None
+        sc._state._parts_bin_cache = None
         assert sc._load_parts_bin() == []
 
 
@@ -3464,7 +3464,7 @@ class TestPartsBinSaveAsFeature:
             await pilot.pause(0.1)
             # Back on the parts screen, with the entry now in features.json.
             assert isinstance(app.screen, sc.PartsBinModal)
-            sc._features_cache = None
+            sc._state._features_cache = None
             entries = sc._load_features()
             assert len(entries) == 1
             entry = entries[0]
@@ -3577,7 +3577,7 @@ class TestFeatureLibraryGenerationCounter:
         # Simulate an external invalidation (test harness, hand-edit of
         # features.json, etc.). _load_features re-reads from disk and
         # bumps the counter so any cached index is treated as stale.
-        sc._features_cache = None
+        sc._state._features_cache = None
         sc._load_features()
         assert sc._state._features_generation > before
 
@@ -6077,13 +6077,13 @@ class TestGrammarHelpers:
 
     def test_all_grammars_returns_builtins(self, tmp_path, monkeypatch):
         # Empty custom grammars file — only built-ins are returned.
-        monkeypatch.setattr(sc, "_grammars_cache", [])
+        monkeypatch.setattr(sc._state, "_grammars_cache", [])
         out = sc._all_grammars()
         assert "gb_l0" in out
         assert "moclo_plant" in out
 
     def test_all_grammars_includes_custom(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sc, "_grammars_cache", [
+        monkeypatch.setattr(sc._state, "_grammars_cache", [
             {"id": "custom_a", "name": "Custom A",
              "enzyme": "BsaI", "site": "GGTCTC",
              "spacer": "A", "pad": "GCGC",
@@ -6105,14 +6105,14 @@ class TestGrammarHelpers:
         self, tmp_path, monkeypatch,
     ):
         # No setting written → default = gb_l0.
-        monkeypatch.setattr(sc, "_settings_cache", {})
+        monkeypatch.setattr(sc._state, "_settings_cache", {})
         active = sc._get_active_grammar()
         assert active["id"] == "gb_l0"
 
     def test_get_active_grammar_resolves_setting(
         self, tmp_path, monkeypatch,
     ):
-        monkeypatch.setattr(sc, "_settings_cache", {"active_grammar": "moclo_plant"})
+        monkeypatch.setattr(sc._state, "_settings_cache", {"active_grammar": "moclo_plant"})
         active = sc._get_active_grammar()
         assert active["id"] == "moclo_plant"
 
@@ -6159,7 +6159,7 @@ class TestSettingsPersistence:
         sc._settings_flush_sync()
         # Force a re-read from disk — the cache must agree with what
         # was written.
-        sc._settings_cache = None
+        sc._state._settings_cache = None
         assert sc._load_settings()["active_grammar"] == "moclo_plant"
 
 
@@ -6180,7 +6180,7 @@ class TestCustomGrammarPersistence:
             "coding_types": [], "type_to_insdc": {}, "catalog": [],
         }]
         sc._save_custom_grammars(entries)
-        sc._grammars_cache = None
+        sc._state._grammars_cache = None
         loaded = sc._load_custom_grammars()
         assert len(loaded) == 1
         assert loaded[0]["id"] == "custom_x"
@@ -6398,7 +6398,7 @@ class TestPartsBinGrammarFilter:
             entries = sc._load_parts_bin()
             entries.insert(0, new_part)
             sc._save_parts_bin(entries)
-            sc._parts_bin_cache = None
+            sc._state._parts_bin_cache = None
             assert sc._load_parts_bin()[0]["grammar"] == "moclo_plant"
 
 

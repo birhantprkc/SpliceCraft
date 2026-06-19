@@ -289,7 +289,7 @@ class TestLibraryPersistence:
         and log the exception — never propagate the error to the UI."""
         isolated_library.write_text("{not valid json")
         # Reset in-memory cache so _load_library actually re-reads the file
-        sc._library_cache = None
+        sc._state._library_cache = None
         result = sc._load_library()
         assert result == []
 

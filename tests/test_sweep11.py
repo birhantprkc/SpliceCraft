@@ -193,7 +193,7 @@ class TestSetEntryVectorsBatchSemantics:
         monkeypatch.setattr(
             sc, "_ENTRY_VECTORS_FILE", tmp_path / "ev.json",
         )
-        sc._entry_vectors_cache = None
+        sc._state._entry_vectors_cache = None
         # 3 updates, one save call.
         updates = [
             ("gb_l0", "Alpha1",
@@ -217,7 +217,7 @@ class TestSetEntryVectorsBatchSemantics:
         monkeypatch.setattr(
             sc, "_ENTRY_VECTORS_FILE", tmp_path / "ev.json",
         )
-        sc._entry_vectors_cache = None
+        sc._state._entry_vectors_cache = None
         updates = [
             ("", "Alpha1", {"name": "Bad", "gb_text": "x"}),
             ("gb_l0", "Alpha1", {"name": "Good", "gb_text": "y"}),
@@ -249,7 +249,7 @@ class TestFindLibraryEntryByIdHelper:
 
     def test_no_match_returns_none(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_path / "lib.json")
-        sc._library_cache = None
+        sc._state._library_cache = None
         # Empty library
         sc._save_library([])
         assert sc._find_library_entry_by_id("nonexistent") is None
@@ -259,7 +259,7 @@ class TestFindLibraryEntryByIdHelper:
         # id-name backfill (PIT-36) is a no-op and lookup by id stays
         # stable across the load.
         monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_path / "lib.json")
-        sc._library_cache = None
+        sc._state._library_cache = None
         sc._save_library([
             {"id": "P1", "name": "P1", "gb_text": "LOCUS p1"},
             {"id": "P2", "name": "P2", "gb_text": "LOCUS p2"},

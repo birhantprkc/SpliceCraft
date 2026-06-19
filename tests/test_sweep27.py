@@ -681,7 +681,7 @@ class TestConcurrencyFuzz:
         # Redirect the library file to tmp_path.
         lib_path = tmp_path / "plasmid_library.json"
         monkeypatch.setattr(sc, "_LIBRARY_FILE", lib_path)
-        monkeypatch.setattr(sc, "_library_cache", None)
+        monkeypatch.setattr(sc._state, "_library_cache", None)
 
         # Seed an initial set of entries.
         initial = [

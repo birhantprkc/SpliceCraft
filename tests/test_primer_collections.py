@@ -32,7 +32,7 @@ class TestPrimerCollectionInfrastructure:
         }]
         sc._save_primer_collections(entries)
         # Force cold reload from disk
-        sc._primer_collections_cache = None
+        sc._state._primer_collections_cache = None
         out = sc._load_primer_collections()
         assert len(out) == 1
         assert out[0]["name"] == "Project alpha"

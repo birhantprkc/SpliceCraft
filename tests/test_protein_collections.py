@@ -12,7 +12,7 @@ import splicecraft as sc
 class TestProteinCollectionsPersistence:
     def test_add_and_reload_from_disk(self):
         assert sc._protein_collection_add("Lux", "luxC", "MKFGLFFL") is None
-        sc._protein_collections_cache = None                  # force a disk reload
+        sc._state._protein_collections_cache = None                  # force a disk reload
         cols = sc._load_protein_collections()
         assert len(cols) == 1 and cols[0]["name"] == "Lux"
         p = cols[0]["proteins"][0]

@@ -101,7 +101,7 @@ class TestExperimentsPersistence:
         normalised = sc._normalise_experiment_entry(entry, fresh=True)
         sc._save_experiments([normalised])
         # Cache invalidated when we re-read
-        sc._experiments_cache = None
+        sc._state._experiments_cache = None
         out = sc._load_experiments()
         assert len(out) == 1
         assert out[0]["id"] == "exp-test1234"
@@ -144,7 +144,7 @@ class TestExperimentsPersistence:
             "id": "exp-aaaaaaaa", "title": "t", "body_md": "b",
         }, fresh=True)
         sc._save_experiments([e])
-        sc._experiments_cache = None
+        sc._state._experiments_cache = None
         first = sc._load_experiments()
         first[0]["body_md"] = "MUTATED"
         # Caller's mutation must not leak into cache
@@ -177,7 +177,7 @@ class TestExperimentsPersistence:
             ],
         }
         sc._EXPERIMENTS_FILE.write_text(json.dumps(raw))
-        sc._experiments_cache = None
+        sc._state._experiments_cache = None
         out = sc._load_experiments()
         assert len(out) == 1
         assert out[0]["id"] == "exp-good"
@@ -304,7 +304,7 @@ class TestPlasmidRefs:
             "title": "Legacy",
             "body_md": "Today: @plasmid:pUC19 and @actions:digest",
         }])
-        sc._experiments_cache = None
+        sc._state._experiments_cache = None
         out = sc._load_experiments()
         assert out[0]["body_md"] == "Today: @pUC19 and !digest"
 
@@ -589,7 +589,7 @@ class TestScreenMount:
             "body_md": "body content", "tags": ["a"],
         }, fresh=True)
         sc._save_experiments([e])
-        sc._experiments_cache = None
+        sc._state._experiments_cache = None
 
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
@@ -625,7 +625,7 @@ class TestScreenMount:
             await pilot.pause()
             scr.action_save_entry()
             await pilot.pause()
-            sc._experiments_cache = None
+            sc._state._experiments_cache = None
             entries = sc._load_experiments()
             assert len(entries) == 1
             assert "pUC19" in entries[0]["attached_plasmid_ids"]
@@ -663,7 +663,7 @@ class TestScreenMount:
             app.screen.dismiss("save")
             await pilot.pause()
             await pilot.pause()
-            sc._experiments_cache = None
+            sc._state._experiments_cache = None
             out = sc._load_experiments()
             assert any(
                 e.get("body_md") == "unsaved body" for e in out
@@ -683,7 +683,7 @@ class TestScreenMount:
             scr.action_new_entry()
             await pilot.pause()
             await pilot.pause()
-            sc._experiments_cache = None
+            sc._state._experiments_cache = None
             before = sc._load_experiments()
             before_bodies = [e.get("body_md") for e in before]
             from textual.widgets import TextArea
@@ -700,7 +700,7 @@ class TestScreenMount:
             app.screen.dismiss("abandon")
             await pilot.pause()
             await pilot.pause()
-            sc._experiments_cache = None
+            sc._state._experiments_cache = None
             after = sc._load_experiments()
             after_bodies = [e.get("body_md") for e in after]
             assert "should-not-persist" not in after_bodies

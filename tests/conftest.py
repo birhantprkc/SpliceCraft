@@ -356,7 +356,7 @@ def isolated_library(tmp_path, monkeypatch):
     import splicecraft as sc
     tmp_lib = tmp_path / "plasmid_library.json"
     monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_lib)
-    monkeypatch.setattr(sc, "_library_cache", None)
+    monkeypatch.setattr(sc._state, "_library_cache", None)
     return tmp_lib
 
 
@@ -369,7 +369,7 @@ def isolated_parts_bin(tmp_path, monkeypatch):
     import splicecraft as sc
     tmp_bin = tmp_path / "parts_bin.json"
     monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_bin)
-    monkeypatch.setattr(sc, "_parts_bin_cache", None)
+    monkeypatch.setattr(sc._state, "_parts_bin_cache", None)
     return tmp_bin
 
 
@@ -380,5 +380,5 @@ def isolated_primers(tmp_path, monkeypatch):
     import splicecraft as sc
     tmp_p = tmp_path / "primers.json"
     monkeypatch.setattr(sc, "_PRIMERS_FILE", tmp_p)
-    monkeypatch.setattr(sc, "_primers_cache", None)
+    monkeypatch.setattr(sc._state, "_primers_cache", None)
     return tmp_p

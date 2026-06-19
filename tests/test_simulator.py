@@ -1119,7 +1119,7 @@ def _seed_collections(active="Default", others=None, seed_entries=None):
     sc._settings_flush_sync()
     sc._safe_save_json_mirror(
         sc._LIBRARY_FILE, list(seed_entries or []), "Plasmid library")
-    sc._library_cache = None
+    sc._state._library_cache = None
 
 
 def _amp_entry(name="amp1", entry_id="amp1", size=500):

@@ -390,7 +390,7 @@ class TestOriginHistoryBackfill:
         import json
         tmp_lib = tmp_path / "library.json"
         monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_lib)
-        monkeypatch.setattr(sc, "_library_cache", None)
+        monkeypatch.setattr(sc._state, "_library_cache", None)
         monkeypatch.setattr(sc, "_origin_history_backfill_done", False)
         legacy = [
             {"id": "Demo311", "name": "Demo311", "size": 2559, "n_feats": 3,
@@ -418,7 +418,7 @@ class TestOriginHistoryBackfill:
         import json
         tmp_lib = tmp_path / "library.json"
         monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_lib)
-        monkeypatch.setattr(sc, "_library_cache", None)
+        monkeypatch.setattr(sc._state, "_library_cache", None)
         monkeypatch.setattr(sc, "_origin_history_backfill_done", False)
         keep = sc._build_origin_history_xml(
             name="Keep", seq_len=10, circular=True, source="paste:keep")
@@ -434,7 +434,7 @@ class TestOriginHistoryBackfill:
         import json
         tmp_coll = tmp_path / "collections.json"
         monkeypatch.setattr(sc, "_COLLECTIONS_FILE", tmp_coll)
-        monkeypatch.setattr(sc, "_collections_cache", None)
+        monkeypatch.setattr(sc._state, "_collections_cache", None)
         monkeypatch.setattr(
             sc, "_collections_origin_history_backfill_done", False)
         colls = [{"name": "Acme Labs", "plasmids": [

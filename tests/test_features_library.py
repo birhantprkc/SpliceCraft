@@ -52,7 +52,7 @@ class TestFeatureLibraryRoundtrip:
              "description": ""},
         ]
         sc._save_features(entries)
-        sc._features_cache = None  # force reload from disk
+        sc._state._features_cache = None  # force reload from disk
         reloaded = sc._load_features()
         assert len(reloaded) == 2
         assert reloaded[0]["name"] == "p1"
@@ -85,12 +85,12 @@ class TestFeatureLibraryCorruptionRecovery:
 
     def test_missing_file_returns_empty(self):
         """First run: file doesn't exist → empty list, no error."""
-        sc._features_cache = None
+        sc._state._features_cache = None
         assert sc._load_features() == []
 
     def test_corrupt_json_returns_empty(self):
         sc._FEATURES_FILE.write_text("{bad json")
-        sc._features_cache = None
+        sc._state._features_cache = None
         # No valid main or bak → empty list
         assert sc._load_features() == []
 
@@ -106,7 +106,7 @@ class TestFeatureLibraryCorruptionRecovery:
                 {"name": "also good", "feature_type": "gene", "sequence": "T"},
             ],
         }))
-        sc._features_cache = None
+        sc._state._features_cache = None
         entries = sc._load_features()
         assert len(entries) == 2
         assert entries[0]["name"] == "good"
@@ -121,7 +121,7 @@ class TestFeatureLibraryCorruptionRecovery:
                             "sequence": "TAA"}])
         # Now corrupt main; .bak holds the 'first' version
         sc._FEATURES_FILE.write_text("!!!corrupt!!!")
-        sc._features_cache = None
+        sc._state._features_cache = None
         entries = sc._load_features()
         assert len(entries) == 1
         assert entries[0]["name"] == "first"
@@ -194,7 +194,7 @@ class TestFeatureEntryColorField:
             "name": "lacZ", "feature_type": "CDS",
             "sequence": "ATG", "strand": 1, "color": "#FF6347",
         }])
-        sc._features_cache = None
+        sc._state._features_cache = None
         loaded = sc._load_features()
         assert loaded[0]["color"] == "#FF6347"
 
@@ -205,7 +205,7 @@ class TestFeatureEntryColorField:
             "name": "pMB1", "feature_type": "rep_origin",
             "sequence": "GCA", "strand": 0,
         }])
-        sc._features_cache = None
+        sc._state._features_cache = None
         loaded = sc._load_features()
         assert loaded[0]["strand"] == 0
 
@@ -215,7 +215,7 @@ class TestFeatureEntryColorField:
             "name": "legacy", "feature_type": "CDS",
             "sequence": "ATG", "strand": 1,
         }])
-        sc._features_cache = None
+        sc._state._features_cache = None
         loaded = sc._load_features()
         assert "color" not in loaded[0] or loaded[0].get("color") is None
 
@@ -226,12 +226,12 @@ class TestFeatureColorsPersistence:
     all degrade to {}."""
 
     def test_missing_file_returns_empty(self):
-        sc._feature_colors_cache = None
+        sc._state._feature_colors_cache = None
         assert sc._load_feature_colors() == {}
 
     def test_save_and_reload(self):
         sc._save_feature_colors({"CDS": "#FF0000", "promoter": "#00FF00"})
-        sc._feature_colors_cache = None
+        sc._state._feature_colors_cache = None
         loaded = sc._load_feature_colors()
         assert loaded == {"CDS": "#FF0000", "promoter": "#00FF00"}
 
@@ -253,7 +253,7 @@ class TestFeatureColorsPersistence:
                 {"feature_type": "gene",     "color": "#00FF00"},
             ],
         }))
-        sc._feature_colors_cache = None
+        sc._state._feature_colors_cache = None
         loaded = sc._load_feature_colors()
         assert loaded == {"CDS": "#FF0000", "gene": "#00FF00"}
 
@@ -264,7 +264,7 @@ class TestResolveFeatureColor:
 
     def test_entry_color_wins(self):
         sc._save_feature_colors({"CDS": "#000000"})
-        sc._feature_colors_cache = None
+        sc._state._feature_colors_cache = None
         col = sc._resolve_feature_color(
             {"feature_type": "CDS", "color": "#AAAAAA"}
         )
@@ -272,12 +272,12 @@ class TestResolveFeatureColor:
 
     def test_user_default_over_builtin(self):
         sc._save_feature_colors({"CDS": "#000000"})
-        sc._feature_colors_cache = None
+        sc._state._feature_colors_cache = None
         col = sc._resolve_feature_color({"feature_type": "CDS"})
         assert col == "#000000"
 
     def test_builtin_default_when_no_user_override(self):
-        sc._feature_colors_cache = None
+        sc._state._feature_colors_cache = None
         col = sc._resolve_feature_color({"feature_type": "CDS"})
         assert col == sc._DEFAULT_TYPE_COLORS["CDS"]
 
@@ -287,13 +287,13 @@ class TestResolveFeatureColor:
         normalises ``color(N)`` palette syntax to hex so downstream Rich
         markup never trips on the parens — the *color* is still the same
         palette entry, just expressed in a markup-safe form."""
-        sc._feature_colors_cache = None
+        sc._state._feature_colors_cache = None
         col = sc._resolve_feature_color({"feature_type": "my_custom_type"})
         assert col == sc._normalise_color_input(sc._FEATURE_PALETTE[0])
 
     def test_empty_color_treated_as_missing(self):
         """Empty string color → treat as not set, fall through to type default."""
-        sc._feature_colors_cache = None
+        sc._state._feature_colors_cache = None
         col = sc._resolve_feature_color(
             {"feature_type": "CDS", "color": ""}
         )

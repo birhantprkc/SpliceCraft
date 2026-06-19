@@ -34,7 +34,7 @@ class TestCollectionsPersistence:
              "plasmids": []},
         ]
         sc._save_collections(sample)
-        sc._collections_cache = None  # force a cold reload from disk
+        sc._state._collections_cache = None  # force a cold reload from disk
         sc._collections_backfill_done = False
         out = sc._load_collections()
         assert len(out) == 2
@@ -53,7 +53,7 @@ class TestCollectionsPersistence:
         sc._COLLECTIONS_FILE.write_text(
             json.dumps([{"name": "legacy", "plasmids": []}])
         )
-        sc._collections_cache = None
+        sc._state._collections_cache = None
         out = sc._load_collections()
         assert len(out) == 1
         assert out[0]["name"] == "legacy"
@@ -63,7 +63,7 @@ class TestCollectionsPersistence:
             "_schema_version": 1,
             "entries": [{"name": "ok", "plasmids": []}, "garbage", 42, None],
         }))
-        sc._collections_cache = None
+        sc._state._collections_cache = None
         out = sc._load_collections()
         assert len(out) == 1
         assert out[0]["name"] == "ok"

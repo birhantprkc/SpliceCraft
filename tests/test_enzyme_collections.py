@@ -429,7 +429,7 @@ def test_enzyme_collections_accepts_legacy_bare_list():
         encoding="utf-8",
     )
     # Bust the cache so the next load re-reads from disk.
-    sc._enzyme_collections_cache = None
+    sc._state._enzyme_collections_cache = None
     out = sc._load_enzyme_collections()
     assert out == [{"name": "Legacy", "enzymes": ["BamHI"]}]
 
@@ -438,7 +438,7 @@ def test_enzyme_collections_corrupted_json_returns_empty():
     """`_safe_load_json` recovers from corruption by returning ``None``
     so `_load_enzyme_collections` falls back to ``[]``."""
     sc._ENZYME_COLLECTIONS_FILE.write_text("{not-json", encoding="utf-8")
-    sc._enzyme_collections_cache = None
+    sc._state._enzyme_collections_cache = None
     out = sc._load_enzyme_collections()
     assert out == []
 

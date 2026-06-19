@@ -933,8 +933,8 @@ class TestInvariant29IdLessEntriesSkipped:
     ):
         # Seed two collections; one has an entry with empty id, the
         # other with a valid id matching the query.
-        monkeypatch.setattr(sc, "_collections_cache", None)
-        monkeypatch.setattr(sc, "_library_cache", None)
+        monkeypatch.setattr(sc._state, "_collections_cache", None)
+        monkeypatch.setattr(sc._state, "_library_cache", None)
         valid_collection = {
             "name": "Valid",
             "plasmids": [{

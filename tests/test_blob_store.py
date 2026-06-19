@@ -317,7 +317,7 @@ class TestLibraryBoundaryIntegration:
         assert disk["gb_ref"] == sc._blob_hash(gb)
         assert sc._blob_path(disk["gb_ref"]).is_file()
         # Bust cache + reload: fully materialised again (gb_text back).
-        sc._library_cache = None
+        sc._state._library_cache = None
         loaded = sc._load_library()
         assert loaded[0]["gb_text"] == gb
         assert "gb_ref" not in loaded[0]
@@ -328,7 +328,7 @@ class TestLibraryBoundaryIntegration:
         # Old-format file: inline gb_text, no gb_ref, no blob.
         sc._LIBRARY_FILE.write_text(json.dumps(
             {"_schema_version": 1, "entries": [{"id": "P2", "gb_text": gb}]}))
-        sc._library_cache = None
+        sc._state._library_cache = None
         loaded = sc._load_library()
         assert loaded[0]["gb_text"] == gb            # inline still resolves
         # A subsequent save migrates it to the blob format on disk.
@@ -343,7 +343,7 @@ class TestLibraryBoundaryIntegration:
         sc._save_library([{"id": "P3", "name": "p3", "gb_text": gb}])
         ref = sc._blob_hash(gb)
         sc._blob_path(ref).unlink()                  # blob lost externally
-        sc._library_cache = None
+        sc._state._library_cache = None
         loaded = sc._load_library()
         assert len(loaded) == 1                      # entry NOT dropped
         assert loaded[0]["id"] == "P3"
@@ -371,7 +371,7 @@ class TestLibraryBoundaryIntegration:
         plas = raw["entries"][0]["plasmids"][0]
         assert "gb_text" not in plas
         assert plas["gb_ref"] == sc._blob_hash(gb)
-        sc._collections_cache = None
+        sc._state._collections_cache = None
         loaded = sc._load_collections()
         assert loaded[0]["plasmids"][0]["gb_text"] == gb
 

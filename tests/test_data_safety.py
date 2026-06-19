@@ -685,7 +685,7 @@ class TestSafeSaveJsonRaisesOnFailure:
 class TestPersistenceIntegration:
     def test_library_save_creates_bak(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_path / "lib.json")
-        monkeypatch.setattr(sc, "_library_cache", None)
+        monkeypatch.setattr(sc._state, "_library_cache", None)
         sc._save_library([{"id": "A", "name": "first"}])
         sc._save_library([{"id": "B", "name": "second"}])
         bak = tmp_path / "lib.json.bak"
@@ -694,7 +694,7 @@ class TestPersistenceIntegration:
 
     def test_parts_bin_save_creates_bak(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_path / "parts.json")
-        monkeypatch.setattr(sc, "_parts_bin_cache", None)
+        monkeypatch.setattr(sc._state, "_parts_bin_cache", None)
         sc._save_parts_bin([{"name": "p1"}])
         sc._save_parts_bin([{"name": "p2"}])
         bak = tmp_path / "parts.json.bak"
@@ -702,7 +702,7 @@ class TestPersistenceIntegration:
 
     def test_primers_save_creates_bak(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "_PRIMERS_FILE", tmp_path / "primers.json")
-        monkeypatch.setattr(sc, "_primers_cache", None)
+        monkeypatch.setattr(sc._state, "_primers_cache", None)
         sc._save_primers([{"name": "pr1"}])
         sc._save_primers([{"name": "pr2"}])
         bak = tmp_path / "primers.json.bak"
@@ -713,18 +713,18 @@ class TestPersistenceIntegration:
         without crashing."""
         p = tmp_path / "lib.json"
         monkeypatch.setattr(sc, "_LIBRARY_FILE", p)
-        monkeypatch.setattr(sc, "_library_cache", None)
+        monkeypatch.setattr(sc._state, "_library_cache", None)
         # File doesn't exist — should return []
         assert sc._load_library() == []
 
     def test_parts_bin_load_survives_deleted_file(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_path / "nope.json")
-        monkeypatch.setattr(sc, "_parts_bin_cache", None)
+        monkeypatch.setattr(sc._state, "_parts_bin_cache", None)
         assert sc._load_parts_bin() == []
 
     def test_primers_load_survives_deleted_file(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sc, "_PRIMERS_FILE", tmp_path / "nope.json")
-        monkeypatch.setattr(sc, "_primers_cache", None)
+        monkeypatch.setattr(sc._state, "_primers_cache", None)
         assert sc._load_primers() == []
 
     def test_parts_bin_load_deepcopies_nested_dicts(self, tmp_path, monkeypatch):
@@ -733,7 +733,7 @@ class TestPersistenceIntegration:
         let caller mutations of the nested dicts poison the cache for every
         subsequent reader. Sacred invariant #17."""
         monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_path / "p.json")
-        monkeypatch.setattr(sc, "_parts_bin_cache", None)
+        monkeypatch.setattr(sc._state, "_parts_bin_cache", None)
         sc._save_parts_bin([{"name": "p1", "primers": {"fwd": "GAATTC"}}])
         first = sc._load_parts_bin()
         first[0]["primers"]["fwd"] = "POISONED"
@@ -746,7 +746,7 @@ class TestPersistenceIntegration:
     def test_primers_load_deepcopies_nested_dicts(self, tmp_path, monkeypatch):
         """Same guard for the primer library."""
         monkeypatch.setattr(sc, "_PRIMERS_FILE", tmp_path / "pr.json")
-        monkeypatch.setattr(sc, "_primers_cache", None)
+        monkeypatch.setattr(sc._state, "_primers_cache", None)
         sc._save_primers([{"name": "pr1", "qualifiers": {"note": "ok"}}])
         first = sc._load_primers()
         first[0]["qualifiers"]["note"] = "POISONED"
@@ -773,7 +773,7 @@ class TestPersistenceIntegration:
         p.write_text("{bad}")
         bak.write_text(json.dumps([{"id": "X", "name": "saved"}]))
         monkeypatch.setattr(sc, "_LIBRARY_FILE", p)
-        monkeypatch.setattr(sc, "_library_cache", None)
+        monkeypatch.setattr(sc._state, "_library_cache", None)
         entries = sc._load_library()
         assert len(entries) == 1
         assert entries[0]["id"] == "X"
@@ -792,9 +792,9 @@ class TestStartupDataCheck:
         monkeypatch.setattr(sc, "_LIBRARY_FILE", tmp_path / "lib.json")
         monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_path / "parts.json")
         monkeypatch.setattr(sc, "_PRIMERS_FILE", tmp_path / "primers.json")
-        monkeypatch.setattr(sc, "_library_cache", None)
-        monkeypatch.setattr(sc, "_parts_bin_cache", None)
-        monkeypatch.setattr(sc, "_primers_cache", None)
+        monkeypatch.setattr(sc._state, "_library_cache", None)
+        monkeypatch.setattr(sc._state, "_parts_bin_cache", None)
+        monkeypatch.setattr(sc._state, "_primers_cache", None)
         # Block the network seeder
         monkeypatch.setattr(
             sc, "fetch_genbank",
@@ -816,9 +816,9 @@ class TestStartupDataCheck:
         monkeypatch.setattr(sc, "_LIBRARY_FILE", p)
         monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_path / "parts.json")
         monkeypatch.setattr(sc, "_PRIMERS_FILE", tmp_path / "primers.json")
-        monkeypatch.setattr(sc, "_library_cache", None)
-        monkeypatch.setattr(sc, "_parts_bin_cache", None)
-        monkeypatch.setattr(sc, "_primers_cache", None)
+        monkeypatch.setattr(sc._state, "_library_cache", None)
+        monkeypatch.setattr(sc._state, "_parts_bin_cache", None)
+        monkeypatch.setattr(sc._state, "_primers_cache", None)
         monkeypatch.setattr(
             sc, "fetch_genbank",
             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no net")),
@@ -1259,11 +1259,11 @@ class TestAuthoritativeLibrarySnapshot:
 
     def test_returns_cache_when_populated(self, monkeypatch):
         cache = [{"id": "live"}]
-        monkeypatch.setattr(sc, "_library_cache", cache)
+        monkeypatch.setattr(sc._state, "_library_cache", cache)
         assert sc._authoritative_library_snapshot([{"id": "stale"}]) is cache
 
     def test_falls_back_when_cache_unset(self, monkeypatch):
-        monkeypatch.setattr(sc, "_library_cache", None)
+        monkeypatch.setattr(sc._state, "_library_cache", None)
         fb = [{"id": "fallback"}]
         assert sc._authoritative_library_snapshot(fb) is fb
 

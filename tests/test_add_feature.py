@@ -1730,7 +1730,7 @@ class TestSaveToLibraryFlow:
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            sc._features_cache = None
+            sc._state._features_cache = None
             assert sc._load_features() == []
             app._add_feature_result({
                 "action": "save",
@@ -1754,7 +1754,7 @@ class TestSaveToLibraryFlow:
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
             await pilot.pause()
             await pilot.pause(0.05)
-            sc._features_cache = None
+            sc._state._features_cache = None
             app._add_feature_result({"action": "save", "entry": {
                 "name": "dup", "feature_type": "CDS",
                 "sequence": "A", "strand": 1,
@@ -2871,7 +2871,7 @@ class TestGroupLibraryEntryRoundTrip:
             "description": "round-trip test",
         }
         sc._save_features([entry])
-        sc._features_cache = None
+        sc._state._features_cache = None
         entries = sc._load_features()
         loaded = next(e for e in entries
                        if e.get("name") == "test-rt")
@@ -2897,7 +2897,7 @@ class TestGroupLibraryEntryRoundTrip:
             "description": "",
         }
         sc._save_features([legacy])
-        sc._features_cache = None
+        sc._state._features_cache = None
         entries = sc._load_features()
         loaded = next(e for e in entries
                        if e.get("name") == "lacZ")

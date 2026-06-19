@@ -121,7 +121,7 @@ class TestRegistry:
         raw = {"ATG": ("M", 42), "TAA": ("*", 7), "GCT": ("A", 11)}
         sc._codon_tables_add("Round Trip", "111111", raw, source="user")
         # Clear cache and reload from disk
-        sc._codon_tables_cache = None
+        sc._state._codon_tables_cache = None
         again = sc._codon_tables_get("111111")
         assert again is not None
         assert again["raw"]["ATG"] == ("M", 42)
@@ -1209,7 +1209,7 @@ class TestLibrarySourceWrapFeature:
         # Patch _load_library directly so the PlasmidApp's default-seed worker
         # can't overwrite our fake cache between mount and modal open.
         monkeypatch.setattr(sc, "_load_library", lambda: list(_entries))
-        monkeypatch.setattr(sc, "_library_cache", _entries)
+        monkeypatch.setattr(sc._state, "_library_cache", _entries)
         # Disable default-seed worker so it doesn't try to fetch pACYC184.
         monkeypatch.setattr(sc.PlasmidApp, "_seed_default_library",
                             lambda self: None)

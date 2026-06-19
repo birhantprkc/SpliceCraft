@@ -63,7 +63,7 @@ def _seed_two_collections(eden_n: int = 3, ffe_n: int = 0):
     sc._settings_flush_sync()
     sc._safe_save_json_mirror(sc._LIBRARY_FILE, eden_plasmids,
                                 "Plasmid library")
-    sc._library_cache = None
+    sc._state._library_cache = None
     return [e["id"] for e in eden_plasmids]
 
 
@@ -163,8 +163,8 @@ class TestMoveCopyCommit:
                  "gb_text": "y"},
             ]},
         ])
-        sc._library_cache = None
-        sc._collections_cache = None
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
         app._move_copy_commit(
             source="DemoColl", target="FFE",
             entry_ids=["eden_0"], mode="copy",
@@ -190,8 +190,8 @@ class TestMoveCopyCommit:
                  "gb_text": "z"},
             ]},
         ])
-        sc._library_cache = None
-        sc._collections_cache = None
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
         app._move_copy_commit(
             source="DemoColl", target="FFE",
             entry_ids=["eden_0"], mode="copy",
@@ -207,8 +207,8 @@ class TestMoveCopyCommit:
                 {"id": "eden_0", "name": "p", "size": 100, "gb_text": "x"},
             ]},
         ])
-        sc._library_cache = None
-        sc._collections_cache = None
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
         app._move_copy_commit(
             source="DemoColl", target="DemoColl",
             entry_ids=["eden_0"], mode="move",
@@ -233,8 +233,8 @@ class TestMoveCopyCommit:
                  "gb_text": "y"},
             ]},
         ])
-        sc._library_cache = None
-        sc._collections_cache = None
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
         app._move_copy_commit(
             source="DemoColl", target="DemoColl",
             entry_ids=["eden_0", "eden_1"], mode="copy",
@@ -270,15 +270,15 @@ class TestMoveCopyCommit:
                 {"id": "eden_0", "name": "p", "size": 100, "gb_text": "x"},
             ]},
         ])
-        sc._library_cache = None
-        sc._collections_cache = None
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
         # First duplication: yields "p COPY".
         app._move_copy_commit(
             source="DemoColl", target="DemoColl",
             entry_ids=["eden_0"], mode="copy",
         )
-        sc._library_cache = None
-        sc._collections_cache = None
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
         # Second duplication of the SAME original: must yield
         # "p COPY 2" (the first COPY is already in the target set).
         app._move_copy_commit(
@@ -336,8 +336,8 @@ class TestMoveCopyCommit:
         sc._save_collections([
             {"name": "FFE", "plasmids": []},
         ])
-        sc._library_cache = None
-        sc._collections_cache = None
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
         app._move_copy_commit(
             source="DemoColl", target="FFE",
             entry_ids=["eden_0"], mode="move",
@@ -369,8 +369,8 @@ class TestMoveCopyCommit:
             {"name": "DemoColl", "plasmids": [rich]},
             {"name": "FFE",  "plasmids": []},
         ])
-        sc._library_cache = None
-        sc._collections_cache = None
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
         app._move_copy_commit(
             source="DemoColl", target="FFE",
             entry_ids=["rich_0"], mode="move",
@@ -410,7 +410,7 @@ class TestMoveCopyCommit:
         sc._settings_flush_sync()
         # Re-mirror to FFE state.
         sc._safe_save_json_mirror(sc._LIBRARY_FILE, [], "Plasmid library")
-        sc._library_cache = None
+        sc._state._library_cache = None
         app._move_copy_commit(
             source="DemoColl", target="FFE",
             entry_ids=["eden_0"], mode="copy",
@@ -458,8 +458,8 @@ class TestMoveCopyCommit:
                 {"id": "p1", "name": "OtherP1", "size": 200, "gb_text": "y"},
             ]},
         ])
-        sc._library_cache = None
-        sc._collections_cache = None
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
         app._move_copy_commit(
             source="DemoColl", target="FFE",
             entry_ids=["p1"], mode="copy",
@@ -539,7 +539,7 @@ class TestMoveCopyNewCollection:
                 {"id": "s0", "name": "p", "size": 100, "gb_text": "x"}]},
         ])
         sc._set_active_collection_name("Solo")
-        sc._collections_cache = None
+        sc._state._collections_cache = None
         app = sc.PlasmidApp.__new__(sc.PlasmidApp)
         pushed, notes = [], []
         app.notify = lambda msg, severity="information", **k: notes.append(

@@ -225,8 +225,8 @@ class TestSaveChainAtomicMirror:
         monkeypatch.setattr(
             sc, "_COLLECTIONS_FILE", tmp_path / "coll.json",
         )
-        sc._library_cache = None
-        sc._collections_cache = None
+        sc._state._library_cache = None
+        sc._state._collections_cache = None
         entries = [{
             "name": "P1", "id": "p1", "size": 100,
             "n_feats": 0, "gb_text": "LOCUS p1",
@@ -245,8 +245,8 @@ class TestSaveChainAtomicMirror:
             sc, "_PARTS_BIN_COLLECTIONS_FILE",
             tmp_path / "parts_bin_coll.json",
         )
-        sc._parts_bin_cache = None
-        sc._parts_bin_collections_cache = None
+        sc._state._parts_bin_cache = None
+        sc._state._parts_bin_collections_cache = None
         sc._save_parts_bin([{"name": "B1", "sequence": "ACGT"}])
         loaded = sc._load_parts_bin()
         assert len(loaded) == 1
@@ -268,7 +268,7 @@ class TestEntryVectorSavesLocked:
         monkeypatch.setattr(
             sc, "_ENTRY_VECTORS_FILE", tmp_path / "ev.json",
         )
-        sc._entry_vectors_cache = None
+        sc._state._entry_vectors_cache = None
         sc._set_entry_vector(
             "gb_l0",
             {"name": "MyVec", "gb_text": "fake"},
@@ -282,7 +282,7 @@ class TestEntryVectorSavesLocked:
         monkeypatch.setattr(
             sc, "_ENTRY_VECTORS_FILE", tmp_path / "ev.json",
         )
-        sc._entry_vectors_cache = None
+        sc._state._entry_vectors_cache = None
         sc._set_entry_vector(
             "gb_l0", {"name": "V1", "gb_text": "x"}, role="Alpha1",
         )

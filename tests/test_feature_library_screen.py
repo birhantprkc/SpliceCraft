@@ -148,12 +148,12 @@ class TestFeatureLibraryCrud:
             # In-memory list shows the removal; disk does not.
             assert lib_screen._entries == []
             assert lib_screen._has_pending_changes is True
-            sc._features_cache = None
+            sc._state._features_cache = None
             assert len(sc._load_features()) == 1
             # action_save persists.
             lib_screen.action_save()
             await pilot.pause()
-            sc._features_cache = None
+            sc._state._features_cache = None
             assert sc._load_features() == []
             assert lib_screen._has_pending_changes is False
 
@@ -176,11 +176,11 @@ class TestFeatureLibraryCrud:
             # original until action_save runs.
             assert len(app.screen._entries) == 2
             assert "(copy)" in app.screen._entries[1]["name"]
-            sc._features_cache = None
+            sc._state._features_cache = None
             assert len(sc._load_features()) == 1
             app.screen.action_save()
             await pilot.pause()
-            sc._features_cache = None
+            sc._state._features_cache = None
             loaded = sc._load_features()
             assert len(loaded) == 2
             assert "(copy)" in loaded[1]["name"]
@@ -203,7 +203,7 @@ class TestFeatureLibraryCrud:
                 app.screen.action_strand()
                 await pilot.pause()
                 # Disk still untouched until save.
-                sc._features_cache = None
+                sc._state._features_cache = None
                 assert sc._load_features()[0]["strand"] == 1
                 # In-memory entry reflects the cycle step.
                 assert app.screen._entries[0]["strand"] == expected
@@ -211,7 +211,7 @@ class TestFeatureLibraryCrud:
                 assert 0 in app.screen._dirty_indices
             app.screen.action_save()
             await pilot.pause()
-            sc._features_cache = None
+            sc._state._features_cache = None
             assert sc._load_features()[0]["strand"] == 1
             assert app.screen._dirty_indices == set()
 
@@ -330,7 +330,7 @@ class TestFeatureLibraryUnsavedFlow:
             # Both modals popped → back to main app.
             assert not isinstance(app.screen, sc.UnsavedQuitModal)
             assert not isinstance(app.screen, sc.FeatureLibraryScreen)
-            sc._features_cache = None
+            sc._state._features_cache = None
             assert sc._load_features()[0]["strand"] == -1
 
     async def test_unsaved_quit_abandon_pops_without_persisting(
@@ -358,7 +358,7 @@ class TestFeatureLibraryUnsavedFlow:
             await pilot.pause()
             await pilot.pause(0.1)
             assert not isinstance(app.screen, sc.FeatureLibraryScreen)
-            sc._features_cache = None
+            sc._state._features_cache = None
             # Disk still shows original strand=1.
             assert sc._load_features()[0]["strand"] == 1
 
@@ -477,7 +477,7 @@ class TestFeatureLibraryUnsavedFlow:
             app.screen.query_one("#btn-abandon", Button).press()
             await pilot.pause()
             await pilot.pause(0.1)
-            # Note: NO sc._features_cache = None reset.
+            # Note: NO sc._state._features_cache = None reset.
             cached = sc._load_features()
             assert cached[0]["strand"] == 1, (
                 f"After Abandon, _features_cache still carried the "
@@ -566,7 +566,7 @@ class TestFeatureLibraryUnsavedFlow:
             assert 0 in app.screen._dirty_indices
             assert app.screen._has_pending_changes is True
             # Disk untouched.
-            sc._features_cache = None
+            sc._state._features_cache = None
             assert sc._load_features()[0]["name"] == "lacZ"
 
 
@@ -1043,7 +1043,7 @@ class TestCaptureToFeatures:
             await pilot.pause(0.1)
             # Must assert INSIDE the context — app shuts down on exit.
             assert isinstance(app.screen, sc.FeatureLibraryScreen)
-            sc._features_cache = None
+            sc._state._features_cache = None
             entries = sc._load_features()
             assert len(entries) == 1
             assert entries[0]["name"] == "captured-1"
@@ -1124,7 +1124,7 @@ class TestSaveFeatureAsLibraryFromEditor:
             )
             await pilot.pause()
             await pilot.pause(0.05)
-            sc._features_cache = None
+            sc._state._features_cache = None
             match = [e for e in sc._load_features()
                      if e.get("name") == "lone-cds"]
             assert len(match) == 1, "single feature must persist exactly once"
@@ -1142,14 +1142,14 @@ class TestSaveFeatureAsLibraryFromEditor:
             pm = app.query_one("#plasmid-map", sc.PlasmidMap)
             idx = next(i for i, f in enumerate(pm._feats)
                        if f.get("type") == "CDS")
-            sc._features_cache = None
+            sc._state._features_cache = None
             before = len(sc._load_features())
             app._apply_save_group_as_entry(
                 {"idx": idx, "group_id": "", "name": "   "}
             )
             await pilot.pause()
             await pilot.pause(0.05)
-            sc._features_cache = None
+            sc._state._features_cache = None
             assert len(sc._load_features()) == before
 
 

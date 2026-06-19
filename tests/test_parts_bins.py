@@ -114,7 +114,7 @@ class TestActiveBinPointer:
         sc._switch_active_parts_bin("A")          # prime the active mirror
         assert sc._switch_active_parts_bin("B") is True
         assert sc._get_active_parts_bin_name() == "B"
-        sc._parts_bin_cache = None
+        sc._state._parts_bin_cache = None
         assert {p.get("name") for p in sc._load_parts_bin()} == {"pb"}
         colls = {b["name"]: b for b in sc._load_parts_bin_collections()}
         assert {p.get("name") for p in colls["A"]["parts"]} == {"pa"}

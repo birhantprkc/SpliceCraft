@@ -3066,7 +3066,7 @@ class TestProteinMotifsPersistence:
 
     def test_load_returns_builtins_when_no_user_file(self):
         # Cold cache + no user file → all built-ins surface.
-        sc._protein_motifs_cache = None
+        sc._state._protein_motifs_cache = None
         merged = sc._load_protein_motifs()
         builtin_names = {m["name"] for m in sc._PROTEIN_MOTIFS}
         merged_names = {m["name"] for m in merged}

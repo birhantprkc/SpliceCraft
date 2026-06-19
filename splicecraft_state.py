@@ -70,3 +70,28 @@ _primer_usage_cache: "dict[str, int] | None" = None
 _primer_usage_cache_gen: int = 0
 _settings_flush_pending: "dict | None" = None
 _settings_flush_running: bool = False
+
+
+# ── Persisted-data caches (Phase A2a) ──────────────────────────────
+# Migrated from the hub; conftest._patch + the Master-Delete reset target
+# them here automatically. Accessed `_state.<name>`.
+_codon_tables_cache: "list | None" = None
+_collections_cache: "list | None" = None
+_custom_enzymes_cache: "list | None" = None
+_entry_vectors_cache: "list | None" = None
+_enzyme_collections_cache: "list | None" = None
+_experiment_projects_cache: "list | None" = None
+_experiments_cache: "list | None" = None
+_feature_colors_cache: "dict[str, str] | None" = None
+_features_cache: "list | None" = None
+_gels_cache: "list | None" = None
+_grammars_cache: "list | None" = None
+_hmm_db_catalog_cache: "list | None" = None
+_library_cache: "list | None" = None
+_parts_bin_cache: "list | None" = None
+_parts_bin_collections_cache: "list | None" = None
+_primer_collections_cache: "list | None" = None
+_primers_cache: "list | None" = None
+_protein_collections_cache: "list | None" = None
+_protein_motifs_cache: "list | None" = None
+_settings_cache: "dict | None" = None

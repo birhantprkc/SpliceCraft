@@ -38,6 +38,13 @@ _MIGRATED = [
     "_primer_usage_cache_gen",
     "_settings_flush_pending",
     "_settings_flush_running",
+    # Phase A2a: persisted-data caches
+    "_codon_tables_cache", "_collections_cache", "_custom_enzymes_cache",
+    "_entry_vectors_cache", "_enzyme_collections_cache", "_experiment_projects_cache",
+    "_experiments_cache", "_feature_colors_cache", "_features_cache", "_gels_cache",
+    "_grammars_cache", "_hmm_db_catalog_cache", "_library_cache", "_parts_bin_cache",
+    "_parts_bin_collections_cache", "_primer_collections_cache", "_primers_cache",
+    "_protein_collections_cache", "_protein_motifs_cache", "_settings_cache",
 ]
 
 

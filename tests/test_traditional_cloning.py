@@ -1801,7 +1801,7 @@ def isolated_parts_bin(tmp_path, monkeypatch):
     fixture in test_domesticator.py."""
     tmp_bin = tmp_path / "parts_bin.json"
     monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_bin)
-    monkeypatch.setattr(sc, "_parts_bin_cache", None)
+    monkeypatch.setattr(sc._state, "_parts_bin_cache", None)
     return tmp_bin
 
 
@@ -2047,7 +2047,7 @@ class TestConstructorMultiGrammarTabs:
         # summary reflects the active role's bound vector.
         ev_file = tmp_path / "entry_vectors.json"
         monkeypatch.setattr(sc, "_ENTRY_VECTORS_FILE", ev_file)
-        monkeypatch.setattr(sc, "_entry_vectors_cache", None)
+        monkeypatch.setattr(sc._state, "_entry_vectors_cache", None)
         for role, name in (
             ("Alpha1", "FFE2_test"),
             ("Alpha2", "FFE3_test"),
@@ -2168,7 +2168,7 @@ class TestConstructorMultiGrammarTabs:
         # no binding the label reads "(none)".
         ev_file = tmp_path / "entry_vectors.json"
         monkeypatch.setattr(sc, "_ENTRY_VECTORS_FILE", ev_file)
-        monkeypatch.setattr(sc, "_entry_vectors_cache", None)
+        monkeypatch.setattr(sc._state, "_entry_vectors_cache", None)
         sc._set_entry_vector("gb_l0", {
             "name":   "MyAcceptor", "size": 3000, "source": "test",
             "gb_text": "",
@@ -2208,7 +2208,7 @@ class TestConstructorMultiGrammarTabs:
         # the right role + activate flag.
         ev_file = tmp_path / "entry_vectors.json"
         monkeypatch.setattr(sc, "_ENTRY_VECTORS_FILE", ev_file)
-        monkeypatch.setattr(sc, "_entry_vectors_cache", None)
+        monkeypatch.setattr(sc._state, "_entry_vectors_cache", None)
         from tests.test_smoke import _build_app, TERMINAL_SIZE
         app = _build_app(tiny_record, isolated_library)
         async with app.run_test(size=TERMINAL_SIZE) as pilot:
@@ -2249,7 +2249,7 @@ class TestConstructorMultiGrammarTabs:
         # / Omega2 / the legacy singleton (role="").
         ev_file = tmp_path / "entry_vectors.json"
         monkeypatch.setattr(sc, "_ENTRY_VECTORS_FILE", ev_file)
-        monkeypatch.setattr(sc, "_entry_vectors_cache", None)
+        monkeypatch.setattr(sc._state, "_entry_vectors_cache", None)
         sc._set_entry_vector("gb_l0", {
             "name": "L0_singleton", "size": 1, "source": "t",
             "gb_text": "",

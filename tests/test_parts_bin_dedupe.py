@@ -372,7 +372,7 @@ class TestDeleteCounterFix:
     def test_counter_removes_one_of_two_duplicates(self, tmp_path, monkeypatch):
         # Two identical entries; select ONE for delete.
         monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_path / "parts_bin.json")
-        sc._parts_bin_cache = None
+        sc._state._parts_bin_cache = None
         entries = [
             {"name": "DUP", "sequence": "ACGT", "type": "CDS"},
             {"name": "DUP", "sequence": "ACGT", "type": "CDS"},
@@ -400,7 +400,7 @@ class TestDeleteCounterFix:
         """Selecting BOTH duplicates → both removed (preserves the
         explicit user intent — Counter doesn't add false safety)."""
         monkeypatch.setattr(sc, "_PARTS_BIN_FILE", tmp_path / "parts_bin.json")
-        sc._parts_bin_cache = None
+        sc._state._parts_bin_cache = None
         entries = [
             {"name": "DUP", "sequence": "ACGT"},
             {"name": "DUP", "sequence": "ACGT"},
