@@ -571,6 +571,12 @@ class TestCollisionModalEvents:
             captured.append((event, fields))
 
         monkeypatch.setattr(sc, "_log_event", _rec)
+        # Phase D: the collision modals (NameCollisionModal / ExactCopyConfirmModal)
+        # moved to splicecraft_modals, which imported `_log_event` by value — patch
+        # that binding too, else their emits resolve in the sibling namespace and
+        # the recorder never sees them.
+        import splicecraft_modals
+        monkeypatch.setattr(splicecraft_modals, "_log_event", _rec)
         return captured
 
     def test_exact_copy_skip_emits_event(self, monkeypatch):
