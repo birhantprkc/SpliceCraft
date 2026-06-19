@@ -123,3 +123,60 @@ _SAVES_AUTHORIZED_REASON: str = ""
 # (`_state._DATA_DIR = _user_data_dir()`); placeholder here so readers + the
 # conftest sandbox patch resolve it. Everything path-related hangs off this.
 _DATA_DIR: "Path | None" = None
+
+
+# ── Persistence-engine config (Phase B-main) ───────────────────────
+# Tunables for the domain-agnostic save/load engine (`_safe_save_json`,
+# `_prune_backups`, `_safe_load_json`, …, extracted to
+# splicecraft_persistence). They live here — not in the engine sibling —
+# because the test suite monkeypatches them (`monkeypatch.setattr(_state,
+# "_BACKUP_RETENTION_COUNT", 3)`) to exercise pruning/oversize paths without
+# fabricating gigabyte files, and a single shared copy keeps the engine's
+# reads and the test's writes in sync (a by-value re-export would desync).
+
+# Schema-envelope version stamped into every data file ({"_schema_version":
+# N, "entries": [...]}). Legacy bare-list files (pre-0.3.1) load + get rewrapped
+# as an envelope on next save.
+_CURRENT_SCHEMA_VERSION: int = 1
+
+# Per-path observed schema versions. When `_safe_load_json` reads a file
+# written by a NEWER SpliceCraft (schema_version > current), it stashes the
+# observed version here keyed by absolute path string so the next
+# `_safe_save_json` for that path preserves it rather than demoting the stamp
+# (which would make a future migrator double-migrate already-current fields).
+# MUTABLE + shared between load + save → must be one copy here.
+_OBSERVED_SCHEMA_VERSIONS: "dict[str, int]" = {}
+
+# Multi-generation backup retention. Each `_safe_save_json` keeps the prior
+# file as `<file>.bak` (latest) + `<file>.bak.YYYYMMDD-HHMMSS` (rotating); the
+# newest `_BACKUP_RETENTION_COUNT` timestamped generations survive.
+_BACKUP_RETENTION_COUNT: int = 10
+# Aggregate byte ceiling across ALL timestamped backups of ONE base file.
+# After count-pruning, `_prune_backups` drops oldest backups until the total
+# falls under this cap — but never below `_BACKUP_MIN_KEEP` newest generations
+# (a large single file must keep some rollback points).
+_BACKUP_TOTAL_SIZE_CAP_BYTES: int = 1024 * 1024 * 1024   # 1 GB per base file
+_BACKUP_MIN_KEEP: int = 2   # never byte-prune below this many newest backups
+
+# Lost-entries spillover (the shrink-guard + raw-bytes recovery copies) lives
+# in a sibling `lost_entries/` dir, two-stage-pruned like the backups.
+_LOST_ENTRIES_DIR_NAME: str = "lost_entries"
+_LOST_ENTRIES_RETENTION_COUNT: int = 5
+_LOST_ENTRIES_TOTAL_SIZE_CAP_BYTES: int = 500 * 1024 * 1024   # 500 MB
+
+# Read-back validation threshold. After writing a save's temp file,
+# `_safe_save_json` re-reads it before the atomic swap; files at/under this
+# size get a full `json.loads` + entry-count check, larger files a cheap tail
+# check so the hot path doesn't eat a multi-second re-parse + RAM spike.
+_SAVE_READBACK_FULL_PARSE_MAX_BYTES: int = 32 * 1024 * 1024   # 32 MB
+
+# Data-dir JSON load cap (the user's OWN library/collections, distinct from the
+# foreign-file ingest cap). 1 GB so accidental cap-trips are rare; the
+# `_safe_save_json` OVERSIZE GUARD handles the remaining edge case so a trip
+# can't nuke data.
+_SAFE_LOAD_JSON_MAX_BYTES: int = 1024 * 1024 * 1024   # 1 GB
+
+# Daily pre-update snapshot subdir (under the data dir). The engine's
+# `_safe_load_json` reads this name to skip the snapshots tree when scanning
+# for backups; hub snapshot code owns the retention/size tunables.
+_SNAPSHOT_DIR_NAME: str = "snapshots"

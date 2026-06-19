@@ -14626,7 +14626,7 @@ class TestRobustnessHardening:
         small.write_bytes(b'{"_schema_version": 1, "entries": []}')
         written = sc._snapshot_data_files(tmp_path, paths=[big, small])
         # Oversized file was skipped; small one was snapshotted.
-        snap_dir = tmp_path / sc._SNAPSHOT_DIR_NAME
+        snap_dir = tmp_path / sc._state._SNAPSHOT_DIR_NAME
         assert not (snap_dir / "huge-*.json").is_file()
         assert any(p.name.startswith("small-") for p in written)
 

@@ -281,7 +281,7 @@ class TestLibraryPersistence:
         # Bypass the cache and read raw bytes
         assert isolated_library.exists()
         parsed = json.loads(isolated_library.read_text())
-        assert parsed["_schema_version"] == sc._CURRENT_SCHEMA_VERSION
+        assert parsed["_schema_version"] == sc._state._CURRENT_SCHEMA_VERSION
         assert parsed["entries"] == entries
 
     def test_load_survives_corrupted_file(self, isolated_library, caplog):

@@ -34,7 +34,7 @@ class TestSafeSaveJson:
         sc._safe_save_json(p, [{"id": "A"}], "test")
         assert p.exists()
         raw = json.loads(p.read_text())
-        assert raw == {"_schema_version": sc._CURRENT_SCHEMA_VERSION,
+        assert raw == {"_schema_version": sc._state._CURRENT_SCHEMA_VERSION,
                        "entries": [{"id": "A"}]}
 
     def test_creates_bak_on_overwrite(self, tmp_path):
@@ -109,7 +109,7 @@ class TestSafeSaveJsonMultiGenBackup:
         """Force the retention cap down to 3 and write 6 generations —
         only the most recent 3 timestamped backups must survive."""
         p = tmp_path / "test.json"
-        monkeypatch.setattr(sc, "_BACKUP_RETENTION_COUNT", 3)
+        monkeypatch.setattr(sc._state, "_BACKUP_RETENTION_COUNT", 3)
         # Seed the file so subsequent saves see prior content.
         sc._safe_save_json(p, [{"id": "0"}], "test")
         # Manually create older timestamped backups so we don't have
@@ -549,7 +549,7 @@ class TestSchemaVersioning:
     def test_envelope_loads_without_warning(self, tmp_path):
         p = tmp_path / "new.json"
         p.write_text(json.dumps({
-            "_schema_version": sc._CURRENT_SCHEMA_VERSION,
+            "_schema_version": sc._state._CURRENT_SCHEMA_VERSION,
             "entries": [{"id": "E1"}],
         }))
         entries, warning = sc._safe_load_json(p, "test")
@@ -562,7 +562,7 @@ class TestSchemaVersioning:
         may be dropped on save."""
         p = tmp_path / "future.json"
         p.write_text(json.dumps({
-            "_schema_version": sc._CURRENT_SCHEMA_VERSION + 99,
+            "_schema_version": sc._state._CURRENT_SCHEMA_VERSION + 99,
             "entries": [{"id": "F1", "new_field": "unknown"}],
         }))
         entries, warning = sc._safe_load_json(p, "test")
@@ -593,7 +593,7 @@ class TestSchemaVersioning:
         # File on disk is now envelope-shaped
         raw = json.loads(p.read_text())
         assert isinstance(raw, dict)
-        assert raw["_schema_version"] == sc._CURRENT_SCHEMA_VERSION
+        assert raw["_schema_version"] == sc._state._CURRENT_SCHEMA_VERSION
         assert raw["entries"] == [{"id": "NEW"}]
 
     def _capture_splicecraft_warnings(self):
@@ -758,7 +758,7 @@ class TestPersistenceIntegration:
         or hostile-shared library file in the multi-GB range used to be
         loaded into memory before any validation. Now stat-and-cap defends
         with a warning return."""
-        monkeypatch.setattr(sc, "_SAFE_LOAD_JSON_MAX_BYTES", 100)
+        monkeypatch.setattr(sc._state, "_SAFE_LOAD_JSON_MAX_BYTES", 100)
         big = tmp_path / "huge.json"
         # Write 200 bytes — over the 100-byte test cap.
         big.write_text("[" + ", ".join(['"x"'] * 50) + "]")
@@ -1058,7 +1058,7 @@ class TestSafeSaveJsonOversizeGuard:
             self, tmp_path, monkeypatch):
         # Patch the cap to a tiny value so we don't have to actually
         # write a 1 GB file in the test.
-        monkeypatch.setattr(sc, "_SAFE_LOAD_JSON_MAX_BYTES", 1024)
+        monkeypatch.setattr(sc._state, "_SAFE_LOAD_JSON_MAX_BYTES", 1024)
         target = tmp_path / "oversized.json"
         # Write a 2 KB blob — over the patched cap.
         target.write_bytes(b"x" * 2048)
@@ -1069,7 +1069,7 @@ class TestSafeSaveJsonOversizeGuard:
 
     def test_save_proceeds_when_existing_file_under_cap(
             self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sc, "_SAFE_LOAD_JSON_MAX_BYTES", 1024 * 1024)
+        monkeypatch.setattr(sc._state, "_SAFE_LOAD_JSON_MAX_BYTES", 1024 * 1024)
         target = tmp_path / "small.json"
         target.write_text('{"_schema_version": 1, "entries": []}')
         # Normal save — must succeed.
@@ -1078,7 +1078,7 @@ class TestSafeSaveJsonOversizeGuard:
 
     def test_save_proceeds_when_no_existing_file(
             self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sc, "_SAFE_LOAD_JSON_MAX_BYTES", 1024)
+        monkeypatch.setattr(sc._state, "_SAFE_LOAD_JSON_MAX_BYTES", 1024)
         target = tmp_path / "fresh.json"
         # First save — file doesn't exist yet, no oversize check triggers.
         sc._safe_save_json(target, [{"id": "X"}], "test")
@@ -1321,9 +1321,9 @@ class TestBackupByteCapPruning:
 
     def test_byte_cap_drops_oldest_beyond_cap(self, tmp_path, monkeypatch):
         p = tmp_path / "test.json"
-        monkeypatch.setattr(sc, "_BACKUP_RETENTION_COUNT", 100)  # disable count cap
-        monkeypatch.setattr(sc, "_BACKUP_TOTAL_SIZE_CAP_BYTES", 300)
-        monkeypatch.setattr(sc, "_BACKUP_MIN_KEEP", 2)
+        monkeypatch.setattr(sc._state, "_BACKUP_RETENTION_COUNT", 100)  # disable count cap
+        monkeypatch.setattr(sc._state, "_BACKUP_TOTAL_SIZE_CAP_BYTES", 300)
+        monkeypatch.setattr(sc._state, "_BACKUP_MIN_KEEP", 2)
         for ts in ["20260101-000000", "20260102-000000", "20260103-000000",
                    "20260104-000000", "20260105-000000"]:
             (tmp_path / f"test.json.bak.{ts}").write_text("x" * 100)
@@ -1337,9 +1337,9 @@ class TestBackupByteCapPruning:
 
     def test_byte_cap_never_below_min_keep(self, tmp_path, monkeypatch):
         p = tmp_path / "test.json"
-        monkeypatch.setattr(sc, "_BACKUP_RETENTION_COUNT", 100)
-        monkeypatch.setattr(sc, "_BACKUP_TOTAL_SIZE_CAP_BYTES", 10)  # tiny
-        monkeypatch.setattr(sc, "_BACKUP_MIN_KEEP", 2)
+        monkeypatch.setattr(sc._state, "_BACKUP_RETENTION_COUNT", 100)
+        monkeypatch.setattr(sc._state, "_BACKUP_TOTAL_SIZE_CAP_BYTES", 10)  # tiny
+        monkeypatch.setattr(sc._state, "_BACKUP_MIN_KEEP", 2)
         for ts in ["20260101-000000", "20260102-000000", "20260103-000000"]:
             (tmp_path / f"test.json.bak.{ts}").write_text("x" * 100)
         sc._prune_backups(p)
@@ -1387,8 +1387,8 @@ class TestLostEntriesPruning:
         import os
         d = tmp_path / "lost_entries"
         d.mkdir()
-        monkeypatch.setattr(sc, "_LOST_ENTRIES_RETENTION_COUNT", 3)
-        monkeypatch.setattr(sc, "_LOST_ENTRIES_TOTAL_SIZE_CAP_BYTES", 10 ** 9)
+        monkeypatch.setattr(sc._state, "_LOST_ENTRIES_RETENTION_COUNT", 3)
+        monkeypatch.setattr(sc._state, "_LOST_ENTRIES_TOTAL_SIZE_CAP_BYTES", 10 ** 9)
         for i in range(6):
             f = d / f"lib-2026010{i}-000000.json"
             f.write_text("x" * 50)
@@ -1404,8 +1404,8 @@ class TestLostEntriesPruning:
         import os
         d = tmp_path / "lost_entries"
         d.mkdir()
-        monkeypatch.setattr(sc, "_LOST_ENTRIES_RETENTION_COUNT", 100)
-        monkeypatch.setattr(sc, "_LOST_ENTRIES_TOTAL_SIZE_CAP_BYTES", 10)
+        monkeypatch.setattr(sc._state, "_LOST_ENTRIES_RETENTION_COUNT", 100)
+        monkeypatch.setattr(sc._state, "_LOST_ENTRIES_TOTAL_SIZE_CAP_BYTES", 10)
         for i in range(4):
             f = d / f"lib-2026010{i}-000000.json"
             f.write_text("x" * 100)
@@ -1583,7 +1583,7 @@ class TestTempReadbackValidation:
     def test_large_branch_tail_check_passes(self, tmp_path, monkeypatch):
         # Force the tail-check branch (threshold below payload size); a
         # valid save must still succeed.
-        monkeypatch.setattr(sc, "_SAVE_READBACK_FULL_PARSE_MAX_BYTES", 1)
+        monkeypatch.setattr(sc._state, "_SAVE_READBACK_FULL_PARSE_MAX_BYTES", 1)
         p = tmp_path / "test.json"
         sc._safe_save_json(p, [{"id": "a"}, {"id": "b"}], "test")
         assert json.loads(p.read_text())["entries"] == [{"id": "a"}, {"id": "b"}]
@@ -1619,8 +1619,8 @@ class TestDataDirHousekeeping:
                 json.dumps({"_schema_version": 1, "entries": []}))
         ld = sc._state._DATA_DIR / "lost_entries"
         ld.mkdir(parents=True, exist_ok=True)
-        monkeypatch.setattr(sc, "_LOST_ENTRIES_RETENTION_COUNT", 1)
-        monkeypatch.setattr(sc, "_LOST_ENTRIES_TOTAL_SIZE_CAP_BYTES", 10 ** 9)
+        monkeypatch.setattr(sc._state, "_LOST_ENTRIES_RETENTION_COUNT", 1)
+        monkeypatch.setattr(sc._state, "_LOST_ENTRIES_TOTAL_SIZE_CAP_BYTES", 10 ** 9)
         for i in range(3):
             f = ld / f"plasmid_library-2026010{i}-000000.json"
             f.write_text("x" * 50)

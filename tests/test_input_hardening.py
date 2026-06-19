@@ -158,7 +158,7 @@ def test_is_safe_zip_member_name_accepts_normal():
 def test_gb_ingest_cap_is_256mb_and_below_json_cap():
     assert sc._GB_INGEST_MAX_BYTES == 256 * 1024 * 1024
     # MUST stay below the data-dir JSON cap so the two never get conflated.
-    assert sc._GB_INGEST_MAX_BYTES < sc._SAFE_LOAD_JSON_MAX_BYTES
+    assert sc._GB_INGEST_MAX_BYTES < sc._state._SAFE_LOAD_JSON_MAX_BYTES
 
 
 def test_gb_text_to_record_empty_raises_clean():

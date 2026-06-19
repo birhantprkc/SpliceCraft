@@ -63,7 +63,7 @@ class TestFeatureLibraryRoundtrip:
         sc._save_features([{"name": "x", "feature_type": "CDS",
                             "sequence": "ATG"}])
         raw = json.loads(sc._state._FEATURES_FILE.read_text())
-        assert raw["_schema_version"] == sc._CURRENT_SCHEMA_VERSION
+        assert raw["_schema_version"] == sc._state._CURRENT_SCHEMA_VERSION
         assert isinstance(raw["entries"], list)
 
     def test_save_creates_bak_on_overwrite(self):
@@ -238,7 +238,7 @@ class TestFeatureColorsPersistence:
     def test_envelope_schema_version(self):
         sc._save_feature_colors({"CDS": "#FF0000"})
         raw = json.loads(sc._state._FEATURE_COLORS_FILE.read_text())
-        assert raw["_schema_version"] == sc._CURRENT_SCHEMA_VERSION
+        assert raw["_schema_version"] == sc._state._CURRENT_SCHEMA_VERSION
         assert isinstance(raw["entries"], list)
         assert raw["entries"][0] == {"feature_type": "CDS", "color": "#FF0000"}
 
