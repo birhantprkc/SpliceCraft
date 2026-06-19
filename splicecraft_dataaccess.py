@@ -1529,3 +1529,148 @@ def _set_setting(key: str, value) -> None:
     _schedule = getattr(_state, "_settings_schedule_flush_hook", None)
     if _schedule is not None:
         _schedule(settings)
+
+
+# ── Library / collections read-only views + finders + active-collection pointer
+# Hot-path accessors moved from the hub (Phase D) so the modal/screen siblings
+# that call them bare can import them. The readonly iters return the cache list
+# WITHOUT cloning (callers MUST NOT mutate — #17); finders clone only the matched
+# entry. The `_ensure_*` migration stays hub-side, reached via the ensure hooks.
+def _iter_library_readonly() -> list[dict]:
+    """Read-only view of the library cache — returns the cached list
+    directly without cloning. Callers MUST NOT mutate any returned
+    dict or its nested lists; doing so poisons the in-memory cache
+    (pitfall #17). Use for hot read paths (listing endpoints, search
+    filters, primer-usage scans, name-collision precheck) where the
+    multi-second `_typed_clone` cost on a 100+ MB library is
+    meaningful. For any path that mutates entries, use
+    ``_load_library()`` instead. Mirrors ``_iter_collections_readonly``
+    (sweep #23) and added as part of sweep #25 (2026-05-23) to close
+    the perf gap on ~40 library-read callsites.
+    """
+    _ensure = _state._ensure_library_hook
+    if _ensure is not None:
+        _ensure()
+    assert _state._library_cache is not None
+    return _state._library_cache
+
+
+def _find_library_entry_by_id(entry_id: "str | None") -> "dict | None":
+    """Return a deep-clone of the library entry whose ``id`` matches,
+    or ``None`` if no match. Accepts ``None`` / non-string / empty
+    string and returns ``None`` for those (callsite-friendly).
+
+    Sweep #11 (2026-05-20): pre-fix ~80 callsites did
+    ``next((e for e in _load_library() if e.get("id") == X), None)``,
+    which clones the ENTIRE library on every lookup. On a 100+ MB
+    library this is multi-second per click for status changes,
+    history-viewer opens, picker dismisses. This helper takes
+    ``_cache_lock``, walks ``_state._library_cache`` directly, and clones
+    only the matched entry — O(N) walk with O(1) cloned bytes
+    instead of O(N) cloned bytes.
+
+    Returns a deep copy of the entry so callers can mutate freely
+    without poisoning the cache (same contract as ``_load_library``
+    per invariant #17). Returns ``None`` for empty/non-string
+    ``entry_id``; the empty-string skip prevents accidental
+    aliasing against id-less library rows (defensive against
+    hand-edited JSON).
+    """
+    if not isinstance(entry_id, str) or not entry_id:
+        return None
+    _ensure = _state._ensure_library_hook
+    if _ensure is not None:
+        _ensure()
+    assert _state._library_cache is not None
+    with _state._cache_lock:
+        for e in _state._library_cache:
+            if e.get("id") == entry_id:
+                return _typed_clone(e)
+    return None
+
+
+def _find_library_entry_by_name(entry_name: str) -> "dict | None":
+    """Return a deep-clone of the first library entry whose ``name``
+    matches, or ``None`` if no match. Sibling of
+    ``_find_library_entry_by_id`` for the rare endpoints (currently
+    ``_h_align_plasmidsaurus_zip``) that accept either an id or a
+    name. Added by sweep #25 (2026-05-23).
+
+    Note: ``name`` is NOT guaranteed unique in the library
+    (collision modals can save a deliberate COPY); returns the first
+    hit, walking in insertion order. Callers needing the canonical
+    one should prefer ``_find_library_entry_by_id``.
+    """
+    if not isinstance(entry_name, str) or not entry_name:
+        return None
+    _ensure = _state._ensure_library_hook
+    if _ensure is not None:
+        _ensure()
+    assert _state._library_cache is not None
+    with _state._cache_lock:
+        for e in _state._library_cache:
+            if e.get("name") == entry_name:
+                return _typed_clone(e)
+    return None
+
+
+def _iter_collections_readonly() -> list[dict]:
+    """Read-only view of the collections cache — returns the cached list
+    directly without cloning. Callers MUST NOT mutate any returned dict
+    or its nested lists; doing so poisons the in-memory cache (pitfall
+    #17). Use for hot read paths (search modals, listing endpoints) where
+    the ~30–50 ms `_typed_clone` cost is meaningful on big libraries.
+    For any path that mutates entries, use `_load_collections()` instead.
+    """
+    _ensure = _state._ensure_collections_hook
+    if _ensure is not None:
+        _ensure()
+    assert _state._collections_cache is not None
+    return _state._collections_cache
+
+
+def _get_active_collection_name() -> "str | None":
+    val = _get_setting("active_collection", None)
+    return val if isinstance(val, str) and val else None
+
+
+def _set_active_collection_name(name: "str | None") -> None:
+    """Persist (or clear) the active-collection pointer."""
+    prev = _get_active_collection_name()
+    target = name or ""
+    if prev != target:
+        _log_event("collection.switched", prev=prev or "", new=target)
+    _set_setting("active_collection", target)
+
+
+def _find_collection(name: str) -> "dict | None":
+    """Return a deep-clone of the collection whose ``name`` matches, or
+    ``None`` if not found. Mirrors ``_find_library_entry_by_id`` —
+    walks the readonly cache view and only ``_typed_clone``s the
+    matched entry instead of the entire collections list.
+
+    Sweep #26 (2026-05-25): pre-fix did ``for c in _load_collections()``
+    which deep-clones the entire ~160 MB collections.json file every
+    call. 13 call sites — each pays 400 ms – 1.6 s. Agent
+    ``bulk-import-folder`` paid 2× (early-out + atomic re-check).
+    """
+    if not isinstance(name, str) or not name:
+        return None
+    with _state._cache_lock:
+        for c in _iter_collections_readonly():
+            if isinstance(c, dict) and c.get("name") == name:
+                return _typed_clone(c)
+    return None
+
+
+def _collection_name_taken(name: str) -> bool:
+    """Dup-name guard for create / rename. Pure check, no side effects.
+    Sweep #26: routed through the readonly walk so the check is O(N)
+    in memory rather than O(N) in deep-clone bytes."""
+    if not isinstance(name, str) or not name:
+        return False
+    with _state._cache_lock:
+        for c in _iter_collections_readonly():
+            if isinstance(c, dict) and c.get("name") == name:
+                return True
+    return False
