@@ -362,3 +362,126 @@ def _name_modal_result(result: "_Any",
         nm = result.strip()
         return (nm, default_collection) if nm else None
     return None
+
+
+# ── Export/collection/color/DNA-normalise pure helpers (moved, Phase D) ─────
+_IUPAC_NUC_CHARS = frozenset("ACGTUMRWSYKVHDBN")
+
+
+_IUPAC_NUC_PATTERN = re.compile(r"^[ACGTUMRWSYKVHDBN]+$")
+
+
+_FASTA_HEADER_PATTERN = re.compile(r"^>[^\n]*\n?", re.MULTILINE)
+
+
+_SCRUB_PATTERN     = re.compile(r"[\s\d]+")
+
+
+_HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$|^#[0-9A-Fa-f]{3}$")
+
+
+_MAX_COLLECTION_NAME_LEN = 200
+
+
+def _normalize_dna_for_align(seq: str) -> str:
+    """Scrub FASTA header lines + whitespace + digits from ``seq``,
+    uppercase, map ``U`` → ``T`` (so RNA pasted into a DNA field
+    aligns instead of every base mismatching), and validate that every
+    remaining character is an IUPAC nucleotide code
+    (``ACGTMRWSYKVHDBN`` after the U-mapping).
+
+    Covers the common bad-paste failure modes upstream of the C-loop:
+
+      * FASTA pasted as-is — ``>name`` line gets stripped along with
+        the embedded newlines, leaving only the sequence body.
+      * GenBank ``ORIGIN`` block — leading bp position numbers, line
+        wraps, spaces between every 10 bp.
+      * Protein pasted in a DNA-only field — would have ``EFILPQ`` etc.
+        Pre-fix Biopython chewed through these and produced a
+        "no alignment" result with no clue why.
+      * RNA consensus pasted into a DNA target — every ``U`` used to
+        mismatch ``T`` for ~0% identity with no hint. Now mapped to
+        ``T`` so the alignment is biologically meaningful.
+
+    Returns the cleaned string. Raises ``ValueError`` on a foreign
+    character (with the offending char(s) named in the message so
+    the user can find them in the source).
+    """
+    if not seq:
+        return ""
+    # Two-pass scrub: FASTA headers first (line-anchored), then
+    # whitespace/digits across the whole string. Order matters —
+    # stripping `\n` first would let the header text leak into the
+    # body and trip the IUPAC check on a leading "MYPLASMID" etc.
+    s = _FASTA_HEADER_PATTERN.sub("", seq)
+    s = _SCRUB_PATTERN.sub("", s).upper()
+    if not s:
+        return ""
+    # 2026-05-27: silent RNA→DNA. The IUPAC alphabet still admits
+    # ``U`` syntactically (frozenset includes it) but the aligner +
+    # state classification work on DNA bases — leaving ``U`` would
+    # mismatch every paired ``T``. The remap is post-uppercase so
+    # both ``u`` and ``U`` in the source collapse to ``T``.
+    if "U" in s:
+        s = s.replace("U", "T")
+    if not _IUPAC_NUC_PATTERN.match(s):
+        bad = sorted(set(s) - _IUPAC_NUC_CHARS)
+        raise ValueError(
+            f"sequence contains non-IUPAC nucleotide character(s): "
+            f"{', '.join(repr(c) for c in bad[:6])}"
+            f"{' (truncated)' if len(bad) > 6 else ''}"
+        )
+    return s
+
+
+def _safe_color_for_picker(raw) -> "str | None":
+    """Filter a raw color value to something ColorPickerModal can
+    safely consume. The picker assigns the value to
+    `styles.background` which raises `StyleValueError` on palette
+    references like `color(39)` and on malformed hex strings like
+    `#OLDCOL`. Members / library entries CAN carry these
+    (canvas `_parse` stamps palette refs at load time, hand-
+    edited `.gb` files can carry garbage in `ApEinfo_fwdcolor`),
+    so we normalize on the way INTO the picker — None means
+    "Auto" / no starting color, and the picker presents its full
+    palette fresh.
+
+    Validation: must match `#RGB` or `#RRGGBB`. Anything else
+    (palette refs, named colours, mangled hex) → None.
+
+    Sweep #30 (2026-05-26 hardening): defends against the
+    `StyleValueError: Invalid color value '...'` crash reported
+    when opening per-row color picker on a feature that had a
+    palette-ref color or a malformed hex."""
+    if not isinstance(raw, str):
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    if _HEX_COLOR_RE.match(raw) is None:
+        return None
+    return raw
+
+
+def _check_export_extension(path: Path, allowed: "tuple[str, ...]",
+                              fmt: str) -> "str | None":
+    """Enforce an extension whitelist on agent export targets. Without
+    this an agent can write `/home/user/.bashrc` as GenBank text (which
+    starts with `LOCUS` — not executable but visually hostile / footgun-
+    y) or write a `.sh` extension that the user later double-clicks by
+    accident. Matches the GUI ExportModal's "save as <FMT>" behaviour
+    where the user can't pick an arbitrary extension."""
+    suffix = path.suffix.lower()
+    if suffix in allowed:
+        return None
+    return (
+        f"refusing to write {fmt} to {path.name!r}: extension must be "
+        f"one of {allowed}"
+    )
+
+
+def _normalize_collection_name(s: "str | None") -> "str | None":
+    """Trim, strip control chars, cap length, reject blank. Returns
+    None on empty input so the caller can 400 the request."""
+    name = _sanitize_label(s, max_len=_MAX_COLLECTION_NAME_LEN)
+    return name or None
