@@ -102,3 +102,102 @@ def _save_feature_colors(mapping: dict[str, str]) -> None:
     with _state._cache_lock:
         _safe_save_json(_state._FEATURE_COLORS_FILE, entries, "Feature colors")
         _state._feature_colors_cache = _typed_clone(mapping)
+
+
+# ── Enzyme collections ──────────────────────────────────────────────────────
+
+
+def _load_enzyme_collections() -> list[dict]:
+    """Deep-copy on read so callers can mutate freely; pitfall #17.
+
+    Sweep #26: double-checked locking — cache-hit fast path is lock-free."""
+    cached = _state._enzyme_collections_cache
+    if cached is not None:
+        return _typed_clone(cached)
+    with _state._cache_lock:
+        if _state._enzyme_collections_cache is None:
+            entries, warning = _safe_load_json(
+                _state._ENZYME_COLLECTIONS_FILE, "Enzyme collections",
+            )
+            if warning:
+                _log.warning(warning)
+            _state._enzyme_collections_cache = [
+                e for e in entries if isinstance(e, dict)
+            ]
+        return _typed_clone(_state._enzyme_collections_cache)
+
+
+def _save_enzyme_collections(entries: list[dict]) -> None:
+    with _state._cache_lock:
+        _safe_save_json(
+            _state._ENZYME_COLLECTIONS_FILE, entries, "Enzyme collections",
+        )
+        _state._enzyme_collections_cache = _typed_clone(entries)
+
+
+# ── Experiment projects ─────────────────────────────────────────────────────
+
+
+def _load_experiment_projects() -> "list[dict]":
+    """Return a deepcopy of the experiment-projects list so callers can
+    mutate entries (rename, edit experiments list) without poisoning
+    the in-memory cache (invariant #17).
+
+    Sweep #26: double-checked locking — cache-hit fast path is lock-free.
+    """
+    cached = _state._experiment_projects_cache
+    if cached is not None:
+        return _typed_clone(cached)
+    with _state._cache_lock:
+        if _state._experiment_projects_cache is None:
+            entries, warning = _safe_load_json(
+                _state._EXPERIMENT_PROJECTS_FILE, "Experiment projects",
+            )
+            if warning:
+                _log.warning(warning)
+            _state._experiment_projects_cache = [
+                e for e in entries if isinstance(e, dict)
+            ]
+    return _typed_clone(_state._experiment_projects_cache)
+
+
+def _save_experiment_projects(entries: "list[dict]") -> None:
+    """Persist the full experiment-projects list through the four-layer
+    data-safety net (invariant #31). Deepcopies into the cache so caller
+    mutations after save can't poison subsequent loaders (invariant #17),
+    under the save lock (invariant #41 — concurrency)."""
+    with _state._cache_lock:
+        _safe_save_json(
+            _state._EXPERIMENT_PROJECTS_FILE, entries, "Experiment projects",
+        )
+        _state._experiment_projects_cache = _typed_clone(entries)
+
+
+# ── Gels ────────────────────────────────────────────────────────────────────
+
+
+def _load_gels() -> "list[dict]":
+    """Cached + deepcopy-on-read load (invariant #17). Filters non-dict
+    entries defensively (hand-edited JSON / schema drift). Sweep #26
+    double-checked locking: the cache-hit fast path runs without the lock
+    so a worker holding it can't freeze every UI-thread `_load_gels`; only
+    the cold populate-from-disk path acquires it, double-checking after."""
+    cached = _state._gels_cache
+    if cached is not None:
+        return _typed_clone(cached)
+    with _state._cache_lock:
+        if _state._gels_cache is None:
+            entries, warning = _safe_load_json(_state._GELS_FILE, "Gels")
+            if warning:
+                _log.warning(warning)
+            _state._gels_cache = [e for e in entries if isinstance(e, dict)]
+        return _typed_clone(_state._gels_cache)
+
+
+def _save_gels(entries: "list[dict]") -> None:
+    """Persist through `_safe_save_json` (atomic + four-layer data-safety).
+    Takes the save lock so concurrent saves can't desync cache vs disk
+    (invariant #41)."""
+    with _state._cache_lock:
+        _safe_save_json(_state._GELS_FILE, entries, "Gels")
+        _state._gels_cache = _typed_clone(entries)

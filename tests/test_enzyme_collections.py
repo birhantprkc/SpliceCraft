@@ -15,6 +15,7 @@ Covers:
 import pytest
 
 import splicecraft as sc
+import splicecraft_dataaccess as _da
 
 pytestmark = [pytest.mark.usefixtures("_protect_user_data")]
 
@@ -449,7 +450,10 @@ def test_save_enzyme_collections_propagates_on_failure(monkeypatch):
     silently desync UI from disk."""
     def boom(*args, **kwargs):
         raise OSError("disk full (synthetic)")
-    monkeypatch.setattr(sc, "_safe_save_json", boom)
+    # _save_enzyme_collections now lives in splicecraft_dataaccess and resolves
+    # _safe_save_json in THAT module's namespace, so patch it there (patching
+    # the hub re-export would not intercept the engine-internal call).
+    monkeypatch.setattr(_da, "_safe_save_json", boom)
     with pytest.raises(OSError, match="disk full"):
         sc._save_enzyme_collections([{"name": "X", "enzymes": []}])
 
