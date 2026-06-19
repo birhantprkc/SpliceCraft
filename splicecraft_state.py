@@ -255,3 +255,10 @@ _ensure_parts_bin_collections_hook: "_Callable[[], None] | None" = None
 _sync_active_parts_bin_parts_hook: "_Callable[..., None] | None" = None
 _after_parts_bin_save_hook: "_Callable[[], None] | None" = None
 _after_parts_bin_collections_save_hook: "_Callable[[], None] | None" = None
+# experiments — `_load_experiments` applies the legacy tag-format migration per
+# body via this hook (the migrator stays hub-side; it's shared with the editor
+# body-readers). `_save_experiments` mirrors into the active experiment project
+# via the synchronous `_sync_active_project_experiments` (hub-side, inside the
+# lock — sweep #9: RLock re-entry, no experiments.json/projects.json drift).
+_migrate_experiment_body_hook: "_Callable[[str], str] | None" = None
+_sync_active_project_experiments_hook: "_Callable[..., None] | None" = None

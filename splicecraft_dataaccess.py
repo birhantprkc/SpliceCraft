@@ -1336,3 +1336,65 @@ def _save_protein_collections(entries: list[dict]) -> None:
     with _state._cache_lock:
         _safe_save_json(_state._PROTEIN_COLLECTIONS_FILE, entries, "Protein collections")
         _state._protein_collections_cache = _typed_clone(entries)
+
+
+# ── Experiments notebook ─────────────────────────────────────────────────────
+# Mirror cluster (like library/collections, synchronous mirror). Load applies
+# the legacy tag-format migration per body via `_state._migrate_experiment_body_hook`
+# (the migrator stays hub-side — it's shared with the editor body-readers). Save
+# mirrors into the active experiment project via `_sync_active_project_experiments`
+# (hub-side, fired INSIDE the lock per sweep #9). The editor / attachment helpers
+# stay hub-side.
+def _load_experiments() -> "list[dict]":
+    """Load the experiments-notebook entries. Cached + deepcopy-on-read
+    per sacred invariant #17 so a caller mutating returned dicts can't
+    poison the cache for the next reader. Filters non-dict entries
+    defensively (hand-edited JSON / schema drift). Applies the
+    legacy-tag-format migration (hub-side via the body hook) to every
+    entry's body so the editor only ever sees the new single-sigil tokens."""
+    if _state._experiments_cache is not None:
+        return _typed_clone(_state._experiments_cache)
+    entries, warning = _safe_load_json(_state._EXPERIMENTS_FILE, "Experiments")
+    if warning:
+        _log.warning(warning)
+    _migrate = getattr(_state, "_migrate_experiment_body_hook", None)
+    cleaned: "list[dict]" = []
+    n_migrated = 0
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        body = e.get("body_md")
+        if isinstance(body, str) and _migrate is not None:
+            migrated = _migrate(body)
+            if migrated != body:
+                e["body_md"] = migrated
+                n_migrated += 1
+        cleaned.append(e)
+    if n_migrated:
+        _log_event(
+            "experiments.tag.migrated",
+            n_entries=n_migrated, n_loaded=len(cleaned),
+        )
+    _state._experiments_cache = cleaned
+    return _typed_clone(_state._experiments_cache)
+
+
+def _save_experiments(entries: "list[dict]") -> None:
+    """Persist the experiments-notebook entries through the full four-
+    layer data-safety net (invariant #31). Deep-clones into the cache
+    on save (invariant #17), under `_state._cache_lock` so concurrent saves
+    don't desync disk/cache ordering (invariant #41 — concurrency).
+
+    After the primary save, mirrors the entries into the active
+    experiment project's `experiments` list — sacred contract: every
+    writeable experiments path goes through this helper. The mirror is
+    hub-side (`_sync_active_project_experiments`), fired via the hook
+    INSIDE the lock (sweep #9: RLock re-entry; a concurrent reader can't
+    observe experiments.json updated while experiment_projects.json lags)."""
+    with _state._cache_lock:
+        _safe_save_json(_state._EXPERIMENTS_FILE, entries, "Experiments")
+        _state._experiments_cache = _typed_clone(entries)
+        # Mirror inside the lock — hub-side via the hook.
+        _mirror = getattr(_state, "_sync_active_project_experiments_hook", None)
+        if _mirror is not None:
+            _mirror(entries)

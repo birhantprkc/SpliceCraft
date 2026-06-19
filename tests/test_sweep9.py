@@ -366,21 +366,26 @@ class TestSaveExperimentsMirrorInsideLock:
     def test_save_experiments_source_holds_lock_through_mirror(self):
         import inspect
         src = inspect.getsource(sc._save_experiments)
-        # The `_sync_active_project_experiments` call MUST appear
-        # before the `with _cache_lock` block exits. The simplest
-        # test: it appears at deeper indentation than the `with`
-        # statement line.
+        # The active-project mirror MUST fire before the cache-lock block
+        # exits. Phase D: `_save_experiments` moved to splicecraft_dataaccess
+        # and now (a) locks via `with _state._cache_lock:` and (b) fires the
+        # mirror through `_state._sync_active_project_experiments_hook` (the
+        # hub-side `_sync_active_project_experiments`, sweep #9 unchanged). The
+        # invariant is the same: the mirror-fire appears at deeper indentation
+        # than the `with` line, i.e. inside the locked block.
         lines = src.splitlines()
         with_indent = -1
         sync_indent = -1
         for ln in lines:
-            if with_indent < 0 and "with _cache_lock" in ln:
+            if (with_indent < 0
+                    and ln.lstrip().startswith("with ")
+                    and "_cache_lock" in ln):
                 with_indent = len(ln) - len(ln.lstrip())
             if (sync_indent < 0
-                    and "_sync_active_project_experiments(" in ln):
+                    and "_sync_active_project_experiments_hook" in ln):
                 sync_indent = len(ln) - len(ln.lstrip())
-        assert with_indent >= 0, "no `with _cache_lock` in source"
-        assert sync_indent >= 0, "no _sync_active_project_experiments call"
+        assert with_indent >= 0, "no `with ... _cache_lock` in source"
+        assert sync_indent >= 0, "no active-project mirror hook fired"
         # Sync must be inside the `with` block: greater indent.
         assert sync_indent > with_indent, (
             "_sync_active_project_experiments must be INSIDE the "
