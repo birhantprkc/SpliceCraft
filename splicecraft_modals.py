@@ -35,9 +35,10 @@ from textual.events import Click, MouseDown, MouseMove, MouseUp
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, DataTable, DirectoryTree, Input, Label, ListItem, ListView, RadioButton, RadioSet, Select, Static, TextArea
 
-from splicecraft_dataaccess import _NEB_ENZYMES, _collection_name_taken, _find_collection, _find_hmm_db_entry, _get_active_collection_name, _grammar_dropdown_options, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _load_collections, _load_feature_colors, _load_library, _load_primer_collections, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_collections
+from splicecraft_cloning import _simulate_cloned_plasmid, _simulate_primed_amplicon
+from splicecraft_dataaccess import _BUILTIN_GRAMMARS, _NEB_ENZYMES, _all_grammars, _collection_name_taken, _find_collection, _find_hmm_db_entry, _get_active_collection_name, _grammar_dropdown_options, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _load_collections, _load_feature_colors, _load_library, _load_primer_collections, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_collections
 from splicecraft_logging import _log, _log_event
-from splicecraft_util import _CONTROL_CHARS_RE, _PLASMID_STATUS_VALUES, _cursor_row_key, _natural_sort_key, _normalize_collection_name, _notify_save_failure, _sanitize_label, _sanitize_plasmid_name, _sanitize_plasmid_status, _scrub_path, _validate_group_members
+from splicecraft_util import _CONTROL_CHARS_RE, _PLASMID_STATUS_VALUES, _cursor_row_key, _natural_sort_key, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _sanitize_label, _sanitize_plasmid_name, _sanitize_plasmid_status, _scrub_path, _validate_group_members
 from splicecraft_widgets import _DEFAULT_TYPE_COLORS, _ExtensionAwareDirectoryTree, _FastaAwareDirectoryTree, _HEX6_RE, _InstantPressButton, _PICKER_PLASMID_STYLE, _PLASMID_STATUS_COLORS, _XtermColorGrid, _ZipAwareDirectoryTree, _markup_safe_color, _normalise_color_input, _xterm_index_to_hex
 
 
@@ -7291,3 +7292,517 @@ class PlasmidStatusPickerModal(_OneShotDismissScreen, ModalScreen):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+class PartEditModal(_OneShotDismissScreen, ModalScreen):
+    """View / edit a parts-bin row.
+
+    Read-only by default — `Edit` flips the form editable, `Save`
+    commits and dismisses with ``{"idx": <row idx>, "entry": <new
+    dict>}``, `Cancel` dismisses with ``None``.
+
+    Grammar is locked: changing it invalidates the type / position /
+    overhang semantics. Users who need to migrate a part to a
+    different grammar should delete + re-create through the
+    Domesticator. Type changes auto-fill position + overhangs from
+    the matching grammar position so the common "re-tag" edit
+    doesn't require manual oh re-entry.
+
+    Sequence + overhang edits trigger re-derivation of ``primed_seq``
+    / ``cloned_seq`` so the Copy Primed / Copy Cloned actions on the
+    Parts Bin keep serving the right amplicon. Primer edits re-run
+    the primer3 Tm calc (or fall back to 0.0 when primer3 is
+    unavailable).
+    """
+
+    _blocks_undo: bool = True   # Input editing; Save mutates parts bin
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    # IUPAC alphabet for DNA. Pre-built once at class scope so every
+    # save doesn't rebuild the lookup set. `frozenset` makes accidental
+    # mutation a TypeError.
+    _VALID_IUPAC = frozenset("ACGTRYWSMKBDHVN")
+
+    DEFAULT_CSS = """
+    #partedit-dlg {
+        width: 108; max-width: 95%; height: auto; max-height: 36;
+        background: $surface;
+        border: solid $accent;
+        padding: 1 2;
+    }
+    #partedit-title {
+        height: 1;
+        text-style: bold;
+        background: $accent;
+        color: $text;
+        padding: 0 1;
+        margin-bottom: 1; text-align: center;
+    }
+    /* Body sizes to content (auto), with overflow scroll as a safety
+       net for sub-baseline terminals. */
+    #partedit-body { height: auto; padding: 0 1; overflow-y: auto; }
+    #partedit-body Label { color: $text-muted; margin: 0; height: 1; }
+    /* Each label+input pair is 4 rows: 1 label + 3 input/select.
+       No margin-top between rows — borders give enough separation. */
+    #partedit-row1, #partedit-row2,
+    #partedit-row3, #partedit-row4 { height: 4; }
+    /* Row 1: Name (3fr) | Grammar (2fr) | Type (2fr) — Name leads because it's
+       the field users actually read + edit, and a long part name was cramped
+       at 2fr (too narrow to see the words); grammar is a real Select so a part
+       can be re-tagged to a different cloning grammar from this modal. */
+    #partedit-row1 #partedit-name-col    { width: 3fr; padding-right: 1; }
+    #partedit-row1 #partedit-grammar-col { width: 2fr; padding-right: 1; }
+    #partedit-row1 #partedit-type-col    { width: 2fr; }
+    /* Row 2: 5'OH | 3'OH | Position. Position widens to 2fr because
+       its values ("Pos 3-4 (CDS)") are wider than 4-bp overhangs. */
+    #partedit-row2 #partedit-oh5-col      { width: 1fr; padding-right: 1; }
+    #partedit-row2 #partedit-oh3-col      { width: 1fr; padding-right: 1; }
+    #partedit-row2 #partedit-position-col { width: 2fr; }
+    /* Rows 3 / 4: pairs of equal-width columns. */
+    #partedit-row3 Vertical,
+    #partedit-row4 Vertical { width: 1fr; padding-right: 1; }
+    #partedit-seq { height: 6; border: solid $primary-darken-1; margin-top: 1; }
+    #partedit-status { height: 1; padding: 0 1; }
+    #partedit-btns { align: right middle;  height: 3; margin-top: 1; }
+    #partedit-btns Button { margin-right: 1; }
+    """
+
+    def __init__(self, idx: int, part: dict) -> None:
+        super().__init__()
+        self._idx = idx
+        # Defensive copy so partial edits don't leak back if the user
+        # cancels — the committed dict is rebuilt from the form widgets
+        # at Save time, so this snapshot only matters for the read-only
+        # initial render.
+        self._part = dict(part)
+        self._editing = False
+        # Grammar id is the source of truth — `_grammar` and
+        # `_position_index` are derived caches refreshed by
+        # `_apply_grammar` whenever the user picks a different
+        # grammar from the dropdown. Storing the id (not the dict)
+        # keeps a stale grammar from leaking after a re-pick.
+        self._grammar_id: str = self._part.get("grammar", "gb_l0") or "gb_l0"
+        self._grammar: dict = {}
+        self._position_index: dict[str, dict] = {}
+        self._apply_grammar(self._grammar_id, refresh_widgets=False)
+
+    def _apply_grammar(self, gid: str, *, refresh_widgets: bool) -> None:
+        """Snap `_grammar` + `_position_index` to the grammar with id
+        ``gid``. Falls back to ``gb_l0`` for an unknown id (e.g., a
+        custom grammar that was deleted while the modal was open).
+
+        ``refresh_widgets=True`` rebuilds the Type select and refreshes
+        the position / overhang inputs from the new grammar's matching
+        position. Pass False from `__init__` (widgets don't exist
+        yet) and True from the grammar-change handler.
+        """
+        all_g = _all_grammars()
+        new_grammar = all_g.get(gid) or _BUILTIN_GRAMMARS["gb_l0"]
+        self._grammar_id = gid if gid in all_g else "gb_l0"
+        self._grammar = new_grammar
+        self._position_index = {}
+        for pos in new_grammar.get("positions", []):
+            ptype = pos.get("type")
+            if (isinstance(ptype, str) and ptype
+                    and ptype not in self._position_index):
+                self._position_index[ptype] = pos
+        if not refresh_widgets:
+            return
+
+        # Preserve the user's current type if it survives the grammar
+        # change; otherwise default to the first option.
+        try:
+            type_sel = self.query_one("#partedit-type", Select)
+            cur_val = type_sel.value
+        except NoMatches:
+            return
+        cur_type = (cur_val if isinstance(cur_val, str)
+                    and cur_val != Select.BLANK else "")
+        opts, _ = self._type_options(cur_type)
+        new_type = (cur_type if cur_type and cur_type in self._position_index
+                    else (opts[0][1] if opts else ""))
+        type_sel.set_options(opts)
+        if new_type:
+            type_sel.value = new_type
+        # Refresh position / overhang inputs from the new grammar's
+        # matching position so the form is internally consistent
+        # immediately after the grammar pick.
+        pos = self._position_index.get(new_type)
+        if pos is not None:
+            for sel, key, upper in (
+                ("#partedit-position", "name", False),
+                ("#partedit-oh5",       "oh5",  True),
+                ("#partedit-oh3",       "oh3",  True),
+            ):
+                try:
+                    val = str(pos.get(key, "") or "")
+                    self.query_one(sel, Input).value = (
+                        val.upper() if upper else val
+                    )
+                except NoMatches:
+                    pass
+
+    def _type_options(self, current_type: "str | None" = None) -> tuple[list[tuple[str, str]], str]:
+        """Build ``(label, ptype)`` options for the Type select keyed
+        off the active grammar's positions. ``current_type`` (if
+        non-empty + not in the grammar) is added with a ``(legacy)``
+        suffix so a Save round-trips it without silently rewriting
+        the field. A grammar with no positions yields a placeholder
+        so the Select widget composes (Select with ``allow_blank=False``
+        and an empty list raises at mount)."""
+        opts: list[tuple[str, str]] = []
+        for ptype, pos in self._position_index.items():
+            label = (
+                f"{ptype}  ({pos.get('name','?')}: "
+                f"{pos.get('oh5','')}→{pos.get('oh3','')})"
+            )
+            opts.append((label, ptype))
+        current = current_type if current_type is not None else (
+            self._part.get("type", "") or ""
+        )
+        if current and current not in self._position_index:
+            opts.insert(0, (f"{current} (legacy)", current))
+        if not opts:
+            # Pathological grammar (no positions, no part type). Surface
+            # an inert placeholder rather than crashing the Select.
+            opts = [("(no types defined)", "")]
+        default = (current
+                   if current and any(v == current for _, v in opts)
+                   else opts[0][1])
+        return opts, default
+
+    def _validate_iupac_chars(self, label: str, value: str,
+                               status_widget) -> bool:
+        """Render a red status + return False if ``value`` contains
+        any non-IUPAC bases. Empty string passes. Used by every DNA
+        field on save (sequence, overhangs, primers) so the error
+        format stays consistent and the validation block doesn't
+        repeat 4 times in `_on_save`."""
+        if not value:
+            return True
+        bad = [c for c in value if c not in self._VALID_IUPAC]
+        if not bad:
+            return True
+        if status_widget is not None:
+            status_widget.update(
+                f"[red]{label} has invalid bases: "
+                f"{''.join(sorted(set(bad)))[:10]}[/red]"
+            )
+        return False
+
+    def _primer_label(self, base: str, tm: object) -> str:
+        """Format a primer field label including its current Tm so
+        the user knows what Tm they're editing against. ``tm`` is
+        coerced to float when possible; non-numeric / zero values
+        render as a plain label without a Tm suffix."""
+        try:
+            tm_f = float(tm)  # type: ignore[arg-type] # handles int, str-of-float, np.float64
+        except (TypeError, ValueError):
+            tm_f = 0.0
+        if tm_f > 0:
+            return f"{base} (Tm {tm_f:.1f}°C):"
+        return f"{base}:"
+
+    def compose(self) -> ComposeResult:
+        type_options, default_type = self._type_options()
+        # Grammar dropdown — the canonical option list shared with the
+        # Domesticator + future grammar pickers. The part's stored
+        # grammar is selected by default; if it's not in the registry
+        # (e.g., a custom grammar deleted since the part was saved)
+        # we splice it in with a "(missing)" suffix so a Save still
+        # round-trips the value rather than silently rewriting it.
+        grammar_options = list(_grammar_dropdown_options())
+        if not any(gid == self._grammar_id for _, gid in grammar_options):
+            grammar_options.insert(
+                0, (f"{self._grammar_id} (missing)", self._grammar_id),
+            )
+        p = self._part
+        # Title interpolates the part name verbatim. Static defaults to
+        # markup=True, which would interpret a name like "[red]X" as
+        # Rich markup. markup=False renders the name literally.
+        with Vertical(id="partedit-dlg"):
+            yield Static(f" Part: {p.get('name', '?')} ",
+                         id="partedit-title", markup=False)
+            with ScrollableContainer(id="partedit-body"):
+                # Row 1 — identity: Name | Grammar | Type
+                with Horizontal(id="partedit-row1"):
+                    with Vertical(id="partedit-name-col"):
+                        yield Label("Name:")
+                        yield Input(value=p.get("name", ""),
+                                     id="partedit-name", disabled=True)
+                    with Vertical(id="partedit-grammar-col"):
+                        yield Label("Cloning grammar:")
+                        yield Select(grammar_options,
+                                      value=self._grammar_id,
+                                      id="partedit-grammar",
+                                      allow_blank=False, disabled=True)
+                    with Vertical(id="partedit-type-col"):
+                        yield Label("Type:")
+                        yield Select(type_options, value=default_type,
+                                     id="partedit-type",
+                                     allow_blank=False, disabled=True)
+                # Row 2 — cloning context: 5'OH | 3'OH | Position
+                with Horizontal(id="partedit-row2"):
+                    with Vertical(id="partedit-oh5-col"):
+                        yield Label("5' overhang:")
+                        yield Input(value=p.get("oh5", ""),
+                                     id="partedit-oh5", disabled=True)
+                    with Vertical(id="partedit-oh3-col"):
+                        yield Label("3' overhang:")
+                        yield Input(value=p.get("oh3", ""),
+                                     id="partedit-oh3", disabled=True)
+                    with Vertical(id="partedit-position-col"):
+                        yield Label("Position:")
+                        yield Input(value=p.get("position", ""),
+                                     id="partedit-position", disabled=True)
+                # Row 3 — vector: Backbone | Selection marker
+                with Horizontal(id="partedit-row3"):
+                    with Vertical():
+                        yield Label("Backbone:")
+                        yield Input(value=p.get("backbone", ""),
+                                     id="partedit-backbone", disabled=True)
+                    with Vertical():
+                        yield Label("Selection marker:")
+                        yield Input(value=p.get("marker", ""),
+                                     id="partedit-marker", disabled=True)
+                # Row 4 — primers (Tms shown in labels)
+                with Horizontal(id="partedit-row4"):
+                    with Vertical():
+                        yield Label(self._primer_label("Forward primer",
+                                                         p.get("fwd_tm")))
+                        yield Input(value=p.get("fwd_primer", ""),
+                                     id="partedit-fwd", disabled=True)
+                    with Vertical():
+                        yield Label(self._primer_label("Reverse primer",
+                                                         p.get("rev_tm")))
+                        yield Input(value=p.get("rev_primer", ""),
+                                     id="partedit-rev", disabled=True)
+                seq = p.get("sequence", "")
+                seq_ta = TextArea(seq, id="partedit-seq",
+                                   read_only=True, soft_wrap=True)
+                seq_ta.border_title = (
+                    f"Insert sequence  (5'→3', {len(seq):,} bp)"
+                )
+                yield seq_ta
+            yield Static("", id="partedit-status", markup=True)
+            with Horizontal(id="partedit-btns"):
+                yield Button("Edit",   id="btn-partedit-edit",
+                             variant="primary")
+                yield Button("Save",   id="btn-partedit-save",
+                             variant="success", disabled=True)
+                yield Button("Cancel", id="btn-partedit-cancel")
+
+    def _set_editing(self, on: bool) -> None:
+        """Toggle every form field between read-only and editable.
+        TextArea uses `read_only`; everything else uses `disabled` —
+        Inputs in the disabled state still show their value clearly,
+        which is the right read-mode look."""
+        self._editing = on
+        for sel in (
+            "#partedit-name", "#partedit-grammar", "#partedit-type",
+            "#partedit-oh5", "#partedit-oh3",
+            "#partedit-position",
+            "#partedit-backbone", "#partedit-marker",
+            "#partedit-fwd", "#partedit-rev",
+        ):
+            try:
+                self.query_one(sel).disabled = not on
+            except NoMatches:
+                pass
+        try:
+            self.query_one("#partedit-seq", TextArea).read_only = not on
+        except NoMatches:
+            pass
+        try:
+            self.query_one("#btn-partedit-edit", Button).display = not on
+            self.query_one("#btn-partedit-save", Button).disabled = not on
+        except NoMatches:
+            pass
+        if on:
+            try:
+                self.query_one("#partedit-name", Input).focus()
+            except NoMatches:
+                pass
+
+    @on(Button.Pressed, "#btn-partedit-edit")
+    def _on_edit(self) -> None:
+        self._set_editing(True)
+        try:
+            self.query_one("#partedit-status", Static).update(
+                "[dim]Edit mode — make changes and press Save.[/dim]"
+            )
+        except NoMatches:
+            pass
+
+    @on(Select.Changed, "#partedit-grammar")
+    def _on_grammar_changed(self, event: Select.Changed) -> None:
+        """Grammar change → swap the active grammar, rebuild the Type
+        select, and refresh position / overhangs from the new
+        grammar's matching position. No-op in read-only mode and on
+        the initial Select.Changed that fires during compose."""
+        if not self._editing:
+            return
+        new_gid = (event.value
+                    if isinstance(event.value, str) else "")
+        if not new_gid or new_gid == self._grammar_id:
+            return
+        self._apply_grammar(new_gid, refresh_widgets=True)
+        try:
+            self.query_one("#partedit-status", Static).update(
+                "[dim]Grammar updated — overhangs refreshed for the "
+                "new grammar.[/dim]"
+            )
+        except NoMatches:
+            pass
+
+    @on(Select.Changed, "#partedit-type")
+    def _on_type_changed(self, event: Select.Changed) -> None:
+        """Type change → prefill position + overhangs from the
+        grammar's matching position so re-tagging a part doesn't
+        require manual oh re-entry. No-op while in read-only mode
+        (Select.Changed fires on initial render too)."""
+        if not self._editing:
+            return
+        ptype = event.value if isinstance(event.value, str) else ""
+        pos = self._position_index.get(ptype) if ptype else None
+        if not pos:
+            return
+        try:
+            pos_inp = self.query_one("#partedit-position", Input)
+            oh5_inp = self.query_one("#partedit-oh5",      Input)
+            oh3_inp = self.query_one("#partedit-oh3",      Input)
+        except NoMatches:
+            return
+        pos_inp.value = pos.get("name", pos_inp.value)
+        oh5_inp.value = (pos.get("oh5", "") or "").upper()
+        oh3_inp.value = (pos.get("oh3", "") or "").upper()
+
+    @on(Button.Pressed, "#btn-partedit-cancel")
+    def _on_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        # Required so the `escape` binding actually closes the modal —
+        # `Binding("escape", "cancel", …)` dispatches to `action_cancel`,
+        # which `ModalScreen` doesn't supply by default. Without this,
+        # Escape would be silently swallowed.
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#btn-partedit-save")
+    def _on_save(self) -> None:
+        if not self._editing:
+            return
+        try:
+            name     = self.query_one("#partedit-name",     Input).value
+            ptype    = self.query_one("#partedit-type",     Select).value
+            oh5      = self.query_one("#partedit-oh5",      Input).value
+            oh3      = self.query_one("#partedit-oh3",      Input).value
+            position = self.query_one("#partedit-position", Input).value
+            backbone = self.query_one("#partedit-backbone", Input).value
+            marker   = self.query_one("#partedit-marker",   Input).value
+            fwd      = self.query_one("#partedit-fwd",      Input).value
+            rev      = self.query_one("#partedit-rev",      Input).value
+            seq_text = self.query_one("#partedit-seq",      TextArea).text
+        except NoMatches:
+            return
+        try:
+            status = self.query_one("#partedit-status", Static)
+        except NoMatches:
+            status = None
+
+        # ── Sanitise form values ────────────────────────────────────
+        clean_name = _sanitize_label(name, max_len=200)
+        if not clean_name:
+            if status:
+                status.update("[red]Name cannot be empty.[/red]")
+            return
+        clean_ptype = _sanitize_label(str(ptype) if ptype else "", max_len=64)
+        if not clean_ptype:
+            if status:
+                status.update("[red]Type cannot be empty.[/red]")
+            return
+        clean_seq = "".join(str(seq_text or "").split()).upper()
+        clean_oh5 = "".join(str(oh5 or "").split()).upper()
+        clean_oh3 = "".join(str(oh3 or "").split()).upper()
+        clean_fwd = "".join(str(fwd or "").split()).upper()
+        clean_rev = "".join(str(rev or "").split()).upper()
+
+        # ── DNA validation (one helper, four call sites) ───────────
+        for label_, val in (
+            ("Sequence",       clean_seq),
+            ("5' OH",          clean_oh5),
+            ("3' OH",          clean_oh3),
+            ("Forward primer", clean_fwd),
+            ("Reverse primer", clean_rev),
+        ):
+            if not self._validate_iupac_chars(label_, val, status):
+                return
+
+        # ── Build updated entry ─────────────────────────────────────
+        # Preserve any unrelated fields the user didn't see (schema-
+        # version stamps, legacy qualifiers) so partial schemas survive.
+        out = dict(self._part)
+        out["name"]       = clean_name
+        out["type"]       = clean_ptype
+        out["position"]   = _sanitize_label(position, max_len=64)
+        out["oh5"]        = clean_oh5
+        out["oh3"]        = clean_oh3
+        out["backbone"]   = _sanitize_label(backbone, max_len=120)
+        out["marker"]     = _sanitize_label(marker,   max_len=120)
+        out["sequence"]   = clean_seq
+        out["fwd_primer"] = clean_fwd
+        out["rev_primer"] = clean_rev
+        out["grammar"]    = self._grammar_id
+        # Re-derive Tms whenever the primer text changed (including
+        # the empty → empty no-op via the equality short-circuit, so
+        # we don't burn a primer3 call on a value the user didn't
+        # touch). Round to 0.1 °C for stable JSON round-trips.
+        if clean_fwd != self._part.get("fwd_primer", ""):
+            tm = _primer_tm_safe(clean_fwd)
+            out["fwd_tm"] = round(float(tm), 1) if tm is not None else 0.0
+        if clean_rev != self._part.get("rev_primer", ""):
+            tm = _primer_tm_safe(clean_rev)
+            out["rev_tm"] = round(float(tm), 1) if tm is not None else 0.0
+        # Re-derive simulator outputs when sequence, overhangs, OR
+        # grammar changed (different grammar → different enzyme tail
+        # in `primed_seq`). Empty sequence drops the derived fields so
+        # a user who hand-clears the seq doesn't ship a stale primed
+        # amplicon to Copy Primed.
+        seq_or_oh_changed = (
+            clean_seq != self._part.get("sequence", "")
+            or clean_oh5 != self._part.get("oh5", "")
+            or clean_oh3 != self._part.get("oh3", "")
+            or self._grammar_id != (self._part.get("grammar") or "gb_l0")
+        )
+        if seq_or_oh_changed:
+            if clean_seq:
+                out["primed_seq"] = _simulate_primed_amplicon(
+                    clean_seq, clean_oh5, clean_oh3, grammar=self._grammar,
+                    part_type=clean_ptype,
+                )
+                out["cloned_seq"] = _simulate_cloned_plasmid(
+                    clean_seq, clean_oh5, clean_oh3, clean_ptype,
+                )
+            else:
+                out.pop("primed_seq", None)
+                out.pop("cloned_seq", None)
+
+        # No-op detection: if every comparable field round-trips
+        # unchanged, dismiss without writing the file. Avoids burning
+        # a JSON write + UI repopulate when the user clicked Edit
+        # → Save with no actual modifications. Derived fields (Tm /
+        # primed_seq / cloned_seq) follow from the exposed set, so
+        # only comparing exposed fields is sufficient.
+        exposed = ("name", "type", "position", "oh5", "oh3",
+                   "backbone", "marker", "sequence",
+                   "fwd_primer", "rev_primer", "grammar")
+        original_grammar = self._part.get("grammar") or "gb_l0"
+        baseline = {**self._part, "grammar": original_grammar}
+        if all(out.get(k, "") == baseline.get(k, "") for k in exposed):
+            self.dismiss(None)
+            return
+        self.dismiss({"idx": self._idx, "entry": out})

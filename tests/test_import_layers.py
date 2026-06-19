@@ -49,7 +49,7 @@ _LAYER_RULES = [
     ("splicecraft_history", 2),
     ("splicecraft_widgets", 3),
     ("splicecraft_modals", 4),
-    ("splicecraft_cloning", 5),
+    ("splicecraft_cloning", 3),  # construction sim: imports history L2/dataaccess L1, used by modals L4
     ("splicecraft_screens", 6),
     ("splicecraft_agent", 7),
     ("splicecraft_live_ref", 8),
