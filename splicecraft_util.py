@@ -12,6 +12,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from splicecraft_logging import _log, _log_event
+
 
 _NATURAL_SORT_RE = re.compile(r"(\d+)")
 
@@ -154,3 +156,132 @@ def _split_default_export_path(default_path: str, fallback_filename: str
     except OSError:
         parent = Path.home()
     return (str(parent), filename)
+
+
+# ── Save-failure notifier + display formatters (moved from hub, Phase D) ────
+def _notify_save_failure(app, label: str, exc: BaseException,
+                          *, severity: str = "error") -> None:
+    """Surface a save failure to the user via the app's notify channel.
+    Wraps every `_save_*` call site that needs to recover gracefully
+    when disk-full / RO-mount / EACCES bubbles out of `_safe_save_json`.
+
+    Per sacred invariant #7, `_safe_save_json` re-raises on failure so
+    callers can notify; this helper makes the notify pattern uniform
+    rather than each call site composing its own message.
+
+    `app` may be `None` (test contexts that don't run an App). Falls
+    back to logging only.
+
+    Emits a structured `save.failed` event so AI parsers of bug-report
+    log dumps can correlate the failure target + exception class
+    without regex-scraping the human-readable `Save failed for X` log
+    line. Sweep #5 — pre-fix, 30+ save sites went through this helper
+    silently from a structured-event perspective.
+    """
+    _log.exception("Save failed for %s", label)
+    _log_event("save.failed", target=label,
+                exc_type=type(exc).__name__,
+                exc_msg=str(exc))
+    msg = f"{label} save failed: {exc}"
+    if app is None:
+        return
+    try:
+        app.notify(msg, severity=severity, timeout=12)
+    except Exception:
+        # If notify itself fails (no app, no screen mounted yet) we've
+        # already logged via _log.exception — that's enough.
+        pass
+
+
+def _format_identity_pct(pct: "float | int | None", *,
+                         decimals: int = 1) -> str:
+    """Format an alignment identity percentage for a compact table cell
+    such that a value below 100% NEVER renders as ``"100%"``.
+
+    The naïve ``f"{v:.1f}%"`` rounds 99.99% up to ``"100.0%"`` — which
+    then reads as a perfect alignment even though `_identity_pct_color`
+    (strict ``>= 100.0`` → light-blue) correctly keeps the cell *green*.
+    The user flagged exactly that contradiction ("says 100% but it's
+    green") for a one-bp mismatch in an 18 kb plasmid. Here, when
+    rounding at ``decimals`` places would land on "100", precision is
+    escalated one place at a time (capped at 4) until the rendered
+    number is strictly < 100, so the same alignment shows e.g.
+    ``"99.99%"`` instead. A genuine 100.0 (``n_matches == aligned_cols``)
+    still renders the clean ``"100%"`` — no decimals — so a true perfect
+    match is visually distinct from a near-perfect one at a glance.
+
+    A value pathologically close to but below 100 (e.g. 99.999999, which
+    rounds to "100.0000" even at 4 places) renders ``"<100%"`` rather
+    than implying perfection. Non-numeric / None → ``"—"`` (no tier
+    implied — matches `_identity_pct_color`'s neutral handling).
+    """
+    if pct is None:
+        return "—"
+    try:
+        v = float(pct)
+    except (TypeError, ValueError):
+        return "—"
+    # Use the SAME strict ``>= 100.0`` boundary as `_identity_pct_color`
+    # so the number and the colour can never disagree about perfection.
+    if v >= 100.0:
+        return "100%"
+    d = max(0, int(decimals))
+    for places in range(d, 5):
+        s = f"{v:.{places}f}"
+        try:
+            shown = float(s)
+        except ValueError:
+            break
+        if shown < 100.0:
+            return f"{s}%"
+    return "<100%"
+
+
+def _sanitize_plasmid_name(raw: str, *,
+                            fallback: str = "assembly",
+                            max_len: int = 60) -> str:
+    """Clean a user-entered plasmid name for safe storage in the
+    library / parts bin and for use as a SeqRecord ``id`` / ``name``.
+
+    Strips control chars (including NUL — would break C-string-style
+    handling in downstream tools), trims whitespace, and truncates
+    to ``max_len`` chars to keep DataTable rows from blowing the
+    row width. Empty / whitespace-only input falls back to
+    ``fallback`` so the caller never gets a zero-length string.
+
+    Forbidden character set is conservative: only printable ASCII +
+    Unicode letters / digits / a small punctuation set (``_-+. ·:``).
+    Colons are kept because the constructor uses them in source
+    annotations (``constructor:gid:role``); slashes and backslashes
+    are dropped because they look like paths and tools commonly
+    interpret them as such.
+    """
+    if not isinstance(raw, str):
+        raw = str(raw or "")
+    # Whitespace control chars (\t \n \r \v \f) become spaces FIRST so
+    # they don't silently fuse adjacent words after the control-strip
+    # pass. e.g. ``"foo\tbar"`` becomes ``"foo bar"``, not ``"foobar"``.
+    for ch in "\t\n\r\v\f":
+        raw = raw.replace(ch, " ")
+    # Drop NUL + remaining C0 control chars (\x00–\x1F + \x7F) — these
+    # never belong in a user-facing identifier and break naive
+    # C-string handling in some downstream tools.
+    cleaned = "".join(
+        ch for ch in raw
+        if (ord(ch) >= 0x20 and ord(ch) != 0x7F)
+    )
+    # Drop path-like separators outright — a name like
+    # ``../../etc/passwd`` becomes ``etc passwd`` after this filter,
+    # so even a malicious agent prompt can't escape into a file path
+    # via the library-save flow downstream.
+    for ch in "/\\":
+        cleaned = cleaned.replace(ch, " ")
+    # Normalise whitespace runs to single spaces; lots of tools
+    # render multiple spaces awkwardly in TUI tables.
+    cleaned = " ".join(cleaned.split())
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return fallback
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip()
+    return cleaned or fallback
