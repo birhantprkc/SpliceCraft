@@ -180,3 +180,14 @@ _SAFE_LOAD_JSON_MAX_BYTES: int = 1024 * 1024 * 1024   # 1 GB
 # `_safe_load_json` reads this name to skip the snapshots tree when scanning
 # for backups; hub snapshot code owns the retention/size tunables.
 _SNAPSHOT_DIR_NAME: str = "snapshots"
+
+# Blob-store dehydration hooks (Phase B-main). The persistence engine's single
+# write chokepoint (`_safe_save_json`) replaces inline `gb_text` with a
+# content-addressed `gb_ref` for the library + collections files. The transform
+# lives in the hub-side blob subsystem; the hub registers it here at import
+# (`_state._dehydrate_entries_hook = _dehydrate_entries`) so the engine can call
+# it WITHOUT importing the hub — keeping the engine sibling's deps to stdlib +
+# _state + logger. None only during the import window (no save runs then); a
+# registration regression is caught loudly by test_blob_store, not silently.
+_dehydrate_entries_hook: "_Callable[[list], list] | None" = None
+_dehydrate_collections_hook: "_Callable[[list], list] | None" = None

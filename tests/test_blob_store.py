@@ -486,3 +486,32 @@ class TestOrphanBlobGC:
         q = (sc._plasmid_blob_dir() / sc._BLOB_ORPHAN_DIR_NAME / f"{ref}.gb")
         sc._prune_blob_quarantine(q.parent)               # fresh → kept
         assert q.is_file()
+
+
+class TestDehydrateHookWiring:
+    """The persistence engine calls blob dehydration through a _state hook
+    (Phase B-main) so it stays decoupled from the hub-side blob subsystem. The
+    hub MUST register the hooks at import; a regression here would silently let
+    library/collections saves write un-dehydrated inline gb_text."""
+
+    def test_hooks_registered_to_hub_functions(self):
+        assert sc._state._dehydrate_entries_hook is sc._dehydrate_entries
+        assert sc._state._dehydrate_collections_hook is sc._dehydrate_collections
+
+    def test_engine_save_dehydrates_via_hook(self):
+        # Saving the library file must replace inline gb_text with a gb_ref.
+        # (conftest's _protect_user_data already authorizes writes.)
+        sc._save_library([{"id": "p1", "name": "p1", "gb_text": GB}])
+        raw = json.loads(sc._state._LIBRARY_FILE.read_text(encoding="utf-8"))
+        entry = raw["entries"][0]
+        assert "gb_text" not in entry and entry.get("gb_ref"), (
+            "engine save did not dehydrate via the _state hook"
+        )
+
+    def test_hook_none_skips_dehydration(self, monkeypatch):
+        # With the hook cleared, the save path leaves gb_text inline (no crash,
+        # abort-don't-corrupt): the `is not None` guard covers the import window.
+        monkeypatch.setattr(sc._state, "_dehydrate_entries_hook", None)
+        sc._save_library([{"id": "p2", "name": "p2", "gb_text": GB}])
+        raw = json.loads(sc._state._LIBRARY_FILE.read_text(encoding="utf-8"))
+        assert raw["entries"][0].get("gb_text") == GB
