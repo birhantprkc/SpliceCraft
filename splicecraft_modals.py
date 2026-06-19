@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 
+from datetime import date as _date
 from pathlib import Path
 from rich.text import Text
 from textual import on
@@ -34,9 +35,9 @@ from textual.events import Click, MouseDown, MouseMove, MouseUp
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, DataTable, DirectoryTree, Input, Label, ListItem, ListView, RadioButton, RadioSet, Select, Static, TextArea
 
-from splicecraft_dataaccess import _NEB_ENZYMES, _collection_name_taken, _get_active_collection_name, _grammar_dropdown_options, _iter_collections_readonly, _iter_library_readonly, _load_feature_colors, _load_library, _load_primer_collections
+from splicecraft_dataaccess import _NEB_ENZYMES, _collection_name_taken, _find_collection, _find_hmm_db_entry, _get_active_collection_name, _grammar_dropdown_options, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _load_collections, _load_feature_colors, _load_library, _load_primer_collections, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_collections
 from splicecraft_logging import _log, _log_event
-from splicecraft_util import _cursor_row_key, _natural_sort_key, _normalize_collection_name, _sanitize_label, _sanitize_plasmid_name
+from splicecraft_util import _cursor_row_key, _natural_sort_key, _normalize_collection_name, _notify_save_failure, _sanitize_label, _sanitize_plasmid_name, _scrub_path
 from splicecraft_widgets import _DEFAULT_TYPE_COLORS, _ExtensionAwareDirectoryTree, _FastaAwareDirectoryTree, _HEX6_RE, _InstantPressButton, _PICKER_PLASMID_STYLE, _XtermColorGrid, _ZipAwareDirectoryTree, _markup_safe_color, _normalise_color_input, _xterm_index_to_hex
 
 
@@ -6448,3 +6449,449 @@ class ColorPickerModal(_OneShotDismissScreen, ModalScreen):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+class HmmDbAddEditModal(ModalScreen):
+    """Add / edit a custom HMM database catalog entry. Three Inputs:
+    display name, source URL, optional version-check URL. On submit,
+    dismisses with a normalised entry dict (or None on cancel).
+
+    Mode is `("add", "")` for a new entry or `("edit", entry_id)` to
+    pre-fill the form with an existing entry. Builtin entries can
+    only have their URL overridden (id + name preserved + builtin
+    flag stays True); user-added entries are fully editable.
+    """
+
+    # Sweep #28: TextArea/Input inside → Ctrl+Z would leak to canvas.
+    _blocks_undo: bool = True
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, *, mode: str = "add",
+                 entry_id: "str | None" = None,
+                 **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._mode = mode
+        self._entry_id = entry_id or ""
+        self._existing: "dict | None" = None
+        if mode == "edit" and entry_id:
+            self._existing = _find_hmm_db_entry(entry_id)
+        # Sweep #50 double-fire guard.
+        self._dismissed: bool = False
+
+    def _dismiss_once(self, result) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(result)
+
+    def compose(self) -> ComposeResult:
+        title = ("Add HMM database" if self._mode == "add"
+                 else "Edit HMM database")
+        with Vertical(id="hmmdb-form-dlg"):
+            yield Static(f" {title} ", id="hmmdb-form-title")
+            yield Label("Display name (used in the BLAST modal picker):")
+            yield Input(
+                value=str(self._existing.get("name", "")
+                          if self._existing else ""),
+                placeholder="e.g. Dfam, my-organism HMMs",
+                id="hmmdb-form-name",
+                disabled=bool(self._existing
+                              and self._existing.get("builtin")),
+            )
+            yield Label("Source URL (must point at a gzipped HMMER3 "
+                        "`.hmm.gz` file):")
+            yield Input(
+                value=str(self._existing.get("url", "")
+                          if self._existing else ""),
+                placeholder="https://…/database.hmm.gz",
+                id="hmmdb-form-url",
+            )
+            yield Label("Optional: version-check URL (small file, "
+                        "polled for update-detection):")
+            yield Input(
+                value=str(self._existing.get("version_url", "")
+                          if self._existing else ""),
+                placeholder="https://…/version (leave blank for "
+                            "HEAD-on-source fallback)",
+                id="hmmdb-form-version-url",
+            )
+            yield Label("Optional: short description:")
+            yield Input(
+                value=str(self._existing.get("description", "")
+                          if self._existing else ""),
+                placeholder="What's in this database?",
+                id="hmmdb-form-desc",
+            )
+            yield Static("", id="hmmdb-form-status", markup=True)
+            with Horizontal(id="hmmdb-form-btns"):
+                yield Button("Save", id="btn-hmmdb-form-save",
+                             variant="primary")
+                yield Button("Cancel", id="btn-hmmdb-form-cancel")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#hmmdb-form-name", Input).focus()
+        except NoMatches:
+            pass
+
+    def _set_status(self, msg: str) -> None:
+        try:
+            self.query_one("#hmmdb-form-status", Static).update(msg)
+        except NoMatches:
+            pass
+
+    @on(Button.Pressed, "#btn-hmmdb-form-save")
+    def _save_btn(self, _) -> None:
+        try:
+            name = self.query_one("#hmmdb-form-name", Input).value.strip()
+            url  = self.query_one("#hmmdb-form-url",  Input).value.strip()
+            vurl = self.query_one("#hmmdb-form-version-url",
+                                    Input).value.strip()
+            desc = self.query_one("#hmmdb-form-desc",
+                                    Input).value.strip()
+        except NoMatches:
+            return
+        # For builtin edits, name + id stay; only URL overrides.
+        if self._existing and self._existing.get("builtin"):
+            entry_id = self._existing["id"]
+            display_name = self._existing.get("name") or entry_id
+            builtin_flag = True
+        else:
+            # User add: id = sanitise(name). Reject if id collides.
+            if not name:
+                self._set_status("[red]Display name is required.[/red]")
+                return
+            entry_id = _sanitize_hmm_db_id(
+                name.replace(" ", "_").lower()
+            )
+            if entry_id is None:
+                self._set_status(
+                    "[red]Name can't be reduced to a valid id "
+                    "(letters, digits, `_`, `-` only).[/red]"
+                )
+                return
+            display_name = name[:200]
+            builtin_flag = False
+            if self._mode == "add" and _find_hmm_db_entry(entry_id):
+                self._set_status(
+                    f"[red]An entry with id [b]{entry_id}[/b] already "
+                    f"exists. Pick a different name.[/red]"
+                )
+                return
+            if _hmm_db_name_taken(
+                display_name,
+                exclude_id=(self._existing or {}).get("id"),
+            ):
+                self._set_status(
+                    f"[red]Display name [b]{display_name}[/b] is "
+                    f"taken.[/red]"
+                )
+                return
+        if _sanitize_hmm_db_url(url) is None:
+            self._set_status(
+                "[red]URL must be a well-formed http(s):// link "
+                "with no whitespace.[/red]"
+            )
+            return
+        if vurl and _sanitize_hmm_db_url(vurl) is None:
+            self._set_status(
+                "[red]Version URL invalid — must be http(s):// or "
+                "blank.[/red]"
+            )
+            return
+        normalised = _normalise_hmm_db_entry({
+            "id":          entry_id,
+            "name":        display_name,
+            "url":         url,
+            "version_url": vurl,
+            "format":      "hmm-gz",
+            "builtin":     builtin_flag,
+            "description": desc,
+        })
+        if normalised is None:
+            self._set_status(
+                "[red]Could not save — entry failed validation.[/red]"
+            )
+            return
+        self._dismiss_once(normalised)
+
+    @on(Button.Pressed, "#btn-hmmdb-form-cancel")
+    def _cancel_btn(self, _) -> None:
+        self._dismiss_once(None)
+
+    def action_cancel(self) -> None:
+        self._dismiss_once(None)
+
+
+class MoveCopyToCollectionModal(ModalScreen):
+    """Sweep #28: target-collection picker for bulk-move / bulk-copy.
+
+    For mode=="move", the source collection is hidden from the list
+    (moving into itself is a no-op). For mode=="copy", the source
+    appears in the list labelled as "(duplicate here)" so the user
+    can clone marked plasmids in-place inside the active collection —
+    each landing gets a " COPY" / " COPY 2" suffix via the same
+    collision-rename path used for cross-collection copies.
+
+    Dismisses with the picked target name (str) on confirm, or None
+    on cancel. The caller (PlasmidApp's
+    `on_library_panel_move_copy_requested` handler) runs the actual
+    transactional commit.
+
+    Hardening:
+      * `_blocks_undo = True` — modal has Input focus via the search
+        field; a stray Ctrl+Z under it would revert the canvas.
+      * `_dismiss_once` flag — double-click on Confirm + a worker
+        mid-flight can't fire the dismiss callback twice.
+      * Default focus on the target-table (cursor highlights the
+        first row) so a deliberate Enter confirms the pick. Cancel
+        is still one Esc / Tab+Enter away. Pre-sweep the focus
+        landed on [Cancel] to defend against a stray Enter on the
+        only choice; with same-collection copy now in the list, the
+        first row is no longer always the "right" answer, so we
+        defer to the user picking.
+      * Refuses if the source collection no longer exists (race
+        between Space-marking and 'm'/'y' press).
+      * Works even when no target collection exists yet — the
+        [New collection] button creates an empty one inline (copies
+        CollectionsModal's create-and-persist path), then selects it so
+        the user can Confirm straight into it. For copy, the source is
+        always offered as "duplicate here".
+    """
+
+    _blocks_undo: bool = True
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, *, source_collection: str,
+                 entry_ids: "list[str]", mode: str,
+                 **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._source = source_collection
+        self._entry_ids = list(entry_ids)
+        self._mode = mode if mode in ("move", "copy") else "move"
+        self._dismissed: bool = False
+        self._row_to_name: list[str] = []
+        # Re-entrancy guard for the [New collection] button: True while
+        # the CollectionNameModal prompt is open so a double-click can't
+        # stack two name prompts.
+        self._naming: bool = False
+
+    def _dismiss_once(self, result) -> None:
+        if self._dismissed:
+            return
+        self._dismissed = True
+        self.dismiss(result)
+
+    def compose(self) -> ComposeResult:
+        n = len(self._entry_ids)
+        verb = "Move" if self._mode == "move" else "Copy"
+        plural = "s" if n != 1 else ""
+        title = f" {verb} {n} plasmid{plural} to… "
+        help_text = (
+            "Pick a destination (Enter to confirm, Esc to cancel). "
+            "The active collection is offered as "
+            "[b]duplicate here[/b] — each duplicate gets a "
+            "[b]COPY[/b] suffix."
+            if self._mode == "copy"
+            else "Pick a target collection (Enter to confirm, "
+                 "Esc to cancel):"
+        )
+        with Vertical(id="movecopy-dlg"):
+            yield Static(title, id="movecopy-title", markup=True)
+            yield Label(
+                f"From collection: [b]{self._source}[/b]",
+                id="movecopy-source",
+                markup=True,
+            )
+            yield Label(help_text, id="movecopy-help", markup=True)
+            yield DataTable(id="movecopy-table",
+                              cursor_type="row",
+                              show_cursor=True,
+                              zebra_stripes=True)
+            yield Static("", id="movecopy-status", markup=True)
+            with Horizontal(id="movecopy-btns"):
+                yield Button("Confirm", id="btn-movecopy-go",
+                             variant="primary")
+                yield Button("New collection", id="btn-movecopy-newcoll")
+                yield Button("Cancel", id="btn-movecopy-cancel")
+
+    def on_mount(self) -> None:
+        self._repopulate()
+        try:
+            self.query_one("#movecopy-table", DataTable).focus()
+        except NoMatches:
+            pass
+
+    def _set_status(self, msg: str) -> None:
+        try:
+            self.query_one("#movecopy-status", Static).update(msg)
+        except NoMatches:
+            pass
+
+    def _repopulate(self) -> None:
+        try:
+            table = self.query_one("#movecopy-table", DataTable)
+        except NoMatches:
+            return
+        table.clear(columns=True)
+        table.add_columns("Collection", "Plasmids")
+        self._row_to_name = []
+        try:
+            colls = list(_iter_collections_readonly())
+        except (OSError, RuntimeError) as exc:
+            self._set_status(
+                f"[red]Couldn't load collections: {_scrub_path(str(exc))}"
+                f"[/red]"
+            )
+            return
+        seen = 0
+        # For copy mode, the source collection is offered as
+        # "(duplicate here)" so the user can clone marked entries
+        # in-place — same collision-rename path as cross-collection
+        # copy, no special-case at the commit layer beyond allowing
+        # source==target for copy.
+        allow_self = (self._mode == "copy")
+        for c in colls:
+            name = (c.get("name") or "").strip()
+            if not name:
+                continue
+            is_source = (name == self._source)
+            if is_source and not allow_self:
+                continue
+            n_plas = len(c.get("plasmids") or [])
+            label = (f"{name}  [dim](duplicate here)[/dim]"
+                     if is_source else name)
+            table.add_row(label, str(n_plas), key=name)
+            self._row_to_name.append(name)
+            seen += 1
+        if seen == 0:
+            self._set_status(
+                "[yellow]No target collections yet — press "
+                "[b]New collection[/b] to make one.[/yellow]"
+            )
+        else:
+            verb = "target" if self._mode == "move" else "destination"
+            self._set_status(
+                f"[dim]{seen} {verb}"
+                f"{'s' if seen != 1 else ''} available.[/dim]"
+            )
+
+    def _selected_name(self) -> "str | None":
+        try:
+            table = self.query_one("#movecopy-table", DataTable)
+        except NoMatches:
+            return None
+        row = table.cursor_row
+        if row is None or row < 0 or row >= len(self._row_to_name):
+            return None
+        return self._row_to_name[row]
+
+    @on(Button.Pressed, "#btn-movecopy-go")
+    def _go_btn(self, _) -> None:
+        target = self._selected_name()
+        if not target:
+            self._set_status("[red]Pick a target collection first.[/red]")
+            return
+        # Re-check the source still exists (race between marking and
+        # confirming — a parallel agent / second-window collection
+        # delete could have removed it).
+        if _find_collection(self._source) is None:
+            self._set_status(
+                f"[red]Source collection {self._source!r} no longer "
+                f"exists — the operation is aborted.[/red]"
+            )
+            return
+        if _find_collection(target) is None:
+            self._set_status(
+                f"[red]Target collection {target!r} disappeared mid-"
+                f"flight. Refresh and retry.[/red]"
+            )
+            self._repopulate()
+            return
+        self._dismiss_once(target)
+
+    @on(DataTable.RowSelected, "#movecopy-table")
+    def _row_selected(self, _event) -> None:
+        # Enter on a row = Confirm. Same UX as the other Picker modals.
+        self._go_btn(None)
+
+    @on(Button.Pressed, "#btn-movecopy-newcoll")
+    def _new_collection_btn(self, _) -> None:
+        """Create a brand-new empty target collection without leaving the
+        picker. Copies CollectionsModal._save's create-and-persist path
+        (normalise via CollectionNameModal → collision check → append an
+        empty collection → `_save_collections` → repopulate). On success
+        the new collection is selected so Enter / Confirm lands on it."""
+        if self._naming:                       # double-click guard
+            return
+
+        def _named(name: "str | None") -> None:
+            self._naming = False
+            if not name:                        # cancelled / empty
+                return
+            # Collision check mirrors CollectionsModal._save. `name` is
+            # already normalised by CollectionNameModal.
+            if _collection_name_taken(name):
+                self._set_status(
+                    f"[red]A collection named '{name}' already exists — "
+                    f"pick it from the list above instead.[/red]"
+                )
+                return
+            try:
+                existing = _load_collections()
+                existing.append({
+                    "name":        name,
+                    "description": "",
+                    "plasmids":    [],
+                    "saved":       _date.today().isoformat(),
+                })
+                _save_collections(existing)
+            except (OSError, RuntimeError) as exc:
+                _notify_save_failure(self.app, "Collections", exc)
+                return
+            self._repopulate()
+            self._select_row_by_name(name)
+            verb = "move" if self._mode == "move" else "copy"
+            self._set_status(
+                f"[green]Created '{name}'. Confirm to {verb} the marked "
+                f"plasmid(s) here.[/green]"
+            )
+
+        self._naming = True
+        try:
+            self.app.push_screen(
+                CollectionNameModal("New collection"), callback=_named,
+            )
+        except Exception:
+            # Push should never fail for a mounted modal, but if it does
+            # don't leave the button permanently dead-locked.
+            self._naming = False
+            _log.debug("movecopy: new-collection prompt push failed",
+                       exc_info=True)
+
+    def _select_row_by_name(self, name: str) -> None:
+        """Move the table cursor onto the row whose key is `name` and
+        focus the table, so a fresh Enter confirms it. No-op if the row
+        isn't present (e.g. it was filtered out as the move source)."""
+        try:
+            table = self.query_one("#movecopy-table", DataTable)
+        except NoMatches:
+            return
+        try:
+            idx = self._row_to_name.index(name)
+        except ValueError:
+            return
+        try:
+            table.move_cursor(row=idx)
+            table.focus()
+        except Exception:
+            _log.debug("movecopy: select-row-by-name failed", exc_info=True)
+
+    @on(Button.Pressed, "#btn-movecopy-cancel")
+    def _cancel_btn(self, _) -> None:
+        self._dismiss_once(None)
+
+    def action_cancel(self) -> None:
+        self._dismiss_once(None)

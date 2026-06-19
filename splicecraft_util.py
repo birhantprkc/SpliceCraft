@@ -621,3 +621,83 @@ def _pick_single_record(records: list, source: str):
             f"record first (found: {ids}{more})."
         )
     return records[0]
+
+
+# ── Identity-color + path-scrub pure helpers (moved from hub, Phase D) ──────
+def _scrub_path(text: str) -> str:
+    """Replace home-directory paths with `~` so a snapshot/bundle is
+    safe to share without exposing the user's username. Best-effort:
+    if `Path.home()` is unset (rare), the input is returned as-is.
+
+    Always returns a string. Multi-platform — handles Linux/Mac
+    (`/home/<user>`, `/Users/<user>`) and Windows
+    (`C:\\Users\\<user>`, `%USERPROFILE%`).
+    """
+    if not isinstance(text, str):
+        return str(text)
+    try:
+        home = str(Path.home())
+    except (RuntimeError, OSError):
+        return text
+    if not home:
+        return text
+    out = text.replace(home, "~")
+    # Cross-OS: if the user runs the bundle command on a different
+    # filesystem layout from where the log was written (rare but
+    # possible: WSL / network home dirs), the literal /home/<user>
+    # pattern may still appear. Fall back to a regex scrub.
+    try:
+        out = re.sub(r"(?:/home|/Users)/[A-Za-z0-9_.\-]+", "~", out)
+        # Windows: handle both forward and back slashes.
+        out = re.sub(
+            r"[A-Za-z]:[\\/]Users[\\/][A-Za-z0-9_.\-]+",
+            "~",
+            out,
+        )
+    except re.error:
+        pass
+    return out
+
+
+def _identity_pct_color(pct: "float | int | None") -> str:
+    """Map an alignment identity percentage to a Rich color name for
+    table cells. Tiers picked 2026-05-27 to match the user's
+    sequencing-QC color grading:
+
+      * **100.0% (strict)** → ``bright_cyan`` (light blue). No
+        rounding-up — a 99.999% identity does NOT promote to light
+        blue; only a literal 100.0 from the pairwise aligner counts.
+      * **>= 90%** → ``green``
+      * **>= 80%** → ``yellow``
+      * **>= 51%** → ``dark_orange``
+      * **>= 11%** → ``red``
+      * **<= 10%** → ``grey50`` (gray; "barely aligned" indicator)
+      * Non-numeric / None → ``white`` (neutral; surface raw to avoid
+        accidentally implying a quality tier the value doesn't carry)
+
+    Used by `AlignmentManagerModal._repopulate` and
+    `VerificationReportModal._add_row`. Pure function — testable
+    without spinning up a screen.
+    """
+    if pct is None:
+        return "white"
+    try:
+        v = float(pct)
+    except (TypeError, ValueError):
+        return "white"
+    # Use `>= 100.0` (strict). pairwise-align computes
+    # identity_pct = 100.0 * n_matches / aligned_len, which lands
+    # on exactly 100.0 only when n_matches == aligned_len; any
+    # mismatch / gap pushes below 100.0 even by a fractional bp,
+    # so this guard isn't subject to float drift in practice.
+    if v >= 100.0:
+        return "bright_cyan"
+    if v >= 90.0:
+        return "green"
+    if v >= 80.0:
+        return "yellow"
+    if v >= 51.0:
+        return "dark_orange"
+    if v >= 11.0:
+        return "red"
+    return "grey50"

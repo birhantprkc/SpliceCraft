@@ -2358,3 +2358,88 @@ def _extract_feature_entries_from_record(record) -> list[dict]:
             "description":  "",
         })
     return entries
+
+
+# ── Gel/HMM/codon/entry-vector derived accessors (moved from hub, Phase D) ──
+def _clear_entry_vectors_for_grammar(grammar_id: str) -> int:
+    """Drop every entry-vector binding for ``grammar_id``, regardless
+    of role. Used by grammar-delete flows so a grammar with multiple
+    role bindings (Constructor's Alpha1/Alpha2/Omega1/Omega2) doesn't
+    leave orphan rows in entry_vectors.json that would silently come
+    back to life if a future custom grammar slugs to the same id.
+
+    Returns the number of bindings removed; 0 when nothing matched.
+    No-op for empty grammar_id (defensive — callers can pass a
+    user-typed value without pre-checking).
+
+    Sweep #10 (2026-05-20): RMW under `_cache_lock`.
+    """
+    if not isinstance(grammar_id, str) or not grammar_id:
+        return 0
+    with _state._cache_lock:
+        entries = _load_entry_vectors()
+        kept = [e for e in entries if e.get("grammar_id") != grammar_id]
+        n_dropped = len(entries) - len(kept)
+        if n_dropped > 0:
+            _save_entry_vectors(kept)
+    return n_dropped
+
+
+def _codon_tables_get(key: str) -> "dict | None":
+    """Look up a table by taxid or name (case-insensitive). Returns the
+    in-memory entry (with 'raw' as tuples) or None."""
+    key = (key or "").strip().lower()
+    if not key:
+        return None
+    for e in _codon_tables_load():
+        if str(e.get("taxid", "")).lower() == key:
+            return e
+        if str(e.get("name", "")).lower() == key:
+            return e
+    return None
+
+
+def _find_hmm_db_entry(entry_id: str) -> "dict | None":
+    """Return a deep-cloned catalog entry by id, or None on miss."""
+    safe = _sanitize_hmm_db_id(entry_id)
+    if safe is None:
+        return None
+    for e in _load_hmm_db_catalog():
+        if e.get("id") == safe:
+            return e
+    return None
+
+
+def _hmm_db_name_taken(name: str,
+                         exclude_id: "str | None" = None) -> bool:
+    """Case-insensitive name lookup. The UI uses display name as the
+    "is this taken?" check (matches collection / gel modal conventions)
+    so two entries can't share a display name even if they have
+    different ids."""
+    if not isinstance(name, str):
+        return False
+    target = name.strip().casefold()
+    if not target:
+        return False
+    for e in _load_hmm_db_catalog():
+        if exclude_id is not None and e.get("id") == exclude_id:
+            continue
+        if (e.get("name") or "").strip().casefold() == target:
+            return True
+    return False
+
+
+def _gel_name_taken(name: str) -> bool:
+    """Dup-name guard. Trims + case-sensitive compare so 'Friday
+    digest' and 'Friday digest ' coexist gracefully but two identical
+    names won't (matches the user's intuition that names are visible
+    identifiers)."""
+    if not isinstance(name, str):
+        return False
+    needle = name.strip()
+    if not needle:
+        return False
+    for g in _load_gels():
+        if (g.get("name") or "").strip() == needle:
+            return True
+    return False
