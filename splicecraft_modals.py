@@ -34,9 +34,9 @@ from textual.events import Click
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, DataTable, DirectoryTree, Input, Label, ListItem, ListView, RadioButton, RadioSet, Select, Static, TextArea
 
-from splicecraft_dataaccess import _NEB_ENZYMES, _get_active_collection_name, _grammar_dropdown_options, _iter_collections_readonly, _iter_library_readonly, _load_library, _load_primer_collections
+from splicecraft_dataaccess import _NEB_ENZYMES, _collection_name_taken, _get_active_collection_name, _grammar_dropdown_options, _iter_collections_readonly, _iter_library_readonly, _load_library, _load_primer_collections
 from splicecraft_logging import _log, _log_event
-from splicecraft_util import _cursor_row_key, _natural_sort_key, _sanitize_label, _sanitize_plasmid_name
+from splicecraft_util import _cursor_row_key, _natural_sort_key, _normalize_collection_name, _sanitize_label, _sanitize_plasmid_name
 from splicecraft_widgets import _ExtensionAwareDirectoryTree, _FastaAwareDirectoryTree, _InstantPressButton, _PICKER_PLASMID_STYLE, _ZipAwareDirectoryTree
 
 
@@ -5958,3 +5958,171 @@ class RestrictionInsertModal(_OneShotDismissScreen, ModalScreen):
             return
         enzyme = row_key.value if hasattr(row_key, "value") else str(row_key)
         self.dismiss(enzyme)
+
+
+class CollectionNameModal(_OneShotDismissScreen, ModalScreen):
+    """Tiny prompt modal for creating or renaming a collection.
+
+    Dismisses with the trimmed name string, or None on cancel.
+    Caller is responsible for collision-checking before persisting.
+    """
+
+    _blocks_undo: bool = True   # Input editing; result mutates collections
+
+    BINDINGS = [
+        Binding("escape", "cancel",     "Cancel"),
+        Binding("tab",    "app.focus_next", "Next", show=False),
+    ]
+
+    def __init__(self, title: str, current: str = "",
+                 placeholder: str = "Collection name") -> None:
+        super().__init__()
+        self.title_text = title
+        self.current = current
+        self.placeholder_text = placeholder
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="collname-dlg"):
+            yield Static(f" {self.title_text} ", id="collname-title")
+            yield Label("Name:")
+            yield Input(value=self.current,
+                        placeholder=self.placeholder_text,
+                        id="collname-input")
+            yield Static("", id="collname-status", markup=True)
+            with Horizontal(id="collname-btns"):
+                yield Button("OK",     id="btn-collname-ok",     variant="primary")
+                yield Button("Cancel", id="btn-collname-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#collname-input", Input).focus()
+
+    @on(Button.Pressed, "#btn-collname-ok")
+    def _ok(self, _) -> None:
+        self._submit()
+
+    @on(Input.Submitted, "#collname-input")
+    def _submitted(self, _) -> None:
+        self._submit()
+
+    def _submit(self) -> None:
+        raw = self.query_one("#collname-input", Input).value
+        # Same normaliser the agent-API uses: strip control chars,
+        # trim, cap length. Stops a hand-typed `name\x00\n` from
+        # breaking the panel header / collection-list rendering.
+        name = _normalize_collection_name(raw)
+        if name is None:
+            self.query_one("#collname-status", Static).update(
+                "[red]Name cannot be empty.[/red]"
+            )
+            return
+        self.dismiss(name)
+
+    @on(Button.Pressed, "#btn-collname-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class MultiRecordFastaModal(_OneShotDismissScreen, ModalScreen):
+    """Prompt to import a multi-record FASTA into a new collection.
+
+    Triggered by `OpenFileModal._do_load` when a picked FASTA contains
+    more than one record. Shows the record count + a name input + a
+    brief description of what will happen (each record becomes a
+    separate library entry; topology is auto-detected from each
+    record's description and otherwise defaults to linear).
+
+    Pure prompt — doesn't touch disk. Dismisses with the validated
+    collection name on submit, or `None` on cancel. The caller
+    (`OpenFileModal`) builds the SeqRecords and calls
+    `_create_fasta_collection` once the modal returns a name.
+    """
+
+    _blocks_undo: bool = True   # Input editing; Ctrl+Z = input undo, not app
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next",   show=False),
+    ]
+
+    DEFAULT_CSS = """
+    #multi-fasta-dlg {
+        width: 72; max-width: 95%; min-width: 56;
+        height: auto; max-height: 90%;
+        background: $surface; border: solid $primary; padding: 1 2;
+    }
+    #multi-fasta-title  { background: $primary-darken-2; color: $text;
+                          padding: 0 1; margin-bottom: 1; text-align: center; }
+    #multi-fasta-info   { height: auto; color: $text-muted;
+                          margin-bottom: 1; }
+    #multi-fasta-dlg Label { color: $text-muted; margin-top: 1; }
+    #multi-fasta-input  { margin-top: 0; margin-bottom: 1; }
+    #multi-fasta-status { height: 2; color: $text-muted; }
+    #multi-fasta-btns   { align: right middle;  height: 3; margin-top: 1; }
+    #multi-fasta-btns Button { margin-right: 1; }
+    """
+
+    def __init__(self, count: int, default_name: str = "") -> None:
+        super().__init__()
+        self.count = int(count)
+        self.default_name = default_name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="multi-fasta-dlg"):
+            yield Static(" Multi-record FASTA ", id="multi-fasta-title")
+            yield Static(
+                f"This FASTA contains [b]{self.count}[/b] records.\n\n"
+                f"Load all into a new collection? Each record becomes "
+                f"a separate plasmid in the collection. Topology is "
+                f"auto-detected per record from its description "
+                f"(records mentioning [b]circular[/b] or [b]plasmid[/b] "
+                f"load as circular; the rest load as linear).",
+                id="multi-fasta-info", markup=True,
+            )
+            yield Label("Collection name:")
+            yield Input(value=self.default_name,
+                          placeholder="Collection name",
+                          id="multi-fasta-input")
+            yield Static("", id="multi-fasta-status", markup=True)
+            with Horizontal(id="multi-fasta-btns"):
+                yield Button("Create collection",
+                              id="btn-multi-fasta-ok", variant="primary")
+                yield Button("Cancel", id="btn-multi-fasta-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#multi-fasta-input", Input).focus()
+
+    @on(Button.Pressed, "#btn-multi-fasta-ok")
+    def _ok(self, _) -> None:
+        self._submit()
+
+    @on(Input.Submitted, "#multi-fasta-input")
+    def _submitted(self, _) -> None:
+        self._submit()
+
+    def _submit(self) -> None:
+        # Re-use the agent-API normaliser: strips control chars + caps
+        # length so a hand-typed `name\x00\n` can't break the panel
+        # header / collection-list rendering.
+        raw = self.query_one("#multi-fasta-input", Input).value
+        name = _normalize_collection_name(raw)
+        status = self.query_one("#multi-fasta-status", Static)
+        if name is None:
+            status.update("[red]Name cannot be empty.[/red]")
+            return
+        if _collection_name_taken(name):
+            status.update(
+                f"[red]A collection named '{name}' already exists. "
+                f"Pick a different name.[/red]"
+            )
+            return
+        self.dismiss(name)
+
+    @on(Button.Pressed, "#btn-multi-fasta-cancel")
+    def _cancel_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
