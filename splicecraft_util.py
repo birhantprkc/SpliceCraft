@@ -485,3 +485,95 @@ def _normalize_collection_name(s: "str | None") -> "str | None":
     None on empty input so the caller can 400 the request."""
     name = _sanitize_label(s, max_len=_MAX_COLLECTION_NAME_LEN)
     return name or None
+
+
+# ── Feature-label + note-sanitise pure helpers (moved from hub, Phase D) ────
+_FEAT_LABEL_DISPLAY_MAX = 28
+
+
+_NOTE_CTRL_RE = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]+"
+)
+
+
+def _feat_label_full(feat) -> str:
+    """Canonical, UNtruncated feature label — the value the feature data
+    model (`PlasmidMap._parse`) stores and that cloning / export / the
+    agent API carry forward. Whitespace is collapsed and a generic
+    "unnamed protein product; <gene>" note is reduced to <gene>.
+
+    DISPLAY callers truncate to their own width (the map + seq-panel via
+    `_feat_decorated_label`, the sidebar via its own `[:14]`); `_feat_label`
+    is the `_FEAT_LABEL_DISPLAY_MAX`-char display wrapper. Baking that cap
+    in here used to corrupt persisted data — a lifted operon's six genes
+    ("…; luxC" … "…; luxG") all collapsed to the identical
+    "unnamed protein product; lux" because the gene letter sits at char 29,
+    past the cap, so the cloned plasmid stored six indistinguishable CDS
+    bars (user-reported)."""
+    for q in ("label", "gene", "product", "standard_name", "note", "bound_moiety"):
+        if q in feat.qualifiers:
+            v = feat.qualifiers[q]
+            # Biopython normally wraps qualifier values in a 1+ element
+            # list, but malformed GenBank files can produce empty lists
+            # or bare strings. Guard both.
+            if isinstance(v, list):
+                if not v:
+                    continue
+                s = v[0]
+            else:
+                s = v
+            if not isinstance(s, str):
+                continue
+            # Collapse whitespace characters (newline, tab, vertical tab)
+            # into single spaces so a multi-line /note="…" qualifier
+            # doesn't break the sidebar row or clobber the map label.
+            # Then strip and fall through if the result is empty.
+            s = " ".join(s.split())
+            if s:
+                return _surface_placeholder_gene(s)
+    return feat.type
+
+
+def _feat_label(feat) -> str:
+    """Display label: `_feat_label_full` truncated to the map / sidebar
+    width cap (`_FEAT_LABEL_DISPLAY_MAX`). Tested at 28 chars by
+    `test_real_label_truncates_at_28`."""
+    return _feat_label_full(feat)[:_FEAT_LABEL_DISPLAY_MAX]
+
+
+def _sanitize_note(s: "str | None", *, max_len: int = 8000) -> str:
+    """Clean a feature ``/note`` body: strip dangerous control bytes
+    (preserves `\\t` and `\\n` so multi-paragraph Markdown survives),
+    cap at `max_len` characters, trim trailing whitespace.
+
+    Type-strict like `_sanitize_label` — a JSON dict / int payload
+    becomes empty rather than `str()`-coerced. Empty / None / non-
+    string input → empty string. The 8 KB cap matches typical
+    GenBank ``/note`` conventions and prevents adversarial / accidental
+    pasted blobs from bloating `.gb` exports or stalling the Markdown
+    parser. Callers split on blank-line paragraphs after sanitizing,
+    so the cap applies to the combined note body, not per-line.
+    """
+    if not isinstance(s, str) or not s:
+        return ""
+    s = _NOTE_CTRL_RE.sub("", s).rstrip()
+    return s[:max_len]
+
+
+# ── Placeholder-gene helper (completes the _feat_label closure, Phase D) ────
+_GENERIC_PRODUCT_PLACEHOLDERS: tuple[str, ...] = (
+    "unnamed protein product",
+)
+
+
+def _surface_placeholder_gene(s: str) -> str:
+    """Reduce a generic ``"unnamed protein product; luxC"`` placeholder to
+    its trailing identifier (``"luxC"``). A bare placeholder with nothing
+    meaningful after it is returned unchanged. Case-insensitive match on
+    the placeholder; the surfaced remainder keeps its original case."""
+    low = s.lower()
+    for ph in _GENERIC_PRODUCT_PLACEHOLDERS:
+        if low.startswith(ph):
+            rest = s[len(ph):].lstrip(" \t;:,-/|")
+            return rest if rest else s
+    return s

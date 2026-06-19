@@ -9,6 +9,7 @@ module.
 from __future__ import annotations
 
 import functools as _functools
+import re
 
 from rich.text import Text
 from textual.coordinate import Coordinate as _Coordinate
@@ -17,6 +18,7 @@ from textual.widgets import Button, DataTable, DirectoryTree, Input, Static
 
 from splicecraft_logging import _log
 from splicecraft_util import _is_fasta_path, _is_seq_zip_path, _natural_sort_key
+from splicecraft_dataaccess import _load_feature_colors
 
 
 class _InstantPressButton(Button):
@@ -534,3 +536,141 @@ class _ZipAwareDirectoryTree(DirectoryTree):
             ),
         )
         super()._populate_node(node, sorted_content)
+
+
+# ── Feature/Rich color helpers (moved from hub, Phase D) ────────────────────
+_FEATURE_PALETTE: list[str] = [
+    "color(39)",   "color(118)",  "color(208)",  "color(213)",  "color(51)",
+    "color(220)",  "color(196)",  "color(46)",   "color(201)",  "color(129)",
+    "color(166)",  "color(33)",   "color(226)",  "color(160)",  "color(87)",
+    "color(105)",  "color(154)",  "color(203)",  "color(81)",   "color(185)",
+]
+
+
+_DEFAULT_TYPE_COLORS: dict[str, str] = {
+    "CDS":             "#FFA500",
+    "gene":            "#FFD700",
+    "mRNA":            "#FFA07A",
+    "tRNA":            "#FF69B4",
+    "rRNA":            "#FF1493",
+    "ncRNA":           "#DA70D6",
+    "misc_RNA":        "#BA55D3",
+    "promoter":        "#00CED1",
+    "terminator":      "#DC143C",
+    "RBS":             "#00FF7F",
+    "polyA_signal":    "#FF6347",
+    "regulatory":      "#7FFFD4",
+    "5'UTR":           "#87CEEB",
+    "3'UTR":           "#4682B4",
+    "intron":          "#A9A9A9",
+    "exon":            "#90EE90",
+    "operon":          "#DDA0DD",
+    "primer_bind":     "#00BFFF",
+    "protein_bind":    "#F08080",
+    "misc_binding":    "#FF8C00",
+    "repeat_region":   "#CD853F",
+    "LTR":             "#8B4513",
+    "mobile_element":  "#8B008B",
+    "rep_origin":      "#9370DB",
+    "oriT":            "#BA55D3",
+    "sig_peptide":     "#ADFF2F",
+    "mat_peptide":     "#9ACD32",
+    "transit_peptide": "#7CFC00",
+    "propeptide":      "#6B8E23",
+    "misc_feature":    "#20B2AA",
+    "misc_recomb":     "#48D1CC",
+    "stem_loop":       "#FF4500",
+    "variation":       "#800080",
+}
+
+
+_HEX3_RE = re.compile(r"^#[0-9A-Fa-f]{3}$")
+
+
+_HEX6_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+
+
+_XTERM_RE = re.compile(r"^(?:color\()?(\d{1,3})\)?$")
+
+
+def _resolve_feature_color(entry: dict) -> str:
+    """Effective render color for a library entry. Never returns an empty
+    string — falls back through entry override → user default → built-in
+    default → palette[0]. Always produces something Rich will parse.
+
+    Palette values that use ``color(N)`` syntax are safe inside Rich
+    Style.parse but blow up Rich's markup lexer when rewrapped as
+    ``[color(N)]...[/]``. Normalise them to their hex equivalent before
+    returning so every downstream caller can use plain markup templating.
+    """
+    col = entry.get("color") if isinstance(entry, dict) else None
+    if isinstance(col, str) and col:
+        return _markup_safe_color(col)
+    ft = entry.get("feature_type", "") if isinstance(entry, dict) else ""
+    user_defaults = _load_feature_colors()
+    if ft in user_defaults:
+        return _markup_safe_color(user_defaults[ft])
+    if ft in _DEFAULT_TYPE_COLORS:
+        return _markup_safe_color(_DEFAULT_TYPE_COLORS[ft])
+    return _markup_safe_color(_FEATURE_PALETTE[0])
+
+
+def _markup_safe_color(col: str) -> str:
+    """Return ``col`` unchanged if it's already safe for Rich markup (hex,
+    named color, or ``rgb(r,g,b)``). Palette-style ``color(N)`` values
+    are converted to hex via :func:`_normalise_color_input` because the
+    parens collide with Rich's ``[...]`` lexer. Falls back to returning
+    the raw string if normalisation fails — better to render something
+    than to crash the preview.
+
+    Sweep #34 (2026-05-26): also strip any Rich markup
+    metacharacters (`[`, `]`) from the input. Pre-fix a
+    `.gb` file with a hand-crafted `color="[red]X[/red]"`
+    qualifier would round-trip through this helper unchanged
+    and break out of `f"[bold {color}]..."` interpolation,
+    corrupting the rendered label. No legitimate colour value
+    contains brackets; rejecting them stops the markup
+    injection cleanly.
+    """
+    if not isinstance(col, str) or not col:
+        return col
+    if "[" in col or "]" in col:
+        # Drop the suspect value; the caller falls back to the
+        # palette default via `_resolve_feature_color`'s chain.
+        return _FEATURE_PALETTE[0]
+    if col.startswith("color("):
+        canon = _normalise_color_input(col)
+        if canon:
+            return canon
+    return col
+
+
+def _normalise_color_input(raw: str) -> "str | None":
+    """Accept any of ``#RGB`` / ``#RRGGBB`` / ``0..255`` / ``color(N)`` and
+    return a canonical hex string. Returns ``None`` if the input isn't
+    parseable — callers surface a validation error.
+
+    Hex is preferred over ``color(N)`` on save because hex survives round-
+    trip through JSON unambiguously and renders identically on every
+    terminal that supports truecolor. xterm indices are converted to their
+    24-bit RGB equivalent via the standard 6×6×6 cube / grayscale ramp.
+    """
+    if not isinstance(raw, str):
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    if _HEX6_RE.match(raw):
+        return "#" + raw[1:].upper()
+    if _HEX3_RE.match(raw):
+        r, g, b = raw[1], raw[2], raw[3]
+        return f"#{r}{r}{g}{g}{b}{b}".upper()
+    m = _XTERM_RE.match(raw)
+    if m:
+        try:
+            idx = int(m.group(1))
+        except ValueError:
+            return None
+        if 0 <= idx <= 255:
+            return _xterm_index_to_hex(idx)
+    return None
