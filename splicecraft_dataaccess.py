@@ -19,6 +19,7 @@ site resolve unchanged.
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import date as _date
 from typing import TypeVar as _TypeVar
 
 import splicecraft_state as _state
@@ -369,3 +370,156 @@ def _save_protein_motifs(entries: list[dict]) -> None:
         # the merged list. Reseating with the user-only list would
         # leave the merged form stale.
         _state._protein_motifs_cache = None
+
+
+# ── Codon-table registry (MISSION-CRITICAL: _codon_optimize depends on it) ──
+# The genetic-code map + builtin K12 table + the raw<->json converters +
+# the load/save accessors. `_codon_raw_from_json` forces each codon's AA to
+# the standard genetic code (never the stored label) so a corrupt table
+# can't feed a wrong AA->codon grouping into the optimizer. `_CODON_GENETIC_CODE`
+# is also used hub-side (optimizer + translation, 17 refs) via the re-export.
+
+
+_CODON_GENETIC_CODE: dict[str, str] = {
+    "TTT": "F", "TTC": "F", "TTA": "L", "TTG": "L",
+    "CTT": "L", "CTC": "L", "CTA": "L", "CTG": "L",
+    "ATT": "I", "ATC": "I", "ATA": "I", "ATG": "M",
+    "GTT": "V", "GTC": "V", "GTA": "V", "GTG": "V",
+    "TCT": "S", "TCC": "S", "TCA": "S", "TCG": "S",
+    "CCT": "P", "CCC": "P", "CCA": "P", "CCG": "P",
+    "ACT": "T", "ACC": "T", "ACA": "T", "ACG": "T",
+    "GCT": "A", "GCC": "A", "GCA": "A", "GCG": "A",
+    "TAT": "Y", "TAC": "Y", "TAA": "*", "TAG": "*",
+    "CAT": "H", "CAC": "H", "CAA": "Q", "CAG": "Q",
+    "AAT": "N", "AAC": "N", "AAA": "K", "AAG": "K",
+    "GAT": "D", "GAC": "D", "GAA": "E", "GAG": "E",
+    "TGT": "C", "TGC": "C", "TGA": "*", "TGG": "W",
+    "CGT": "R", "CGC": "R", "CGA": "R", "CGG": "R",
+    "AGT": "S", "AGC": "S", "AGA": "R", "AGG": "R",
+    "GGT": "G", "GGC": "G", "GGA": "G", "GGG": "G",
+}
+
+
+_CODON_BUILTIN_K12: dict[str, tuple[str, int]] = {
+    "GGG": ("G",  44), "GGA": ("G",  47), "GGT": ("G", 109), "GGC": ("G", 171),
+    "GAG": ("E",  94), "GAA": ("E", 224), "GAT": ("D", 194), "GAC": ("D", 105),
+    "GTG": ("V", 135), "GTA": ("V",  59), "GTT": ("V",  86), "GTC": ("V",  60),
+    "GCG": ("A", 197), "GCA": ("A", 108), "GCT": ("A",  55), "GCC": ("A", 162),
+    "AGG": ("R",   8), "AGA": ("R",   7), "AGT": ("S",  37), "AGC": ("S",  85),
+    "AAG": ("K",  62), "AAA": ("K", 170), "AAT": ("N", 112), "AAC": ("N", 125),
+    "ATG": ("M", 127), "ATA": ("I",  19), "ATT": ("I", 156), "ATC": ("I",  93),
+    "ACG": ("T",  59), "ACA": ("T",  33), "ACT": ("T",  41), "ACC": ("T", 117),
+    "TGG": ("W",  55), "TGT": ("C",  30), "TGC": ("C",  41),
+    "TAT": ("Y",  86), "TAC": ("Y",  75),
+    "TTG": ("L",  61), "TTA": ("L",  78), "TTT": ("F", 101), "TTC": ("F",  77),
+    "TCG": ("S",  41), "TCA": ("S",  40), "TCT": ("S",  29), "TCC": ("S",  28),
+    "CGG": ("R",  21), "CGA": ("R",  22), "CGT": ("R", 108), "CGC": ("R", 133),
+    "CAG": ("Q", 142), "CAA": ("Q",  62), "CAT": ("H",  81), "CAC": ("H",  67),
+    "CTG": ("L", 240), "CTA": ("L",  27), "CTT": ("L",  61), "CTC": ("L",  54),
+    "CCG": ("P", 137), "CCA": ("P",  34), "CCT": ("P",  43), "CCC": ("P",  33),
+    "TAA": ("*",   9), "TAG": ("*",   0), "TGA": ("*",   5),
+}
+
+
+def _codon_raw_to_json(raw: dict) -> dict:
+    """Convert in-memory {codon: (aa, count)} → JSON-safe {codon: [aa, count]}."""
+    return {c: [aa, int(n)] for c, (aa, n) in raw.items()}
+
+
+def _codon_raw_from_json(blob: dict) -> dict:
+    """Inverse of `_codon_raw_to_json`. Accepts tuples or 2-item lists.
+
+    HARDENED (2026-06-12): the codon KEY must be a real codon and its
+    amino acid is forced to the standard genetic code — never trusted from
+    the stored label. A corrupted or hand-edited `codon_tables.json` (e.g.
+    `ATG` mislabelled `L`, or a 2-nt key) would otherwise feed a wrong
+    AA→codon grouping straight into `_codon_optimize`, silently breaking
+    the round-trip / no-codon→AA-mismatch invariant the optimizer
+    guarantees (a mission-critical, zero-tolerance subsystem). This mirrors
+    the validation the interactive TSV importer already enforces
+    (`_parse_codon_tsv`). Unparseable rows are dropped (not raised) so a
+    partly-corrupt table still loads its good rows — and a dropped codon
+    surfaces loudly later as a "missing amino acid" optimizer error rather
+    than as silent wrong DNA."""
+    out: dict = {}
+    if not isinstance(blob, dict):
+        return out
+    for c, v in blob.items():
+        if not (isinstance(v, (list, tuple)) and len(v) == 2):
+            continue
+        codon = str(c).upper().replace("U", "T")
+        aa = _CODON_GENETIC_CODE.get(codon)
+        if aa is None:
+            continue                      # bad length / non-ACGT / unknown codon
+        try:
+            count = int(v[1])
+        except (TypeError, ValueError):
+            continue
+        if count < 0:
+            continue
+        out[codon] = (aa, count)
+    return out
+
+
+def _codon_tables_load() -> list[dict]:
+    """Load codon-table registry. Returns a deep copy so caller-side
+    mutation of the `raw` dict (e.g. an in-progress Kazusa import edit)
+    can't poison the cache — matches invariant #17. Seeds built-in
+    E. coli K12 on first run so the library is never empty."""
+    if _state._codon_tables_cache is not None:
+        return _typed_clone(_state._codon_tables_cache)
+    entries, warning = _safe_load_json(_state._CODON_TABLES_FILE, "Codon table library")
+    if warning:
+        _log.warning("Codon table library: %s", warning)
+    fixed: list = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        raw = _codon_raw_from_json(e.get("raw", {}))
+        if not raw:
+            continue
+        fixed.append({
+            "name":   e.get("name", "?"),
+            "taxid":  str(e.get("taxid", "")),
+            "source": e.get("source", "user"),
+            "added":  e.get("added", ""),
+            "raw":    raw,
+        })
+    # Seed built-in K12 if not present
+    if not any(e.get("taxid") == "83333" for e in fixed):
+        fixed.insert(0, {
+            "name":   "E. coli K12",
+            "taxid":  "83333",
+            "source": "builtin",
+            "added":  _date.today().isoformat(),
+            "raw":    dict(_CODON_BUILTIN_K12),
+        })
+        _state._codon_tables_cache = fixed
+        # Module-level seed path — no `app` context to notify. Log-only
+        # so a disk-full first launch surfaces in the log bundle and
+        # the cache (in memory) still has the K12 seed.
+        try:
+            _codon_tables_save(fixed)
+        except (OSError, RuntimeError):
+            _log.exception("Codon tables: K12 seed save failed (in-memory "
+                           "cache populated; disk write deferred)")
+    else:
+        _state._codon_tables_cache = fixed
+    return _typed_clone(_state._codon_tables_cache)
+
+
+def _codon_tables_save(entries: list[dict]) -> None:
+    """Persist registry to disk via _safe_save_json (atomic, .bak).
+    Re-seats the cache with a deep copy so callers that retain a reference
+    to the input list (and continue mutating it) can't leak post-save
+    edits into the next reader. Matches invariant #17."""
+    serializable = [{
+        "name":   e.get("name", "?"),
+        "taxid":  str(e.get("taxid", "")),
+        "source": e.get("source", "user"),
+        "added":  e.get("added", ""),
+        "raw":    _codon_raw_to_json(e.get("raw", {})),
+    } for e in entries]
+    with _state._cache_lock:
+        _safe_save_json(_state._CODON_TABLES_FILE, serializable, "Codon table library")
+        _state._codon_tables_cache = _typed_clone(entries)
