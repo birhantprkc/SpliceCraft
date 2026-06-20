@@ -137,3 +137,45 @@ def test_multisite_pick_is_rotation_invariant(R):
     bR = sc._rederive_primer_binding(_SYN_PRIMER, +1, _rot(_SYN, R), n,
                                      hint_start=(hint - R) % n, circular=True)
     assert bR == _shift(b0, R, n)
+
+
+# ── _primer_binding_sites (the mismatch-tolerant primer-CHECK finder) ──────────
+def _froze(site):
+    return tuple(sorted((k, round(v, 6) if isinstance(v, float) else v)
+                        for k, v in site.items()))
+
+
+def _site_set(sites, n, shift=0):
+    out = set()
+    for s in sites:
+        d = dict(s)
+        d["foot_start"] = (d["foot_start"] + shift) % n
+        out.add(_froze(d))
+    return out
+
+
+def _mut(s, i, ch):
+    return s[:i] + ch + s[i + 1:]
+
+
+@pytest.mark.parametrize("R", [0, 1, 137, 1289, 2572, 600, 2569])
+@pytest.mark.parametrize("kind", ["fwd_exact", "rev_exact", "fwd_1mm", "fwd_wrap", "rev_wrap"])
+def test_primer_binding_sites_rotation_invariant(template, kind, R):
+    """The mismatch-tolerant binding-site list is origin-rotation invariant:
+    un-rotating the rotated sites' foot_start by +R recovers the original SET
+    (robust to identity-tie ordering)."""
+    T = sc._normalize_dna_for_align(template)
+    n = len(T)
+    ex = (T[600:624] if 600 + 24 <= n else T[600:] + T[:600 + 24 - n])
+    primer = {
+        "fwd_exact": ex,
+        "rev_exact": sc._rc(ex),
+        "fwd_1mm": _mut(T[300:324], 5, {"A": "C", "C": "A", "G": "T", "T": "G"}[T[305]]),
+        "fwd_wrap": (T[n - 10:] + T[:16]),
+        "rev_wrap": sc._rc(T[n - 10:] + T[:16]),
+    }[kind]
+    s0 = sc._primer_binding_sites(primer, T, n, circular=True)
+    assert s0, f"{kind}: expected at least one binding site"
+    sR = sc._primer_binding_sites(primer, _rot(T, R), n, circular=True)
+    assert _site_set(sR, n, shift=R) == _site_set(s0, n), (
+        f"{kind} R={R}: rotated site-set differs from the original")

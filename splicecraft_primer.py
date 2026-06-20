@@ -19,7 +19,10 @@ from __future__ import annotations
 import re
 
 from splicecraft_logging import _log
-from splicecraft_biology import _mut_revcomp, _rc
+from splicecraft_util import _normalize_dna_for_align
+from splicecraft_biology import (
+    _circ_slice, _iupac_compatible, _mut_revcomp, _rc, _search_subsequence,
+)
 
 
 _MUT_CODON_USAGE = {
@@ -282,3 +285,122 @@ def _rederive_primer_binding(primer_seq: str, strand: int, template: str,
     # *stored*-feature repair (a fragment built 1 bp short of its primer) is
     # handled in `PlasmidMap._parse`, where start/end/length are all known.
     return None
+
+
+# ── primer-CHECK binding finder (Phase D, moved from hub) ──────────────────
+# Mismatch-tolerant 3'-anchored binding-site list (which sites a primer binds, with
+# identity %) + the confidence glyph. Verified by the real-plasmid golden
+# (site lists + origin-rotation invariance). Uses the biology align primitives.
+_PRIMER_CHECK_SEED_LEN  = 12     # exact 3'-anchor required for a binding call
+
+
+_PRIMER_CHECK_MAX_SITES = 200    # per-template binding-site cap (repeat guard)
+
+
+def _primer_binding_sites(
+    primer: str, top: str, total: int, *,
+    circular: bool = True,
+    seed_len: int = _PRIMER_CHECK_SEED_LEN,
+    min_identity_pct: float = 0.0,
+    max_sites: int = _PRIMER_CHECK_MAX_SITES,
+) -> "list[dict]":
+    """3'-anchored binding sites of `primer` on the top strand `top`
+    (length `total`, ASSUMED pre-normalised — uppercase IUPAC, no whitespace).
+
+    A site requires an EXACT match over the primer's 3'-terminal `seed_len`
+    bases (clamped to the primer length); identity is then computed over the
+    FULL primer. Returns sites sorted best-first (identity desc)::
+
+        {"strand": +1 | -1,   # +1 forward (primer == top-strand sense),
+                              # -1 reverse (primer anneals TO the top strand)
+         "foot_start": int,   # 0-based footprint start on the top strand,
+                              # canonical [0, total); footprint spans
+                              # [foot_start, foot_start+length) around the circle
+         "length": int,       # primer length
+         "ident_pct": float,  # full-primer identity 0..100
+         "mismatches": int}
+
+    The primer's 3' end is the HIGH-coord edge of a forward footprint and the
+    foot_start (LOW-coord) edge of a reverse footprint — so an amplicon runs
+    from a forward site's foot_start to a reverse site's foot_start+length.
+
+    Raises ValueError (via `_normalize_dna_for_align`) on a foreign character
+    in `primer`.
+    """
+    P = _normalize_dna_for_align(primer or "")
+    L = len(P)
+    if L == 0 or total <= 0 or L > total:
+        return []
+    seed = max(1, min(int(seed_len), L))
+    anchor = P[-seed:]
+    try:
+        # Exact 3'-anchor hits on BOTH strands, wrap-aware, via the tested
+        # matcher. A '+' hit is the 3' end of a FORWARD-role primer; a '-' hit
+        # (rc(anchor) on the top strand) is the 3' end of a REVERSE-role primer.
+        hits = _search_subsequence(
+            top, anchor, max_mismatches=0,
+            circular=circular, both_strands=True,
+        )
+    except ValueError:
+        return []
+    iupac_ok = _iupac_compatible
+    sites: "list[dict]" = []
+    seen: "set[tuple[int, int]]" = set()
+    for h in hits:
+        hs, he, strand = h["start"], h["end"], h["strand"]
+        if strand == "+":
+            foot_start = he - L           # 5' edge of the forward footprint
+            s_strand = 1
+        else:
+            foot_start = hs               # 3'/left edge of the reverse footprint
+            s_strand = -1
+        if circular:
+            window = _circ_slice(top, foot_start, L, total)
+        else:
+            if foot_start < 0 or foot_start + L > total:
+                continue                  # primer hangs off a linear end
+            window = top[foot_start:foot_start + L]
+        if len(window) != L:
+            continue
+        oriented = window if s_strand == 1 else _rc(window)
+        mm = 0
+        for i in range(L):
+            if not iupac_ok(P[i], oriented[i]):
+                mm += 1
+        ident = 100.0 * (L - mm) / L
+        if ident < min_identity_pct:
+            continue
+        canon = foot_start % total
+        key = (canon, s_strand)
+        if key in seen:
+            continue
+        seen.add(key)
+        sites.append({
+            "strand":     s_strand,
+            "foot_start": canon,
+            "length":     L,
+            "ident_pct":  ident,
+            "mismatches": mm,
+        })
+        if len(sites) >= max_sites:
+            break
+    sites.sort(key=lambda s: (-s["ident_pct"], s["foot_start"]))
+    return sites
+
+
+def _primer_check_confidence(pct: "float | int | None") -> "tuple[str, str]":
+    """Map a primer-binding / amplicon identity to a (glyph, Rich-colour)
+    confidence badge for the Primer Check results table. Mirrors the
+    alignment-status tiers so ✓/⚠/~/✗ read consistently app-wide."""
+    if not isinstance(pct, (int, float)):
+        return ("?", "white")
+    v = float(pct)
+    if v >= 99.999:
+        return ("✓", "bright_cyan")
+    if v >= 90.0:
+        return ("✓", "green")
+    if v >= 75.0:
+        return ("⚠", "yellow")
+    if v >= 60.0:
+        return ("~", "dark_orange")
+    return ("✗", "red")
