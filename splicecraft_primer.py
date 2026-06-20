@@ -26,6 +26,10 @@ from splicecraft_biology import (
     _circ_slice, _iupac_compatible, _mut_revcomp, _rc, _search_subsequence,
     _slice_circular,
 )
+# The mutagenesis-inner design picks the mutant codon via the codon-usage map —
+# the one cross-subsystem dep, and why splicecraft_primer sits at L2 (codon is L2;
+# codon does not import primer, so no cycle).
+from splicecraft_codon import _codon_build_aa_map
 
 
 _MUT_CODON_USAGE = {
@@ -762,3 +766,244 @@ def _design_generic_primers(
         "fwd_pos":  fwd_pos,
         "rev_pos":  rev_pos,
     }
+
+
+# ── mutagenesis-INNER design (Phase D, moved from hub) ─────────────────────
+# The QuikChange inner primers that INTRODUCE the codon change (mutant codon
+# chosen via the codon-usage map _codon_build_aa_map, codon L2), the folded
+# modified-outer, and CDS extraction (origin-wrap + reverse-strand aware).
+# Verified by the real-CDS mutagenesis-inner golden (byte-identical output).
+_MUT_MIN_SOE_FRAG  = 60                             # nt; below this → edge case
+
+
+# A folded "modified outer" primer (2-primer direct PCR, no SOE) MUST span
+# the mutant codon, otherwise it amplifies wild-type — a silent wrong product.
+# Cap its length and require a matched extension anchor past the mutation; when
+# no spanning primer fits, the caller falls back to the regular SOE design.
+_MUT_OUTER_MAX_LEN = 45    # nt; mutation farther than this from the end → SOE
+
+
+_MUT_OUTER_ANCHOR  = 8     # matched template bases required past the mutation
+
+
+def _mut_design_modified_outer(dna_mut: str, near_start: bool,
+                               nt_start: int) -> "dict | None":
+    """Edge-case: mutation < _MUT_MIN_SOE_FRAG nt from a CDS end → fold the
+    mutant codon into a single outer primer so the PCR is a 2-primer direct
+    reaction (no SOE).
+
+    The folded primer MUST span the mutant codon at `nt_start` (with a matched
+    anchor for clean extension), else it would carry wild-type sequence and
+    silently amplify a WT product. Returns None when no spanning primer fits
+    within `_MUT_OUTER_MAX_LEN`, so the caller falls back to the regular
+    (always-correct) SOE inner+outer design."""
+    mut_end = nt_start + 3                      # exclusive end of mutant codon
+    if nt_start < 0 or mut_end > len(dna_mut):
+        return None
+    if near_start:
+        # FWD outer anneals from base 3 (after the BsaI tail) toward 3'; it
+        # must start at/before the codon and reach mut_end + anchor.
+        anneal_start = 3
+        if nt_start < anneal_start:
+            return None
+        end_hi = min(len(dna_mut), anneal_start + _MUT_OUTER_MAX_LEN)
+        best = None
+        for end in range(mut_end + _MUT_OUTER_ANCHOR, end_hi + 1):
+            anneal = dna_mut[anneal_start:end]
+            if len(anneal) < 18:
+                continue
+            s = _mut_score_outer(anneal)
+            if best is None or s < best["score"]:
+                best = {
+                    "anneal":    anneal,
+                    "full":      _MUT_BSAI_FWD_TAIL + anneal,
+                    "tm_anneal": _mut_tm(anneal),
+                    "gc":        _mut_gc_pct(anneal),
+                    "score":     s,
+                }
+        if best is None:
+            return None
+        best["label"]    = "modified_FWD_outer"
+        best["partner"]  = "REV_outer (unchanged)"
+        best["replaces"] = "FWD_outer"
+        return best
+    # near_end: REV outer anneals to the bottom strand at the 3' end; the
+    # top-strand window [start, len) must reach back past the mutant codon.
+    seq_len  = len(dna_mut)
+    lo_start = max(0, seq_len - _MUT_OUTER_MAX_LEN)
+    hi_start = nt_start - _MUT_OUTER_ANCHOR
+    best = None
+    for start in range(lo_start, hi_start + 1):
+        tail = dna_mut[start:]
+        if len(tail) < 18:
+            continue
+        anneal = _mut_revcomp(tail)
+        s = _mut_score_outer(anneal)
+        if best is None or s < best["score"]:
+            best = {
+                "anneal":    anneal,
+                "full":      _MUT_BSAI_REV_TAIL + anneal,
+                "tm_anneal": _mut_tm(anneal),
+                "gc":        _mut_gc_pct(anneal),
+                "score":     s,
+            }
+    if best is None:
+        return None
+    best["label"]    = "modified_REV_outer"
+    best["partner"]  = "FWD_outer (unchanged)"
+    best["replaces"] = "REV_outer"
+    return best
+
+
+def _mut_design_inner(dna: str, mut_pos_1: int, mut_aa: str, wt_aa: str,
+                      codon_table: "dict | None" = None) -> dict:
+    """Inner mutagenic pair (FWD carries mutant codon; REV = revcomp(FWD)).
+
+    `codon_table` is an optional {codon: (aa, count)} map used to pick the
+    mutant codon. Defaults to E. coli K12 (_MUT_AA_TO_CODONS)."""
+    idx      = mut_pos_1 - 1
+    nt_start = idx * 3
+
+    wt_codon  = dna[nt_start:nt_start + 3]
+    if len(wt_codon) < 3:
+        raise ValueError(
+            f"Position {mut_pos_1} is past the end of the CDS."
+        )
+    wt_actual = _MUT_CODON_TO_AA.get(wt_codon, "?")
+    if wt_actual != wt_aa:
+        raise ValueError(
+            f"Position {mut_pos_1}: mutation says WT='{wt_aa}' but DNA codon "
+            f"'{wt_codon}' encodes '{wt_actual}'."
+        )
+
+    if codon_table:
+        aa_map, _ = _codon_build_aa_map(codon_table)
+    else:
+        aa_map = _MUT_AA_TO_CODONS
+
+    if mut_aa == "*":
+        # Prefer the selected table's most-frequent stop codon (TAA fallback)
+        # so the suggestion respects the organism instead of always TAA.
+        # _codon_build_aa_map excludes stops, so read them from the raw table.
+        stops = [
+            (str(c).upper(), v)
+            for c, v in (codon_table or {}).items()
+            if isinstance(v, (list, tuple)) and len(v) >= 2 and v[0] == "*"
+        ]
+
+        def _stop_count(item) -> float:
+            try:
+                return float(item[1][1])
+            except (TypeError, ValueError, IndexError):
+                return 0.0
+
+        mut_codon = max(stops, key=_stop_count)[0] if stops else "TAA"
+    else:
+        mut_codon = next(
+            (c for c, _f in aa_map.get(mut_aa, []) if c != wt_codon),
+            None,
+        )
+        if mut_codon is None:
+            raise ValueError(f"No alternative codon available for '{mut_aa}' "
+                             "in the selected codon table")
+
+    mut_dna = dna[:nt_start] + mut_codon + dna[nt_start + 3:]
+
+    TM_TARGET      = 60.0
+    TM_MIN, TM_MAX = 55.0, 75.0
+    GC_MIN, GC_MAX = 35.0, 68.0
+    seq_len = len(mut_dna)
+
+    candidates: list = []
+    for left_ext in range(5, 28):
+        for right_ext in range(5, 28):
+            lo  = max(0, nt_start - left_ext)
+            hi  = min(seq_len, nt_start + 3 + right_ext)
+            fwd = mut_dna[lo:hi]
+            if len(fwd) < 15 or len(fwd) > 58:
+                continue
+            t  = _mut_tm(fwd)
+            gc = _mut_gc_pct(fwd)
+            if not (TM_MIN <= t <= TM_MAX):
+                continue
+            if not (GC_MIN <= gc <= GC_MAX):
+                continue
+            hp = _mut_hairpin_dg(fwd)
+            hd = _mut_homodimer_dg(fwd)
+            score = (
+                abs(t - TM_TARGET) * 2.0
+                + (0 if _mut_ends_gc(fwd) else 4.0)
+                + max(0, -hp - 1000) / 400.0
+                + max(0, -hd - 2000) / 400.0
+                + abs(gc - 50) * 0.1
+                - (len(fwd) * 0.15 if abs(t - TM_TARGET) <= 1.0 else 0)
+            )
+            candidates.append({
+                "fwd": fwd, "rev": _mut_revcomp(fwd),
+                "tm": t, "gc": gc, "length": len(fwd),
+                "hairpin_dg": hp, "homodimer_dg": hd, "score": score, "lo": lo,
+            })
+
+    if not candidates:
+        raise RuntimeError(
+            f"No valid inner primers found for {wt_aa}{mut_pos_1}{mut_aa}. "
+            "Mutation may be too close to sequence ends."
+        )
+
+    seen: dict = {}
+    for c in sorted(candidates, key=lambda x: x["score"]):
+        if c["fwd"] not in seen:
+            seen[c["fwd"]] = c
+    ranked = sorted(seen.values(), key=lambda x: x["score"])[:5]
+    for i, c in enumerate(ranked):
+        c["rank"] = i + 1
+
+    best_lo = ranked[0]["lo"]
+    best_hi = best_lo + ranked[0]["length"]
+    fwd_anneal_start = 3
+    frag_a = best_hi - fwd_anneal_start
+    frag_b = seq_len - best_lo
+
+    near_start = frag_a < _MUT_MIN_SOE_FRAG
+    near_end   = frag_b < _MUT_MIN_SOE_FRAG
+
+    edge_case = None
+    if near_start or near_end:
+        modified_outer = _mut_design_modified_outer(
+            mut_dna, near_start=near_start, nt_start=nt_start)
+        # Only offer the 2-primer direct shortcut when the folded primer
+        # actually spans the mutation; otherwise edge_case stays None and the
+        # regular SOE inner+outer design (always correct) is shown/saved.
+        # Pre-fix the modified outer used a fixed start-anchored window and
+        # could omit the mutation for codons ~11-19 → silent WT product.
+        if modified_outer is not None:
+            edge_case = {
+                "near_start":     near_start,
+                "near_end":       near_end,
+                "frag_a":         frag_a,
+                "frag_b":         frag_b,
+                "modified_outer": modified_outer,
+            }
+
+    return {
+        "mutation":    f"{wt_aa}{mut_pos_1}{mut_aa}",
+        "nt_position": nt_start + 1,
+        "wt_codon":    wt_codon,
+        "mut_codon":   mut_codon,
+        "nt_changes":  sum(a != b for a, b in zip(wt_codon, mut_codon)),
+        "candidates":  ranked,
+        "edge_case":   edge_case,
+    }
+
+
+def _mut_extract_cds(full_seq: str, start: int, end: int, strand: int) -> str:
+    """Return the CDS DNA in its biological 5'→3' orientation, handling
+    origin-wrap (end < start) and reverse-strand features."""
+    if end < start:
+        sub = full_seq[start:] + full_seq[:end]
+    else:
+        sub = full_seq[start:end]
+    sub = sub.upper()
+    if strand == -1:
+        sub = _mut_revcomp(sub)
+    return sub
