@@ -36,10 +36,10 @@ from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, DataTable, DirectoryTree, Input, Label, ListItem, ListView, RadioButton, RadioSet, Select, Static, TextArea
 
 from splicecraft_cloning import _simulate_cloned_plasmid, _simulate_primed_amplicon
-from splicecraft_dataaccess import _BUILTIN_GRAMMARS, _NEB_ENZYMES, _all_grammars, _collection_name_taken, _find_collection, _find_hmm_db_entry, _get_active_collection_name, _grammar_dropdown_options, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _load_collections, _load_feature_colors, _load_library, _load_primer_collections, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_collections
+from splicecraft_dataaccess import _BUILTIN_GRAMMARS, _NEB_ENZYMES, _all_grammars, _collection_name_taken, _find_collection, _find_hmm_db_entry, _get_active_collection_name, _grammar_dropdown_options, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _load_collections, _load_feature_colors, _load_library, _load_primer_collections, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_collections, _search_collections_library
 from splicecraft_logging import _log, _log_event
 from splicecraft_util import _CONTROL_CHARS_RE, _PLASMID_STATUS_VALUES, _cursor_row_key, _natural_sort_key, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _sanitize_label, _sanitize_plasmid_name, _sanitize_plasmid_status, _scrub_path, _validate_group_members
-from splicecraft_widgets import _DEFAULT_TYPE_COLORS, _ExtensionAwareDirectoryTree, _FastaAwareDirectoryTree, _HEX6_RE, _InstantPressButton, _PICKER_PLASMID_STYLE, _PLASMID_STATUS_COLORS, _XtermColorGrid, _ZipAwareDirectoryTree, _markup_safe_color, _normalise_color_input, _xterm_index_to_hex
+from splicecraft_widgets import _DEFAULT_TYPE_COLORS, _ExtensionAwareDirectoryTree, _FastaAwareDirectoryTree, _HEX6_RE, _InstantPressButton, _PICKER_PLASMID_STYLE, _PLASMID_STATUS_COLORS, _SearchInput, _XtermColorGrid, _ZipAwareDirectoryTree, _markup_safe_color, _normalise_color_input, _xterm_index_to_hex
 
 
 
@@ -7806,3 +7806,169 @@ class PartEditModal(_OneShotDismissScreen, ModalScreen):
             self.dismiss(None)
             return
         self.dismiss({"idx": self._idx, "entry": out})
+
+
+class LibrarySearchModal(_OneShotDismissScreen, ModalScreen):
+    """Cross-collection plasmid search.
+
+    Lists every plasmid across every collection on disk, fuzzy-
+    filtered as the user types in the input box. The current
+    library panel only filters within the active collection — this
+    modal is the "where did I save that pUC19 variant" affordance.
+
+    Dismiss payload:
+      None                    — cancelled
+      (collection, entry_id)  — user picked a row; caller switches
+                                to that collection and loads the
+                                plasmid via the existing
+                                `_apply_record` flow.
+    """
+
+    # Sweep #26: search-query Input editing — block app-level Ctrl+Z.
+    _blocks_undo: bool = True
+
+    BINDINGS = [
+        Binding("escape", "cancel",         "Cancel"),
+        Binding("tab",    "app.focus_next", "Next",   show=False),
+    ]
+
+    # Debounce window for live filter. 150 ms feels instant on modern
+    # terminals but coalesces a "type 5 chars in 200 ms" burst into
+    # 1 search instead of 5 — matters when collections.json contains
+    # thousands of plasmids and `_search_collections_library` is the
+    # hot path.
+    _LIVE_FILTER_DEBOUNCE_S = 0.15
+
+    def __init__(self, *, initial_query: str = "") -> None:
+        super().__init__()
+        self._initial_query = initial_query
+        self._matches: list[dict] = []
+        self._filter_timer = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="libsearch-box"):
+            yield Static(" Find plasmid (across all collections) ",
+                         id="libsearch-title")
+            yield Input(
+                value=self._initial_query,
+                placeholder="type to filter (fuzzy match)…",
+                id="libsearch-input",
+            )
+            yield DataTable(id="libsearch-table",
+                            cursor_type="row",
+                            zebra_stripes=True)
+            yield Static("", id="libsearch-status", markup=True)
+            with Horizontal(id="libsearch-btns"):
+                yield Button("Open", id="btn-libsearch-ok",
+                             variant="primary")
+                yield Button("Close", id="btn-libsearch-close")
+
+    def on_mount(self) -> None:
+        try:
+            t = self.query_one("#libsearch-table", DataTable)
+        except NoMatches:
+            return
+        t.add_columns("Plasmid", "Collection", "Status", "bp")
+        # Initial population — user sees something immediately even
+        # before they start typing. Cap at 200 (matches the helper
+        # default; large libraries get a hint to narrow the query).
+        self._refresh()
+        try:
+            self.query_one("#libsearch-input", Input).focus()
+        except NoMatches:
+            pass
+
+    def _refresh(self) -> None:
+        try:
+            inp = self.query_one("#libsearch-input", Input)
+            t   = self.query_one("#libsearch-table", DataTable)
+        except NoMatches:
+            return
+        query = (inp.value or "").strip()
+        # Strip the prefill text so a user who hasn't focused the
+        # input yet sees all plasmids instead of "search for the
+        # word `Search`".
+        if query == _SearchInput.PREFILL:
+            query = ""
+        self._matches = _search_collections_library(query, limit=300)
+        t.clear()
+        for m in self._matches:
+            status = m.get("status") or ""
+            color  = _PLASMID_STATUS_COLORS.get(status)
+            status_cell = (Text(status, style=f"{color} bold")
+                           if status and color is not None
+                           else Text("—", style="dim"))
+            t.add_row(
+                Text(m["name"], no_wrap=True, overflow="ellipsis"),
+                Text(m["collection"], no_wrap=True, overflow="ellipsis"),
+                status_cell,
+                f"{m.get('size', 0):,}",
+                key=f"{m['collection']}\x00{m['id']}",
+            )
+        try:
+            self.query_one("#libsearch-status", Static).update(
+                f"[dim]{len(self._matches)} match(es)"
+                + (" — refine the query to see more"
+                   if len(self._matches) >= 300 else "")
+                + "[/dim]"
+            )
+        except NoMatches:
+            pass
+
+    @on(Input.Changed, "#libsearch-input")
+    def _on_query_changed(self, _event: Input.Changed) -> None:
+        # Live filter as the user types — debounced via `set_timer` so
+        # a burst of keystrokes coalesces into a single
+        # `_search_collections_library` call. Per-keystroke firing was
+        # noticeably laggy on 5 k+ plasmid libraries (the matcher walks
+        # every entry across every collection); the debounce keeps
+        # typing snappy without sacrificing live-update behaviour.
+        if self._filter_timer is not None:
+            try:
+                self._filter_timer.stop()
+            except Exception:
+                pass
+        self._filter_timer = self.set_timer(
+            self._LIVE_FILTER_DEBOUNCE_S, self._refresh,
+        )
+
+    @on(Input.Submitted, "#libsearch-input")
+    def _on_query_submitted(self, _event: Input.Submitted) -> None:
+        # Enter in the input == press Open if there's a match.
+        if not self._matches:
+            # Sweep #9 (2026-05-19): notify on empty result so the
+            # user gets feedback instead of silent no-op.
+            try:
+                self.app.notify(
+                    "No matches — try a different query.",
+                    severity="warning", timeout=4,
+                )
+            except Exception:
+                pass
+            return
+        try:
+            t = self.query_one("#libsearch-table", DataTable)
+        except NoMatches:
+            return
+        idx = t.cursor_row if t.cursor_row is not None else 0
+        if 0 <= idx < len(self._matches):
+            m = self._matches[idx]
+            self.dismiss((m["collection"], m["id"]))
+
+    @on(Button.Pressed, "#btn-libsearch-ok")
+    def _ok_btn(self, _) -> None:
+        self._on_query_submitted(None)  # type: ignore[arg-type]
+
+    @on(DataTable.RowSelected, "#libsearch-table")
+    def _row_selected(self, event: DataTable.RowSelected) -> None:
+        idx = event.cursor_row
+        if 0 <= idx < len(self._matches):
+            m = self._matches[idx]
+            self.dismiss((m["collection"], m["id"]))
+
+    @on(Button.Pressed, "#btn-libsearch-close")
+    def _close_btn(self, _) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)

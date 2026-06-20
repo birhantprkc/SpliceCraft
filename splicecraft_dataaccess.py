@@ -29,7 +29,7 @@ from splicecraft_logging import _log, _log_event, _repr_for_log
 from splicecraft_persistence import _safe_load_json, _safe_save_json
 from splicecraft_record import _gb_text_to_record
 from splicecraft_biology import _rc
-from splicecraft_util import _feat_label, _sanitize_gel_id
+from splicecraft_util import _feat_label, _fuzzy_match, _natural_sort_key, _sanitize_gel_id, _sanitize_plasmid_status
 
 # Immutable types `_typed_clone` returns as-is (no copy needed). Everything else
 # recurses (dict / list / tuple) or falls through to `deepcopy` for any
@@ -2507,3 +2507,85 @@ def _iter_parts_bin_readonly() -> list[dict]:
         _ensure()
     assert _state._parts_bin_cache is not None
     return _state._parts_bin_cache
+
+
+# ── Active-primer-collection pointer + library/collection fuzzy search (Phase D)
+def _search_collections_library(query: str, *,
+                                  limit: int = 200) -> list[dict]:
+    """Cross-collection plasmid search. Returns up to `limit` matches
+    across every collection on disk. Each match is
+    ``{collection, name, id, size, status, n_feats}``. The query is
+    fuzzy-matched against the plasmid name (same `_fuzzy_match`
+    semantics as the library panel's in-collection search) so a user
+    typing `puc` finds `pUC19`. An empty `query` returns the first
+    `limit` plasmids across all collections (useful as a "list
+    everything" affordance for agents).
+
+    Used by the cross-collection search modal (`LibrarySearchModal`,
+    File → Find plasmid (all collections)…) and the `search-library`
+    agent endpoint.
+    Results are natural-sorted by ``(collection_name, plasmid_name)``
+    so ``Backbones 2`` lands before ``Backbones 10`` and within a
+    collection ``pBin2`` lands before ``pBin10``.
+    """
+    out: list[dict] = []
+    q = (query or "").strip()
+    # Read-only walk — we copy each match's scalar fields into a fresh
+    # dict below, so the cached entries themselves are never exposed
+    # to the caller. Lets us skip the per-call `_typed_clone` of the
+    # entire collections cache (~30–50 ms on a 5k-plasmid library).
+    for c in _iter_collections_readonly():
+        cname = c.get("name") or "?"
+        for entry in c.get("plasmids", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            entry_id = entry.get("id") or ""
+            # Skip entries without an `id` — without one we can't
+            # round-trip the dismiss payload to `_apply_record`, and
+            # the loader would alias every untagged entry to the
+            # first one it finds.
+            if not entry_id:
+                continue
+            name = entry.get("name") or entry_id
+            if q and not _fuzzy_match(q, name):
+                continue
+            out.append({
+                "collection": cname,
+                "name":       name,
+                "id":         entry_id,
+                "size":       entry.get("size", 0),
+                "status":     _sanitize_plasmid_status(entry.get("status")),
+                "n_feats":    entry.get("n_feats", 0),
+            })
+    # Natural-sort by (collection, name) — group rows from the same
+    # collection together, with plasmids inside each group in
+    # human-friendly numeric order. `heapq.nsmallest` keeps this O(N
+    # + limit·log(limit)) instead of the full O(N·log(N)) `out.sort`
+    # would cost, which matters once the user crosses ~1k plasmids
+    # (typical limit=200). For small libraries the two paths are
+    # indistinguishable; for a 5k-plasmid catalog the heap form saves
+    # ~30 ms per search keystroke.
+    import heapq as _heapq
+    return _heapq.nsmallest(
+        limit, out,
+        key=lambda r: (
+            _natural_sort_key(r.get("collection") or ""),
+            _natural_sort_key(r.get("name") or ""),
+        ),
+    )
+
+
+def _get_active_primer_collection_name() -> "str | None":
+    val = _get_setting("active_primer_collection", None)
+    return val if isinstance(val, str) and val else None
+
+
+def _set_active_primer_collection_name(name: "str | None") -> None:
+    prev = _get_active_primer_collection_name()
+    target = name or ""
+    if prev != target:
+        _log_event(
+            "primer_collection.switched",
+            prev=prev or "", new=target,
+        )
+    _set_setting("active_primer_collection", target)

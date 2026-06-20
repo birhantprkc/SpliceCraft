@@ -958,3 +958,22 @@ def _validate_group_members(
         })
     out.sort(key=lambda m: (m["rel_start"], m["rel_end"]))
     return out
+
+
+# ── Markdown-escape + circular-topology pure helpers (moved, Phase D) ───────
+def _gb_text_is_circular(gb_text: "str | None") -> bool:
+    """Cheap topology read from a GenBank record's LOCUS line, for the
+    origin-history helpers. Returns False only when the LOCUS line
+    explicitly says ``linear`` (PCR amplicons, synthesis fragments);
+    defaults to circular for the common plasmid case + unmarked text."""
+    if not gb_text:
+        return True
+    return "linear" not in gb_text.split("\n", 1)[0].lower()
+
+
+def _esc_md(s: str) -> str:
+    """Local helper — escape Rich markup metachars so a hostile / odd
+    file path or error string can't inject styling into Static updates
+    in this modal. Equivalent to `rich.markup.escape`."""
+    from rich.markup import escape
+    return escape(s)
