@@ -14,6 +14,16 @@
 
 ---
 
+## [1.0.88] — 2026-06-20
+
+### Under the hood
+
+- **More of the codebase moved into separately-loadable modules.** Continuing the v1.0.85–v1.0.87 reorganization: the codon optimizer (its frequency-matching reverse-translation, the codon-usage table fetchers, and the usage chart), the online NCBI record fetchers + taxonomy search, a new shared hardened-network layer, and the primer / site-directed-mutagenesis design tools — including the code that works out exactly where a primer anneals on the circular map and the primer-check binding finder — now each live in their own focused module that the main program imports; the single giant file shrank by roughly another 4,600 lines. As before, this is a **maintainability and AI-assistability change only: nothing about how SpliceCraft behaves changes.** Every feature, keyboard shortcut, saved-file format, and the agent API are byte-for-byte identical — locked down by the public-surface snapshot test — and the write-guard that protects your saved library is untouched throughout.
+
+### Hardening
+
+- **New real-plasmid regression test for primer binding.** Locked down the catastrophic-class "a primer must bind exactly where it anneals" guarantee with 142 automated cases on a real `.dna` plasmid — forward / reverse / origin-wrapping / multi-site primers, checked to stay correct as the plasmid origin is rotated to any position.
+
 ## [1.0.87] — 2026-06-20
 
 ### Under the hood
