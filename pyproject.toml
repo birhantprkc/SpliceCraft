@@ -204,6 +204,7 @@ only-include = [
     "splicecraft_experiments.py",
     "splicecraft_fileio.py",
     "splicecraft_codon.py",
+    "splicecraft_net.py",
     "CHANGELOG.md",
 ]
 
@@ -229,6 +230,7 @@ include = [
     "splicecraft_experiments.py",
     "splicecraft_fileio.py",
     "splicecraft_codon.py",
+    "splicecraft_net.py",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",

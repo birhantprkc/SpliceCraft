@@ -1529,7 +1529,6 @@
  "_rbs_strength",
  "_rc",
  "_rc_fragment",
- "_re_mod",
  "_read_backup_bytes",
  "_read_log_tail",
  "_rebuild_scan_catalog",

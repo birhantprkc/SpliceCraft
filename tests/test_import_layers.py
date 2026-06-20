@@ -37,6 +37,7 @@ _LAYER_RULES = [
     ("splicecraft_paths", 0),
     ("splicecraft_persistence", 0),
     ("splicecraft_util", 0),        # pure cross-cutting helpers (natural sort, sanitise, ...)
+    ("splicecraft_net", 0),         # shared SSRF-hardened network-fetch primitives (state + stdlib only)
     ("splicecraft_record", 1),      # GenBank <-> SeqRecord serialization (+ LRU parse cache)
     ("splicecraft_dataaccess", 1),  # _typed_clone + (Phase D) the domain _load_X/_save_X accessors
     ("splicecraft_gels", 1),        # [SUB-gels] agarose-gel sim/render: imports biology L0 + util L0
