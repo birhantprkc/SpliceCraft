@@ -59,10 +59,20 @@ def test_sacred_names_present():
     )
 
 
+# Python-version-specific module dunders: `__annotate__` and
+# `__conditional_annotations__` are PEP 649 deferred-annotation machinery that
+# CPython 3.14 puts in `dir(<module>)` but 3.12 does not. They are interpreter
+# internals, never SpliceCraft's public API, so a baseline snapshotted on 3.14
+# must NOT make the suite fail on the 3.12 CI runner (and vice-versa). Excluded
+# from the comparison on BOTH ends so the surface test is interpreter-stable.
+_VERSION_SPECIFIC_DUNDERS = frozenset({"__annotate__", "__conditional_annotations__"})
+
+
 def test_full_baseline_surface_preserved():
     """No name present on the pre-refactor module may silently vanish."""
-    live = set(dir(sc))
-    dropped = [n for n in _BASELINE if n not in live]
+    live = set(dir(sc)) | _VERSION_SPECIFIC_DUNDERS
+    dropped = [n for n in _BASELINE
+               if n not in live and n not in _VERSION_SPECIFIC_DUNDERS]
     head = dropped[:40]
     assert not dropped, (
         f"{len(dropped)} name(s) disappeared from the `splicecraft` public "
