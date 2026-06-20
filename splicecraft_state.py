@@ -334,3 +334,13 @@ _sync_active_project_experiments_hook: "_Callable[..., None] | None" = None
 # hub-side (hot path + a write subsystem + UI-failure notify), reached via these.
 _validate_settings_hook: "_Callable[[dict], tuple[dict, list[str]]] | None" = None
 _settings_schedule_flush_hook: "_Callable[[dict], None] | None" = None
+# loader — the fileio `.dna` loader stamps the source file's date onto a dateless
+# construction-history root via `_stamp_history_root_date` (hub-side: it serialises
+# through `_serialize_commercialsaas_history`, which lives in cloning L3 — above
+# fileio L2, so it can't move down). Best-effort + cosmetic: the safe default just
+# returns the history XML unchanged, so an unregistered hook degrades gracefully
+# (no crash, no data loss) rather than failing loud. The hub registers the real fn
+# at import, before any load.
+def _stamp_history_root_date_passthrough(hist_xml, date_str):
+    return hist_xml
+_stamp_history_root_date_hook: "_Callable[..., object]" = _stamp_history_root_date_passthrough

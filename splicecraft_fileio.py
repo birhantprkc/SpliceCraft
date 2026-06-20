@@ -26,7 +26,7 @@ from splicecraft_persistence import (
 from splicecraft_biology import _rc
 from splicecraft_util import (
     _CONTROL_CHARS_RE, _DEFAULT_TYPE_COLORS, _feat_bounds, _is_windows_reserved_stem,
-    _natural_sort_key, _safe_xml_parse,
+    _natural_sort_key, _pick_single_record, _safe_xml_parse, _sanitize_label,
 )
 from splicecraft_record import (
     _GB_LOCUS_NAME_MAX, _gb_text_to_record, _normalize_primer_seq, _record_to_gb_text,
@@ -2943,3 +2943,204 @@ def _export_commercialsaas_dna(entry: dict, out_path: "Path | str") -> "str":
             pass
         raise
     return str(out.resolve())
+
+
+
+# ── .dna / GenBank file loader (Phase D, moved from hub) ────────────────────
+# The format-detecting single-file loader: sniff GenBank/EMBL/.dna by extension
+# + content, parse via Biopython, then (for .dna) augment from the raw packets
+# (colours/primers/history). _stamp_history_root_date stays hub-side (cloning
+# L3) and is reached via _state._stamp_history_root_date_hook. fetch_genbank
+# (network) stays hub-side pending the _DEMO_MODE migration.
+# Local `.dna` augment-read cap. Mirrors the network caps (pitfall #20)
+# for an untrusted-blob class that arrives via download/share, not just
+# the network path. `_augment_dna_record_from_packets` walks raw bytes;
+# without a cap a hostile `.dna` could OOM before any packet validation.
+_DNA_AUGMENT_MAX_BYTES = 100 * 1024 * 1024  # 100 MB
+
+
+# Third-party API contract: BioPython's SeqIO format identifier for the
+# popular commercial plasmid editor's binary `.dna` format. Stored hex-encoded
+# so the trademarked string never appears verbatim in our source.
+_BIOPYTHON_DNA_FMT = bytes.fromhex("736e617067656e65").decode("ascii")
+
+
+def _detect_plasmid_format(path: str) -> str:
+    """Pick a Biopython SeqIO format key from a file path's extension.
+
+    Supported:
+      - GenBank        (.gb, .gbk, .genbank)       → "genbank"
+      - EMBL           (.embl)                     → "embl"
+      - popular commercial plasmid editor binary (.dna)
+                                                  → ``_BIOPYTHON_DNA_FMT``
+
+    Extensions are matched case-insensitively. Unknown extensions get
+    a cheap content sniff: if the first non-empty line starts with
+    "LOCUS " (GenBank) or "ID " (EMBL), we route accordingly; the
+    8-byte CommercialSaaS cookie at offset 0 routes to `.dna`.
+    Otherwise we still default to GenBank — that's the historical
+    behaviour and the most common plasmid format; the parser will
+    then raise a clear error.
+    """
+    from pathlib import Path
+    suffix = Path(path).suffix.lower()
+    if suffix == ".dna":
+        return _BIOPYTHON_DNA_FMT
+    if suffix in (".gb", ".gbk", ".genbank"):
+        return "genbank"
+    if suffix == ".embl":
+        return "embl"
+    # Unknown extension — peek at the first few bytes to give a
+    # better error class than "GenBank parser said no". Reads are
+    # capped so a 10 GB symlink can't OOM us before `load_genbank`
+    # gets its own size guard.
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(256)
+    except OSError:
+        return "genbank"
+    if head.startswith(_COMMERCIALSAAS_COOKIE_MAGIC):
+        return _BIOPYTHON_DNA_FMT
+    try:
+        text_head = head.decode("ascii", errors="replace").lstrip()
+    except (UnicodeDecodeError, ValueError):
+        text_head = ""
+    if text_head.startswith("LOCUS "):
+        return "genbank"
+    if text_head.startswith("ID "):
+        return "embl"
+    return "genbank"
+
+
+@_timed("op.load_genbank")
+def load_genbank(path: str):
+    """Load a plasmid file (GenBank .gb/.gbk or .dna). Returns
+    SeqRecord.
+
+    Despite the name (kept for backward compatibility), this also
+    handles native `.dna` files (the popular commercial plasmid editor's
+    binary format) via the BioPython binary parser keyed by
+    ``_BIOPYTHON_DNA_FMT``. Dispatch is based on file extension.
+
+    For `.dna` files, BioPython leaves `record.id` / `record.name`
+    as `<unknown id>` / `<unknown name>` sentinels (the editor's own
+    name/title metadata is not exposed through SeqIO). Backfill both
+    from the file stem so the library and map title show something
+    human-readable instead of `<unknown name>`.
+
+    Size + symlink check via `_safe_file_size_check`: pre-fix a CLI
+    invocation `splicecraft /path/to/huge.gb` (e.g. a 1 GB chromosome
+    dump) reached `SeqIO.parse` directly and SeqIO eagerly parsed it
+    into RAM. The cap matches the modal-flow cap.
+
+    Raises ValueError with a user-friendly message if the file has no
+    records, multiple records, is oversized, or is a symlink to a
+    character device.
+    """
+    import struct
+    from Bio import SeqIO
+    from pathlib import Path as _P
+    ok, reason = _safe_file_size_check(
+        _P(path), _GB_INGEST_MAX_BYTES, "Plasmid",
+    )
+    if not ok:
+        raise ValueError(reason or "Plasmid file is unsafe to load")
+    fmt = _detect_plasmid_format(path)
+    try:
+        records = list(SeqIO.parse(path, fmt))
+    except (ValueError, struct.error) as exc:
+        # CommercialSaaS parser raises ValueError on most malformed files, but
+        # Biopython's binary unpacking can also leak struct.error when a
+        # .dna file has a truncated header / nonsense packet length.
+        # Rewrap both as user-friendly ValueError so callers don't have
+        # to special-case struct.error.
+        if fmt == _BIOPYTHON_DNA_FMT:
+            raise ValueError(
+                f"Could not parse popular commercial plasmid editor "
+                f"file {path}: {exc}. If this file was exported from an "
+                f"older release, try re-exporting as .dna from a current "
+                f"version of the editor."
+            ) from exc
+        raise
+    rec = _pick_single_record(records, path)
+
+    # CommercialSaaS (and occasionally minimally-annotated GenBank) records
+    # leave id/name as Biopython sentinels. Fall back to the filename
+    # so the UI has something meaningful to display.
+    stem = _P(path).stem or "plasmid"
+    # Sanitize: GenBank LOCUS names can't contain spaces (INSDC spec)
+    # so the rec.id / rec.name fall back to an underscored, truncated
+    # form. SACRED (2026-05-21): preserve the ORIGINAL stem with
+    # spaces as `_tui_display_name` so panels show "my plasmid" while
+    # GenBank serialisation still gets the LOCUS-safe "my_plasmid".
+    # See feedback_no_underscores_in_names: file-being-imported wins.
+    # `_sanitize_label` also strips control chars / lone surrogates a hostile
+    # filename stem could otherwise bake into the LOCUS (rec.name/id) or the
+    # display name; it preserves internal spaces, so the no-underscore rule
+    # still holds.
+    safe_stem = _sanitize_label(stem.replace(" ", "_"), max_len=16) or "plasmid"
+    if not rec.id or rec.id.startswith("<unknown"):
+        rec.id = safe_stem
+    if not rec.name or rec.name.startswith("<unknown"):
+        rec.name = safe_stem
+    # Display-name override: when the on-disk filename carried
+    # spaces, keep them visible in the UI even though LOCUS got
+    # underscored. _apply_record / library_load both read this attr.
+    if stem != safe_stem and " " in stem:
+        try:
+            rec._tui_display_name = _sanitize_label(stem, max_len=200)
+        except Exception:
+            pass
+
+    # `.dna` augmentation: re-read the file bytes to recover per-feature
+    # colours + primer-bind sequence stamps + 0x05 primer-DB entries that
+    # BioPython's `.dna` parser silently drops. Stashed on the record
+    # as a transient attribute so `_apply_record` can flush the primer
+    # entries into `primers.json` after the load completes. Failures here
+    # are non-fatal — the record loads with palette colours and bare
+    # primer features (the historical behaviour).
+    if fmt == _BIOPYTHON_DNA_FMT:
+        try:
+            with open(path, "rb") as fh:
+                _dna_bytes = fh.read(_DNA_AUGMENT_MAX_BYTES + 1)
+            if len(_dna_bytes) > _DNA_AUGMENT_MAX_BYTES:
+                _log.warning(
+                    "dna augment skipped for %s: exceeds %d MB cap; "
+                    "record loads with palette colours instead of source colours",
+                    path, _DNA_AUGMENT_MAX_BYTES // (1024 * 1024),
+                )
+            else:
+                extra_primers = _augment_dna_record_from_packets(rec, _dna_bytes)
+                if extra_primers:
+                    rec._dna_primer_entries = extra_primers
+                # Stash the construction-history packet + the raw bytes
+                # on the record so a SINGLE-file open (→ `add_entry`)
+                # round-trips history the way the bulk-import path
+                # already does. Pre-fix only bulk import extracted the
+                # 0x07 history + saved the `.dna` sidecar; opening one
+                # `.dna` and re-exporting it silently dropped both the
+                # history AND every CommercialSaaS-specific packet
+                # (alignments, enzymes, …). `add_entry` consumes these.
+                try:
+                    hist_xml = _extract_commercialsaas_history_xml(_dna_bytes)
+                    if hist_xml:
+                        # Stamp the file's OWN date (from its Notes packet)
+                        # onto the dateless history root so the import's top
+                        # History entry shows when the source file was made.
+                        rec._dna_history_xml = _state._stamp_history_root_date_hook(
+                            hist_xml,
+                            _extract_commercialsaas_file_date(_dna_bytes))
+                except ValueError as exc:
+                    _log.warning("dna history extract failed for %s: %s",
+                                 path, exc)
+                # Original bytes enable splice-mode export (byte-exact
+                # round-trip preserving unknown packets). Only retained
+                # when within the augment cap — see the skip branch above.
+                rec._dna_original_bytes = _dna_bytes
+        except (OSError, ValueError) as exc:
+            _log.warning(
+                "dna augment failed for %s (%s); record loads with "
+                "palette colours instead of source colours",
+                path, exc,
+            )
+    return rec
