@@ -17,6 +17,8 @@ from Bio.SeqFeature import (
 from Bio.SeqRecord import SeqRecord
 
 import splicecraft as sc
+import splicecraft_fileio as _fileio  # the format-I/O caps moved here (Phase D);
+# the parsers read them in this sibling's namespace, so patch it, not `sc`.
 
 
 def _make_circular_record(seq: str = "ACGTACGTACGTACGTACGTACGTACGT") -> SeqRecord:
@@ -127,7 +129,7 @@ def test_ab1_path_rejects_oversize(tmp_path, monkeypatch):
     worker because SeqIO.parse streams unbounded."""
     p = tmp_path / "huge.ab1"
     p.write_bytes(b"\x00" * 100)
-    monkeypatch.setattr(sc, "_BULK_IMPORT_MAX_BYTES", 50)
+    monkeypatch.setattr(_fileio, "_BULK_IMPORT_MAX_BYTES", 50)
     with pytest.raises(ValueError):
         sc._ab1_path_to_record(str(p))
 
@@ -135,7 +137,7 @@ def test_ab1_path_rejects_oversize(tmp_path, monkeypatch):
 def test_fastq_path_rejects_oversize(tmp_path, monkeypatch):
     p = tmp_path / "huge.fastq"
     p.write_text("@r\nACGT\n+\n!!!!\n")
-    monkeypatch.setattr(sc, "_BULK_IMPORT_MAX_BYTES", 5)
+    monkeypatch.setattr(_fileio, "_BULK_IMPORT_MAX_BYTES", 5)
     with pytest.raises(ValueError):
         sc._fastq_path_to_records(str(p))
 
@@ -149,7 +151,7 @@ def test_fastq_path_rejects_too_many_reads(tmp_path, monkeypatch):
     ) + "\n"
     p = tmp_path / "many.fastq"
     p.write_text(body)
-    monkeypatch.setattr(sc, "_FASTQ_MAX_READS", 5)
+    monkeypatch.setattr(_fileio, "_FASTQ_MAX_READS", 5)
     with pytest.raises(ValueError, match="reads"):
         sc._fastq_path_to_records(str(p))
 

@@ -1677,7 +1677,6 @@
  "_settings_validator_int_range",
  "_settings_validator_min_len_4_or_6",
  "_sha256_file",
- "_shallow_copy",
  "_shrink_guard_tokens",
  "_signal",
  "_simulate_cloned_plasmid",

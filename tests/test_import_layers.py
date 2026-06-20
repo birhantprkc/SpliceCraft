@@ -49,6 +49,7 @@ _LAYER_RULES = [
     ("splicecraft_logging", 0),        # logging primitives (_log, _log_event, filters)
     ("splicecraft_render", 1),
     ("splicecraft_history", 2),
+    ("splicecraft_fileio", 2),      # single-file seq-format I/O: imports record L1 + persistence/logging L0
     ("splicecraft_widgets", 3),
     ("splicecraft_modals", 4),
     ("splicecraft_cloning", 3),  # construction sim: imports history L2/dataaccess L1, used by modals L4
