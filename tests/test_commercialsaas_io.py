@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 
 import splicecraft as sc
+import splicecraft_fileio as _fileio  # .dna codec lives here (Phase D L2); cap reads resolve in this namespace
 
 
 _SAMPLE_DIR = Path(os.environ.get(
@@ -174,7 +175,7 @@ class TestCommercialSaaSHistoryExtract:
         gigabytes must NOT silently allocate that much. The cap lives
         at `_COMMERCIALSAAS_HISTORY_MAX_XML`; lower it for the test so we
         don't actually have to build a multi-GB file."""
-        monkeypatch.setattr(sc, "_COMMERCIALSAAS_HISTORY_MAX_XML", 100)
+        monkeypatch.setattr(_fileio, "_COMMERCIALSAAS_HISTORY_MAX_XML", 100)
         big_xml = "<HistoryTree>" + ("X" * 500) + "</HistoryTree>"
         payload = sc._pack_commercialsaas_history_payload(big_xml)
         data = _make_minimal_dna((0x07, payload))
@@ -192,7 +193,7 @@ class TestCommercialSaaSHistoryExtract:
         # 10 KB compressed cap with a payload that decompresses to ~100 KB.
         # The old code would allocate the full 100 KB before checking
         # — verify behaviour is now bounded by the cap.
-        monkeypatch.setattr(sc, "_COMMERCIALSAAS_HISTORY_MAX_XML", 1_000)
+        monkeypatch.setattr(_fileio, "_COMMERCIALSAAS_HISTORY_MAX_XML", 1_000)
         big_xml = "<HistoryTree>" + ("Z" * 100_000) + "</HistoryTree>"
         payload = sc._pack_commercialsaas_history_payload(big_xml)
         data = _make_minimal_dna((0x07, payload))
