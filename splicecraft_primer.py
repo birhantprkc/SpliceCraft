@@ -19,7 +19,7 @@ from __future__ import annotations
 import re
 
 from splicecraft_logging import _log
-from splicecraft_biology import _mut_revcomp
+from splicecraft_biology import _mut_revcomp, _rc
 
 
 _MUT_CODON_USAGE = {
@@ -205,3 +205,80 @@ def _mut_design_outer(dna: str) -> dict:
         "b5_overhang": "CGTT",
         "fwd_anneal_start": 3,
     }
+
+
+# ── circular primer-binding re-derivation (Phase D, moved from hub) ─────────
+# THE catastrophic 'where does a primer ACTUALLY land on the (circular) map'
+# core: longest 3'-anchored template match, flap excluded, wrap-aware,
+# hint-tie-broken. Verified by the real-plasmid golden (site-containment +
+# origin-rotation invariance + multi-site hint). pos_end==total => ends at origin.
+# Shortest contiguous match we'll trust as a genuine primer binding when
+# re-deriving from the template (Domesticator binding is ≥18 bp; 12 is a
+# safe floor that still rejects spurious short coincidences).
+_PRIMER_REBIND_MIN: int = 12
+
+
+def _rederive_primer_binding(primer_seq: str, strand: int, template: str,
+                             total: int, hint_start: int = 0,
+                             *, circular: bool = True,
+                             ) -> "tuple[int, int] | None":
+    """Find where a primer's annealing region ACTUALLY binds the
+    (circular) ``template``, so a stale / mis-saved ``pos_start`` /
+    ``pos_end`` can't park the primer off its true site on the map.
+
+    Returns ``(pos_start, pos_end)`` in top-strand coordinates —
+    half-open, with ``pos_end < pos_start`` when the binding wraps the
+    origin (and ``pos_end == total`` when it ends exactly at the
+    origin). Returns ``None`` when no clean binding is found, so the
+    caller keeps the stored positions.
+
+    The binding region is the LONGEST contiguous stretch at the primer's
+    3' end that matches the template — forward: the primer's own 3'
+    suffix on the top strand; reverse: that suffix's reverse-complement
+    on the top strand (which equals a prefix of ``rc(primer)``). The 5'
+    flap (enzyme site / spacer / fusion overhang) is whatever doesn't
+    match. When a primer legitimately binds more than one site, the
+    occurrence nearest ``hint_start`` (the stored position) wins, so the
+    primer still lands where the user designed it."""
+    seq = (primer_seq or "").upper()
+    if not seq or not template or total <= 0:
+        return None
+    # Circular search space: append the wrap-around head so a binding
+    # that spans the origin is found as one contiguous slice. Cap the
+    # tail at the primer length so we never scan more than necessary.
+    # A LINEAR template's ends don't join, so a primer can't anneal
+    # across them (real-world affinity) — search the bare template.
+    if circular:
+        tail = template[:max(0, min(len(seq), total) - 1)]
+        aug = template + tail
+    else:
+        aug = template
+    rc = _rc(seq) if strand < 0 else ""
+    max_L = min(len(seq), total)
+    hint = (int(hint_start) % total) if total else 0
+    for L in range(max_L, _PRIMER_REBIND_MIN - 1, -1):
+        target = (seq[len(seq) - L:] if strand >= 0 else rc[:L])
+        starts: list[int] = []
+        i = aug.find(target)
+        while i != -1 and i < total:
+            starts.append(i)
+            i = aug.find(target, i + 1)
+        if not starts:
+            continue
+        # Closest occurrence to the stored hint (circular distance).
+        def _cdist(p: int) -> int:
+            d = abs(p - hint)
+            return min(d, total - d)
+        m = min(starts, key=_cdist)
+        pos_end = m + L
+        if pos_end > total:          # wraps the origin
+            pos_end -= total
+        return (m, pos_end)
+    # No clean contiguous suffix — keep the stored positions (caller decides).
+    # NB: we deliberately do NOT slide the whole primer to a best-offset here.
+    # `_attach_pcr_primers_to_record` calls with hint_start=0, so a best-offset
+    # window would sit at the origin and could anchor a non-binding primer
+    # there — a mis-placed cloning primer is catastrophic. The length-short
+    # *stored*-feature repair (a fragment built 1 bp short of its primer) is
+    # handled in `PlasmidMap._parse`, where start/end/length are all known.
+    return None
