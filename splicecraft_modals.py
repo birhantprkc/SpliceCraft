@@ -33,10 +33,11 @@ from textual.coordinate import Coordinate as _Coordinate
 from textual.css.query import NoMatches
 from textual.events import Click, MouseDown, MouseMove, MouseUp
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, DataTable, DirectoryTree, Input, Label, ListItem, ListView, RadioButton, RadioSet, Select, Static, TextArea
+from textual.widgets import Button, DataTable, DirectoryTree, Input, Label, ListItem, ListView, RadioButton, RadioSet, Select, Static, TextArea, Tree
 
 from splicecraft_cloning import _simulate_cloned_plasmid, _simulate_primed_amplicon
 from splicecraft_dataaccess import _BUILTIN_GRAMMARS, _NEB_ENZYMES, _all_grammars, _collection_name_taken, _find_collection, _find_hmm_db_entry, _get_active_collection_name, _grammar_dropdown_options, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _load_collections, _load_feature_colors, _load_library, _load_primer_collections, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_collections, _search_collections_library
+from splicecraft_history import _history_detail_lines, _history_populate_tree, _history_protocol_renderable, _history_tree_label
 from splicecraft_logging import _log, _log_event
 from splicecraft_util import _CONTROL_CHARS_RE, _PLASMID_STATUS_VALUES, _cursor_row_key, _natural_sort_key, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _sanitize_label, _sanitize_plasmid_name, _sanitize_plasmid_status, _scrub_path, _validate_group_members
 from splicecraft_widgets import _DEFAULT_TYPE_COLORS, _ExtensionAwareDirectoryTree, _FastaAwareDirectoryTree, _HEX6_RE, _InstantPressButton, _PICKER_PLASMID_STYLE, _PLASMID_STATUS_COLORS, _SearchInput, _XtermColorGrid, _ZipAwareDirectoryTree, _markup_safe_color, _normalise_color_input, _xterm_index_to_hex
@@ -7972,3 +7973,144 @@ class LibrarySearchModal(_OneShotDismissScreen, ModalScreen):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+class HistoryViewerModal(_OneShotDismissScreen, ModalScreen):
+    """Construction-history viewer for a library plasmid.
+
+    Renders the parsed `<HistoryTree>` from
+    `_parse_commercialsaas_history` into a Textual Tree widget — each
+    history step is one tree node, expandable to show its parent
+    fragments. Used by the LibraryPanel's `h` key binding; the App
+    handler builds the tree object and pushes this modal.
+
+    The display is read-only — modifying history is the
+    responsibility of the construction action that produced it
+    (Traditional cloning Save, future: Mutagenesis, Gibson, etc.).
+    Closing returns to the library panel; the tree is rebuilt
+    fresh each open so library edits in another window are
+    reflected on the next view.
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss_history", "Close"),
+        Binding("q",      "dismiss_history", "Close"),
+    ]
+
+    DEFAULT_CSS = """
+    #hist-box {
+        /* Was `height: 36;` (rigid) — switched to flex height with a
+           cap so the dialog shrinks to content on a sparse history
+           and still leaves Tree room to scroll on a deep one
+           (2026-05-20 UX audit). */
+        width: 110; height: 90%; max-height: 36; min-height: 18;
+        background: $surface; border: solid $accent;
+        padding: 1 2;
+    }
+    #hist-title {
+        background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; text-align: center;
+    }
+    #hist-proto-label { color: $accent; text-style: bold; }
+    #hist-proto {
+        height: auto; max-height: 9; margin-bottom: 1;
+        border: solid $primary-darken-2; padding: 0 1; overflow-y: auto;
+    }
+    #hist-proto Static { padding: 0 1; }
+    #hist-tree { height: 1fr; }
+    #hist-detail {
+        height: 8; border: solid $primary-darken-2;
+        padding: 0 1; margin-top: 1; overflow-y: auto;
+    }
+    #hist-detail Static { padding: 0 1; }
+    #hist-btns { height: 3; align: right middle; margin-top: 1; }
+    #hist-btns Button { min-width: 10; }
+    """
+
+    def __init__(self, title: str,
+                  root_node: "_CommercialSaaSHistoryNode") -> None:
+        super().__init__()
+        self._title = title
+        self._root_node = root_node
+        # Map Textual tree-node-id → CommercialSaaS history node, populated
+        # in `on_mount`. Lets the Selected handler look up the
+        # backing history node without re-parsing the XML.
+        self._node_by_id: "dict[int, _CommercialSaaSHistoryNode]" = {}
+
+    def compose(self) -> ComposeResult:
+        from rich.markup import escape as _esc
+        with Vertical(id="hist-box"):
+            yield Static(f" Construction history — {_esc(self._title)} ",
+                          id="hist-title")
+            yield Static("Protocol", id="hist-proto-label")
+            with VerticalScroll(id="hist-proto"):
+                yield Static("", id="hist-proto-text", markup=True)
+            yield Tree("History", id="hist-tree")
+            with Vertical(id="hist-detail"):
+                yield Static(
+                    "[dim]Pick a node to see its details.[/]",
+                    id="hist-detail-text", markup=True,
+                )
+            with Horizontal(id="hist-btns"):
+                yield Button("Close", id="btn-hist-close")
+
+    def on_mount(self) -> None:
+        tree = self.query_one("#hist-tree", Tree)
+        tree.show_root = False
+        tree.guide_depth = 4
+        # De-noised, iterative populate — shared with `HistoryScreen` so
+        # both viewers render identically (only the product auto-expands;
+        # repeated ancestors collapse to references). Replaces the old
+        # recursive `_add`, which both auto-expanded everything AND could
+        # blow the recursion limit on a deeply-nested hostile `.dna`.
+        if _history_populate_tree(tree, self._root_node, self._node_by_id):
+            _log.warning("history: modal tree render truncated by cap "
+                         "for %r", self._title)
+        try:
+            proto = self.query_one("#hist-proto-text", Static)
+            proto.update(_history_protocol_renderable(self._root_node))
+        except NoMatches:
+            pass
+        # Auto-select the root so the detail pane has something
+        # interesting on open.
+        try:
+            top = tree.root.children[0]
+            tree.select_node(top)
+        except IndexError:
+            pass
+
+    @staticmethod
+    def _tree_label_for(node: "_CommercialSaaSHistoryNode") -> str:
+        """One-line tree label — thin wrapper around the module-level
+        `_history_tree_label` helper so the legacy modal and the
+        fullscreen `HistoryScreen` render identical rows. Kept as a
+        staticmethod for backwards compatibility with code that calls
+        `HistoryViewerModal._tree_label_for(node)`."""
+        return _history_tree_label(node)
+
+    @on(Button.Pressed, "#btn-hist-close")
+    def _on_close(self, _: Button.Pressed) -> None:
+        self.dismiss(None)
+
+    def action_dismiss_history(self) -> None:
+        """Close the history viewer modal. Named distinctly from the
+        Textual base `Screen.action_dismiss` (which is async + takes a
+        result kwarg) so the override doesn't trip
+        `reportIncompatibleMethodOverride` — the binding above routes
+        to this method by name."""
+        self.dismiss(None)
+
+    @on(Tree.NodeSelected, "#hist-tree")
+    def _on_node_selected(self, event) -> None:
+        """When the user picks a node, render its full details into the
+        bottom detail panel via the shared `_history_detail_lines` (same
+        block the full-screen viewer shows; every dynamic field is
+        Rich-escaped). Falls back gracefully if the lookup fails —
+        defence-in-depth against the dict going stale."""
+        hist = self._node_by_id.get(event.node.id)
+        if hist is None:
+            return
+        try:
+            detail = self.query_one("#hist-detail-text", Static)
+        except NoMatches:
+            return
+        detail.update("\n".join(_history_detail_lines(hist)))
