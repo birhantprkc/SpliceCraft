@@ -12,6 +12,7 @@ import pytest
 
 import splicecraft as sc
 import splicecraft_codon as _codon  # the optimizer core lives here (Phase D L2); its deps resolve in this namespace
+import splicecraft_search as _search  # NCBI taxonomy search lives here (Phase D L1)
 
 
 async def _settle_tab(pilot, tabs, want, tries=60):
@@ -561,7 +562,7 @@ class TestNcbiSearch:
         """Regression guard for 2026-05-06 fix: a compromised / MITM'd
         upstream that streams gigabytes at us must not OOM the worker.
         Response is capped at `_NCBI_MAX_RESPONSE_BYTES`."""
-        monkeypatch.setattr(sc, "_NCBI_MAX_RESPONSE_BYTES", 100)
+        monkeypatch.setattr(_search, "_NCBI_MAX_RESPONSE_BYTES", 100)
         # Build a response well over the cap.
         big_xml = b"<?xml?><eSearchResult>" + (b"<Id>1</Id>" * 1000) + b"</eSearchResult>"
 
