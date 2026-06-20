@@ -11,6 +11,7 @@ import re
 import pytest
 
 import splicecraft as sc
+import splicecraft_codon as _codon  # the optimizer core lives here (Phase D L2); its deps resolve in this namespace
 
 
 async def _settle_tab(pilot, tabs, want, tries=60):
@@ -2580,9 +2581,11 @@ class TestForbiddenSitesSetting:
 
     @staticmethod
     def _patch(monkeypatch, names):
-        monkeypatch.setattr(
-            sc, "_get_setting",
-            lambda k, d=None: names if k == "codon_forbidden_enzymes" else d)
+        fake = lambda k, d=None: names if k == "codon_forbidden_enzymes" else d
+        # _codon_forbidden_sites reads _get_setting in the codon-sibling namespace;
+        # the hub-side _forbidden_sites_label reads it in the hub namespace. Patch both.
+        monkeypatch.setattr(_codon, "_get_setting", fake)
+        monkeypatch.setattr(sc, "_get_setting", fake)
 
     def test_resolves_names_to_sites(self, monkeypatch):
         self._patch(monkeypatch, ["BsaI", "EcoRI"])
