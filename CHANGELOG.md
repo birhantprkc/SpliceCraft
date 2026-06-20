@@ -14,6 +14,12 @@
 
 ---
 
+## [1.0.87] — 2026-06-20
+
+### Under the hood
+
+- **More of the codebase moved into separately-loadable modules.** Continuing the v1.0.85/v1.0.86 reorganization: the restriction-site scanner and enzyme digest, the agarose-gel simulator, the lab-notebook entry processing, and single-file sequence I/O (reading and writing FASTA / GenBank / GFF / AB1 / FASTQ) now each live in their own focused module that the main program imports — the single giant file shrank by roughly another 2,300 lines — and one behind-the-scenes data path was tidied up. As before, this is a **maintainability and AI-assistability change only: nothing about how SpliceCraft behaves changes.** Every feature, keyboard shortcut, saved-file format, and the agent API are byte-for-byte identical — locked down by the public-surface snapshot test — and the write-guard that protects your saved library is untouched throughout.
+
 ## [1.0.86] — 2026-06-19
 
 ### Under the hood
