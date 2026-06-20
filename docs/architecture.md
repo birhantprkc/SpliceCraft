@@ -21,6 +21,7 @@ chokepoint), `splicecraft_dataaccess` (every domain `_load_X`/`_save_X` accessor
 `splicecraft_record` (GenBank↔SeqRecord serialization), `splicecraft_util` (pure
 cross-cutting helpers), `splicecraft_cloning` (construction simulation),
 `splicecraft_gels` (agarose-gel sim/render — `[SUB-gels]`),
+`splicecraft_experiments` (lab-notebook entry processing — `[SUB-experiments]`),
 `splicecraft_render`, `splicecraft_history`, `splicecraft_widgets`,
 `splicecraft_modals` (60 dependency-clean dialog classes), `splicecraft_errors`
 (plus the stdlib-only `splicecraft_cli` sidecar and `splicecraft_demo_plasmids`
