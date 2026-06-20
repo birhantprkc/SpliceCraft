@@ -128,6 +128,13 @@ _SAVES_AUTHORIZED_REASON: str = ""
 # (`_state._DATA_DIR = _user_data_dir()`); placeholder here so readers + the
 # conftest sandbox patch resolve it. Everything path-related hangs off this.
 _DATA_DIR: Path = None  # type: ignore[assignment]
+# `_DNA_ORIGINALS_DIR` — the .dna CommercialSaaS-roundtrip sidecar dir (a
+# `_DATA_DIR`-derived sub-dir). Migrated here (Phase D, the fileio-extraction
+# prerequisite) so the fileio sibling can reach it without an upward hub import;
+# the hub sets the real `_DATA_DIR/dna_originals` at import. Enumerated BY NAME in
+# the hub's `_USER_DATA_DIR_ATTRS` + resolved via `_resolve_state_or_hub` (checks
+# _state first), so master-delete / snapshot / housekeeping still cover it.
+_DNA_ORIGINALS_DIR: Path = None  # type: ignore[assignment]
 
 # ── Per-file data paths (Phase B-prep) — the hub sets the real `_DATA_DIR/...`
 # values at import; declared here (typed Path) so every `_state._X_FILE` reader

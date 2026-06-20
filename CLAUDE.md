@@ -11,8 +11,10 @@ The user's plasmid library + collections + primers + parts live in `~/.local/sha
    import os, tempfile; os.environ["XDG_DATA_HOME"] = tempfile.mkdtemp(prefix="sc-")
    os.environ.setdefault("SPLICECRAFT_SKIP_LOCK", "1")
    import splicecraft as sc
-   assert "sc-" in str(sc._DATA_DIR), f"unsandboxed: {sc._DATA_DIR}"
-   sc._authorize_writes_for_sandbox(sc._DATA_DIR)   # L2 chokepoint opt-in
+   # NB: _DATA_DIR (+ the _*_FILE paths, _DNA_ORIGINALS_DIR, …) migrated to _state
+   # during the modularization — read them as `sc._state._DATA_DIR`, not `sc._DATA_DIR`.
+   assert "sc-" in str(sc._state._DATA_DIR), f"unsandboxed: {sc._state._DATA_DIR}"
+   sc._authorize_writes_for_sandbox(sc._state._DATA_DIR)   # L2 chokepoint opt-in
    ```
 2. **`_save_*` helpers are nuclear-coded.** Calling `_save_collections`, `_save_library`, `_save_primers`, `_save_parts_bin`, `_save_features`, `_save_custom_grammars`, `_save_entry_vectors`, `_codon_tables_save`, `_save_protein_motifs`, `_save_experiments`, `_save_experiment_projects`, `_save_gels`, `_save_custom_enzymes`, `_save_enzyme_collections`, or `_safe_save_json` directly from outside the four sanctioned callers (`PlasmidApp.main()`, pytest `_protect_user_data` fixture, agent HTTP server, sandboxed verifier harness) raises `RuntimeError` since the L2 chokepoint landed — sandbox first or use the GUI.
 3. **Verifier scripts always go through `.claude/skills/verifier-splicecraft.md`.** It enforces the sandbox + authorization at the top. Don't roll your own.

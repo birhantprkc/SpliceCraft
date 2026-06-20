@@ -12244,7 +12244,7 @@ class TestUpdateDataSafety:
         cr = sc._CRASH_RECOVERY_DIR
         cr.mkdir(parents=True, exist_ok=True)
         (cr / "myplas-abc123.gb").write_text("LOCUS test\n", encoding="utf-8")
-        do = sc._DNA_ORIGINALS_DIR
+        do = sc._state._DNA_ORIGINALS_DIR
         do.mkdir(parents=True, exist_ok=True)
         (do / "myplas.dna").write_bytes(b"\x00fake commercial saas binary")
         path = sc._create_pre_update_snapshot("0.0.0-test")

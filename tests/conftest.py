@@ -97,8 +97,7 @@ def _protect_user_data(tmp_path, monkeypatch):
     # CommercialSaaS .dna sidecar storage (Phase 4d): tests that import .dna
     # files would otherwise create copies in the user's real
     # _DATA_DIR/dna_originals on disk. Same isolation pattern.
-    monkeypatch.setattr(sc, "_DNA_ORIGINALS_DIR",
-                          tmp_path / "dna_originals")
+    _patch("_DNA_ORIGINALS_DIR", tmp_path / "dna_originals")
     # Plugin namespace (reserved): redirect so a test that triggers
     # `_check_and_stamp_data_version` doesn't `mkdir` the user's real
     # _DATA_DIR/plugins, and so any snapshot test that includes

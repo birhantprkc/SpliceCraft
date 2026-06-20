@@ -75,7 +75,7 @@ class TestSidecarCaseCollision:
     def test_load_falls_back_to_legacy(self, tmp_path, monkeypatch):
         """_load_dna_original finds a pre-0.8.9 legacy-named sidecar
         when the canonical path is missing — migration coverage."""
-        monkeypatch.setattr(sc, "_DNA_ORIGINALS_DIR", tmp_path)
+        monkeypatch.setattr(sc._state, "_DNA_ORIGINALS_DIR", tmp_path)
         eid = "pUC19"
         legacy = sc._dna_sidecar_legacy_path(eid)
         legacy.write_bytes(b"legacy bytes")
@@ -84,7 +84,7 @@ class TestSidecarCaseCollision:
     def test_save_canonical_cleans_up_legacy(self, tmp_path, monkeypatch):
         """After a save to the canonical path, the legacy sidecar (if
         any) is unlinked so the migration is one-way and durable."""
-        monkeypatch.setattr(sc, "_DNA_ORIGINALS_DIR", tmp_path)
+        monkeypatch.setattr(sc._state, "_DNA_ORIGINALS_DIR", tmp_path)
         eid = "pUC19"
         legacy = sc._dna_sidecar_legacy_path(eid)
         legacy.write_bytes(b"legacy")
@@ -338,7 +338,7 @@ class TestLoadDnaOriginalSizeCap:
     could OOM the export path."""
 
     def test_oversized_sidecar_refused(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sc, "_DNA_ORIGINALS_DIR", tmp_path)
+        monkeypatch.setattr(sc._state, "_DNA_ORIGINALS_DIR", tmp_path)
         eid = "big"
         target = sc._dna_sidecar_path(eid)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -346,7 +346,7 @@ class TestLoadDnaOriginalSizeCap:
         assert sc._load_dna_original(eid) is None
 
     def test_normal_sidecar_accepted(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(sc, "_DNA_ORIGINALS_DIR", tmp_path)
+        monkeypatch.setattr(sc._state, "_DNA_ORIGINALS_DIR", tmp_path)
         eid = "small"
         target = sc._dna_sidecar_path(eid)
         target.parent.mkdir(parents=True, exist_ok=True)

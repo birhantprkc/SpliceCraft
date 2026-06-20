@@ -1313,7 +1313,7 @@ class TestDnaSidecarStorage:
         # The actual file lives under the sidecar dir, not at the
         # escaped path.
         actual = sc._dna_sidecar_path(evil)
-        assert actual.parent == sc._DNA_ORIGINALS_DIR
+        assert actual.parent == sc._state._DNA_ORIGINALS_DIR
 
     def test_sidecar_path_rejects_pure_dot_segments(self):
         """Regression guard for 2026-05-06 fix: an `entry_id` of just
@@ -1322,7 +1322,7 @@ class TestDnaSidecarStorage:
         weird filesystems."""
         for evil in ("..", ".", "...", "./..", "/", "\\", "//"):
             p = sc._dna_sidecar_path(evil)
-            assert p.parent == sc._DNA_ORIGINALS_DIR
+            assert p.parent == sc._state._DNA_ORIGINALS_DIR
             assert p.name not in (".dna", "..dna")  # never a dotfile
             assert "/" not in p.name
             assert "\\" not in p.name
@@ -1331,14 +1331,14 @@ class TestDnaSidecarStorage:
         """NUL bytes in a path raise on POSIX; normalise to underscore
         instead so the sentinel rule applies cleanly."""
         p = sc._dna_sidecar_path("foo\x00bar")
-        assert p.parent == sc._DNA_ORIGINALS_DIR
+        assert p.parent == sc._state._DNA_ORIGINALS_DIR
         assert "\x00" not in p.name
 
     def test_sidecar_path_rejects_absolute_path_id(self):
         """An entry_id that's a fully-qualified path must still produce
         a sidecar inside the originals dir (basename only)."""
         p = sc._dna_sidecar_path("/etc/passwd")
-        assert p.parent == sc._DNA_ORIGINALS_DIR
+        assert p.parent == sc._state._DNA_ORIGINALS_DIR
         # Underscores replace slashes before basename extraction, so the
         # full sanitised id ends up as the filename.
         assert p.name.endswith(".dna")
