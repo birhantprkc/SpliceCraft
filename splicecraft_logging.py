@@ -15,9 +15,11 @@ DELIBERATELY LEFT IN THE HUB (do not move here):
 """
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
+import time as _time
 import re
 import uuid as _uuid
 
@@ -234,3 +236,108 @@ def _log_event(event: str, *, _stacklevel: int = 2, **fields) -> None:
         # also slip past `_repr_for_log`. Should be unreachable.
         payload = repr(safe)[:500]
     _log.info("event %s %s", event, payload, stacklevel=_stacklevel)
+
+
+# ── Decorators: structured action logging + perf timing (moved from hub, Phase D)
+# `_log_event`/`_log` resolve in THIS module now, so event-capture tests patch
+# `splicecraft_logging._log_event` (the patchable source moved WITH the decorators;
+# see tests/test_logging.py::test_action_log_routes_through_patchable_log_event).
+def _action_log(event_name: str):
+    """Decorator that emits an INFO event at action-method entry
+    plus the active record id (when present) so the log line tells
+    the reader what the user was looking at, not just what they
+    pressed.
+
+    Applied to ``action_*`` methods on `PlasmidApp` so the per-action
+    boilerplate stays a one-line decorator instead of an explicit
+    `_log_event` call at the head of every body. Any exception in
+    the logging path is swallowed — logging must never break the
+    underlying action.
+
+    Use as::
+
+        @_action_log("app.fetch")
+        def action_fetch(self):
+            ...
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(self, *args, **kwargs):
+            # Level-gate FIRST so an INFO-suppressed run pays one
+            # attribute lookup per action invocation (no getattr chain,
+            # no dict build, no JSON encode). The same guard inside
+            # `_log_event` covers the explicit-call path; this one
+            # short-circuits the decorator wrapper too.
+            if _log.isEnabledFor(logging.INFO):
+                try:
+                    ctx: dict = {}
+                    rec = getattr(self, "_current_record", None)
+                    if rec is not None:
+                        rid = getattr(rec, "id", None) or getattr(
+                            rec, "name", None
+                        )
+                        if rid:
+                            ctx["rec"] = rid
+                    # _stacklevel=3 so the logger's funcName:lineno
+                    # points at the wrapped action method, not at this
+                    # wrapper. Without it every action shows up in the
+                    # log as "_action_log:531" — useless for tracing.
+                    _log_event(event_name, _stacklevel=3, **ctx)
+                except Exception:  # noqa: BLE001 — logging must never raise
+                    # INV-73 (2026-05-25): the silent-swallow used to
+                    # mean a malformed _log_event payload caused the
+                    # entire log entry to vanish with no trace. Now
+                    # we leave a debug-level breadcrumb on the std
+                    # logger so a power user grepping the log can
+                    # spot the regression — the action still runs
+                    # so user-facing behaviour is untouched.
+                    try:
+                        _log.debug(
+                            "_action_log decorator: event emit "
+                            "failed for %s; action still ran",
+                            event_name,
+                        )
+                    except Exception:  # noqa: BLE001 — last-resort
+                        pass
+            return func(self, *args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def _timed(path: str, threshold_ms: float = 0.0):
+    """Decorator counterpart to `_log_timing` — wraps a whole function
+    body in the same start/elapsed harness. Use on top-level heavy
+    operations (NCBI fetch, primer3, BLAST, Gibson simulate) where
+    every call is potentially diagnostic-worthy.
+
+    Default `threshold_ms=0` means every call emits an event — useful
+    for known-heavy paths where you always want a timestamp + duration
+    in the log. Bump to a non-zero value to silence fast cases on
+    paths that mostly return quickly.
+
+    Naming: pass a `path` like ``"op.fetch_genbank"`` or
+    ``"op.gibson_simulate"`` so the AI-parser can group all slow
+    events by operation type.
+
+    Performance: same level-gate short-circuit as `_log_event` — when
+    INFO is suppressed the wrapper still measures (`perf_counter` is
+    sub-microsecond) but `_log_event` early-returns before any JSON
+    encode. Net cost per call when INFO is off: ~300 ns.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            t0 = _time.perf_counter()
+            try:
+                return func(*args, **kwargs)
+            finally:
+                dt_ms = (_time.perf_counter() - t0) * 1000
+                if dt_ms >= threshold_ms:
+                    # _stacklevel=3 so the funcName:lineno prefix
+                    # points at the wrapped function, not at this
+                    # wrapper closure.
+                    _log_event("op.timed", _stacklevel=3,
+                                path=path,
+                                elapsed_ms=round(dt_ms, 1))
+        return wrapper
+    return decorator

@@ -31,12 +31,16 @@ def test_primitives_live_in_logging_sibling():
         )
 
 
-def test_decorators_stay_in_hub():
-    # `_action_log` / `_timed` must remain hub-defined so their internal
-    # `_log_event` resolves the patchable re-export -- the monkeypatch path the
-    # event-capture tests rely on. If they ever move, that path breaks silently.
-    assert sc._action_log.__module__ == "splicecraft"
-    assert sc._timed.__module__ == "splicecraft"
+def test_decorators_live_in_logging():
+    # `_action_log` / `_timed` live in splicecraft_logging (Phase D) -- they ARE
+    # logging concerns, alongside `_log` / `_log_event`. Their internal
+    # `_log_event` now resolves THIS module's namespace, so event-capture tests
+    # patch `splicecraft_logging._log_event` (see
+    # test_action_log_routes_through_patchable_log_event). The patchable path
+    # moved WITH the decorators; the hub re-exports them so the 116
+    # `@_action_log(...)` / `@_timed(...)` apply sites resolve unchanged.
+    assert sc._action_log.__module__ == "splicecraft_logging"
+    assert sc._timed.__module__ == "splicecraft_logging"
 
 
 def test_log_event_reaches_a_file(tmp_path):
@@ -57,11 +61,12 @@ def test_log_event_reaches_a_file(tmp_path):
 
 
 def test_action_log_routes_through_patchable_log_event(monkeypatch):
-    """A test that patches `sc._log_event` must intercept events emitted via the
-    `@_action_log` decorator -- i.e. the decorator (in the hub) resolves the
-    patchable re-export, not a private copy in the sibling."""
+    """A test that patches `splicecraft_logging._log_event` must intercept events
+    emitted via the `@_action_log` decorator -- the decorator (in
+    splicecraft_logging) resolves its OWN module's `_log_event`, which is the
+    patchable source now that the decorator moved out of the hub."""
     captured: list = []
-    monkeypatch.setattr(sc, "_log_event", lambda e, **f: captured.append((e, f)))
+    monkeypatch.setattr(splicecraft_logging, "_log_event", lambda e, **f: captured.append((e, f)))
 
     class _Dummy:
         _current_record = None
