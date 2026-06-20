@@ -26,6 +26,9 @@ import splicecraft_state as _state
 # NCBI esearch / esummary XML for a 200-id batch is ~50 KB in practice;
 # 4 MB is wildly generous. Kazusa showcodon HTML is ~30 KB; 1 MB is plenty.
 _NCBI_MAX_RESPONSE_BYTES   = 4 * 1024 * 1024
+# NCBI socket timeout (seconds) — shared by the Entrez fetchers (fileio) + the
+# online-BLAST poll loop (search). The UI worker can't otherwise cancel a hang.
+_NCBI_TIMEOUT_S = 30
 
 
 _HMM_DB_RETRY_BACKOFF_S = 0.25      # one retry, 250 ms backoff

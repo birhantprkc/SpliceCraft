@@ -32,6 +32,7 @@ from splicecraft_record import (
     _GB_LOCUS_NAME_MAX, _gb_text_to_record, _normalize_primer_seq, _record_to_gb_text,
 )
 from splicecraft_history import _CommercialSaaSHistoryNode, _history_human_dt
+from splicecraft_net import _NCBI_TIMEOUT_S
 
 
 # Foreign-file ingest cap (GenBank / .dna / GFF3 the user *opens*, NOT the
@@ -3152,8 +3153,8 @@ def load_genbank(path: str):
 # guard `_demo_block_network` STAYS hub-side (it reads _DEMO_MODE + has 5 other
 # callers); reached here via _state._demo_block_network_hook (fail-closed).
 # Entrez.tool stamps _state._sc_version (= hub __version__). Lazy Bio.Entrez/
-# SeqIO/socket/io inside the fns.
-_NCBI_TIMEOUT_S = 30   # cap long NCBI hangs; the UI worker can't otherwise cancel
+# SeqIO/socket/io inside the fns. _NCBI_TIMEOUT_S now lives in splicecraft_net
+# (shared with online BLAST); imported in the header.
 
 # Cap on the GenBank-text response size from `Entrez.efetch`. The record-list
 # API (`_NCBI_MAX_RESPONSE_BYTES = 4 MB`) is too tight for a real chromosome
