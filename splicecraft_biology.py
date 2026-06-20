@@ -34,6 +34,12 @@ import re
 import threading as _threading
 from collections import OrderedDict
 
+# Same-layer (L0) sibling deps for the restriction-scan engine
+# (Phase D): the LRU caches + catalog/enzyme getters live in _state;
+# the @_timed scan decorator + _log come from splicecraft_logging.
+import splicecraft_state as _state
+from splicecraft_logging import _log, _timed
+
 
 # ── IUPAC + reverse complement ────────────────────────────────────────────
 
@@ -1478,11 +1484,733 @@ def _assemble_operon(genes, *, promoter='', terminator='',
             'genes': report}
 
 
+
+
+# ── Restriction-site scanner + enzyme digest (Phase D, extracted from the
+# hub). Sacred invariants #1/#2/#6 live here. Pure given _state (caches +
+# `_scan_catalog_hook`/`_all_enzymes_hook` getters) + `_rc`/`_iupac_pattern`
+# above. `_rebuild_scan_catalog` (writes the catalog) + `_all_enzymes` (reads
+# dataaccess) stay hub-side and feed in through the _state getters.
+# ──────────────────────────────────────────────────────────────────────────
+
+@_timed("op.scan_restriction", threshold_ms=25)
+def _scan_restriction_sites(
+    seq: str,
+    min_recognition_len: int = 6,
+    unique_only: bool = True,
+    circular: bool = True,
+    allowed_enzymes: "frozenset[str] | None" = None,
+) -> list[dict]:
+    """Cached entry point for restriction-site scans. Identical
+    signature + return shape to the inner `_scan_restriction_sites_impl`;
+    consults `_RESTR_SCAN_CACHE` first so a `r`-toggle on a 5 Mb record
+    drops from ~3 s to ~5 ms after the first scan.
+
+    `allowed_enzymes` (GH #13, 2026-05-14): when supplied, the scan
+    restricts to ONLY these names — overrides the `min_recognition_len`
+    / `unique_only` filters since the user has hand-picked the set.
+    Pass `None` to use the standard filter rules."""
+    # Cache key uses `hash(seq)` rather than `id(seq)`: id-based keys
+    # break for transient strings (e.g. unit tests build a fresh seq
+    # per test, GC'd between calls — CPython's allocator can hand the
+    # same address to a later string and produce a stale cache hit).
+    # CPython interns the string hash on the first call, so subsequent
+    # scans of the same seq are still O(1). Same fix applied to
+    # `_ENZYME_CUTS_CACHE`.
+    allowed_key = (
+        tuple(sorted(allowed_enzymes)) if allowed_enzymes else None
+    )
+    key = (hash(seq), int(min_recognition_len),
+           bool(unique_only), bool(circular), allowed_key)
+    hit = _state._RESTR_SCAN_CACHE.get(key)
+    if hit is not None:
+        # Move to end (LRU touch) so a steady-state "I'm scanning the
+        # same record" stays hot.
+        _state._RESTR_SCAN_CACHE.move_to_end(key)
+        return hit
+    result = _scan_restriction_sites_impl(
+        seq, min_recognition_len, unique_only, circular,
+        allowed_enzymes=allowed_enzymes,
+    )
+    if len(_state._RESTR_SCAN_CACHE) >= _state._RESTR_SCAN_CACHE_MAX:
+        _state._RESTR_SCAN_CACHE.popitem(last=False)
+    _state._RESTR_SCAN_CACHE[key] = result
+    return result
+
+
+def _scan_restriction_sites_impl(
+    seq: str,
+    min_recognition_len: int = 6,
+    unique_only: bool = True,
+    circular: bool = True,
+    *,
+    allowed_enzymes: "frozenset[str] | None" = None,
+) -> list[dict]:
+    """Scan both strands; return resite + recut dicts for every hit.
+
+    resite — the recognition sequence span (colored bar)
+    recut  — the cut position (single-bp marker: ↓ above or ↑ below DNA)
+
+    min_recognition_len — skip enzymes whose recognition site is shorter than this
+                          (default 6 to reduce noise from 4-cutters)
+    unique_only         — if True, only include enzymes that cut exactly once
+                          (forward + reverse strand combined; default True)
+    circular            — if True (default), recognition sequences that span
+                          the origin (bp n-1 → bp 0) are also found. SpliceCraft
+                          is a plasmid viewer, so circularity is on by default.
+
+    Wrap-around resites are emitted as TWO pieces so the existing linear-span
+    rendering in the map / sequence panel stays correct: one piece on the
+    "tail" (start..n) with the enzyme label, one unlabeled piece on the
+    "head" (0..tail_len). The single-bp recut marker is placed at its real
+    absolute position modulo n.
+    """
+    seq_u = seq.upper()
+    n = len(seq_u)
+    # Per-enzyme results collected first so we can filter to unique cutters
+    by_enzyme: dict[str, list[dict]] = {}
+    seen: set[tuple[str, int, int]] = set()   # deduplicate palindromes
+
+    # For circular sequences, scan an augmented copy that includes up to
+    # site_len-1 bp re-attached from the beginning so matches starting near
+    # the end (that would otherwise be truncated) are found too.
+    max_site_len = max((e[2] for e in _state._scan_catalog_hook()), default=0)
+    scan_seq = (seq_u + seq_u[: max_site_len - 1]) if (circular and n > 0) else seq_u
+
+    def _emit_resite(hits, p, site_len, strand, color, name,
+                     cut_col, ext_cut_bp,
+                     top_cut_bp=-1, bottom_cut_bp=-1):
+        """Emit one or two resite dicts depending on wrap. Labels only on the
+        first piece so the map doesn't double-print. For wrapped sites, the
+        cut_col / ext_cut_bp fields are only meaningful on the piece that
+        actually contains the cut; we attach them to the tail piece by default
+        and clear them on the head piece.
+
+        `top_cut_bp` / `bottom_cut_bp` are absolute top-strand-coordinate
+        positions where the enzyme cleaves each strand. They're stored on
+        every piece (including wrap continuations) so a click anywhere on
+        the bar can render the per-strand cut split.
+        """
+        common = {
+            "top_cut_bp":    top_cut_bp,
+            "bottom_cut_bp": bottom_cut_bp,
+        }
+        if p + site_len <= n:
+            hits.append({
+                "type":       "resite",
+                "start":      p,
+                "end":        p + site_len,
+                "strand":     strand,
+                "color":      color,
+                "label":      name,
+                "cut_col":    cut_col,
+                "ext_cut_bp": ext_cut_bp,
+                # Full recognition span (== start/end when it doesn't
+                # wrap). Carried explicitly so the click-highlight knows
+                # the TRUE recognition bounds even on a wrapped piece.
+                "rec_start":  p,
+                "rec_end":    p + site_len,
+                **common,
+            })
+            return
+        # Wraps origin: tail [p, n) + head [0, (p + site_len) - n).
+        tail_len = n - p
+        head_len = (p + site_len) - n
+        # cut_col (bar-relative) maps to whichever piece actually contains the
+        # cut. ext_cut_bp (absolute) is unrelated to the tail/head split — it's
+        # only meaningful when cut_col is None (Type IIS cuts outside the
+        # recognition sequence). Attach it to both pieces so the cut arrow is
+        # drawn regardless of which chunk contains the external cut position;
+        # the chunk-level `chunk_start <= ext_cut_bp < chunk_end` test makes
+        # the render idempotent. Regression guard added 2026-04-13.
+        tail_cut_col = cut_col if (cut_col is not None and cut_col < tail_len) else None
+        head_cut_col = ((cut_col - tail_len) if (cut_col is not None and cut_col >= tail_len)
+                        else None)
+        # Both pieces carry the SAME wrap-encoded recognition span
+        # `[p, head_len)` (rec_end < rec_start signals the origin wrap)
+        # so clicking the labeled tail can still highlight the full
+        # recognition — tail bases [p, n) AND head bases [0, head_len).
+        # Pre-2026-05-30 the tail piece reported `rec_end = n`, so the
+        # click-highlight coloured only the pre-origin bases ("too few
+        # purple bases" on a near-origin BsaI / Esp3I site).
+        hits.append({
+            "type":       "resite",
+            "start":      p,
+            "end":        n,
+            "strand":     strand,
+            "color":      color,
+            "label":      name,
+            "cut_col":    tail_cut_col,
+            "ext_cut_bp": ext_cut_bp,
+            "rec_start":  p,
+            "rec_end":    head_len,
+            **common,
+        })
+        hits.append({
+            "type":       "resite",
+            "start":      0,
+            "end":        head_len,
+            "strand":     strand,
+            "color":      color,
+            "label":      "",     # unlabeled continuation
+            "cut_col":    head_cut_col,
+            "ext_cut_bp": ext_cut_bp,
+            "rec_start":  p,
+            "rec_end":    head_len,
+            **common,
+        })
+
+    for entry in _state._scan_catalog_hook():
+        name, site, site_len, fwd_cut, rev_cut, color, pat, is_palindrome, rc_pat = entry
+        # `allowed_enzymes` (GH #13): when set, the user has hand-
+        # picked a working list — bypass the length filter so a 4-cutter
+        # like Sau3AI shows up even when the global `restr_min_len`
+        # is 6. We DO still honour `unique_only` below, since "unique
+        # cutters of MY hand-picked list" is the common intent.
+        if allowed_enzymes is not None:
+            if name not in allowed_enzymes:
+                continue
+        else:
+            if site_len < min_recognition_len:
+                continue
+        hits: list[dict] = []
+
+        # Forward strand scan (over augmented sequence if circular)
+        for m in pat.finditer(scan_seq):
+            p = m.start()
+            if p >= n:
+                continue   # duplicate of match already found at p - n
+            key = (name, p, 1)
+            if key in seen:
+                continue
+            seen.add(key)
+            # On LINEAR molecules a negative-cut enzyme (e.g. BaeI fwd_cut=-10)
+            # matching within |cut| bp of the 5' end makes (p+fwd_cut)%n wrap
+            # to a phantom cut near the 3' end that doesn't biologically exist.
+            # Mirror the reverse-strand guard below: drop the hit when a raw cut
+            # falls outside the molecule. Circular molecules wrap correctly.
+            if not circular and (
+                    (p + fwd_cut) < 0 or (p + fwd_cut) > n
+                    or (p + rev_cut) < 0 or (p + rev_cut) > n):
+                continue
+            # ext_cut_bp: absolute cut position when cut falls outside recognition
+            _ext = ((p + fwd_cut) % n) if (fwd_cut <= 0 or fwd_cut >= site_len) else None
+            _cc  = fwd_cut if 0 < fwd_cut < site_len else None
+            # For forward-strand binding (whether palindromic or Type IIS),
+            # fwd_cut counts from the recognition's 5' end on the top strand
+            # and rev_cut counts from the recognition's 3' end on the bottom
+            # strand (= 5' end of bottom strand reading right-to-left). Both
+            # measured in top-strand coordinates: top cut at p+fwd_cut,
+            # bottom cut at p+rev_cut. For palindromes these are mirror
+            # images (rev_cut == site_len - fwd_cut); for Type IIS like BsaI
+            # both fall outside the recognition.
+            _top_cut = (p + fwd_cut) % n if n > 0 else 0
+            _bot_cut = (p + rev_cut) % n if n > 0 else 0
+            _emit_resite(hits, p, site_len, 1, color, name, _cc, _ext,
+                         top_cut_bp=_top_cut, bottom_cut_bp=_bot_cut)
+            hits.append({
+                "type":   "recut",
+                "start":  _top_cut,
+                "end":    _top_cut + 1,
+                "strand": 1,
+                "color":  color,
+                "label":  name,
+            })
+
+        # Reverse strand handling — uses precomputed is_palindrome and rc_pat
+        # from _SCAN_CATALOG (no per-call _rc / _iupac_pattern work).
+        if not is_palindrome:
+            # Non-palindromic: scan for RC on forward strand to find
+            # reverse-strand binding sites at their correct positions.
+            for m in rc_pat.finditer(scan_seq):
+                p = m.start()
+                if p >= n:
+                    continue   # duplicate of match already found at p - n
+                key = (name, p, -1)
+                if key in seen:
+                    continue
+                seen.add(key)
+                # Cut column within the bar: enzyme's fwd_cut mapped to
+                # the reversed orientation displayed on the forward strand.
+                # Symmetry: a forward-strand cut at offset `c` from the
+                # recognition's 5' end appears on a reverse-bound site at
+                # offset `site_len - c` from the bar's left edge.
+                rev_cut_col = site_len - fwd_cut
+                # 2026-05-27 (audit-5 restriction M1): on LINEAR
+                # molecules, a reverse-strand non-palindromic
+                # enzyme whose Type IIS cut would land BEFORE the
+                # 5' end (e.g. BsaI with rev_cut=11 matching at p=2
+                # on a linear plasmid → cut at -3 wraps to n-3)
+                # can produce a cut position that doesn't biologically
+                # exist. Drop the hit on linear molecules when the
+                # cut would wrap. Circular molecules wrap correctly.
+                _top_cut_raw = p + site_len - rev_cut
+                _bot_cut_raw = p + site_len - fwd_cut
+                if not circular and (
+                        _top_cut_raw < 0 or _top_cut_raw > n
+                        or _bot_cut_raw < 0 or _bot_cut_raw > n):
+                    continue
+                _top_cut_bp = _top_cut_raw % n   # top-strand cut in fwd coords
+                _bot_cut_bp = _bot_cut_raw % n if n > 0 else 0
+                _top_cut_outside = ((_top_cut_bp - p) % n) >= site_len
+                _cc  = rev_cut_col if 0 <= rev_cut_col < site_len else None
+                _ext = _top_cut_bp if _top_cut_outside else None
+                _emit_resite(hits, p, site_len, -1, color, name, _cc, _ext,
+                             top_cut_bp=_top_cut_bp,
+                             bottom_cut_bp=_bot_cut_bp)
+                hits.append({
+                    "type":   "recut",
+                    "start":  _bot_cut_bp,
+                    "end":    _bot_cut_bp + 1,
+                    "strand": -1,
+                    "color":  color,
+                    "label":  name,
+                })
+
+        if hits:
+            by_enzyme[name] = hits
+
+    feats: list[dict] = []
+    # `placed` tracks (start, end, recognition_site) — keying on the
+    # recognition string in addition to the span means HF / iso
+    # variants of the SAME enzyme (e.g., EcoRI vs EcoRI-HF, both with
+    # site "GAATTC") still collapse, but two enzymes with DIFFERENT
+    # recognition patterns whose hits happen to land on the same
+    # bp range (e.g., AccI/GTMKAC and BstZ17I/GTATAC both matching
+    # GTATAC at one position) stay independent. Pre-2026-05-18 this
+    # was `set[tuple[int, int]]` which over-collapsed and caused
+    # `unique_only=True`/`False` to disagree on which enzyme to
+    # surface when the catalog-order winner was a multi-cutter
+    # filtered out by `unique_only=True` but kept by `unique_only=False`.
+    placed: set[tuple[int, int, str]] = set()
+    site_of: dict[str, str] = {
+        entry[0]: entry[1] for entry in _state._scan_catalog_hook()
+    }
+    # When a custom enzyme list is active, the user has hand-picked
+    # the set — surface every hit of those enzymes regardless of
+    # cut-count. The `unique_only` filter is a discovery aid for the
+    # default "show me 6+ bp unique cutters" workflow; it actively
+    # hides multi-cutters (BsaI in a Golden Gate plasmid, EcoRI in a
+    # repeat-laden synthetic construct) which is the opposite of what
+    # the user wants after they typed those enzymes in by hand.
+    effective_unique_only = (
+        unique_only and allowed_enzymes is None
+    )
+    for name, hits in by_enzyme.items():
+        # Count LABELED resites only — a wrap-around hit is emitted as one
+        # labeled piece + one unlabeled continuation, but counts as 1 site.
+        n_sites = sum(
+            1 for h in hits if h["type"] == "resite" and h.get("label")
+        )
+        if effective_unique_only and n_sites != 1:
+            continue
+        # Skip isoschizomers / HF-variants of the SAME recognition that
+        # land on an already-placed site. The recognition string is
+        # part of the key so genuinely-different enzymes (different
+        # recognition patterns) with accidental position overlap stay
+        # independent.
+        site_key = site_of.get(name, "")
+        positions = {
+            (h["start"], h["end"], site_key) for h in hits
+            if h["type"] == "resite" and h.get("label")
+        }
+        if positions & placed:
+            continue
+        placed |= positions
+        # Tag the per-enzyme cut-count on each labeled resite (NOT the label —
+        # the label is a lookup key in Scrub / digest code). Renderers append a
+        # superscript badge ("EcoRI²") from this when it's > 1, so the user
+        # spots a multi-cutter at a glance and watches the count fall as they
+        # edit out a site. Reactive for free: the scan re-runs on every record
+        # change.
+        if n_sites > 1:
+            for h in hits:
+                if h["type"] == "resite" and h.get("label"):
+                    h["cut_count"] = n_sites
+        feats.extend(hits)
+    return feats
+
+
+def _enzyme_cuts(seq: str, enzyme_names: list[str], *,
+                  circular: bool = True) -> list[dict]:
+    """Return all cuts on `seq` from the given enzymes, sorted by top
+    cut position. Each entry is
+    ``{top, bot, kind, overhang_seq, enzyme}`` where ``top`` and
+    ``bot`` are absolute 0-based top-strand coords of the top-strand
+    and bottom-strand cuts respectively.
+
+    Unknown enzyme names are silently dropped (caller validates).
+    Empty `enzyme_names` returns ``[]``.
+
+    Results are LRU-cached on `(hash(seq), tuple(sorted enzymes), circular)`
+    so that the Constructor's "Traditional" tab (which calls
+    ``str(rec.seq).upper()`` afresh on every Simulate, allocating a
+    new string object each time) still hits the cache on repeat
+    clicks. Hash collisions are statistically irrelevant at the
+    16-entry LRU size (~2^-32 per pair).
+
+    Why not `id(seq)`: the old key only worked when the caller held
+    onto the exact same string object across calls. The traditional-
+    cloning flow doesn't, so the cache used to be permanently cold."""
+    key = (hash(seq), tuple(sorted(set(enzyme_names))), bool(circular))
+    hit = _state._ENZYME_CUTS_CACHE.get(key)
+    if hit is not None:
+        _state._ENZYME_CUTS_CACHE.move_to_end(key)
+        # Defensive copy — callers occasionally mutate fragment dicts
+        # (e.g., when filtering features), and a shared mutable list
+        # would poison subsequent hits.
+        return [dict(c) for c in hit]
+    result = _enzyme_cuts_impl(seq, enzyme_names, circular=circular)
+    if len(_state._ENZYME_CUTS_CACHE) >= _state._ENZYME_CUTS_CACHE_MAX:
+        _state._ENZYME_CUTS_CACHE.popitem(last=False)
+    _state._ENZYME_CUTS_CACHE[key] = [dict(c) for c in result]
+    return result
+
+
+def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
+                        circular: bool = True) -> list[dict]:
+    """Underlying scanner — see `_enzyme_cuts` for the cached entry
+    point. Same signature + return shape; this one is the actual
+    work."""
+    n = len(seq)
+    if n == 0 or not enzyme_names:
+        return []
+    seq_u = seq.upper()
+    out: dict[tuple[int, int, str], dict] = {}
+    # Combined catalog so user-added custom enzymes participate in
+    # every cloning flow that funnels through `_enzyme_cuts`. Via the
+    # `_state` getter so this works once the fn moves to the L0 sibling.
+    catalog = _state._all_enzymes_hook()
+    for ename in enzyme_names:
+        if ename not in catalog:
+            continue
+        site, fwd_cut, rev_cut = catalog[ename]
+        site_u   = site.upper()
+        site_len = len(site_u)
+        try:
+            pat      = _iupac_pattern(site_u)
+            rc_site  = _rc(site_u)
+        except ValueError:
+            # Sweep #30 (2026-05-28): a corrupt custom-enzyme site (e.g. a
+            # hand-edited custom_enzymes.json with a non-IUPAC char) makes
+            # _iupac_pattern raise. Skip the bad enzyme rather than
+            # crashing the whole digest — mirrors the per-enzyme guard
+            # INV-85 added to _rebuild_scan_catalog. Pre-fix one bad site
+            # silently killed the trad-cloning Simulate / MoClo workers.
+            # (A valid site's reverse complement is always valid IUPAC, so
+            # the rc_pat compile below can't raise once this passed.)
+            _log.warning(
+                "enzyme_cuts: skipping %r — bad recognition site %r",
+                ename, site,
+            )
+            continue
+        is_pal   = (rc_site == site_u)
+        scan_seq = (seq_u + seq_u[: site_len - 1]) if (circular and n > 0) else seq_u
+
+        def _emit(top_bp_raw: int, bot_bp_raw: int):
+            # Use raw (pre-modulo) values for kind detection AND to find
+            # the overhang's earlier-cut anchor — post-modulo, a cut
+            # that crosses the origin can flip the top<bot ordering
+            # (e.g., raw top=99, raw bot=103, n=100 → post-mod top=99,
+            # bot=3, which would falsely suggest a 3' overhang). The
+            # raw difference equals |fwd_cut - rev_cut| which is fixed
+            # by the enzyme.
+            top_bp = top_bp_raw % n
+            bot_bp = bot_bp_raw % n
+            overhang_len = abs(top_bp_raw - bot_bp_raw)
+            oh_start = (top_bp if top_bp_raw <= bot_bp_raw else bot_bp)
+            oh_end   = (oh_start + overhang_len) % n if n else 0
+            if overhang_len == 0:
+                overhang = ""
+            elif oh_end > oh_start:
+                overhang = seq_u[oh_start:oh_end]
+            else:
+                # Origin-wrap: overhang region crosses bp 0.
+                overhang = seq_u[oh_start:] + seq_u[:oh_end]
+            kind = ("blunt" if top_bp_raw == bot_bp_raw
+                    else "5'" if top_bp_raw < bot_bp_raw
+                    else "3'")
+            key = (top_bp, bot_bp, ename)
+            out[key] = {
+                "top":          top_bp,
+                "bot":          bot_bp,
+                "kind":         kind,
+                "overhang_seq": overhang,
+                "enzyme":       ename,
+            }
+
+        for m in pat.finditer(scan_seq):
+            p = m.start()
+            if p >= n:
+                continue
+            # Linear molecules: skip a negative-cut enzyme whose cut would wrap
+            # past the 5' end into a phantom 3'-end fragment boundary (mirrors
+            # the restriction-overlay scan guard). Circular wraps correctly.
+            if not circular and (
+                    (p + fwd_cut) < 0 or (p + fwd_cut) > n
+                    or (p + rev_cut) < 0 or (p + rev_cut) > n):
+                continue
+            _emit(p + fwd_cut, p + rev_cut)
+        if not is_pal:
+            rc_pat = _iupac_pattern(rc_site)
+            for m in rc_pat.finditer(scan_seq):
+                p = m.start()
+                if p >= n:
+                    continue
+                # On a reverse-strand binding, the cut positions mirror
+                # around the recognition midpoint. Top cut on the bound
+                # site (= bottom strand of unbound) is `site_len - rev_cut`
+                # bases from the recognition's 5' end on the unbound
+                # forward strand; bottom cut is `site_len - fwd_cut`.
+                _rev_top_raw = p + site_len - rev_cut
+                _rev_bot_raw = p + site_len - fwd_cut
+                # Linear molecules: a reverse-strand Type IIS cut that falls
+                # past the 5' end would wrap via _emit's `% n` into a phantom
+                # 3'-end fragment boundary. Mirror the forward-path guard above
+                # (and the restriction-overlay reverse-strand guard) and drop
+                # it; circular molecules wrap correctly.
+                if not circular and (
+                        _rev_top_raw < 0 or _rev_top_raw > n
+                        or _rev_bot_raw < 0 or _rev_bot_raw > n):
+                    continue
+                _emit(_rev_top_raw, _rev_bot_raw)
+    return sorted(out.values(), key=lambda c: (c["top"], c["enzyme"]))
+
+
+def _split_features_at_cuts(features: list[dict], n: int,
+                              cut_top_positions: list[int],
+                              circular: bool) -> dict[int, list[dict]]:
+    """Slot features into fragments based on cut positions. Returns
+    ``{fragment_index: [features]}``. Features that span a cut are
+    split into two halves (one in each adjacent fragment); wrap features
+    in a circular input get the same treatment around the origin too.
+
+    Fragment indexing matches ``_fragments_from_cuts`` ordering:
+      - circular: `i` ranges over `[0, len(cuts))`, fragment `i` runs from
+        `cuts[i].top` to `cuts[(i+1) % n_cuts].top`.
+      - linear: `i` ranges over `[0, len(cuts)+1)`, fragment 0 starts at 0
+        and fragment `len(cuts)` ends at `n`.
+    """
+    if not features:
+        return {}
+    n_cuts = len(cut_top_positions)
+    if n_cuts == 0:
+        # All features in fragment 0.
+        return {0: list(features)}
+
+    # Wrap features (end < start on a circular input) need to be
+    # split into a tail half [start, n) + a head half [0, end)
+    # before the slotting algorithm runs. The latter assumes
+    # start ≤ end, so a wrap feature would otherwise route through
+    # `_slot_for(end-1)` for a position BEFORE the wrap, mis-
+    # slotting the head half into a non-adjacent fragment. Each
+    # half is tagged with `_wrap_origin_split` so a downstream
+    # caller can rejoin them if it cares about origin-spanning
+    # annotations on the result.
+    expanded: list[dict] = []
+    for f in features:
+        try:
+            fs = int(f.get("start", 0))
+            fe = int(f.get("end",   0))
+        except (TypeError, ValueError):
+            continue
+        if circular and fe < fs and 0 <= fe and fs <= n:
+            expanded.append({**f, "start": fs, "end": n,
+                              "_wrap_origin_split": "tail"})
+            expanded.append({**f, "start": 0, "end": fe,
+                              "_wrap_origin_split": "head"})
+        else:
+            expanded.append(f)
+    features = expanded
+
+    def _slot_for(bp: int) -> int:
+        """Return the fragment index containing `bp` (0-based)."""
+        if circular:
+            # Find the cut k such that bp ∈ (cuts[k], cuts[k+1]] (mod n).
+            for i in range(n_cuts):
+                a = cut_top_positions[i]
+                b = cut_top_positions[(i + 1) % n_cuts]
+                if a < b:
+                    if a <= bp < b:
+                        return i
+                else:
+                    # Wrap fragment crosses origin
+                    if bp >= a or bp < b:
+                        return i
+            return 0
+        # Linear: cut at position c → bases [c, next_c) belong to fragment k+1.
+        for i, c in enumerate(cut_top_positions):
+            if bp < c:
+                return i
+        return n_cuts
+
+    out: dict[int, list[dict]] = {}
+    for f in features:
+        s = int(f.get("start", 0))
+        e = int(f.get("end",   0))
+        if e == s:
+            slot = _slot_for(s)
+            out.setdefault(slot, []).append(dict(f))
+            continue
+        slot_s = _slot_for(s)
+        # End is half-open. A feature ending exactly at a cut belongs in
+        # the fragment that ends at that cut. Use end-1 then bump.
+        slot_e = _slot_for(e - 1)
+        if slot_s == slot_e:
+            # Both ends in the same fragment — BUT if a cut falls STRICTLY
+            # inside the feature, an excised piece was removed from its middle
+            # (the classic case: cloning into lacZα's MCS excises the stuffer
+            # between two cuts that both sit inside lacZα). The remnant rides
+            # whole in this fragment, yet the gene is DISRUPTED — tag it
+            # ``_split="whole"`` so the labeller flags it, even though it
+            # wasn't split across two fragments.
+            piece = dict(f)
+            if any(s < c < e for c in cut_top_positions):
+                piece["_split"] = "whole"
+            out.setdefault(slot_s, []).append(piece)
+        else:
+            # Feature crosses one or more cuts; emit a half-feature into
+            # each affected fragment. For v1 we don't try to chain them
+            # across fragments — each half stands alone with its local
+            # coords; the user can re-annotate if they want.
+            out.setdefault(slot_s, []).append({**f, "_split": "head"})
+            out.setdefault(slot_e, []).append({**f, "_split": "tail"})
+    return out
+
+
+def _fragments_from_cuts(seq: str, cuts: list[dict], *,
+                          circular: bool,
+                          features: "list[dict] | None" = None,
+                          source_label: str = "") -> list[dict]:
+    """Slice `seq` at the given cut positions into a list of Fragment dicts.
+
+    For circular input with ≥1 cut: `len(cuts)` fragments arranged around
+    the origin. For circular input with 0 cuts: 1 fragment (the whole
+    plasmid linearised at position 0; both ends marked "linear" — the
+    caller should usually error out before reaching this case).
+
+    For linear input: `len(cuts) + 1` fragments; the leftmost fragment
+    starts at 0, the rightmost ends at `n`. End edges of these are
+    marked `kind="linear"` since there's no enzyme there.
+
+    Each fragment's `top_seq` is the contiguous top-strand slice from
+    one cut's `top` to the next cut's `top` (or origin / endpoint).
+    Features are slotted via `_split_features_at_cuts` and shifted into
+    fragment-local 0-based coords."""
+    n = len(seq)
+    if n == 0:
+        return []
+    if not cuts:
+        if circular:
+            return [{
+                "top_seq": seq,
+                "left":  {"overhang_seq": "", "kind": "linear", "enzyme": ""},
+                "right": {"overhang_seq": "", "kind": "linear", "enzyme": ""},
+                "features": [dict(f) for f in (features or [])],
+                "source_label": source_label,
+            }]
+        return [{
+            "top_seq": seq,
+            "left":  {"overhang_seq": "", "kind": "linear", "enzyme": ""},
+            "right": {"overhang_seq": "", "kind": "linear", "enzyme": ""},
+            "features": [dict(f) for f in (features or [])],
+            "source_label": source_label,
+        }]
+    cut_tops = [c["top"] for c in cuts]
+    feat_slots = _split_features_at_cuts(features or [], n, cut_tops,
+                                           circular=circular)
+    fragments: list[dict] = []
+    if circular:
+        for i, c in enumerate(cuts):
+            nxt = cuts[(i + 1) % len(cuts)]
+            a, b = c["top"], nxt["top"]
+            if a < b:
+                top_seq = seq[a:b]
+                offset  = a
+            else:
+                top_seq = seq[a:] + seq[:b]
+                offset  = a   # fragment-local coord = (abs - a) % n
+            local_feats: list[dict] = []
+            for f in feat_slots.get(i, []):
+                fs = int(f.get("start", 0))
+                fe = int(f.get("end",   0))
+                # Shift into fragment-local.
+                if a < b:
+                    new_s = fs - offset
+                    new_e = fe - offset
+                else:
+                    new_s = (fs - offset) % n
+                    new_e = (fe - offset) % n
+                # Clamp to fragment bounds.
+                local_feats.append({
+                    **f,
+                    "start": max(0, min(new_s, len(top_seq))),
+                    "end":   max(0, min(new_e, len(top_seq))),
+                })
+            fragments.append({
+                "top_seq": top_seq,
+                "left":  {"overhang_seq": c["overhang_seq"],
+                           "kind": c["kind"],
+                           "enzyme": c["enzyme"]},
+                "right": {"overhang_seq": nxt["overhang_seq"],
+                           "kind": nxt["kind"],
+                           "enzyme": nxt["enzyme"]},
+                "features": local_feats,
+                "source_label": source_label,
+            })
+        return fragments
+    # Linear: walk left → right
+    boundaries = [0] + cut_tops + [n]
+    for i in range(len(boundaries) - 1):
+        a, b = boundaries[i], boundaries[i + 1]
+        top_seq = seq[a:b]
+        local_feats: list[dict] = []
+        for f in feat_slots.get(i, []):
+            fs = int(f.get("start", 0))
+            fe = int(f.get("end",   0))
+            local_feats.append({
+                **f,
+                "start": max(0, min(fs - a, len(top_seq))),
+                "end":   max(0, min(fe - a, len(top_seq))),
+            })
+        left  = ({"overhang_seq": "", "kind": "linear", "enzyme": ""}
+                 if i == 0 else
+                 {"overhang_seq": cuts[i - 1]["overhang_seq"],
+                  "kind":         cuts[i - 1]["kind"],
+                  "enzyme":       cuts[i - 1]["enzyme"]})
+        right = ({"overhang_seq": "", "kind": "linear", "enzyme": ""}
+                 if i == len(boundaries) - 2 else
+                 {"overhang_seq": cuts[i]["overhang_seq"],
+                  "kind":         cuts[i]["kind"],
+                  "enzyme":       cuts[i]["enzyme"]})
+        fragments.append({
+            "top_seq":      top_seq,
+            "left":         left,
+            "right":        right,
+            "features":     local_feats,
+            "source_label": source_label,
+        })
+    return fragments
+
+
+def _digest_with_enzymes(seq: str, enzyme_names: list[str], *,
+                          circular: bool = True,
+                          features: "list[dict] | None" = None,
+                          source_label: str = "") -> list[dict]:
+    """One-call digest: cut `seq` with `enzyme_names`, return Fragments.
+
+    Fragments are sorted in cut order around the molecule (or 5'→3' for
+    linear). Caller passes the input's features in absolute 0-based
+    coords; they're slotted + shifted onto the appropriate fragments.
+
+    Empty `enzyme_names` (or all-unknown) returns the input as a single
+    uncut fragment."""
+    cuts = _enzyme_cuts(seq, enzyme_names, circular=circular)
+    return _fragments_from_cuts(seq, cuts, circular=circular,
+                                  features=features,
+                                  source_label=source_label)
+
 # What is intentionally NOT extracted (yet):
-#
-#   _scan_restriction_sites + _scan_restriction_sites_impl — depend on
-#   `_NEB_ENZYMES` (giant dict), `_RESTR_SCAN_CACHE`, and several module-
-#   level worker-side helpers. Not pure.
 #
 #   _translate_cds — depends on `_GENETIC_CODE` and Biopython's translate.
 #   Could move but increases the import surface meaningfully.

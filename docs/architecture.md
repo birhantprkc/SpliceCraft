@@ -5,13 +5,15 @@ How SpliceCraft is organized, why, and how to navigate it.
 ## Hub + layered siblings
 
 SpliceCraft began as a single-file app and is now a **hub + layered-siblings**
-layout on Textual + Biopython. `splicecraft.py` is the ~117k-line **hub**
+layout on Textual + Biopython. `splicecraft.py` is the ~116k-line **hub**
 (`PlasmidApp`, the data-safety POLICY, the `.dna` blob store, CLI, agent-API,
 screens, and the app-coupled modals/widgets — the deeply-coupled application
 core, deliberately kept together; extracting `PlasmidApp` + its three main panels
 would cascade into the data-safety core). The cleanly-separable layers live in
 flat `splicecraft_*.py` siblings the hub imports and re-exports:
-`splicecraft_biology`, `splicecraft_state`, `splicecraft_logging` (`_log` /
+`splicecraft_biology` (pure biology + the restriction-site scanner / enzyme
+digest — sacred invariants #1/#2/#6 — reading its caches + catalog through
+`_state` getters), `splicecraft_state`, `splicecraft_logging` (`_log` /
 `_log_event` + the `_action_log` / `_timed` decorators),
 `splicecraft_persistence` (the domain-agnostic save/load engine + data-safety
 chokepoint), `splicecraft_dataaccess` (every domain `_load_X`/`_save_X` accessor

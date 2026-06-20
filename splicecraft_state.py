@@ -26,6 +26,7 @@ from any layer.
 from __future__ import annotations
 
 import threading
+from collections import OrderedDict as _OrderedDict
 from pathlib import Path
 from typing import Any as _Any, Callable as _Callable
 
@@ -254,6 +255,35 @@ _after_entry_vectors_save_hook: "_Callable[[], None] | None" = None
 # Saving cloning grammars busts the assembly-fragment + EV-role-detect caches (a
 # grammar enzyme change shifts fragment overhangs / role detection) — hub-side.
 _after_custom_grammars_save_hook: "_Callable[[], None] | None" = None
+
+# ── Restriction-scanner runtime state (Phase D — the scanner + digest engine
+# move to splicecraft_biology; their caches + catalog access live here so the L0
+# sibling reaches them without an upward import to the hub). The two LRU caches
+# are mutated in-place (.get / .move_to_end / .popitem / [k]= / .clear) and NEVER
+# reassigned, so the hub keeps live aliases AND the custom-enzyme bust
+# (`_resolve_state_or_hub` → `.clear()`) finds them here. `_SCAN_CATALOG` itself
+# IS reassigned by the hub's `_rebuild_scan_catalog` (test_sweep25 H4 pins the
+# atomic `globals()["_SCAN_CATALOG"]` form), so it stays the hub global and the
+# sibling reads it fresh through `_scan_catalog_hook`.
+_RESTR_SCAN_CACHE: "_OrderedDict[tuple, list]" = _OrderedDict()
+_RESTR_SCAN_CACHE_MAX: int = 4
+_ENZYME_CUTS_CACHE: "_OrderedDict[tuple, list[dict]]" = _OrderedDict()
+_ENZYME_CUTS_CACHE_MAX: int = 16
+# Getters the hub registers at import so the sibling scanner reaches hub-side
+# data: the fresh `_SCAN_CATALOG`, and the combined `_all_enzymes()` view
+# (built-in + custom — reads dataaccess, so the function itself stays hub-side).
+# Typed non-optional (the scanner calls them on every scan, unguarded) with a
+# fail-loud default rather than None: registration happens during hub import,
+# before any scan/digest runs, so this default is never hit at runtime — but if
+# it ever were, raising beats silently scanning an empty catalog (silent-biology
+# hazard).
+def _scanner_hook_unregistered():
+    raise RuntimeError(
+        "restriction-scanner _state hook called before the hub registered it")
+
+
+_scan_catalog_hook: "_Callable[[], list]" = _scanner_hook_unregistered
+_all_enzymes_hook: "_Callable[[], dict]" = _scanner_hook_unregistered
 # Resolver returning the active primer-collection NAME (stored in settings, read
 # hub-side via `_get_setting`). The sibling's `_sync_active_primer_collection_primers`
 # mirror needs it but must not pull the settings layer in, so the hub registers
