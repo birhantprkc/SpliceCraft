@@ -653,3 +653,135 @@ def _codon_gc(dna: str) -> float:
         return 0.0
     gc = sum(1 for c in dna.upper() if c in "GC")
     return gc / len(dna) * 100.0
+
+
+# ── codon usage chart (Phase D, moved from hub) ─────────────────────────────
+# Renders a per-amino-acid synonymous-codon usage chart as a Rich-markup
+# STRING (no Rich object dependency). _AA_NAME_3 (AA 1->3 letter) is used only
+# here.
+# Single-letter → three-letter amino-acid names for the genetic-code chart
+# (`_render_codon_chart`). Stop is spelled "Stop" to match the canonical
+# textbook wall chart. The full-name catalog lives on `AminoAcidPickerModal`.
+_AA_NAME_3: dict[str, str] = {
+    "A": "Ala", "R": "Arg", "N": "Asn", "D": "Asp", "C": "Cys",
+    "Q": "Gln", "E": "Glu", "G": "Gly", "H": "His", "I": "Ile",
+    "L": "Leu", "K": "Lys", "M": "Met", "F": "Phe", "P": "Pro",
+    "S": "Ser", "T": "Thr", "W": "Trp", "Y": "Tyr", "V": "Val",
+    "*": "Stop",
+}
+
+
+def _render_codon_chart(raw: dict, *, rna: bool = True) -> str:
+    """Render a codon-usage table as the classic textbook genetic-code grid,
+    returned as a Rich-markup string.
+
+    The layout matches the canonical wall chart: the four 1st-base blocks
+    (U/C/A/G) stack vertically, the 2nd base runs across the four columns,
+    and the four lines inside every cell are the 3rd base (U/C/A/G). Each
+    codon is annotated with its usage *within its amino-acid family* (the
+    relative synonymous usage, as a percentage), and each amino-acid family's
+    single most-used codon is highlighted bold green for easy visual
+    identification. The choice is FAMILY-WIDE (matching the % shown), so a
+    family split across two cells — Leu, Ser, Arg, and the three stops
+    (UAA/UAG/UGA, treated as one family) — yields exactly one highlight, not
+    one per cell. A codon with no usage in the table is never highlighted.
+    Synonymous residues are bracketed and named (3-letter; stops as "Stop").
+    Codons missing from the table render a dim "·" placeholder.
+
+    Bases display as RNA (U) by default to match the iconic chart; lookups
+    are always by the stored DNA (T) key. Pure — display only, no I/O."""
+    _aa_codons, codon_frac = _codon_build_aa_map(raw)
+
+    def _count(codon: str) -> int:
+        v = raw.get(codon)
+        return int(v[1]) if v else 0
+
+    # The single most-used codon in each amino-acid family is highlighted green.
+    # The choice is FAMILY-WIDE (matching the relative-synonymous-usage % shown),
+    # so a family split across two cells — Leu (UU+CU), Ser (UC+AG), Arg (CG+AG),
+    # and the stops UAA/UAG/UGA (UA+UG) — yields exactly ONE highlight, never one
+    # per cell. Stops are one family. Deterministic tie-break by codon; a family
+    # with no usage in the table gets no highlight.
+    _fam: dict = {}
+    for _codon, _aa in _CODON_GENETIC_CODE.items():
+        _fam.setdefault(_aa, []).append(_codon)
+    dominant: set = set()
+    for _members in _fam.values():
+        champ = sorted(_members, key=lambda c: (-_count(c), c))[0]
+        if _count(champ) > 0:
+            dominant.add(champ)
+
+    order = "TCAG"                       # U, C, A, G in DNA (T) coordinates
+    CW, AAW, LGUT, RGUT = 17, 4, 2, 2    # cell / AA-label / gutter widths
+    label_row = {1: 0, 2: 0, 3: 1, 4: 1}  # which row of a run carries the name
+
+    def _disp(b: str) -> str:
+        return "U" if (rna and b == "T") else b
+
+    def _cell(first: str, second: str) -> list:
+        """Four markup lines (3rd base = U/C/A/G) for one grid cell, each
+        exactly CW visible columns wide (markup tags are zero-width)."""
+        codons = [first + second + third for third in order]
+        aas = [_CODON_GENETIC_CODE[c] for c in codons]
+        # Group the four residues into runs of equal AA (for the brackets). The
+        # green highlight is the family-wide champion computed above (`dominant`).
+        run_of: dict = {}
+        i = 0
+        while i < 4:
+            j = i
+            while j < 4 and aas[j] == aas[i]:
+                j += 1
+            for r in range(i, j):
+                run_of[r] = (i, j - i)
+            i = j
+        out: list = []
+        for r in range(4):
+            cdn = codons[r]
+            show = "".join(_disp(b) for b in cdn)
+            frac = codon_frac.get(cdn)
+            pct = ("[dim]   ·[/dim]" if frac is None
+                   else f"{round(frac * 100):>3d}%")     # 4 visible cols
+            field = f"{show} {pct}"                       # 8 visible cols
+            if cdn in dominant:
+                field = f"[b green]{field}[/]"            # stark + easy to spot
+            start, length = run_of[r]
+            pos = r - start
+            if length == 1:
+                g = "─"
+            elif pos == 0:
+                g = "╮"
+            elif pos == length - 1:
+                g = "╯"
+            elif pos == label_row[length]:
+                g = "┤"
+            else:
+                g = "│"
+            if pos == label_row[length]:
+                nm = _AA_NAME_3.get(aas[r], aas[r])
+                lab = (f"[red]{nm:<{AAW}}[/red]" if aas[r] == "*"
+                       else f"{nm:<{AAW}}")
+            else:
+                lab = " " * AAW
+            out.append(f" {field} [dim]{g}[/dim] {lab} ")   # CW visible
+        return out
+
+    def _rule(left: str, mid: str, right: str) -> str:
+        return (" " * LGUT) + left + mid.join(["─" * CW] * 4) + right + \
+               (" " * RGUT)
+
+    width = LGUT + 1 + CW * 4 + 3 + 1 + RGUT
+    lines: list = [f"{'second base':^{width}}"]
+    # Column header: 2nd-base letter centred over each column.
+    lines.append((" " * (LGUT + 1))
+                 + " ".join(f"[b]{_disp(s):^{CW}}[/b]" for s in order)
+                 + " " + (" " * RGUT))
+    lines.append(_rule("┌", "┬", "┐"))
+    for bi, first in enumerate(order):
+        cells = [_cell(first, second) for second in order]
+        for r in range(4):
+            row = "│".join(cells[c][r] for c in range(4))
+            left = f" [b]{_disp(first)}[/b]" if r == 1 else "  "
+            right = f" [b]{_disp(order[r])}[/b]"
+            lines.append(f"{left}│{row}│{right}")
+        lines.append(_rule("├", "┼", "┤") if bi < 3 else _rule("└", "┴", "┘"))
+    return "\n".join(lines)
