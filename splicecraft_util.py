@@ -1136,3 +1136,29 @@ def _safe_xml_parse(xml_data: str, *, allow_dtd: bool = False):
         elif event == "end":
             depth -= 1
     return ET.fromstring(xml_data)
+
+
+# ── Windows-reserved-filename guard (relocated from hub, blob/export prereq) ──
+# Shared by every sanitiser that emits an on-disk filename (_dna_sidecar_path
+# in fileio, _safe_export_filename + _safe_snapshot_token in the hub) — an L0
+# filename-safety leaf so the L2 blob store can reach it without importing up.
+# Windows reserved device names (case-insensitive). NTFS refuses to
+# open any file whose stem matches one of these, so every sanitiser
+# that produces an on-disk filename must rewrite a matching stem.
+# Hoisted to module scope so the three sanitisers (`_dna_sidecar_path`,
+# `_safe_export_filename`, `_safe_snapshot_token`) share one set and a
+# new sanitiser added later can't accidentally drift to a stale list.
+_WIN_RESERVED_FILENAMES: frozenset = frozenset({
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+})
+
+
+def _is_windows_reserved_stem(name: str) -> bool:
+    """True if `name`'s first dot-separated segment is a Windows
+    reserved device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9). Case-
+    insensitive; matches the Win32 namespace rules."""
+    if not name:
+        return False
+    return name.split(".")[0].lower() in _WIN_RESERVED_FILENAMES

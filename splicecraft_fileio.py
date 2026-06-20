@@ -17,11 +17,16 @@ from copy import copy as _shallow_copy
 from datetime import date as _date
 from pathlib import Path
 
+import splicecraft_state as _state
 from splicecraft_logging import _log, _timed
-from splicecraft_persistence import _atomic_write_text, _safe_file_size_check
+from splicecraft_persistence import (
+    _atomic_write_text, _fsync_parent_dir, _refuse_unauthorized_delete,
+    _refuse_unauthorized_write, _safe_file_size_check,
+)
 from splicecraft_biology import _rc
 from splicecraft_util import (
-    _CONTROL_CHARS_RE, _DEFAULT_TYPE_COLORS, _feat_bounds, _natural_sort_key, _safe_xml_parse,
+    _CONTROL_CHARS_RE, _DEFAULT_TYPE_COLORS, _feat_bounds, _is_windows_reserved_stem,
+    _natural_sort_key, _safe_xml_parse,
 )
 from splicecraft_record import (
     _GB_LOCUS_NAME_MAX, _gb_text_to_record, _normalize_primer_seq, _record_to_gb_text,
@@ -2667,3 +2672,274 @@ def _display_label_for_gbk(name: str) -> str:
     if m:
         leaf = m.group(1)
     return leaf.replace("_", " ").strip()
+
+
+
+# ── .dna blob store + export (Phase D, moved from hub) ──────────────────────
+# The per-entry .dna sidecar blob store (save/load/delete) under
+# _state._DNA_ORIGINALS_DIR + the from-scratch .dna export. DATA-SAFETY: every
+# write/delete goes through the persistence chokepoint
+# (_refuse_unauthorized_write / _refuse_unauthorized_delete). Lazy os/tempfile/
+# hashlib/Path inside the fns, as in the hub.
+_DNA_SIDECAR_MAX_BYTES = 50 * 1024 * 1024   # 50 MB — same as bulk import
+# Cap the sidecar basename so the full path stays under NTFS's 260-char
+# default limit on reasonable installs. Raised to 200 from the implicit
+# OS limit so a hostile / accidentally-pasted multi-KB entry_id can't
+# trip ENAMETOOLONG at write time.
+_DNA_SIDECAR_BASENAME_MAX = 200
+
+
+def _dna_sidecar_path(entry_id: str) -> "Path":
+    """Path for the sidecar file for `entry_id`. The id is sanitised
+    via ``Path(...).name`` so a user-controlled id like ``../../etc/passwd``
+    or ``foo/bar`` can't break out of the originals dir. NUL bytes are
+    rejected (POSIX would raise ``ValueError`` on the join, but normalising
+    here gives a stable sentinel). Empty / non-string ids fall back to a
+    sentinel so the path is always under ``_DNA_ORIGINALS_DIR``.
+
+    The basename is case-folded AND suffixed with an 8-char SHA-1 prefix
+    of the original (un-folded) entry_id. Without the case-fold + hash:
+    on case-insensitive filesystems (macOS APFS default, NTFS) two
+    library entries ``pUC19`` and ``puc19`` collided on the same on-disk
+    sidecar — silently overwriting each other's round-trip bytes, so
+    exporting the older entry to `.dna` emitted the wrong molecule.
+    The hash is computed on the raw id (pre-sanitisation) so two ids
+    that collapse to the same `safe` after separator scrubbing
+    (``a/b`` vs ``a_b``) also stay distinct. Total basename is capped
+    so the resulting path stays under NTFS's 260-char total-path limit
+    on reasonable installs (suffix `-<8>.dna` reserves 13 chars).
+    """
+    raw = str(entry_id) if entry_id else "_unknown_"
+    cleaned = raw.replace("/", "_").replace("\\", "_").replace("\x00", "_")
+    safe = Path(cleaned).name or "_unknown_"
+    if safe in (".", "..") or not safe.strip("."):
+        safe = "_unknown_"
+    import hashlib as _hashlib
+    digest = _hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()[:8]
+    safe_lower = safe.lower()
+    if _is_windows_reserved_stem(safe_lower):
+        safe_lower = f"_{safe_lower}"
+    max_safe = _DNA_SIDECAR_BASENAME_MAX - len(digest) - len(".dna") - 1
+    if len(safe_lower) > max_safe:
+        safe_lower = safe_lower[:max_safe]
+    return _state._DNA_ORIGINALS_DIR / f"{safe_lower}-{digest}.dna"
+
+
+def _dna_sidecar_legacy_path(entry_id: str) -> "Path":
+    """Pre-0.8.9 sidecar path (case-sensitive, no hash discriminator).
+    Migration scaffolding — `_load_dna_original` falls back to this
+    when the canonical path is missing, and `_save_dna_original` /
+    `_delete_dna_original` clean it up alongside the canonical write.
+    Safe to remove a few releases after all-users-migrated."""
+    raw = str(entry_id) if entry_id else "_unknown_"
+    cleaned = raw.replace("/", "_").replace("\\", "_").replace("\x00", "_")
+    safe = Path(cleaned).name or "_unknown_"
+    if safe in (".", "..") or not safe.strip("."):
+        safe = "_unknown_"
+    return _state._DNA_ORIGINALS_DIR / f"{safe}.dna"
+
+
+def _save_dna_original(entry_id: str, data: bytes) -> bool:
+    """Write the original .dna bytes for `entry_id` into the sidecar
+    dir. Returns True on success, False on any failure (logged but
+    never raised — the sidecar is a nice-to-have, not a blocker
+    for import). Atomic write via tempfile + os.replace, mirroring
+    the JSON helpers' safety convention.
+
+    Refuses to write if `data` exceeds the per-sidecar cap. Also
+    refuses to overwrite an existing sidecar with EMPTY bytes (a
+    bug in the caller would silently nuke the round-trip data
+    otherwise)."""
+    if not entry_id:
+        return False
+    if not data:
+        _log.warning("dna sidecar: refusing to save empty bytes for %r",
+                       entry_id)
+        return False
+    if len(data) > _DNA_SIDECAR_MAX_BYTES:
+        _log.warning("dna sidecar: refusing to save %d bytes for %r "
+                       "(cap %d)", len(data), entry_id,
+                       _DNA_SIDECAR_MAX_BYTES)
+        return False
+    import tempfile as _tempfile
+    import os as _os
+    try:
+        _state._DNA_ORIGINALS_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _log.warning("dna sidecar: mkdir failed for %s: %s",
+                       _state._DNA_ORIGINALS_DIR, exc)
+        return False
+    target = _dna_sidecar_path(entry_id)
+    legacy = _dna_sidecar_legacy_path(entry_id)
+    # [INV-66 extension] L2 chokepoint covers the .dna sidecar too. The
+    # 2026-05-22 caught failure was a probe nuking JSON files; sidecars
+    # are equally "the data is the product" since they carry the
+    # CommercialSaaS round-trip bytes. An unsandboxed
+    # `sc._save_dna_original("some_id", b"...")` would otherwise write
+    # straight into the user's real ~/.local/share/splicecraft/
+    # dna_originals/ and overwrite a valid sidecar by id collision.
+    _refuse_unauthorized_write(target, "dna sidecar")
+    try:
+        fd, tmp_path = _tempfile.mkstemp(prefix=".tmp_",
+                                            dir=str(_state._DNA_ORIGINALS_DIR))
+        try:
+            with _os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                _os.fsync(f.fileno())
+            _os.replace(tmp_path, target)
+            _fsync_parent_dir(target)
+        except Exception:
+            try:
+                _os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        if legacy != target:
+            try:
+                legacy.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError as exc:
+        _log.warning("dna sidecar: write failed for %r: %s",
+                       entry_id, exc)
+        return False
+    return True
+
+
+def _load_dna_original(entry_id: str) -> "bytes | None":
+    """Return the sidecar bytes for `entry_id`, or None if missing /
+    unreadable. Used by the export path to splice fresh history into
+    the original .dna byte stream. Read size-capped via
+    `_safe_file_size_check` so a hand-edited or filesystem-corrupted
+    sidecar can't OOM the export path."""
+    if not entry_id:
+        return None
+    target = _dna_sidecar_path(entry_id)
+    legacy = _dna_sidecar_legacy_path(entry_id)
+    try:
+        if target.exists():
+            ok, reason = _safe_file_size_check(
+                target, _DNA_SIDECAR_MAX_BYTES, "dna sidecar",
+            )
+            if not ok:
+                _log.warning("dna sidecar: %s", reason)
+                return None
+            return target.read_bytes()
+        if legacy != target and legacy.exists():
+            ok, reason = _safe_file_size_check(
+                legacy, _DNA_SIDECAR_MAX_BYTES, "dna sidecar (legacy)",
+            )
+            if not ok:
+                _log.warning("dna sidecar: %s", reason)
+                return None
+            return legacy.read_bytes()
+        return None
+    except OSError as exc:
+        _log.warning("dna sidecar: read failed for %r: %s", entry_id, exc)
+        return None
+
+
+def _delete_dna_original(entry_id: str) -> bool:
+    """Remove the sidecar for `entry_id` (both canonical and any
+    pre-0.8.9 legacy path). Returns True if at least one file was
+    removed; False on any failure (logged) or if neither existed.
+    Idempotent — safe to call when removing a library entry whether or
+    not it had a sidecar. Uses `unlink(missing_ok=True)` so a race
+    where another process deletes the file between our `exists()` and
+    `unlink()` doesn't false-negative on the otherwise-successful op."""
+    if not entry_id:
+        return False
+    target = _dna_sidecar_path(entry_id)
+    legacy = _dna_sidecar_legacy_path(entry_id)
+    # [INV-66 extension + INV-75 sweep #27] L2 chokepoint: refuse to
+    # unlink a user sidecar from an unsandboxed import. Same threat
+    # model as `_save_dna_original` — a probe calling
+    # `_delete_dna_original` would otherwise wipe the user's real
+    # sidecar. Routed through `_refuse_unauthorized_delete` (sweep
+    # #27); semantically equivalent to the prior write-gate call but
+    # uses the delete-flavoured helper for grep-discoverability.
+    _refuse_unauthorized_delete(target, "dna sidecar")
+    paths = (target,) if target == legacy else (target, legacy)
+    removed = False
+    for p in paths:
+        try:
+            had = p.exists()
+            p.unlink(missing_ok=True)
+            if had:
+                removed = True
+        except OSError as exc:
+            _log.warning("dna sidecar: delete failed for %r at %s: %s",
+                           entry_id, p, exc)
+    return removed
+
+
+def _export_commercialsaas_dna(entry: dict, out_path: "Path | str") -> "str":
+    """Write a `.dna` file for `entry`.
+
+    Two paths:
+      1. **Splice mode** — preferred when the entry has a sidecar
+         (i.e., was originally imported from a CommercialSaaS `.dna`).
+         Reads the sidecar bytes, splices in the entry's current
+         `history_xml` via `_inject_commercialsaas_history`, writes.
+         Preserves every CommercialSaaS-specific packet we don't yet
+         understand (alignments, custom enzymes, etc.).
+      2. **From-scratch mode** — when no sidecar exists. Parses the
+         entry's `gb_text` into a SeqRecord and runs
+         `_write_commercialsaas_dna_bytes` to emit a minimum-viable
+         `.dna` (cookie + DNA + features + notes + optional
+         history). Sequence + features are byte-correct; cosmetic
+         packets (primers, alignments, enzyme-visibility) are
+         omitted. CommercialSaaS Viewer is expected to fill defaults on
+         first open.
+
+    Returns the absolute output path on success. Raises
+    ``ValueError`` when the entry has no usable id or no parseable
+    GenBank text. Raises ``OSError`` on file-write failure."""
+    from pathlib import Path as _Path
+    eid = str(entry.get("id") or "")
+    if not eid:
+        raise ValueError("entry has no id; cannot resolve a path")
+    original = _load_dna_original(eid)
+    history_xml = entry.get("history_xml") or None
+    if original is not None:
+        # Splice mode: replace history packet, leave everything else
+        # byte-identical.
+        out_bytes = _inject_commercialsaas_history(original, history_xml)
+    else:
+        # From-scratch mode: rebuild from the GenBank text.
+        gb_text = entry.get("gb_text") or ""
+        if not gb_text:
+            raise ValueError(
+                f"entry {entry.get('name')!r} has no `gb_text` to "
+                f"build from; cannot export"
+            )
+        try:
+            record = _gb_text_to_record(gb_text)
+        except Exception as exc:
+            raise ValueError(
+                f"entry {entry.get('name')!r}: GenBank text is not "
+                f"parseable ({exc}); cannot build .dna"
+            ) from exc
+        out_bytes = _write_commercialsaas_dna_bytes(
+            record, history_xml=history_xml,
+        )
+    out = _Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # Atomic write via tempfile + replace (matches sidecar convention).
+    import tempfile as _tempfile, os as _os
+    fd, tmp_path = _tempfile.mkstemp(prefix=".tmp_", dir=str(out.parent))
+    try:
+        with _os.fdopen(fd, "wb") as f:
+            f.write(out_bytes)
+            f.flush()
+            _os.fsync(f.fileno())
+        _os.replace(tmp_path, out)
+        _fsync_parent_dir(out)
+    except Exception:
+        try:
+            _os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return str(out.resolve())

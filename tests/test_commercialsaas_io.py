@@ -1288,7 +1288,7 @@ class TestDnaSidecarStorage:
         assert sc._save_dna_original("foo", b"") is False
 
     def test_save_refuses_oversized(self, monkeypatch):
-        monkeypatch.setattr(sc, "_DNA_SIDECAR_MAX_BYTES", 8)
+        monkeypatch.setattr(_fileio, "_DNA_SIDECAR_MAX_BYTES", 8)
         # Cap is 8 bytes; 16-byte payload rejected.
         assert sc._save_dna_original("foo", b"x" * 16) is False
         # Sidecar file should NOT exist.
