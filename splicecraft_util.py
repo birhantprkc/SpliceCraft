@@ -987,3 +987,152 @@ def _now_iso() -> str:
     `updated_at`. Timezone-aware so a user roaming across timezones
     still gets unambiguous timestamps."""
     return _datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+# ── Feature-type default colours (relocated from widgets, fileio .dna prereq) ──
+# Pure data: feature_type -> hex colour. Read by widgets `_resolve_feature_color`,
+# a feature-colour modal, and the .dna writer's feature-packet builder. Lives at
+# L0 so the L2 fileio .dna codec can reach it without an upward widgets import.
+_DEFAULT_TYPE_COLORS: dict[str, str] = {
+    "CDS":             "#FFA500",
+    "gene":            "#FFD700",
+    "mRNA":            "#FFA07A",
+    "tRNA":            "#FF69B4",
+    "rRNA":            "#FF1493",
+    "ncRNA":           "#DA70D6",
+    "misc_RNA":        "#BA55D3",
+    "promoter":        "#00CED1",
+    "terminator":      "#DC143C",
+    "RBS":             "#00FF7F",
+    "polyA_signal":    "#FF6347",
+    "regulatory":      "#7FFFD4",
+    "5'UTR":           "#87CEEB",
+    "3'UTR":           "#4682B4",
+    "intron":          "#A9A9A9",
+    "exon":            "#90EE90",
+    "operon":          "#DDA0DD",
+    "primer_bind":     "#00BFFF",
+    "protein_bind":    "#F08080",
+    "misc_binding":    "#FF8C00",
+    "repeat_region":   "#CD853F",
+    "LTR":             "#8B4513",
+    "mobile_element":  "#8B008B",
+    "rep_origin":      "#9370DB",
+    "oriT":            "#BA55D3",
+    "sig_peptide":     "#ADFF2F",
+    "mat_peptide":     "#9ACD32",
+    "transit_peptide": "#7CFC00",
+    "propeptide":      "#6B8E23",
+    "misc_feature":    "#20B2AA",
+    "misc_recomb":     "#48D1CC",
+    "stem_loop":       "#FF4500",
+    "variation":       "#800080",
+}
+
+
+# ── XML-security parse primitive (relocated from hub, [PIT-19]) ──────────────
+# Pure stdlib (lazy io + xml.etree). Defangs billion-laughs / XXE / deep-nesting.
+# Shared by NCBI fetch, BLAST XML, .dna history XML — an L0 security leaf.
+def _safe_xml_parse(xml_data: str, *, allow_dtd: bool = False):
+    """Parse XML with defense against billion-laughs / XXE tricks.
+
+    Python's stdlib ET (expat) already refuses to fetch external entities
+    since 3.7.1, so the remaining attack surface is DTD-declared entity
+    expansion. Pre-fix we substring-matched `<!doctype` / `<!entity` only
+    in the FIRST 4096 chars — exploitable with a long whitespace /
+    comment prefix that pushes the DOCTYPE past the window.
+
+    Replaced with a streaming prologue scan: skip leading whitespace +
+    comments + processing instructions and inspect the first non-trivial
+    declaration. If it's a DOCTYPE / ENTITY, refuse before handing to
+    expat. NCBI / Kazusa / .dna history XML have no legitimate DTD, so
+    this never false-positives.
+
+    ``allow_dtd=True`` opts a caller into permitting an **external** DTD
+    reference — e.g. NCBI BLAST's ``FORMAT_TYPE=XML`` output, which opens
+    with ``<!DOCTYPE BlastOutput PUBLIC ... NCBI_BlastOutput.dtd>``. A
+    standalone ``<!ENTITY>`` and any DOCTYPE carrying an internal subset
+    (``[ … ]`` — where billion-laughs entity definitions live) are still
+    refused. expat never fetches the external DTD (no network since
+    3.7.1) and there are no entities to expand, so this stays XXE-safe.
+    Default ``False`` keeps every existing caller's strict behaviour.
+    """
+    import io
+    import xml.etree.ElementTree as ET
+    # Streaming prologue scan: advance past whitespace, comments, and
+    # processing instructions to find the first non-trivial declaration.
+    i = 0
+    n = len(xml_data)
+    while i < n:
+        c = xml_data[i]
+        if c in " \t\r\n":
+            i += 1
+            continue
+        # Comment: <!-- ... -->
+        if xml_data.startswith("<!--", i):
+            end = xml_data.find("-->", i + 4)
+            if end == -1:
+                # Unterminated comment — defer to expat for the parse
+                # error so the user sees the proper diagnostic.
+                break
+            i = end + 3
+            continue
+        # Processing instruction: <?xml version="1.0"?> etc.
+        if xml_data.startswith("<?", i):
+            end = xml_data.find("?>", i + 2)
+            if end == -1:
+                break
+            i = end + 2
+            continue
+        # DOCTYPE / ENTITY declaration — refuse (or, with allow_dtd, permit
+        # only an external-DTD reference). Case-insensitive check on the
+        # next ~16 chars (case-folding the WHOLE document is expensive on
+        # multi-MB inputs).
+        head = xml_data[i:i + 16].lower()
+        if head.startswith("<!entity"):
+            raise ET.ParseError(
+                "XML contains a standalone ENTITY declaration — refusing"
+            )
+        if head.startswith("<!doctype"):
+            if not allow_dtd:
+                raise ET.ParseError(
+                    "XML contains DTD/ENTITY — refusing to parse"
+                )
+            # Permit an external-DTD reference but refuse any internal
+            # subset (`[ … ]`), which is where entity-expansion attacks
+            # live. The DOCTYPE without a subset ends at the first `>`.
+            close = xml_data.find(">", i)
+            bracket = xml_data.find("[", i)
+            if close == -1:
+                break  # malformed — let expat surface the parse error
+            if bracket != -1 and bracket < close:
+                raise ET.ParseError(
+                    "XML DOCTYPE has an internal subset — refusing to parse"
+                )
+            i = close + 1
+            continue
+        # Reached a normal start tag — safe to hand off to expat.
+        break
+    # 2026-05-27 (audit-3 M6): cap nesting depth via iterparse so a
+    # 10k-deep `<Node><Node>...</Node></Node>` chain can't blow the
+    # Python stack in downstream consumers (HistoryTree walkers,
+    # qualifier readers). 256 levels is more than any legitimate
+    # plasmid annotation tree ever produces.
+    _MAX_DEPTH = 256
+    depth = 0
+    max_depth_seen = 0
+    for event, _elem in ET.iterparse(
+            io.StringIO(xml_data), events=("start", "end"),
+    ):
+        if event == "start":
+            depth += 1
+            if depth > max_depth_seen:
+                max_depth_seen = depth
+                if depth > _MAX_DEPTH:
+                    raise ET.ParseError(
+                        f"XML nesting exceeds {_MAX_DEPTH} levels "
+                        f"(unbounded recursion guard)"
+                    )
+        elif event == "end":
+            depth -= 1
+    return ET.fromstring(xml_data)

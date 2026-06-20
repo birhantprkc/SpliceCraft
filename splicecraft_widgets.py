@@ -17,7 +17,9 @@ from textual.events import MouseDown
 from textual.widgets import Button, DataTable, DirectoryTree, Input, Static
 
 from splicecraft_logging import _log
-from splicecraft_util import _FASTA_EXTS, _is_fasta_path, _is_seq_zip_path, _natural_sort_key
+from splicecraft_util import (
+    _DEFAULT_TYPE_COLORS, _FASTA_EXTS, _is_fasta_path, _is_seq_zip_path, _natural_sort_key,
+)
 from splicecraft_dataaccess import _load_feature_colors
 
 
@@ -546,42 +548,6 @@ _FEATURE_PALETTE: list[str] = [
     "color(105)",  "color(154)",  "color(203)",  "color(81)",   "color(185)",
 ]
 
-
-_DEFAULT_TYPE_COLORS: dict[str, str] = {
-    "CDS":             "#FFA500",
-    "gene":            "#FFD700",
-    "mRNA":            "#FFA07A",
-    "tRNA":            "#FF69B4",
-    "rRNA":            "#FF1493",
-    "ncRNA":           "#DA70D6",
-    "misc_RNA":        "#BA55D3",
-    "promoter":        "#00CED1",
-    "terminator":      "#DC143C",
-    "RBS":             "#00FF7F",
-    "polyA_signal":    "#FF6347",
-    "regulatory":      "#7FFFD4",
-    "5'UTR":           "#87CEEB",
-    "3'UTR":           "#4682B4",
-    "intron":          "#A9A9A9",
-    "exon":            "#90EE90",
-    "operon":          "#DDA0DD",
-    "primer_bind":     "#00BFFF",
-    "protein_bind":    "#F08080",
-    "misc_binding":    "#FF8C00",
-    "repeat_region":   "#CD853F",
-    "LTR":             "#8B4513",
-    "mobile_element":  "#8B008B",
-    "rep_origin":      "#9370DB",
-    "oriT":            "#BA55D3",
-    "sig_peptide":     "#ADFF2F",
-    "mat_peptide":     "#9ACD32",
-    "transit_peptide": "#7CFC00",
-    "propeptide":      "#6B8E23",
-    "misc_feature":    "#20B2AA",
-    "misc_recomb":     "#48D1CC",
-    "stem_loop":       "#FF4500",
-    "variation":       "#800080",
-}
 
 
 _HEX3_RE = re.compile(r"^#[0-9A-Fa-f]{3}$")
