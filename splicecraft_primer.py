@@ -17,11 +17,14 @@ Re-exported by the hub so sc.<name> + every call site resolves unchanged.
 from __future__ import annotations
 
 import re
+from typing import Callable as _Callable
 
-from splicecraft_logging import _log
+import splicecraft_state as _state
+from splicecraft_logging import _log, _timed
 from splicecraft_util import _normalize_dna_for_align
 from splicecraft_biology import (
     _circ_slice, _iupac_compatible, _mut_revcomp, _rc, _search_subsequence,
+    _slice_circular,
 )
 
 
@@ -404,3 +407,358 @@ def _primer_check_confidence(pct: "float | int | None") -> "tuple[str, str]":
     if v >= 60.0:
         return ("~", "dark_orange")
     return ("✗", "red")
+
+
+# ── generic primer design (Phase D, moved from hub) ────────────────────────
+# Tm + binding-region selection + the cloning / detection / generic primer
+# designers (primer3 thermodynamics; enzyme catalog via _state._all_enzymes_hook).
+# Verified by the real-plasmid design golden (byte-identical output). The GB /
+# domestication-scrub designers (_design_gb_primers / _scrub_*) stay hub-side.
+def _primer_tm(seq: str) -> "float | None":
+    """Melting temperature (°C, 1 dp) of an oligo — primer3's nearest-neighbour
+    model when available, else the 2(A+T)+4(G+C) rule. Module-level so the CSV
+    import (and any caller) can compute a Tm without the local ``_calc_tm``
+    closures the design / .dna paths use. Returns None for empty input."""
+    s = (seq or "").strip().upper()
+    if not s:
+        return None
+    try:
+        import primer3
+        return round(float(primer3.calc_tm(s)), 1)
+    except Exception:
+        gc = sum(1 for c in s if c in "GC")
+        at = sum(1 for c in s if c in "AT")
+        return float(2 * at + 4 * gc)
+
+
+# Hard cap on the TOTAL synthesised oligo length: the 5' tail (pad + enzyme
+# site + spacer + overhang) PLUS the 3' binding region. Oligo-synthesis cost
+# is driven by the whole oligo and standard (cheap) synthesis tops out around
+# here, so each design grows its binding region to reach `target_tm` but
+# never past `_PRIMER_MAX_OLIGO_LEN − len(tail)` (2026-06-09, user spec).
+# For a low-GC (AT-rich — e.g. codon-optimised for a low-GC host like
+# E. faecium) part this lets the binding extend well past the old fixed
+# 25 nt so it can actually reach ~60 °C; for a high-GC part the "closest to
+# target" pick stays short. If even the capped binding can't reach
+# `target_tm`, the closest is returned + flagged (`_GB_TM_OFFTARGET_MARGIN`)
+# rather than bloating the oligo past the synthesis budget.
+_PRIMER_MAX_OLIGO_LEN = 50
+
+
+def _binding_max_len(tail_len: int, min_len: int = 18) -> int:
+    """Largest binding-region length that keeps the TOTAL oligo
+    (`tail_len` + binding) within `_PRIMER_MAX_OLIGO_LEN`. Never returns
+    below `min_len`: an over-long tail can't shrink the binding below the
+    minimum usable annealing length — that (rare) design is surfaced by the
+    downstream low-Tm advisory instead of an unusably short arm."""
+    return max(min_len, _PRIMER_MAX_OLIGO_LEN - max(0, int(tail_len)))
+
+
+def _pick_binding_region(seq: str, target_tm: float = 60.0,
+                         min_len: int = 18, max_len: int = 25) -> tuple[str, float]:
+    """Return the prefix of `seq` (length min_len..max_len) whose Tm is
+    closest to `target_tm`. Uses primer3-py's SantaLucia Tm calculation.
+
+    Returns (binding_sequence, tm). If primer3-py is not installed, falls
+    back to a crude 2+4 rule estimate.
+    """
+    # Type the dispatcher as a `(str) -> float` Callable so pyright can
+    # accept both primer3.calc_tm (which has a richly-typed signature
+    # with extra defaulted kwargs) and the fallback approximation
+    # below. Using two separate names avoids the param-name mismatch
+    # pyright flags when a `def _tm(s)` re-defines the same binding.
+    def _tm_fallback(s: str) -> float:
+        gc = sum(1 for c in s.upper() if c in "GC")
+        at = sum(1 for c in s.upper() if c in "AT")
+        return float(2 * at + 4 * gc)
+    _tm: "_Callable[..., float]"
+    try:
+        import primer3
+        _tm = primer3.calc_tm
+    except ImportError:
+        _tm = _tm_fallback
+
+    # Defensive init: if the caller forgot the len(seq) >= min_len guard,
+    # the loop below won't execute and we'd otherwise return Tm=0 with a
+    # too-short binding. Compute Tm for whatever is there so downstream
+    # validation (low Tm, short primer) still trips honestly.
+    best_seq = seq[:max(min_len, 1)]
+    best_tm  = _tm(best_seq) if best_seq else 0.0
+    best_diff = float("inf")
+    # Pick the length whose Tm is CLOSEST to target — minimising
+    # |tm - target|. When `target_tm` is unreachable within the
+    # [min_len, max_len] window (too high for an AT-rich arm even at
+    # max_len, too low for a GC-rich arm even at min_len), the nearest
+    # achievable Tm wins — the longest candidate when the target sits
+    # above the whole window, the shortest when below — so the caller
+    # always gets the next-best binding instead of a failure.
+    for n in range(min_len, min(max_len + 1, len(seq) + 1)):
+        candidate = seq[:n]
+        tm = _tm(candidate)
+        diff = abs(tm - target_tm)
+        if diff < best_diff:
+            best_seq, best_tm, best_diff = candidate, tm, diff
+    return best_seq, best_tm
+
+
+@_timed("op.primer3.detection_design")
+def _design_detection_primers(
+    template_seq: str,
+    target_start: int,
+    target_end: int,
+    product_min: int = 450,
+    product_max: int = 550,
+    target_tm: float = 60.0,
+    primer_len: int = 25,
+) -> dict:
+    """Design diagnostic PCR primers WITHIN a selected region using Primer3.
+
+    Both primers bind INSIDE the region (target_start..target_end) and the
+    amplicon is product_min..product_max bp. This is the standard approach
+    for detection/screening primers: you pick a gene or feature and want a
+    ~500 bp diagnostic band from within it.
+
+    Uses SEQUENCE_INCLUDED_REGION (not SEQUENCE_TARGET) so Primer3 places
+    both primers inside the selected region rather than trying to flank it.
+
+    Returns a dict with keys: fwd_seq, rev_seq, fwd_tm, rev_tm, fwd_pos,
+    rev_pos, product_size, or an 'error' key on failure.
+    """
+    import primer3
+    seq   = template_seq.upper()
+    total = len(seq)
+    wraps = target_end < target_start
+
+    # Primer3 is linear-only. For a wrap region we rotate the template
+    # so the region becomes contiguous at [0, region_len), run Primer3,
+    # then unrotate the returned positions via (coord + rotation) % total.
+    if wraps:
+        rotation    = target_start
+        p3_seq      = seq[target_start:] + seq[:target_start]
+        region_len  = (total - target_start) + target_end
+        p3_start    = 0
+    else:
+        rotation    = 0
+        p3_seq      = seq
+        region_len  = target_end - target_start
+        p3_start    = target_start
+
+    if region_len < 1:
+        return {"error": "Target region is empty."}
+    if region_len < product_min:
+        return {
+            "error": f"Region ({region_len} bp) is shorter than minimum "
+                     f"product size ({product_min} bp). Select a larger "
+                     f"region or reduce the product size."
+        }
+
+    try:
+        result = primer3.design_primers(
+            seq_args={
+                "SEQUENCE_TEMPLATE": p3_seq,
+                # INCLUDED_REGION: primers must bind WITHIN this region.
+                # This is the key difference from SEQUENCE_TARGET (which
+                # would require primers to sit OUTSIDE the target).
+                "SEQUENCE_INCLUDED_REGION": [p3_start, region_len],
+            },
+            global_args={
+                "PRIMER_TASK": "generic",
+                "PRIMER_PICK_LEFT_PRIMER": 1,
+                "PRIMER_PICK_RIGHT_PRIMER": 1,
+                # primer_len is the OPTIMAL length — Primer3 will expand
+                # or contract within the min/max range to find the best Tm.
+                "PRIMER_OPT_SIZE": primer_len,
+                "PRIMER_MIN_SIZE": max(15, primer_len - 8),
+                "PRIMER_MAX_SIZE": min(36, primer_len + 8),
+                "PRIMER_OPT_TM": target_tm,
+                "PRIMER_MIN_TM": target_tm - 3,
+                "PRIMER_MAX_TM": target_tm + 3,
+                "PRIMER_PRODUCT_SIZE_RANGE": [[product_min, product_max]],
+                "PRIMER_NUM_RETURN": 1,
+            },
+        )
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+        # Sweep #25 (2026-05-23): `(OSError, Exception)` is `Exception`
+        # since `Exception` subsumes `OSError` — that tuple was a
+        # bare-except in disguise (the INV-65 grep for `(AttributeError,
+        # Exception)` missed the `(OSError, Exception)` shape).
+        # Narrowed to the actual Primer3 failure modes: missing lib
+        # (OSError), bad params (ValueError), and the misc errors the
+        # C wrapper raises (RuntimeError / KeyError / TypeError when
+        # the result dict shape doesn't match).
+        return {"error": f"Primer3 rejected parameters: {exc}"}
+
+    n_found = result.get("PRIMER_PAIR_NUM_RETURNED", 0)
+    if n_found == 0:
+        explain = result.get("PRIMER_LEFT_EXPLAIN", "")
+        return {"error": f"Primer3 found no valid pair. {explain}"}
+
+    fwd_pos = result["PRIMER_LEFT_0"]     # (start, length) on p3_seq
+    rev_pos = result["PRIMER_RIGHT_0"]    # (start, length) — start is 3' end on p3_seq
+
+    # Unrotate positions back to original-template coordinates. Apply
+    # `% total` ONLY when the target region wraps origin (Primer3 ran
+    # on a rotated template). On the linear path, `rotation == 0` and
+    # the modulo is a no-op for most values BUT silently flips a primer
+    # 3'-ending at exact bp `total - 1` into `rev_end = total % total = 0`
+    # — which `_add_selected_to_map` then reads as a wrap-encoded primer
+    # (`p_end < p_start`) and stamps a wrap CompoundLocation with a 0-bp
+    # head part. Mirrors `_design_cloning_primers_raw` (gate-on-wraps).
+    if wraps:
+        fwd_start = (fwd_pos[0] + rotation) % total
+        fwd_end   = (fwd_pos[0] + fwd_pos[1] + rotation) % total
+        rev_start = (rev_pos[0] - rev_pos[1] + 1 + rotation) % total
+        rev_end   = (rev_pos[0] + 1 + rotation) % total
+    else:
+        fwd_start = fwd_pos[0]
+        fwd_end   = fwd_pos[0] + fwd_pos[1]
+        rev_start = rev_pos[0] - rev_pos[1] + 1
+        rev_end   = rev_pos[0] + 1
+
+    return {
+        "fwd_seq":      result["PRIMER_LEFT_0_SEQUENCE"],
+        "rev_seq":      result["PRIMER_RIGHT_0_SEQUENCE"],
+        "fwd_tm":       round(result["PRIMER_LEFT_0_TM"], 1),
+        "rev_tm":       round(result["PRIMER_RIGHT_0_TM"], 1),
+        "fwd_pos":      (fwd_start, fwd_end),
+        "rev_pos":      (rev_start, rev_end),
+        "product_size": result["PRIMER_PAIR_0_PRODUCT_SIZE"],
+    }
+
+
+@_timed("op.primer3.cloning_design")
+def _design_cloning_primers_raw(
+    template_seq: str,
+    start: int,
+    end: int,
+    site_5: str,
+    site_3: str,
+    name_5: str = "5'site",
+    name_3: str = "3'site",
+    target_tm: float = 60.0,
+    padding: str = "GCGC",
+) -> dict:
+    """Design cloning primers with arbitrary recognition-site tails + padding.
+
+    Accepts raw site sequences (not just NEB enzyme names) so users can
+    enter custom cutter sequences.
+
+    Structure (5'→3'):
+        Forward: [padding] [5' site]    [binding region →]
+        Reverse: [padding] [RC 3' site] [← binding region RC]
+
+    Returns dict with keys: fwd_full, rev_full, fwd_binding, rev_binding,
+    fwd_tm, rev_tm, re_5prime, re_3prime, site_5, site_3, insert_seq,
+    fwd_pos, rev_pos, or 'error'.
+    """
+    site_5 = site_5.upper()
+    site_3 = site_3.upper()
+    if not site_5 or not set(site_5) <= set("ACGTRYWSMKBDHVN"):
+        return {"error": f"Invalid 5' site sequence: {site_5!r}"}
+    if not site_3 or not set(site_3) <= set("ACGTRYWSMKBDHVN"):
+        return {"error": f"Invalid 3' site sequence: {site_3!r}"}
+
+    total  = len(template_seq)
+    insert = _slice_circular(template_seq.upper(), start, end)
+    wraps  = end < start
+    if len(insert) < 18:
+        return {"error": "Region too short (< 18 bp)."}
+
+    # Cap each binding so the TOTAL oligo (tail + binding) stays within
+    # `_PRIMER_MAX_OLIGO_LEN`; tail = padding + RE site.
+    fwd_bind, fwd_tm = _pick_binding_region(
+        insert, target_tm, max_len=_binding_max_len(len(padding) + len(site_5)))
+    rev_bind, rev_tm = _pick_binding_region(
+        _rc(insert), target_tm,
+        max_len=_binding_max_len(len(padding) + len(site_3)))
+
+    fwd_full = padding + site_5 + fwd_bind
+    rev_full = padding + _rc(site_3) + rev_bind
+
+    if wraps:
+        fwd_pos = (start, (start + len(fwd_bind)) % total)
+        rev_pos = ((end - len(rev_bind)) % total, end)
+    else:
+        fwd_pos = (start, start + len(fwd_bind))
+        rev_pos = (end - len(rev_bind), end)
+
+    return {
+        "fwd_full":    fwd_full,
+        "rev_full":    rev_full,
+        "fwd_binding": fwd_bind,
+        "rev_binding": rev_bind,
+        "fwd_tm":      round(fwd_tm, 1),
+        "rev_tm":      round(rev_tm, 1),
+        "re_5prime":   name_5,
+        "re_3prime":   name_3,
+        "site_5":      site_5,
+        "site_3":      site_3,
+        "insert_seq":  insert,
+        "fwd_pos":     fwd_pos,
+        "rev_pos":     rev_pos,
+    }
+
+
+def _design_cloning_primers(
+    template_seq: str,
+    start: int,
+    end: int,
+    re_5prime: str,
+    re_3prime: str,
+    target_tm: float = 60.0,
+    padding: str = "GCGC",
+) -> dict:
+    """Design cloning primers using enzyme names from the combined
+    catalog (built-in NEB ∪ user-added custom). Delegates to
+    _design_cloning_primers_raw after looking up recognition sites."""
+    catalog = _state._all_enzymes_hook()
+    if re_5prime not in catalog:
+        return {"error": f"Unknown enzyme: {re_5prime}"}
+    if re_3prime not in catalog:
+        return {"error": f"Unknown enzyme: {re_3prime}"}
+    site_5, _, _ = catalog[re_5prime]
+    site_3, _, _ = catalog[re_3prime]
+    return _design_cloning_primers_raw(
+        template_seq, start, end, site_5, site_3,
+        name_5=re_5prime, name_3=re_3prime,
+        target_tm=target_tm, padding=padding,
+    )
+
+
+@_timed("op.primer3.generic_design")
+def _design_generic_primers(
+    template_seq: str,
+    start: int,
+    end: int,
+    target_tm: float = 60.0,
+) -> dict:
+    """Design simple binding primers (no tails, no RE sites, no overhangs).
+
+    Forward primer: optimal binding region at the start of the region.
+    Reverse primer: optimal binding region at the end (reverse-complement).
+    """
+    total  = len(template_seq)
+    insert = _slice_circular(template_seq.upper(), start, end)
+    wraps  = end < start
+    if len(insert) < 18:
+        return {"error": "Region too short (< 18 bp)."}
+    # No tail (binding-only primers) → the whole oligo IS the binding, so it
+    # may grow up to the full `_PRIMER_MAX_OLIGO_LEN`.
+    fwd_bind, fwd_tm = _pick_binding_region(
+        insert, target_tm, max_len=_binding_max_len(0))
+    rev_bind, rev_tm = _pick_binding_region(
+        _rc(insert), target_tm, max_len=_binding_max_len(0))
+    if wraps:
+        fwd_pos = (start, (start + len(fwd_bind)) % total)
+        rev_pos = ((end - len(rev_bind)) % total, end)
+    else:
+        fwd_pos = (start, start + len(fwd_bind))
+        rev_pos = (end - len(rev_bind), end)
+    return {
+        "fwd_seq":  fwd_bind,
+        "rev_seq":  rev_bind,
+        "fwd_tm":   round(fwd_tm, 1),
+        "rev_tm":   round(rev_tm, 1),
+        "fwd_pos":  fwd_pos,
+        "rev_pos":  rev_pos,
+    }
