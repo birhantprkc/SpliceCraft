@@ -758,7 +758,7 @@ class TestKazusaSizeCap:
     def test_kazusa_oversized_response_rejected(self, monkeypatch):
         """Regression guard for 2026-05-06 fix: cap Kazusa's HTML
         response size to bound worker memory."""
-        monkeypatch.setattr(sc, "_KAZUSA_MAX_RESPONSE_BYTES", 100)
+        monkeypatch.setattr(_codon, "_KAZUSA_MAX_RESPONSE_BYTES", 100)
         big_html = b"<html>" + (b"X" * 10_000) + b"</html>"
 
         def fake_urlopen(req, timeout=None):
