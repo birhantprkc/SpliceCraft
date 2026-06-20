@@ -23,6 +23,7 @@ from __future__ import annotations
 import pytest
 
 import splicecraft as sc
+import splicecraft_fileio as _fileio  # zip/Plasmidsaurus handling lives here (Phase D L2)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2935,7 +2936,7 @@ class TestPlasmidsaurusZipParser:
         """A zip claiming to be larger than the cap is refused."""
         # Build a tiny zip then artificially cap to a smaller size.
         zp = self._build_zip(tmp_path, [("DEMO1", None, None)])
-        monkeypatch.setattr(sc, "_PLASMIDSAURUS_ZIP_MAX_BYTES", 1)
+        monkeypatch.setattr(_fileio, "_PLASMIDSAURUS_ZIP_MAX_BYTES", 1)
         with pytest.raises(ValueError, match="too large"):
             sc._parse_plasmidsaurus_zip(zp)
 
@@ -3405,7 +3406,7 @@ class TestSequencingHardening:
             zf.writestr("R_per-base-data/R_1_X.tsv", big_body)
         # Cap to 1 KB so the 200 KB tsv is refused upfront.
         monkeypatch.setattr(
-            sc, "_PLASMIDSAURUS_PERBASE_MAX_BYTES", 1024,
+            _fileio, "_PLASMIDSAURUS_PERBASE_MAX_BYTES", 1024,
         )
         data = sc._parse_plasmidsaurus_zip(zp)
         assert len(data["samples"]) == 1

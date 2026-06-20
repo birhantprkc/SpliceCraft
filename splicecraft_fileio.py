@@ -11,6 +11,8 @@ hub-side (separate concerns / data-safety). Re-exported by the hub so `sc.<name>
 """
 from __future__ import annotations
 
+import os
+import re
 from copy import copy as _shallow_copy
 from datetime import date as _date
 from pathlib import Path
@@ -19,7 +21,7 @@ from splicecraft_logging import _log, _timed
 from splicecraft_persistence import _atomic_write_text, _safe_file_size_check
 from splicecraft_biology import _rc
 from splicecraft_util import (
-    _CONTROL_CHARS_RE, _DEFAULT_TYPE_COLORS, _feat_bounds, _safe_xml_parse,
+    _CONTROL_CHARS_RE, _DEFAULT_TYPE_COLORS, _feat_bounds, _natural_sort_key, _safe_xml_parse,
 )
 from splicecraft_record import (
     _GB_LOCUS_NAME_MAX, _gb_text_to_record, _normalize_primer_seq, _record_to_gb_text,
@@ -1847,3 +1849,821 @@ def _parse_commercialsaas_history(xml_text: str) -> "_CommercialSaaSHistoryNode 
     wrapper = _CommercialSaaSHistoryNode(nodes[0])
     wrapper._sibling_elements = list(nodes[1:])
     return wrapper
+
+
+
+# ── zip / Plasmidsaurus member handling (Phase D, moved from hub) ───────────
+# [SUB-plasmidsaurus] zip member safety (path-traversal + size caps) + the
+# Plasmidsaurus run-zip / per-base-TSV parsers + gbk display-label helper. The
+# members are returned as text/metadata; the CALLER parses records (no
+# load_genbank dependency here). Lazy zipfile/stat/codecs/re inside the fns.
+# ── Sequencing-data ingestion (Plasmidsaurus etc.) ────────────────────────────
+#
+# Plasmidsaurus delivers each run as a .zip with per-sample directories
+# containing a consensus assembly (`*.gbk` / `*.gb`), raw reads, and
+# QC plots. SpliceCraft's first-pass workflow:
+#
+#   1. User picks the .zip via `PlasmidsaurusZipModal` (file browser).
+#   2. We list every `.gbk` / `.gb` member inside (size-capped to keep
+#      the picker responsive against absurd zips).
+#   3. User picks a member; we `_extract_gbk_member` it into memory and
+#      parse via `_gb_text_to_record`.
+#   4. User picks a target plasmid from the library — we run a
+#      `_pairwise_align` between the two sequences and surface the
+#      result on `AlignmentScreen`.
+#
+# Future: a Plasmidsaurus API key + per-account download lands here as
+# a network sibling of the zip path. Same downstream alignment +
+# visualisation pipeline.
+
+# Per-zip + per-member size caps. Plasmidsaurus zips for a single run
+# are typically <50 MB and the consensus assembly is <100 KB. Anything
+# larger is suspicious; refuse rather than OOM the picker.
+_PLASMIDSAURUS_ZIP_MAX_BYTES    = 500 * 1024 * 1024   # 500 MB whole zip
+_PLASMIDSAURUS_MEMBER_MAX_BYTES = 50  * 1024 * 1024   # 50 MB per .gbk
+_PLASMIDSAURUS_MAX_MEMBERS      = 2000                # listing cap
+_GBK_EXTS = (".gbk", ".gb", ".genbank")
+
+
+def _is_safe_zip_member_name(name: str) -> bool:
+    """Return True if `name` is safe to surface in the picker AND safe
+    to feed back into `zf.getinfo(name)`. Rejects:
+
+      * absolute paths (`/etc/passwd.gbk`, `C:\\Users\\…`)
+      * `..` segments (`../../escape.gbk`)
+      * NUL bytes (terminal-display ANSI smuggling)
+      * embedded ANSI escape codes (likewise)
+
+    Stdlib `zipfile.open(info)` doesn't extract to a path, so a hostile
+    name is currently bounded — but a future `extract()` / `extractall()`
+    switch would silently flow into path traversal. This rejection
+    fences off the whole class of bugs at the listing stage.
+    """
+    if not name or "\x00" in name:
+        return False
+    # ANSI escape (\x1b) — used in terminal-injection attacks
+    if "\x1b" in name:
+        return False
+    # Any other C0 control byte / DEL / C1 block (CR, bell, backspace, the
+    # 8-bit CSI 0x9b, …) mangles a DataTable row render and is never a
+    # legitimate member name; plus lone surrogates (a non-UTF-8 filename
+    # decoded with surrogateescape) that can't even UTF-8-encode for
+    # display / logging. Closes the same class as commit e573159 did for logs.
+    if any(ord(c) < 0x20 or 0x7f <= ord(c) <= 0x9f for c in name):
+        return False
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    # Windows absolute (C:, D:, etc.)
+    if len(name) >= 2 and name[1] == ":" and name[0].isalpha():
+        return False
+    # Backslash separator (Windows paths in malicious zips)
+    norm = name.replace("\\", "/")
+    if norm.startswith("/"):
+        return False
+    parts = norm.split("/")
+    if any(p in ("..", ".") for p in parts):
+        return False
+    return True
+
+
+def _list_gbk_members_in_zip(zip_path: Path) -> "list[dict]":
+    """Walk a .zip and return a list of dicts describing every .gbk /
+    .gb / .genbank member. Each dict carries:
+
+        ``{"name": <member name>, "size": <uncompressed bytes>}``
+
+    Raises ValueError on unreadable / oversized / non-zip files.
+    Cap-protected: refuses zips above `_PLASMIDSAURUS_ZIP_MAX_BYTES`,
+    individual members above `_PLASMIDSAURUS_MEMBER_MAX_BYTES`, and
+    listings beyond `_PLASMIDSAURUS_MAX_MEMBERS` to keep the picker
+    snappy and resistant to malformed archives.
+
+    Sweep #26 (2026-05-23): closes the TOCTOU window between the
+    size check and the zip open by opening via ``os.open(path,
+    O_RDONLY)`` (which dereferences the symlink ONCE) then
+    ``fstat`` on the fd (immune to a concurrent path swap) and
+    ``zipfile.ZipFile(fileobj=os.fdopen(...))``. Pre-sweep a hostile
+    local process could swap the file between the path-based
+    ``stat()`` and the path-based ``ZipFile(str(p))`` call to
+    bypass the size cap.
+    """
+    import zipfile
+    import stat as _stat
+    p = Path(zip_path)
+    try:
+        fd = os.open(str(p), os.O_RDONLY)
+    except FileNotFoundError as exc:
+        raise ValueError(f"zip not found: {p}") from exc
+    except OSError as exc:
+        raise ValueError(f"could not open zip: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            raise ValueError(f"not a regular file: {p}")
+        size = st.st_size
+        if size > _PLASMIDSAURUS_ZIP_MAX_BYTES:
+            raise ValueError(
+                f"zip too large ({size:,} bytes; cap "
+                f"{_PLASMIDSAURUS_ZIP_MAX_BYTES:,})"
+            )
+        try:
+            fobj = os.fdopen(fd, "rb")
+            fd = -1   # ownership transferred to fobj
+        except OSError as exc:
+            raise ValueError(f"could not open zip: {exc}") from exc
+        try:
+            zf = zipfile.ZipFile(fobj, "r")
+        except (zipfile.BadZipFile, OSError) as exc:
+            fobj.close()
+            raise ValueError(f"could not open zip: {exc}") from exc
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    members: list[dict] = []
+    try:
+        for info in zf.infolist():
+            if len(members) >= _PLASMIDSAURUS_MAX_MEMBERS:
+                _log.warning(
+                    "plasmidsaurus: zip listing truncated at %d members",
+                    _PLASMIDSAURUS_MAX_MEMBERS,
+                )
+                break
+            if info.is_dir():
+                continue
+            name = info.filename
+            if not _is_safe_zip_member_name(name):
+                _log.warning(
+                    "plasmidsaurus: skipping unsafe zip member name %r",
+                    name,
+                )
+                continue
+            base = name.rsplit("/", 1)[-1]
+            if not base or base.startswith("."):
+                continue
+            ext = ""
+            for e in _GBK_EXTS:
+                if name.lower().endswith(e):
+                    ext = e
+                    break
+            if not ext:
+                continue
+            if info.file_size > _PLASMIDSAURUS_MEMBER_MAX_BYTES:
+                _log.warning(
+                    "plasmidsaurus: skipping oversized member %s (%d bytes)",
+                    name, info.file_size,
+                )
+                continue
+            members.append({
+                "name": name,
+                "size": int(info.file_size),
+            })
+    finally:
+        # Sweep #26: explicit close of both the zipfile AND the
+        # underlying fileobj. `ZipFile.close()` does NOT close a
+        # caller-supplied fileobj (per stdlib docs), so without
+        # this `fobj.close()` we'd leak the underlying fd.
+        try:
+            zf.close()
+        except OSError:
+            pass
+        try:
+            fobj.close()
+        except OSError:
+            pass
+    members.sort(key=lambda m: _natural_sort_key(m["name"]))
+    return members
+
+
+def _extract_gbk_member(zip_path: Path, member_name: str) -> str:
+    """Read a single .gbk member out of a zip and return its decoded
+    text. Caller passes the result through `_gb_text_to_record` to get
+    a SeqRecord. Raises ValueError on missing / oversized / unreadable
+    member, on UTF-8 / latin-1 decode failure, or on an unsafe member
+    name (path traversal / NUL / ANSI smuggling).
+
+    Sweep #26 (2026-05-23): TOCTOU-safe open via ``os.open`` +
+    ``fileobj`` — see ``_list_gbk_members_in_zip`` rationale.
+    """
+    import zipfile
+    import stat as _stat
+    if not _is_safe_zip_member_name(member_name):
+        raise ValueError(f"unsafe zip member name: {member_name!r}")
+    try:
+        fd = os.open(str(zip_path), os.O_RDONLY)
+    except OSError as exc:
+        raise ValueError(f"could not open zip: {exc}") from exc
+    try:
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"not a regular file: {zip_path}")
+        try:
+            fobj = os.fdopen(fd, "rb")
+            fd = -1
+        except OSError as exc:
+            raise ValueError(f"could not open zip: {exc}") from exc
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    try:
+        with zipfile.ZipFile(fobj, "r") as zf:
+            try:
+                # Sweep #9 (2026-05-19): route through the resolver
+                # so Windows-built zips with backslash separators in
+                # their central directory still match a member name
+                # we stored with forward slashes.
+                info = _zf_get_member_info(zf, member_name)
+            except KeyError as exc:
+                raise ValueError(
+                    f"member not in zip: {member_name!r}"
+                ) from exc
+            if info.file_size > _PLASMIDSAURUS_MEMBER_MAX_BYTES:
+                raise ValueError(
+                    f"member too large ({info.file_size:,} bytes; cap "
+                    f"{_PLASMIDSAURUS_MEMBER_MAX_BYTES:,})"
+                )
+            # Bounded streaming read: the central-directory `file_size`
+            # is attacker-controlled. A malicious zip can claim 1 KB
+            # but stream 5 GB of compressed-to-zero data and OOM the
+            # process. Cap the actual read at MAX+1 and abort if we
+            # exceeded — pre-fix `fh.read()` was unbounded and only
+            # the (untrusted) header was checked.
+            cap = _PLASMIDSAURUS_MEMBER_MAX_BYTES
+            with zf.open(info, "r") as fh:
+                raw = fh.read(cap + 1)
+            if len(raw) > cap:
+                raise ValueError(
+                    f"member exceeded cap during decompression "
+                    f"(claimed {info.file_size:,} bytes; cap {cap:,}) "
+                    f"— possible zip-bomb"
+                )
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise ValueError(f"could not read zip: {exc}") from exc
+    finally:
+        try:
+            fobj.close()
+        except OSError:
+            pass
+    # GenBank is ASCII per the spec; fall back to latin-1 only if a
+    # stray high-bit byte slipped in (some sequencer pipelines do).
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1", errors="replace")
+
+
+# ── Plasmidsaurus run-zip structured parser ───────────────────────────────────
+#
+# A standard Plasmidsaurus results zip groups files by category and
+# names each by `<run>_<sample-idx>_<sample-name>.<ext>`. Categories
+# seen in the wild:
+#
+#   <run>_genbank-files/<base>.gbk          — annotated consensus
+#   <run>_fasta-files/<base>.fasta          — bare consensus FASTA
+#   <run>_summary-files/<base>.txt          — k-mer % + contamination %
+#   <run>_per-base-data/<base>.tsv          — per-bp coverage / quality
+#   <run>_histograms/<base>.png             — read-length histogram
+#   <run>_coverage-plots/<base>.png         — coverage plot
+#   <run>_interactive-map/<base>.html       — Bokeh interactive map
+#   <run>_ab1-files/<base>.<n-of-m>.ab1     — Sanger trace
+#   <run>_gel.png                            — run-level virtual gel
+#
+# The `_parse_plasmidsaurus_zip` walk groups every member under its
+# sample's canonical base name, surfaces run-level files separately,
+# and returns small dicts the Sequencing toolbar's sub-tabs can render
+# without re-reading the zip per tab. The summary-file body and the
+# per-base TSV header are streamed inline (both tiny — <500 KB) so
+# the QC tab can render contamination / coverage stats without a
+# second pass.
+
+# Cap on the inline-cached summary-file text we keep on the SequencingScreen
+# instance. Per the Plasmidsaurus summary files inspected (≤200 bytes
+# typical), 4 KB is generous; refuse anything larger to keep the
+# in-memory cache bounded even on malformed runs.
+_PLASMIDSAURUS_SUMMARY_MAX_BYTES = 4 * 1024
+
+# Cap on per-base TSV reads. Real Plasmidsaurus per-base data is
+# ~50 bytes/row × plasmid bp (so a 10 kbp plasmid ships ~500 KB).
+# 100 MB is generous for the largest plasmids we'd ever see (200 kbp
+# ≈ 10 MB) while still bounding a hostile zip that claims a tiny
+# `file_size` in the central directory but streams unbounded data on
+# decompress. Sacred-invariant defence-in-depth: also enforced inside
+# `_summarize_perbase_tsv` via a chunked read so a single bombing
+# line without newlines can't OOM `io.TextIOWrapper`'s buffer.
+_PLASMIDSAURUS_PERBASE_MAX_BYTES = 100 * 1024 * 1024
+
+
+def _normalize_zip_member(name: str) -> str:
+    """Return `name` with backslashes folded to forward slashes. Some
+    Windows-built zips ship `category\\sample.ext` member names; the
+    rest of this module assumes forward slashes."""
+    return (name or "").replace("\\", "/")
+
+
+def _zf_get_member_info(zf, name: str):
+    """Resolve a zip member by name, transparently handling
+    Windows-built zips whose central directory stores `\\`
+    separators while our internal stored names use `/`.
+
+    Tries `getinfo(name)` first (the common case where the name
+    we stored is the same as the name in the zip). On KeyError,
+    falls back to looking the member up by its normalised form —
+    matches against `_normalize_zip_member(info.filename)` so we
+    catch backslash-stored entries whose normalised form equals
+    the requested name.
+
+    Raises KeyError if no match. Sacred robustness invariant added
+    in Sweep #9 (2026-05-19) — without this, a Windows-built
+    Plasmidsaurus zip on a POSIX host silently degraded the
+    Sequencing tab to error rows because every `zf.getinfo` call
+    KeyError'd against a stored-forward-slash name."""
+    try:
+        return zf.getinfo(name)
+    except KeyError:
+        pass
+    norm_target = _normalize_zip_member(name)
+    for info in zf.infolist():
+        if _normalize_zip_member(info.filename) == norm_target:
+            return info
+    raise KeyError(name)
+
+
+def _parse_plasmidsaurus_zip(zip_path: Path) -> dict:
+    """Inspect a Plasmidsaurus results zip and return a structured
+    summary keyed by sample.
+
+    Returns ``{"run_id", "samples": [{"base", "name", "gbk", "fasta",
+    "summary", "summary_text", "perbase", "perbase_coverage",
+    "histogram", "coverage_plot", "interactive_map", "ab1_files"}, ...],
+    "run_files": [{"name", "size", "category"}, ...], "total_files",
+    "total_size"}``.
+
+    Each ``gbk``/``fasta``/``summary``/``perbase`` value is the zip
+    member name (or None when absent). ``summary_text`` is a verbatim
+    decode of the summary file body when it is below
+    ``_PLASMIDSAURUS_SUMMARY_MAX_BYTES``; consumers parse contamination
+    + k-mer percentages from this. ``perbase_coverage`` carries
+    coverage stats {"mean", "min", "max", "n_pos", "above_20x"} derived
+    from the per-base TSV's `reads_all` column. Both summary_text and
+    perbase_coverage are best-effort — missing / unreadable members
+    leave them as ``""`` and ``{}``.
+
+    All size caps from `_list_gbk_members_in_zip` apply. Members with
+    paths failing `_is_safe_zip_member_name` are silently skipped.
+
+    Raises ValueError on the zip itself being missing / oversized /
+    corrupt — same surface as `_list_gbk_members_in_zip`.
+    """
+    import zipfile
+    p = Path(zip_path)
+    if not p.exists():
+        raise ValueError(f"zip not found: {p}")
+    if not p.is_file():
+        raise ValueError(f"not a regular file: {p}")
+    try:
+        size = p.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"could not stat zip: {exc}") from exc
+    if size > _PLASMIDSAURUS_ZIP_MAX_BYTES:
+        raise ValueError(
+            f"zip too large ({size:,} bytes; cap "
+            f"{_PLASMIDSAURUS_ZIP_MAX_BYTES:,})"
+        )
+    try:
+        zf = zipfile.ZipFile(str(p), "r")
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise ValueError(f"could not open zip: {exc}") from exc
+
+    # Sweep #35 (2026-05-26): everything from here through the loop
+    # is inside the try/finally that closes `zf`. Pre-fix, the
+    # dict/tuple setup below sat in an unguarded window — currently
+    # exception-free, but a future maintainer wiring in any call
+    # that can raise (per-zip lookups, custom suffix tables, etc.)
+    # would silently leak the ZipFile handle until GC ran. Moving
+    # the setup under the same try keeps the closure guarantee
+    # tight regardless of future changes.
+    try:
+        # Per-sample dict keyed by canonical base name (filename without
+        # the category-folder prefix, minus extension).
+        samples: dict[str, dict] = {}
+        run_files: list[dict] = []
+        total_files = 0
+        total_size = 0
+        # Run ID: parent folder name prefix shared by category dirs
+        # (e.g., `34XK5N_genbank-files/...` → run_id=`34XK5N`).
+        # Inferred by majority vote so a malformed zip with mixed
+        # prefixes doesn't pick a stale one.
+        prefix_votes: dict[str, int] = {}
+
+        # Category folder → field-name on the sample dict. Anchored on
+        # the underscore-separator pattern Plasmidsaurus uses so a
+        # sample whose own filename happens to contain `_genbank-files`
+        # doesn't false-positive. We probe per-suffix rather than full
+        # prefix because the run-ID prefix varies per zip.
+        _CATEGORY_SUFFIXES = (
+            ("_genbank-files",      "gbk"),
+            ("_fasta-files",        "fasta"),
+            ("_summary-files",      "summary"),
+            ("_per-base-data",      "perbase"),
+            ("_histograms",         "histogram"),
+            ("_coverage-plots",     "coverage_plot"),
+            ("_interactive-map",    "interactive_map"),
+            ("_ab1-files",          "ab1"),   # multiple per sample
+        )
+        for idx, info in enumerate(zf.infolist()):
+            if idx >= _PLASMIDSAURUS_MAX_MEMBERS:
+                # Parity with the listing walk's cap (line ~15627): a zip of
+                # millions of tiny members would otherwise balloon the per-
+                # sample dicts. Log the truncation rather than silently drop.
+                _log.warning(
+                    "plasmidsaurus: zip exceeds %d members — parsing only "
+                    "the first %d", _PLASMIDSAURUS_MAX_MEMBERS,
+                    _PLASMIDSAURUS_MAX_MEMBERS,
+                )
+                break
+            if info.is_dir():
+                continue
+            raw_name = _normalize_zip_member(info.filename)
+            if not _is_safe_zip_member_name(raw_name):
+                _log.warning(
+                    "plasmidsaurus: skipping unsafe zip member name %r",
+                    raw_name,
+                )
+                continue
+            total_files += 1
+            total_size += int(info.file_size or 0)
+            parts = raw_name.split("/")
+            if len(parts) < 2:
+                # Top-level file (e.g., `<run>_gel.png`, `README.txt`).
+                base = parts[0]
+                # Run-level: anchor the prefix vote on a typical
+                # top-level naming, e.g. `34XK5N_gel.png` → `34XK5N`.
+                stem = base.rsplit(".", 1)[0]
+                if "_" in stem:
+                    prefix_votes[stem.split("_", 1)[0]] = (
+                        prefix_votes.get(stem.split("_", 1)[0], 0) + 1
+                    )
+                run_files.append({
+                    "name": base,
+                    "size": int(info.file_size or 0),
+                    "category": "run",
+                })
+                continue
+            folder = parts[0]
+            # Match a category suffix anchored on `_<suffix>` at end.
+            matched_field: "str | None" = None
+            for suffix, field in _CATEGORY_SUFFIXES:
+                if folder.endswith(suffix):
+                    matched_field = field
+                    # Vote: everything before the matched suffix is
+                    # the run-ID candidate (e.g. `34XK5N` from
+                    # `34XK5N_genbank-files`). A zip whose folders
+                    # share one prefix wins by majority.
+                    prefix_candidate = folder[: -len(suffix)]
+                    if prefix_candidate:
+                        prefix_votes[prefix_candidate] = (
+                            prefix_votes.get(prefix_candidate, 0) + 1
+                        )
+                    break
+            if matched_field is None:
+                # Unknown category folder. If the file itself is a
+                # .gbk / .gb / .genbank, treat it as a standalone
+                # sample so test-fixture-style zips (no
+                # `_genbank-files/` subfolder, just `sample_A/x.gbk`)
+                # still surface every plasmid. Otherwise surface
+                # under `run_files` so a custom Plasmidsaurus build
+                # with an extra folder is still inspectable.
+                leaf_raw = parts[-1]
+                low = leaf_raw.lower()
+                if any(low.endswith(ext) for ext in _GBK_EXTS):
+                    matched_field = "gbk"
+                else:
+                    run_files.append({
+                        "name": raw_name,
+                        "size": int(info.file_size or 0),
+                        "category": folder,
+                    })
+                    continue
+            leaf = parts[-1]
+            # Canonical sample base: filename minus dot-extensions.
+            # `.1-of-2.ab1` collapses to the base+strip-of-tail logic
+            # below so all ab1s for a sample group under the same key.
+            base = leaf
+            for _ in range(4):  # at most a couple of dot segments
+                if "." not in base:
+                    break
+                stem, _, ext = base.rpartition(".")
+                if not stem:
+                    break
+                # Stop on the canonical biology extensions; everything
+                # past `.ab1`, `.gbk`, `.fasta`, `.tsv`, `.txt`,
+                # `.png`, `.html` is part of the sample name.
+                if ext.lower() in (
+                    "gbk", "gb", "genbank", "fasta", "fa", "tsv", "txt",
+                    "png", "jpg", "jpeg", "html", "ab1",
+                ):
+                    base = stem
+                    continue
+                # `.1-of-2` style sub-suffix on ab1 — strip too so all
+                # trace files for a sample collapse to one entry.
+                if matched_field == "ab1" and "-of-" in ext:
+                    base = stem
+                    continue
+                break
+            entry = samples.setdefault(base, {
+                "base": base,
+                "name": base,
+                "gbk": None, "fasta": None, "summary": None,
+                "perbase": None, "histogram": None,
+                "coverage_plot": None, "interactive_map": None,
+                "ab1_files": [],
+                "summary_text": "", "perbase_coverage": {},
+            })
+            if matched_field == "ab1":
+                entry["ab1_files"].append(raw_name)
+            else:
+                entry[matched_field] = raw_name
+
+        # Stream the small text bodies inline so the QC sub-tab can
+        # render contamination / coverage without re-opening the zip.
+        for sample in samples.values():
+            sm = sample.get("summary")
+            if sm:
+                try:
+                    info = _zf_get_member_info(zf, sm)
+                    if info.file_size <= _PLASMIDSAURUS_SUMMARY_MAX_BYTES:
+                        with zf.open(info, "r") as fh:
+                            data = fh.read(
+                                _PLASMIDSAURUS_SUMMARY_MAX_BYTES + 1,
+                            )
+                        if len(data) <= _PLASMIDSAURUS_SUMMARY_MAX_BYTES:
+                            try:
+                                sample["summary_text"] = data.decode(
+                                    "utf-8",
+                                )
+                            except UnicodeDecodeError:
+                                sample["summary_text"] = data.decode(
+                                    "latin-1", errors="replace",
+                                )
+                except (KeyError, OSError, zipfile.BadZipFile):
+                    _log.exception(
+                        "plasmidsaurus: failed to read summary for %s",
+                        sample.get("base", "?"),
+                    )
+            pb = sample.get("perbase")
+            if pb:
+                try:
+                    info = _zf_get_member_info(zf, pb)
+                    # Per-base TSV can run multi-MB on large plasmids;
+                    # stream-decode rather than load fully into memory.
+                    # Two-layer cap: refuse outright on a central-directory
+                    # `file_size` that already overshoots the limit, then
+                    # pass the cap into the streamer so a hostile zip with
+                    # an under-claimed size that decompresses into GB still
+                    # bails before OOM.
+                    if info.file_size > _PLASMIDSAURUS_PERBASE_MAX_BYTES:
+                        _log.warning(
+                            "plasmidsaurus: skipping oversize perbase %s "
+                            "(%d bytes; cap %d)",
+                            pb, info.file_size,
+                            _PLASMIDSAURUS_PERBASE_MAX_BYTES,
+                        )
+                    else:
+                        with zf.open(info, "r") as fh:
+                            sample["perbase_coverage"] = (
+                                _summarize_perbase_tsv(
+                                    fh,
+                                    max_bytes=(
+                                        _PLASMIDSAURUS_PERBASE_MAX_BYTES
+                                    ),
+                                )
+                            )
+                except (KeyError, OSError, zipfile.BadZipFile):
+                    _log.exception(
+                        "plasmidsaurus: failed to read perbase for %s",
+                        sample.get("base", "?"),
+                    )
+    finally:
+        zf.close()
+
+    # Resolve the run ID by majority vote on the prefixes we saw.
+    run_id = ""
+    if prefix_votes:
+        run_id = max(prefix_votes.items(), key=lambda kv: kv[1])[0]
+
+    # Natural-sort samples by name so DEMO32 < DEMO34 < ... < DEMO310.
+    sample_list = sorted(
+        samples.values(),
+        key=lambda s: _natural_sort_key(s.get("name") or ""),
+    )
+    return {
+        "run_id": run_id,
+        "samples": sample_list,
+        "run_files": run_files,
+        "total_files": total_files,
+        "total_size": total_size,
+    }
+
+
+def _summarize_perbase_tsv(fh, *, max_bytes: "int | None" = None) -> dict:
+    """Stream the per-base TSV file handle and return summary coverage
+    stats: ``{"mean", "min", "max", "n_pos", "above_20x"}``.
+
+    Assumes the Plasmidsaurus column layout (col 0=pos, col 1=ref,
+    col 2=reads_all, ...). Defensive on header detection — header row
+    is skipped if col 2 isn't an integer. Returns an empty dict on
+    parse failure so the caller can degrade gracefully.
+
+    Streams in 64 KB chunks with a hard byte cap (``max_bytes``). A
+    zip-bomb that decompresses into a single multi-GB line without
+    newlines would otherwise let ``io.TextIOWrapper`` buffer the whole
+    line in memory before yielding it. ``max_bytes=None`` skips the
+    cap for trusted callers (no current caller hits this path — the
+    Plasmidsaurus parser always passes its cap).
+    """
+    total = 0
+    n = 0
+    lo = 10 ** 9
+    hi = -1
+    above_20x = 0
+    import codecs
+    chunk_size = 64 * 1024
+    try:
+        utf8_decoder = codecs.getincrementaldecoder("utf-8")(
+            errors="replace",
+        )
+    except LookupError:
+        # Should never happen on a stdlib build, but degrade rather
+        # than raising — the caller treats {} as "couldn't summarise".
+        return {}
+    consumed = 0
+    pending = ""
+    truncated = False
+
+    def _consume_line(line: str, header_seen_box: list[bool]) -> None:
+        nonlocal n, total, lo, hi, above_20x
+        cols = line.rstrip("\r").split("\t")
+        if len(cols) < 3:
+            return
+        if not header_seen_box[0]:
+            header_seen_box[0] = True
+            # Header probe: skip iff col 2 isn't numeric. Sweep #9
+            # (2026-05-19): use `float()` rather than `int()` for
+            # the numeric test so a TSV that ships fractional
+            # `reads_all` (e.g. a sub-sampled assay) doesn't
+            # silently discard its first data row.
+            try:
+                float(cols[2])
+            except ValueError:
+                return
+        try:
+            v = int(float(cols[2]))
+        except ValueError:
+            return
+        n += 1
+        total += v
+        if v < lo:
+            lo = v
+        if v > hi:
+            hi = v
+        if v >= 20:
+            above_20x += 1
+
+    header_seen = [False]
+    try:
+        while True:
+            try:
+                chunk = fh.read(chunk_size)
+            except (OSError, ValueError):
+                _log.exception(
+                    "plasmidsaurus: perbase TSV read failed mid-stream"
+                )
+                return {}
+            if not chunk:
+                # Tail flush — last line without trailing newline.
+                if pending:
+                    _consume_line(pending, header_seen)
+                break
+            consumed += len(chunk)
+            if max_bytes is not None and consumed > max_bytes:
+                truncated = True
+            text = utf8_decoder.decode(chunk, final=truncated)
+            pending += text
+            lines = pending.split("\n")
+            pending = lines.pop()  # last fragment may be partial
+            for line in lines:
+                _consume_line(line, header_seen)
+            if truncated:
+                # Flush any partial tail we have, then stop.
+                if pending:
+                    _consume_line(pending, header_seen)
+                _log.warning(
+                    "plasmidsaurus: perbase TSV exceeded %d-byte cap; "
+                    "summary truncated", max_bytes,
+                )
+                break
+    except Exception:
+        _log.exception("plasmidsaurus: perbase TSV summarize failed")
+        return {}
+    if n == 0:
+        return {}
+    return {
+        "mean":      total / n,
+        "min":       lo if lo != 10 ** 9 else 0,
+        "max":       hi if hi >= 0 else 0,
+        "n_pos":     n,
+        "above_20x": above_20x,
+    }
+
+
+def _parse_plasmidsaurus_summary(text: str) -> dict:
+    """Parse the body of a Plasmidsaurus `<run>_<n>_<name>.txt` summary
+    file. Returns ``{"kmer_moles_pct": float, "kmer_mass_pct": float,
+    "contamination_pct": float, "contamination_source": str,
+    "raw_text": str}``. Missing fields default to ``None``.
+
+    Format observed in the wild::
+
+            1-mer (%)  2-mer (%)
+        moles       97.5        2.5
+        mass        95.1        4.9
+
+
+        *************************
+
+
+        E. coli genomic contamination: 18.0%
+
+    Both the column count (`<n>-mer`) and the contamination source
+    line vary across runs; we extract the first numeric token after
+    `moles`/`mass` (the canonical 1-mer percentages) and grep the
+    contamination line for the % value + source organism.
+    """
+    out: dict = {
+        "kmer_moles_pct":      None,
+        "kmer_mass_pct":       None,
+        "contamination_pct":   None,
+        "contamination_source": "",
+        "raw_text":             text,
+    }
+    if not text:
+        return out
+    import re as _re
+    moles_match = _re.search(
+        r"^\s*moles\s+([0-9.]+)", text, _re.MULTILINE,
+    )
+    mass_match = _re.search(
+        r"^\s*mass\s+([0-9.]+)",  text, _re.MULTILINE,
+    )
+    if moles_match:
+        try:
+            out["kmer_moles_pct"] = float(moles_match.group(1))
+        except (TypeError, ValueError):
+            pass
+    if mass_match:
+        try:
+            out["kmer_mass_pct"] = float(mass_match.group(1))
+        except (TypeError, ValueError):
+            pass
+    contam_match = _re.search(
+        r"([^\n]+?)\s*contamination:\s*([0-9.]+)%", text, _re.IGNORECASE,
+    )
+    if contam_match:
+        out["contamination_source"] = contam_match.group(1).strip()
+        try:
+            out["contamination_pct"] = float(contam_match.group(2))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _display_label_for_gbk(name: str) -> str:
+    """INV-73 (2026-05-25): convert a Plasmidsaurus gbk basename
+    (e.g. ``RUN42_1_DEMO34.gbk``) into a display-ready label
+    (``DEMO34``) by stripping the run-id prefix, the file extension,
+    and replacing any remaining underscores with spaces. User
+    feedback: "no underscores in names in the TUI".
+
+    Falls back to the basename minus extension if no run prefix
+    is found, so non-Plasmidsaurus filenames still get clean
+    display labels.
+    """
+    if not name:
+        return ""
+    leaf = name.rsplit("/", 1)[-1]
+    for ext in (".gbk", ".gb", ".genbank", ".dna"):
+        if leaf.lower().endswith(ext):
+            leaf = leaf[: -len(ext)]
+            break
+    m = re.match(
+        r"^[A-Z0-9]+_\d+_(.+)$", leaf, flags=re.IGNORECASE,
+    )
+    if m:
+        leaf = m.group(1)
+    return leaf.replace("_", " ").strip()

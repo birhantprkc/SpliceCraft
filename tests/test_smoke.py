@@ -19,6 +19,7 @@ import sys
 import pytest
 
 import splicecraft as sc
+import splicecraft_fileio as _fileio  # zip/Plasmidsaurus handling lives here (Phase D L2)
 
 
 TERMINAL_SIZE = (160, 48)   # wide enough for the three-pane layout
@@ -10785,7 +10786,7 @@ class TestShiftClickFeatureExtend:
     def test_list_gbk_members_rejects_oversized(self, tmp_path, monkeypatch):
         import zipfile
         # Cap the zip-size constant so we don't have to write 500 MB.
-        monkeypatch.setattr(sc, "_PLASMIDSAURUS_ZIP_MAX_BYTES", 100)
+        monkeypatch.setattr(_fileio, "_PLASMIDSAURUS_ZIP_MAX_BYTES", 100)
         zp = tmp_path / "huge.zip"
         with zipfile.ZipFile(zp, "w") as zf:
             zf.writestr("a/a.gbk", "X" * 1000)
