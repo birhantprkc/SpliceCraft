@@ -39,6 +39,7 @@ from collections import OrderedDict
 # the @_timed scan decorator + _log come from splicecraft_logging.
 import splicecraft_state as _state
 from splicecraft_logging import _log, _timed
+from splicecraft_util import _normalize_dna_for_align  # same-layer L0 (util doesn't import biology); used by _search_subsequence
 
 
 # ── IUPAC + reverse complement ────────────────────────────────────────────
@@ -2258,3 +2259,210 @@ def _forbidden_hit_set(seq: str, patterns) -> set[tuple[str, int]]:
 
 def _mut_revcomp(seq: str) -> str:
     return seq.upper().translate(_IUPAC_COMP)[::-1]
+
+
+# ── General sequence-alignment primitives (moved from hub) ─────────────────
+# IUPAC degenerate-base matching + fuzzy 3'-anchored subsequence search +
+# circular slice. Shared by the Myers/pairwise aligner, annotation-transfer,
+# and primer-check — an L0 home below all of them.
+# IUPAC ambiguity → set of unambiguous bases the code can stand for.
+# Used by alignment match/mismatch counting + segment-state derivation
+# so a primer with `N` against an `A` target counts as a MATCH (the
+# `N` is compatible with `A`) rather than a mismatch. Pre-2026-05-27
+# the pairwise aligner used scalar match/mismatch scoring with strict
+# character equality — consensus reads and ambiguity-aware primers
+# scored artificially low. `U` maps to {T} so RNA-pasted-as-DNA still
+# aligns (also normalised to T in `_normalize_dna_for_align`).
+_IUPAC_BASE_SET: "dict[str, frozenset[str]]" = {
+    "A": frozenset("A"),
+    "C": frozenset("C"),
+    "G": frozenset("G"),
+    "T": frozenset("T"),
+    "U": frozenset("T"),
+    "R": frozenset("AG"),
+    "Y": frozenset("CT"),
+    "S": frozenset("CG"),
+    "W": frozenset("AT"),
+    "K": frozenset("GT"),
+    "M": frozenset("AC"),
+    "B": frozenset("CGT"),
+    "D": frozenset("AGT"),
+    "H": frozenset("ACT"),
+    "V": frozenset("ACG"),
+    "N": frozenset("ACGT"),
+}
+
+
+def _iupac_compatible(a: str, b: str) -> bool:
+    """Return True when IUPAC codes ``a`` and ``b`` share at least one
+    unambiguous base. ``"A" vs "A"`` → True; ``"A" vs "N"`` → True;
+    ``"A" vs "C"`` → False; ``"R" vs "Y"`` → False (R={A,G}, Y={C,T});
+    ``"R" vs "M"`` → True (both include `A`).
+
+    Case-insensitive. Returns False for any character not in the IUPAC
+    nucleotide alphabet — including the gap glyph ``"-"`` (gaps are
+    handled BEFORE this check at every call site).
+    """
+    if not a or not b:
+        return False
+    sa = _IUPAC_BASE_SET.get(a.upper())
+    sb = _IUPAC_BASE_SET.get(b.upper())
+    if sa is None or sb is None:
+        return False
+    return bool(sa & sb)
+
+
+# Hard cap on hits returned by `_search_subsequence` — a degenerate
+# query (all-`N`, or a high mismatch budget) on a large plasmid could
+# otherwise match nearly every position. The scan stops once the cap is
+# reached; the Ctrl+F handler surfaces "first N" when it bites.
+_SEQ_SEARCH_MAX_HITS = 10_000
+
+
+def _search_subsequence(
+    seq: str,
+    query: str,
+    *,
+    max_mismatches: int = 0,
+    circular: bool = False,
+    both_strands: bool = True,
+    max_hits: int = _SEQ_SEARCH_MAX_HITS,
+) -> "list[dict]":
+    """Find every position where ``query`` occurs in ``seq`` within
+    ``max_mismatches`` substitutions (Hamming distance — NO indels).
+
+    IUPAC-aware: each base pair is compared with `_iupac_compatible`, so
+    an ``N`` (or any ambiguity code) in either the query or the template
+    matches every base it admits. Both inputs are scrubbed + validated
+    through `_normalize_dna_for_align` (uppercase, ``U``→``T``, FASTA /
+    whitespace / digits stripped); a foreign character propagates its
+    ``ValueError`` so the caller can show the offending char.
+
+    Returns hits sorted by start (then ``+`` before ``-``, then fewest
+    mismatches), each::
+
+        {"start": int, "end": int, "strand": "+"|"-", "mismatches": int}
+
+    Coordinates are FORWARD (top-strand) for BOTH strands: a ``-`` hit at
+    ``[start, end)`` means the query's reverse-complement sits on the top
+    strand there (the query anneals to the BOTTOM strand across that
+    span) — the same forward-coordinate convention the restriction scan
+    uses for bottom-strand cuts (sacred invariant #2). ``start`` is always
+    in ``[0, len(seq))``; ``end`` can exceed ``len(seq)`` for a hit that
+    wraps the origin (circular only).
+
+    circular: also find matches spanning the origin (scans
+              ``seq + seq[:m-1]``). Leave False for a linear record.
+    both_strands: also search the reverse-complement of the query, so a
+                  motif is found on either strand (handy for annotating
+                  inverted / direct repeats). A hit that lands on the same
+                  span on both strands collapses to one ``+`` entry.
+    max_hits: hard cap; the scan stops once reached. The caller should
+              surface truncation when ``len(result) == max_hits``.
+
+    Empty query, query longer than the sequence, or
+    ``max_mismatches < 0`` → ``[]``.
+    """
+    if max_mismatches < 0:
+        return []
+    # Scrub + validate (may raise ValueError on a foreign char — let it
+    # propagate; the modal turns it into a status-line message).
+    s = _normalize_dna_for_align(seq or "")
+    q = _normalize_dna_for_align(query or "")
+    # Coordinate-safety guard (2026-06-02): this matcher returns indices
+    # INTO the normalised haystack `s`, which the caller maps straight
+    # back to a bp position on the loaded record (focus_span / select /
+    # annotate). `_normalize_dna_for_align` only strips length-CHANGING
+    # junk (whitespace / digits / FASTA headers); a loaded record's
+    # sequence never carries those (U→T and upper-casing preserve
+    # length), so `len(s) == len(seq)`. If a future caller ever feeds an
+    # un-cleaned haystack, fail loud here rather than silently jump to /
+    # select the WRONG base — coordinate drift in a search hit is the
+    # same misleading-position class as a mis-drawn primer.
+    if len(s) != len(seq or ""):
+        raise ValueError(
+            "search haystack changed length under normalisation "
+            "(stray whitespace / digits / FASTA header?) — match "
+            "coordinates would not line up with the sequence"
+        )
+    n = len(s)
+    m = len(q)
+    if m == 0 or n == 0 or m > n:
+        return []
+    # k >= m makes every window a "match"; clamp so the budget is
+    # meaningful and the early-exit still bounds work.
+    k = min(int(max_mismatches), m)
+    iupac_ok = _iupac_compatible
+
+    def _scan(pattern: str, strand: str, out: "list[dict]") -> None:
+        # Origin-wrapping windows for circular records: a start at p in
+        # [0, n) covers [p, p+m), reading across the origin via the
+        # appended head. Linear records stop at n-m.
+        scan_text = (s + s[: m - 1]) if circular else s
+        last_start = (n - 1) if circular else (n - m)
+        for p in range(0, last_start + 1):
+            mm = 0
+            ok = True
+            for i in range(m):
+                if not iupac_ok(pattern[i], scan_text[p + i]):
+                    mm += 1
+                    if mm > k:
+                        ok = False
+                        break
+            if ok:
+                out.append({
+                    "start": p,
+                    "end": p + m,
+                    "strand": strand,
+                    "mismatches": mm,
+                })
+                if len(out) >= max_hits:
+                    return
+
+    hits: "list[dict]" = []
+    _scan(q, "+", hits)
+    if both_strands and len(hits) < max_hits:
+        rc = _rc(q)
+        # A fully palindromic query (rc == q) would duplicate every
+        # forward hit on the reverse pass — skip it.
+        if rc != q:
+            _scan(rc, "-", hits)
+
+    # De-dup: a '+' and '-' hit on the SAME span (semi-palindromic
+    # window) collapse to the '+' entry so find-next doesn't visit the
+    # same bp twice.
+    seen: "dict[tuple, dict]" = {}
+    for h in hits:
+        key = (h["start"], h["end"])
+        prev = seen.get(key)
+        if prev is None or (prev["strand"] == "-" and h["strand"] == "+"):
+            seen[key] = h
+    deduped = list(seen.values())
+    deduped.sort(
+        key=lambda h: (h["start"], 0 if h["strand"] == "+" else 1,
+                       h["mismatches"]),
+    )
+    return deduped[:max_hits]
+
+
+def _circ_slice(seq: str, start: int, length: int, total: int) -> str:
+    """`length` bases of `seq` starting at `start` (taken mod `total`),
+    wrapping the origin as needed. `start` may be negative or >= total.
+    Returns "" on degenerate input."""
+    if total <= 0 or length <= 0 or not seq:
+        return ""
+    start %= total
+    if start + length <= total:
+        return seq[start:start + length]
+    out = seq[start:]
+    need = length - len(out)
+    # Primers are short (<= _PCR_MAX_PRIMER_LEN) and the template is >= the
+    # primer length at every call site, so this wraps at most once for real
+    # inputs; the loop is belt-and-suspenders for a length > total.
+    while need > 0:
+        chunk = seq[:need]
+        if not chunk:
+            break
+        out += chunk
+        need -= len(chunk)
+    return out[:length]
