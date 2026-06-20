@@ -14,6 +14,12 @@
 
 ---
 
+## [1.0.86] — 2026-06-19
+
+### Under the hood
+
+- **A lot more of the codebase moved into separately-loadable modules.** Continuing the v1.0.85 reorganization: how plasmids, collections, primers, settings and the rest are loaded and saved (the data-access layer), GenBank file reading/writing, the cloning/construction simulation, around 60 dialog windows, and the structured-logging helpers now each live in their own focused module that the main program imports — the single giant file shrank by roughly 14,000 lines. As before, this is a **maintainability and AI-assistability change only: nothing about how SpliceCraft behaves changes.** Every feature, keyboard shortcut, saved-file format, and the agent API are byte-for-byte identical — locked down by the public-surface snapshot test — and the write-guard that protects your saved library is untouched throughout.
+
 ## [1.0.85] — 2026-06-18
 
 ### Under the hood

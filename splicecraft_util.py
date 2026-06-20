@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import functools as _functools
+from typing import Any as _Any
 from pathlib import Path
 
 from splicecraft_logging import _log, _log_event

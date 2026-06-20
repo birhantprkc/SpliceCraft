@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import threading
+from typing import Callable as _Callable
 from contextlib import contextmanager
 from datetime import datetime as _datetime
 from pathlib import Path

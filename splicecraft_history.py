@@ -12,7 +12,6 @@ serialise these trees stay in the hub (they couple to file I/O).
 from __future__ import annotations
 
 from rich.text import Text
-from rich.table import Table
 
 import re
 

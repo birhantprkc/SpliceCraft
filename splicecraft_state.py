@@ -26,6 +26,8 @@ from any layer.
 from __future__ import annotations
 
 import threading
+from pathlib import Path
+from typing import Any as _Any, Callable as _Callable
 
 # ── Render tier ──────────────────────────────────────────────────────────────
 # Set by `_select_render_tier()` / `_set_ascii_mode()` in splicecraft.py; read
@@ -124,7 +126,34 @@ _SAVES_AUTHORIZED_REASON: str = ""
 # The resolved user-data dir. COMPUTED by the hub at import time
 # (`_state._DATA_DIR = _user_data_dir()`); placeholder here so readers + the
 # conftest sandbox patch resolve it. Everything path-related hangs off this.
-_DATA_DIR: "Path | None" = None
+_DATA_DIR: Path = None  # type: ignore[assignment]
+
+# ── Per-file data paths (Phase B-prep) — the hub sets the real `_DATA_DIR/...`
+# values at import; declared here (typed Path) so every `_state._X_FILE` reader
+# type-checks and pyright knows the attribute. Placeholder None until the hub runs.
+_AGENT_TOKEN_FILE: Path = None  # type: ignore[assignment]
+_CODON_TABLES_FILE: Path = None  # type: ignore[assignment]
+_COLLECTIONS_FILE: Path = None  # type: ignore[assignment]
+_CUSTOM_ENZYMES_FILE: Path = None  # type: ignore[assignment]
+_DATA_VERSION_FILE: Path = None  # type: ignore[assignment]
+_ENTRY_VECTORS_FILE: Path = None  # type: ignore[assignment]
+_ENZYME_COLLECTIONS_FILE: Path = None  # type: ignore[assignment]
+_EXPERIMENT_PROJECTS_FILE: Path = None  # type: ignore[assignment]
+_EXPERIMENTS_FILE: Path = None  # type: ignore[assignment]
+_FEATURE_COLORS_FILE: Path = None  # type: ignore[assignment]
+_FEATURES_FILE: Path = None  # type: ignore[assignment]
+_GELS_FILE: Path = None  # type: ignore[assignment]
+_GRAMMARS_FILE: Path = None  # type: ignore[assignment]
+_HMM_DB_CATALOG_FILE: Path = None  # type: ignore[assignment]
+_LIBRARY_FILE: Path = None  # type: ignore[assignment]
+_PARTS_BIN_COLLECTIONS_FILE: Path = None  # type: ignore[assignment]
+_PARTS_BIN_FILE: Path = None  # type: ignore[assignment]
+_PRIMER_COLLECTIONS_FILE: Path = None  # type: ignore[assignment]
+_PRIMERS_FILE: Path = None  # type: ignore[assignment]
+_PROTEIN_COLLECTIONS_FILE: Path = None  # type: ignore[assignment]
+_PROTEIN_MOTIFS_FILE: Path = None  # type: ignore[assignment]
+_SETTINGS_FILE: Path = None  # type: ignore[assignment]
+_sc_version: str = ""  # set by the hub from __version__ (splicecraft_record stamp)
 
 
 # ── Persistence-engine config (Phase B-main) ───────────────────────

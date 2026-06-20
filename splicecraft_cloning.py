@@ -10,7 +10,6 @@ the hub so every call site resolves unchanged.
 """
 from __future__ import annotations
 
-import re
 
 from splicecraft_biology import _rc
 from splicecraft_dataaccess import (

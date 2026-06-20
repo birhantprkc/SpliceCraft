@@ -117,6 +117,7 @@ def _plant_everything():
     # the test is stronger with content).
     for attr in sc._USER_DATA_DIR_ATTRS:
         d = sc._resolve_state_or_hub(attr)
+        assert d is not None, f"{attr} unresolved"   # all dir attrs are set by import
         d.mkdir(parents=True, exist_ok=True)
         (d / "marker.txt").write_text("PLANTED")
         paths.append(d / "marker.txt")

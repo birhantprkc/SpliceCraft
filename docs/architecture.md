@@ -5,20 +5,27 @@ How SpliceCraft is organized, why, and how to navigate it.
 ## Hub + layered siblings
 
 SpliceCraft began as a single-file app and is now a **hub + layered-siblings**
-layout on Textual + Biopython. `splicecraft.py` is the ~130k-line **hub**
-(`PlasmidApp`, the persistence/data-safety core, CLI, agent-API, screens, most
-modals — the deeply-coupled application core, deliberately kept together;
-extracting it would cascade into the data-safety core). The cleanly-separable
-layers live in flat `splicecraft_*.py` siblings the hub imports and re-exports:
-`splicecraft_biology`, `splicecraft_state`, `splicecraft_logging`,
+layout on Textual + Biopython. `splicecraft.py` is the ~117k-line **hub**
+(`PlasmidApp`, the data-safety POLICY, the `.dna` blob store, CLI, agent-API,
+screens, and the app-coupled modals/widgets — the deeply-coupled application
+core, deliberately kept together; extracting `PlasmidApp` + its three main panels
+would cascade into the data-safety core). The cleanly-separable layers live in
+flat `splicecraft_*.py` siblings the hub imports and re-exports:
+`splicecraft_biology`, `splicecraft_state`, `splicecraft_logging` (`_log` /
+`_log_event` + the `_action_log` / `_timed` decorators),
 `splicecraft_persistence` (the domain-agnostic save/load engine + data-safety
-chokepoint), `splicecraft_render`, `splicecraft_history`, `splicecraft_widgets`,
-`splicecraft_errors` (plus the stdlib-only `splicecraft_cli` sidecar and
-`splicecraft_demo_plasmids` seed).
+chokepoint), `splicecraft_dataaccess` (every domain `_load_X`/`_save_X` accessor
++ grammar/enzyme data; the migrations/mirrors stay hub-side via `_state` hooks),
+`splicecraft_record` (GenBank↔SeqRecord serialization), `splicecraft_util` (pure
+cross-cutting helpers), `splicecraft_cloning` (construction simulation),
+`splicecraft_render`, `splicecraft_history`, `splicecraft_widgets`,
+`splicecraft_modals` (60 dependency-clean dialog classes), `splicecraft_errors`
+(plus the stdlib-only `splicecraft_cli` sidecar and `splicecraft_demo_plasmids`
+seed).
 
 The hub stays greppable as one totally-ordered file; the siblings are bounded,
 independently-loadable units (the goal: a context-limited model can hold one
-whole). Siblings are layered L0→L3 with **no upward imports** and re-exported so
+whole). Siblings are layered L0→L4 with **no upward imports** and re-exported so
 `import splicecraft as sc; sc.<name>` resolves unchanged. Mutable-state siblings
 are accessed by attribute (`_state.X`) so hub, siblings, and tests share one
 copy — a by-value `from splicecraft_state import X` binds a stale copy and is
