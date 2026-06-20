@@ -291,6 +291,19 @@ def _scanner_hook_unregistered():
 
 _scan_catalog_hook: "_Callable[[], list]" = _scanner_hook_unregistered
 _all_enzymes_hook: "_Callable[[], dict]" = _scanner_hook_unregistered
+# Resolver returning a CDS translation (single-letter AA string). The hub-side
+# `_translate_cds` selects its genetic-code table via `_codon_table_for` (in
+# splicecraft_codon, L2) AND has callers spread across the hub (ORF finder, CDS
+# display), so it stays hub-side; the QuikChange-scrub engine in splicecraft_primer
+# reaches it here. FAILS LOUD if unregistered — a silently-empty translation would
+# let a NON-synonymous "cure" slip past the scrub's protein-preservation guard
+# (silent-biology hazard). Registered during hub import, before any scrub runs.
+def _translate_cds_unregistered(*args, **kwargs) -> str:
+    raise RuntimeError(
+        "translate-CDS _state hook called before the hub registered it")
+
+
+_translate_cds_hook: "_Callable[..., str]" = _translate_cds_unregistered
 # Resolver returning the active primer-collection NAME (stored in settings, read
 # hub-side via `_get_setting`). The sibling's `_sync_active_primer_collection_primers`
 # mirror needs it but must not pull the settings layer in, so the hub registers

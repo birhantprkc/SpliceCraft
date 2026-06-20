@@ -1,18 +1,42 @@
-"""splicecraft_primer — primer / mutagenesis design (Phase D, layer L1).
+"""splicecraft_primer — primer / mutagenesis design (Phase D, layer L2).
 
-The start of the primer subsystem, extracted from the hub. Seeded with the PURE
-site-directed-mutagenesis core: the _MUT_* E. coli codon-usage data, the
-biophysics math (_mut_tm / _mut_hairpin_dg / _mut_homodimer_dg / _mut_gc_pct /
-_mut_ends_gc, via primer3 thermodynamics), the mutation parse/translate, and the
-constant-outer annealing-primer design. PURE — no record/UI/I-O coupling, deps =
-biology._mut_revcomp + logging only.
+The primer subsystem, extracted from the hub. Holds the PURE, app-free core:
 
-CATASTROPHIC-CLASS subsystem (project_primer_design_catastrophic): primers must
-BIND + DISPLAY exactly where they anneal. Guarded by test_mutagenize. The
-record-coupled design orchestration (_mut_design_inner/_modified_outer/_extract_cds),
-the UI preview/cursor, and the binding/display (_primer_binding_sites /
-_rederive_primer_binding / _paint_primer_*) stay hub-side for a dedicated effort.
-Re-exported by the hub so sc.<name> + every call site resolves unchanged.
+  * Site-directed mutagenesis: the _MUT_* E. coli codon-usage data, the
+    biophysics math (_mut_tm / _mut_hairpin_dg / _mut_homodimer_dg / _mut_gc_pct /
+    _mut_ends_gc, via primer3 thermodynamics), mutation parse/translate, the
+    constant-outer annealing design (_mut_design_outer/_fwd_anneal/_rev_anneal),
+    and the record-region INNER design (_mut_design_inner / _mut_design_modified_outer
+    / _mut_extract_cds) that picks the mutant codon from the usage map.
+  * Binding / display rederivation — the catastrophic core: _rederive_primer_binding
+    (longest 3'-anchored match wins; origin-rotation invariant) + _primer_binding_sites
+    (origin-wrap-aware site scan) + _primer_check_confidence.
+  * Generic primer designers: _primer_tm / _pick_binding_region / _binding_max_len /
+    _design_detection_primers / _design_cloning_primers(_raw) / _design_generic_primers.
+  * QuikChange-scrub engine [INV-97] (clone-free restriction-site removal): the
+    planner (_scrub_design + its _scrub_* helpers) that finds the minimal SILENT
+    substitutions destroying each site, and the improved-QuikChange primer designer
+    (_scrub_qc_primers / _scrub_qc_verify). Reaches its two hub-pinned deps via
+    _state hooks — _all_enzymes_hook (custom-enzyme catalog) and _translate_cds_hook
+    (the canonical translator; stays hub-side for its genetic-code-table dep).
+
+Deps are siblings ≤ L2 only: biology L0 (_rc/_circ_slice/_iupac_compatible/_iupac_pattern/
+_scan_restriction_sites/_forbidden_hit_set/_mut_revcomp/_slice_circular), util L0
+(_normalize_dna_for_align), logging L0, and codon L2 (_codon_build_aa_map — the
+mutant-codon pick, the single cross-subsystem dep and why this sibling is L2; codon
+does not import primer, so no cycle). NO record / dataaccess / UI coupling — the two
+hub-pinned biology deps come through _state hooks, not imports.
+
+CATASTROPHIC-CLASS subsystem (project_primer_design_catastrophic): primers must BIND
++ DISPLAY exactly where they anneal, and a scrub must never silently change a protein
+or leave a site behind. Guarded by test_mutagenize + test_scrub +
+test_primer_binding_rotation (origin-rotation golden on a real plasmid). What STAYS
+hub-side: the grammar-coupled orchestrators (_design_gb_primers, _design_operon_soe_primers),
+the Golden-Braid scrub (_scrub_gb_* — needs real digest+ligate assembly = cloning L3),
+the primer-usage index + collection cache (_primer_usage_*, _primer_collection_name_taken),
+the UI cursor/preview (_mut_next_cursor, _paint_primer_*) — all anchored on the
+PlasmidApp God-class, the dataaccess save layer, or an above-L2 sibling. Re-exported by
+the hub so sc.<name> + every call site resolves unchanged.
 """
 from __future__ import annotations
 
@@ -23,7 +47,8 @@ import splicecraft_state as _state
 from splicecraft_logging import _log, _timed
 from splicecraft_util import _normalize_dna_for_align
 from splicecraft_biology import (
-    _circ_slice, _iupac_compatible, _mut_revcomp, _rc, _search_subsequence,
+    _circ_slice, _forbidden_hit_set, _iupac_compatible, _iupac_pattern,
+    _mut_revcomp, _rc, _scan_restriction_sites, _search_subsequence,
     _slice_circular,
 )
 # The mutagenesis-inner design picks the mutant codon via the codon-usage map —
@@ -1007,3 +1032,688 @@ def _mut_extract_cds(full_seq: str, start: int, end: int, strand: int) -> str:
     if strand == -1:
         sub = _mut_revcomp(sub)
     return sub
+
+
+# ═══ QuikChange-scrub engine (moved from the hub) ══════════════════════════
+# Clone-free restriction-site removal: the planner (_scrub_design + helpers)
+# and the improved-QuikChange primer designer (_scrub_qc_*). Reaches the two
+# hub-pinned deps via _state hooks (_all_enzymes_hook / _translate_cds_hook).
+
+# ── Scrub: clone-free restriction-site removal (improved QuikChange) ────────
+#
+# "Scrub" cures a plasmid of chosen restriction recognition sites by
+# introducing the MINIMAL set of point substitutions that destroy each
+# site WITHOUT (a) changing any overlapping CDS's protein (synonymous /
+# silent), (b) creating a NEW copy of any forbidden site anywhere, or
+# (c) — softly — touching annotated non-coding elements when avoidable.
+# The result is a single contiguous circular sequence the user makes in
+# the lab by improved-QuikChange whole-plasmid PCR + self-recircularization
+# (DpnI, transform — no ligase, no fragment assembly). See docs/invariants
+# [INV-97] and the MutagenizeModal "Scrub" tab.
+#
+# Why it leans on the hardened primitives instead of rolling its own:
+#   * Site enumeration AND the final "did I introduce a new site?" guard go
+#     through `_scan_restriction_sites(circular=True)`, so origin-spanning
+#     sites (sacred inv #6) and reverse-strand coords (sacred inv #2) are
+#     handled by code that already has tests.
+#   * Synonymy is verified by RE-TRANSLATING every overlapping CDS with
+#     `_translate_cds` (the canonical translator) rather than hand-mapping
+#     codons — wrap, reverse strand, /codon_start and /transl_table all come
+#     out right for free, including a site straddling TWO CDSes on opposite
+#     strands (both frames must stay synonymous or the change is rejected).
+#   * Every cure is a 1-base→1-base SUBSTITUTION, so the cured sequence is
+#     the SAME LENGTH and feature coordinates never shift — the caller can
+#     swap `record.seq` and keep features verbatim (no `_rebuild_record_
+#     with_edit`, no coordinate migration).
+
+# Marquee use case is clone-free MoClo / Golden Braid domestication, so the
+# default target set is the Type IIS cutters assembly can't tolerate inside a
+# part. Esp3I covers its isoschizomer BsmBI (same CGTCTC site).
+_SCRUB_DEFAULT_ENZYMES: "tuple[str, ...]" = ("BsaI", "Esp3I", "BbsI")
+# Edits within this many bp share a single QuikChange primer pair (one PCR
+# round); edits farther apart need separate sequential rounds.
+_SCRUB_PRIMER_FOOTPRINT = 30
+# Cap on substitutions tried to kill one site. A 6-cutter almost always dies
+# to a single change; 3 covers a constrained CDS where the obvious wobble
+# base isn't free. Beyond this we report the site as un-scrubbable rather
+# than mangling a long stretch.
+_SCRUB_MAX_CHANGES = 3
+
+
+def _circ_window(seq: str, start: int, length: int, n: int) -> str:
+    """Return `length` bases of `seq` starting at forward coord `start`,
+    wrapping the origin when `start + length > n` (`n == len(seq)`)."""
+    end = start + length
+    if end <= n:
+        return seq[start:end]
+    return seq[start:] + seq[:end - n]
+
+
+def _scrub_pos_in_feat(g: int, s: int, e: int) -> bool:
+    """Wrap-aware membership: is genome coord `g` inside span `[s, e)`
+    (where `e < s` signals an origin wrap)? Module-level mirror of
+    `PlasmidMap._bp_in` for the Scrub path."""
+    if e >= s:
+        return s <= g < e
+    return g >= s or g < e
+
+
+def _scrub_is_transition(a: str, b: str) -> bool:
+    """A↔G / C↔T are transitions; the other four swaps are transversions.
+    Used only as a tie-break — transitions are the milder substitution."""
+    return {a, b} in ({"A", "G"}, {"C", "T"})
+
+
+def _scrub_resolve_sites(enzymes) -> "dict[str, str]":
+    """Resolve enzyme names → forward recognition sites from the merged
+    built-in + custom catalog. Unknown names and non-IUPAC sites are
+    skipped (one bad custom enzyme never aborts the whole scrub)."""
+    enz = _state._all_enzymes_hook()
+    out: "dict[str, str]" = {}
+    for nm in enzymes or ():
+        info = enz.get(str(nm))
+        if not info:
+            continue
+        site = str(info[0] or "").upper()
+        if not site:
+            continue
+        try:
+            _iupac_pattern(site)
+        except ValueError:
+            continue
+        out[str(nm)] = site
+    return out
+
+
+def _scrub_expand_forbidden(forward: "dict[str, str]") -> "tuple[str, ...]":
+    """Forward sites + their reverse complements (deduped) as the flat
+    tuple `_forbidden_hit_set` consumes — so the 'no new site' guard vetoes
+    a swap that would spawn a forbidden site on EITHER strand."""
+    out: "list[str]" = []
+    for site in forward.values():
+        if site not in out:
+            out.append(site)
+        rc = _rc(site)
+        if rc not in out:
+            out.append(rc)
+    return tuple(out)
+
+
+def _scrub_scan_targets(seq: str, allowed: "frozenset[str]",
+                        circular: bool) -> "list[dict]":
+    """One entry per recognition-site INSTANCE of the allowed enzymes:
+    `{enzyme, strand, rec_start, rec_end, positions}` where `positions` is
+    the wrap-aware list of genome coords the recognition covers. Counts
+    only LABELED resite pieces (sacred inv #6 — a wrap hit's unlabeled
+    head piece is a continuation, not a second site)."""
+    n = len(seq)
+    hits = _scan_restriction_sites(
+        seq, min_recognition_len=1, unique_only=False,
+        circular=circular, allowed_enzymes=allowed)
+    out: "list[dict]" = []
+    for h in hits:
+        if h.get("type") != "resite" or not h.get("label"):
+            continue
+        rs = h.get("rec_start", h["start"])
+        re_ = h.get("rec_end", h["end"])
+        if re_ < rs:                      # origin wrap
+            positions = list(range(rs, n)) + list(range(0, re_))
+        else:
+            positions = list(range(rs, re_))
+        if not positions:
+            continue
+        out.append({
+            "enzyme": h["label"], "strand": h.get("strand", 1),
+            "rec_start": rs, "rec_end": re_, "positions": positions,
+        })
+    out.sort(key=lambda t: (t["rec_start"], t["enzyme"], t["strand"]))
+    return out
+
+
+def _scrub_overlapping_feats(target: dict, feats: list) -> tuple:
+    """Split `feats` into (cds_feats, other_feats) that overlap the target
+    recognition window. Only 'CDS' constrains synonymy; everything else
+    (gene/promoter/RBS/rep_origin/…) is 'annotated non-coding' and only
+    earns a soft penalty for being touched."""
+    posset = set(target["positions"])
+    cds: list = []
+    other: list = []
+    for f in feats:
+        s = f.get("start")
+        e = f.get("end")
+        if s is None or e is None:
+            continue
+        if not any(_scrub_pos_in_feat(g, s, e) for g in posset):
+            continue
+        if f.get("type") == "CDS":
+            cds.append(f)
+        else:
+            other.append(f)
+    return cds, other
+
+
+def _scrub_region_label(cds_feats: list, other_feats: list) -> str:
+    """Human label for where a site sits, for the preview table."""
+    if cds_feats:
+        names = ", ".join(str(f.get("label") or "CDS") for f in cds_feats)
+        return f"CDS: {names}"
+    if other_feats:
+        names = ", ".join(str(f.get("label") or f.get("type") or "?")
+                          for f in other_feats)
+        return f"non-coding (in {names})"
+    return "non-coding"
+
+
+def _scrub_cds_protein(seq: str, f: dict) -> str:
+    """Translate one CDS feature dict on `seq` via the canonical translator,
+    honouring wrap / strand / _exons / codon_start / transl_table."""
+    return _state._translate_cds_hook(
+        seq,
+        f.get("_orig_start", f["start"]),
+        f.get("_orig_end", f["end"]),
+        f.get("strand", 1),
+        f.get("_exons"),
+        int(f.get("codon_start", 1) or 1),
+        int(f.get("transl_table", 1) or 1),
+    )
+
+
+def _scrub_introduces_site(orig: str, test: str, target: dict,
+                           all_forbidden: "tuple[str, ...]", n: int) -> bool:
+    """True if `test` has a forbidden site near the edit that `orig` didn't.
+
+    A substitution can only create a new site within (L-1) bp of a changed
+    base (L = longest forbidden site), so a padded circular window around
+    the recognition covers every site this change could spawn — comparing
+    before/after hit sets on that SAME window is wrap-safe (a site present
+    at the window's own boundary in both is not 'new'). The caller's final
+    full re-scan is the authoritative whole-plasmid guard; this is the fast
+    per-candidate pre-filter so we PICK a clean candidate."""
+    L = max((len(s) for s in all_forbidden), default=8)
+    pad = max(L - 1, 1)
+    win_len = len(target["positions"]) + 2 * pad
+    if win_len >= n:                       # tiny plasmid — scan it all
+        a = orig + orig[:L - 1]
+        b = test + test[:L - 1]
+    else:
+        start = (target["rec_start"] - pad) % n
+        a = _circ_window(orig, start, win_len, n)
+        b = _circ_window(test, start, win_len, n)
+    return bool(_forbidden_hit_set(b, all_forbidden)
+                - _forbidden_hit_set(a, all_forbidden))
+
+
+def _scrub_cds_reading_positions(f: dict, n: int) -> tuple:
+    """Genome positions of a CDS feature in 5'→3' CODING order (after the
+    ``/codon_start`` offset), plus its strand. Codon ``i`` is positions
+    ``[3i:3i+3]``; on the reverse strand the coding base at each position is
+    the complement of the top strand. Mirrors the slice logic in
+    `_cds_aa_list` / `_translate_cds` so frequency look-ups land on exactly
+    the codons the synonymy check translates."""
+    s = f.get("_orig_start", f["start"])
+    e = f.get("_orig_end", f["end"])
+    strand = f.get("strand", 1)
+    exons = f.get("_exons")
+    cs = max(0, min(2, int(f.get("codon_start", 1) or 1) - 1))
+    if exons:
+        gpos: list = []
+        for xs, xe in exons:
+            gpos.extend(range(xs, xe))
+    elif e < s:                              # origin wrap
+        gpos = list(range(s, n)) + list(range(0, e))
+    else:
+        gpos = list(range(s, e))
+    if strand == -1:
+        gpos = gpos[::-1]
+    return gpos[cs:], strand
+
+
+def _scrub_one_site(seq: str, target: dict, feats: list,
+                    forward: "dict[str, str]",
+                    all_forbidden: "tuple[str, ...]", n: int, *,
+                    codon_frac: "dict | None" = None,
+                    max_changes: int = _SCRUB_MAX_CHANGES) -> tuple:
+    """Find the minimal substitution set that destroys ONE site instance.
+
+    Returns `(changes, region, None)` where `changes = {genome_pos:
+    new_base}`, or `(None, region, reason)` when the site can't be cured
+    silently. A candidate is accepted only if it (1) destroys this
+    instance, (3) leaves every overlapping CDS's protein unchanged, and
+    (2) introduces no new forbidden site near the edit. Among the accepted,
+    the score prefers: fewest changes → not touching annotated bases →
+    (when `codon_frac` is given) the host-frequent synonymous codon →
+    transitions over transversions → GC-neutral → lexicographic
+    (deterministic, so the same plasmid always cures the same way).
+
+    `codon_frac` (``{codon: usage_fraction}``) is a TIE-BREAK ONLY: synonymy
+    is already guaranteed by check (3), so even a wrong frame map could only
+    pick a less-preferred — never a non-silent — cure."""
+    from itertools import combinations, product
+    positions = target["positions"]
+    site_len = len(positions)
+    cds_feats, other_feats = _scrub_overlapping_feats(target, feats)
+    region = _scrub_region_label(cds_feats, other_feats)
+    orig_aa = [_scrub_cds_protein(seq, f) for f in cds_feats]
+    annotated: set = set()
+    for f in other_feats:
+        s = f.get("start")
+        e = f.get("end")
+        for g in positions:
+            if _scrub_pos_in_feat(g, s, e):
+                annotated.add(g)
+    # Reading-frame maps for overlapping CDSes, so a coding cure can prefer
+    # the host-frequent synonymous codon. Built once per site (not per
+    # candidate). Skipped entirely when no codon table was supplied.
+    cds_frames: list = []
+    if codon_frac:
+        for f in cds_feats:
+            gpos, st = _scrub_cds_reading_positions(f, n)
+            cds_frames.append((gpos, st, {g: j for j, g in enumerate(gpos)}))
+    fwd_site = forward[target["enzyme"]]
+    pat_f = _iupac_pattern(fwd_site)
+    pat_r = _iupac_pattern(_rc(fwd_site))
+    best: "tuple | None" = None
+    for k in range(1, max_changes + 1):
+        for combo in combinations(positions, k):
+            # Each chosen position is forced to a DIFFERENT base, so every
+            # candidate makes exactly `k` real changes (no silent no-ops).
+            alts = [[b for b in "ACGT" if b != seq[g]] for g in combo]
+            for repl in product(*alts):
+                tl = list(seq)
+                for j, g in enumerate(combo):
+                    tl[g] = repl[j]
+                test = "".join(tl)
+                # (1) this instance must be gone (check the exact window,
+                #     both strands so a reverse-strand hit is covered).
+                win = _circ_window(test, target["rec_start"], site_len, n)
+                if pat_f.fullmatch(win) or pat_r.fullmatch(win):
+                    continue
+                # (3) synonymous in every overlapping CDS frame.
+                if any(_scrub_cds_protein(test, f) != orig_aa[i]
+                       for i, f in enumerate(cds_feats)):
+                    continue
+                # (2) no NEW forbidden site near the edit.
+                if _scrub_introduces_site(seq, test, target,
+                                          all_forbidden, n):
+                    continue
+                # Codon-usage preference: total fraction of the resulting
+                # codons at each changed coding position (higher = better).
+                freq = 0.0
+                for gpos, st, idx in cds_frames:
+                    for g in combo:
+                        jj = idx.get(g)
+                        if jj is None:
+                            continue
+                        trip = gpos[(jj // 3) * 3:(jj // 3) * 3 + 3]
+                        if len(trip) < 3:
+                            continue
+                        codon = ("".join(_rc(test[p]) for p in trip)
+                                 if st == -1 else
+                                 "".join(test[p] for p in trip))
+                        freq += (codon_frac or {}).get(codon, 0.0)
+                score = (
+                    k,
+                    sum(1 for g in combo if g in annotated),
+                    -round(freq, 6),
+                    sum(1 for j in range(k)
+                        if not _scrub_is_transition(seq[combo[j]], repl[j])),
+                    sum(1 for j in range(k)
+                        if (seq[combo[j]] in "GC") != (repl[j] in "GC")),
+                    repl,
+                )
+                if best is None or score < best[0]:
+                    best = (score, {combo[j]: repl[j] for j in range(k)})
+        if best is not None:        # found the minimal-k solution; stop
+            break
+    if best is None:
+        return None, region, ("no silent substitution removes this site "
+                              "without creating another")
+    return best[1], region, None
+
+
+def _scrub_cluster_edits(positions: list, n: int,
+                         footprint: int = _SCRUB_PRIMER_FOOTPRINT) -> list:
+    """Group edit positions into QuikChange rounds: consecutive positions
+    within `footprint` bp share one primer pair. Merges the first and last
+    clusters when they sit within `footprint` across the origin."""
+    if not positions:
+        return []
+    ps = sorted(set(positions))
+    clusters: "list[list[int]]" = [[ps[0]]]
+    for p in ps[1:]:
+        if p - clusters[-1][-1] <= footprint:
+            clusters[-1].append(p)
+        else:
+            clusters.append([p])
+    if len(clusters) > 1:
+        # Distance from the last cluster's tail, across the origin, to the
+        # first cluster's head.
+        if (clusters[0][0] + n) - clusters[-1][-1] <= footprint:
+            clusters[0] = clusters[-1] + clusters[0]
+            clusters.pop()
+    return clusters
+
+
+def _scrub_design(seq: str, feats: "list | None" = None,
+                  enzymes=None, *, circular: bool = True,
+                  codon_raw: "dict | None" = None) -> dict:
+    """Plan a clone-free scrub of `seq`. Returns a dict with the cured
+    sequence, the per-base edits, which sites were removed vs skipped, the
+    QuikChange round clustering, and any warnings. Pure biology — designs
+    no primers (see `_scrub_qc_primers`) and mutates nothing on disk.
+
+    `codon_raw` (an organism's ``{codon: (aa, count)}`` usage table) is an
+    optional preference: when a coding site has more than one silent cure,
+    the host-frequent synonymous codon wins. Omit it and ties fall back to
+    the deterministic transition/GC/lexicographic order."""
+    seq = (seq or "").upper()
+    n = len(seq)
+    forward = _scrub_resolve_sites(
+        enzymes if enzymes is not None else _SCRUB_DEFAULT_ENZYMES)
+    codon_frac: "dict | None" = None
+    if codon_raw:
+        try:
+            _, codon_frac = _codon_build_aa_map(codon_raw)
+        except Exception:
+            codon_frac = None
+    result: dict = {
+        "ok": True, "orig_seq": seq, "cured_seq": seq,
+        "enzymes": sorted(forward.keys()),
+        "edits": [], "sites_removed": [], "sites_skipped": [],
+        "clusters": [], "n_rounds": 0, "warnings": [],
+    }
+    if not seq:
+        result["warnings"].append("No sequence loaded.")
+        return result
+    if not forward:
+        result["warnings"].append("No valid enzymes selected to scrub.")
+        return result
+    allowed = frozenset(forward.keys())
+    all_forbidden = _scrub_expand_forbidden(forward)
+    feats = [f for f in (feats or [])
+             if f.get("start") is not None and f.get("end") is not None]
+
+    working = list(seq)
+    failed: set = set()
+    # Each successful cure removes >=1 target and (guard #2) adds none, so the
+    # target count strictly drops; failed targets are parked. The cap is a
+    # belt-and-braces backstop against a pathological cascade.
+    initial = _scrub_scan_targets(seq, allowed, circular)
+    max_iter = 2 * len(initial) + 8
+    it = 0
+    while it < max_iter:
+        it += 1
+        cur = "".join(working)
+        targets = [t for t in _scrub_scan_targets(cur, allowed, circular)
+                   if (t["enzyme"], t["rec_start"], t["strand"]) not in failed]
+        if not targets:
+            break
+        t = targets[0]
+        ident = (t["enzyme"], t["rec_start"], t["strand"])
+        changes, region, reason = _scrub_one_site(
+            cur, t, feats, forward, all_forbidden, n, codon_frac=codon_frac)
+        if changes is None:
+            result["sites_skipped"].append({
+                "enzyme": t["enzyme"], "pos": t["rec_start"],
+                "strand": t["strand"], "region": region, "reason": reason})
+            failed.add(ident)
+            continue
+        for g, nb in sorted(changes.items()):
+            result["edits"].append({
+                "pos": g, "frm": cur[g], "to": nb,
+                "region": region, "enzyme": t["enzyme"]})
+            working[g] = nb
+        result["sites_removed"].append({
+            "enzyme": t["enzyme"], "pos": t["rec_start"],
+            "strand": t["strand"], "region": region})
+
+    cured = "".join(working)
+
+    # Substitution-only invariant — should be impossible to violate, but a
+    # length drift would corrupt every downstream feature coordinate, so
+    # abort loudly rather than ship it.
+    if len(cured) != n:
+        _log.error("Scrub: length drift %d->%d — aborting cure", n, len(cured))
+        return {**result, "ok": False, "cured_seq": seq, "edits": [],
+                "sites_removed": [],
+                "warnings": result["warnings"] + ["Internal error: aborted "
+                "to protect sequence integrity."]}
+    result["cured_seq"] = cured
+
+    # Authoritative wrap-aware guard: by the loop's exit condition the only
+    # residual selected-enzyme sites are the ones we explicitly parked as
+    # failed. Anything else means a cure cascade re-formed or spawned a site
+    # — never observed (guard #2 forbids it), but if it ever happens we must
+    # NOT claim the plasmid is clean.
+    for t in _scrub_scan_targets(cured, allowed, circular):
+        ident = (t["enzyme"], t["rec_start"], t["strand"])
+        if ident in failed:
+            continue
+        _log.error("Scrub: unexpected residual %s at %d after cure pass",
+                   t["enzyme"], t["rec_start"])
+        result["sites_removed"] = [
+            r for r in result["sites_removed"]
+            if (r["enzyme"], r["pos"], r["strand"]) != ident]
+        result["sites_skipped"].append({
+            "enzyme": t["enzyme"], "pos": t["rec_start"],
+            "strand": t["strand"], "region": "?",
+            "reason": "could not be removed without side effects"})
+
+    clusters = _scrub_cluster_edits([e["pos"] for e in result["edits"]], n)
+    result["clusters"] = [{"positions": c} for c in clusters]
+    result["n_rounds"] = len(clusters)
+    if n > 8000:
+        result["warnings"].append(
+            f"Plasmid is {n:,} bp — whole-plasmid QuikChange amplifies "
+            "linearly and less efficiently above ~8 kb; use a long extension "
+            "time (~1 min/kb) and more template.")
+    return result
+
+
+# ── Scrub: improved-QuikChange whole-plasmid primer design ──────────────────
+#
+# Per scrubbed locus (cluster of nearby cures), design ONE partial-overlap
+# QuikChange primer pair (Liu & Naismith 2008) that amplifies the whole
+# cured plasmid: a shared central region carries the cure(s) with ~12 bp
+# correct flank each side, and each primer has a unique 3' extension (a
+# perfectly-matched anchor) so the pair doesn't fully self-prime (far less
+# primer-dimer than classic full-overlap QuikChange) while the products
+# still self-anneal into a nicked circle the cell seals after transform —
+# no ligase, no assembly. Primers are sliced from the CURED template, so
+# what we display IS what anneals on the product (primer design is
+# catastrophic-class — binding == display by construction). We compute Tm
+# on circular slices directly, so an origin-adjacent locus needs no Primer3
+# rotation ([PIT-06] is only for Primer3's linear placement engine).
+
+_SCRUB_QC_FLANK_RANGE = range(10, 19)    # correct bases each side of the cure
+_SCRUB_QC_EXT_RANGE   = range(8, 17)     # unique 3' anchor length (improved)
+_SCRUB_QC_LEN_MIN, _SCRUB_QC_LEN_MAX = 25, 48
+_SCRUB_QC_MIN_TEMPLATE = 60              # whole-plasmid PCR needs room
+_SCRUB_QC_TARGET_TM = 72.0              # NN target for the matched flanks
+
+
+def _circ_extract(seq: str, start: int, length: int, n: int) -> str:
+    """Extract `length` bases of `seq` from `start` (mod n), wrapping the
+    origin. `start` may be negative or >= n — it's normalized. Lets a
+    primer straddle the origin so an origin-adjacent cure is still primed
+    correctly without a Primer3 rotation."""
+    if n <= 0 or length <= 0:
+        return ""
+    start %= n
+    if start + length <= n:
+        return seq[start:start + length]
+    return "".join(seq[(start + i) % n] for i in range(length))
+
+
+def _scrub_cluster_span(positions: list, n: int) -> tuple:
+    """Smallest circular arc containing all `positions`: returns
+    `(start, end)` where `end < start` signals the arc wraps the origin.
+    Found as the complement of the largest inter-position gap."""
+    ps = sorted(set(positions))
+    if len(ps) == 1:
+        return ps[0], ps[0]
+    best_gap = -1
+    best_i = 0
+    for i in range(len(ps)):
+        gap = (ps[(i + 1) % len(ps)] - ps[i]) % n
+        if gap > best_gap:
+            best_gap = gap
+            best_i = i
+    return ps[(best_i + 1) % len(ps)], ps[best_i]
+
+
+def _scrub_qc_tm(primer: str, n_mismatch: int) -> float:
+    """Stratagene QuikChange Tm: 81.5 + 0.41·%GC − 675/N − %mismatch. Unlike
+    the nearest-neighbour `_mut_tm` (which assumes a perfectly-matched
+    primer), this folds in the internal cure mismatch that lowers the
+    first-cycle annealing temperature — so the reported number is the one
+    the QuikChange ≥78 °C guideline actually refers to."""
+    N = len(primer)
+    if N == 0:
+        return 0.0
+    return 81.5 + 0.41 * _mut_gc_pct(primer) - 675.0 / N \
+        - (n_mismatch / N) * 100.0
+
+
+def _scrub_qc_primers(cured_seq: str, positions: list, *,
+                      circular: bool = True, overlap: str = "improved",
+                      round_no: int = 1) -> dict:
+    """Design the improved-QuikChange primer pair for ONE cluster of cure
+    positions on `cured_seq`. `overlap` is "improved" (partial overlap,
+    default) or "classic" (full overlap). Returns a result dict with
+    fwd_seq/rev_seq + their template coords, Tm/GC, overlap length, mismatch
+    count and any warnings — or one carrying an `error` string when no
+    acceptable pair fits."""
+    n = len(cured_seq)
+    res: dict = {"round": round_no, "positions": sorted(positions),
+                 "warnings": []}
+    if n < _SCRUB_QC_MIN_TEMPLATE:
+        res["error"] = (f"Plasmid is only {n} bp — too small for "
+                        "whole-plasmid QuikChange.")
+        return res
+    if not positions:
+        res["error"] = "No cure positions in this round."
+        return res
+
+    start, end = _scrub_cluster_span(positions, n)
+    width = (end - start) % n          # 0 for a single-base cluster
+    ext_choices = [0] if overlap == "classic" else list(_SCRUB_QC_EXT_RANGE)
+    posset = set(positions)
+
+    def _count_mm(fp_start: int, fp_len: int) -> int:
+        return sum(1 for i in range(fp_len) if (fp_start + i) % n in posset)
+
+    # Winner stored as a positional tuple (not a dict) so each field keeps
+    # its own type — a heterogeneous dict would widen the int coords to
+    # `str | float` and trip the downstream int-typed helpers.
+    best_score: "float | None" = None
+    best: "tuple | None" = None
+    for flank in _SCRUB_QC_FLANK_RANGE:
+        ov_start = (start - flank) % n
+        ov_len = width + 1 + 2 * flank
+        for ext_f in ext_choices:
+            fwd_len = ov_len + ext_f
+            if not (_SCRUB_QC_LEN_MIN <= fwd_len <= _SCRUB_QC_LEN_MAX) \
+                    or fwd_len >= n:
+                continue
+            fwd = _circ_extract(cured_seq, ov_start, fwd_len, n)
+            gc_f = _mut_gc_pct(fwd)
+            if not (35 <= gc_f <= 68):
+                continue
+            tm_f = _mut_tm(fwd)
+            for ext_r in ext_choices:
+                rev_start = (start - flank - ext_r) % n
+                rev_len = ov_len + ext_r
+                if not (_SCRUB_QC_LEN_MIN <= rev_len <= _SCRUB_QC_LEN_MAX) \
+                        or rev_len >= n:
+                    continue
+                rev = _mut_revcomp(
+                    _circ_extract(cured_seq, rev_start, rev_len, n))
+                gc_r = _mut_gc_pct(rev)
+                if not (35 <= gc_r <= 68):
+                    continue
+                tm_r = _mut_tm(rev)
+                score = (
+                    abs(tm_f - _SCRUB_QC_TARGET_TM)
+                    + abs(tm_r - _SCRUB_QC_TARGET_TM)
+                    + (0 if _mut_ends_gc(fwd) else 6)
+                    + (0 if _mut_ends_gc(rev) else 6)
+                    + abs(gc_f - 50) * 0.1 + abs(gc_r - 50) * 0.1
+                    + abs(ov_len - 21) * 0.5
+                    + (fwd_len + rev_len) * 0.02
+                    + abs(tm_f - tm_r) * 0.5
+                )
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best = (fwd, rev, ov_start, fwd_len, rev_start, rev_len,
+                            tm_f, tm_r, gc_f, gc_r, ov_len)
+    if best is None:
+        res["error"] = ("No QuikChange primer pair met the length/GC "
+                        "constraints for this locus.")
+        return res
+
+    (fwd, rev, fwd_start, fwd_len, rev_start, rev_len,
+     tm_f, tm_r, gc_f, gc_r, ov_len) = best
+    mm_f = _count_mm(fwd_start, fwd_len)
+    mm_r = _count_mm(rev_start, rev_len)
+    hp = min(_mut_hairpin_dg(fwd), _mut_hairpin_dg(rev))
+    dim = max(_mut_homodimer_dg(fwd), _mut_homodimer_dg(rev))
+    res.update({
+        "fwd_seq": fwd, "rev_seq": rev,
+        "fwd_start": fwd_start, "fwd_len": fwd_len, "fwd_strand": 1,
+        "rev_start": rev_start, "rev_len": rev_len, "rev_strand": -1,
+        "fwd_tm": round(tm_f, 1), "rev_tm": round(tm_r, 1),
+        "fwd_tm_qc": round(_scrub_qc_tm(fwd, mm_f), 1),
+        "rev_tm_qc": round(_scrub_qc_tm(rev, mm_r), 1),
+        "fwd_gc": round(gc_f, 1), "rev_gc": round(gc_r, 1),
+        "overlap_len": ov_len, "n_mismatch": mm_f,
+        "hairpin_dg": round(hp, 1), "homodimer_dg": round(dim, 1),
+        "overlap_style": "classic" if overlap == "classic" else "improved",
+    })
+    if not _mut_ends_gc(fwd) or not _mut_ends_gc(rev):
+        res["warnings"].append("No 3' G/C clamp on a primer.")
+    if min(res["fwd_tm_qc"], res["rev_tm_qc"]) < 78:
+        res["warnings"].append(
+            f"QuikChange Tm below the 78 °C guideline "
+            f"(min {min(res['fwd_tm_qc'], res['rev_tm_qc'])} °C).")
+    if hp < -9000 or dim < -9000:
+        res["warnings"].append("Strong predicted hairpin/dimer.")
+    return res
+
+
+def _scrub_qc_verify(orig: str, cured: str, rounds: list, n: int) -> tuple:
+    """Prove the improved-QuikChange primers reconstitute the CURED plasmid
+    EXACTLY — the seamless-cure guarantee for the QuikChange route (the Golden
+    Braid route has `_scrub_gb_verify`).
+
+    The lab product: each primer anneals to the ORIGINAL template and is
+    extended around the whole plasmid; the product strand is the primer's own
+    bases over its footprint (the cure rides in the primer) + a faithful copy
+    of the template everywhere else; the two strands self-anneal through the
+    shared overlap into the cured nicked circle. So simulate it: start from
+    `orig`, lay every round's forward primer AND the top-strand bases of its
+    reverse primer onto their footprints, and the result MUST equal `cured`.
+    A cure that fell outside every primer's footprint would leave the original
+    base there → product != cured → caught. Returns `(ok, errors)`."""
+    if not orig or len(orig) != len(cured) or n <= 0:
+        return False, ["sequence / length mismatch"]
+    product = list(orig)
+    any_primer = False
+    for r in rounds:
+        if r.get("error"):
+            continue
+        any_primer = True
+        fwd = str(r.get("fwd_seq", ""))
+        fstart = int(r.get("fwd_start", 0))
+        for j, base in enumerate(fwd):
+            product[(fstart + j) % n] = base
+        rev_top = _mut_revcomp(str(r.get("rev_seq", "")))
+        rstart = int(r.get("rev_start", 0))
+        for j, base in enumerate(rev_top):
+            product[(rstart + j) % n] = base
+    if not any_primer:
+        return False, ["no usable primer rounds to verify"]
+    if "".join(product) != cured:
+        return False, ["QuikChange primers would not reconstitute the cured "
+                       "plasmid exactly — a cure fell outside primer reach"]
+    return True, []
