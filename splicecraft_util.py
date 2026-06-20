@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import functools as _functools
+from datetime import datetime as _datetime
 from typing import Any as _Any
 from pathlib import Path
 
@@ -978,3 +979,11 @@ def _esc_md(s: str) -> str:
     in this modal. Equivalent to `rich.markup.escape`."""
     from rich.markup import escape
     return escape(s)
+
+
+def _now_iso() -> str:
+    """ISO-8601 timestamp with local-timezone offset, e.g.
+    `2026-05-18T14:30:00-07:00`. Used for entry `created_at` /
+    `updated_at`. Timezone-aware so a user roaming across timezones
+    still gets unambiguous timestamps."""
+    return _datetime.now().astimezone().isoformat(timespec="seconds")
