@@ -344,3 +344,14 @@ _settings_schedule_flush_hook: "_Callable[[dict], None] | None" = None
 def _stamp_history_root_date_passthrough(hist_xml, date_str):
     return hist_xml
 _stamp_history_root_date_hook: "_Callable[..., object]" = _stamp_history_root_date_passthrough
+# network egress guard — the fileio NCBI fetchers (fetch_genbank/fetch_protein) call
+# the hub-side `_demo_block_network` SSRF/egress gate (it reads `_DEMO_MODE` + has 5
+# other hub callers, so it STAYS hub-side) through this hook. SECURITY: the default
+# FAILS CLOSED — if somehow unregistered it raises, so no outbound fetch can run
+# unguarded. The hub registers the real guard at import, before any fetch.
+def _demo_block_network_unregistered(label: str = "Network access") -> None:
+    raise RuntimeError(
+        "demo-mode network guard hook is not registered — refusing network "
+        "egress (fail-closed). The hub registers _demo_block_network at import."
+    )
+_demo_block_network_hook: "_Callable[..., None]" = _demo_block_network_unregistered

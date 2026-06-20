@@ -18,7 +18,7 @@ from datetime import date as _date
 from pathlib import Path
 
 import splicecraft_state as _state
-from splicecraft_logging import _log, _timed
+from splicecraft_logging import _log, _log_event, _timed
 from splicecraft_persistence import (
     _atomic_write_text, _fsync_parent_dir, _refuse_unauthorized_delete,
     _refuse_unauthorized_write, _safe_file_size_check,
@@ -3144,3 +3144,228 @@ def load_genbank(path: str):
                 path, exc,
             )
     return rec
+
+
+
+# ── NCBI Entrez fetch (Phase D, moved from hub) ─────────────────────────────
+# Network record fetch by accession (GenBank + protein). The web-demo egress
+# guard `_demo_block_network` STAYS hub-side (it reads _DEMO_MODE + has 5 other
+# callers); reached here via _state._demo_block_network_hook (fail-closed).
+# Entrez.tool stamps _state._sc_version (= hub __version__). Lazy Bio.Entrez/
+# SeqIO/socket/io inside the fns.
+_NCBI_TIMEOUT_S = 30   # cap long NCBI hangs; the UI worker can't otherwise cancel
+
+# Cap on the GenBank-text response size from `Entrez.efetch`. The record-list
+# API (`_NCBI_MAX_RESPONSE_BYTES = 4 MB`) is too tight for a real chromosome
+# accession (e.g. an E. coli genome serialises to ~10 MB of GB text).
+# 64 MB lets every legitimate plasmid / cosmid / BAC / small chromosome
+# through while refusing a multi-GB pathological response (compromised /
+# misconfigured server, MITM). Mirrors the `resp.read(MAX + 1)` + bail
+# pattern from invariant #20.
+_NCBI_GB_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+
+
+@_timed("op.fetch_genbank")
+def fetch_genbank(accession: str, email: str = "splicecraft@local"):
+    """Fetch a GenBank record by accession from NCBI Entrez. Returns SeqRecord.
+
+    Raises ValueError with a user-friendly message if NCBI returns no
+    records (obsolete accession), multiple records, or a response larger
+    than `_NCBI_GB_MAX_RESPONSE_BYTES`. A 30 s socket timeout is applied
+    so a silent network stall surfaces as an error instead of pinning
+    the worker thread forever; the size cap defends against a server
+    that is reachable but misbehaving (a fast 30 s of GB-text could
+    OOM the worker without it).
+    """
+    _state._demo_block_network_hook("NCBI fetch")
+    import io
+    import socket
+    import time as _time
+    from Bio import Entrez, SeqIO
+    Entrez.email = email
+    # Sweep #27: NCBI's E-utilities policy asks every caller to identify
+    # itself via `Entrez.tool` + `Entrez.email` so they can rate-limit
+    # and contact problem clients. Pre-sweep we set only `email`; NCBI
+    # could (and occasionally does) throttle or block unidentified
+    # traffic. `tool` is a free-form ASCII identifier — using
+    # `SpliceCraft/<version>` mirrors the User-Agent set on PyPI /
+    # Kazusa fetches and makes our traffic identifiable in NCBI logs.
+    Entrez.tool = f"SpliceCraft/{_state._sc_version}"
+    # Biopython's Entrez._open adds its OWN retry loop (max_tries=3,
+    # sleep_between_tries=15s) UNDER our 2-attempt loop below; left at the
+    # default a stalling server could burn ~2×(3×30s socket + 2×15s) ≈ 240s,
+    # not the ~60s our retry intends. We do our own retry, so cap Biopython
+    # at one try per efetch call.
+    Entrez.max_tries = 1
+    prev_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(_NCBI_TIMEOUT_S)
+    # One-retry pattern with 250 ms backoff to absorb transient
+    # NCBI flakes (rate-limited 429, brief gateway 502, etc.). Two
+    # attempts total — bounded by 2 × 30 s socket timeout + backoff.
+    raw: "bytes | str | None" = None
+    last_exc: "BaseException | None" = None
+    try:
+        for attempt in range(2):
+            try:
+                with Entrez.efetch(
+                    db="nucleotide", id=accession,
+                    rettype="gb", retmode="text"
+                ) as handle:
+                    raw = handle.read(_NCBI_GB_MAX_RESPONSE_BYTES + 1)
+                break
+            except (OSError, socket.timeout) as exc:
+                last_exc = exc
+                if attempt == 0:
+                    _log.debug(
+                        "NCBI fetch attempt 1 failed for %r (%s); retrying",
+                        accession, exc,
+                    )
+                    _log_event(
+                        "net.retry", endpoint="ncbi",
+                        accession=accession, attempt=1,
+                        exc_type=type(exc).__name__,
+                    )
+                    _time.sleep(0.25)
+                    continue
+                # Both attempts failed — re-raise so the caller's
+                # outer handler turns this into a user-facing error.
+                raise
+    finally:
+        socket.setdefaulttimeout(prev_timeout)
+    if raw is None:
+        # Defensive — if we got here without raw, something went
+        # wrong that the loop didn't catch. Fall back to last_exc.
+        raise last_exc if last_exc is not None else OSError(
+            f"NCBI fetch failed for {accession!r}"
+        )
+    # Entrez handles return either bytes or str depending on Biopython
+    # version; normalise to text for SeqIO.
+    if isinstance(raw, bytes):
+        raw_len = len(raw)
+        text = raw.decode("utf-8", errors="replace")
+    else:
+        raw_len = len(raw.encode("utf-8", errors="replace"))
+        text = raw
+    if raw_len > _NCBI_GB_MAX_RESPONSE_BYTES:
+        raise ValueError(
+            f"NCBI accession {accession!r} returned more than "
+            f"{_NCBI_GB_MAX_RESPONSE_BYTES // (1024 * 1024)} MB; refusing "
+            f"to load. If this is a legitimate large record, fetch via "
+            f"NCBI directly and use File > Open."
+        )
+    # An NCBI outage / rate-limit can return an HTML error page (or an
+    # eutils <ERROR> document) with a 200 status instead of GenBank text;
+    # SeqIO would then yield zero records and surface a cryptic "no
+    # records" message. Detect the markup up front and say what's wrong.
+    if text.lstrip()[:1] == "<":
+        raise ValueError(
+            f"NCBI returned an error page instead of a record for "
+            f"{accession!r} — the service may be down or rate-limiting. "
+            f"Wait a moment and try again."
+        )
+    records = list(SeqIO.parse(io.StringIO(text), "genbank"))
+    rec = _pick_single_record(records, f"NCBI accession {accession!r}")
+    # 2026-05-27 (audit-3 H4): verify the returned record actually
+    # matches the requested accession. NCBI occasionally redirects an
+    # obsolete accession to a different record; pre-fix we accepted
+    # whatever came back and stamped it with the requested id, so a
+    # user asking for L09137 could silently get a different plasmid.
+    # Match against the record's id + accessions list (versioned or
+    # not); fail loud on mismatch.
+    requested = (accession or "").strip().upper()
+    # Strip a `.N` version suffix from the user's request — accession
+    # comparison is version-agnostic by NCBI convention.
+    requested_base = requested.split(".", 1)[0] if requested else ""
+    returned_ids: "list[str]" = []
+    if rec.id and rec.id != "<unknown id>":
+        returned_ids.append(rec.id.upper())
+    for acc in (rec.annotations or {}).get("accessions") or []:
+        if isinstance(acc, str) and acc:
+            returned_ids.append(acc.upper())
+    returned_bases = {rid.split(".", 1)[0] for rid in returned_ids}
+    if (requested_base
+            and requested_base not in returned_bases
+            and requested not in {rid.upper() for rid in returned_ids}):
+        raise ValueError(
+            f"NCBI returned a record that doesn't match the requested "
+            f"accession {accession!r}: got id={rec.id!r}, "
+            f"accessions={(rec.annotations or {}).get('accessions') or []!r}. "
+            f"The accession may be obsolete or redirected — fetch the "
+            f"replacement directly from NCBI if intended."
+        )
+    return rec
+
+
+def fetch_protein(accession: str, email: str = "splicecraft@local"):
+    """Fetch a protein record by accession from NCBI Entrez (``db=protein``).
+    Returns ``(description, aa_sequence)`` — the FASTA header text and the
+    uppercase amino-acid sequence. Raises ValueError if NCBI returns no /
+    multiple records, an oversized or empty response, or a record that
+    doesn't match the requested accession. Mirrors `fetch_genbank`'s
+    30 s timeout, one-retry, and size-cap network hardening."""
+    import io
+    import socket
+    import time as _time
+    from Bio import Entrez, SeqIO
+    Entrez.email = email
+    Entrez.tool = f"SpliceCraft/{_state._sc_version}"
+    # Biopython's Entrez._open adds its OWN retry loop (max_tries=3,
+    # sleep_between_tries=15s) UNDER our 2-attempt loop below; left at the
+    # default a stalling server could burn ~2×(3×30s socket + 2×15s) ≈ 240s,
+    # not the ~60s our retry intends. We do our own retry, so cap Biopython
+    # at one try per efetch call.
+    Entrez.max_tries = 1
+    prev_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(_NCBI_TIMEOUT_S)
+    raw: "bytes | str | None" = None
+    last_exc: "BaseException | None" = None
+    try:
+        for attempt in range(2):
+            try:
+                with Entrez.efetch(
+                    db="protein", id=accession,
+                    rettype="fasta", retmode="text",
+                ) as handle:
+                    raw = handle.read(_NCBI_GB_MAX_RESPONSE_BYTES + 1)
+                break
+            except (OSError, socket.timeout) as exc:
+                last_exc = exc
+                if attempt == 0:
+                    _log.debug("NCBI protein fetch attempt 1 failed for %r "
+                               "(%s); retrying", accession, exc)
+                    _time.sleep(0.25)
+                    continue
+                raise
+    finally:
+        socket.setdefaulttimeout(prev_timeout)
+    if raw is None:
+        raise last_exc if last_exc is not None else OSError(
+            f"NCBI protein fetch failed for {accession!r}")
+    if isinstance(raw, bytes):
+        raw_len = len(raw)
+        text = raw.decode("utf-8", errors="replace")
+    else:
+        raw_len = len(raw.encode("utf-8", errors="replace"))
+        text = raw
+    if raw_len > _NCBI_GB_MAX_RESPONSE_BYTES:
+        raise ValueError(
+            f"NCBI protein {accession!r} returned more than "
+            f"{_NCBI_GB_MAX_RESPONSE_BYTES // (1024 * 1024)} MB; refusing "
+            f"to load.")
+    records = list(SeqIO.parse(io.StringIO(text), "fasta"))
+    rec = _pick_single_record(records, f"NCBI protein {accession!r}")
+    seq = str(rec.seq).strip().upper()
+    if not seq:
+        raise ValueError(
+            f"NCBI protein {accession!r} returned an empty sequence.")
+    # Accession-match guard (mirrors fetch_genbank's H4 check): the FASTA
+    # id should contain the requested accession (version-agnostic).
+    requested = (accession or "").strip().upper()
+    req_base = requested.split(".", 1)[0]
+    rid = (rec.id or "").upper()
+    if req_base and req_base not in rid and requested not in rid:
+        raise ValueError(
+            f"NCBI returned a protein that doesn't match the requested "
+            f"accession {accession!r}: got id={rec.id!r}. The accession may "
+            f"be obsolete or redirected.")
+    return (rec.description or rec.id or accession).strip(), seq
