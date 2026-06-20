@@ -2225,3 +2225,36 @@ def _digest_with_enzymes(seq: str, enzyme_names: list[str], *,
 # Future extractions are welcome but must pass the three-test rule
 # in CONTRIBUTING.md: no PlasmidApp coupling, reduces complexity at
 # the call site, every existing test passes unchanged.
+
+
+# ── Shared pure scan/revcomp helpers (relocated from hub for codon/primer) ──
+# IUPAC-aware forbidden-site scan + IUPAC reverse-complement. Pure (only
+# _iupac_pattern / _IUPAC_COMP); used by the codon optimizer, primer design,
+# and the scrub paths — an L0 biology home keeps them reachable from every
+# sibling without a codon/primer dependency.
+def _forbidden_hit_set(seq: str, patterns) -> set[tuple[str, int]]:
+    """Return ``{(pattern, position)}`` for every occurrence of every
+    pattern in *seq*.
+
+    IUPAC-aware (2026-05-30 hardening): a degenerate recognition site
+    (``GGWCC``, ``CCANNNNNNTGG``, ``RGATCY`` …) is matched against concrete
+    A/C/G/T via `_iupac_pattern`, not as a literal substring — so forbidding
+    a degenerate-site enzyme actually finds (and the caller removes) its real
+    sites instead of silently matching nothing. For an exact A/C/G/T site
+    this is identical to the previous `seq.find` scan. Overlapping
+    occurrences are reported via a zero-width lookahead (codon swaps are 3→3
+    bases, so positions stay stable, letting the caller compare before/after
+    hit sets directly). A pattern that isn't valid IUPAC is skipped."""
+    out: set[tuple[str, int]] = set()
+    for p in patterns:
+        try:
+            pat = _iupac_pattern(p)
+        except ValueError:
+            continue
+        for m in re.finditer(f"(?={pat.pattern})", seq):
+            out.add((p, m.start()))
+    return out
+
+
+def _mut_revcomp(seq: str) -> str:
+    return seq.upper().translate(_IUPAC_COMP)[::-1]
