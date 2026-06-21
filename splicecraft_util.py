@@ -1162,3 +1162,24 @@ def _is_windows_reserved_stem(name: str) -> bool:
     if not name:
         return False
     return name.split(".")[0].lower() in _WIN_RESERVED_FILENAMES
+
+
+def _strip_fasta_headers(text: str) -> str:
+    """Drop FASTA header lines (lines whose first non-whitespace char is
+    ``>``) so a paste of a ``>id\\nATG…`` blob becomes just the body.
+    Preserves the rest of the text — `_detect_query_program` then
+    handles whitespace + alphabet.
+
+    Tolerant to leading whitespace on the header so a copy-pasted
+    FASTA from a wrapped editor or e-mail still gets cleaned. A line
+    that's just ``>`` with nothing after it is also dropped (defends
+    against misformatted multi-FASTA pastes).
+    """
+    if ">" not in (text or ""):
+        return text or ""
+    out = []
+    for line in (text or "").splitlines():
+        if line.lstrip().startswith(">"):
+            continue
+        out.append(line)
+    return "\n".join(out)
