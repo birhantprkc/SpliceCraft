@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import subprocess
 import sys
-import tempfile
-from pathlib import Path
 
 import splicecraft as sc
 
@@ -108,6 +106,7 @@ class TestWebDemoLockdown:
         monkeypatch.setattr(sc, "_DEMO_MODE", "web")
         for fn, args in [
             (sc.fetch_genbank, ("L09137",)),
+            (sc.fetch_protein, ("P12345",)),
             (sc._fetch_latest_pypi_version_ex, ()),
             (sc._ncbi_taxid_search, ("coli",)),
             (sc._codon_fetch_kazusa, ("83333",)),

@@ -3303,7 +3303,8 @@ def fetch_protein(accession: str, email: str = "splicecraft@local"):
     uppercase amino-acid sequence. Raises ValueError if NCBI returns no /
     multiple records, an oversized or empty response, or a record that
     doesn't match the requested accession. Mirrors `fetch_genbank`'s
-    30 s timeout, one-retry, and size-cap network hardening."""
+    30 s timeout, one-retry, size-cap, AND demo-mode egress guard."""
+    _state._demo_block_network_hook("NCBI protein fetch")
     import io
     import socket
     import time as _time
