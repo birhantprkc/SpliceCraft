@@ -46,6 +46,14 @@ from splicecraft_search import (_delete_hmm_db_files, _hmm_db_acquire_download_s
 from splicecraft_seqanalysis import (_classify_part_from_plasmid, _find_orfs)
 from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
+from splicecraft_backup import (_PRE_UPDATE_NAME_RE, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
+from splicecraft_biology import (_scan_restriction_sites)
+from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _design_gb_primers)
+from splicecraft_dataaccess import (_active_enzyme_allowed_set, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
+from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, _export_gff_to_path, _extract_gbk_member)
+from splicecraft_gels import (_AGAROSE_CHOICES, _GEL_HEIGHT_MAX, _GEL_HEIGHT_MIN, _GEL_LANE_WIDTH_MAX, _GEL_LANE_WIDTH_MIN, _GEL_MAX_LANES, _agarose_mobility, _gel_bands_for_lane, _render_gel_image)
+from splicecraft_persistence import (_safe_save_json_mirror)
+from splicecraft_primer import (_design_cloning_primers_raw, _design_detection_primers)
 
 
 def _custom_enzyme_meta(name: str) -> "dict | None":
@@ -3211,3 +3219,1744 @@ def _h_clear_entry_vectors_for_grammar(app, payload):
         grammar=gid, n_cleared=n, via="agent",
     )
     return {"ok": True, "grammar_id": gid, "n_cleared": n}
+
+
+# Deferred data handlers (Phase D: relocated-blocker + hooked-engine endpoints)
+# Hard cap on per-side sequence length to keep DP memory bounded.
+# 200 kb on each side = ~80 GB if naive O(NM); Biopython's aligner is
+# smarter than that but we still don't want the user pasting a
+# chromosome.
+_PAIRWISE_MAX_LEN = 200_000
+
+
+# Output formats accepted by the bulk-export helper. Each maps to a
+# writer function + canonical extension. Keep in sync with the format
+# Select in `BulkExportCollectionModal` and the agent endpoint's
+# `format` validation.
+_BULK_EXPORT_FORMATS: dict = {
+    "genbank": ("gb",   "GenBank"),
+    "embl":    ("embl", "EMBL"),
+    "fasta":   ("fa",   "FASTA"),
+    "dna":     ("dna",  "CommercialSaaS .dna"),
+}
+
+
+# Module-level cache globals that hold cleared persisted state. Every
+# entry MUST exist as `_<name>_cache: ... | None = None` somewhere in
+# this module — `_perform_master_delete` looks them up by name and
+# resets to None so the next read re-loads from (now empty) disk.
+# Adding a new cache? Append it here AND to `_protect_user_data` in
+# tests/conftest.py.
+_MASTER_DELETE_CACHE_ATTRS: tuple = (
+    "_library_cache",
+    "_collections_cache",
+    "_parts_bin_cache",
+    "_parts_bin_collections_cache",
+    "_primers_cache",
+    "_primer_collections_cache",
+    "_primer_usage_cache",            # sweep #20: was missed, primer use-count map
+    "_features_cache",
+    "_feature_colors_cache",
+    "_feature_library_index_cache",   # sweep #20: was missed, feature-library lookup index
+    "_grammars_cache",
+    "_entry_vectors_cache",
+    "_codon_tables_cache",
+    "_settings_cache",
+    "_experiments_cache",
+    "_experiment_projects_cache",
+    "_gels_cache",
+    "_protein_motifs_cache",   # sweep #15: protein-motif user overrides
+    "_custom_enzymes_cache",      # user-added restriction enzymes
+    "_enzyme_collections_cache",  # enzyme-set collections
+    "_hmm_db_catalog_cache",      # sweep #28: HMM database registry
+    "_protein_collections_cache",  # named protein-sequence collections (operon workbench)
+)
+
+
+# Per-lane source kinds. The UI surfaces these in a Select dropdown.
+_LANE_SOURCES: tuple[tuple[str, str], ...] = (
+    ("Empty",          "empty"),
+    ("Ladder",         "ladder"),
+    ("Plasmid (uncut)", "plasmid"),
+    ("Digest",         "digest"),
+    ("PCR amplicon",   "pcr"),
+)
+
+
+@_agent_endpoint("tools")
+def _h_tools(app, payload):
+    """Self-describe: list of available endpoints + their write/read mode.
+
+    Global error-shape contract every endpoint follows:
+      * Success     → ``200`` with handler-specific JSON.
+      * Bad input   → ``400`` with ``{"error": "..."}`` describing the
+                       field that failed validation.
+      * Auth        → ``401`` for write endpoints called without the
+                       bearer token.
+      * Missing     → ``404`` when the requested object (library entry,
+                       collection, hmm file) doesn't exist.
+      * Stale ref   → ``409`` when the request was valid at receive time
+                       but the canvas record / library state moved on
+                       before apply (audit sweep #4 added this to
+                       `transfer-annotations`; mirrors
+                       `replace-sequence`). Retry against current state.
+      * Loaded?     → ``422`` for endpoints that need a record loaded
+                       but `_current_record is None`.
+      * Save fail   → ``500`` with ``{"error": "save failed for X: ..."}``
+                       when the disk write raised (disk-full, RO mount,
+                       EACCES). The in-process UI user ALSO sees a
+                       failure toast via `_notify_save_failure`. Agent
+                       endpoints route through `_agent_save_or_500` so
+                       the shape is uniform across 7 write paths
+                       (delete-from-library, create/delete/rename-
+                       collection, set-active-collection,
+                       bulk-import-folder, set-plasmid-status).
+      * Crash       → ``500`` with ``{"error": "...", "type": "..."}``
+                       (the dispatcher's catch-all).
+    """
+    return {"endpoints": [
+        {
+            "name":   name,
+            "method": "POST" if write else "GET",
+            "write":  write,
+            "doc":    (fn.__doc__ or "").strip().split("\n")[0],
+        }
+        for name, (fn, write) in sorted(_state._AGENT_HANDLERS.items())
+    ]}
+
+
+_EXPORT_GENBANK_EXTS = (".gb", ".gbk", ".genbank")
+
+
+_EXPORT_GFF_EXTS     = (".gff", ".gff3")
+
+
+_EXPORT_FASTA_EXTS   = (".fa", ".fasta", ".fna")
+
+
+@_agent_endpoint("export-genbank", write=True)
+def _h_export_genbank(app, payload):
+    """Write the current record to `path` as GenBank. Body: ``{path}``.
+    Path may be relative (resolved against $HOME). Doesn't change the
+    record's `_source_path`, so subsequent `save` calls still target
+    the original location."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    path = _sanitize_path(payload.get("path"))
+    if path is None:
+        return ({"error": "missing 'path'"}, 400)
+    if (ext_err := _check_export_extension(
+            path, _EXPORT_GENBANK_EXTS, "GenBank")) is not None:
+        return ({"error": ext_err}, 400)
+    err = _check_agent_write_path(path)
+    if err is not None:
+        return ({"error": err}, 403)
+    try:
+        result = _export_genbank_to_path(rec, path)
+    except (OSError, ValueError) as exc:
+        return ({"error": f"export failed: {_scrub_path(str(exc))}"}, 500)
+    return {"ok": True, **result}
+
+
+@_agent_endpoint("export-gff", write=True)
+def _h_export_gff(app, payload):
+    """Write the current record to `path` as GFF3. Body: ``{path}``.
+    Wrap features become two GFF3 rows joined by a shared `ID=...`
+    attribute. Returns ``{ok, path, bp, features}``."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    path = _sanitize_path(payload.get("path"))
+    if path is None:
+        return ({"error": "missing 'path'"}, 400)
+    if (ext_err := _check_export_extension(
+            path, _EXPORT_GFF_EXTS, "GFF3")) is not None:
+        return ({"error": ext_err}, 400)
+    err = _check_agent_write_path(path)
+    if err is not None:
+        return ({"error": err}, 403)
+    try:
+        result = _export_gff_to_path(rec, path)
+    except OSError as exc:
+        return ({"error": f"export failed: {_scrub_path(str(exc))}"}, 500)
+    return {"ok": True, **result}
+
+
+@_agent_endpoint("export-fasta", write=True)
+def _h_export_fasta(app, payload):
+    """Write the current sequence to `path` as FASTA. Body: ``{path}``.
+    Single-record FASTA with the plasmid name as the header."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    path = _sanitize_path(payload.get("path"))
+    if path is None:
+        return ({"error": "missing 'path'"}, 400)
+    if (ext_err := _check_export_extension(
+            path, _EXPORT_FASTA_EXTS, "FASTA")) is not None:
+        return ({"error": ext_err}, 400)
+    err = _check_agent_write_path(path)
+    if err is not None:
+        return ({"error": err}, 403)
+    try:
+        result = _export_fasta_to_path(
+            rec.name or rec.id or "plasmid",
+            str(rec.seq),
+            path,
+        )
+    except (OSError, ValueError) as exc:
+        return ({"error": f"export failed: {_scrub_path(str(exc))}"}, 500)
+    return {"ok": True, **result}
+
+
+@_agent_endpoint("bulk-export-collection", write=True)
+def _h_bulk_export_collection(app, payload):
+    """Write every plasmid in `collection` to `dir` as files of
+    `format`. Body: ``{collection, format, dir}``. ``format`` ∈
+    {"genbank", "embl", "fasta", "dna"}. Returns ``{ok, total,
+    written, failures, dir}`` mirroring `_bulk_export_collection`.
+    Per-entry failures don't abort the batch — each is reported in
+    the `failures` list. Path is sanitised + symlink-refused via the
+    same checks `export-genbank` uses on the target dir."""
+    coll = payload.get("collection")
+    if not coll or not isinstance(coll, str):
+        return ({"error": "missing 'collection'"}, 400)
+    fmt = payload.get("format")
+    if fmt not in _BULK_EXPORT_FORMATS:
+        return ({"error": (
+            f"unknown format {fmt!r}; "
+            f"choose one of {sorted(_BULK_EXPORT_FORMATS)}"
+        )}, 400)
+    target = _sanitize_path(payload.get("dir"))
+    if target is None:
+        return ({"error": "missing 'dir'"}, 400)
+    if target.exists() and not target.is_dir():
+        return ({"error": f"target is not a directory: {target}"}, 400)
+    err = _check_agent_write_path(target)
+    if err is not None:
+        return ({"error": err}, 403)
+    try:
+        result = _state._bulk_export_collection_hook(coll, fmt, target)
+    except (OSError, ValueError) as exc:
+        return ({"error": f"bulk export failed: {_scrub_path(str(exc))}"}, 500)
+    return {"ok": True, **result}
+
+
+@_agent_endpoint("list-restriction-sites")
+def _h_list_restriction_sites(app, payload):
+    """Scan the loaded record for restriction sites. Body:
+    ``{enzymes?: [str, ...], min_length?: int, unique_only?: bool,
+       respect_active_collection?: bool = true}``.
+
+    Default scans the combined catalog (built-in NEB ∪ user-added
+    custom enzymes) with `min_length=4` and `unique_only=False`.
+
+    When ``enzymes`` is omitted AND ``respect_active_collection`` is
+    true (the default), the agent endpoint mirrors the UI overlay: if
+    the user has set an active enzyme collection, only those enzymes
+    surface in the result. Pass ``respect_active_collection=false`` to
+    force a full-catalog scan regardless. Explicit ``enzymes`` always
+    wins.
+
+    Returns each hit as ``{enzyme, start, end, strand, cut_bp}``."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    enzymes = payload.get("enzymes")
+    if enzymes is not None:
+        if not isinstance(enzymes, list):
+            return ({"error": "'enzymes' must be a list"}, 400)
+        # Reject non-string elements up front — otherwise a mixed-type
+        # list (e.g. `[1, 2.5, null]`) builds a set whose `not in` check
+        # silently filters every hit to zero. The endpoint owes agents
+        # an explicit 400 rather than an empty `sites: []` result.
+        if not all(isinstance(e, str) for e in enzymes):
+            return ({"error": "'enzymes' must contain only strings"}, 400)
+    min_len = _coerce_int(payload.get("min_length", 4),
+                            name="min_length")
+    if isinstance(min_len, str):
+        return ({"error": min_len}, 400)
+    unique = bool(payload.get("unique_only", False))
+    respect_active = bool(payload.get("respect_active_collection", True))
+    seq = str(rec.seq)
+    is_circular = rec.annotations.get("topology") == "circular"
+    sites = _scan_restriction_sites(
+        seq, min_recognition_len=min_len,
+        unique_only=unique, circular=is_circular,
+    )
+    # Build the filter set. Explicit `enzymes` overrides everything;
+    # otherwise fall back to the user's active enzyme collection (if
+    # any) so the agent mirrors UI overlay semantics.
+    if enzymes:
+        enzyme_filter: "set[str] | None" = set(enzymes)
+    elif respect_active:
+        active = _active_enzyme_allowed_set()
+        enzyme_filter = set(active) if active is not None else None
+    else:
+        enzyme_filter = None
+    out = []
+    for s in sites:
+        if s.get("type") != "resite":
+            continue
+        label = s.get("label", "")
+        if enzyme_filter is not None and label not in enzyme_filter:
+            continue
+        out.append({
+            "enzyme":  label,
+            "start":   s.get("start"),
+            "end":     s.get("end"),
+            "strand":  s.get("strand", 1),
+            "cut_bp":  s.get("top_cut_bp", -1),
+        })
+    return {"sites": out, "count": len(out)}
+
+
+@_agent_endpoint("diff-plasmid")
+def _h_diff_plasmid(app, payload):
+    """Pairwise alignment of the loaded record against another plasmid
+    in the library. Body: ``{target_id, mode?, circular?}``.
+
+    `circular` (default ``auto`` — detected from the target's topology
+    annotation) gates the rotation picker. Pass ``false`` to skip
+    rotation; pass ``true`` to force it even when the target's
+    topology isn't annotated.
+
+    Runs the same `_pick_best_rotation` pipeline `_diff_align_worker`
+    uses (canvas_axis="query"): tries plain forward, plain RC,
+    query-rotation (forward + RC), target-rotation (forward + RC).
+    Picks whichever crosses ``_ROTATION_EARLY_STOP_PCT`` first or has
+    the highest overall identity. Returns the full result plus
+    rotation metadata so an agent can replicate the alignment:
+
+      * ``picked_rotation``  — ``"none"`` / ``"query"`` / ``"target"``.
+      * ``query_rotation``   — bp offset applied to the query (0 unless
+                               ``picked_rotation == "query"``).
+      * ``target_rotation``  — bp offset applied to the target (0 unless
+                               ``picked_rotation == "target"``).
+      * ``query_rc``         — bool: was the query reverse-complemented
+                               to find this alignment?
+      * ``rotation_offset``  — back-compat field: equals
+                               ``target_rotation`` (the legacy single-
+                               rotation API only rotated the target).
+
+    Skips the UI and feeds an agent the same numbers
+    `AlignmentScreen` surfaces — a "how similar are pUC19 and my new
+    construct" question can be answered in one round-trip."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    target_id = _sanitize_label(payload.get("target_id"), max_len=200)
+    if not target_id:
+        return ({"error": "missing 'target_id'"}, 400)
+    mode = payload.get("mode", "global")
+    if mode not in ("global", "local"):
+        return ({"error": "'mode' must be 'global' or 'local'"}, 400)
+    # Sweep #25: helper avoids the per-call full-library deepcopy.
+    target_entry = _find_library_entry_by_id(target_id)
+    if target_entry is None:
+        return ({"error": f"no library entry id={target_id!r}"}, 404)
+    gb_text = target_entry.get("gb_text", "")
+    if not gb_text:
+        return ({"error": "target entry has no gb_text"}, 422)
+    try:
+        target_record = _gb_text_to_record(gb_text)
+    except Exception as exc:
+        # Sweep #27: scrub exception text.
+        _log.warning("agent diff-plasmid: target parse failed (%s)", exc)
+        return ({"error": f"target parse failed: {_scrub_path(str(exc))}"},
+                500)
+    # Auto-detect circular from topology annotation; agents can override
+    # with an explicit `circular` boolean.
+    circ_raw = payload.get("circular")
+    if circ_raw is None:
+        target_annotations = getattr(target_record, "annotations",
+                                       None) or {}
+        is_circular = (target_annotations.get("topology") == "circular")
+    else:
+        is_circular = bool(circ_raw)
+    query_seq = str(rec.seq)
+    target_seq = str(target_record.seq)
+    # Pre-cap both seqs at `_PAIRWISE_MAX_LEN` BEFORE the picker runs.
+    # `_pick_best_rotation` may double the target inside
+    # `_find_circular_alignment_offset` (t + t) — a 50 MB library entry
+    # would otherwise allocate 100 MB before reaching the alignment cap.
+    if (len(query_seq) > _PAIRWISE_MAX_LEN
+            or len(target_seq) > _PAIRWISE_MAX_LEN):
+        return ({
+            "error": (
+                f"sequence too long for diff "
+                f"(query={len(query_seq):,}, target={len(target_seq):,}, "
+                f"cap={_PAIRWISE_MAX_LEN:,})"
+            ),
+        }, 413)
+    # Use the same picker the UI workers use — INV-72 (2026-05-25)
+    # closes the agent/UI divergence: pre-sweep this endpoint ran
+    # bare `_pairwise_align` after a single `_find_circular_alignment_
+    # offset` call, so agents missed RC-orientation detection +
+    # the multi-rotation best-of-N pick that `_diff_align_worker`
+    # gained in `[INV-71]`. canvas_axis="query" matches the UI flow:
+    # the loaded record is the query, the picked library entry is
+    # the target.
+    try:
+        result = _state._pick_best_rotation_hook(
+            query_seq, target_seq,
+            is_circular=is_circular,
+            mode=mode, canvas_axis="query",
+        )
+    except ValueError as exc:
+        return ({"error": f"alignment rejected: {exc}"}, 400)
+    except Exception as exc:
+        _log.exception("diff-plasmid: pick_best_rotation raised")
+        return ({"error": f"alignment failed: {exc}"}, 500)
+    picked = result.get("picked_rotation", "none")
+    target_rotation = int(result.get("target_rotation") or 0)
+    return {
+        "ok":              True,
+        "target_id":       target_id,
+        "target_name":     target_record.name or target_record.id or "",
+        "circular":        is_circular,
+        # Back-compat: the legacy single-rotation API exposed
+        # `rotation_offset` as the bp the target was rotated by.
+        # Picker may instead rotate the query or pick "none" — in
+        # those cases `rotation_offset` is 0 and the new
+        # `query_rotation` / `picked_rotation` fields tell the full
+        # story.
+        "rotation_offset": target_rotation,
+        "picked_rotation": picked,
+        "query_rotation":  int(result.get("query_rotation") or 0),
+        "target_rotation": target_rotation,
+        "query_rc":        bool(result.get("query_rc", False)),
+        "result":          result,
+    }
+
+
+@_agent_endpoint("align-plasmidsaurus-zip")
+def _h_align_plasmidsaurus_zip(app, payload):
+    """Align a Plasmidsaurus zip member against a library plasmid.
+    Body: ``{path, member, target_id?, target_name?, mode?, circular?}``.
+
+    Either `target_id` (library entry id) or `target_name` is
+    required. `mode` is ``global`` (default) or ``local``.
+    `circular` defaults to the target's topology annotation;
+    passing it explicitly overrides the auto-detect.
+
+    Runs the same pipeline `_align_worker` uses in the UI:
+    extract the `.gbk` member from the zip, parse it as a
+    SeqRecord, find the circular alignment offset against the
+    target via `_find_circular_alignment_offset`, run
+    `_pairwise_align`. Returns the alignment result plus the
+    rotation offset so the agent can map matches back to the
+    target's original coordinates.
+
+    Read-only — does not register an overlay in the UI or persist
+    anything. The library is consulted to resolve the target only.
+    """
+    raw_path = payload.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return ({"error": "missing 'path'"}, 400)
+    member = payload.get("member")
+    if not isinstance(member, str) or not member:
+        return ({"error": "missing 'member' (zip member filename)"}, 400)
+    target_id_raw = payload.get("target_id")
+    target_name_raw = payload.get("target_name")
+    target_id = (_sanitize_label(target_id_raw, max_len=200)
+                 if isinstance(target_id_raw, str) else "")
+    target_name = (_sanitize_label(target_name_raw, max_len=200)
+                   if isinstance(target_name_raw, str) else "")
+    if not target_id and not target_name:
+        return ({"error": "missing 'target_id' or 'target_name'"}, 400)
+    mode = payload.get("mode", "global")
+    if mode not in ("global", "local"):
+        return ({"error": "'mode' must be 'global' or 'local'"}, 400)
+    path = _sanitize_path(raw_path)
+    if path is None:
+        return ({"error": "could not sanitize 'path'"}, 400)
+    # Sweep #26 (2026-05-23): defense-in-depth ancestor symlink walk
+    # (see `_h_list_plasmidsaurus_members` rationale).
+    anc_err = _check_agent_read_path_ancestors(path)
+    if anc_err is not None:
+        _log.warning("agent align-plasmidsaurus-zip: %s", anc_err)
+        return ({"error": "zip rejected (see splicecraft log)"}, 400)
+    # Sweep #25 (2026-05-23): collapse path errors to a uniform 400
+    # (see `_h_list_plasmidsaurus_members` rationale).
+    ok, reason = _safe_file_size_check(
+        path, _PLASMIDSAURUS_ZIP_MAX_BYTES, "Plasmidsaurus zip",
+    )
+    if not ok:
+        _log.warning("agent align-plasmidsaurus-zip: rejected (%s): %s",
+                     reason or "unsafe", path)
+        return ({"error": "zip rejected (see splicecraft log)"}, 400)
+    # Resolve the target in the active library. Cross-collection
+    # search isn't this endpoint's job — agents should
+    # `set-active-collection` first when the target lives elsewhere.
+    # Sweep #25: id-then-name helpers avoid the per-call full-library
+    # deepcopy. id takes precedence (matches pre-sweep semantics —
+    # `target_id` was checked first on each iteration).
+    target_entry: "dict | None" = None
+    if target_id:
+        target_entry = _find_library_entry_by_id(target_id)
+    if target_entry is None and target_name:
+        target_entry = _find_library_entry_by_name(target_name)
+    if target_entry is None:
+        descriptor = (f"id={target_id!r}" if target_id
+                      else f"name={target_name!r}")
+        return ({"error": f"no library entry matching {descriptor}"},
+                404)
+    # Sweep #26 (2026-05-23): capture the resolved id so the post-
+    # alignment re-check can detect a concurrent library mutation
+    # (target deleted/renamed mid-flight). The alignment itself runs
+    # against the snapshot we extracted above, but the result's
+    # `target_name` would otherwise reflect the pre-rename name with
+    # no way for the agent to detect the drift.
+    resolved_target_id = target_entry.get("id") or ""
+    gb_text_target = target_entry.get("gb_text") or ""
+    if not gb_text_target:
+        return ({"error": "target entry has no gb_text"}, 422)
+    try:
+        target_record = _gb_text_to_record(gb_text_target)
+    except Exception as exc:
+        # Sweep #27: scrub exception text on all three parse paths.
+        _log.warning("agent align-plasmidsaurus: target parse failed (%s)",
+                      exc)
+        return ({"error": f"target parse failed: {_scrub_path(str(exc))}"},
+                500)
+    # Extract + parse the zip member.
+    try:
+        gb_text_query = _extract_gbk_member(path, member)
+    except ValueError as exc:
+        _log.warning("agent align-plasmidsaurus: extract failed (%s)", exc)
+        return ({"error": "could not extract member (see splicecraft log)"},
+                422)
+    except Exception as exc:
+        _log.exception("agent align-plasmidsaurus-zip: extract failed")
+        return ({"error": "extract failed (see splicecraft log)",
+                 "type":  type(exc).__name__}, 500)
+    try:
+        query_record = _gb_text_to_record(gb_text_query)
+    except Exception as exc:
+        _log.warning("agent align-plasmidsaurus: query parse failed (%s)",
+                      exc)
+        return ({"error": f"query parse failed: {_scrub_path(str(exc))}"},
+                422)
+    query_seq = str(query_record.seq)
+    target_seq = str(target_record.seq)
+    if not query_seq or not target_seq:
+        return ({"error": "query or target sequence is empty"}, 422)
+    # Length-cap before kicking off the C-loop alignment. Even though
+    # `_pairwise_align` enforces the same cap, surfacing it as 413
+    # here gives a clearer error than a generic "rejected" downstream.
+    if len(query_seq) > _PAIRWISE_MAX_LEN:
+        return ({"error": f"query exceeds {_PAIRWISE_MAX_LEN:,} bp"},
+                413)
+    if len(target_seq) > _PAIRWISE_MAX_LEN:
+        return ({"error": f"target exceeds {_PAIRWISE_MAX_LEN:,} bp"},
+                413)
+    # Circular rotation: same auto-detect as `diff-plasmid`.
+    circ_raw = payload.get("circular")
+    if circ_raw is None:
+        target_annotations = getattr(target_record, "annotations",
+                                       None) or {}
+        is_circular = (target_annotations.get("topology") == "circular")
+    else:
+        is_circular = bool(circ_raw)
+    # INV-72 (2026-05-25): use the same picker the UI uses. Pre-sweep
+    # this endpoint ran bare `_pairwise_align` after a single
+    # `_find_circular_alignment_offset` call — agents missed the
+    # RC-orientation + multi-rotation best-of-N pick that `_align_worker`
+    # gained in `[INV-71]`. canvas_axis defaults to "target" (matches
+    # the UI: the read is the query, the library entry is the target).
+    try:
+        result = _state._pick_best_rotation_hook(
+            query_seq, target_seq,
+            is_circular=is_circular,
+            mode=mode, canvas_axis="target",
+        )
+    except ValueError as exc:
+        return ({"error": f"alignment rejected: {exc}"}, 400)
+    except Exception as exc:
+        _log.exception("align-plasmidsaurus-zip: pick_best_rotation raised")
+        return ({"error": f"alignment failed: {exc}"}, 500)
+    # Sweep #26 (2026-05-23): post-alignment drift check. If the
+    # target entry was deleted between resolve and alignment
+    # completion (multi-second CPU-bound `_pairwise_align`), surface
+    # 410 Gone — the alignment result is technically valid but the
+    # named target no longer exists, so any agent follow-up against
+    # it (set-active, load-entry) would 404.
+    if resolved_target_id:
+        current = _find_library_entry_by_id(resolved_target_id)
+        if current is None:
+            return ({"error": (
+                "target deleted mid-flight; alignment ran against "
+                "the resolved snapshot but the library entry is gone"
+            ), "target_id": resolved_target_id}, 410)
+        # If rename happened, the result still ships, but flag the
+        # drift in the payload so the agent's follow-ups can use the
+        # current name.
+        current_name = current.get("name") or ""
+        if current_name and current_name != (target_record.name
+                                              or target_record.id or ""):
+            result = dict(result)
+            result["_target_renamed_to"] = current_name
+    picked = result.get("picked_rotation", "none")
+    target_rotation = int(result.get("target_rotation") or 0)
+    query_rotation = int(result.get("query_rotation") or 0)
+    _log_event(
+        "alignment.agent",
+        path=str(path), member=member,
+        target=target_record.name or target_record.id or "",
+        identity_pct=round(float(result.get("identity_pct") or 0), 1),
+        picked_rotation=picked,
+        query_rotation=query_rotation,
+        target_rotation=target_rotation,
+        query_rc=bool(result.get("query_rc", False)),
+        mode=mode,
+    )
+    return {
+        "ok":              True,
+        "path":            str(path),
+        "member":          member,
+        "query_name":      query_record.name or query_record.id or "",
+        "target_id":       target_entry.get("id") or "",
+        "target_name":     target_record.name or target_record.id or "",
+        "circular":        is_circular,
+        # Back-compat: `rotation_offset` mirrors `target_rotation`
+        # (the legacy single-rotation API only ever rotated the target).
+        # New `picked_rotation` / `query_rotation` / `query_rc` fields
+        # carry the full picker decision so agents can replicate the
+        # alignment.
+        "rotation_offset": target_rotation,
+        "picked_rotation": picked,
+        "query_rotation":  query_rotation,
+        "target_rotation": target_rotation,
+        "query_rc":        bool(result.get("query_rc", False)),
+        "result":          result,
+    }
+
+
+@_agent_endpoint("blast")
+def _h_blast(app, payload):
+    """In-process BLASTN / BLASTP against the user's plasmid
+    collections. Body: ``{query, program?, collections?, max_hits?,
+    six_frame?, backend?}``. ``program`` is auto-detected from the
+    query alphabet when omitted; ``collections`` defaults to all
+    collections; ``max_hits`` defaults to 25 (capped at 500);
+    ``six_frame`` enables BLASTP six-frame ORF indexing (off by
+    default); ``backend`` is ``auto`` / ``pyhmmer`` / ``pure``.
+
+    Read-only — never touches the loaded record or any saved file.
+    Hits are returned as a list of dicts (subject name + collection,
+    coords, score, identity %, alignment fragments)."""
+    raw_query = payload.get("query")
+    if not raw_query or not isinstance(raw_query, str):
+        return ({"error": "missing or non-string 'query'"}, 400)
+    program_hint = str(payload.get("program") or "").lower()
+    if program_hint and program_hint not in ("blastn", "blastp"):
+        return ({"error": "'program' must be 'blastn' or 'blastp'"}, 400)
+    program, cleaned = _state._detect_query_program_hook(raw_query, program_hint)
+    if not cleaned:
+        return ({"error": "query is empty after sanitisation"}, 400)
+
+    # Validate collections list — must be a JSON array of strings,
+    # capped at a sane size so a malicious payload can't make us scan
+    # 10,000 names.
+    coll_raw = payload.get("collections")
+    coll_names: "list[str] | None" = None
+    if coll_raw is not None:
+        if not isinstance(coll_raw, list):
+            return ({"error": "'collections' must be a list of names"}, 400)
+        if len(coll_raw) > 100:
+            return ({"error": "'collections' too long (max 100)"}, 400)
+        coll_names = []
+        for n in coll_raw:
+            norm = _normalize_collection_name(n)
+            if norm is None:
+                return ({"error":
+                          f"invalid collection name in list: {n!r}"}, 400)
+            coll_names.append(norm)
+
+    max_hits = _coerce_int(payload.get("max_hits", 25),
+                             name="max_hits")
+    if isinstance(max_hits, str):
+        return ({"error": max_hits}, 400)
+    max_hits = max(1, min(max_hits, 500))
+
+    six_frame = bool(payload.get("six_frame", False))
+    backend = str(payload.get("backend") or "auto").lower()
+    if backend not in ("auto", "pyhmmer", "pure"):
+        return ({"error": "'backend' must be 'auto' / 'pyhmmer' / 'pure'"},
+                400)
+
+    try:
+        db = _state._blast_get_db_hook(program, coll_names, six_frame=six_frame)
+        hits = _state._blast_search_hook(cleaned, db, max_hits=max_hits, backend=backend)
+    except Exception as exc:
+        _log.exception("agent-api blast failed")
+        return ({"error": f"blast failed: {exc}",
+                 "type": type(exc).__name__}, 500)
+
+    return {
+        "ok":           True,
+        "program":      program,
+        "backend":      backend,
+        "query_length": len(cleaned),
+        "n_hits":       len(hits),
+        "hits":         hits,
+    }
+
+
+@_agent_endpoint("hmmscan")
+def _h_hmmscan(app, payload):
+    """Scan a query AA sequence against a HMMER 3 profile DB. Body:
+    ``{query, hmm_path, max_hits?}``. ``hmm_path`` must point at a
+    readable .hmm / .h3m / .h3p file on the server filesystem; the
+    file is read lazily so Pfam-scale DBs don't pre-fetch into RAM.
+    Returns hits in the same shape as ``blast``.
+
+    Path safety (audit sweep #4 2026-05-15): `hmm_path` is routed
+    through `_safe_file_size_check` (2 GB cap, symlink rejection,
+    `S_ISREG` check) before opening — without this an agent caller
+    could pass `/dev/zero` or a symlink to it and DoS the worker
+    via `pyhmmer.HMMFile`'s streaming read."""
+    raw_query = payload.get("query")
+    if not raw_query or not isinstance(raw_query, str):
+        return ({"error": "missing or non-string 'query'"}, 400)
+    hmm_path = _sanitize_path(payload.get("hmm_path"))
+    if hmm_path is None:
+        return ({"error": "missing 'hmm_path'"}, 400)
+    # Sweep #11 (2026-05-20): collapse "file-not-acceptable" responses
+    # to a generic 400 so an unauthenticated caller can't probe
+    # filesystem state via the error differential (pre-fix the
+    # responses for "not found" / "not a regular file" / "too large"
+    # were distinguishable, letting a local attacker enumerate which
+    # paths exist + what kind). The detail still lands in the log
+    # for the SpliceCraft user's own diagnostic bundle.
+    _HMMSCAN_HMM_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
+    _generic_rejection = (
+        {"error": "hmm file not acceptable (see splicecraft log)"}, 400,
+    )
+    if not hmm_path.exists():
+        _log.info("hmmscan: refused path (not found): %s", hmm_path)
+        return _generic_rejection
+    # Symlink + size + regular-file check. Asymmetric vs
+    # `_h_load_file` which already routes through `_safe_file_size_check`;
+    # without this, `pyhmmer.HMMFile(/dev/zero)` streams forever and an
+    # agent caller can DoS the worker. Cap at 2 GB — real Pfam-A.hmm
+    # bundles weigh in around 1.3 GB so this is generous but bounded.
+    ok, reason = _safe_file_size_check(
+        hmm_path, _HMMSCAN_HMM_MAX_BYTES, "hmm file",
+    )
+    if not ok:
+        _log.info(
+            "hmmscan: refused path %s — %s", hmm_path, reason,
+        )
+        return _generic_rejection
+    max_hits = _coerce_int(payload.get("max_hits", 25),
+                             name="max_hits")
+    if isinstance(max_hits, str):
+        return ({"error": max_hits}, 400)
+    max_hits = max(1, min(max_hits, 500))
+    try:
+        hits = _state._hmmscan_run_hook(raw_query, str(hmm_path), max_hits=max_hits)
+    except FileNotFoundError as exc:
+        # Sweep #26: collapse the TOCTOU race-window 404 to a uniform
+        # log-only message. The sibling `_safe_file_size_check` /
+        # path-shape checks earlier in the handler already returned
+        # the same opaque string; matching the wording here closes
+        # the path-existence oracle that an attacker could probe
+        # via "file removed between exists() and open()" races.
+        _log.warning("agent hmmscan: %s", _scrub_path(str(exc)))
+        return ({"error": "hmm file not acceptable (see splicecraft log)"},
+                404)
+    except ValueError as exc:
+        return ({"error": _scrub_path(str(exc))}, 400)
+    except Exception as exc:
+        _log.exception("agent-api hmmscan failed")
+        return ({"error": f"hmmscan failed: {_scrub_path(str(exc))}",
+                 "type": type(exc).__name__}, 500)
+    return {"ok": True, "n_hits": len(hits), "hits": hits}
+
+
+@_agent_endpoint("list-parts-bins")
+def _h_list_parts_bins(app, payload):
+    """Every named parts bin. Each item: ``{name, n_parts, description}``;
+    `active` is the currently-selected bin name (empty if none)."""
+    out = []
+    for b in _load_parts_bin_collections():
+        out.append({
+            "name":        b.get("name", "?"),
+            "n_parts":     len(b.get("parts", []) or []),
+            "description": str(b.get("description") or "")[:200],
+        })
+    return {"ok": True, "parts_bins": out,
+            "active": _get_active_parts_bin_name() or ""}
+
+
+@_agent_endpoint("set-active-parts-bin", write=True)
+def _h_set_active_parts_bin(app, payload):
+    """Switch the active parts bin. Body: ``{name}`` (one of
+    `list-parts-bins`). The named bin in `parts_bin_collections.json` is
+    the source of truth; its parts are mirrored into the live
+    `parts_bin.json` via `_safe_save_json_mirror` so the switch may
+    legitimately shrink the mirror without tripping the L3 guard
+    ([INV-83]). RMW under `_state._cache_lock`, matching `PartsBinPickerModal`."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing 'name'"}, 400)
+    name = name.strip()
+    with _state._cache_lock:
+        target = _find_parts_bin(name)
+        if target is None:
+            valid = [b.get("name") for b in _load_parts_bin_collections()]
+            return ({"error":
+                      f"unknown parts bin {name!r}; "
+                      f"valid: {sorted(v for v in valid if v)}"}, 404)
+        _set_active_parts_bin_name(name)
+        _state._settings_flush_sync_hook()
+        raw_parts = target.get("parts", [])
+        if not isinstance(raw_parts, list):
+            raw_parts = []
+        target_parts = [p for p in raw_parts if isinstance(p, dict)]
+        err = _agent_save_or_500(
+            lambda: _safe_save_json_mirror(
+                _state._PARTS_BIN_FILE, target_parts, "Parts bin"),
+            "Parts bin")
+        if err:
+            return err
+        _state._parts_bin_cache = None
+        _state._clear_assembly_fragment_cache_hook()
+    _log_event("parts_bin.switch", name=name, via="agent")
+    return {"ok": True, "active": name, "n_parts": len(target_parts)}
+
+
+@_agent_endpoint("set-active-hmm-database", write=True)
+def _h_set_active_hmm_database(app, payload):
+    """Pick the active HMM database. Body: ``{id}`` (one of
+    `list-hmm-databases`). Persists the `hmm_db_active_id` setting."""
+    eid = payload.get("id")
+    if not isinstance(eid, str) or not eid.strip():
+        return ({"error": "missing 'id'"}, 400)
+    eid = eid.strip()
+    if eid not in {e.get("id") for e in _load_hmm_db_catalog()}:
+        return ({"error": "hmm database not found"}, 404)
+    _set_setting("hmm_db_active_id", eid)
+    _state._settings_flush_sync_hook()
+    _log_event("hmm_db.set_active", id=eid, via="agent")
+    return {"ok": True, "active": eid}
+
+
+@_agent_endpoint("list-backups")
+def _h_list_backups(app, payload):
+    """List recoverable backups for one user-data file. Body:
+    ``{label}`` where ``label`` is one of plasmid_library /
+    collections / parts_bin / parts_bin_collections / primers /
+    features / feature_colors / grammars / entry_vectors /
+    codon_tables / settings.
+
+    Returns rows from the four-layer JSON safety net: `legacy_bak`
+    (`<file>.bak`), `rotating_bak` (timestamped), `snapshot`
+    (daily), `lost_entries` (shrink-guard spillover). Newest first.
+    """
+    path, msg = _resolve_backup_label(payload.get("label"))
+    if path is None:
+        return ({"error": msg}, 400)
+    rows = []
+    for b in _list_recoverable_backups(path):
+        rows.append({
+            "kind":        b.get("kind", ""),
+            "source_path": str(b.get("source_path", "")),
+            "n_entries":   int(b.get("n_entries") or 0),
+            "mtime_str":   str(b.get("mtime_str") or ""),
+        })
+    return {"ok": True, "label": msg, "target_path": str(path),
+            "backups": rows, "count": len(rows)}
+
+
+@_agent_endpoint("restore-backup", write=True)
+def _h_restore_backup(app, payload):
+    """Restore one user-data file from a chosen backup. Body:
+    ``{label, source_path}`` where ``source_path`` must come from a
+    prior `list-backups` response (verified to belong to one of the
+    four backup tiers for the same target).
+
+    Triggers a fresh rotating backup of the current state as part of
+    `_safe_save_json`'s atomic write, so the pre-restore data is
+    NOT lost. Caches for the restored label are busted afterwards.
+    """
+    guard = _agent_dirty_guard(app, payload)
+    if guard is not None:
+        return guard
+    path, msg = _resolve_backup_label(payload.get("label"))
+    if path is None:
+        return ({"error": msg}, 400)
+    src_raw = payload.get("source_path")
+    if not isinstance(src_raw, str) or not src_raw:
+        return ({"error": "missing 'source_path'"}, 400)
+    # Verify the source_path matches one of the registered backup
+    # rows — otherwise an agent could read or write arbitrary files
+    # under the user's uid via this endpoint.
+    src = Path(src_raw).expanduser()
+    legitimate = {Path(b["source_path"])
+                  for b in _list_recoverable_backups(path)}
+    if src not in legitimate:
+        return ({"error": "source_path is not a registered backup for "
+                  f"label {msg!r}"}, 403)
+    try:
+        n = _restore_from_backup(path, src, label=msg)
+    except ValueError as exc:
+        return ({"error": f"unreadable backup: {exc}"}, 422)
+    except OSError as exc:
+        _log.exception("agent restore-backup: write failed")
+        return ({"error": f"restore write failed: {exc}"}, 500)
+    # Bust the in-memory cache for the restored label so the next
+    # read picks up the restored content.
+    cache_attr = {
+        "plasmid_library":       "_library_cache",
+        "collections":           "_collections_cache",
+        "parts_bin":             "_parts_bin_cache",
+        "parts_bin_collections": "_parts_bin_collections_cache",
+        "primers":               "_primers_cache",
+        "primer_collections":    "_primer_collections_cache",
+        "features":              "_features_cache",
+        "feature_colors":        "_feature_colors_cache",
+        "grammars":              "_grammars_cache",
+        "entry_vectors":         "_entry_vectors_cache",
+        "codon_tables":          "_codon_tables_cache",
+        "settings":              "_settings_cache",
+        "experiments":           "_experiments_cache",
+        "experiment_projects":   "_experiment_projects_cache",
+        "gels":                  "_gels_cache",
+        "protein_motifs":        "_protein_motifs_cache",
+        "custom_enzymes":        "_custom_enzymes_cache",
+        "enzyme_collections":    "_enzyme_collections_cache",
+        "hmm_db_catalog":        "_hmm_db_catalog_cache",
+        "protein_collections":   "_protein_collections_cache",
+    }.get(msg)
+    if cache_attr is not None:
+        _state._reset_master_delete_cache_hook(cache_attr)
+    return {"ok": True, "label": msg, "entries_restored": n,
+            "source_path": str(src)}
+
+
+@_agent_endpoint("restore-pre-update-snapshot", write=True)
+def _h_restore_pre_update_snapshot(app, payload):
+    """Restore a pre-update snapshot by id (or "latest"). Body:
+    ``{id?: str}``. When ``id`` is missing or "latest", restores the
+    newest snapshot.
+
+    Same sacred four checks as the CLI path (schema version ≤
+    current, attr in `_USER_DATA_FILE_ATTRS`, name regex
+    `_PRE_UPDATE_NAME_RE`, SHA-256 re-verify before `os.replace`).
+    """
+    guard = _agent_dirty_guard(app, payload)
+    if guard is not None:
+        return guard
+    raw_id = payload.get("id") or "latest"
+    if not isinstance(raw_id, str):
+        return ({"error": "'id' must be string"}, 400)
+    raw_id = raw_id.strip() or "latest"
+    if raw_id != "latest":
+        # Enforce the regex on the wire boundary so a malformed id
+        # never reaches `_restore_pre_update_snapshot`'s validator.
+        if not _PRE_UPDATE_NAME_RE.match(raw_id):
+            return ({"error": f"id {raw_id!r} fails the pre-update "
+                      "snapshot name regex"}, 400)
+    try:
+        if raw_id == "latest":
+            snaps = _list_pre_update_snapshots()
+            if not snaps:
+                return ({"error": "no pre-update snapshots available"},
+                        404)
+            target = snaps[0]["path"]
+        else:
+            target = raw_id
+        report = _restore_pre_update_snapshot(target)
+    except FileNotFoundError as exc:
+        return ({"error": f"snapshot not found: {exc}"}, 404)
+    except ValueError as exc:
+        return ({"error": f"snapshot rejected: {exc}"}, 422)
+    except OSError as exc:
+        _log.exception("agent restore-pre-update-snapshot: write failed")
+        return ({"error": f"restore write failed: {exc}"}, 500)
+    # Bust every cached user-data so post-restore reads see the
+    # restored state. Sweep #25 (2026-05-23) — drives the enumeration
+    # from `_MASTER_DELETE_CACHE_ATTRS` so new caches enroll
+    # automatically. Pre-sweep this list was hand-maintained and
+    # drifted: sweep #20 added `_state._primer_usage_cache` +
+    # `_state._feature_library_index_cache` (derived caches that must reset
+    # when their source data changes); sweep #20 also added
+    # `_state._primer_collections_cache`. None propagated here. Settings
+    # cache IS reset here (unlike the UI restore path) because the
+    # `splicecraft update --restore` flow is invoked outside the
+    # running app session.
+    for cache_attr in _MASTER_DELETE_CACHE_ATTRS:
+        _state._reset_master_delete_cache_hook(cache_attr)
+    return {"ok": True, "report": report}
+
+
+@_agent_endpoint("simulate-pcr")
+def _h_simulate_pcr(app, payload):
+    """Run an in-silico PCR. Body:
+    ``{template_seq, fwd_primer, rev_primer,
+        circular?: bool = true,
+        max_amplicon?: int = 20000}``.
+
+    Binding model is exact-match (no mismatch tolerance, no Tm-aware
+    annealing — see `_simulate_pcr` for the contract). Primers must be
+    10–80 bp, ACGT only. Templates above ``_PCR_MAX_TEMPLATE_BP``
+    (5 Mb) are refused rather than risking a chromosome-scale find.
+    Returns up to ``_PCR_MAX_AMPLICONS`` (50) amplicons sorted by
+    length descending; the ``capped`` field flags mispriming runaway.
+
+    Read-only. To save an amplicon as a linear library entry, use the
+    Simulator screen (which constructs a SeqRecord with primer_bind
+    features at the ends) — the agent flow is meant for analysis.
+    """
+    template = payload.get("template_seq")
+    if not isinstance(template, str):
+        return ({"error": "missing or non-string 'template_seq'"}, 400)
+    if len(template) > _PCR_MAX_TEMPLATE_BP:
+        return ({"error": f"'template_seq' exceeds "
+                  f"{_PCR_MAX_TEMPLATE_BP:,} bp PCR-sim cap"}, 413)
+    fwd = payload.get("fwd_primer")
+    rev = payload.get("rev_primer")
+    if not isinstance(fwd, str) or not isinstance(rev, str):
+        return ({"error": "missing or non-string 'fwd_primer' / "
+                  "'rev_primer'"}, 400)
+    fwd_clean = fwd.upper().strip()
+    rev_clean = rev.upper().strip()
+    if not fwd_clean or not rev_clean:
+        return ({"error": "'fwd_primer' and 'rev_primer' must be "
+                  "non-empty"}, 400)
+    if len(fwd_clean) < _PCR_MIN_PRIMER_LEN or \
+            len(rev_clean) < _PCR_MIN_PRIMER_LEN:
+        return ({"error": f"primers must be at least "
+                  f"{_PCR_MIN_PRIMER_LEN} bp"}, 400)
+    if len(fwd_clean) > _PCR_MAX_PRIMER_LEN or \
+            len(rev_clean) > _PCR_MAX_PRIMER_LEN:
+        return ({"error": f"primers must be at most "
+                  f"{_PCR_MAX_PRIMER_LEN} bp"}, 400)
+    if any(c not in "ACGT" for c in fwd_clean):
+        return ({"error": "'fwd_primer' must be ACGT only "
+                  "(IUPAC ambiguity not supported)"}, 400)
+    if any(c not in "ACGT" for c in rev_clean):
+        return ({"error": "'rev_primer' must be ACGT only "
+                  "(IUPAC ambiguity not supported)"}, 400)
+    max_amp = _coerce_int(payload.get("max_amplicon",
+                                        _PCR_DEFAULT_MAX_AMPLICON),
+                           name="max_amplicon")
+    if isinstance(max_amp, str):
+        return ({"error": max_amp}, 400)
+    if not (1 <= max_amp <= _PCR_AMPLICON_HARD_CAP):
+        return ({"error": f"'max_amplicon' must be in "
+                  f"[1, {_PCR_AMPLICON_HARD_CAP}]"}, 400)
+    circular = bool(payload.get("circular", True))
+    try:
+        amps = _state._simulate_pcr_hook(template, fwd_clean, rev_clean,
+                              circular=circular, max_amplicon=max_amp)
+    except Exception as exc:
+        _log.exception("agent simulate-pcr: simulator failed")
+        return ({"error": f"simulator failed: {exc}"}, 500)
+    _log_event("simulator.pcr.agent",
+                template_bp=len(template),
+                circular=circular,
+                fwd_len=len(fwd_clean), rev_len=len(rev_clean),
+                max_amplicon=max_amp,
+                n_amplicons=len(amps),
+                capped=(len(amps) >= _PCR_MAX_AMPLICONS))
+    return {
+        "ok":         True,
+        "n":          len(amps),
+        "capped":     len(amps) >= _PCR_MAX_AMPLICONS,
+        "amplicons":  amps,
+    }
+
+
+@_agent_endpoint("simulate-gel")
+def _h_simulate_gel(app, payload):
+    """Render an in-silico agarose gel. Body:
+    ``{lanes:           [{name?, source, detail?}, ...],
+        agarose_pct?:    float = 1.0,
+        template_seq?:   str = "",
+        template_circular?: bool = true,
+        pcr_amplicon?:   dict | null = null,
+        height?:         int = 22,
+        lane_width?:     int = 7,
+        include_image?:  bool = false}``.
+
+    `source` is one of ``"empty" | "ladder" | "plasmid" | "digest" |
+    "pcr"``. `detail` semantics depend on source: ladder → ladder
+    name (``"1 kb Plus"``, ``"1 kb"``, ``"100 bp"``,
+    ``"Lambda/HindIII"``); digest → comma-separated enzyme names;
+    plasmid/pcr/empty → ignored. `pcr_amplicon` is the output of
+    ``simulate-pcr`` (when source = ``"pcr"``).
+
+    Returns structured band data per lane (bp / form / mobility /
+    display row). When ``include_image=true``, also returns the
+    rendered gel as a plain-text string (one line per row).
+
+    Read-only.
+    """
+    lanes = payload.get("lanes")
+    if not isinstance(lanes, list):
+        return ({"error": "'lanes' must be a list"}, 400)
+    if not lanes:
+        return ({"error": "'lanes' must contain at least one lane"}, 400)
+    if len(lanes) > _GEL_MAX_LANES:
+        return ({"error": f"too many lanes (max {_GEL_MAX_LANES})"}, 400)
+    cleaned_lanes: list[dict] = []
+    for i, lane in enumerate(lanes):
+        if not isinstance(lane, dict):
+            return ({"error": f"lanes[{i}] must be a dict"}, 400)
+        src = lane.get("source")
+        if not isinstance(src, str) or not src:
+            return ({"error": f"lanes[{i}].source missing or "
+                      "non-string"}, 400)
+        valid_sources = {kind for _, kind in _LANE_SOURCES}
+        if src.lower() not in valid_sources:
+            return ({"error": f"lanes[{i}].source {src!r} not in "
+                      f"{sorted(valid_sources)}"}, 400)
+        name = _sanitize_label(lane.get("name"), max_len=80) or f"L{i+1}"
+        detail = lane.get("detail", "")
+        if not isinstance(detail, str):
+            return ({"error": f"lanes[{i}].detail must be a string"},
+                    400)
+        if len(detail) > 200:
+            return ({"error": f"lanes[{i}].detail exceeds 200 chars"},
+                    400)
+        cleaned_lanes.append({
+            "name":   name,
+            "source": src.lower(),
+            "detail": detail,
+        })
+    template = payload.get("template_seq", "")
+    if not isinstance(template, str):
+        return ({"error": "'template_seq' must be a string"}, 400)
+    if len(template) > _PCR_MAX_TEMPLATE_BP:
+        return ({"error": f"'template_seq' exceeds "
+                  f"{_PCR_MAX_TEMPLATE_BP:,} bp cap"}, 413)
+    template_circular = bool(payload.get("template_circular", True))
+    pcr_amplicon = payload.get("pcr_amplicon")
+    if pcr_amplicon is not None and not isinstance(pcr_amplicon, dict):
+        return ({"error": "'pcr_amplicon' must be a dict or null"}, 400)
+    agarose = payload.get("agarose_pct", 1.0)
+    try:
+        agarose = float(agarose)
+    except (TypeError, ValueError):
+        return ({"error": "'agarose_pct' must be a number"}, 400)
+    # _agarose_mobility snaps to nearest configured %, but reject
+    # absurdly out-of-range values up front so the agent gets a
+    # clear error instead of silent snapping.
+    if not (0.1 <= agarose <= 10.0):
+        return ({"error": "'agarose_pct' must be in [0.1, 10.0]"}, 400)
+    height = _coerce_int(payload.get("height", 22), name="height")
+    if isinstance(height, str):
+        return ({"error": height}, 400)
+    if not (_GEL_HEIGHT_MIN <= height <= _GEL_HEIGHT_MAX):
+        return ({"error": f"'height' must be in "
+                  f"[{_GEL_HEIGHT_MIN}, {_GEL_HEIGHT_MAX}]"}, 400)
+    lane_width = _coerce_int(payload.get("lane_width", 7),
+                              name="lane_width")
+    if isinstance(lane_width, str):
+        return ({"error": lane_width}, 400)
+    if not (_GEL_LANE_WIDTH_MIN <= lane_width <= _GEL_LANE_WIDTH_MAX):
+        return ({"error": f"'lane_width' must be in "
+                  f"[{_GEL_LANE_WIDTH_MIN}, "
+                  f"{_GEL_LANE_WIDTH_MAX}]"}, 400)
+    include_image = bool(payload.get("include_image", False))
+    # Compute per-lane bands + mobility.
+    lane_results: list[dict] = []
+    try:
+        for li, lane in enumerate(cleaned_lanes):
+            bands = _gel_bands_for_lane(
+                lane,
+                template_seq=template,
+                template_circular=template_circular,
+                pcr_amplicon=pcr_amplicon,
+            )
+            band_info: list[dict] = []
+            for bp, form in bands:
+                mob = _agarose_mobility(bp, agarose, dna_form=form)
+                row = max(0, min(height - 1, int(round(mob * (height - 1)))))
+                band_info.append({
+                    "bp":       bp,
+                    "form":     form,
+                    "mobility": mob,
+                    "row":      row,
+                })
+            lane_results.append({
+                "index":  li,
+                "name":   lane["name"],
+                "source": lane["source"],
+                "detail": lane["detail"],
+                "bands":  band_info,
+            })
+    except Exception as exc:
+        _log.exception("agent simulate-gel: band computation failed")
+        return ({"error": f"band computation failed: {exc}"}, 500)
+    response: dict = {
+        "ok":          True,
+        "agarose_pct": min(_AGAROSE_CHOICES,
+                            key=lambda g: abs(g - agarose)),
+        "height":      height,
+        "lane_width":  lane_width,
+        "lanes":       lane_results,
+    }
+    if include_image:
+        try:
+            rt = _render_gel_image(
+                cleaned_lanes,
+                template_seq=template,
+                template_circular=template_circular,
+                pcr_amplicon=pcr_amplicon,
+                agarose_pct=agarose,
+                height=height,
+                lane_width=lane_width,
+            )
+            # `Text.plain` strips Rich styles — agent gets a plain
+            # ASCII rendering it can paste into a terminal.
+            response["image"] = rt.plain
+        except Exception as exc:
+            _log.exception("agent simulate-gel: image render failed")
+            return ({"error": f"image render failed: {exc}"}, 500)
+    source_mix: dict[str, int] = {}
+    for lane in cleaned_lanes:
+        source_mix[lane["source"]] = source_mix.get(lane["source"], 0) + 1
+    _log_event("simulator.gel.agent",
+                n_lanes=len(cleaned_lanes),
+                agarose_pct=agarose,
+                template_bp=len(template),
+                sources=source_mix,
+                include_image=include_image)
+    return response
+
+
+@_agent_endpoint("design-gb-part")
+def _h_design_gb_part(app, payload):
+    """Design Golden Braid / MoClo domestication primers. Body:
+    ``{template, start, end, part_type, grammar?, target_tm?,
+        codon_taxid?}``.
+
+    `template` is the source DNA sequence; `start`/`end` are 0-based
+    half-open coords (wrap-aware: end < start means origin-spanning
+    on a circular plasmid). `part_type` must be a position type in
+    the named grammar (default `gb_l0`). When `part_type` is a
+    coding type and `codon_taxid` resolves to a codon table,
+    internal forbidden sites are silently repaired via synonymous
+    substitution.
+
+    Returns the `_design_gb_primers` dict (insert_seq, primer pairs,
+    mutations list, overhang labels).
+    """
+    template = payload.get("template")
+    if not isinstance(template, str) or not template.strip():
+        return ({"error": "missing or non-string 'template'"}, 400)
+    template_clean = "".join(ch for ch in template.upper()
+                              if ch in "ACGTRYWSMKBDHVN")
+    if not template_clean:
+        return ({"error": "no IUPAC bases in 'template'"}, 400)
+    if len(template_clean) > _PAIRWISE_MAX_LEN:
+        return ({"error": f"'template' exceeds "
+                  f"{_PAIRWISE_MAX_LEN:,} bp cap"}, 413)
+    start = _coerce_int(payload.get("start"), name="start")
+    if isinstance(start, str):
+        return ({"error": start}, 400)
+    end = _coerce_int(payload.get("end"), name="end")
+    if isinstance(end, str):
+        return ({"error": end}, 400)
+    n = len(template_clean)
+    if not (0 <= start < n) or not (0 < end <= n):
+        return ({"error": f"start/end out of range for "
+                  f"{n}-bp template"}, 400)
+    # 2026-05-27 (audit-5 domesticator M2): accept optional `strand`
+    # parameter. The GUI's `_resolve_source` already respects the
+    # feature strand (H1 fix); programmatic callers can now do the
+    # same. Strand = -1 means the CDS is on the bottom strand; we
+    # RC the slice before passing to `_design_gb_primers` so codon
+    # repair runs in the right frame.
+    strand = payload.get("strand", 1)
+    try:
+        strand = int(strand)
+    except (TypeError, ValueError):
+        return ({"error": "'strand' must be 1 or -1"}, 400)
+    if strand not in (1, -1):
+        return ({"error": "'strand' must be 1 or -1"}, 400)
+    if strand == -1:
+        # Wrap-aware slice + RC. Mirrors `_resolve_source`'s logic.
+        if end < start:
+            fwd_slice = (template_clean[start:n] + template_clean[:end])
+        else:
+            fwd_slice = template_clean[start:end]
+        template_clean = _rc(fwd_slice)
+        start = 0
+        end = len(template_clean)
+        n = len(template_clean)
+    part_type = payload.get("part_type")
+    if not isinstance(part_type, str) or not part_type:
+        return ({"error": "missing 'part_type'"}, 400)
+    gid = payload.get("grammar", "gb_l0")
+    if not isinstance(gid, str):
+        return ({"error": "'grammar' must be string"}, 400)
+    grammar = _all_grammars().get(gid)
+    if grammar is None:
+        return ({"error": f"unknown grammar id {gid!r}"}, 404)
+    target_tm = payload.get("target_tm", 60.0)
+    try:
+        target_tm = float(target_tm)
+    except (TypeError, ValueError):
+        return ({"error": "'target_tm' must be a number"}, 400)
+    if not (40.0 <= target_tm <= 90.0):
+        return ({"error": "'target_tm' must be in [40, 90] °C"}, 400)
+    codon_raw = None
+    codon_taxid = payload.get("codon_taxid")
+    if codon_taxid is not None:
+        if not isinstance(codon_taxid, str):
+            return ({"error": "'codon_taxid' must be string"}, 400)
+        entry = _codon_tables_get(codon_taxid)
+        if entry is None:
+            return ({"error": f"unknown codon_taxid {codon_taxid!r}"},
+                    404)
+        codon_raw = entry.get("raw")
+    try:
+        result = _design_gb_primers(
+            template_clean, start, end, part_type,
+            target_tm=target_tm, codon_raw=codon_raw, grammar=grammar,
+        )
+    except Exception as exc:
+        _log.exception("agent design-gb-part: design failed")
+        return ({"error": f"design failed: {exc}"}, 500)
+    if isinstance(result, dict) and result.get("error"):
+        return ({"error": result["error"]}, 422)
+    return {"ok": True, "result": result}
+
+
+@_agent_endpoint("design-primers")
+def _h_design_primers(app, payload):
+    """Generic primer-pair design over a target region. Body:
+    ``{template, start, end, mode?: "cloning"|"detection",
+        target_tm?: float, site_5?: str, site_3?: str}``.
+
+    Wraps `_design_detection_primers` and
+    `_design_cloning_primers_raw`. **Detection** mode picks a
+    diagnostic amplicon WITHIN the selected region (no overhangs).
+    **Cloning** mode requires `site_5` + `site_3` recognition-site
+    strings and appends them to the primers as RE-cloning tails;
+    for cloning-grammar overhangs (Golden Braid / MoClo Type IIS)
+    use `design-gb-part` instead.
+
+    Returns a primer dict with `fwd_full`, `rev_full`, `fwd_tm`,
+    `rev_tm`, `amplicon_len`, plus mode-specific keys.
+    """
+    template = payload.get("template")
+    if not isinstance(template, str) or not template.strip():
+        return ({"error": "missing or non-string 'template'"}, 400)
+    template_clean = "".join(ch for ch in template.upper()
+                              if ch in "ACGTRYWSMKBDHVN")
+    if not template_clean:
+        return ({"error": "no IUPAC bases in 'template'"}, 400)
+    if len(template_clean) > _PAIRWISE_MAX_LEN:
+        return ({"error": f"'template' exceeds "
+                  f"{_PAIRWISE_MAX_LEN:,} bp cap"}, 413)
+    start = _coerce_int(payload.get("start"), name="start")
+    if isinstance(start, str):
+        return ({"error": start}, 400)
+    end = _coerce_int(payload.get("end"), name="end")
+    if isinstance(end, str):
+        return ({"error": end}, 400)
+    n = len(template_clean)
+    if not (0 <= start < n) or not (0 < end <= n):
+        return ({"error": f"start/end out of range for "
+                  f"{n}-bp template"}, 400)
+    mode = payload.get("mode", "detection")
+    if mode not in ("cloning", "detection"):
+        return ({"error": "'mode' must be 'cloning' or 'detection'"},
+                400)
+    target_tm = payload.get("target_tm", 60.0)
+    try:
+        target_tm = float(target_tm)
+    except (TypeError, ValueError):
+        return ({"error": "'target_tm' must be a number"}, 400)
+    if not (40.0 <= target_tm <= 90.0):
+        return ({"error": "'target_tm' must be in [40, 90] °C"}, 400)
+    try:
+        if mode == "detection":
+            result = _design_detection_primers(
+                template_clean, start, end, target_tm=target_tm,
+            )
+        else:
+            site_5 = payload.get("site_5", "")
+            site_3 = payload.get("site_3", "")
+            if not isinstance(site_5, str) or not isinstance(site_3, str):
+                return ({"error": "cloning mode requires 'site_5' + "
+                          "'site_3' recognition-site strings"}, 400)
+            result = _design_cloning_primers_raw(
+                template_clean, start, end,
+                site_5=site_5.upper(), site_3=site_3.upper(),
+                target_tm=target_tm,
+            )
+    except Exception as exc:
+        _log.exception("agent design-primers: design failed")
+        return ({"error": f"design failed: {exc}"}, 500)
+    if isinstance(result, dict) and result.get("error"):
+        return ({"error": result["error"]}, 422)
+    return {"ok": True, "mode": mode, "result": result}
+
+
+@_agent_endpoint("list-experiments")
+def _h_list_experiments(app, payload):
+    """List entries in the active experiment project's notebook.
+    Returns id, title, tag list, timestamps + body byte length per
+    entry (omits `body_md` itself to keep responses small — fetch
+    via ``get-experiment``)."""
+    out: "list[dict]" = []
+    for e in _load_experiments():
+        body = e.get("body_md") or ""
+        body_bytes = len(body.encode("utf-8", errors="replace")) \
+            if isinstance(body, str) else 0
+        out.append({
+            "id":          e.get("id", ""),
+            "title":       e.get("title", ""),
+            "tags":        list(e.get("tags") or []),
+            "created_at":  e.get("created_at", ""),
+            "updated_at":  e.get("updated_at", ""),
+            "body_bytes":  body_bytes,
+            "attached_plasmid_ids": list(
+                e.get("attached_plasmid_ids") or [],
+            ),
+            "attached_gel_ids":     list(e.get("attached_gel_ids") or []),
+            "attached_actions":     list(e.get("attached_actions") or []),
+            "image_paths":          list(e.get("image_paths") or []),
+        })
+    return {"experiments": out,
+            "active_project": _get_active_project_name() or ""}
+
+
+@_agent_endpoint("delete-experiment", write=True)
+def _h_delete_experiment(app, payload):
+    """Delete a notebook entry by id. Removes the attachment dir
+    (`_EXPERIMENTS_DIR/<id>/`) too. Body: ``{id: str}``."""
+    eid = _sanitize_experiment_id(payload.get("id"))
+    if eid is None:
+        return ({"error": "missing or invalid 'id'"}, 400)
+    # Sweep #26: RMW under `_state._cache_lock`.
+    with _state._cache_lock:
+        entries = _load_experiments()
+        new_entries = [e for e in entries if e.get("id") != eid]
+        if len(new_entries) == len(entries):
+            return ({"error": f"no experiment with id {eid!r}"}, 404)
+        err = _agent_save_or_500(
+            lambda: _save_experiments(new_entries), "Experiments",
+        )
+        if err:
+            return err
+    try:
+        _state._delete_experiment_attach_dir_hook(eid)
+    except OSError as exc:
+        _log.warning(
+            "agent delete-experiment: attach dir cleanup failed: %s",
+            exc,
+        )
+    _log_event("experiments.delete", eid=eid, via="agent")
+    return {"ok": True, "id": eid,
+            "remaining": len(new_entries)}
+
+
+@_agent_endpoint("list-experiment-projects")
+def _h_list_experiment_projects(app, payload):
+    """List experiment projects + the currently active one.
+    Returns project name, description, save-stamp, and entry count
+    per project (no body content — fetch via ``list-experiments``
+    after switching active)."""
+    projs = _load_experiment_projects()
+    out: "list[dict]" = []
+    for p in projs:
+        raw_entries = p.get("experiments") or []
+        n = len(raw_entries) if isinstance(raw_entries, list) else 0
+        out.append({
+            "name":        p.get("name", ""),
+            "description": p.get("description", ""),
+            "saved":       p.get("saved", ""),
+            "n_entries":   n,
+        })
+    return {"projects": out,
+            "active": _get_active_project_name() or ""}
+
+
+@_agent_endpoint("set-active-experiment-project", write=True)
+def _h_set_active_experiment_project(app, payload):
+    """Switch the active experiment project. Body: ``{name: str}``.
+    Mirrors the GUI flow (invariant #43 + sweep #9): updates the
+    active-pointer, forces a sync settings flush, then writes the
+    target project's entries into `experiments.json`. Power-loss
+    safe across the two writes."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name:
+        return ({"error": "missing 'name'"}, 400)
+    # Sweep #26 (2026-05-25): hold `_state._cache_lock` across the
+    # (find-target → set-pointer → save-disk → null-cache) flow so
+    # a concurrent `_save_experiments` from another thread can't
+    # interleave: pre-fix the OTHER thread's save could complete +
+    # reseat `_state._experiments_cache` between our `_safe_save_json` and
+    # our `_state._experiments_cache = None`, leaving the
+    # cache in the OTHER thread's freshly-saved state — which the
+    # next `_load_experiments` would then return, masking our
+    # project switch. RLock allows the nested re-entry from
+    # `_settings_flush_sync` (which may touch `_set_setting`'s
+    # locked path).
+    with _state._cache_lock:
+        target = _find_project(name)
+        if target is None:
+            return ({"error": f"no project named {name!r}"}, 404)
+        raw_entries = target.get("experiments") or []
+        if not isinstance(raw_entries, list):
+            raw_entries = []
+        target_entries = [e for e in raw_entries if isinstance(e, dict)]
+        _set_active_project_name(name)
+        _state._settings_flush_sync_hook()
+        try:
+            # [INV-83, sweep #27] Agent project-switch mirror-swap;
+            # source-of-truth is experiment_projects.json.
+            _safe_save_json_mirror(
+                _state._EXPERIMENTS_FILE, target_entries, "Experiments",
+            )
+        except (OSError, RuntimeError) as exc:
+            _notify_save_failure(
+                _state._LIVE_APP_REF.get(), "Experiments", exc,
+            )
+            return ({"error": f"save failed: {_scrub_path(str(exc))}"}, 500)
+        _state._experiments_cache = None
+    return {"ok": True, "active": name,
+            "n_entries": len(target_entries)}
+
+
+@_agent_endpoint("rename-experiment-project", write=True)
+def _h_rename_experiment_project(app, payload):
+    """Rename a project. Body: ``{name: str, new_name: str}``. If
+    the renamed project is the active one, the active-pointer
+    follows so subsequent ``_save_experiments`` mirrors land in the
+    correct slot."""
+    old = payload.get("name")
+    if not isinstance(old, str) or not old.strip():
+        return ({"error": "missing 'name'"}, 400)
+    old = old.strip()
+    new = _sanitize_label(payload.get("new_name"), max_len=200)
+    if not new:
+        return ({"error": "missing 'new_name'"}, 400)
+    if old == new:
+        return ({"error": "old and new names are identical"}, 400)
+    # Sweep #26: RMW under `_state._cache_lock`.
+    with _state._cache_lock:
+        projs = _load_experiment_projects()
+        if not any((p.get("name") or "").strip() == old for p in projs):
+            return ({"error": f"no project named {old!r}"}, 404)
+        if any((p.get("name") or "").strip() == new for p in projs):
+            return ({"error": f"name {new!r} already taken"}, 409)
+        for p in projs:
+            if p.get("name") == old:
+                p["name"]  = new
+                p["saved"] = _date.today().isoformat()
+                break
+        err = _agent_save_or_500(
+            lambda: _save_experiment_projects(projs),
+            "Experiment projects",
+        )
+        if err:
+            return err
+        if _get_active_project_name() == old:
+            _set_active_project_name(new)
+            _state._settings_flush_sync_hook()
+    _log_event("project.renamed", old=old, new=new, via="agent")
+    return {"ok": True, "name": new}
+
+
+@_agent_endpoint("delete-experiment-project", write=True)
+def _h_delete_experiment_project(app, payload):
+    """Delete a project + its entries. Body: ``{name: str}``.
+    Refuses to delete the last remaining project (matches the GUI
+    last-project guard). If the deleted project was active,
+    promotes the first remaining project to active."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing 'name'"}, 400)
+    name = name.strip()
+    # Sweep #26: RMW under `_state._cache_lock`.
+    with _state._cache_lock:
+        projs = _load_experiment_projects()
+        if len(projs) <= 1:
+            return ({"error":
+                      "cannot delete the last remaining project"}, 409)
+        if not any((p.get("name") or "").strip() == name for p in projs):
+            return ({"error": f"no project named {name!r}"}, 404)
+        was_active = _get_active_project_name() == name
+        new_projs = [p for p in projs if p.get("name") != name]
+        err = _agent_save_or_500(
+            lambda: _save_experiment_projects(new_projs),
+            "Experiment projects",
+        )
+        if err:
+            return err
+        # The auto-promote + mirror-swap must stay under the same
+        # _state._cache_lock hold (RLock, so the inner load/save re-enter
+        # safely) — otherwise a concurrent _save_experiments can
+        # reseat the cache between our save and the cache-null below,
+        # desyncing cache from disk. Matches the locked UI sibling
+        # ExperimentProjectsPickerModal._do_delete.
+        promoted = ""
+        if was_active and new_projs:
+            promoted = new_projs[0].get("name") or ""
+            _set_active_project_name(promoted)
+            _state._settings_flush_sync_hook()
+            raw_entries = new_projs[0].get("experiments") or []
+            if not isinstance(raw_entries, list):
+                raw_entries = []
+            target_entries = [
+                e for e in raw_entries if isinstance(e, dict)
+            ]
+            try:
+                # [INV-83, sweep #27] Agent project-delete auto-promotes;
+                # mirror-swap to the promoted project's entries.
+                _safe_save_json_mirror(
+                    _state._EXPERIMENTS_FILE, target_entries, "Experiments",
+                )
+            except (OSError, RuntimeError):
+                pass
+            _state._experiments_cache = None
+    _log_event("project.deleted", name=name, via="agent",
+                promoted=promoted)
+    return {"ok": True, "name": name, "promoted": promoted}
+
+
+@_agent_endpoint("get-enzyme-collection")
+def _h_get_enzyme_collection(app, payload):
+    """Return one enzyme collection by `name`. Body: ``{name}``."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing or non-string 'name'"}, 400)
+    name = name.strip()
+    coll = _find_enzyme_collection(name)
+    if coll is None:
+        return ({"error": f"unknown enzyme collection {name!r}"}, 404)
+    return {"ok": True, "collection": coll}
+
+
+@_agent_endpoint("update-enzyme-collection", write=True)
+def _h_update_enzyme_collection(app, payload):
+    """Replace an existing enzyme collection by `name`. Body:
+    ``{name, enzymes?: [str, ...], new_name?: str}``. ``new_name``
+    renames the collection (and updates the active pointer if it
+    matched). Omitting ``enzymes`` keeps the existing list."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing or non-string 'name'"}, 400)
+    name = name.strip()
+    new_name = payload.get("new_name")
+    if new_name is not None:
+        new_name = _sanitize_label(new_name, max_len=200)
+        if not new_name:
+            return ({"error": "'new_name' must be a non-empty string"}, 400)
+    enzymes_arg = payload.get("enzymes")
+    if enzymes_arg is not None:
+        if not isinstance(enzymes_arg, list) or not all(
+                isinstance(e, str) for e in enzymes_arg):
+            return ({"error":
+                      "'enzymes' must be a list of strings"}, 400)
+    # Sweep #25: full RMW under `_state._cache_lock` (see
+    # `_h_create_custom_enzyme` docstring for rationale).
+    with _state._cache_lock:
+        entries = _load_enzyme_collections()
+        for i, e in enumerate(entries):
+            if e.get("name") == name:
+                updated = dict(e)
+                if new_name is not None:
+                    # Reject rename onto an already-taken name.
+                    if new_name != name and any(
+                            x.get("name") == new_name for x in entries):
+                        return ({"error":
+                                  f"name {new_name!r} already exists"}, 409)
+                    updated["name"] = new_name
+                if enzymes_arg is not None:
+                    updated["enzymes"] = sorted(set(enzymes_arg))
+                entries[i] = updated
+                if (err := _agent_save_or_500(
+                        lambda: _save_enzyme_collections(entries),
+                        "Enzyme collections")) is not None:
+                    return err
+                # Update active pointer on rename.
+                if new_name is not None and new_name != name and \
+                        _get_active_enzyme_collection_name() == name:
+                    _set_active_enzyme_collection_name(new_name)
+                return {"ok": True, "name": updated["name"]}
+    return ({"error": f"unknown enzyme collection {name!r}"}, 404)
+
+
+@_agent_endpoint("delete-enzyme-collection", write=True)
+def _h_delete_enzyme_collection(app, payload):
+    """Delete an enzyme collection by `name`. If the deleted
+    collection was the active one, clears the active pointer."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing or non-string 'name'"}, 400)
+    name = name.strip()
+    # Sweep #25: full RMW under `_state._cache_lock` (see
+    # `_h_create_custom_enzyme` docstring for rationale).
+    with _state._cache_lock:
+        entries = _load_enzyme_collections()
+        new_entries = [e for e in entries if e.get("name") != name]
+        if len(new_entries) == len(entries):
+            return ({"error": f"unknown enzyme collection {name!r}"}, 404)
+        if (err := _agent_save_or_500(
+                lambda: _save_enzyme_collections(new_entries),
+                "Enzyme collections")) is not None:
+            return err
+    if _get_active_enzyme_collection_name() == name:
+        _set_active_enzyme_collection_name(None)
+    return {"ok": True, "name": name}
+
+
+@_agent_endpoint("get-active-enzyme-collection")
+def _h_get_active_enzyme_collection(app, payload):
+    """Return the currently active enzyme collection name (or
+    ``None`` if no collection is active — the scanner then uses the
+    full catalog)."""
+    return {"ok": True, "name": _get_active_enzyme_collection_name()}
+
+
+@_agent_endpoint("set-active-enzyme-collection", write=True)
+def _h_set_active_enzyme_collection(app, payload):
+    """Set or clear the active enzyme collection pointer. Body:
+    ``{name: str | null}`` — ``null`` clears the pointer. Refuses
+    names that don't resolve to an existing collection."""
+    name = payload.get("name")
+    if name is not None and (not isinstance(name, str) or not name.strip()):
+        return ({"error":
+                  "'name' must be a non-empty string or null"}, 400)
+    if isinstance(name, str):
+        name = name.strip()
+        if _find_enzyme_collection(name) is None:
+            return ({"error":
+                      f"unknown enzyme collection {name!r}"}, 404)
+    _set_active_enzyme_collection_name(name)
+    return {"ok": True, "name": name}
+
+
+@_agent_endpoint("auto-detect-entry-vectors", write=True)
+def _h_auto_detect_entry_vectors(app, payload):
+    """Run the Type-IIS-digest auto-detection pass across every
+    library entry and bind newly-detected acceptors to their grammar
+    roles. Body: ``{grammar_ids?: list[str] = <all>}``.
+
+    Sacred — existing user bindings are NEVER clobbered (invariant
+    #47). Returns the consolidated summary string + per-grammar
+    bound-role count. Use ``list-entry-vectors`` afterwards to see
+    the new bindings."""
+    grammar_ids = payload.get("grammar_ids")
+    if grammar_ids is not None and not isinstance(grammar_ids, list):
+        return ({"error":
+                  "'grammar_ids' must be a list of grammar id strings"
+                }, 400)
+    entries = _load_library()
+    summary = _state._auto_bind_entry_vectors_from_entries_hook(
+        entries,
+        grammar_ids=grammar_ids,
+    )
+    return {"ok": True, "summary": summary}

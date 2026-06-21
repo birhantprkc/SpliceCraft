@@ -436,3 +436,26 @@ def _resolve_data_attr_unregistered(name: str):
         "user-data attr resolver hook called before the hub registered it")
 _resolve_data_attr_hook: "_Callable[[str], object]" = _resolve_data_attr_unregistered
 _gc_orphan_blobs_hook: "_Callable[[], int] | None" = None
+# Deferred-agent-handler hooks (Phase D) — the data-only agent handlers in
+# splicecraft_agent reach these deep-coupled hub-side fns (in-process BLAST/HMM
+# (pyhmmer), the alignment engine, PCR sim, the settings-flush + master-delete +
+# assembly-fragment caches, the experiment blob dir, the entry-vector binder)
+# through these hooks instead of importing the hub. The fns STAY hub-side (their
+# own deep deps + hub callers); the hub registers each at import. Typed
+# NON-optional with a fail-loud default (the hooks are always live before any
+# endpoint runs) so pyright sees them as callable rather than `... | None`.
+def _deferred_agent_hook_unregistered(*args, **kwargs):
+    raise RuntimeError(
+        "a deferred-agent-handler hook was called before the hub registered it")
+_settings_flush_sync_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
+_pick_best_rotation_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
+_reset_master_delete_cache_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
+_bulk_export_collection_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
+_blast_search_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
+_blast_get_db_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
+_detect_query_program_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
+_hmmscan_run_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
+_clear_assembly_fragment_cache_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
+_simulate_pcr_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
+_delete_experiment_attach_dir_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered
+_auto_bind_entry_vectors_from_entries_hook: "_Callable[..., _Any]" = _deferred_agent_hook_unregistered

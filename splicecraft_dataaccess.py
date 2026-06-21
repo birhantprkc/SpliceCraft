@@ -2589,3 +2589,105 @@ def _set_active_primer_collection_name(name: "str | None") -> None:
             prev=prev or "", new=target,
         )
     _set_setting("active_primer_collection", target)
+
+
+# ── Active-name getters/setters + finders (Phase D: project / enzyme-collection /
+# parts-bin). Settings-backed data ops, same shape as the active-primer-collection
+# pair above; relocated from the hub so the agent endpoints + hub callers resolve
+# them here. The enzyme catalog is reached via `_state._all_enzymes_hook`.
+def _find_enzyme_collection(name: str) -> "dict | None":
+    """Return the collection dict matching ``name`` (case-sensitive), or
+    None. Operates on the readonly cache view to avoid the deepcopy cost
+    on hot read paths (modal grammar selector, restriction-scan dispatch)."""
+    if not isinstance(name, str) or not name:
+        return None
+    if _state._enzyme_collections_cache is None:
+        _load_enzyme_collections()  # populates the cache as a side effect
+    for entry in (_state._enzyme_collections_cache or []):
+        if isinstance(entry, dict) and entry.get("name") == name:
+            return _typed_clone(entry)
+    return None
+
+
+def _get_active_enzyme_collection_name() -> "str | None":
+    """Return the active enzyme-collection name, or None when the user
+    hasn't picked one (= scan against the full NEB master catalog)."""
+    val = _get_setting("active_enzyme_collection", None)
+    return val if isinstance(val, str) and val else None
+
+
+def _set_active_enzyme_collection_name(name: "str | None") -> None:
+    """Persist (or clear) the active enzyme-collection pointer."""
+    prev = _get_active_enzyme_collection_name()
+    target = name or ""
+    if prev != target:
+        _log_event(
+            "enzyme_collection.switched",
+            prev=prev or "", new=target,
+        )
+    _set_setting("active_enzyme_collection", target)
+
+
+def _active_enzyme_allowed_set() -> "frozenset[str] | None":
+    """Resolve the enzyme allow-list for the active enzyme collection.
+
+    Returns ``None`` when no collection is active or the active one is
+    empty/missing — caller treats None as "scan the full master
+    catalog" (built-in NEB ∪ user-added custom enzymes). Filters
+    against `_state._all_enzymes_hook()` so a stale name in a collection (manually
+    edited JSON, deleted built-in, or a custom enzyme since removed)
+    never reaches the scanner."""
+    name = _get_active_enzyme_collection_name()
+    if not name:
+        return None
+    coll = _find_enzyme_collection(name)
+    if not coll:
+        return None
+    enzymes = coll.get("enzymes") or []
+    if not isinstance(enzymes, list):
+        return None
+    known = _state._all_enzymes_hook()
+    parsed = frozenset(
+        n for n in enzymes
+        if isinstance(n, str) and n in known
+    )
+    return parsed or None
+
+
+def _get_active_parts_bin_name() -> "str | None":
+    val = _get_setting("active_parts_bin", None)
+    return val if isinstance(val, str) and val else None
+
+
+def _set_active_parts_bin_name(name: "str | None") -> None:
+    _set_setting("active_parts_bin", name or "")
+
+
+def _find_parts_bin(name: str) -> "dict | None":
+    for b in _load_parts_bin_collections():
+        if b.get("name") == name:
+            return b
+    return None
+
+
+def _get_active_project_name() -> "str | None":
+    val = _get_setting("active_project", None)
+    return val if isinstance(val, str) and val else None
+
+
+def _set_active_project_name(name: "str | None") -> None:
+    """Persist (or clear) the active-project pointer. Emits a
+    `project.switched` event on actual change so debug bundles
+    capture the switch context (mirrors `collection.switched`)."""
+    prev = _get_active_project_name()
+    target = name or ""
+    if prev != target:
+        _log_event("project.switched", prev=prev or "", new=target)
+    _set_setting("active_project", target)
+
+
+def _find_project(name: str) -> "dict | None":
+    for p in _load_experiment_projects():
+        if p.get("name") == name:
+            return p
+    return None

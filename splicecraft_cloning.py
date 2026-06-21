@@ -2743,3 +2743,43 @@ def _grammar_position_overhangs(grammar: dict,
         if p and p.get("oh5") and p.get("oh3"):
             return str(p["oh5"]), str(p["oh3"])
     return None
+
+
+# ── PCR backend caps (Phase D) — shared by the hub PCR simulator (_simulate_pcr,
+# which stays hub-side via its _state hook) + the agent PCR endpoint's input
+# validation; relocated here so both resolve them (the early cloning re-export
+# covers the hub default-arg uses).
+_PCR_MIN_PRIMER_LEN     = 10       # primers shorter than this can't anneal
+
+
+_PCR_MAX_PRIMER_LEN     = 80       # absurdly long primer = user error
+
+
+_PCR_DEFAULT_MAX_AMPLICON = 20_000   # bp — function / agent default ceiling
+
+
+# UI default for the Simulator's "Max amplicon" box: 500 bp is a common
+# amplicon size, a friendlier starting point than the 20 kb long-PCR
+# ceiling. UI-only — the function / agent default above is unchanged.
+_PCR_UI_DEFAULT_MAX_AMPLICON = 500
+
+
+_PCR_AMPLICON_HARD_CAP  = 100_000  # bp — safety cap regardless of UI input
+
+
+_PCR_MAX_AMPLICONS      = 50       # cap on result count (a mispriming primer
+
+
+                                   # on a repetitive template can yield 1000s)
+_PCR_MAX_TEMPLATE_BP    = 5_000_000  # 5 Mb — above this we skip the run rather
+
+
+                                     # than freeze the UI on chromosome-scale
+                                     # inputs (genome chunks via FASTA import
+                                     # routinely break this threshold).
+# Pathological case: a 10-bp ACGT-only primer on a 5 Mb template can yield
+# ≈ 4,768 expected hits at random; an A-rich primer on an A-rich tract can
+# yield orders of magnitude more. The fwd × rev double-loop is O(N²); cap
+# either side at this many positions and refuse — surfacing a clearer error
+# than a multi-second UI freeze on a pure-A primer.
+_PCR_MAX_PRIMER_HITS    = 5_000

@@ -40,12 +40,17 @@ from pathlib import Path
 import splicecraft_state as _state
 from splicecraft_logging import _log, _log_event, _timed
 from splicecraft_persistence import (
+    _allow_catastrophic_shrink,
     _atomic_write_bytes,
     _atomic_write_text,
+    _backup_info,
     _compress_old_backups,
+    _extract_entries,
+    _iter_backups,
     _prune_backups,
     _prune_lost_entries,
     _safe_file_size_check,
+    _safe_save_json,
 )
 from splicecraft_util import _RUNTIME_PLATFORM, _is_windows_reserved_stem
 
@@ -1616,3 +1621,173 @@ def _format_pre_update_snapshot_table(snaps: "list[dict]") -> str:
             f"({when})"
         )
     return "\n".join(lines)
+
+
+# ── Settings -> Restore-from-backup (the per-file recovery UI's engine; distinct
+# from the pre-update snapshot restore above). Discovers every recoverable copy of
+# a target JSON across the four storage tiers + applies one back to the live file
+# (chokepoint-guarded via persistence). `_AGENT_BACKUP_LABELS` maps the agent /
+# GUI friendly backup-target names to their _state attr; the hub GUI restore reads
+# it via the re-export. `_resolve_backup_label` resolves attrs via the _state hook.
+def _list_recoverable_backups(target_path: Path) -> "list[dict]":
+    """Return every recoverable copy of `target_path` across the four
+    storage tiers, sorted newest first.
+
+    Each entry: ``{kind, source_path, n_entries, mtime_str}`` where
+    ``kind`` is one of:
+      * ``"legacy_bak"``    — single-generation `<file>.bak`
+      * ``"rotating_bak"``  — timestamped `<file>.bak.YYYYMMDD-HHMMSS`
+      * ``"snapshot"``      — daily snapshot in `<DATA_DIR>/snapshots/`
+      * ``"lost_entries"``  — shrink-guard spillover in
+                               `<DATA_DIR>/lost_entries/`
+    """
+    found: list[dict] = []
+    data_dir = target_path.parent
+    # Legacy single-gen backup.
+    legacy = target_path.with_suffix(target_path.suffix + ".bak")
+    if legacy.exists():
+        info = _backup_info(legacy)
+        if info:
+            found.append({"kind": "legacy_bak",
+                          "source_path": legacy, **info})
+    # Rotating multi-gen backups (covers both `.bak.<ts>` and
+    # collision-bumped `.bak.<ts>.<N>`).
+    for bak in _iter_backups(target_path):
+        info = _backup_info(bak)
+        if info:
+            found.append({"kind": "rotating_bak",
+                          "source_path": bak, **info})
+    # Daily snapshots.
+    snap_dir = data_dir / _state._SNAPSHOT_DIR_NAME
+    if snap_dir.exists():
+        try:
+            stem = target_path.stem
+            ext = target_path.suffix
+            for snap in snap_dir.glob(f"{stem}-*{ext}"):
+                info = _backup_info(snap)
+                if info:
+                    found.append({"kind": "snapshot",
+                                  "source_path": snap, **info})
+        except OSError:
+            pass
+    # Lost-entries spillover.
+    lost_dir = data_dir / _state._LOST_ENTRIES_DIR_NAME
+    if lost_dir.exists():
+        try:
+            for lost in lost_dir.glob(f"{target_path.stem}-*.json"):
+                info = _backup_info(lost)
+                if info:
+                    found.append({"kind": "lost_entries",
+                                  "source_path": lost, **info})
+        except OSError:
+            pass
+    # Newest first by mtime string (lex-sortable).
+    found.sort(key=lambda x: x["mtime_str"], reverse=True)
+    return found
+
+
+def _restore_from_backup(target_path: Path, source_path: Path,
+                          label: str) -> int:
+    """Read entries from `source_path` and write them onto
+    `target_path` via `_safe_save_json` so the current state is
+    automatically backed up under the new rotating-backup discipline
+    before being overwritten. Returns the number of entries
+    restored. Raises ValueError on unparseable / oversized source,
+    OSError on write failure.
+
+    Size-capped at `_state._SAFE_LOAD_JSON_MAX_BYTES` to match
+    `_safe_load_json` — a co-resident attacker who planted a 50 GB
+    file under `<DATA_DIR>/` would otherwise OOM the restore worker.
+    Symlink-rejected via lstat.
+    """
+    ok, reason = _safe_file_size_check(
+        source_path, _state._SAFE_LOAD_JSON_MAX_BYTES, "backup",
+    )
+    if not ok:
+        raise ValueError(reason or "backup file rejected")
+    try:
+        raw = json.loads(source_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unreadable backup: {exc}") from exc
+    # If the source backup carries a higher-than-current schema version,
+    # stamp it under the *target* path so the subsequent `_safe_save_json`
+    # write preserves the v stamp instead of demoting it to
+    # `_state._CURRENT_SCHEMA_VERSION`. Mirrors `_safe_load_json`'s observation
+    # logic — restoring a v2 backup onto a v1 SpliceCraft no longer
+    # silently downgrades the user's data on the next save.
+    if isinstance(raw, dict):
+        try:
+            observed_v = int(raw.get("_schema_version", 0))
+        except (TypeError, ValueError):
+            observed_v = 0
+        if observed_v > _state._CURRENT_SCHEMA_VERSION:
+            _state._OBSERVED_SCHEMA_VERSIONS[str(target_path)] = observed_v
+    entries, _shape_warn = _extract_entries(raw, label)
+    if entries is None:
+        raise ValueError(
+            f"backup {source_path.name} is not a recognisable "
+            f"{label} payload"
+        )
+    # Restore can legitimately write a small backup over a large live
+    # file (e.g. user picks `library.json.bak.<old>` after a recent
+    # bulk add). Opt in to the L3 catastrophic-shrink bypass so the
+    # restore isn't blocked by the same guard that catches accidental
+    # wipes.
+    with _allow_catastrophic_shrink():
+        _safe_save_json(target_path, entries, label)
+    return len(entries)
+
+
+# Mapping of user-friendly data-file labels to the splicecraft attr
+# that holds the live path. Agents pass the friendly label so we don't
+# leak filesystem-paths into the wire surface, and so a relocated
+# DATA_DIR doesn't require an agent-side change.
+_AGENT_BACKUP_LABELS: dict = {
+    "plasmid_library":         "_LIBRARY_FILE",
+    "collections":             "_COLLECTIONS_FILE",
+    "parts_bin":               "_PARTS_BIN_FILE",
+    "parts_bin_collections":   "_PARTS_BIN_COLLECTIONS_FILE",
+    "primers":                 "_PRIMERS_FILE",
+    "primer_collections":      "_PRIMER_COLLECTIONS_FILE",
+    "features":                "_FEATURES_FILE",
+    "feature_colors":          "_FEATURE_COLORS_FILE",
+    "grammars":                "_GRAMMARS_FILE",
+    "entry_vectors":           "_ENTRY_VECTORS_FILE",
+    "codon_tables":            "_CODON_TABLES_FILE",
+    "settings":                "_SETTINGS_FILE",
+    # Parity with `RestoreFromBackupModal._TARGETS` — agent should
+    # be able to list/restore every persisted user-data file the GUI
+    # can. Pre-fix the agent rejected Experiments/Gels/Protein-motifs
+    # labels even though their `.bak` files exist on disk.
+    "experiments":             "_EXPERIMENTS_FILE",
+    "experiment_projects":     "_EXPERIMENT_PROJECTS_FILE",
+    "gels":                    "_GELS_FILE",
+    "protein_motifs":          "_PROTEIN_MOTIFS_FILE",
+    # Enzyme catalog extensions (2026-05-22). Parity with
+    # `RestoreFromBackupModal._TARGETS` and `_USER_DATA_FILE_ATTRS`.
+    "custom_enzymes":          "_CUSTOM_ENZYMES_FILE",
+    "enzyme_collections":      "_ENZYME_COLLECTIONS_FILE",
+    # Sweep #28: HMM database registry (covers the catalog JSON, not
+    # the per-DB downloads under hmm_databases/<id>/ — those are large
+    # binaries handled by the file-level Master Delete sweep, not by
+    # the .bak rotation backup chain).
+    "hmm_db_catalog":          "_HMM_DB_CATALOG_FILE",
+    "protein_collections":     "_PROTEIN_COLLECTIONS_FILE",
+}
+
+
+def _resolve_backup_label(label: str) -> "tuple[Path | None, str]":
+    """Map a label → Path + human label. Returns (None, error_msg)
+    if the label isn't registered. Used by both list/restore agent
+    endpoints so the validation is uniform."""
+    if not isinstance(label, str) or not label:
+        return (None, "missing 'label'")
+    attr = _AGENT_BACKUP_LABELS.get(label)
+    if attr is None:
+        return (None,
+                f"unknown label {label!r} (valid: "
+                f"{sorted(_AGENT_BACKUP_LABELS)})")
+    path = _state._resolve_data_attr_hook(attr)
+    if not isinstance(path, Path):
+        return (None, f"label {label!r} not mapped to a Path")
+    return (path, label)
