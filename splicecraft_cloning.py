@@ -10,7 +10,9 @@ merge) and `_gibson_record_from_result`; plus the **traditional (restriction) cl
 simulator** ([INV-127]): the ligation primitives (`_ends_compatible`/`_ligate_fragments`
 /`_close_circular`) and the cut-paste sims (`_simulate_traditional_cloning`(`_multi`),
 `_classify_junction`, `_annotate_scars_on_product`, `_rc_fragment`,
-`_label_disrupted_split_features`). Extracted so the cloning modal/screen siblings can
+`_label_disrupted_split_features`), with the fragment-prep that feeds them
+(`_make_synthetic_fragment`, `_excise_pcr_insert`, `_excise_fragment_pair`,
+`_enzyme_is_type_iis`). Extracted so the cloning modal/screen siblings can
 import them. Layer L3: imports state(L0), biology(L0), dataaccess(L1), record(L1),
 history(L2), logging(L0); used by the modals (L4). The enzyme catalog is reached via
 `_state._all_enzymes_hook` (it reads dataaccess but stays hub-side). Re-exported by the
@@ -25,7 +27,9 @@ if TYPE_CHECKING:  # annotation-only; the real Bio import is lazy, inside the fn
     from Bio.SeqRecord import SeqRecord
 
 import splicecraft_state as _state
-from splicecraft_biology import _iupac_pattern, _rc
+from splicecraft_biology import (
+    _enzyme_cuts, _fragments_from_cuts, _iupac_pattern, _rc,
+)
 from splicecraft_dataaccess import (
     _BUILTIN_GRAMMARS, _GB_CODING_PART_TYPES, _GB_L0_ENZYME_SITE, _GB_PAD, _GB_SPACER,
 )
@@ -1492,3 +1496,254 @@ def _rc_fragment(frag: dict) -> dict:
         "features":     flipped_feats,
         "source_label": frag["source_label"],
     }
+
+
+# ═══ Fragment prep for cloning — moved from the hub ═════════════════════════
+# Build/excise the fragments the cloning sims consume (synthetic PCR-product
+# fragments + digest-and-purify the insert). Enzyme catalog via the hook.
+
+def _make_synthetic_fragment(seq: str, *, enz_left: str, enz_right: str,
+                               source_label: str = "",
+                               features: "list[dict] | None" = None,
+                              ) -> dict:
+    """Synthesise a Fragment from a linear DNA sequence by stamping
+    canonical sticky ends from the chosen enzymes. The simulator doesn't
+    pretend to find recognition sites in the input — it just synthesises the
+    overhangs the chosen enzymes would leave.
+
+    NOTE — schematic only. This keeps the WHOLE input as `top_seq` (it does
+    NOT cut), so it is used for the Constructor's puzzle-piece T-view (which
+    only needs the enzyme overhangs, fed a dummy sequence) and as a low-level
+    overhang primitive in the unit tests. The REAL insert excision —
+    digesting a PCR product and purifying away the primer pad / off-cut bases
+    so they never reach the clone — goes through `_excise_pcr_insert`. Don't
+    route a real cloning insert through here: its untrimmed `top_seq` would
+    carry the pad + outside-the-cut site bases into the ligation product.
+
+    Both enzymes must resolve via `_state._all_enzymes_hook()` (built-in NEB ∪
+    user-added custom enzymes). Raises ValueError on unknown names.
+    Features (if any) are carried through verbatim in `top_seq`-local
+    coordinates — NOT shifted here."""
+    catalog = _state._all_enzymes_hook()
+    if enz_left not in catalog:
+        raise ValueError(f"unknown enzyme: {enz_left!r}")
+    if enz_right not in catalog:
+        raise ValueError(f"unknown enzyme: {enz_right!r}")
+    site_l, fwd_l, rev_l = catalog[enz_left]
+    site_r, fwd_r, rev_r = catalog[enz_right]
+    site_l_u = site_l.upper()
+    site_r_u = site_r.upper()
+    site_l_len = len(site_l_u)
+    site_r_len = len(site_r_u)
+    # Canonical overhang for `enz_left`: top-strand bases of the
+    # recognition site between min(fwd, rev) and max(fwd, rev). This
+    # is what the user effectively "buys" by adding the recognition
+    # site as a primer tail and then digesting.
+    lo_l, hi_l = min(fwd_l, rev_l), max(fwd_l, rev_l)
+    lo_r, hi_r = min(fwd_r, rev_r), max(fwd_r, rev_r)
+    # Type IIS enzymes (BsaI, Esp3I, BsmBI, etc.) cut OUTSIDE their
+    # recognition site, so `hi > site_len` and the overhang depends
+    # on bases the user supplies AFTER the recognition — not on
+    # the recognition itself. The synthetic-fragment model can't
+    # know what those bases are, so it'd produce an empty overhang
+    # and silently fail to ligate. Reject upfront with a message
+    # pointing at the literal-digest mode (a) which DOES handle
+    # Type IIS correctly because it operates on the actual sequence.
+    if hi_l > site_l_len or lo_l < 0:
+        raise ValueError(
+            f"{enz_left!r} cuts outside its recognition site (Type IIS); "
+            f"use 'From plasmid' mode for literal digest"
+        )
+    if hi_r > site_r_len or lo_r < 0:
+        raise ValueError(
+            f"{enz_right!r} cuts outside its recognition site (Type IIS); "
+            f"use 'From plasmid' mode for literal digest"
+        )
+    overhang_l = site_l_u[lo_l:hi_l]
+    overhang_r = site_r_u[lo_r:hi_r]
+    kind_l = ("blunt" if fwd_l == rev_l
+              else "5'" if fwd_l < rev_l else "3'")
+    kind_r = ("blunt" if fwd_r == rev_r
+              else "5'" if fwd_r < rev_r else "3'")
+    return {
+        "top_seq":      seq.upper(),
+        "left":  {"overhang_seq": overhang_l, "kind": kind_l,
+                  "enzyme": enz_left},
+        "right": {"overhang_seq": overhang_r, "kind": kind_r,
+                  "enzyme": enz_right},
+        "features":     [dict(f) for f in (features or [])],
+        "source_label": source_label,
+    }
+
+
+def _enzyme_is_type_iis(name: str) -> bool:
+    """True when ``name`` cuts OUTSIDE its recognition site (Type IIS —
+    BsaI / BsmBI / BbsI / SapI / Esp3I …). The add-cut-sites cloning model
+    only places the recognition site in the primer tail, so a Type IIS
+    enzyme (whose overhang depends on bases AFTER the site) can't be used
+    that way — mirrors the reject in `_make_synthetic_fragment`."""
+    ent = _state._all_enzymes_hook().get(name)
+    if not ent or len(ent) < 3:
+        return False
+    try:
+        site = ent[0]
+        lo = min(int(ent[1]), int(ent[2]))
+        hi = max(int(ent[1]), int(ent[2]))
+    except (TypeError, ValueError):
+        return False
+    return hi > len(site) or lo < 0
+
+
+@_timed("op.excise_pcr_insert", threshold_ms=25)
+def _excise_pcr_insert(seq: str, enz_left: str, enz_right: str, *,
+                        features: "list[dict] | None" = None,
+                        source_label: str = "",
+                        pad: str = "GCGC",
+                       ) -> "tuple[dict | None, str | None]":
+    """Digest a PCR product and return ONLY the purified insert — the bench
+    "cut, then gel-purify away the primer off-cuts" step. Returns
+    ``(fragment_or_None, error_or_None)``.
+
+    This is the biologically-faithful replacement for handing a PCR / feature
+    insert to `_make_synthetic_fragment`, which kept the WHOLE input as the
+    fragment's `top_seq` — so the GCGC primer pad + the recognition-site bases
+    OUTSIDE the cut leaked into the ligated clone ("extra bases in the
+    product"). At the bench those off-cuts are tiny end pieces you purify away;
+    only the middle fragment carries into the ligation.
+
+    Two input shapes, one identical result:
+
+      * **Full PCR product** already carrying the ``[pad][site]…[site][pad]``
+        primer tails — what the Clone-region (Alt+Shift+P) workflow builds, or
+        a user pasting their real amplicon. A literal linear digest drops the
+        flanking pad/off-cut pieces and keeps the single middle fragment.
+      * **Bare region** the user amplified (no tails — the Constructor's manual
+        "Paste DNA" donor). We wrap it in the SAME ``[pad][site]…[site][pad]``
+        the tailed primers would add, then digest — so the purified insert is
+        byte-identical to the full-product case.
+
+    Either way NONE of the primer-added pad / outside-the-cut site bases
+    survive into the fragment; the retained POST-cut site bases (which reform
+    the recognition site when it ligates) DO stay, exactly as at the bench. The
+    overhang sequence + kind come straight from the real cut (`_fragments_from_
+    cuts`), so 5'/3'/blunt, palindromic and asymmetric cutters all land right
+    and the fragment ligates against a literally-digested vector without the
+    convention mismatch the synthetic model had.
+
+    Features (amplicon-local coords) are slotted onto the insert by
+    `_fragments_from_cuts`; on the wrap path they're first offset past the
+    synthesised ``[pad][site]`` lead so they still land on the payload.
+
+    Type IIS is refused (the recognition-only tail can't encode an outside
+    cut — mirrors `_make_synthetic_fragment`); use 'From plasmid' literal
+    digest for those."""
+    catalog = _state._all_enzymes_hook()
+    for e in (enz_left, enz_right):
+        if e not in catalog:
+            return None, f"Unknown enzyme: {e!r}"
+        if _enzyme_is_type_iis(e):
+            return None, (f"{e} is Type IIS (cuts outside its recognition "
+                          "site) — not supported by add-cut-sites cloning; use "
+                          "'From plasmid' for a literal digest.")
+    cleaned = "".join(c for c in (seq or "").upper()
+                       if c in "ACGTRYWSMKBDHVN")
+    if not cleaned:
+        return None, "Empty PCR-product sequence."
+
+    def _interior(amp: str, feats: "list[dict] | None") -> list[dict]:
+        # Literal LINEAR digest, then keep fragments cut on BOTH ends (a real
+        # enzyme cut, not the molecule's own linear terminus). The pad/off-cut
+        # end pieces always carry one `linear` edge, so they fall away; the
+        # purified insert is the piece flanked by two cuts.
+        cuts = _enzyme_cuts(amp, [enz_left, enz_right], circular=False)
+        frags = _fragments_from_cuts(amp, cuts, circular=False,
+                                       features=feats,
+                                       source_label=source_label)
+        return [f for f in frags
+                if f["left"].get("kind") != "linear"
+                and f["right"].get("kind") != "linear"]
+
+    def _internal_site_err() -> str:
+        return (f"The {enz_left}"
+                + (f"/{enz_right}" if enz_right != enz_left else "")
+                + " recognition site occurs inside the region you're cloning — "
+                "the amplicon would be cut internally and the clone would fail. "
+                "Pick an enzyme whose site isn't in your insert.")
+
+    # 1) Treat the input as a FULL PCR product first (tails already present).
+    interior = _interior(cleaned, features)
+    if len(interior) == 1:
+        return interior[0], None
+    if len(interior) > 1:
+        return None, _internal_site_err()
+
+    # 2) No fragment flanked by two cuts → the input is the BARE region (no
+    #    tails). Wrap it the way tailed primers would and digest that.
+    site_l = catalog[enz_left][0].upper()
+    site_r = catalog[enz_right][0].upper()
+    lead = len(pad) + len(site_l)
+    wrapped = pad + site_l + cleaned + site_r + _rc(pad)
+    w_feats = ([{**f,
+                 "start": int(f.get("start", 0)) + lead,
+                 "end":   int(f.get("end",   0)) + lead}
+                for f in features]
+               if features else None)
+    interior = _interior(wrapped, w_feats)
+    if len(interior) == 1:
+        return interior[0], None
+    if len(interior) > 1:
+        return None, _internal_site_err()
+    return None, (f"Couldn't cut the PCR product with {enz_left} / "
+                  f"{enz_right} — check the recognition sites.")
+
+
+@_timed("op.excise_fragment_pair", threshold_ms=25)
+def _excise_fragment_pair(seq: str, enzyme_names: list[str], *,
+                           circular: bool = True,
+                           features: "list[dict] | None" = None,
+                           source_label: str = "",
+                          ) -> tuple[list[dict], "dict | None"]:
+    """Mode (a) helper for both insert and vector: digest `seq` with
+    the given enzymes; return ``(fragments, error_dict_or_none)``. If
+    the digest produces exactly 2 fragments (typical 1-cut + 1-cut
+    case on a circular plasmid), the caller picks one as the insert
+    or vector. Otherwise an error dict is returned describing the
+    cut count problem.
+
+    The error dict has shape ``{"error": str, "cuts": [{enzyme, top}]}``
+    so the UI can surface it clearly."""
+    cuts = _enzyme_cuts(seq, enzyme_names, circular=circular)
+    n_cuts = len(cuts)
+    if n_cuts == 0:
+        return [], {"error": (f"no cut sites found for "
+                                f"{', '.join(enzyme_names) or '(none)'}"),
+                     "cuts": []}
+    # Categorise per enzyme so the error message is specific.
+    per_enzyme: dict[str, int] = {}
+    for c in cuts:
+        per_enzyme[c["enzyme"]] = per_enzyme.get(c["enzyme"], 0) + 1
+    fragments = _fragments_from_cuts(seq, cuts, circular=circular,
+                                       features=features,
+                                       source_label=source_label)
+    if circular and n_cuts < 2:
+        return fragments, {
+            "error":
+                (f"need ≥2 cuts to excise an insert; "
+                 f"got {n_cuts} on a circular plasmid"),
+            "cuts": [{"enzyme": c["enzyme"], "top": c["top"]} for c in cuts],
+        }
+    # Exactly-2 cuts is the only ligation-compatible case for the
+    # 2-fragment "insert + vector" model. ≥3 cuts on a circular plasmid
+    # produces N fragments and the caller can't unambiguously pick the
+    # "insert" vs the "vector" — surface the ambiguity here so future
+    # callers can't quietly take fragments[0:2] and ship a wrong product.
+    if circular and n_cuts > 2:
+        per_enz_str = ", ".join(f"{e}×{n}" for e, n in per_enzyme.items())
+        return fragments, {
+            "error":
+                (f"got {n_cuts} cut sites ({per_enz_str}); "
+                 f"need exactly 2 for unambiguous excise. "
+                 f"Pick a different enzyme pair."),
+            "cuts": [{"enzyme": c["enzyme"], "top": c["top"]} for c in cuts],
+        }
+    return fragments, None
