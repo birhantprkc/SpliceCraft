@@ -112,3 +112,23 @@ def _sanitize_accession(s: "str | None") -> "str | None":
     if _NCBI_ACCESSION_RE.fullmatch(s):
         return s
     return None
+
+
+def _redact_url_credentials(url: str) -> str:
+    """Strip `user:pass@` from a URL for safe logging. Real-world
+    URLs never carry credentials for our two builtins, but a user's
+    custom URL might."""
+    if not isinstance(url, str):
+        return ""
+    try:
+        from urllib.parse import urlparse, urlunparse
+        parts = urlparse(url)
+        if parts.username or parts.password:
+            netloc = parts.hostname or ""
+            if parts.port:
+                netloc = f"{netloc}:{parts.port}"
+            scrubbed = parts._replace(netloc=netloc)
+            return urlunparse(scrubbed)
+    except (ValueError, AttributeError):
+        pass
+    return url

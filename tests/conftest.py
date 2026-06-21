@@ -121,8 +121,7 @@ def _protect_user_data(tmp_path, monkeypatch):
     # HMM database downloads (sweep #28) — per-DB dir under
     # `<DATA_DIR>/hmm_databases/<id>/`. Redirect so download tests
     # never touch the user's real GBs of Pfam-A.
-    monkeypatch.setattr(sc, "_HMM_DATABASES_DIR",
-                          tmp_path / "hmm_databases")
+    _patch("_HMM_DATABASES_DIR", tmp_path / "hmm_databases")
     # Content-addressed plasmid blob store (v1.0.23): plasmid sequences
     # live here as immutable sha256-named blobs. Redirect so dehydrate /
     # rehydrate / GC never write to or quarantine the user's real blob dir.

@@ -895,7 +895,7 @@ class TestBlastnEdgeCases:
         # Force the availability flag off, request backend="pyhmmer"
         # explicitly — should raise. Auto would silently fall back.
         import pytest
-        monkeypatch.setattr(sc, "_PYHMMER_AVAILABLE", False)
+        monkeypatch.setattr(sc._state, "_PYHMMER_AVAILABLE", False)
         rec = _make_record("X01", "ACGT" * 30)
         _seed_collection("ExpTest", [rec])
         sc._blast_clear_cache()
@@ -959,7 +959,7 @@ class TestHmmscanEngine:
         # pyhmmer is a hard dependency on POSIX (conditional on Windows,
         # where it has no wheels). On any non-Windows test env the probe
         # must report it present; this class is skipped on Windows.
-        assert sc._PYHMMER_AVAILABLE is True
+        assert sc._state._PYHMMER_AVAILABLE is True
 
     def test_hits_a_matching_protein(self, tmp_path):
         path = _build_tiny_hmm(tmp_path, name="toy_match")

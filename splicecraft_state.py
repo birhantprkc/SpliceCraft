@@ -61,6 +61,16 @@ _WIN_UTF8_CONSOLE: bool = False
 _ESCAPE_ASPECT: "float | None" = None
 
 
+# ── Library capability (feature availability) ─────────────────────────────────
+# `_PYHMMER_AVAILABLE`: True when the optional `pyhmmer` package imported cleanly.
+# The hub computes it once at import (`_state._PYHMMER_AVAILABLE = _probe_pyhmmer()`);
+# both the in-process BLAST/HMMER search (hub) and the HMM-DB downloader+hmmpress
+# (splicecraft_search) read it. Migrated to _state (demand-driven) so the search
+# sibling can gate hmmpress on it without importing the hub. Tests exercising the
+# no-pyhmmer path patch `_state._PYHMMER_AVAILABLE`.
+_PYHMMER_AVAILABLE: bool = False
+
+
 # ── Caches, generation counters, background-write coordination (Phase A1) ──
 # Migrated out of the hub; accessed `_state.<name>`. Not conftest-patched.
 _BLAST_CACHE_GENERATION: int = 0
@@ -75,6 +85,14 @@ _primer_usage_cache: "dict[str, int] | None" = None
 _primer_usage_cache_gen: int = 0
 _settings_flush_pending: "dict | None" = None
 _settings_flush_running: bool = False
+
+# ── HMM-DB download coordination (sweep #28) ──
+# Cross-modal-instance "is this DB already downloading?" guard + its lock.
+# Migrated to _state (demand-driven) so the HMM-DB downloader (splicecraft_search)
+# and the agent download handler's 409-check share the SAME set/lock object
+# (mutated in place; the hub keeps NO alias — readers use `_state.<name>`).
+_HMM_DB_DOWNLOAD_INFLIGHT: "set[str]" = set()
+_HMM_DB_DOWNLOAD_INFLIGHT_LOCK = threading.Lock()
 
 
 # ── Persisted-data caches (Phase A2a) ──────────────────────────────
@@ -152,6 +170,7 @@ _FEATURE_COLORS_FILE: Path = None  # type: ignore[assignment]
 _FEATURES_FILE: Path = None  # type: ignore[assignment]
 _GELS_FILE: Path = None  # type: ignore[assignment]
 _GRAMMARS_FILE: Path = None  # type: ignore[assignment]
+_HMM_DATABASES_DIR: Path = None  # type: ignore[assignment]
 _HMM_DB_CATALOG_FILE: Path = None  # type: ignore[assignment]
 _LIBRARY_FILE: Path = None  # type: ignore[assignment]
 _PARTS_BIN_COLLECTIONS_FILE: Path = None  # type: ignore[assignment]

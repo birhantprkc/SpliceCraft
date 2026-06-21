@@ -13,23 +13,49 @@ in splicecraft_net (_build_hardened_url_opener / _NCBI_TIMEOUT_S) + the XML-secu
 parse in splicecraft_util, gates egress through the fail-closed
 _state._demo_block_network_hook, stamps the User-Agent from _state._sc_version (= hub
 __version__), and never logs sequence content ([INV-38]). The BlastModal / HmmerModal
-UI screens (which run these in @work(thread=True) workers) STAY hub-side. The HMM-DB
-fetch can still join here later. Re-exported by the hub so sc.<name> + every call site
+UI screens (which run these in @work(thread=True) workers) STAY hub-side.
+
+ALSO owns the **HMM-database downloader** (sweep #28) — the download / version-check /
+gz-decompress / hmmpress / delete pipeline for HMMER3 databases (Pfam-A, NCBIfam, custom
+URLs): _hmm_db_perform_download + _stream_download_to_path / _decompress_gz_to_path /
+_hmmpress_db / _delete_hmm_db_files / _fetch_hmm_db_remote_version + the entry-dir/meta
+helpers + the download-slot guard + the _HMM_DB_* / _GZIP_MAGIC / _HMMER3_MAGIC_PREFIXES
+consts. Writes land under _state._HMM_DATABASES_DIR, gated by the persistence L2
+chokepoint (_refuse_unauthorized_write/_delete + atomic _safe_save/load_json); the
+cross-modal download slot + lock live in _state (_HMM_DB_DOWNLOAD_INFLIGHT[_LOCK]). This
+part imports the same-layer L1 siblings dataaccess (_get_setting / _sanitize_hmm_db_id /
+catalog) + persistence (cycle-free — neither imports search). The HMMscan *search* engine
+(_hmmscan_run) + its pyhmmer helpers (_BLASTP_QUERY_ALPHABET / _pyhmmer_alignment_identity
+/ _sanitize_path) STAY hub-side. Re-exported by the hub so sc.<name> + every call site
 resolves unchanged.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import threading
+from pathlib import Path
 from typing import Any as _Any, Callable as _Callable
 
 import splicecraft_state as _state
-from splicecraft_logging import _log
-from splicecraft_util import _CONTROL_CHARS_RE, _safe_xml_parse, _strip_fasta_headers
+from splicecraft_logging import _log, _log_event
+from splicecraft_util import (
+    _CONTROL_CHARS_RE, _safe_xml_parse, _strip_fasta_headers, _now, _monotonic,
+)
 from splicecraft_net import (
     _NCBI_MAX_RESPONSE_BYTES, _NCBI_TIMEOUT_S, _build_hardened_url_opener,
+    _HMM_DB_RETRY_BACKOFF_S, _hmm_db_assert_content_type_ok, _redact_url_credentials,
 )
+# Data-safety: the HMM-DB downloader writes multi-GB databases under
+# `_state._HMM_DATABASES_DIR`; every write/delete routes through the persistence
+# L2 chokepoint (`_refuse_unauthorized_*`) + atomic `_safe_save/load_json`.
+from splicecraft_persistence import (
+    _fsync_parent_dir, _refuse_unauthorized_write, _refuse_unauthorized_delete,
+    _safe_save_json, _safe_load_json,
+)
+from splicecraft_dataaccess import _get_setting, _sanitize_hmm_db_id
 
 
 def _ncbi_prep_term(query: str) -> str:
@@ -724,3 +750,944 @@ def _hmmer_web_hmmscan(protein: str, max_hits: int,
     raise RuntimeError(
         f"EBI HMMER timed out after {_ONLINE_MAX_WAIT_S}s — try again "
         f"or use the Local tab with a downloaded Pfam database.")
+
+
+# ── HMM database downloader (sweep #28) — relocated from the hub (Phase D) ──
+# The download / version-check / decompress / hmmpress / delete pipeline for
+# HMMER3 databases (Pfam-A, NCBIfam, custom URLs). Writes land under
+# `_state._HMM_DATABASES_DIR` and are L2-chokepoint-guarded
+# (`_refuse_unauthorized_write` / `_refuse_unauthorized_delete`). The HMMscan
+# *search* engine (`_hmmscan_run`) + the Blast/Hmmer UI modals stay hub-side.
+
+# Per-download caps. The 4 GB ceiling is well above the largest
+# realistic single-HMM database (NCBIfam compressed is ~600 MB,
+# uncompressed ~3.5 GB; Pfam-A compressed ~300 MB, uncompressed ~2 GB).
+# A 100 GB typo'd URL (or a hostile mirror serving /dev/zero) bails
+# at the cap instead of OOM'ing the disk.
+_HMM_DB_DOWNLOAD_MAX_BYTES = 4 * 1024 * 1024 * 1024
+# Version-file cap is tiny — Pfam.version.gz is ~150 bytes.
+_HMM_DB_VERSION_MAX_BYTES = 64 * 1024
+
+# Re-check the remote version no more than once every 24h. Pfam
+# releases happen every 6-12 months; NCBIfam every few weeks. The
+# cache is keyed by entry id so a manual "Check now" on one DB
+# doesn't reset the timer on the others.
+_HMM_DB_VERSION_CHECK_TTL_S = 24 * 3600
+
+
+def _hmm_db_entry_dir(entry_id: str) -> Path:
+    """Per-DB directory: `<DATA_DIR>/hmm_databases/<id>/`. The id has
+    already been sanitised via `_sanitize_hmm_db_id` before any call
+    site reaches here; we still re-sanitise defensively so a future
+    caller that forgets the sanitisation can't talk us into writing
+    outside the databases dir."""
+    safe = _sanitize_hmm_db_id(entry_id) or "_unknown"
+    return _state._HMM_DATABASES_DIR / safe
+
+
+def _hmm_db_meta_path(entry_id: str) -> Path:
+    """Per-DB metadata file: download timestamp, sha256, n_profiles,
+    pressed-state. Routed through `_safe_save_json` so it gets the
+    same atomic-write + backup chain as every other persisted file."""
+    return _hmm_db_entry_dir(entry_id) / "meta.json"
+
+
+def _hmm_db_hmm_path(entry_id: str) -> Path:
+    """The decompressed HMM file. pyhmmer's hmmscan reads this (or
+    the `.h3*` sibling index files if pressed)."""
+    return _hmm_db_entry_dir(entry_id) / "db.hmm"
+
+
+
+
+
+
+# ── HMM DB local state ────────────────────────────────────────────────
+# Each downloaded DB gets a `meta.json` sibling tracking:
+#   * `version`         — remote release identifier (e.g. "Pfam 37.4")
+#                         or HTTP Last-Modified fallback for DBs
+#                         without an explicit version file
+#   * `downloaded_at`   — ISO-8601, tz-aware
+#   * `sha256`          — checksum of the source `.hmm.gz` (so a
+#                         truncated download is detectable)
+#   * `n_profiles`      — count of HMMs in the file (smoke check)
+#   * `pressed`         — bool: are the `.h3i/.h3m/.h3p/.h3f`
+#                         siblings present?
+#   * `last_remote_version_check_ts` — wall-clock monotonic seconds
+#                         for the 24h auto-check cache
+#   * `last_remote_version` — what the remote said last time we polled
+
+
+def _load_hmm_db_local_meta(entry_id: str) -> "dict | None":
+    """Read the per-DB metadata. Returns None if no download has
+    happened yet OR if the file is corrupted (we don't try to
+    recover; the UI will show "not downloaded" and a fresh download
+    overwrites)."""
+    path = _hmm_db_meta_path(entry_id)
+    if not path.exists():
+        return None
+    try:
+        entries, _warning = _safe_load_json(path, "HMM DB meta")
+    except (OSError, ValueError):
+        return None
+    if not entries:
+        return None
+    meta = entries[0]
+    return meta if isinstance(meta, dict) else None
+
+
+def _save_hmm_db_local_meta(entry_id: str, meta: dict) -> None:
+    """Persist per-DB metadata. The entry's directory is created
+    on demand (mkdir parents=True, exist_ok=True). The L2 chokepoint
+    fires via `_safe_save_json` so an unsandboxed probe can't talk
+    its way past the gate."""
+    d = _hmm_db_entry_dir(entry_id)
+    d.mkdir(parents=True, exist_ok=True)
+    path = _hmm_db_meta_path(entry_id)
+    _safe_save_json(path, [meta], "HMM DB meta")
+
+
+def _is_hmm_db_downloaded(entry_id: str) -> bool:
+    """True iff the decompressed HMM file is present on disk. Doesn't
+    require the pressed `.h3*` files (those are an optimisation; a
+    raw `.hmm` is still usable, just slower)."""
+    return _hmm_db_hmm_path(entry_id).exists()
+
+
+def _hmm_db_pressed(entry_id: str) -> bool:
+    """True iff `pyhmmer.hmmer.hmmpress` has been run (all four
+    index files present). pyhmmer can hmmscan an unpressed HMM,
+    just much slower on Pfam-scale DBs."""
+    base = _hmm_db_hmm_path(entry_id)
+    return all((base.parent / f"{base.name}.{ext}").exists()
+               for ext in ("h3i", "h3m", "h3p", "h3f"))
+
+
+# ── Network hardening (sweep #28) ────────────────────────────────────
+# These helpers are shared by every internet-facing HMM helper below
+# (`_fetch_hmm_db_remote_version`, `_stream_download_to_path`) so the
+# hardening lands in one place. Rationale per defense layer:
+#
+#   * **HTTPS only by default** — every builtin URL is https; a user
+#     adding a custom URL gets a debug log + the download proceeds
+#     (we don't refuse http outright because some legacy mirrors only
+#     serve over plain HTTP). The setting `hmm_db_allow_http` (off by
+#     default) gates this; absent it, http URLs are rejected.
+#   * **Explicit SSL context** — `ssl.create_default_context()` so
+#     cert validation uses the system trust store. Pre-sweep `urllib.
+#     request.urlopen` defaulted to whatever Python's compiled-in
+#     defaults were; on a system with a broken CA bundle this could
+#     silently fall through to no validation. Explicit context makes
+#     the validation intent obvious + greppable.
+#   * **Bounded redirects (5 max)** — urllib's default is 10. We tighten
+#     to 5 so a hostile mirror can't bounce us through an arbitrarily
+#     long chain of redirects (each one is a network round-trip + a
+#     fresh chance for partial-response weirdness).
+#   * **Content-Type guard** — refuse responses whose Content-Type is
+#     `text/html` or `application/json`. Both indicate the server
+#     returned an error page (CDN block, captcha, "site under
+#     maintenance" wrapper) instead of the binary payload we asked
+#     for. Pre-sweep we'd happily save 12 KB of HTML as `db.hmm.gz`
+#     and bewilder the user with a "not a gzip file" error from
+#     hmmpress later.
+#   * **Magic-byte verification** — gunzip output starts with the
+#     ASCII tag `HMMER3/f` (or `HMMER2.0`, rare). We sniff the first
+#     line and reject if missing — catches a download that was the
+#     right size but the wrong file (CDN substitution, mirror drift,
+#     redirect to a `README.txt`).
+#   * **n_profiles ≥ 1** — after hmmpress, if the press returns 0
+#     profiles, the file was syntactically valid HMMER3 but empty;
+#     refuse + clean up. Real Pfam-A has ~21000 profiles; NCBIfam ~14000.
+#   * **Retry on transient failures** — one retry with 250 ms backoff
+#     for `URLError` / `socket.timeout` (mirrors `[INV-37]`'s
+#     `_fetch_latest_pypi_version` + `fetch_genbank`). Persistent
+#     errors surface immediately.
+#   * **Disk-space pre-check** — `shutil.disk_usage` before any
+#     download. Refuse if free < expected × 2.5 (the ×2.5 reserves
+#     headroom for decompression + hmmpress on top of the .gz size).
+#   * **Bounded URL in logs** — `_redact_url_credentials` strips any
+#     embedded `user:pass@host` from a logged URL (a paranoid user
+#     could paste a URL with creds; we don't want them in the
+#     diagnostic bundle).
+#   * **Mid-flight cancellation** — every long phase (download chunk
+#     loop, decompress chunk loop) calls `cancel_check_cb()` between
+#     iterations. The worker's cb peeks `is_mounted` so a closed
+#     modal aborts cleanly instead of running to completion against
+#     a no-longer-visible UI.
+#   * **Global cross-modal download lock** — `_HMM_DB_DOWNLOAD_INFLIGHT`
+#     dict-of-id-→-bool gates concurrent downloads of the same DB
+#     even across re-opened modal instances. Each modal still has its
+#     own `_active_downloads` set for per-modal UI state.
+#   * **Atomic hmmpress cleanup** — `_hmmpress_db` removes any
+#     partial `.h3*` siblings on failure so a half-pressed state
+#     doesn't get treated as "ready" by `_hmm_db_pressed`.
+
+
+_HMM_DB_NETWORK_TIMEOUT_S = 60      # connect + read; per-op
+# Disk-space reserve multiplier: total free space must be ≥ expected
+# download size × this. Covers decompression (~7×) + hmmpress (~0.3×)
+# headroom on top of the .gz. 2.5 is comfortable for compressed HMM
+# files; for an unknown-size download we use a fixed 5 GB reserve.
+_HMM_DB_DISK_RESERVE_MULTIPLIER = 2.5
+_HMM_DB_DISK_RESERVE_DEFAULT_BYTES = 5 * 1024 * 1024 * 1024
+
+def _hmm_db_acquire_download_slot(entry_id: str) -> bool:
+    """Reserve the download slot for `entry_id`. Returns True if
+    acquired (caller must release), False if another flow holds it."""
+    with _state._HMM_DB_DOWNLOAD_INFLIGHT_LOCK:
+        if entry_id in _state._HMM_DB_DOWNLOAD_INFLIGHT:
+            return False
+        _state._HMM_DB_DOWNLOAD_INFLIGHT.add(entry_id)
+        return True
+
+
+def _hmm_db_release_download_slot(entry_id: str) -> None:
+    """Release the download slot. Idempotent — safe in `finally`."""
+    with _state._HMM_DB_DOWNLOAD_INFLIGHT_LOCK:
+        _state._HMM_DB_DOWNLOAD_INFLIGHT.discard(entry_id)
+
+
+def _hmm_db_check_disk_space(target: Path,
+                              expected_bytes: "int | None") -> None:
+    """Raise OSError if there's insufficient free space at `target`'s
+    filesystem. `expected_bytes` is the Content-Length of the planned
+    download (None → use `_HMM_DB_DISK_RESERVE_DEFAULT_BYTES`)."""
+    needed = (int(expected_bytes * _HMM_DB_DISK_RESERVE_MULTIPLIER)
+              if expected_bytes
+              else _HMM_DB_DISK_RESERVE_DEFAULT_BYTES)
+    # Walk up to an existing ancestor for the disk_usage probe; the
+    # entry dir itself may not exist yet.
+    probe = target if target.exists() else target.parent
+    while probe and not probe.exists():
+        probe = probe.parent
+    if probe is None:
+        return  # disk-space check is best-effort
+    try:
+        usage = shutil.disk_usage(str(probe))
+    except OSError:
+        return
+    if usage.free < needed:
+        raise OSError(
+            f"insufficient disk space at {probe}: need ≥ "
+            f"{needed // (1024*1024):,} MB free (have "
+            f"{usage.free // (1024*1024):,} MB). The download is "
+            f"refused before any bytes hit disk."
+        )
+
+
+def _hmm_db_user_agent() -> str:
+    """Identify our traffic to EBI / NCBI per their crawler policies.
+    Mirrors the NCBI Entrez `tool` identifier added in sweep #27."""
+    return f"SpliceCraft/{_state._sc_version} (HMM database client)"
+
+
+def _hmm_db_url_scheme_ok(url: str) -> "str | None":
+    """Return None if the URL passes the http/https policy, else a
+    user-facing error string. http URLs are rejected by default
+    (any custom-URL builtin override should be https); enable via
+    `settings.hmm_db_allow_http = true` for the rare legacy mirror."""
+    if not isinstance(url, str) or not url:
+        return "URL missing"
+    if url.startswith("https://"):
+        return None
+    if url.startswith("http://"):
+        if _get_setting("hmm_db_allow_http", False):
+            return None
+        return ("URL uses plain http:// — refused for safety. Enable "
+                "the `hmm_db_allow_http` setting if you really need "
+                "to download from an http-only mirror.")
+    return "URL must start with https:// (or http:// with opt-in)"
+
+
+def _parse_pfam_version_text(text: str) -> str:
+    """Pfam's `Pfam.version` file contains lines like:
+
+        Pfam release       : 37.4
+        Pfam-A families    : 21978
+        Date               : 2025-02
+        Based on UniProtKB : 2024_06
+
+    Return the bare release identifier (`"37.4"`) or the full first
+    non-empty line if the format ever drifts. We never raise on a
+    malformed version file — degraded "version present but I can't
+    parse it" is better than the modal blocking on an EBI hiccup."""
+    if not isinstance(text, str):
+        return ""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Match `Pfam release : 37.4` (case-insensitive, lenient
+        # whitespace + colon).
+        low = line.lower()
+        if low.startswith("pfam release"):
+            _, _, rest = line.partition(":")
+            v = rest.strip()
+            if v:
+                return v[:64]
+        # Fallback for hypothetical future formats: take the first
+        # numeric token that looks like a version.
+    # Last resort: first non-empty trimmed line, capped.
+    for line in text.splitlines():
+        s = line.strip()
+        if s:
+            return s[:64]
+    return ""
+
+
+def _fetch_hmm_db_remote_version(entry: dict) -> "tuple[str, str]":
+    """Return `(version_string, source)` for the remote DB. `source`
+    is one of `"version_file"` (parsed from a dedicated version URL),
+    `"last_modified"` (HTTP HEAD on the main URL), or `""` on failure.
+
+    Hardened (sweep #28):
+      * HTTPS scheme check (bypass via `hmm_db_allow_http` setting).
+      * Hardened opener (bounded redirects, explicit SSL context).
+      * One retry with 250 ms backoff on transient network failures
+        (mirrors `[INV-37]`).
+      * Cap-bounded read (`_HMM_DB_VERSION_MAX_BYTES = 64 KB`).
+      * URL credentials redacted in any log line.
+
+    Best-effort: every error path returns `("", "")` rather than
+    raising, because the UI should degrade to "couldn't check"
+    rather than failing the modal mount."""
+    import gzip
+    import socket
+    import time as _time
+    import urllib.error
+
+    opener = _build_hardened_url_opener()
+    entry_id = entry.get("id") or "?"
+    version_url = (entry.get("version_url") or "").strip()
+
+    def _redacted(u: str) -> str:
+        return _redact_url_credentials(u)[:200]
+
+    def _try_get(url: str,
+                 *, method: str,
+                 max_bytes: int) -> "tuple[bytes, dict] | None":
+        """One-shot fetch with retry. Returns (raw, headers) or None."""
+        from urllib.request import Request as _Req
+        scheme_err = _hmm_db_url_scheme_ok(url)
+        if scheme_err is not None:
+            _log.warning(
+                "HMM DB version check %r refused: %s (%s)",
+                entry_id, scheme_err, _redacted(url),
+            )
+            return None
+        last_exc: "BaseException | None" = None
+        for attempt in range(2):
+            try:
+                req = _Req(
+                    url, method=method,
+                    headers={"User-Agent": _hmm_db_user_agent()},
+                )
+                with opener.open(
+                    req, timeout=_HMM_DB_NETWORK_TIMEOUT_S,
+                ) as resp:
+                    # Refuse an HTML / JSON / XML error page served with a 200
+                    # at the version URL — pre-fix a CDN interstitial flowed
+                    # into gzip.decompress / the version parser and surfaced
+                    # its first line as the "remote version", mislabelling the
+                    # DB as out-of-date. HEAD has no body to check.
+                    if method == "GET":
+                        _hmm_db_assert_content_type_ok(resp, url)
+                    raw = resp.read(max_bytes + 1) if method == "GET" else b""
+                    if method == "GET" and len(raw) > max_bytes:
+                        _log.warning(
+                            "HMM DB version file at %s exceeds %d byte "
+                            "cap; aborting check.",
+                            _redacted(url), max_bytes,
+                        )
+                        return None
+                    return (raw, dict(resp.headers))
+            except (urllib.error.URLError, socket.timeout, OSError,
+                    ValueError) as exc:
+                last_exc = exc
+                if attempt == 0:
+                    _log.debug(
+                        "HMM DB version probe attempt 1 failed for %s "
+                        "(%s); retrying after %.1fs",
+                        _redacted(url), exc, _HMM_DB_RETRY_BACKOFF_S,
+                    )
+                    _log_event(
+                        "net.retry", endpoint="hmm_db_version",
+                        url=_redacted(url),
+                        exc_type=type(exc).__name__,
+                    )
+                    _time.sleep(_HMM_DB_RETRY_BACKOFF_S)
+                    continue
+                _log.warning(
+                    "HMM DB version check %r failed (%s); url=%s",
+                    entry_id, exc, _redacted(url),
+                )
+                return None
+        _ = last_exc   # silence "unused" — already logged
+        return None
+
+    if version_url:
+        out = _try_get(version_url, method="GET",
+                        max_bytes=_HMM_DB_VERSION_MAX_BYTES)
+        if out is not None:
+            raw, _hdrs = out
+            try:
+                if version_url.endswith(".gz"):
+                    # Sweep #30 (2026-05-28): bound the DECOMPRESSED size.
+                    # `raw` is 64 KB-capped, but gzip can expand ~1000x, so
+                    # a crafted bomb would balloon to tens of MB in RAM on
+                    # every (24h-gated) modal mount. The real version file
+                    # is ~150 bytes; stream-decompress with the same cap and
+                    # bail on overflow rather than one-shot gzip.decompress
+                    # (which would inflate the whole bomb). [INV-84]
+                    import io as _io
+                    with gzip.GzipFile(fileobj=_io.BytesIO(raw)) as _gz:
+                        _dec = _gz.read(_HMM_DB_VERSION_MAX_BYTES + 1)
+                    if len(_dec) > _HMM_DB_VERSION_MAX_BYTES:
+                        _log.warning(
+                            "HMM DB version file at %s decompresses past the "
+                            "%d-byte cap; ignoring (possible gzip bomb).",
+                            _redacted(version_url),
+                            _HMM_DB_VERSION_MAX_BYTES,
+                        )
+                        text = ""
+                    else:
+                        text = _dec.decode("utf-8", errors="replace")
+                else:
+                    text = raw.decode("utf-8", errors="replace")
+            except (OSError, ValueError, EOFError):
+                text = raw.decode("utf-8", errors="replace")
+            parsed = _parse_pfam_version_text(text)
+            if parsed:
+                return (parsed, "version_file")
+
+    main_url = (entry.get("url") or "").strip()
+    if not main_url:
+        return ("", "")
+    out = _try_get(main_url, method="HEAD", max_bytes=0)
+    if out is not None:
+        _, hdrs = out
+        last_mod = (hdrs.get("Last-Modified")
+                    or hdrs.get("last-modified") or "")
+        if last_mod:
+            return (last_mod.strip()[:64], "last_modified")
+    return ("", "")
+
+
+def _hmm_db_local_version(entry_id: str) -> str:
+    """Return the locally-stored version string, or "" if no download
+    has happened."""
+    meta = _load_hmm_db_local_meta(entry_id)
+    if meta is None:
+        return ""
+    v = meta.get("version")
+    return v if isinstance(v, str) else ""
+
+
+def _hmm_db_should_check_remote(entry_id: str) -> bool:
+    """24h cache: if the last remote check was less than `_HMM_DB_
+    VERSION_CHECK_TTL_S` ago, skip the network round-trip."""
+    meta = _load_hmm_db_local_meta(entry_id)
+    if meta is None:
+        return True
+    last = meta.get("last_remote_version_check_ts")
+    if not isinstance(last, (int, float)):
+        return True
+    return (_monotonic() - last) > _HMM_DB_VERSION_CHECK_TTL_S
+
+
+def _record_hmm_db_remote_version(entry_id: str,
+                                    remote_version: str) -> None:
+    """Stamp the remote version + check timestamp into the per-DB
+    meta. Creates the meta if no download has happened yet (so a
+    pure version-check user gets the 24h cache benefit even before
+    they download anything)."""
+    meta = _load_hmm_db_local_meta(entry_id) or {
+        "id":             entry_id,
+        "version":        "",
+        "downloaded_at":  "",
+        "sha256":         "",
+        "n_profiles":     0,
+        "pressed":        False,
+    }
+    meta["last_remote_version"] = (
+        remote_version or ""
+    )[:64]
+    meta["last_remote_version_check_ts"] = _monotonic()
+    try:
+        _save_hmm_db_local_meta(entry_id, meta)
+    except (OSError, RuntimeError) as exc:
+        _log.warning(
+            "HMM DB version stamp save failed for %r: %s",
+            entry_id, exc,
+        )
+
+
+# ── Download worker ──────────────────────────────────────────────────
+
+
+_GZIP_MAGIC = b"\x1f\x8b"
+
+
+def _stream_download_to_path(url: str, dest: Path,
+                              *,
+                              max_bytes: int,
+                              progress_cb=None,
+                              cancel_check_cb=None,
+                              chunk_size: int = 64 * 1024) -> str:
+    """Stream `url` to `dest` atomically. Returns the SHA-256 hex.
+
+    Hardened (sweep #28):
+      * HTTPS-only by default; http requires `hmm_db_allow_http` opt-in.
+      * Hardened opener (bounded redirects, explicit SSL context).
+      * One retry with 250 ms backoff on transient network failures.
+      * Content-Type guard refuses HTML/JSON error pages.
+      * Disk-space pre-check (`needed = Content-Length × 2.5` or 5 GB).
+      * `cancel_check_cb()` polled between chunks for cooperative abort
+        (returns True to abort).
+      * Gzip magic bytes verified on the first read so a malformed
+        download fails fast instead of after writing GB.
+      * Atomic write: tmp → fsync → os.replace → fsync_parent.
+      * L2 chokepoint via `_refuse_unauthorized_write`.
+
+    Raises:
+      ValueError on cap exceedance / bad content-type / bad magic.
+      OSError on network / disk failure / cancellation.
+    """
+    import hashlib
+    import socket
+    import time as _time
+    import urllib.error
+
+    redacted = _redact_url_credentials(url)
+
+    scheme_err = _hmm_db_url_scheme_ok(url)
+    if scheme_err is not None:
+        raise ValueError(scheme_err)
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _refuse_unauthorized_write(dest, "hmm db download")
+
+    tmp = dest.with_name(dest.name + ".download_tmp")
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+
+    opener = _build_hardened_url_opener()
+    from urllib.request import Request as _Req
+
+    def _open_with_retry():
+        """One retry with 250 ms backoff, only on transient errors
+        (URLError, socket.timeout). Permanent errors (HTTPError 4xx,
+        ValueError) raise immediately."""
+        last_exc: "BaseException | None" = None
+        for attempt in range(2):
+            try:
+                req = _Req(
+                    url,
+                    headers={"User-Agent": _hmm_db_user_agent()},
+                )
+                return opener.open(
+                    req, timeout=_HMM_DB_NETWORK_TIMEOUT_S,
+                )
+            except urllib.error.HTTPError:
+                # 4xx/5xx is a permanent server response; don't retry
+                # (we'd just hit the same response).
+                raise
+            except (urllib.error.URLError, socket.timeout) as exc:
+                last_exc = exc
+                if attempt == 0:
+                    _log.debug(
+                        "HMM DB download attempt 1 failed for %s (%s); "
+                        "retrying after %.1fs",
+                        redacted, exc, _HMM_DB_RETRY_BACKOFF_S,
+                    )
+                    _log_event(
+                        "net.retry", endpoint="hmm_db_download",
+                        url=redacted, exc_type=type(exc).__name__,
+                    )
+                    _time.sleep(_HMM_DB_RETRY_BACKOFF_S)
+                    continue
+                raise
+        assert last_exc is not None
+        raise last_exc  # unreachable; for the type checker
+
+    sha = hashlib.sha256()
+    bytes_so_far = 0
+    cancelled = False
+    saw_magic = False
+    try:
+        resp = _open_with_retry()
+        try:
+            _hmm_db_assert_content_type_ok(resp, url)
+            total_header = resp.headers.get("Content-Length")
+            total: "int | None"
+            try:
+                total = int(total_header) if total_header else None
+            except (TypeError, ValueError):
+                total = None
+            if total is not None and total > max_bytes:
+                raise ValueError(
+                    f"refusing download: server reports "
+                    f"{total:,} bytes > cap {max_bytes:,}"
+                )
+            # Disk-space pre-check (after we know total, before we
+            # commit any bytes to disk).
+            _hmm_db_check_disk_space(dest, total)
+            first_chunk = True
+            with open(tmp, "wb") as fh:
+                while True:
+                    if (cancel_check_cb is not None
+                            and bool(cancel_check_cb())):
+                        cancelled = True
+                        raise OSError("download cancelled by user")
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    bytes_so_far += len(chunk)
+                    if bytes_so_far > max_bytes:
+                        raise ValueError(
+                            f"download exceeded {max_bytes:,} byte cap "
+                            f"({bytes_so_far:,} read) — likely zip-bomb "
+                            f"or wrong URL"
+                        )
+                    if first_chunk:
+                        first_chunk = False
+                        if not chunk.startswith(_GZIP_MAGIC):
+                            raise ValueError(
+                                "first bytes don't match gzip magic "
+                                "(0x1f8b) — server didn't return a "
+                                "gzipped HMM file"
+                            )
+                        saw_magic = True
+                    sha.update(chunk)
+                    fh.write(chunk)
+                    if progress_cb is not None:
+                        try:
+                            progress_cb(bytes_so_far, total)
+                        except Exception:
+                            _log.exception(
+                                "HMM DB download: progress callback raised",
+                            )
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        if not saw_magic:
+            raise ValueError(
+                "download empty — server returned 0 bytes"
+            )
+        os.replace(str(tmp), str(dest))
+        _fsync_parent_dir(dest)
+    except Exception:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        if cancelled:
+            _log_event(
+                "hmm_db.download.cancelled",
+                url=redacted, bytes_read=bytes_so_far,
+            )
+        raise
+    return sha.hexdigest()
+
+
+_HMMER3_MAGIC_PREFIXES: tuple[bytes, ...] = (b"HMMER3/", b"HMMER2.0")
+
+
+def _decompress_gz_to_path(src: Path, dest: Path,
+                            *,
+                            max_bytes: int,
+                            cancel_check_cb=None) -> None:
+    """Streaming gunzip with size cap + HMMER3 magic verification.
+
+    Hardened (sweep #28):
+      * `max_bytes` bounds the DECOMPRESSED output (legitimate Pfam-A
+        compression ratio is ~7:1; we cap at 4 GB for the .hmm).
+      * HMMER3 magic check on first chunk — rejects a file that
+        decompresses fine but isn't an HMM (CDN-served README, etc.).
+      * `cancel_check_cb()` polled between chunks.
+      * Disk-space pre-check via `_hmm_db_check_disk_space` (uses
+        compressed file size × 10 as a conservative reserve).
+      * L2 chokepoint via `_refuse_unauthorized_write`.
+
+    Raises ValueError on cap exceedance / bad magic / corrupt gzip;
+    OSError on disk failure or cancellation."""
+    import gzip
+
+    _refuse_unauthorized_write(dest, "hmm db gunzip")
+    # Reserve roughly 10× the .gz size (Pfam-A is ~7:1 compressed;
+    # rounded up for safety + hmmpress headroom).
+    try:
+        src_size = src.stat().st_size
+        _hmm_db_check_disk_space(dest, src_size * 10)
+    except OSError:
+        # Disk check itself can fail (e.g. on a path that doesn't
+        # exist yet); re-raise.
+        raise
+
+    tmp = dest.with_name(dest.name + ".gz_tmp")
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    written = 0
+    cancelled = False
+    saw_magic = False
+    try:
+        with gzip.open(str(src), "rb") as fh_in, open(tmp, "wb") as fh_out:
+            first = True
+            while True:
+                if (cancel_check_cb is not None
+                        and bool(cancel_check_cb())):
+                    cancelled = True
+                    raise OSError("decompression cancelled by user")
+                try:
+                    chunk = fh_in.read(1024 * 1024)
+                except (OSError, EOFError) as exc:
+                    raise ValueError(
+                        f"corrupt gzip data after {written:,} bytes: "
+                        f"{exc}"
+                    ) from exc
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > max_bytes:
+                    raise ValueError(
+                        f"decompressed output exceeded {max_bytes:,} "
+                        f"byte cap (likely zip-bomb / bad upload)"
+                    )
+                if first:
+                    first = False
+                    if not any(chunk.startswith(m)
+                               for m in _HMMER3_MAGIC_PREFIXES):
+                        raise ValueError(
+                            "decompressed file isn't a HMMER profile "
+                            "database — expected first bytes to start "
+                            "with 'HMMER3/' or 'HMMER2.0'"
+                        )
+                    saw_magic = True
+                fh_out.write(chunk)
+            fh_out.flush()
+            try:
+                os.fsync(fh_out.fileno())
+            except OSError:
+                pass
+        if not saw_magic:
+            raise ValueError(
+                "decompressed file is empty — source .hmm.gz holds no "
+                "HMMER content"
+            )
+        os.replace(str(tmp), str(dest))
+        _fsync_parent_dir(dest)
+    except Exception:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        if cancelled:
+            _log_event(
+                "hmm_db.decompress.cancelled",
+                src=str(src.name), bytes_written=written,
+            )
+        raise
+
+
+def _cleanup_pressed_files(hmm_path: Path) -> None:
+    """Remove any partial `.h3i/.h3m/.h3p/.h3f` siblings of `hmm_path`.
+    Called from `_hmmpress_db`'s failure path so a half-pressed state
+    doesn't get treated as "ready" by `_hmm_db_pressed`."""
+    for ext in ("h3i", "h3m", "h3p", "h3f"):
+        sibling = hmm_path.parent / f"{hmm_path.name}.{ext}"
+        _refuse_unauthorized_delete(sibling, "HMM DB pressed index")
+        try:
+            sibling.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            _log.warning(
+                "HMM DB cleanup: couldn't remove %s (%s)",
+                sibling, exc,
+            )
+
+
+def _hmmpress_db(hmm_path: Path) -> "tuple[int, bool]":
+    """Run `pyhmmer.hmmer.hmmpress` on `hmm_path` to create the
+    four `.h3*` index files pyhmmer needs for fast hmmscan.
+
+    Returns `(n_profiles, success_bool)`. `success_bool=False` is
+    surfaced separately from raising because hmmpress failing is
+    not fatal — pyhmmer can still scan an unpressed `.hmm`, just
+    much slower. The user gets a notify either way.
+
+    Hardened (sweep #28):
+      * Pyhmmer absence treated cleanly (pressed=False, n=0).
+      * Half-pressed leftovers cleaned on any failure via
+        `_cleanup_pressed_files` so `_hmm_db_pressed` doesn't
+        report success for a corrupted index.
+      * Validates pressed files exist after hmmpress returns; if any
+        of the four are missing, treats it as failure.
+      * n_profiles == 0 → returns (0, False) since an "empty" press
+        is functionally identical to an absent index.
+    """
+    n: int = 0
+    if not _state._PYHMMER_AVAILABLE:
+        return (0, False)
+    try:
+        import pyhmmer
+    except ImportError:
+        return (0, False)
+    try:
+        # pyhmmer's HMMFile yields HMMs lazily; pass the file
+        # handle directly to hmmpress so the press is streaming.
+        with pyhmmer.plan7.HMMFile(str(hmm_path)) as hf:
+            n = pyhmmer.hmmer.hmmpress(hf, str(hmm_path))
+    except Exception as exc:
+        _log.exception(
+            "HMM DB hmmpress failed for %s (%s); will fall back to "
+            "unpressed scan",
+            hmm_path, exc,
+        )
+        _cleanup_pressed_files(hmm_path)
+        return (0, False)
+    # Post-press verification: all 4 index files present + n_profiles ≥ 1.
+    pressed_ok = all(
+        (hmm_path.parent / f"{hmm_path.name}.{ext}").exists()
+        for ext in ("h3i", "h3m", "h3p", "h3f")
+    )
+    n_int = int(n) if isinstance(n, (int, float)) else 0
+    if not pressed_ok or n_int < 1:
+        _log.warning(
+            "HMM DB hmmpress %s returned n=%d but index files "
+            "incomplete (pressed_ok=%s); cleaning up.",
+            hmm_path, n_int, pressed_ok,
+        )
+        _cleanup_pressed_files(hmm_path)
+        return (n_int, False)
+    return (n_int, True)
+
+
+def _delete_hmm_db_files(entry_id: str) -> int:
+    """Remove every file under `<DATA_DIR>/hmm_databases/<id>/`.
+    Returns the count of files removed. Used by the catalog modal's
+    "Delete download" button and by the entry-delete flow.
+
+    Routed through `_refuse_unauthorized_delete` per [INV-75] so an
+    unsandboxed probe can't wipe a real DB by guessing the id."""
+    d = _hmm_db_entry_dir(entry_id)
+    if not d.exists():
+        return 0
+    removed = 0
+    for p in sorted(d.glob("*")):
+        if not p.is_file():
+            continue
+        try:
+            _refuse_unauthorized_delete(p, "hmm db file")
+            p.unlink()
+            removed += 1
+        except (OSError, RuntimeError) as exc:
+            _log.warning(
+                "HMM DB delete: failed on %s (%s)", p, exc,
+            )
+    try:
+        d.rmdir()
+    except OSError:
+        pass
+    return removed
+
+
+def _hmm_db_perform_download(
+    entry: dict,
+    *,
+    progress_cb: "_Callable[[int, int | None], None] | None" = None,
+    status_cb: "_Callable[[str], None] | None" = None,
+    cancel_check_cb: "_Callable[[], bool] | None" = None,
+) -> dict:
+    """Download → decompress → hmmpress → stamp meta for one catalog entry.
+
+    The HEADLESS core shared by `HmmDbCatalogModal._download_worker` (GUI)
+    and the `download-hmm-database` agent endpoint, so an agent-triggered
+    download lands byte-identical on disk to a user-triggered one — same
+    `db.hmm(.gz)` + `.h3*` siblings, same `meta.json`, same catalog state
+    ("sits nicely as if the user downloaded it themselves").
+
+    `entry` is a catalog dict with at least ``id`` + ``url``. The optional
+    callbacks are pure UI side-channels — all no-ops when None (the agent
+    path passes none): ``progress_cb(done, total)`` during the byte
+    stream, ``status_cb(phase)`` where *phase* is ``"decompress"`` /
+    ``"hmmpress"``, and ``cancel_check_cb()`` polled between chunks
+    (return True to abort).
+
+    Returns ``{id, n_profiles, pressed, sha256, version, bytes}``. Raises
+    OSError / ValueError / RuntimeError on any failure (the caller logs +
+    notifies). Does NOT manage the cross-modal `_HMM_DB_DOWNLOAD_INFLIGHT`
+    slot — the caller (GUI worker / agent endpoint) owns acquire+release
+    so each can report "already running" in its own idiom.
+
+    Writes go through the L2-gated `_save_hmm_db_local_meta`, so this only
+    runs from a sanctioned caller (GUI app, agent server, sandboxed
+    verifier); an unsandboxed probe still trips the chokepoint."""
+    eid = entry["id"]
+    url = entry["url"]
+    redacted = _redact_url_credentials(url)
+    dest_gz = _hmm_db_entry_dir(eid) / "db.hmm.gz"
+    dest_hmm = _hmm_db_hmm_path(eid)
+
+    # Phase 1: stream download (content-type + gzip/HMMER3 magic + size +
+    # disk-space + redirect/scheme guards all live inside the helper).
+    sha = _stream_download_to_path(
+        url, dest_gz,
+        max_bytes=_HMM_DB_DOWNLOAD_MAX_BYTES,
+        progress_cb=progress_cb,
+        cancel_check_cb=cancel_check_cb,
+    )
+    # Phase 2: decompress (gzip-bomb-bounded, cancel-aware).
+    if status_cb:
+        status_cb("decompress")
+    _decompress_gz_to_path(
+        dest_gz, dest_hmm,
+        max_bytes=_HMM_DB_DOWNLOAD_MAX_BYTES,
+        cancel_check_cb=cancel_check_cb,
+    )
+    # Phase 3: hmmpress. n_profiles == 0 means the bytes landed but the
+    # file isn't a usable HMM DB — treat as failure (don't record success
+    # for a DB hmmscan can't open).
+    if status_cb:
+        status_cb("hmmpress")
+    n_profiles, pressed = _hmmpress_db(dest_hmm)
+    if n_profiles < 1:
+        raise ValueError(
+            "post-press validation: 0 profiles parsed from the "
+            "downloaded file. Source URL likely served the "
+            "wrong file or a corrupted upload."
+        )
+    # Phase 4: stamp meta (mirrors the GUI worker exactly).
+    existing = _load_hmm_db_local_meta(eid) or {}
+    existing.update({
+        "id":            eid,
+        "version":       _hmm_db_local_version(eid) or "downloaded",
+        "downloaded_at": _now().isoformat(timespec="seconds"),
+        "sha256":        sha,
+        "source_url":    redacted,
+        "n_profiles":    n_profiles,
+        "pressed":       pressed,
+    })
+    remote = (existing.get("last_remote_version") or "").strip()
+    if remote:
+        existing["version"] = remote
+    _save_hmm_db_local_meta(eid, existing)
+    return {
+        "id":         eid,
+        "n_profiles": n_profiles,
+        "pressed":    pressed,
+        "sha256":     sha,
+        "version":    existing["version"],
+        "bytes":      dest_gz.stat().st_size if dest_gz.exists() else 0,
+    }

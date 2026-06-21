@@ -32,6 +32,10 @@ import urllib.error
 import pytest
 
 import splicecraft as sc
+# The HMM-DB downloader moved to splicecraft_search (Phase D); functions there
+# resolve _build_hardened_url_opener / _monotonic in the SEARCH namespace, so
+# clock/opener mocks must patch _search, not the hub re-export.
+import splicecraft_search as _search
 
 
 # ── Catalog persistence ──────────────────────────────────────────────
@@ -323,7 +327,7 @@ class TestDownloadMagicBytes:
                         content_type="application/octet-stream",
                     )
             return _O()
-        monkeypatch.setattr(sc, "_build_hardened_url_opener", _opener)
+        monkeypatch.setattr(_search, "_build_hardened_url_opener", _opener)
         with pytest.raises(ValueError, match="gzip magic"):
             sc._stream_download_to_path(
                 "https://example.com/x.gz",
@@ -340,7 +344,7 @@ class TestDownloadMagicBytes:
                         html, content_type="text/html",
                     )
             return _O()
-        monkeypatch.setattr(sc, "_build_hardened_url_opener", _opener)
+        monkeypatch.setattr(_search, "_build_hardened_url_opener", _opener)
         with pytest.raises(ValueError, match="Content-Type"):
             sc._stream_download_to_path(
                 "https://example.com/x.gz",
@@ -355,7 +359,7 @@ class TestDownloadMagicBytes:
                 def open(self, _req, timeout=None):
                     return TestDownloadMagicBytes._stub_urlopen(gz)
             return _O()
-        monkeypatch.setattr(sc, "_build_hardened_url_opener", _opener)
+        monkeypatch.setattr(_search, "_build_hardened_url_opener", _opener)
         dest = tmp_path / "db.hmm.gz"
         sha = sc._stream_download_to_path(
             "https://example.com/x.gz", dest,
@@ -439,8 +443,8 @@ class TestDownloadSlot:
     def teardown_method(self, _m):
         # Always release any test-held slots so a test order change
         # doesn't leak.
-        with sc._HMM_DB_DOWNLOAD_INFLIGHT_LOCK:
-            sc._HMM_DB_DOWNLOAD_INFLIGHT.clear()
+        with sc._state._HMM_DB_DOWNLOAD_INFLIGHT_LOCK:
+            sc._state._HMM_DB_DOWNLOAD_INFLIGHT.clear()
 
     def test_acquire_release(self):
         assert sc._hmm_db_acquire_download_slot("pfam-a")
@@ -559,7 +563,7 @@ class TestPerDbLocalState:
         assert sc._hmm_db_should_check_remote("pfam-a")
         # Stamp a recent check; should NOT re-check.
         clock = [1000.0]
-        monkeypatch.setattr(sc, "_monotonic", lambda: clock[0])
+        monkeypatch.setattr(_search, "_monotonic", lambda: clock[0])
         sc._record_hmm_db_remote_version("pfam-a", "37.4")
         assert not sc._hmm_db_should_check_remote("pfam-a")
         # Advance past 24h.
@@ -630,7 +634,7 @@ class TestNetworkRetry:
                 if calls[0] == 1:
                     raise urllib.error.URLError("transient")
                 return _StubResp()
-        monkeypatch.setattr(sc, "_build_hardened_url_opener",
+        monkeypatch.setattr(_search, "_build_hardened_url_opener",
                               lambda: _Opener())
         v, src = sc._fetch_hmm_db_remote_version({
             "id":          "pfam-a",
@@ -650,7 +654,7 @@ class TestNetworkRetry:
         class _Opener:
             def open(self, _req, timeout=None):
                 raise urllib.error.URLError("persistent")
-        monkeypatch.setattr(sc, "_build_hardened_url_opener",
+        monkeypatch.setattr(_search, "_build_hardened_url_opener",
                               lambda: _Opener())
         v, src = sc._fetch_hmm_db_remote_version({
             "id":          "pfam-a",

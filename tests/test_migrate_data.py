@@ -122,7 +122,7 @@ class TestMigrateRoundTrip:
 
     def test_hmm_excluded_by_default_but_optional(self, tmp_path):
         _seed()
-        hd = getattr(sc, "_HMM_DATABASES_DIR", None)
+        hd = getattr(sc._state, "_HMM_DATABASES_DIR", None)
         if not isinstance(hd, sc.Path):
             pytest.skip("no HMM databases dir attr")
         hd.mkdir(parents=True, exist_ok=True)

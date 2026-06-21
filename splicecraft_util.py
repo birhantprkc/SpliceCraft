@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import functools as _functools
+import time as _time_mod
 from datetime import datetime as _datetime
 from typing import Any as _Any
 from pathlib import Path
@@ -1183,3 +1184,22 @@ def _strip_fasta_headers(text: str) -> str:
             continue
         out.append(line)
     return "\n".join(out)
+
+
+# ── Single time source (INV-78, sweep #27) ────────────────────────────
+# Every wall-clock and monotonic-clock read in the codebase routes through
+# these two helpers (relocated here from the hub during the modularization so
+# the siblings can import them at L0 instead of calling them bare on the hub).
+# Reasons: (1) a monkeypatch on `_now` / `_monotonic` covers every callsite at
+# once; (2) `_now()` is always tz-aware, avoiding silent DST off-by-hours bugs;
+# (3) a future "freeze the clock for this transaction" need lands in one place.
+def _now() -> _datetime:
+    """Current wall-clock as a tz-aware datetime in the user's local
+    zone. Use this everywhere instead of `datetime.now()`."""
+    return _datetime.now().astimezone()
+
+
+def _monotonic() -> float:
+    """Monotonic clock reading in seconds. Use for elapsed-time
+    measurements; `_now()` for absolute timestamps."""
+    return _time_mod.monotonic()

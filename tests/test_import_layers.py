@@ -52,7 +52,7 @@ _LAYER_RULES = [
     ("splicecraft_history", 2),
     ("splicecraft_fileio", 2),      # single-file seq-format I/O: imports record L1 + persistence/logging L0
     ("splicecraft_codon", 2),       # codon optimizer: imports dataaccess L1 + biology/util/logging L0
-    ("splicecraft_search", 1),      # online NCBI search ops: imports net/util/logging L0
+    ("splicecraft_search", 1),      # online NCBI search ops + HMM-DB downloader: net/util/logging L0 + dataaccess/persistence L1
     ("splicecraft_primer", 2),      # primer/mutagenesis design: imports codon L2 (mutagenesis-inner) + biology/util/logging L0
     ("splicecraft_widgets", 3),
     ("splicecraft_modals", 4),
