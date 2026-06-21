@@ -14,6 +14,14 @@
 
 ---
 
+## [1.0.89] — 2026-06-21
+
+### Under the hood
+
+- **The codebase modularization reaches its finish line — and this release lands its largest batch.** This completes the multi-release reorganization that began in v1.0.85, carving SpliceCraft out of one ~131,000-line file into roughly two dozen focused, separately-loadable modules. This batch moves out the heaviest remaining pieces: the whole **construction / cloning simulation** (Gibson assembly, traditional restriction cloning, fragment preparation, and the Golden-Braid / MoClo domestication designers); the complete **primer and site-directed-mutagenesis design core** (including the QuikChange "scrub" tools); **sequence analysis** (ORF finding plus Golden-Braid / MoClo part classification); the **online NCBI BLAST / EBI HMMER search** and the HMM-database downloader; the **user-data backup / restore / migrate engine** (the daily snapshots, the `splicecraft update` rollback safety net, cross-machine data export/import, and the Master Delete machinery); and the **entire data-only half of the agent API** — all 107 read / query / data endpoints now live in their own module, leaving only the genuinely screen-bound handlers in the main program. End to end, the single main file shrank by roughly **32,000 lines (≈131k → ≈99k)**.
+
+- **Same program, byte for byte.** As with every step of this saga, this is a **maintainability and AI-assistability change only — nothing about how SpliceCraft behaves changes.** Every feature, keyboard shortcut, saved-file format, and the agent API stay identical, locked down by the public-surface snapshot test. Because this batch touched the data-safety machinery directly (backups, restore, Master Delete, the content-addressed sequence store), each move was re-verified in a throwaway sandbox: snapshot→restore and cross-machine export→import round-trips recover your data intact, Master Delete still finds every user-data location, and the write-guard that protects your saved library was confirmed untouched throughout.
+
 ## [1.0.88] — 2026-06-20
 
 ### Under the hood
