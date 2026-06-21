@@ -93,7 +93,7 @@ def _protect_user_data(tmp_path, monkeypatch):
 
     # Crash-recovery autosave dir: redirect so tests can't leave files in
     # the user's real _DATA_DIR/crash_recovery on disk.
-    monkeypatch.setattr(sc, "_CRASH_RECOVERY_DIR", tmp_path / "crash_recovery")
+    _patch("_CRASH_RECOVERY_DIR", tmp_path / "crash_recovery")
     # CommercialSaaS .dna sidecar storage (Phase 4d): tests that import .dna
     # files would otherwise create copies in the user's real
     # _DATA_DIR/dna_originals on disk. Same isolation pattern.
@@ -102,7 +102,7 @@ def _protect_user_data(tmp_path, monkeypatch):
     # `_check_and_stamp_data_version` doesn't `mkdir` the user's real
     # _DATA_DIR/plugins, and so any snapshot test that includes
     # `_PLUGINS_DIR` reads from the tmp tree.
-    monkeypatch.setattr(sc, "_PLUGINS_DIR", tmp_path / "plugins")
+    _patch("_PLUGINS_DIR", tmp_path / "plugins")
     # Data-version stamp file: same reasoning — keeps every test from
     # competing for / racing on the real ~/.local/share/.../.splicecraft-
     # data-version file.
@@ -111,7 +111,7 @@ def _protect_user_data(tmp_path, monkeypatch):
     # `splicecraft logs --bundle` CLI command both write here):
     # redirect so tests of the snapshot system don't litter the
     # user's real ~/.local/share/splicecraft/ui_snapshots/.
-    monkeypatch.setattr(sc, "_UI_SNAPSHOTS_DIR", tmp_path / "ui_snapshots")
+    _patch("_UI_SNAPSHOTS_DIR", tmp_path / "ui_snapshots")
     # Experiments-notebook attachments directory: image files attached
     # to experiment entries land in `<DATA_DIR>/experiments/<entry_id>/`,
     # which would otherwise litter the user's real data dir during tests

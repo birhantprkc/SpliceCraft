@@ -128,9 +128,9 @@ def _plant_everything():
         (d / "marker.txt").write_text("PLANTED")
         paths.append(d / "marker.txt")
     # UI snapshots (has a constant but resolves to the same path).
-    sc._UI_SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-    (sc._UI_SNAPSHOTS_DIR / "ui-snapshot.md").write_text("PLANTED")
-    paths.append(sc._UI_SNAPSHOTS_DIR / "ui-snapshot.md")
+    sc._state._UI_SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    (sc._state._UI_SNAPSHOTS_DIR / "ui-snapshot.md").write_text("PLANTED")
+    paths.append(sc._state._UI_SNAPSHOTS_DIR / "ui-snapshot.md")
     # Pre-update backups (sibling of DATA_DIR via the
     # SPLICECRAFT_UPDATE_BACKUP_DIR env-var override the conftest sets).
     pre = sc._resolve_pre_update_backup_dir()
@@ -635,4 +635,4 @@ def test_dir_target_enumeration_covers_adhoc_subdirs():
         assert str(expected) in target_set, (
             f"{name}/ subdir not enumerated"
         )
-    assert str(sc._UI_SNAPSHOTS_DIR) in target_set
+    assert str(sc._state._UI_SNAPSHOTS_DIR) in target_set

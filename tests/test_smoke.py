@@ -4610,7 +4610,7 @@ class TestCrashRecoveryNoticeOncePerSet:
             self, tiny_record, isolated_library, tmp_path,
             monkeypatch):
         crash_dir = tmp_path / "crash_recovery"
-        monkeypatch.setattr(sc, "_CRASH_RECOVERY_DIR", crash_dir)
+        monkeypatch.setattr(sc._state, "_CRASH_RECOVERY_DIR", crash_dir)
         self._make_leftover(crash_dir, "rec_a")
         self._make_leftover(crash_dir, "rec_b")
         # Make sure the seen-set starts empty for this test (the
@@ -4638,7 +4638,7 @@ class TestCrashRecoveryNoticeOncePerSet:
             self, tiny_record, isolated_library, tmp_path,
             monkeypatch):
         crash_dir = tmp_path / "crash_recovery"
-        monkeypatch.setattr(sc, "_CRASH_RECOVERY_DIR", crash_dir)
+        monkeypatch.setattr(sc._state, "_CRASH_RECOVERY_DIR", crash_dir)
         old = self._make_leftover(crash_dir, "old_rec")
         # Pre-seed the seen-set so the OLD file alone would be quiet.
         sc._set_setting(
@@ -4660,7 +4660,7 @@ class TestCrashRecoveryNoticeOncePerSet:
             monkeypatch):
         crash_dir = tmp_path / "crash_recovery"
         crash_dir.mkdir(parents=True, exist_ok=True)
-        monkeypatch.setattr(sc, "_CRASH_RECOVERY_DIR", crash_dir)
+        monkeypatch.setattr(sc._state, "_CRASH_RECOVERY_DIR", crash_dir)
         # Stale seen-set from a prior session.
         sc._set_setting(
             "crash_recovery_seen", ["something_old|123"],
@@ -12242,7 +12242,7 @@ class TestUpdateDataSafety:
 
     def test_snapshot_includes_user_data_dirs(self, tmp_path):
         # Crash-recovery autosaves and .dna sidecars also get snapshotted.
-        cr = sc._CRASH_RECOVERY_DIR
+        cr = sc._state._CRASH_RECOVERY_DIR
         cr.mkdir(parents=True, exist_ok=True)
         (cr / "myplas-abc123.gb").write_text("LOCUS test\n", encoding="utf-8")
         do = sc._state._DNA_ORIGINALS_DIR
@@ -12528,7 +12528,7 @@ class TestUpdateDataSafety:
             )
 
     def test_restore_recovers_user_data_dirs(self):
-        cr = sc._CRASH_RECOVERY_DIR
+        cr = sc._state._CRASH_RECOVERY_DIR
         cr.mkdir(parents=True, exist_ok=True)
         (cr / "myplas.gb").write_text("LOCUS A\n", encoding="utf-8")
         snap = sc._create_pre_update_snapshot("0.0.0-test")
@@ -12894,7 +12894,7 @@ class TestUpdateDataSafetyHardening:
         # copytree to fail mid-way. The rollback must restore the
         # pre-restore stash so the user doesn't end up with a partial
         # crash_recovery dir.
-        cr = sc._CRASH_RECOVERY_DIR
+        cr = sc._state._CRASH_RECOVERY_DIR
         cr.mkdir(parents=True, exist_ok=True)
         (cr / "alpha.gb").write_text("LOCUS A\n", encoding="utf-8")
         (cr / "beta.gb").write_text("LOCUS B\n", encoding="utf-8")
@@ -13492,7 +13492,7 @@ class TestFutureProofingFeatures:
         monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(sc._state, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
-        monkeypatch.setattr(sc, "_PLUGINS_DIR",
+        monkeypatch.setattr(sc._state, "_PLUGINS_DIR",
                               tmp_path / "data" / "plugins")
         warning = sc._check_and_stamp_data_version()
         # First run: no prior stamp → no warning.
@@ -13505,7 +13505,7 @@ class TestFutureProofingFeatures:
         monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(sc._state, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
-        monkeypatch.setattr(sc, "_PLUGINS_DIR",
+        monkeypatch.setattr(sc._state, "_PLUGINS_DIR",
                               tmp_path / "data" / "plugins")
         # Plant a stamp written by a far-future version.
         stamp = tmp_path / "data" / ".splicecraft-data-version"
@@ -13525,7 +13525,7 @@ class TestFutureProofingFeatures:
         monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(sc._state, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
-        monkeypatch.setattr(sc, "_PLUGINS_DIR",
+        monkeypatch.setattr(sc._state, "_PLUGINS_DIR",
                               tmp_path / "data" / "plugins")
         stamp = tmp_path / "data" / ".splicecraft-data-version"
         stamp.parent.mkdir(parents=True)
@@ -13542,7 +13542,7 @@ class TestFutureProofingFeatures:
         monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(sc._state, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
-        monkeypatch.setattr(sc, "_PLUGINS_DIR",
+        monkeypatch.setattr(sc._state, "_PLUGINS_DIR",
                               tmp_path / "data" / "plugins")
         stamp = tmp_path / "data" / ".splicecraft-data-version"
         stamp.parent.mkdir(parents=True)
@@ -13560,7 +13560,7 @@ class TestFutureProofingFeatures:
         monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(sc._state, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
-        monkeypatch.setattr(sc, "_PLUGINS_DIR",
+        monkeypatch.setattr(sc._state, "_PLUGINS_DIR",
                               tmp_path / "data" / "plugins")
         stamp = tmp_path / "data" / ".splicecraft-data-version"
         stamp.parent.mkdir(parents=True)
@@ -13575,7 +13575,7 @@ class TestFutureProofingFeatures:
         monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(sc._state, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
-        monkeypatch.setattr(sc, "_PLUGINS_DIR",
+        monkeypatch.setattr(sc._state, "_PLUGINS_DIR",
                               tmp_path / "data" / "plugins")
         sc._check_and_stamp_data_version()
         assert (tmp_path / "data" / "plugins").is_dir()
@@ -13587,7 +13587,7 @@ class TestFutureProofingFeatures:
                               tmp_path / "nonexistent-readonly")
         monkeypatch.setattr(sc._state, "_DATA_VERSION_FILE",
                               tmp_path / "nonexistent-readonly" / "x")
-        monkeypatch.setattr(sc, "_PLUGINS_DIR",
+        monkeypatch.setattr(sc._state, "_PLUGINS_DIR",
                               tmp_path / "nonexistent-readonly" / "p")
         # Even if mkdir succeeds, atomic_write_text might fail; we
         # just don't want an exception to propagate.
@@ -13632,11 +13632,11 @@ class TestFutureProofingFeatures:
     def test_plugins_dir_contents_get_snapshotted(self):
         # End-to-end: a plugin that drops a file in _PLUGINS_DIR
         # MUST see that file copied into pre-update snapshots.
-        sc._PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
-        plugin_file = sc._PLUGINS_DIR / "myplugin-state.json"
+        sc._state._PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
+        plugin_file = sc._state._PLUGINS_DIR / "myplugin-state.json"
         plugin_file.write_text('{"counter": 7}', encoding="utf-8")
         snap = sc._create_pre_update_snapshot("0.0.0-test")
-        copied = snap / sc._PLUGINS_DIR.name / "myplugin-state.json"
+        copied = snap / sc._state._PLUGINS_DIR.name / "myplugin-state.json"
         assert copied.is_file()
         assert copied.read_text(encoding="utf-8") == '{"counter": 7}'
 
@@ -13701,7 +13701,7 @@ class TestFutureProofingFeatures:
         monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path / "data")
         monkeypatch.setattr(sc._state, "_DATA_VERSION_FILE",
                               tmp_path / "data" / ".splicecraft-data-version")
-        monkeypatch.setattr(sc, "_PLUGINS_DIR",
+        monkeypatch.setattr(sc._state, "_PLUGINS_DIR",
                               tmp_path / "data" / "plugins")
         sc._check_and_stamp_data_version()
         sc._check_and_stamp_data_version()  # idempotent
