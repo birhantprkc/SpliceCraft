@@ -104,3 +104,26 @@ def test_runtime_writer_mutates_the_shared_copy(monkeypatch):
     )
     sc._set_ascii_mode(False)
     assert splicecraft_state._ASCII_MODE is False
+
+
+def test_all_state_hooks_registered():
+    """Every `_state._*_hook` must be REGISTERED once the hub has imported -- it
+    points at a real hub (or sibling) function, not its `splicecraft_state`
+    fail-loud / None placeholder. The hub+siblings architecture leans on these:
+    a sibling reaches a hub-pinned dependency through `_state._X_hook`, never by
+    importing the hub (a cycle). If a future refactor adds a hook slot but forgets
+    the `_state._X_hook = ...` registration (or drops an existing one), the
+    dependent endpoints / accessors break at runtime; this catches it at import."""
+    hooks = [n for n in dir(splicecraft_state) if n.endswith("_hook")]
+    assert hooks, "expected _*_hook attributes on the state module"
+    unregistered = [
+        n for n in hooks
+        if (fn := getattr(splicecraft_state, n)) is None
+        or getattr(fn, "__module__", "") == "splicecraft_state"
+    ]
+    assert not unregistered, (
+        f"_state hook(s) left unregistered after `import splicecraft`: "
+        f"{unregistered}. The hub must register each at import "
+        "(`_state._X_hook = _X`); an unregistered hook means the sibling "
+        "endpoints / accessors that call it fail (fail-loud default)."
+    )

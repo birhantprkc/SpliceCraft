@@ -5,7 +5,7 @@ How SpliceCraft is organized, why, and how to navigate it.
 ## Hub + layered siblings
 
 SpliceCraft began as a single-file app and is now a **hub + layered-siblings**
-layout on Textual + Biopython. `splicecraft.py` is the ~115k-line **hub**
+layout on Textual + Biopython. `splicecraft.py` is the ~99k-line **hub**
 (`PlasmidApp`, the data-safety POLICY, the `.dna` blob store, CLI, agent-API,
 screens, and the app-coupled modals/widgets — the deeply-coupled application
 core, deliberately kept together; extracting `PlasmidApp` + its three main panels
@@ -19,19 +19,32 @@ digest — sacred invariants #1/#2/#6 — reading its caches + catalog through
 chokepoint), `splicecraft_dataaccess` (every domain `_load_X`/`_save_X` accessor
 + grammar/enzyme data; the migrations/mirrors stay hub-side via `_state` hooks),
 `splicecraft_record` (GenBank↔SeqRecord serialization), `splicecraft_util` (pure
-cross-cutting helpers), `splicecraft_cloning` (construction simulation),
+cross-cutting helpers), `splicecraft_net` (SSRF-hardened network primitives),
+`splicecraft_codon` (the mission-critical codon optimizer), `splicecraft_primer`
+(primer / site-directed-mutagenesis design), `splicecraft_search` (online
+BLAST / HMMER + the HMM-DB downloader), `splicecraft_cloning` (construction
+simulation + the PCR caps), `splicecraft_seqanalysis` (ORF finder + part
+classifier),
 `splicecraft_gels` (agarose-gel sim/render — `[SUB-gels]`),
 `splicecraft_experiments` (lab-notebook entry processing — `[SUB-experiments]`),
 `splicecraft_fileio` (single-file sequence-format I/O — FASTA/GenBank/GFF/AB1/FASTQ),
-`splicecraft_render`, `splicecraft_history`, `splicecraft_widgets`,
-`splicecraft_modals` (60 dependency-clean dialog classes), `splicecraft_errors`
-(plus the stdlib-only `splicecraft_cli` sidecar and `splicecraft_demo_plasmids`
-seed).
+`splicecraft_backup` (the user-data backup / restore / migrate engine + Master
+Delete enumeration — the data-safety core), `splicecraft_render`,
+`splicecraft_history`, `splicecraft_widgets`, `splicecraft_modals` (60
+dependency-clean dialog classes), `splicecraft_agent` (all 107 data-only
+agent-API endpoints; the deep engines they call are reached via `_state` hooks),
+`splicecraft_errors` (plus the stdlib-only `splicecraft_cli` sidecar and
+`splicecraft_demo_plasmids` seed). **The flat-sibling modularization is now
+essentially complete** — the hub went from ~131k to ~99k lines (−25%) across 24
+siblings; only the God-class application core (PlasmidApp + the big-3 panels +
+their anchored modals/handlers + the blob writers + the pyhmmer BLAST/HMM engine)
+stays hub-side, which would need in-App decomposition rather than a lift.
 
 The hub stays greppable as one totally-ordered file; the siblings are bounded,
 independently-loadable units (the goal: a context-limited model can hold one
-whole). Siblings are layered L0→L4 with **no upward imports** and re-exported so
-`import splicecraft as sc; sc.<name>` resolves unchanged. Mutable-state siblings
+whole). Siblings are layered L0→L7 with **no upward imports** and re-exported so
+`import splicecraft as sc; sc.<name>` resolves unchanged.
+Mutable-state siblings
 are accessed by attribute (`_state.X`) so hub, siblings, and tests share one
 copy — a by-value `from splicecraft_state import X` binds a stale copy and is
 forbidden.

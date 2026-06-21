@@ -632,9 +632,9 @@ See also: `[INV-43]` settings schema, `[INV-37]` `_SETTINGS_SCHEMA` + `_validate
 
 ## [ARCH] Architecture pointers
 
-`splicecraft.py` top-to-bottom: imports + persistence helpers → enzyme catalog + IUPAC + scanner + 2D feature packer + seq-panel renderer → GenBank I/O → `_Canvas` / `_BrailleCanvas` / `PlasmidMap` / `FeatureSidebar` → `LibraryPanel` → `SequencePanel` → core modals → grammars + settings → codon registry + Kazusa + mutagenesis → feature-library → parts bin → domesticator + constructor → mutagenize → primer design → small modals → `PlasmidApp` → `main()`.
+After the Phase-D modularization (131k → ~99k, −25%), most subsystems live in `splicecraft_*` siblings — see CLAUDE.md's sibling list + `docs/architecture.md` for the full map. What REMAINS in the hub `splicecraft.py`, top-to-bottom: imports + the `_resolve_state_or_hub` resolver + the data-safety POLICY (`_authorize_writes*` + the sandbox gate) + all the `_state`-hook registrations → the `.dna` blob store + content-addressed sequence store + blob writers (`_save_dna_original`/`_save_ui_snapshot`/`_save_experiment_image`) → the format-detecting loader glue → the big-3 panels (`PlasmidMap` / `LibraryPanel` / `SequencePanel`) + render glue + their ~26 anchored modals → migrations + the re-entrant active-collection mirror → the in-process pyhmmer BLAST/HMM engine → the agent-API HTTP server + the 26 app-coupled `_h_*` handlers (the 107 data-only ones are in `splicecraft_agent`) → backup/restore + Master-Delete **app glue** (`_perform_master_delete`, UI-snapshot capture, the `splicecraft update` CLI — the engines are in `splicecraft_backup`) → `PlasmidApp` + its Search/Undo/Restriction/Record controllers → `main()`.
 
-Use `grep -n "^class \|^def " splicecraft.py` for live map. Test files 1:1 named after the subsystem.
+Use `grep -rn "^class \|^def " splicecraft*.py` for the live map across hub + siblings. Test files 1:1 named after the subsystem.
 
 See `docs/architecture.md` for the long-form rationale (single-file rule, test pyramid, concurrency model, observability).
 

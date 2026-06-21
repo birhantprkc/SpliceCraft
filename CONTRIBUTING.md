@@ -13,7 +13,7 @@ means in practice.
 
 - [Before you open a PR](#before-you-open-a-pr)
 - [Local setup](#local-setup)
-- [The single-file rule](#the-single-file-rule)
+- [Hub and layered siblings](#hub-and-layered-siblings)
 - [Sacred invariants](#sacred-invariants)
 - [Testing](#testing)
 - [Style](#style)
@@ -74,23 +74,44 @@ Full suite (~5 minutes on 8 cores):
 python3 -m pytest -n auto -q
 ```
 
-## The single-file rule
+## Hub and layered siblings
 
-The entire application lives in `splicecraft.py` (~61k LoC) and
-`splicecraft_cli.py` (a stdlib-only sidecar for the agent-API
-client). This is intentional: it keeps the codebase greppable and
-keeps a single, totally-ordered file as the source of truth for
-behaviour.
+The application is a **hub + layered-siblings** layout: `splicecraft.py`
+is the ~99k-line hub (the application core — `PlasmidApp`, the big-3
+panels, the data-safety policy, the `.dna` blob store, the agent-API
+server, and the app-coupled modals), and the cleanly-separable layers
+live in ~24 flat `splicecraft_*.py` siblings the hub imports and
+re-exports (plus the stdlib-only `splicecraft_cli.py` agent-client
+sidecar). The hub stays greppable as one totally-ordered file; each
+sibling is a bounded, independently-loadable unit so a context-limited
+model can hold one whole. The Phase-D modularization that carved the
+~131k-line monolith down to ~99k is essentially complete — see
+`docs/architecture.md` and `CLAUDE.md` for the full sibling map.
 
-That said, **extractions are allowed** when they pass three tests:
+**A new sibling — or a move into an existing one — must pass three guards:**
 
-1. The extracted module has no `PlasmidApp` coupling.
-2. The extraction reduces complexity at the call site (i.e. removes
-   shared state, not just moves lines).
-3. Every existing test still passes without modification — including
-   the byte-for-byte assertions in `test_commercialsaas_io.py`.
+1. **No upward imports / no cycle, and it's packaged.**
+   `tests/test_import_layers.py` classifies every sibling into a layer
+   (L0→L7), forbids upward imports, and verifies the file is in
+   `pyproject.toml`'s wheel **and** sdist lists (miss either and the
+   released wheel breaks at the re-import step).
+2. **The public surface stays byte-for-byte identical.** Re-export every
+   moved name so `import splicecraft as sc; sc.<name>` resolves
+   unchanged; `tests/public_surface_baseline.json` enforces it (only a
+   deliberate migration to `_state` drops a name).
+3. **Shared mutable state lives in `_state`**, accessed by attribute
+   (`_state.X`, never `from splicecraft_state import X` — that binds a
+   stale copy). `tests/test_state_module.py` guards the
+   single-source-of-truth contract. A sibling reaches hub-pinned
+   dependencies through `_state` hooks, never by importing the hub
+   (which would be a cycle).
 
-If you cannot meet all three, the single-file convention wins.
+Everything else must still pass without modification, including the
+byte-for-byte assertions in `test_commercialsaas_io.py`. What stays
+hub-side: `PlasmidApp`, the big-3 panels (`PlasmidMap` / `SequencePanel`
+/ `LibraryPanel`), their anchored modals, and the blob writers — the
+God-class application core, which would need in-App decomposition rather
+than a lift.
 
 ## Sacred invariants
 

@@ -17,9 +17,16 @@ into the SAME dict through the re-exported decorator.
 
 Reaches hub-pinned bits via _state: `_AGENT_HANDLERS` (registry), `_LIVE_APP_REF`
 (live-app singleton, for save-failure notify), `_resolve_data_attr_hook`,
-`_all_enzymes_hook`, `_cache_lock`. `_sanitize_path` / `_ENZYME_CUT_RANGE` were
-relocated to L0 (util / biology) as prerequisites. Top layer among the siblings
-(imports the whole domain stack ≤L3); nothing imports it but the hub.
+`_all_enzymes_hook`, `_cache_lock`, plus 12 deferred-handler hooks for the deep
+engines that stay hub-side (in-process BLAST/HMM via pyhmmer, the alignment-
+rotation picker, the PCR sim, settings-flush, the master-delete + assembly-
+fragment cache busts, the experiment blob delete, the entry-vector binder). The
+"deferred chase" relocated the movable blockers — active-name getters/finders →
+dataaccess, the restore-from-backup engine → backup, the PCR caps → cloning — so
+ALL 107 data-only endpoints live here; only the 26 app-coupled handlers stay hub.
+`_sanitize_path` / `_ENZYME_CUT_RANGE` were relocated to L0 (util / biology) as
+prerequisites. Top layer among the siblings (imports the whole domain stack ≤L3);
+nothing imports it but the hub.
 """
 from __future__ import annotations
 
