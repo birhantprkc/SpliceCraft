@@ -16,12 +16,18 @@ simulator** ([INV-127]): the ligation primitives (`_ends_compatible`/`_ligate_fr
 ([INV-127]): `_scrub_gb_design` + its `_scrub_gb_*` helpers + `_assemble_scrub_amplicons_real`
 + the `_SCRUB_GB_*` constants — cures sites by splitting at each cluster into BsaI-tailed
 PCR fragments that Golden-Gate reassemble into the cured plasmid (real digest+ligate,
-verified). Extracted so the cloning modal/screen siblings can import them. Layer L3:
-imports state(L0), biology(L0), primer(L2), dataaccess(L1), record(L1), history(L2),
-logging(L0); used by the modals (L4). The enzyme catalog is reached via
-`_state._all_enzymes_hook` (it reads dataaccess but stays hub-side); the GB scrub reuses
-primer's `_scrub_design` + binding helpers (L2, downward — primer never imports cloning).
-Re-exported by the hub so every call site resolves unchanged.
+verified); and the **Golden-Braid / MoClo domestication primer designers**:
+`_design_gb_primers` (single-part domestication, with internal-Type-IIS synonymous
+repair) + `_design_operon_soe_primers` (whole-operon SOE) + the grammar-position /
+forbidden-site / pair-name helpers (`_grammar_position_by_type`/`_position_overhangs`/
+`_tu_overhangs`, `_gb_find_forbidden_hits`, `_gb_binding_region_advisory`,
+`_dom_primer_pair_names`). Extracted so the cloning modal/screen siblings can import them.
+Layer L3: imports state(L0), biology(L0), codon(L2), primer(L2), dataaccess(L1),
+record(L1), history(L2), logging(L0); used by the modals (L4). The enzyme catalog is
+reached via `_state._all_enzymes_hook` (it reads dataaccess but stays hub-side); the GB
+scrub + designers reuse primer's `_scrub_design`/binding helpers + codon's `_codon_fix_*`
+(all L2, downward — neither imports cloning). Re-exported by the hub so every call site
+resolves unchanged.
 """
 from __future__ import annotations
 
@@ -34,14 +40,18 @@ if TYPE_CHECKING:  # annotation-only; the real Bio import is lazy, inside the fn
 import splicecraft_state as _state
 from splicecraft_biology import (
     _digest_with_enzymes, _enzyme_cuts, _forbidden_hit_set, _fragments_from_cuts,
-    _iupac_pattern, _rc,
+    _iupac_pattern, _rc, _slice_circular,
 )
+from splicecraft_codon import _codon_fix_mutation_positions, _codon_fix_sites  # L2
 from splicecraft_primer import (   # L2 (downward; primer never imports cloning)
-    _PRIMER_MAX_OLIGO_LEN, _SCRUB_DEFAULT_ENZYMES, _circ_extract, _mut_gc_pct,
-    _pick_binding_region, _scrub_cluster_edits, _scrub_cluster_span, _scrub_design,
+    _PRIMER_MAX_OLIGO_LEN, _SCRUB_DEFAULT_ENZYMES, _SCRUB_PRIMER_FOOTPRINT,
+    _binding_max_len, _circ_extract, _mut_gc_pct, _mut_translate, _pick_binding_region,
+    _primer_tm, _scrub_cluster_edits, _scrub_cluster_span, _scrub_design,
+    _scrub_resolve_sites,
 )
 from splicecraft_dataaccess import (
-    _BUILTIN_GRAMMARS, _GB_CODING_PART_TYPES, _GB_L0_ENZYME_SITE, _GB_PAD, _GB_SPACER,
+    _BUILTIN_GRAMMARS, _GB_CODING_PART_TYPES, _GB_DOMESTICATION_FORBIDDEN,
+    _GB_L0_ENZYME_SITE, _GB_PAD, _GB_SPACER,
 )
 from splicecraft_history import (
     _CommercialSaaSHistoryNode, _coerce_int_or_zero, _history_now_str,
@@ -2123,3 +2133,613 @@ def _scrub_gb_design(seq: str, feats: "list | None" = None, enzymes=None, *,
         result["ok"] = False
         result["errors"].extend(errors)
     return result
+
+
+# ═══ Golden-Braid / MoClo domestication primer designers — moved from the hub ═
+# _design_gb_primers (single-part domestication) + _design_operon_soe_primers
+# (whole-operon SOE) + the grammar-position / forbidden-site / pair-name helpers.
+# Reuse primer L2 (designers + _scrub_design) + codon L2 (_codon_fix_*) + the
+# GB grammar data (dataaccess) + _atg_offset_for_part (local).
+
+def _dom_primer_pair_names(part_name: str, idx: int = 1) -> "tuple[str, str]":
+    """The canonical ``(fwd, rev)`` primer NAMES for a domestication pair:
+    ``{part_name}-DOM-{idx}-F`` / ``-R``. Single source of the naming
+    convention shared by `_save_primers_to_library` (the primer LIBRARY
+    entry), the `primer_bind` feature LABELS on the fragment + clone (via
+    `_part_primer_labels`), and the construction-history ``<Oligo>`` names
+    — so every surface shows the SAME name for a given primer (user
+    request 2026-06-05: "all unified"). ``idx`` is the 1-indexed pair
+    number within a run, matching `_save_primers_to_library`'s loop."""
+    base = str(part_name or "").strip() or "part"
+    return f"{base}-DOM-{idx}-F", f"{base}-DOM-{idx}-R"
+
+
+def _grammar_position_by_type(grammar: dict, ptype: str) -> "dict | None":
+    """Helper: find the position spec for a given part type within a
+    grammar. ``None`` if the grammar doesn't define that type — which
+    e.g. means CDS-NS isn't a valid pick under MoClo Plant."""
+    for pos in grammar.get("positions", []):
+        if pos.get("type") == ptype:
+            return pos
+    return None
+
+
+def _gb_find_forbidden_hits(
+    seq: str,
+    sites: "dict[str, str] | None" = None,
+) -> list[tuple[str, str, int]]:
+    """Return ``(enzyme_name, site_found, position)`` for **every** internal
+    Type IIS recognition in *seq*, on both forward and reverse strands.
+
+    The ``sites`` map (``{enzyme_name: recognition}``) defaults to the
+    Golden Braid L0 forbidden set (Esp3I + BsaI). Pass a different
+    grammar's ``forbidden_sites`` to scan against MoClo (BsaI + BpiI),
+    a custom grammar, or any other Type IIS combination. Returns every
+    occurrence — not just the first per enzyme. Critical for accurate
+    reporting when an insert contains multiple sites: the user must
+    know about all of them before paying for a gBlock synthesis.
+    Results are sorted by position to aid downstream reporting.
+    """
+    if sites is None:
+        sites = _GB_DOMESTICATION_FORBIDDEN
+    out: list[tuple[str, str, int]] = []
+    for name, site in sites.items():
+        if not isinstance(site, str) or not site:
+            continue
+        rc = _rc(site)
+        needles = [site] if rc == site else [site, rc]
+        for needle in needles:
+            start = 0
+            while True:
+                pos = seq.find(needle, start)
+                if pos == -1:
+                    break
+                out.append((name, needle, pos))
+                start = pos + 1
+    out.sort(key=lambda t: (t[2], t[0], t[1]))
+    return out
+
+
+def _gb_binding_region_advisory(
+    mutations: list[str],
+    insert_len: int,
+    fwd_bind_len: int,
+    rev_bind_len: int,
+) -> list[dict]:
+    """Return one entry per mutation that lands inside a primer binding
+    window. Each entry is ``{"text", "region", "codon_start"}`` where
+    ``region`` is ``"fwd"`` or ``"rev"``. Empty list when every mutation
+    is safely inside the amplicon's interior.
+
+    Why this matters: if a mutation falls inside the 5′ or 3′ binding
+    window, the PCR primer won't bind perfectly to the user's original
+    plasmid template — they must order the *mutated* insert as a gBlock
+    and use that as the PCR template (or redesign around the site).
+    """
+    if not mutations or insert_len <= 0:
+        return []
+    positions = _codon_fix_mutation_positions(mutations)
+    fwd_hi = max(0, fwd_bind_len)             # [0, fwd_hi) covers fwd binding
+    rev_lo = insert_len - max(0, rev_bind_len)  # [rev_lo, insert_len) covers rev binding
+    out: list[dict] = []
+    for text, codon_start in zip(mutations, positions):
+        if codon_start < 0:
+            continue
+        codon_end = codon_start + 3
+        # A 3-nt codon overlaps the fwd window if any nt is in [0, fwd_hi).
+        in_fwd = codon_start < fwd_hi
+        # Overlaps the rev window if any nt is in [rev_lo, insert_len).
+        in_rev = codon_end > rev_lo
+        if in_fwd:
+            out.append({"text": text, "region": "fwd",
+                        "codon_start": codon_start})
+        if in_rev:
+            out.append({"text": text, "region": "rev",
+                        "codon_start": codon_start})
+    return out
+
+
+@_timed("op.primer3.gb_design")
+def _design_gb_primers(
+    template_seq: str,
+    start: int,
+    end: int,
+    part_type: str,
+    target_tm: float = 60.0,
+    codon_raw: "dict | None" = None,
+    grammar: "dict | None" = None,
+) -> dict:
+    """Design modular cloning domestication primers for a template region.
+
+    Defaults to Golden Braid L0 (Esp3I, GGAG/TGAC/AATG/GCTT/CGCT
+    overhangs); pass ``grammar`` to use a different cloning grammar
+    (MoClo Plant, custom user-defined). The amplified product, after
+    digestion with the grammar's enzyme, carries the 4-nt overhangs
+    associated with ``part_type`` in that grammar's position table.
+
+    Primer structure (5'→3'):
+
+        Forward: [pad] [enzyme site] [spacer] [5' overhang]    [binding →]
+        Reverse: [pad] [enzyme site] [spacer] [RC 3' overhang] [← binding RC]
+
+    When *codon_raw* (a ``{codon: (aa, count)}`` dict from the codon-table
+    registry) is supplied and *part_type* is a coding type (CDS / CDS-NS /
+    C-tag), internal BsaI or Esp3I sites are silently repaired by
+    substituting synonymous codons before the primers are designed — the
+    returned ``insert_seq`` is then the *mutated* sequence (which is what
+    the user should order as a gBlock / synthetic fragment for PCR).
+    The list of substitutions made is returned under ``mutations``.
+
+    Returns a dict with keys: part_type, position, oh5, oh3, insert_seq,
+    fwd_binding, rev_binding, fwd_full, rev_full, fwd_tm, rev_tm,
+    amplicon_len, mutations, and a ``pairs`` list. ``pairs`` holds one
+    dict per amplicon — each with ``fwd_full``, ``rev_full``, ``fwd_tm``,
+    ``rev_tm``, ``fwd_pos``, ``rev_pos``, ``fwd_binding``, ``rev_binding``,
+    ``amplicon_len``. Callers that only need the first pair can continue
+    to read the legacy top-level keys; multi-pair savers should iterate
+    ``pairs`` (future SOE-PCR splitting for non-repairable internal sites
+    will extend this list beyond one pair).
+    """
+    g = grammar if isinstance(grammar, dict) else _BUILTIN_GRAMMARS["gb_l0"]
+    pos_spec = _grammar_position_by_type(g, part_type)
+    if pos_spec is None:
+        return {
+            "error": f"Part type {part_type!r} is not defined in grammar "
+                     f"{g.get('name', '?')}. Available types: "
+                     f"{', '.join(p.get('type', '?') for p in g.get('positions', []))}.",
+            "mutations": [],
+        }
+    pos_label, oh5, oh3 = pos_spec.get("name", "?"), pos_spec.get("oh5", ""), pos_spec.get("oh3", "")
+    forbidden_sites = g.get("forbidden_sites", _GB_DOMESTICATION_FORBIDDEN) or _GB_DOMESTICATION_FORBIDDEN
+    coding_types = set(g.get("coding_types", []) or _GB_CODING_PART_TYPES)
+    enzyme_pad = g.get("pad", _GB_PAD)
+    enzyme_site = g.get("site", _GB_L0_ENZYME_SITE)
+    enzyme_spacer = g.get("spacer", _GB_SPACER)
+
+    total  = len(template_seq)
+    insert = _slice_circular(template_seq.upper(), start, end)
+    wraps  = end < start
+
+    # Need at least 18 bp to pick a proper binding region — otherwise
+    # _pick_binding_region returns the whole (too-short) insert with Tm=0.
+    if len(insert) < 18:
+        return {
+            "error": f"Cloning region is too short ({len(insert)} bp). "
+                     f"Select at least 18 bp (recommended 25+ bp for a "
+                     f"robust binding region).",
+            "mutations": [],
+        }
+
+    # Internal Type IIS check. The grammar's `forbidden_sites` lists
+    # every recognition that must be absent from the final part — for
+    # GB L0 that's Esp3I (current cut) + BsaI (next-level reuse); for
+    # MoClo Plant, BsaI + BpiI. Coding parts can be repaired via
+    # synonymous codon substitution; non-coding parts have no reading
+    # frame so internal sites must be fixed manually.
+    mutations: list[str] = []
+    initial_hits = _gb_find_forbidden_hits(insert, sites=forbidden_sites)
+    if initial_hits:
+        hit_str = ", ".join(
+            f"{name} {site} at +{pos + 1}"
+            for name, site, pos in initial_hits
+        )
+        can_attempt_fix = (
+            part_type in coding_types
+            and bool(codon_raw)
+            and len(insert) % 3 == 0
+        )
+        if can_attempt_fix and codon_raw:
+            # Inline `codon_raw` narrowing for pyright: the `bool(codon_raw)`
+            # inside `can_attempt_fix` is not visible across the assignment,
+            # so re-asserting truthiness here lets the type checker see
+            # `codon_raw` as non-None at the call site below.
+            protein = _mut_translate(insert)
+            # 2026-05-27 (audit-5 H3): validate the reading frame
+            # before codon repair. `_mut_translate` stops on the
+            # first stop codon, so if the user's CDS selection is
+            # off-frame (codon_start != 1, partial CDS, or an
+            # off-by-one in the selected region) the protein comes
+            # out short and `_codon_fix_sites` will silently
+            # substitute synonyms in the WRONG codon table for every
+            # position — silently corrupting the synthesized part.
+            # Require the translated protein to cover ≥ 90 % of the
+            # insert's codons (allows for a single mid-CDS stop in
+            # error-tolerant cases but catches off-by-1 / off-by-2).
+            expected_codons = len(insert) // 3
+            if expected_codons and len(protein) < int(expected_codons * 0.9):
+                return {
+                    "error": (
+                        f"CDS reading-frame validation failed: translated "
+                        f"protein is {len(protein)} aa but the {len(insert)} "
+                        f"bp insert should encode ~{expected_codons} aa. "
+                        f"The selection is likely off-frame "
+                        f"(check `codon_start` qualifier, partial CDS, or "
+                        f"adjust selection boundaries to align with codon 1)."
+                    ),
+                }
+            if protein:
+                # 2026-05-27 (audit-5 H2): the insert is the user's
+                # raw CDS region — NOT a `_codon_optimize` output
+                # with an appended stop. Pass `has_appended_stop=False`
+                # so the boundary check doesn't silently skip the
+                # last 1-2 codons (leaving forbidden sites overlapping
+                # the C-terminus unfixed).
+                fixed_insert, mutations = _codon_fix_sites(
+                    insert, protein, codon_raw,
+                    sites=forbidden_sites,
+                    has_appended_stop=False,
+                )
+                remaining = _gb_find_forbidden_hits(
+                    fixed_insert, sites=forbidden_sites,
+                )
+                if remaining:
+                    remain_str = ", ".join(
+                        f"{name} {site} at +{pos + 1}"
+                        for name, site, pos in remaining
+                    )
+                    return {
+                        "error": f"Internal Type IIS site(s) remain after "
+                                 f"silent-mutation attempt ({remain_str}). "
+                                 f"The sites overlap codons with no "
+                                 f"synonymous alternative in this codon "
+                                 f"table — pick a different region or "
+                                 f"redesign.",
+                        "mutations": mutations,
+                    }
+                insert = fixed_insert
+            else:
+                return {
+                    "error": f"Internal Type IIS site(s) found ({hit_str}) "
+                             f"but the insert could not be translated for "
+                             f"silent mutation — pick a different region.",
+                    "mutations": [],
+                }
+        else:
+            reasons: list[str] = []
+            if part_type not in coding_types:
+                reasons.append(f"{part_type} is non-coding")
+            else:
+                if not codon_raw:
+                    reasons.append("no codon table selected")
+                if len(insert) % 3 != 0:
+                    reasons.append(f"insert length {len(insert)} bp is "
+                                   f"not a multiple of 3")
+            extra = f" ({'; '.join(reasons)})" if reasons else ""
+            return {
+                "error": f"Internal Type IIS site(s) found: {hit_str}. "
+                         f"Silent-mutation repair unavailable{extra}. "
+                         f"Pick a different region or redesign.",
+                "mutations": [],
+            }
+
+    # CDS ATG-fusion rule (regression guard 2026-05-21):
+    # When the 5' overhang carries the CDS start codon (e.g.
+    # AATG = 'A' spacer + 'ATG' start codon in GB L0), the
+    # forward primer must NOT re-include the CDS's own first
+    # 3 bp or the assembled L1 reads `...AATG ATG codon2...` —
+    # duplicated start codon that frameshifts the rest of the
+    # ORF. `_atg_offset_for_part` is the canonical helper that
+    # encodes which (overhang, part_type) pairs trigger this
+    # skip; it returns 3 for GB AATG+coding and 0 for MoClo
+    # Plant AGGT (no embedded ATG) or any other custom grammar
+    # whose CDS overhang doesn't carry the start codon. Extend
+    # `_atg_offset_for_part` to cover new ATG-carrying
+    # overhangs introduced by future grammars rather than
+    # hard-coding the rule here.
+    # NOTE: NO symmetric `oh3` skip. The GCTT (GB) / GCTT
+    # (MoClo Plant C-tag) 3' overhang does NOT embed a stop
+    # codon — the stop codon lives in the user's CDS body OR
+    # in the downstream LINK's body. Stripping the last 3 bp
+    # of the insert would silently drop the user's real stop.
+    fwd_skip = _atg_offset_for_part(oh5, part_type)
+    fwd_insert = insert[fwd_skip:] if fwd_skip else insert
+    # Assemble the 5' tails FIRST so each binding region can be capped to keep
+    # the TOTAL oligo within `_PRIMER_MAX_OLIGO_LEN` (binding grows to reach
+    # `target_tm` but never past 50 − len(tail)) — a low-GC arm reaches
+    # ~60 °C without blowing the oligo-synthesis budget.
+    fwd_tail = enzyme_pad + enzyme_site + enzyme_spacer + oh5
+    rev_tail = enzyme_pad + enzyme_site + enzyme_spacer + _rc(oh3)
+    fwd_bind, fwd_tm = _pick_binding_region(
+        fwd_insert, target_tm, max_len=_binding_max_len(len(fwd_tail)))
+    rev_bind, rev_tm = _pick_binding_region(
+        _rc(insert), target_tm, max_len=_binding_max_len(len(rev_tail)))
+    rev_skip = 0   # kept as a binding so the pos calc below works
+
+    fwd_full = fwd_tail + fwd_bind
+    rev_full = rev_tail + rev_bind
+
+    # Amplicon = pad + Esp3I + spacer + oh + insert + oh_rc + spacer_rc
+    #          + Esp3I_rc + pad_rc
+    amplicon_len = len(fwd_tail) + len(insert) + len(rev_tail)
+
+    # Positions of the primer binding regions on the TEMPLATE (not the
+    # full amplicon). The forward primer binds the top strand at the
+    # start of the insert; the reverse primer binds the bottom strand at
+    # the end of the insert (positions are reported in forward-strand
+    # coordinates). Save-to-library needs these to add primer_bind
+    # features to the map. For wrap regions, compute positions with
+    # modular arithmetic so they land on the real plasmid coordinates.
+    # AATG/GCTT skips shift the binding start/end by the skipped
+    # codon so the primer_bind features land on the actual primed
+    # bases (codon 2 .. last-but-one codon), not the duplicated
+    # start/stop.
+    if wraps:
+        fwd_pos = ((start + fwd_skip) % total,
+                   (start + fwd_skip + len(fwd_bind)) % total)
+        rev_pos = ((end - rev_skip - len(rev_bind)) % total,
+                   (end - rev_skip) % total)
+    else:
+        fwd_pos = (start + fwd_skip,
+                   start + fwd_skip + len(fwd_bind))
+        rev_pos = (end - rev_skip - len(rev_bind),
+                   end - rev_skip)
+
+    pair = {
+        "fwd_full":     fwd_full,
+        "rev_full":     rev_full,
+        "fwd_binding":  fwd_bind,
+        "rev_binding":  rev_bind,
+        "fwd_tm":       round(fwd_tm, 1),
+        "rev_tm":       round(rev_tm, 1),
+        "fwd_pos":      fwd_pos,
+        "rev_pos":      rev_pos,
+        "amplicon_len": amplicon_len,
+    }
+    # Binding-region advisory: flag any silent mutation that lands inside
+    # the forward or reverse primer binding window. When non-empty, the
+    # user must order the mutated insert as a gBlock and use that — not
+    # the original template — as the PCR template.
+    binding_region_mutations = _gb_binding_region_advisory(
+        mutations, len(insert), len(fwd_bind), len(rev_bind),
+    )
+    return {
+        "part_type":    part_type,
+        "position":     pos_label,
+        "oh5":          oh5,
+        "oh3":          oh3,
+        "insert_seq":   insert,
+        "mutations":    mutations,
+        "binding_region_mutations": binding_region_mutations,
+        "pairs":        [pair],
+        # Segment lengths for the results painter: GB primers
+        # assemble as `pad + enzyme_site + spacer + overhang +
+        # binding`. Exposed so `_show_result` can highlight the
+        # RE recognition seq in blue and the overhang/spacer as
+        # padding rather than leaving the whole tail gray.
+        "enzyme_site":   enzyme_site,
+        "enzyme_pad":    enzyme_pad,
+        "enzyme_spacer": enzyme_spacer,
+        # The binding-portion Tm this design aimed for. The achieved
+        # fwd_tm / rev_tm are the closest reachable within the allowed
+        # binding window (`_pick_binding_region`); `_show_result` flags any arm
+        # whose achieved Tm lands off this target so the next-best choice
+        # is visible to the user.
+        "target_tm":     float(target_tm),
+        # Legacy top-level mirror of pairs[0] for callers (cloning simulator,
+        # PrimerDesignScreen) that don't iterate the list yet.
+        **pair,
+    }
+
+
+def _design_operon_soe_primers(
+    operon_seq: str,
+    feats: "list[dict] | None",
+    grammar: dict,
+    *,
+    manual_edits: "list[dict] | None" = None,
+    extra_enzymes: "list[str] | None" = None,
+    codon_raw: "dict | None" = None,
+    target_tm: float = 60.0,
+    overlap_arm: int = 18,
+) -> dict:
+    """Design an SOE-PCR primer set that LIFTS a native operon off its template,
+    cures every grammar-forbidden Type IIS site, and adds the grammar's TU
+    cassette to the ends — ready to clone into the grammar's entry vector.
+
+    ``extra_enzymes`` (names, e.g. ``["EcoRI", "KpnI"]``) are cured ALONGSIDE the
+    grammar's Type IIS set — resolved against the merged enzyme catalog and
+    treated identically (synonymous inside CDS, flagged outside), so the lifted
+    operon can be scrubbed of downstream cloning sites too, not just the
+    assembly enzymes.
+
+    The user amplifies NATIVE DNA (no synthesis), so every cure must be carried
+    by a primer. Curing = synonymous substitutions inside CDS features
+    (`_scrub_design`, multi-CDS, reverse-strand- and stop-safe) PLUS any
+    ``manual_edits`` ({pos, to}) the user marked for non-coding sites. Edits are
+    clustered (`_SCRUB_PRIMER_FOOTPRINT`); each cluster becomes an SOE junction
+    with a complementary mutagenic primer pair carrying the cured bases, and the
+    two outermost primers carry ``pad + site + spacer + TU-overhang + binding``.
+
+    Returns one of:
+      * ``{ok: True, cured_seq, edits, primers:[{name, seq, kind, tm, ...}],
+            n_clusters, tu_overhangs, amplicon_len, warnings}``
+      * ``{needs_manual: True, sites_skipped:[{enzyme, site, pos, in_cds}],
+            cured_seq, edits, warnings}`` — forbidden sites remain (non-coding,
+            or a CDS site with no synonymous cure); caller collects
+            ``manual_edits`` for the ``in_cds=False`` ones and re-runs.
+      * ``{error: str}``
+
+    CATASTROPHIC-CLASS GATE: a cure is only real if a primer carries it. Before
+    returning ``ok`` every edit position is checked to fall inside a
+    primer-covered window (a flank binding region or a mutagenic window);
+    otherwise PCR off the native template would silently leave that site intact,
+    so the design is REFUSED ([[project_primer_design_catastrophic]])."""
+    operon_seq = (operon_seq or "").upper()
+    n = len(operon_seq)
+    if n < 40:
+        return {"error": f"Operon is too short ({n} bp) for SOE domestication."}
+    forbidden = dict(grammar.get("forbidden_sites") or _GB_DOMESTICATION_FORBIDDEN)
+    if extra_enzymes:
+        # Merge user-requested cloning enzymes (EcoRI / KpnI / …) into the
+        # forbidden set, resolved against the merged built-in + custom catalog.
+        forbidden.update(_scrub_resolve_sites(extra_enzymes))
+    enzymes = list(forbidden.keys())
+
+    # 1. Auto-cure synonymous CDS sites via the Scrub engine (strand/stop-safe,
+    #    multi-CDS; it skips non-coding sites — those need manual override).
+    scrub = _scrub_design(operon_seq, feats, enzymes=enzymes,
+                          circular=False, codon_raw=codon_raw)
+    if not scrub.get("ok", True):
+        return {"error": "; ".join(scrub.get("warnings") or ["cure failed"])}
+    # Auto-apply ONLY synonymous cures whose changed base sits INSIDE a CDS
+    # feature — the rule is "mutate inside CDS, flag outside" (the Scrub engine
+    # will freely substitute a non-coding base, but a stray change could break
+    # an RBS / regulator, so we leave those for manual override). A site that
+    # needs a non-coding edit is therefore left intact → flagged below.
+    cds_spans = [(int(f["start"]), int(f["end"]))
+                 for f in (feats or [])
+                 if str(f.get("type", "")).upper() == "CDS"
+                 and f.get("start") is not None and f.get("end") is not None]
+
+    def _in_cds(p: int) -> bool:
+        return any(s <= p < e for s, e in cds_spans)
+
+    working = list(operon_seq)
+    edits: "list[dict]" = []
+    for e in scrub.get("edits", []):
+        p = int(e["pos"])
+        if not _in_cds(p):
+            continue
+        working[p] = str(e["to"]).upper()
+        edits.append({"pos": p, "to": str(e["to"]).upper(),
+                      "frm": operon_seq[p], "region": "CDS"})
+
+    # 2. Apply user manual edits (single-base substitutions the user marked for
+    #    non-coding sites — explicitly authorized, so they bypass the CDS rule).
+    for m in (manual_edits or []):
+        try:
+            p, b = int(m["pos"]), str(m["to"]).upper()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 0 <= p < n and b in "ACGT":
+            working[p] = b
+            edits.append({"pos": p, "to": b, "frm": operon_seq[p],
+                          "region": "manual"})
+    cured = "".join(working)
+    if len(cured) != n:
+        return {"error": "internal: cure changed the sequence length"}
+
+    # 3. Any forbidden site still present? → caller must supply manual edits.
+    remaining = _gb_find_forbidden_hits(cured, sites=forbidden)
+    if remaining:
+        flagged = [{"enzyme": nm, "site": st, "pos": ps,
+                    "in_cds": _in_cds(ps)}
+                   for nm, st, ps in remaining]
+        return {"needs_manual": True, "sites_skipped": flagged,
+                "cured_seq": cured, "edits": edits,
+                "warnings": scrub.get("warnings", [])}
+
+    # 4. Cluster edits (linear — no origin merge) into SOE junctions.
+    positions = sorted(e["pos"] for e in edits)
+    clusters: "list[list[int]]" = []
+    if positions:
+        clusters = [[positions[0]]]
+        for p in positions[1:]:
+            if p - clusters[-1][-1] <= _SCRUB_PRIMER_FOOTPRINT:
+                clusters[-1].append(p)
+            else:
+                clusters.append([p])
+
+    # 5. Flanking primers carry the grammar cassette. An operon clones as a
+    #    CDS-EQUIVALENT L0 part, so use the OPERON position's overhangs (AATG
+    #    carrying the first gene's start codon → GCTT before a terminator),
+    #    falling back to CDS, then the TU boundary.
+    pad = grammar.get("pad", _GB_PAD)
+    site = grammar.get("site", _GB_L0_ENZYME_SITE)
+    spacer = grammar.get("spacer", _GB_SPACER)
+    oh = _grammar_position_overhangs(grammar, ("OPERON", "CDS"))
+    op_oh5, op_oh3 = oh if oh else _grammar_tu_overhangs(grammar)
+    if not op_oh5 or not op_oh3:                       # custom grammar w/o any
+        op_oh5, op_oh3 = "AATG", "GCTT"
+    fwd_tail = pad + site + spacer + op_oh5
+    rev_tail = pad + site + spacer + _rc(op_oh3)
+    # ATG-fusion: when the 5' overhang carries the start codon (AATG) AND the
+    # operon really begins with the first gene's ATG, the forward primer binds
+    # at codon 2 so the assembled L1 reads ...AATG + codon2... (no duplicated
+    # ATG) — exactly the CDS convention (`_atg_offset_for_part`).
+    fwd_skip = (_atg_offset_for_part(op_oh5, "OPERON")
+                if cured[:3] == "ATG" else 0)
+    fwd_bind, fwd_tm = _pick_binding_region(
+        cured[fwd_skip:], target_tm, max_len=_binding_max_len(len(fwd_tail)))
+    rev_bind, rev_tm = _pick_binding_region(
+        _rc(cured), target_tm, max_len=_binding_max_len(len(rev_tail)))
+    primers: "list[dict]" = []
+    fwd_name, rev_name = _dom_primer_pair_names("operon", 1)
+    primers.append({"name": fwd_name, "seq": fwd_tail + fwd_bind,
+                    "kind": "flank-fwd", "tm": round(fwd_tm, 1),
+                    "covers": [fwd_skip, fwd_skip + len(fwd_bind)]})
+    primers.append({"name": rev_name, "seq": rev_tail + rev_bind,
+                    "kind": "flank-rev", "tm": round(rev_tm, 1),
+                    "covers": [n - len(rev_bind), n]})
+    # Primer-covered windows: the two flank binding regions sit at the ends
+    # (the forward one starts past the skipped start codon).
+    cover: "list[tuple[int, int]]" = [(fwd_skip, fwd_skip + len(fwd_bind)),
+                                      (n - len(rev_bind), n)]
+
+    # 6. Internal mutagenic pairs — one per cluster, carrying the cured bases.
+    #    Window = cluster span ± overlap_arm (clamped); the fwd primer IS the
+    #    cured window, the rev its reverse-complement → a fully-complementary
+    #    SOE overlap that anneals during the assembly PCR.
+    for j, cl in enumerate(clusters, start=2):
+        ws = max(0, cl[0] - overlap_arm)
+        we = min(n, cl[-1] + 1 + overlap_arm)
+        if we - ws < 2 * overlap_arm:                 # near an end → widen in
+            if ws == 0:
+                we = min(n, 2 * overlap_arm)
+            else:
+                ws = max(0, n - 2 * overlap_arm if we == n else we - 2 * overlap_arm)
+        win = cured[ws:we]
+        fj, rj = _dom_primer_pair_names("operon", j)
+        primers.append({"name": fj, "seq": win, "kind": "soe-fwd",
+                        "tm": round(_primer_tm(win) or 0.0, 1),
+                        "covers": [ws, we]})
+        primers.append({"name": rj, "seq": _rc(win), "kind": "soe-rev",
+                        "tm": round(_primer_tm(_rc(win)) or 0.0, 1),
+                        "covers": [ws, we]})
+        cover.append((ws, we))
+
+    # 7. CATASTROPHIC-CLASS GATE — every cure must ride a primer.
+    for e in edits:
+        if not any(s <= e["pos"] < q for s, q in cover):
+            return {"error": (
+                f"cure at +{e['pos'] + 1} ({e.get('frm')}→{e['to']}) "
+                "falls outside every primer — the SOE set would not introduce "
+                "it. Aborting (catastrophic-class primer safety).")}
+    if _gb_find_forbidden_hits(cured, sites=forbidden):
+        return {"error": "internal: forbidden site survived the cure"}
+
+    return {"ok": True, "cured_seq": cured, "edits": edits, "primers": primers,
+            "n_clusters": len(clusters), "overhangs": [op_oh5, op_oh3],
+            "fwd_skip": fwd_skip,
+            "amplicon_len": len(fwd_tail) + (n - fwd_skip) + len(rev_tail),
+            "warnings": scrub.get("warnings", [])}
+
+
+def _grammar_tu_overhangs(grammar: dict) -> tuple[str, str]:
+    """Return ``(tu_start, tu_end)`` — the boundary overhangs of a
+    full TU under this grammar. ``tu_start`` is the first position's
+    `oh5` (Promoter side); ``tu_end`` is the last position's `oh3`
+    (Terminator side)."""
+    positions = grammar.get("positions") or []
+    if not positions:
+        return ("", "")
+    return (
+        str(positions[0].get("oh5") or ""),
+        str(positions[-1].get("oh3") or ""),
+    )
+
+
+def _grammar_position_overhangs(grammar: dict,
+                                type_names: "tuple[str, ...]"
+                                ) -> "tuple[str, str] | None":
+    """Return ``(oh5, oh3)`` of the FIRST of ``type_names`` present in this
+    grammar's position list (matched by part-type name), or ``None`` if none
+    are defined. Lets the Native Operon designer prefer the ``OPERON`` position
+    (CDS overhangs), fall back to ``CDS``, then to the TU boundary."""
+    by_type = {str(p.get("type") or ""): p
+               for p in (grammar.get("positions") or [])}
+    for nm in type_names:
+        p = by_type.get(nm)
+        if p and p.get("oh5") and p.get("oh3"):
+            return str(p["oh5"]), str(p["oh3"])
+    return None
