@@ -86,6 +86,23 @@ _primer_usage_cache_gen: int = 0
 _settings_flush_pending: "dict | None" = None
 _settings_flush_running: bool = False
 
+# Agent-API endpoint registry (Phase D) — `{name: (handler_fn, write_bool)}`,
+# populated at import by the `_agent_endpoint` decorator. Migrated to _state so
+# the splicecraft_agent sibling's handlers AND the hub's stay-behind handlers
+# register into the SAME dict; the hub keeps a same-object alias
+# (`_AGENT_HANDLERS = _state._AGENT_HANDLERS`) since it is mutated in place and
+# NEVER reassigned (the `_cache_lock` pattern), so the server dispatch, the
+# `sc._AGENT_HANDLERS` tests, and the getsource guards all resolve unchanged.
+_AGENT_HANDLERS: "dict[str, tuple]" = {}
+
+# Live running-app singleton (a hub-side `_LiveAppRef` holder). Migrated to
+# _state so the splicecraft_agent sibling's save-failure notifier
+# (`_agent_save_or_500`) reaches the running app without importing the hub. The
+# hub keeps a same-object alias (`_LIVE_APP_REF = _state._LIVE_APP_REF`); the
+# holder is created once + mutated via .set()/.acquire()/.release(), never
+# reassigned (the `_AGENT_HANDLERS` / `_cache_lock` pattern).
+_LIVE_APP_REF: "_Any" = None
+
 # ── HMM-DB download coordination (sweep #28) ──
 # Cross-modal-instance "is this DB already downloading?" guard + its lock.
 # Migrated to _state (demand-driven) so the HMM-DB downloader (splicecraft_search)

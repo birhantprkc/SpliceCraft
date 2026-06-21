@@ -61,6 +61,14 @@ _IUPAC_RE: dict[str, str] = {
 _PATTERN_CACHE: "OrderedDict[str, re.Pattern[str]]" = OrderedDict()
 _PATTERN_CACHE_MAX = 256
 
+# Sweep #26 (2026-05-23): cut-position validation bounds for custom enzymes.
+# Type IIS enzymes cut OUTSIDE the recognition site (offset can be larger than
+# `len(site)`); the ±30 window is generous enough to accept every NEB Type IIS
+# in production while still catching typos. Shared so the UI
+# (`AddCustomEnzymeModal`) and the agent custom-enzyme validator read one
+# definition rather than re-hardcoding ±30. Re-exported into the hub.
+_ENZYME_CUT_RANGE = 30
+
 
 def _iupac_pattern(site: str) -> "re.Pattern[str]":
     # Sweep #22: case-fold cache key. Patterns ARE always built from

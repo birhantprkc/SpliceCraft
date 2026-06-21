@@ -543,22 +543,23 @@ class TestCustomEnzymeAgentLock:
     def test_create_wraps_in_cache_lock(self):
         import inspect
         src = inspect.getsource(sc._h_create_custom_enzyme)
-        assert "with _cache_lock:" in src
+        # moved to splicecraft_agent — resolves the lock as _state._cache_lock
+        assert "with _state._cache_lock:" in src
 
     def test_update_wraps_in_cache_lock(self):
         import inspect
         src = inspect.getsource(sc._h_update_custom_enzyme)
-        assert "with _cache_lock:" in src
+        assert "with _state._cache_lock:" in src
 
     def test_delete_wraps_in_cache_lock(self):
         import inspect
         src = inspect.getsource(sc._h_delete_custom_enzyme)
-        assert "with _cache_lock:" in src
+        assert "with _state._cache_lock:" in src
 
     def test_collection_create_wraps_in_cache_lock(self):
         import inspect
         src = inspect.getsource(sc._h_create_enzyme_collection)
-        assert "with _cache_lock:" in src
+        assert "with _state._cache_lock:" in src
 
 
 # ═════════════════════════════════════════════════════════════════════

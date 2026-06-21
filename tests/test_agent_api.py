@@ -2842,7 +2842,10 @@ class TestAddCodonTableGenome:
                 "organism": "Testus organismus",
                 "stats": {"mode": mode, "n_cds_total": 7, "n_codons": 135},
             }
-        monkeypatch.setattr(sc, "_genome_build_codon_table", fake_build)
+        # _h_add_codon_table moved to splicecraft_agent — patch the sibling
+        # namespace it resolves the genome builder in (not the hub re-export).
+        monkeypatch.setattr(
+            "splicecraft_agent._genome_build_codon_table", fake_build)
         result = sc._h_add_codon_table(
             None, {"source": "genome", "taxid": "1423", "mode": "heg"})
         assert result["ok"] is True
@@ -2854,7 +2857,7 @@ class TestAddCodonTableGenome:
 
     def test_build_failure_returns_502(self, monkeypatch):
         monkeypatch.setattr(
-            sc, "_genome_build_codon_table",
+            "splicecraft_agent._genome_build_codon_table",
             lambda q, m, timeout=60.0: (None, "no such assembly", None))
         result = sc._h_add_codon_table(
             None, {"source": "genome", "accession": "GCF_000000000.0"})

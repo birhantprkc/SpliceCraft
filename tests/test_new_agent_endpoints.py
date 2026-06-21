@@ -525,7 +525,8 @@ def test_download_hmm_database_success(monkeypatch):
         return {"id": entry["id"], "n_profiles": 7, "pressed": True,
                 "sha256": "abc", "version": "downloaded", "bytes": 1234}
 
-    monkeypatch.setattr(sc, "_hmm_db_perform_download", _fake_perform)
+    monkeypatch.setattr(
+        "splicecraft_agent._hmm_db_perform_download", _fake_perform)
     res = sc._h_download_hmm_database(None, {"id": "stub_db"})
     assert res["ok"] and res["id"] == "stub_db"
     assert res["n_profiles"] == 7 and res["pressed"] is True
@@ -549,7 +550,7 @@ def test_download_hmm_database_failure_500_releases_slot(monkeypatch):
     def _boom(entry, **kw):
         raise RuntimeError("network exploded")
 
-    monkeypatch.setattr(sc, "_hmm_db_perform_download", _boom)
+    monkeypatch.setattr("splicecraft_agent._hmm_db_perform_download", _boom)
     res = sc._h_download_hmm_database(None, {"id": "pfam-a"})
     assert isinstance(res, tuple) and res[1] == 500
     # Slot must be released even on failure.

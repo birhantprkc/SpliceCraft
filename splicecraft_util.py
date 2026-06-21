@@ -32,6 +32,29 @@ except Exception:  # pragma: no cover — defensive against weird platforms
     _RUNTIME_PLATFORM = "?"
 
 
+def _sanitize_path(p: "str | None") -> "Path | None":
+    """Resolve a user-supplied path with `~` expansion. Returns None
+    on empty / None / non-string input. Doesn't reject any specific
+    paths — the user owns their filesystem and the agent runs with
+    their permissions, so OS-level file mode controls trust. We just
+    normalize so a relative path lands at CWD rather than a surprise
+    location, and reject non-string types so a JSON ``{"path": {}}``
+    can't smuggle a dict's str() into a Path constructor.
+
+    Refuses ``~user`` syntax (where ``user`` is anything other than
+    the empty current user). `Path.expanduser` will happily resolve
+    ``~daemon/.bashrc`` to /var/lib/daemon/... and similar — combined
+    with `_h_load_file`'s 404 vs 400 distinction this would be a
+    user-enumeration oracle for an agent caller. Only ``~`` (current
+    user, no trailing identifier) is allowed.
+    """
+    if not isinstance(p, str) or not p:
+        return None
+    if p.startswith("~") and len(p) > 1 and p[1] not in ("/", "\\"):
+        return None
+    return Path(p).expanduser()
+
+
 _NATURAL_SORT_RE = re.compile(r"(\d+)")
 
 _NATURAL_SORT_KEY_CACHE: "dict[str, tuple]" = {}
