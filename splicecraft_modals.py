@@ -35,8 +35,9 @@ from textual.events import Click, MouseDown, MouseMove, MouseUp
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, DataTable, DirectoryTree, Input, Label, ListItem, ListView, RadioButton, RadioSet, Select, Static, TextArea, Tree
 
+import splicecraft_state as _state
 from splicecraft_cloning import _simulate_cloned_plasmid, _simulate_primed_amplicon
-from splicecraft_dataaccess import _BUILTIN_GRAMMARS, _NEB_ENZYMES, _all_grammars, _collection_name_taken, _find_collection, _find_hmm_db_entry, _get_active_collection_name, _grammar_dropdown_options, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _load_collections, _load_feature_colors, _load_library, _load_primer_collections, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_collections, _search_collections_library
+from splicecraft_dataaccess import _BUILTIN_GRAMMARS, _all_grammars, _collection_name_taken, _find_collection, _find_hmm_db_entry, _get_active_collection_name, _grammar_dropdown_options, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _load_collections, _load_feature_colors, _load_library, _load_primer_collections, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_collections, _search_collections_library
 from splicecraft_history import _CommercialSaaSHistoryNode, _history_detail_lines, _history_populate_tree, _history_protocol_renderable, _history_tree_label
 from splicecraft_logging import _log, _log_event
 from splicecraft_util import _CONTROL_CHARS_RE, _PLASMID_STATUS_VALUES, _cursor_row_key, _natural_sort_key, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _sanitize_label, _sanitize_plasmid_name, _sanitize_plasmid_status, _scrub_path, _validate_group_members
@@ -5880,7 +5881,7 @@ class RestrictionInsertModal(_OneShotDismissScreen, ModalScreen):
         self._all_rows: list[tuple[str, str, int]] = sorted(
             (
                 (name, info[0], len(info[0].replace("N", "")))
-                for name, info in _NEB_ENZYMES.items()
+                for name, info in _state._all_enzymes_hook().items()
                 if isinstance(info, tuple) and info
             ),
             key=lambda r: _natural_sort_key(r[0]),

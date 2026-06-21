@@ -74,6 +74,26 @@ def test_all_enzymes_includes_custom():
     assert "EcoRI" in combined
 
 
+def test_custom_enzymes_appear_in_pickers():
+    """A user-defined custom enzyme must be SELECTABLE in the enzyme pickers AND
+    ACCEPTED by grammar validation -- not just usable in the scan/cloning paths.
+    Closes the INV-64 parity gap: the cloning-RE picker, the restriction-insert
+    modal, the Domesticator/primer pickers, and the GrammarEditor validation
+    keyed on the built-in NEB set; they now route through `_all_enzymes()`."""
+    import splicecraft_modals as _m
+    sc._save_custom_enzymes([
+        {"name": "MyEnzI", "site": "GMGCGC", "fwd_cut": 1, "rev_cut": 5},
+    ])
+    # 1. cloning-RE picker options include the custom enzyme (+ keep the built-ins).
+    names = {n for _, n in sc._cloning_re_options()}
+    assert "MyEnzI" in names and "EcoRI" in names
+    # 2. GrammarEditor validation accepts it (the modal gate is `not in _all_enzymes()`).
+    assert "MyEnzI" in sc._all_enzymes()
+    # 3. the restriction-insert modal picker lists it (built from `_all_enzymes_hook`).
+    rows = _m.RestrictionInsertModal()._all_rows
+    assert any(name == "MyEnzI" for name, _site, _bp in rows)
+
+
 def test_save_custom_enzyme_rebuilds_scan_catalog():
     """Saving a custom enzyme must rebuild `_SCAN_CATALOG` so the new enzyme is
     immediately scannable. Pre-Phase-D this side-effect was inline in

@@ -895,6 +895,7 @@
  "_clone_part_synthesise_insert",
  "_clone_part_try_primer_path",
  "_cloning_enzyme_options",
+ "_cloning_re_options",
  "_close_circular",
  "_codon_allocate",
  "_codon_build_aa_map",
