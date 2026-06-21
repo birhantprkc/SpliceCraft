@@ -57,6 +57,7 @@ _LAYER_RULES = [
     ("splicecraft_widgets", 3),
     ("splicecraft_modals", 4),
     ("splicecraft_cloning", 3),  # construction sim: imports history L2/dataaccess L1, used by modals L4
+    ("splicecraft_seqanalysis", 3),  # ORF finder + part classifier: imports cloning L3 (same-layer, no cycle) + codon L2/record L1
     ("splicecraft_screens", 6),
     ("splicecraft_agent", 7),
     ("splicecraft_live_ref", 8),

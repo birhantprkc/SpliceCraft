@@ -276,6 +276,13 @@ _RESTR_SCAN_CACHE: "_OrderedDict[tuple, list]" = _OrderedDict()
 _RESTR_SCAN_CACHE_MAX: int = 4
 _ENZYME_CUTS_CACHE: "_OrderedDict[tuple, list[dict]]" = _OrderedDict()
 _ENZYME_CUTS_CACHE_MAX: int = 16
+# Part-classification caches for the seq-analysis sibling. Canonical home is
+# `_state`; the hub keeps live aliases (`_VECTOR_MATCH_CACHE = _state._VECTOR_MATCH_CACHE`)
+# so `_after_entry_vectors_save`'s `globals().get(...).clear()` bust still finds + clears
+# the SAME dict the sibling reads. Mutated in place only (never reassigned), so the alias
+# never desyncs. (FIFO-bounded by the sibling's `_*_CACHE_MAX`.)
+_VECTOR_MATCH_CACHE: "dict[tuple, str | None]" = {}
+_ACCEPTOR_TU_PAIRS_CACHE: "dict[tuple[str, str], list[tuple[str, str, str, str]]]" = {}
 # Getters the hub registers at import so the sibling scanner reaches hub-side
 # data: the fresh `_SCAN_CATALOG`, and the combined `_all_enzymes()` view
 # (built-in + custom — reads dataaccess, so the function itself stays hub-side).
