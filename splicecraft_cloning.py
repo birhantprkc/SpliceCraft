@@ -6,10 +6,15 @@ digest+ligation (`_simulate_cloned_plasmid`), the pUPD2 backbone stub, overhang
 fusion, the Commercial-SaaS `.dna` history serialisation, and the **Gibson assembly
 simulator** ([INV-85/86]): `_simulate_gibson_assembly` + its `_gibson_*` helpers
 (overlap detect, body-length validate, product build, feature shift + origin-wrap
-merge) and `_gibson_record_from_result`. Extracted so the cloning modal/screen
-siblings can import them. Layer L3: imports biology(L0), dataaccess(L1), record(L1),
-history(L2), logging(L0); used by the modals (L4). Re-exported by the hub so every
-call site resolves unchanged.
+merge) and `_gibson_record_from_result`; plus the **traditional (restriction) cloning
+simulator** ([INV-127]): the ligation primitives (`_ends_compatible`/`_ligate_fragments`
+/`_close_circular`) and the cut-paste sims (`_simulate_traditional_cloning`(`_multi`),
+`_classify_junction`, `_annotate_scars_on_product`, `_rc_fragment`,
+`_label_disrupted_split_features`). Extracted so the cloning modal/screen siblings can
+import them. Layer L3: imports state(L0), biology(L0), dataaccess(L1), record(L1),
+history(L2), logging(L0); used by the modals (L4). The enzyme catalog is reached via
+`_state._all_enzymes_hook` (it reads dataaccess but stays hub-side). Re-exported by the
+hub so every call site resolves unchanged.
 """
 from __future__ import annotations
 
@@ -19,7 +24,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # annotation-only; the real Bio import is lazy, inside the fn
     from Bio.SeqRecord import SeqRecord
 
-from splicecraft_biology import _rc
+import splicecraft_state as _state
+from splicecraft_biology import _iupac_pattern, _rc
 from splicecraft_dataaccess import (
     _BUILTIN_GRAMMARS, _GB_CODING_PART_TYPES, _GB_L0_ENZYME_SITE, _GB_PAD, _GB_SPACER,
 )
@@ -875,3 +881,614 @@ def _gibson_record_from_result(result: dict, *, name: str) -> "SeqRecord | None"
             ])
         rec.features.append(SeqFeature(loc, type=ftype, qualifiers=quals))
     return rec
+
+
+# ═══ Traditional (restriction) cloning simulation — moved from the hub ═══════
+# Ligation primitives + the cut-paste cloning sims ([INV-127]: the design IS
+# the product). Enzyme catalog via _state._all_enzymes_hook.
+
+def _label_disrupted_split_features(features: "list[dict]",
+                                     enzymes: "list[str] | None" = None) -> None:
+    """In-place: a feature split across a cloning cut (tagged ``_split`` head/
+    tail by `_split_features_at_cuts`) had a cut site land INSIDE it — e.g.
+    cloning into lacZα's MCS knocks the gene out. Mark each surviving half as
+    disrupted: append `` (disrupted)`` to its label (once) and record a note
+    naming the cut enzyme(s), so the product shows the broken feature as two
+    flanking pieces instead of an intact one. Render-only — coords untouched.
+    Idempotent (skips a half already marked); leaves un-split features (the
+    carried-over insert annotations) alone."""
+    enz = sorted({e for e in (enzymes or []) if e})
+    where = f" ({'/'.join(enz)} cut site inside it)" if enz else ""
+    for f in features:
+        # head/tail = split across fragments; whole = cut(s) inside it but the
+        # remnant stayed in one fragment (an excised middle, e.g. a lacZ MCS).
+        if f.get("_split") not in ("head", "tail", "whole") or f.get("_disrupted"):
+            continue
+        base = str(f.get("label") or f.get("type") or "feature")
+        if "(disrupted)" not in base:
+            f["label"] = f"{base} (disrupted)"
+        tag = f"Disrupted by the cloning insertion{where}."
+        note = str(f.get("note") or "").strip()
+        f["note"] = f"{note}; {tag}" if note else tag
+        f["_disrupted"] = True
+
+
+def _ends_compatible(end_a: dict, end_b: dict) -> bool:
+    """Return True if two fragment edges can ligate. Same kind +
+    matching overhang sequence (both stored top-strand-canonical). A
+    `linear` edge never ligates."""
+    ka, kb = end_a.get("kind"), end_b.get("kind")
+    if ka == "linear" or kb == "linear":
+        return False
+    if ka != kb:
+        return False
+    return end_a.get("overhang_seq", "") == end_b.get("overhang_seq", "")
+
+
+def _ligate_fragments(a: dict, b: dict) -> "dict | None":
+    """Ligate `a.right` to `b.left`. Returns merged fragment (linear),
+    or None if the overhangs are incompatible. The merged top strand
+    is `a.top_seq + b.top_seq` (overhang bases live in whichever piece's
+    top strand carried them — see the canonicalisation comment above).
+    Features from `b` are shifted by `len(a.top_seq)`."""
+    if not _ends_compatible(a["right"], b["left"]):
+        return None
+    shift = len(a["top_seq"])
+    merged_feats = list(a["features"])
+    for f in b["features"]:
+        merged_feats.append({
+            **f,
+            "start": int(f.get("start", 0)) + shift,
+            "end":   int(f.get("end",   0)) + shift,
+        })
+    return {
+        "top_seq":      a["top_seq"] + b["top_seq"],
+        "left":         a["left"],
+        "right":        b["right"],
+        "features":     merged_feats,
+        "source_label": (f"{a['source_label']}+{b['source_label']}"
+                         if a["source_label"] or b["source_label"] else ""),
+    }
+
+
+def _close_circular(frag: dict) -> "dict | None":
+    """Close a linear fragment into a circle by ligating its right + left
+    edges. Returns ``{top_seq, features, source_label, circular: True}``
+    or None if the ends don't match."""
+    if not _ends_compatible(frag["right"], frag["left"]):
+        return None
+    return {
+        "top_seq":      frag["top_seq"],
+        "features":     [dict(f) for f in frag["features"]],
+        "source_label": frag["source_label"],
+        "circular":     True,
+    }
+
+
+@_timed("op.simulate_traditional_cloning")
+def _simulate_traditional_cloning(insert_frag: dict,
+                                    vector_frag: dict,
+                                   ) -> dict:
+    """Try to ligate `insert_frag` into `vector_frag` in both possible
+    orientations, returning a result dict:
+
+      ``{
+          "forward":  {"top_seq", "features", "compatible": bool},
+          "reverse":  {"top_seq", "features", "compatible": bool},
+          "warnings": [str, ...],
+          "errors":   [str, ...],
+        }``
+
+    `forward` = vector + insert as supplied; `reverse` = vector + RC of
+    insert. `compatible` is True when the overhangs actually permit
+    that orientation; False means the orientation is rendered for
+    reference (the insert can be flipped post-hoc) but isn't reachable
+    by canonical ligation chemistry. When BOTH orientations are
+    compatible (common with palindromic single-enzyme cuts), a
+    warning calls out the ambiguity."""
+    warnings: list[str] = []
+    errors:   list[str] = []
+    insert_rc = _rc_fragment(insert_frag)
+
+    fwd_linear = _ligate_fragments(vector_frag, insert_frag)
+    rev_linear = _ligate_fragments(vector_frag, insert_rc)
+
+    fwd_compat = fwd_linear is not None and \
+        _ends_compatible(fwd_linear["right"], fwd_linear["left"])
+    rev_compat = rev_linear is not None and \
+        _ends_compatible(rev_linear["right"], rev_linear["left"])
+
+    fwd_seq = (fwd_linear["top_seq"] if fwd_linear is not None
+               else vector_frag["top_seq"] + insert_frag["top_seq"])
+    rev_seq = (rev_linear["top_seq"] if rev_linear is not None
+               else vector_frag["top_seq"] + insert_rc["top_seq"])
+
+    def _shift_feats(base: dict, shift: int) -> list[dict]:
+        return [{**f,
+                  "start": int(f.get("start", 0)) + shift,
+                  "end":   int(f.get("end",   0)) + shift}
+                 for f in base["features"]]
+
+    # Cloning enzymes at the junctions — name the cut in the "(disrupted)"
+    # note for any vector feature a cut site landed inside.
+    _junction_enz = [e for e in (
+        insert_frag.get("left",  {}).get("enzyme"),
+        insert_frag.get("right", {}).get("enzyme"),
+        vector_frag.get("left",  {}).get("enzyme"),
+        vector_frag.get("right", {}).get("enzyme"),
+    ) if e]
+    # Fresh per-orientation copies of the vector features (don't mutate the
+    # caller's fragment) so each can be labelled independently.
+    fwd_feats = [dict(f) for f in vector_frag["features"]] + _shift_feats(
+        insert_frag, len(vector_frag["top_seq"]))
+    rev_feats = [dict(f) for f in vector_frag["features"]] + _shift_feats(
+        insert_rc,   len(vector_frag["top_seq"]))
+    # A cut site that fell inside a vector feature (e.g. cloning into lacZα's
+    # MCS) split it into two halves — surface that as "(disrupted)".
+    _label_disrupted_split_features(fwd_feats, _junction_enz)
+    _label_disrupted_split_features(rev_feats, _junction_enz)
+
+    if fwd_compat and rev_compat:
+        warnings.append(
+            "Ambiguous orientation: both forward and reverse ligation "
+            "are chemically compatible. The cloning reaction will yield "
+            "a mixture; pick by sequencing.")
+    elif fwd_compat and not rev_compat:
+        warnings.append(
+            "Directional cloning: only the forward orientation is "
+            "biologically achievable. Reverse is rendered for reference "
+            "but cannot ligate.")
+    elif rev_compat and not fwd_compat:
+        warnings.append(
+            "Directional cloning: only the reverse orientation is "
+            "biologically achievable. Forward is rendered for reference "
+            "but cannot ligate.")
+    else:
+        errors.append(
+            "Neither orientation has matching overhangs at both junctions. "
+            "Check that the insert and vector were cut with the same "
+            "enzyme(s).")
+
+    return {
+        "forward": {"top_seq": fwd_seq, "features": fwd_feats,
+                     "compatible": fwd_compat},
+        "reverse": {"top_seq": rev_seq, "features": rev_feats,
+                     "compatible": rev_compat},
+        "warnings": warnings,
+        "errors":   errors,
+    }
+
+
+def _classify_junction(left_enz: str, right_enz: str,
+                          context_top: str,
+                          *, context_left_offset: int = 6) -> dict:
+    """Classify a ligation junction by checking whether the parent
+    enzymes can still re-cut the joint sequence.
+
+    ``context_top`` is the ~12 bp window straddling the junction
+    (default 6 bp on each side; `context_left_offset` says how many
+    bases of `context_top` are upstream of the cut). Returns:
+
+      {
+        "scar":         bool,    # True when NEITHER parent enzyme
+                                 # recognises the joint — irreversible
+                                 # (BioBrick-style idempotent assembly:
+                                 # SpeI A/CTAGT + XbaI T/CTAGA → ACTAGA,
+                                 # neither cuttable).
+        "re_cuttable":  list[str],  # parent enzyme names whose
+                                    # recognition site IS still
+                                    # present at the junction.
+        "label":        str,     # human-readable badge for warnings /
+                                 # feature annotations.
+      }
+
+    Generic to all enzymes (palindromic + asymmetric + Type IIS):
+    matches each parent enzyme's recognition site (via IUPAC pattern
+    + reverse-complement) against the junction context window, so
+    BamHI/BamHI (re-cuttable), BamHI/BglII (scar), and
+    BsaI-Type-IIS junctions all classify correctly.
+    """
+    enzymes = []
+    if left_enz:
+        enzymes.append(left_enz)
+    if right_enz and right_enz != left_enz:
+        enzymes.append(right_enz)
+    catalog = _state._all_enzymes_hook()
+    re_cuttable: list[str] = []
+    ctx = context_top.upper()
+    for ename in enzymes:
+        spec = catalog.get(ename)
+        if spec is None:
+            continue
+        site = spec[0].upper()
+        if not site:
+            continue
+        pat = _iupac_pattern(site)
+        if pat.search(ctx):
+            re_cuttable.append(ename)
+            continue
+        # Check the reverse complement too — asymmetric / Type IIS
+        # enzymes can bind either strand and re-cut from the other
+        # side. Palindromic sites are their own RC so a double-match
+        # is fine.
+        rc_pat = _iupac_pattern(_rc(site))
+        if rc_pat.search(ctx):
+            re_cuttable.append(ename)
+    if re_cuttable:
+        return {
+            "scar":        False,
+            "re_cuttable": re_cuttable,
+            "label":       (f"{'/'.join(re_cuttable)} "
+                              f"re-cuttable junction"),
+        }
+    # No parent enzyme site survives → idempotent scar.
+    pair = f"{left_enz}/{right_enz}" if left_enz != right_enz else left_enz
+    return {
+        "scar":        True,
+        "re_cuttable": [],
+        "label":       f"{pair} scar (uncuttable by parent enzymes)",
+    }
+
+
+@_timed("op.simulate_traditional_cloning_multi")
+def _simulate_traditional_cloning_multi(insert_frags: list[dict],
+                                          vector_frag: dict) -> dict:
+    """N-way version of `_simulate_traditional_cloning`. Pre-chains
+    ``insert_frags`` in lane order — each adjacent pair must have
+    matching sticky ends — then delegates to the 2-fragment engine
+    for the final vector + chained-insert ligation. For N=1 this is
+    bit-identical to calling the 2-fragment engine directly.
+
+    Forward = inserts in lane order; Reverse = the entire chain RC'd
+    (the 2-fragment engine handles the flip). Per-junction error
+    messages name the failing pair by its ``source_label`` so the
+    user can diagnose which sticky-end pair didn't match.
+
+    Returns the same shape as `_simulate_traditional_cloning`:
+    ``{"forward": {...}, "reverse": {...}, "warnings": [...],
+       "errors": [...]}``.
+    """
+    if not insert_frags:
+        empty = {"top_seq": vector_frag.get("top_seq", ""),
+                 "features": [], "compatible": False}
+        return {
+            "forward":  empty,
+            "reverse":  empty,
+            "warnings": [],
+            "errors":   ["No insert fragments queued for ligation."],
+        }
+    if len(insert_frags) == 1:
+        result = _simulate_traditional_cloning(insert_frags[0],
+                                                 vector_frag)
+        _annotate_scars_on_product(result, insert_frags, vector_frag)
+        return result
+    chained = insert_frags[0]
+    # Record junction info as we chain so the scar annotator below
+    # can locate each junction in the final product.
+    junction_info: list[dict] = []
+    for i in range(1, len(insert_frags)):
+        left_enz_at_junc  = chained["right"].get("enzyme") or ""
+        right_enz_at_junc = insert_frags[i]["left"].get("enzyme") or ""
+        junction_pos = len(chained["top_seq"])  # bp position in chain
+        nxt = _ligate_fragments(chained, insert_frags[i])
+        if nxt is None:
+            a_label = chained.get("source_label") or f"fragment {i}"
+            b_label = (insert_frags[i].get("source_label")
+                        or f"fragment {i + 1}")
+            empty = {"top_seq": "", "features": [], "compatible": False}
+            return {
+                "forward":  empty,
+                "reverse":  empty,
+                "warnings": [],
+                "errors": [
+                    f"Junction {i} → {i + 1}: sticky ends incompatible "
+                    f"between {a_label!r} (3' end) and {b_label!r} "
+                    f"(5' end). Check that adjacent fragments share an "
+                    f"enzyme at the matching cut."
+                ],
+            }
+        junction_info.append({
+            "label":       f"insert {i} ↔ insert {i + 1}",
+            "left_enz":    left_enz_at_junc,
+            "right_enz":   right_enz_at_junc,
+            "pos_in_chain": junction_pos,
+        })
+        chained = nxt
+    result = _simulate_traditional_cloning(chained, vector_frag)
+    _annotate_scars_on_product(result, insert_frags, vector_frag,
+                                  internal_junctions=junction_info)
+    return result
+
+
+def _annotate_scars_on_product(
+    result: dict,
+    insert_frags: list[dict],
+    vector_frag: dict,
+    *,
+    internal_junctions: "list[dict] | None" = None,
+) -> None:
+    """Walk every ligation junction in the simulated product and
+    emit (a) a warning per junction describing whether it's
+    re-cuttable or an idempotent scar (BioBrick-style), and (b) a
+    ``misc_feature`` at the junction position labelled with the
+    same. The annotations land on BOTH the forward and reverse
+    orientation products so the user's saved plasmid carries the
+    scar info regardless of which orientation they keep.
+
+    ``internal_junctions`` is a list of ``{label, left_enz,
+    right_enz, pos_in_chain}`` for the N-1 insert↔insert junctions
+    when N inserts were chained pre-vector-ligation. The vector↔
+    chain junctions are computed here from the parent frags'
+    end-enzyme metadata. Mutates `result["warnings"]` and
+    `result["forward"/"reverse"]["features"]` in place."""
+    warnings: list[str] = result.setdefault("warnings", [])
+    # Chained-insert sequence (everything except the vector).
+    chain_top = "".join(f.get("top_seq", "") for f in insert_frags)
+    chain_len = len(chain_top)
+    vec_len   = len(vector_frag.get("top_seq", ""))
+    # Per-orientation junctions are built lazily inside
+    # `_build_orient_junctions(reverse, total)` below — forward and
+    # reverse need different position math (the close-junction wraps
+    # at the product's actual length, not at `vec_len + chain_len`).
+    _ = chain_len  # kept for future re-use; no longer needed here
+
+    def _build_orient_junctions(reverse: bool,
+                                   total: int) -> list[dict]:
+        """Per-orientation junction list. In REVERSE the insert chain
+        is RC'd, so each chain end uses the OPPOSITE end's enzyme
+        (RC swaps left↔right metadata). Positions also need
+        re-derivation: the close lives at the product's wrap point
+        (total), not at `vec_len + forward_chain_len`."""
+        out: list[dict] = []
+        if not reverse:
+            # Forward = original layout.
+            out.append({
+                "label":     "vector ↔ insert 1",
+                "left_enz":  vector_frag["right"].get("enzyme") or "",
+                "right_enz": insert_frags[0]["left"].get("enzyme") or "",
+                "pos":       vec_len,
+            })
+            for j in internal_junctions or []:
+                out.append({
+                    "label":     j["label"],
+                    "left_enz":  j["left_enz"],
+                    "right_enz": j["right_enz"],
+                    "pos":       vec_len + j["pos_in_chain"],
+                })
+            out.append({
+                "label":     f"insert {len(insert_frags)} ↔ vector",
+                "left_enz":  insert_frags[-1]["right"].get("enzyme") or "",
+                "right_enz": vector_frag["left"].get("enzyme") or "",
+                "pos":       total,
+            })
+            return out
+        # Reverse — chain order is REVERSED (insert N comes first,
+        # insert 1 last) and each insert's left/right enzymes swap.
+        n_inserts = len(insert_frags)
+        # vec.right ↔ RC(chain_first).left = chain_first was
+        # insert_frags[-1] (reversed order), so its left after RC
+        # corresponds to original right.
+        first_in_rc_chain = insert_frags[-1]
+        out.append({
+            "label":     f"vector ↔ insert {n_inserts}",
+            "left_enz":  vector_frag["right"].get("enzyme") or "",
+            "right_enz": first_in_rc_chain["right"].get("enzyme") or "",
+            "pos":       vec_len,
+        })
+        # Internal junctions (only when N > 1): the chain runs in
+        # reverse order, and each insert-to-insert junction uses the
+        # RC'd ends. For an internal junction `insert i ↔ insert
+        # i+1` in forward, the reverse equivalent is `insert (n - i)
+        # ↔ insert (n - i - 1)` with swapped enzymes.
+        if internal_junctions:
+            # Walk forward chain junctions backwards.
+            for jf in reversed(internal_junctions):
+                out.append({
+                    "label":     jf["label"] + " (reverse)",
+                    # Enzymes swap because chain is RC'd
+                    "left_enz":  jf["right_enz"],
+                    "right_enz": jf["left_enz"],
+                    "pos":       vec_len + (sum(
+                        len(f.get("top_seq", ""))
+                        for f in insert_frags
+                    ) - jf["pos_in_chain"]),
+                })
+        # Closing junction (chain last → vec). chain_last was
+        # insert_frags[0] in original order.
+        last_in_rc_chain = insert_frags[0]
+        out.append({
+            "label":     "insert 1 ↔ vector",
+            "left_enz":  last_in_rc_chain["left"].get("enzyme") or "",
+            "right_enz": vector_frag["left"].get("enzyme") or "",
+            "pos":       total,
+        })
+        return out
+
+    def _annotate_orient(prod: dict, *, reverse: bool) -> None:
+        if not prod.get("compatible", False):
+            return
+        top = prod.get("top_seq", "")
+        if not top:
+            return
+        feats = prod.setdefault("features", [])
+        total = len(top)
+        for j in _build_orient_junctions(reverse, total):
+            pos = j["pos"]
+            # Circular wrap window — the closing junction sits at
+            # `pos = total`. The context must straddle the linear-
+            # string boundary or the regenerated parent recognition
+            # site disappears.
+            if pos >= total or pos == 0:
+                pre = top[max(0, total - 6):total]
+                post = top[:min(6, total)]
+                context = pre + post
+                ctx_left_offset = len(pre)
+            else:
+                window_l = max(0, pos - 6)
+                window_r = min(total, pos + 6)
+                context = top[window_l:window_r]
+                ctx_left_offset = pos - window_l
+            cls = _classify_junction(
+                j["left_enz"], j["right_enz"], context,
+                context_left_offset=ctx_left_offset,
+            )
+            warnings.append(f"Junction {j['label']}: {cls['label']}")
+            # Tag the 4 bp ligation OVERHANG — light-blue, arrowless (strand
+            # 0) — instead of labelling the junction a "LIGATION SCAR" (the
+            # user wanted scars left as-is in the sequence, not annotated; the
+            # re-cuttable / scar classification still rides the warnings
+            # above). The ORIGIN junction's overhang straddles the
+            # linearisation point, so tag it as a wrap feature (end < start →
+            # CompoundLocation on save) — a full 4 bp, not the 2 bp head a
+            # flat [0,2) clamp gives (review F6).
+            if pos >= total or pos == 0:
+                if total >= 4:
+                    feats.append({
+                        "start":  total - 2,
+                        "end":    2,
+                        "strand": 0,
+                        "type":   "misc_feature",
+                        "label":  (top[total - 2:total] + top[:2]).upper()
+                                  or "overhang",
+                        "color":  "#ADD8E6",
+                    })
+                continue
+            feat_s = max(0, pos - 2)
+            feat_e = min(total, pos + 2)
+            if feat_e > feat_s:
+                feats.append({
+                    "start":  feat_s,
+                    "end":    feat_e,
+                    "strand": 0,
+                    "type":   "misc_feature",
+                    "label":  top[feat_s:feat_e].upper() or "overhang",
+                    "color":  "#ADD8E6",
+                })
+
+    _annotate_orient(result.get("forward", {}), reverse=False)
+    _annotate_orient(result.get("reverse", {}), reverse=True)
+
+
+def _rc_fragment(frag: dict) -> dict:
+    """Reverse-complement a Fragment, swapping its left/right ends and
+    flipping its feature coordinates. The overhang sequences of the
+    swapped ends are themselves reverse-complemented (the strand that
+    sticks out is now the other strand). 5' overhangs stay 5' (the
+    "5'-protruding" geometry is preserved across the flip — only the
+    bases change).
+
+    Convention-aware ``top_seq`` reconstruction (fix for the
+    EcoRI+KpnI reverse-orientation scar-detection bug, 2026-05-23):
+    excised fragments include overhang bases in ``top_seq`` at ends
+    where the overhang is on the TOP strand (5' at left, 3' at
+    right); synthetic fragments do not. After RC, the strand the
+    overhang sits on flips, so the included/excluded bases must move
+    accordingly — naive ``_rc(top_seq)`` produces junk at the
+    junction for excise-convention fragments. The heuristic below
+    detects per-end whether the convention is excise (overhang bases
+    present in top_seq) by comparing the prefix/suffix of top_seq to
+    the overhang_seq, and rebuilds the new top with the right
+    strand-side overhang inclusion."""
+    n = len(frag["top_seq"])
+    top = frag["top_seq"]
+    left  = frag["left"]
+    right = frag["right"]
+    left_oh  = left.get("overhang_seq", "") or ""
+    right_oh = right.get("overhang_seq", "") or ""
+    left_kind  = left.get("kind", "")
+    right_kind = right.get("kind", "")
+    # Convention detection: excise fragments include overhang bases
+    # in top_seq at ends where the overhang is on the top strand
+    # (5' at left OR 3' at right). Synthetic fragments
+    # (`_make_synthetic_fragment`) never include them. Heuristic:
+    # if top_seq's prefix/suffix matches the overhang at any on-top
+    # end, the fragment is excise; otherwise synthetic. When neither
+    # end is on-top (3' at left + 5' at right), heuristic can't
+    # tell — default to excise (the common case from
+    # `_excise_fragment_pair`).
+    # Per-end positive checks: top_seq prefix/suffix matches the
+    # overhang where the overhang sits on the TOP strand. A match is
+    # a strong excise indicator; an end that COULD be on-top but
+    # doesn't match is a strong synthetic indicator.
+    can_check_left  = (left_kind == "5'" and bool(left_oh))
+    can_check_right = (right_kind == "3'" and bool(right_oh))
+    excise_match_left  = (can_check_left
+        and top[:len(left_oh)].upper() == left_oh.upper())
+    excise_match_right = (can_check_right
+        and top[n - len(right_oh):].upper() == right_oh.upper())
+    synth_match_left  = can_check_left  and not excise_match_left
+    synth_match_right = can_check_right and not excise_match_right
+    if excise_match_left or excise_match_right:
+        is_excise = True
+    elif synth_match_left or synth_match_right:
+        is_excise = False
+    else:
+        # No on-top ends exist (both 3'-at-left or 5'-at-right) —
+        # can't detect from top_seq. Default to excise (the common
+        # case for `_excise_fragment_pair` output).
+        is_excise = True
+    if not is_excise:
+        # Synthetic convention — preserve the pre-fix behaviour
+        # (naive RC of top_seq, swap ends, no overhang-side
+        # adjustment). The synthetic ligation path has its own
+        # quirks but that's a separate bug.
+        new_top = _rc(top)
+        left_strip = 0
+        right_strip = 0
+        new_left_extra_len = 0
+        new_right_extra_len = 0
+    else:
+        left_strip = len(left_oh) if excise_match_left else 0
+        right_strip = len(right_oh) if excise_match_right else 0
+        core_top = top[left_strip:n - right_strip] if right_strip else \
+                   top[left_strip:]
+        rc_core = _rc(core_top)
+        # After RC, old.right (overhang on bot if 5') contributes
+        # bases at new.left's top — prepend RC'd overhang. Old.left
+        # (overhang on bot if 3') contributes at new.right's top —
+        # append RC'd overhang.
+        new_left_extra = (_rc(right_oh)
+            if right_kind == "5'" and right_oh and right_strip == 0
+            else "")
+        new_right_extra = (_rc(left_oh)
+            if left_kind == "3'" and left_oh and left_strip == 0
+            else "")
+        new_top = new_left_extra + rc_core + new_right_extra
+        new_left_extra_len = len(new_left_extra)
+        new_right_extra_len = len(new_right_extra)
+    new_left  = {
+        "overhang_seq": _rc(right_oh) if right_oh else "",
+        "kind":         right_kind,
+        "enzyme":       right.get("enzyme", ""),
+    }
+    new_right = {
+        "overhang_seq": _rc(left_oh) if left_oh else "",
+        "kind":         left_kind,
+        "enzyme":       left.get("enzyme", ""),
+    }
+    # Feature coords flip relative to the OLD top, then translate
+    # into the new top's frame via the strip/extra adjustments.
+    new_n = len(new_top)
+    _ = new_right_extra_len  # avoid unused-variable lint
+    flipped_feats: list[dict] = []
+    for f in frag["features"]:
+        fs = int(f.get("start", 0))
+        fe = int(f.get("end",   0))
+        # Map old end → new start, old start → new end. Clamp to
+        # the new top's length so out-of-range features (those in
+        # the stripped-off old overhang region) collapse to a valid
+        # zero-length slice rather than negative coords.
+        new_start_raw = (n - fe) - left_strip + new_left_extra_len
+        new_end_raw   = (n - fs) - left_strip + new_left_extra_len
+        new_f = dict(f)
+        new_f["start"]  = max(0, min(new_n, new_start_raw))
+        new_f["end"]    = max(0, min(new_n, new_end_raw))
+        new_f["strand"] = -int(f.get("strand", 1) or 0) or 0
+        flipped_feats.append(new_f)
+    return {
+        "top_seq":      new_top,
+        "left":         new_left,
+        "right":        new_right,
+        "features":     flipped_feats,
+        "source_label": frag["source_label"],
+    }
