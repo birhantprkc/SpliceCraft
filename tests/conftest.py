@@ -117,7 +117,7 @@ def _protect_user_data(tmp_path, monkeypatch):
     # which would otherwise litter the user's real data dir during tests
     # that exercise attach. Redirect to tmp_path so the whole experiments
     # surface (entries JSON + per-entry attach dirs) is isolated.
-    monkeypatch.setattr(sc, "_EXPERIMENTS_DIR", tmp_path / "experiments")
+    _patch("_EXPERIMENTS_DIR", tmp_path / "experiments")
     # HMM database downloads (sweep #28) — per-DB dir under
     # `<DATA_DIR>/hmm_databases/<id>/`. Redirect so download tests
     # never touch the user's real GBs of Pfam-A.
@@ -125,8 +125,7 @@ def _protect_user_data(tmp_path, monkeypatch):
     # Content-addressed plasmid blob store (v1.0.23): plasmid sequences
     # live here as immutable sha256-named blobs. Redirect so dehydrate /
     # rehydrate / GC never write to or quarantine the user's real blob dir.
-    monkeypatch.setattr(sc, "_PLASMID_BLOB_DIR",
-                          tmp_path / "plasmid_blobs")
+    _patch("_PLASMID_BLOB_DIR", tmp_path / "plasmid_blobs")
 
     # Pre-update snapshot directory (`splicecraft update` data-safety net):
     # tests that exercise the `update` subcommand all the way through to

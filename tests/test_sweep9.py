@@ -444,7 +444,7 @@ class TestOrphanTmpSweepCoversExperiments:
         monkeypatch.setattr(sc._state, "_DATA_DIR", tmp_path)
         exp_root = tmp_path / "experiments"
         exp_root.mkdir()
-        monkeypatch.setattr(sc, "_EXPERIMENTS_DIR", exp_root)
+        monkeypatch.setattr(sc._state, "_EXPERIMENTS_DIR", exp_root)
         # Make a per-entry subdir with an orphan tmp file aged
         # beyond the cleanup threshold.
         entry_dir = exp_root / "exp-deadbeef"

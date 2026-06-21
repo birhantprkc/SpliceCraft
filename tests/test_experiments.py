@@ -391,8 +391,8 @@ class TestSaveExperimentImage:
         target = tmp_path / "real-target"
         target.mkdir()
         # Build the symlink path inside the experiments dir
-        sc._EXPERIMENTS_DIR.mkdir(parents=True, exist_ok=True)
-        link = sc._EXPERIMENTS_DIR / "exp-symlnk1"
+        sc._state._EXPERIMENTS_DIR.mkdir(parents=True, exist_ok=True)
+        link = sc._state._EXPERIMENTS_DIR / "exp-symlnk1"
         # If we can't create symlinks on this OS (e.g. Windows without
         # privilege), skip.
         try:
