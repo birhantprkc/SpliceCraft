@@ -399,3 +399,23 @@ def _demo_block_network_unregistered(label: str = "Network access") -> None:
         "egress (fail-closed). The hub registers _demo_block_network at import."
     )
 _demo_block_network_hook: "_Callable[..., None]" = _demo_block_network_unregistered
+# user-data backup/restore engine (splicecraft_backup, L1) — the snapshot /
+# pre-update / migrate-archive / master-delete-enumeration cluster moves to the
+# sibling but reaches two hub-pinned bits through these hooks:
+#  * `_resolve_data_attr_hook` = the hub's `_resolve_state_or_hub`. Resolves a
+#    user-data path/dir/cache BY NAME (the `_USER_DATA_*_ATTRS` registries are
+#    lists of names). It must run in the HUB namespace for its `globals().get`
+#    fallback to cover any name not yet migrated to _state; a sibling copy would
+#    resolve against the sibling's globals and silently miss such a name. FAILS
+#    LOUD if unregistered — a None during Master Delete / snapshot enumeration
+#    would silently drop a dir from the wipe/backup set (data-loss class).
+#  * `_gc_orphan_blobs_hook` = the hub's `_gc_orphan_blobs`. Data-dir
+#    housekeeping reclaims disk from superseded plasmid-sequence blobs, but the
+#    blob store stays hub-side, so housekeeping fires GC here. Best-effort
+#    (housekeeping swallows errors); None just skips GC (disk not reclaimed,
+#    never data loss).
+def _resolve_data_attr_unregistered(name: str):
+    raise RuntimeError(
+        "user-data attr resolver hook called before the hub registered it")
+_resolve_data_attr_hook: "_Callable[[str], object]" = _resolve_data_attr_unregistered
+_gc_orphan_blobs_hook: "_Callable[[], int] | None" = None

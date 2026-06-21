@@ -10,6 +10,7 @@ existing call site resolves unchanged.
 from __future__ import annotations
 
 import re
+import platform
 import functools as _functools
 import time as _time_mod
 from datetime import datetime as _datetime
@@ -17,6 +18,18 @@ from typing import Any as _Any
 from pathlib import Path
 
 from splicecraft_logging import _log, _log_event
+
+
+# Snapshot the runtime platform string ONCE at import (INV-36). On some OSes
+# `platform.platform()` shells out via `subprocess.run`; tests that monkeypatch
+# `subprocess.run` (e.g. the `splicecraft update` command capture) would
+# otherwise re-trigger it and crash on the mock. Read this constant rather than
+# re-invoking `platform.platform()` in any hot path. Lives in L0 util so the hub
+# and the backup sibling share one cached value; re-exported as `sc._RUNTIME_PLATFORM`.
+try:
+    _RUNTIME_PLATFORM: str = platform.platform()
+except Exception:  # pragma: no cover — defensive against weird platforms
+    _RUNTIME_PLATFORM = "?"
 
 
 _NATURAL_SORT_RE = re.compile(r"(\d+)")
