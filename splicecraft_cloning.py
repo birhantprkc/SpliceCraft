@@ -12,11 +12,16 @@ simulator** ([INV-127]): the ligation primitives (`_ends_compatible`/`_ligate_fr
 `_classify_junction`, `_annotate_scars_on_product`, `_rc_fragment`,
 `_label_disrupted_split_features`), with the fragment-prep that feeds them
 (`_make_synthetic_fragment`, `_excise_pcr_insert`, `_excise_fragment_pair`,
-`_enzyme_is_type_iis`). Extracted so the cloning modal/screen siblings can
-import them. Layer L3: imports state(L0), biology(L0), dataaccess(L1), record(L1),
-history(L2), logging(L0); used by the modals (L4). The enzyme catalog is reached via
-`_state._all_enzymes_hook` (it reads dataaccess but stays hub-side). Re-exported by the
-hub so every call site resolves unchanged.
+`_enzyme_is_type_iis`); and the **Golden-Braid (BsaI Type IIS) fragment scrub**
+([INV-127]): `_scrub_gb_design` + its `_scrub_gb_*` helpers + `_assemble_scrub_amplicons_real`
++ the `_SCRUB_GB_*` constants — cures sites by splitting at each cluster into BsaI-tailed
+PCR fragments that Golden-Gate reassemble into the cured plasmid (real digest+ligate,
+verified). Extracted so the cloning modal/screen siblings can import them. Layer L3:
+imports state(L0), biology(L0), primer(L2), dataaccess(L1), record(L1), history(L2),
+logging(L0); used by the modals (L4). The enzyme catalog is reached via
+`_state._all_enzymes_hook` (it reads dataaccess but stays hub-side); the GB scrub reuses
+primer's `_scrub_design` + binding helpers (L2, downward — primer never imports cloning).
+Re-exported by the hub so every call site resolves unchanged.
 """
 from __future__ import annotations
 
@@ -28,7 +33,12 @@ if TYPE_CHECKING:  # annotation-only; the real Bio import is lazy, inside the fn
 
 import splicecraft_state as _state
 from splicecraft_biology import (
-    _enzyme_cuts, _fragments_from_cuts, _iupac_pattern, _rc,
+    _digest_with_enzymes, _enzyme_cuts, _forbidden_hit_set, _fragments_from_cuts,
+    _iupac_pattern, _rc,
+)
+from splicecraft_primer import (   # L2 (downward; primer never imports cloning)
+    _PRIMER_MAX_OLIGO_LEN, _SCRUB_DEFAULT_ENZYMES, _circ_extract, _mut_gc_pct,
+    _pick_binding_region, _scrub_cluster_edits, _scrub_cluster_span, _scrub_design,
 )
 from splicecraft_dataaccess import (
     _BUILTIN_GRAMMARS, _GB_CODING_PART_TYPES, _GB_L0_ENZYME_SITE, _GB_PAD, _GB_SPACER,
@@ -1747,3 +1757,369 @@ def _excise_fragment_pair(seq: str, enzyme_names: list[str], *,
             "cuts": [{"enzyme": c["enzyme"], "top": c["top"]} for c in cuts],
         }
     return fragments, None
+
+
+# ═══ Golden-Braid (BsaI Type IIS) fragment-based scrub — moved from the hub ══
+# Cures sites by splitting at each cluster into BsaI-tailed PCR fragments that
+# Golden-Gate reassemble into the cured plasmid (real digest+ligate, verified).
+# Uses primer's _scrub_design + the now-local _ligate_fragments/_close_circular.
+
+# ── Scrub: Golden Braid (BsaI Type IIS) fragment-based curing ───────────────
+#
+# An alternative re-circularization to the QuikChange path above. Instead of
+# one whole-plasmid amplicon that self-anneals, the plasmid is split at each
+# cure cluster into PCR fragments; each fragment's primers carry a BsaI
+# (GGTCTC) 5' tail + the NATIVE 4 nt junction overhang, and a Golden Gate /
+# Golden Braid (BsaI) reaction reassembles the fragments seamlessly — the
+# only net change vs the original is the cured sites.
+#
+# Because BsaI is the ASSEMBLY enzyme, EVERY BsaI site in the plasmid (not
+# just user-listed ones) must be cured — a retained BsaI site is cut
+# mid-reaction and scrambles the product. That is the "an unwanted site IS
+# BsaI" edge case: BsaI is force-added to the cure set, and a BsaI site that
+# can't be silently removed makes the whole Golden Braid design fail (you
+# can't Golden-Gate around a site the enzyme still cuts). The cure is sliced
+# into the primer ends from the CURED template, so each amplicon is
+# internally BsaI-clean; a digest+ligate simulation then proves the
+# reassembled product equals the cured plasmid (catastrophic-class: the
+# design IS the product). Primer-tail layout mirrors the Domesticator
+# (PAD + GGTCTC + spacer + native binding); the binding's first 4 nt ARE the
+# fusion overhang, so reassembly restores native sequence except the cures.
+
+_SCRUB_GB_ENZYME    = "BsaI"
+_SCRUB_GB_SITE      = "GGTCTC"
+_SCRUB_GB_PAD       = "GCGC"        # 5' pad → efficient terminal cutting
+_SCRUB_GB_SPACER    = "A"           # 1 nt between recognition and the overhang
+_SCRUB_GB_TARGET_TM = 60.0          # NN target for each fragment's annealing arm
+_SCRUB_GB_BIND_MIN  = 18
+# Grow the binding to reach `_SCRUB_GB_TARGET_TM` while keeping the TOTAL
+# scrub oligo (tail + binding) within `_PRIMER_MAX_OLIGO_LEN` — same
+# oligo-length budget as every other primer path. 50 − 11 nt tail = 39.
+_SCRUB_GB_BIND_MAX  = _PRIMER_MAX_OLIGO_LEN - (
+    len(_SCRUB_GB_PAD) + len(_SCRUB_GB_SITE) + len(_SCRUB_GB_SPACER))
+_SCRUB_GB_MIN_FRAG  = 50            # shorter than this is impractical to PCR + gel
+_SCRUB_GB_OH_SLIDE  = 10            # ± window to slide a junction for a clean overhang
+_SCRUB_GB_CLUSTER_FOOTPRINT = 18    # tighter than QuikChange: both arms must reach
+
+
+def _scrub_gb_overhang_ok(oh: str) -> bool:
+    """A 4 nt Golden Gate overhang is usable iff it is exactly 4 ACGT bases,
+    NOT palindromic (a palindromic overhang ligates to its own RC → a
+    fragment flips or concatemerizes), and not a single base ×4 (AAAA/TTTT/…
+    ligate promiscuously and misassemble). These are the standard Golden Gate
+    fidelity rules — the difference between a clean 4 nt junction and a
+    scrambled assembly."""
+    if len(oh) != 4 or any(c not in "ACGT" for c in oh):
+        return False
+    if oh == _rc(oh):                  # palindrome
+        return False
+    if len(set(oh)) == 1:              # AAAA / CCCC / GGGG / TTTT
+        return False
+    return True
+
+
+def _scrub_gb_cluster_center(positions: list, n: int) -> int:
+    """Midpoint coordinate of a cure cluster (wrap-aware), where the junction
+    cut is centred so both flanking primers reach every cure in the cluster."""
+    start, end = _scrub_cluster_span(positions, n)   # end < start ⇒ wraps origin
+    span = (end - start) % n
+    return (start + span // 2) % n
+
+
+def _scrub_gb_pick_cuts(cured: str, clusters: list, n: int) -> tuple:
+    """One cut position per cluster, each yielding a clean, mutually-unique
+    4 nt Golden Gate overhang `cured[cut:cut+4]`. Searches outward from each
+    cluster centre within ±_SCRUB_GB_OH_SLIDE. An overhang AND its reverse
+    complement are both reserved once used, so no two junctions can ligate
+    cross-wise. Returns `(cuts_sorted, None)` or `(None, reason)` when a
+    cluster has no usable overhang window (e.g. an AT-homopolymer junction)."""
+    used: set = set()
+    raw: list = []
+    for c in clusters:
+        positions = c["positions"] if isinstance(c, dict) else c
+        center = _scrub_gb_cluster_center(positions, n)
+        chosen: "int | None" = None
+        for d in range(0, _SCRUB_GB_OH_SLIDE + 1):
+            for p in dict.fromkeys(((center + d) % n, (center - d) % n)):
+                oh = _circ_extract(cured, p, 4, n)
+                if not _scrub_gb_overhang_ok(oh):
+                    continue
+                if oh in used or _rc(oh) in used:
+                    continue
+                chosen = p
+                used.add(oh)
+                used.add(_rc(oh))
+                break
+            if chosen is not None:
+                break
+        if chosen is None:
+            return None, (
+                f"no unique non-palindromic BsaI overhang within "
+                f"{_SCRUB_GB_OH_SLIDE} bp of the cure near {center} bp — "
+                "the QuikChange method has no overhang constraint")
+        raw.append(chosen)
+    return sorted(set(raw)), None
+
+
+def _scrub_gb_fragment(cured: str, cut_l: int, cut_r: int, n: int, *,
+                       single: bool, idx: int) -> dict:
+    """Design ONE Golden Braid fragment + its BsaI-tailed primer pair. The
+    fragment spans junction `cut_l`→`cut_r` (the whole plasmid when `single`,
+    i.e. a lone junction whose fragment self-circularises). Both primers are
+    sliced from the CURED template, so the cure rides in the primer end and
+    the binding's first 4 nt are the native fusion overhang."""
+    span = n if single else (cut_r - cut_l) % n
+    body_len = span + 4                 # include the right overhang's 4 nt
+    tail = _SCRUB_GB_PAD + _SCRUB_GB_SITE + _SCRUB_GB_SPACER
+    # Forward primer: native binding STARTING at the left junction; its first
+    # 4 nt become the 5' overhang after BsaI cuts 1 nt past the recognition.
+    fwd_full_bind = _circ_extract(cured, cut_l, _SCRUB_GB_BIND_MAX, n)
+    fwd_bind, fwd_tm = _pick_binding_region(
+        fwd_full_bind, _SCRUB_GB_TARGET_TM,
+        _SCRUB_GB_BIND_MIN, _SCRUB_GB_BIND_MAX)
+    fwd_full = tail + fwd_bind
+    # Reverse primer: binding ENDS at cut_r+4 (so its last template base is the
+    # 4 nt right overhang). rc() of that window is the bottom-strand 5'→3'
+    # primer; its first 4 nt = rc(right overhang). Prefix-of-rc trick: growing
+    # the picked length extends the 3' anchor leftward while the 5' overhang
+    # stays fixed (same as `_pick_binding_region`'s prefix selection).
+    rev_win = _circ_extract(cured, (cut_r + 4 - _SCRUB_GB_BIND_MAX) % n,
+                            _SCRUB_GB_BIND_MAX, n)
+    rev_bind, rev_tm = _pick_binding_region(
+        _rc(rev_win), _SCRUB_GB_TARGET_TM,
+        _SCRUB_GB_BIND_MIN, _SCRUB_GB_BIND_MAX)
+    rev_full = tail + rev_bind
+    return {
+        "index": idx, "cut_l": cut_l, "cut_r": cut_r, "span": body_len,
+        "oh_left": _circ_extract(cured, cut_l, 4, n),
+        "oh_right": _circ_extract(cured, cut_r, 4, n),
+        "fwd_seq": fwd_full, "rev_seq": rev_full,
+        "fwd_bind_len": len(fwd_bind), "rev_bind_len": len(rev_bind),
+        "fwd_tm": round(fwd_tm, 1), "rev_tm": round(rev_tm, 1),
+        "fwd_gc": round(_mut_gc_pct(fwd_full), 1),
+        "rev_gc": round(_mut_gc_pct(rev_full), 1),
+    }
+
+
+def _scrub_gb_build_amplicons(orig: str, cured: str, frags: list, n: int, *,
+                              single: bool) -> list:
+    """Reconstruct each Golden Braid fragment's REAL PCR product:
+    ``tail + body + _rc(tail)`` — ``tail`` is the BsaI cassette
+    (``_SCRUB_GB_PAD + _SCRUB_GB_SITE + _SCRUB_GB_SPACER``) and ``body`` carries
+    the CURED base inside each primer's binding footprint but the ORIGINAL-
+    template base in the PCR-copied middle (a cure outside primer reach would NOT
+    make it into the product). Shared by `_scrub_gb_verify` (the design-time
+    proof) and the Apply-cure save, which digests + ligates these EXACT amplicons
+    so the saved intermediates and the assembled product are the same molecules.
+    Returns ``[{index, cut_l, body, amplicon}, …]`` in fragment order.
+
+    NOTE: not `_simulate_pcr` — that is exact-match only and explicitly does not
+    handle 5' tailed primers; this is the faithful tailed-mutagenic-PCR product."""
+    tail = _SCRUB_GB_PAD + _SCRUB_GB_SITE + _SCRUB_GB_SPACER
+    out: list = []
+    for fr in frags:
+        cut_l, cut_r = fr["cut_l"], fr["cut_r"]
+        span = n if single else (cut_r - cut_l) % n
+        body_len = span + 4              # include the right overhang's 4 nt
+        fwd_len, rev_len = fr["fwd_bind_len"], fr["rev_bind_len"]
+        chars: list = []
+        for i in range(body_len):
+            g = (cut_l + i) % n
+            if i < fwd_len or i >= body_len - rev_len:
+                chars.append(cured[g])   # inside a primer footprint → cured
+            else:
+                chars.append(orig[g])    # PCR-copied middle → original template
+        body = "".join(chars)
+        out.append({"index": fr["index"], "cut_l": cut_l, "body": body,
+                    "amplicon": tail + body + _rc(tail)})
+    return out
+
+
+def _scrub_gb_verify(orig: str, cured: str, frags: list, n: int, *,
+                     single: bool) -> tuple:
+    """Catastrophic-class proof. Build each amplicon AS REAL PCR PRODUCES IT
+    (`_scrub_gb_build_amplicons`) then: (1) confirm exactly two BsaI sites per
+    amplicon (the two tails, no internal site), (2) release each fragment
+    body, (3) ligate by chaining native overhangs, and (4) assert the
+    reassembled circle equals the CURED plasmid with no forbidden site left.
+    Returns `(ok, errors)`."""
+    errors: list = []
+    site_pat = _iupac_pattern(_SCRUB_GB_SITE)
+    rc_pat = _iupac_pattern(_rc(_SCRUB_GB_SITE))
+    amps = _scrub_gb_build_amplicons(orig, cured, frags, n, single=single)
+    bodies: list = []
+    for a in amps:
+        amplicon = a["amplicon"]
+        n_sites = len(site_pat.findall(amplicon)) + len(rc_pat.findall(amplicon))
+        if n_sites != 2:
+            errors.append(
+                f"fragment {a['index'] + 1}: amplicon carries {n_sites} BsaI "
+                "site(s) (expected exactly 2 — the two tails); an internal "
+                "site slipped through and would be cut mid-assembly")
+        bodies.append((a["cut_l"], a["body"]))
+    if not bodies:
+        return False, ["no fragments to verify"]
+    bodies.sort(key=lambda t: t[0])
+    # Each body ends with the next fragment's left overhang (4 nt shared at the
+    # junction); drop it so each base appears once in the reassembled circle.
+    product = "".join(b[:-4] for _, b in bodies)
+    expect = _circ_extract(cured, bodies[0][0], n, n)
+    if len(product) != n or product != expect:
+        errors.append(
+            "re-assembled product does not equal the cured plasmid — a cure "
+            "fell outside primer reach of its junction, or a junction is "
+            "mis-placed")
+    # Final whole-circle scan: the product must be BsaI-CLEAN (wrap-aware).
+    # Every BsaI site was force-cured and the assembly cuts off the added
+    # tails, so a residual BsaI would mean the reaction re-cuts the product
+    # (fratricide). NON-assembly unwanted sites that couldn't be cured stay
+    # reported in `sites_skipped` (exactly like QuikChange) — they leave the
+    # product unchanged at that site but must NOT fail the whole design.
+    asm = (_SCRUB_GB_SITE, _rc(_SCRUB_GB_SITE))
+    if _forbidden_hit_set(product + product[:len(_SCRUB_GB_SITE) - 1], asm):
+        errors.append("re-assembled product still carries a BsaI site")
+    return (not errors), errors
+
+
+def _assemble_scrub_amplicons_real(amplicon_specs: list, *,
+                                   enzyme: str = _SCRUB_GB_ENZYME
+                                   ) -> "str | None":
+    """The REAL Golden Braid assembly behind Apply cure (vs the design-time
+    proof in `_scrub_gb_verify`, which string-chains bodies): genuinely
+    BsaI-digest each amplicon (`_digest_with_enzymes`), keep the released insert
+    body (the ONLY fragment with a sticky overhang on BOTH edges — each end stub
+    has one ``linear`` edge), chain the inserts by matching native 4 nt overhangs
+    (`_ligate_fragments`), and close the circle (`_close_circular`) — the same
+    primitives the Constructor's Golden Gate assembly uses.
+
+    `amplicon_specs` is ``[{cut_l, amplicon}, …]``; ``cut_l`` orders the inserts
+    around the plasmid. Returns the circular product's top-strand sequence, or
+    None if any digest / overhang-mismatch / closure step fails — the caller then
+    ABORTS the save rather than persist a mis-assembled plasmid."""
+    inserts: list = []
+    for spec in sorted(amplicon_specs, key=lambda s: s["cut_l"]):
+        try:
+            frags = _digest_with_enzymes(spec["amplicon"], [enzyme],
+                                         circular=False)
+        except Exception:
+            _log.exception("scrub assemble: BsaI digest failed")
+            return None
+        body = [f for f in frags
+                if f.get("left", {}).get("kind") != "linear"
+                and f.get("right", {}).get("kind") != "linear"]
+        if len(body) != 1:
+            _log.error("scrub assemble: amplicon released %d insert(s) "
+                       "(expected exactly 1 between the two BsaI cuts)",
+                       len(body))
+            return None
+        inserts.append(body[0])
+    if not inserts:
+        return None
+    chained = inserts[0]
+    for nxt in inserts[1:]:
+        chained = _ligate_fragments(chained, nxt)
+        if chained is None:
+            _log.error("scrub assemble: overhang mismatch chaining fragments")
+            return None
+    closed = _close_circular(chained)
+    if closed is None:
+        _log.error("scrub assemble: terminal overhangs don't close the circle")
+        return None
+    return str(closed.get("top_seq") or "") or None
+
+
+def _scrub_gb_design(seq: str, feats: "list | None" = None, enzymes=None, *,
+                     circular: bool = True, codon_raw: "dict | None" = None
+                     ) -> dict:
+    """Plan a Golden Braid (BsaI Type IIS) fragment cure of `seq`. Cures the
+    selected unwanted sites AND every BsaI site (the assembly enzyme), splits
+    the plasmid at each cure cluster into PCR fragments with BsaI-tailed
+    primers carrying the native 4 nt junction overhangs, and verifies a
+    digest+ligate reassembles the cured plasmid seamlessly. Pure biology —
+    designs the primers but mutates nothing on disk.
+
+    `codon_raw` biases coding cures toward host-frequent synonyms (tie-break
+    only — synonymy is guaranteed independently). Returns a result dict with
+    `ok`, `cured_seq`, `fragments` (each with its primer pair + overhangs),
+    `sites_removed` / `sites_skipped`, `verified`, `warnings`, and `errors`."""
+    seq = (seq or "").upper()
+    n = len(seq)
+    # The assembly enzyme MUST be in the cure set — a retained BsaI site is cut
+    # during the Golden Gate reaction and scrambles the product. Force-add it
+    # so BsaI is always cured, never merely tolerated ("unwanted site IS BsaI").
+    base = list(enzymes) if enzymes is not None else list(_SCRUB_DEFAULT_ENZYMES)
+    if _SCRUB_GB_ENZYME not in base:
+        base.append(_SCRUB_GB_ENZYME)
+    plan = _scrub_design(seq, feats, base, circular=circular,
+                         codon_raw=codon_raw)
+    result: dict = {
+        "ok": True, "method": "golden_braid", "enzyme": _SCRUB_GB_ENZYME,
+        "orig_seq": seq, "cured_seq": plan.get("cured_seq", seq),
+        "edits": list(plan.get("edits", [])),
+        "sites_removed": list(plan.get("sites_removed", [])),
+        "sites_skipped": list(plan.get("sites_skipped", [])),
+        "fragments": [], "n_fragments": 0, "verified": False,
+        "warnings": list(plan.get("warnings", [])), "errors": [],
+    }
+    if not seq:
+        result["ok"] = False
+        result["errors"].append("No sequence loaded.")
+        return result
+    if not plan.get("ok", False):
+        result["ok"] = False
+        result["errors"].append("Curing failed; nothing to assemble.")
+        return result
+    # Edge case — a BsaI site that can't be silently cured is FATAL for Golden
+    # Braid: you cannot Golden-Gate around a site the assembly enzyme cuts.
+    bsai_skipped = [s for s in result["sites_skipped"]
+                    if s.get("enzyme") == _SCRUB_GB_ENZYME]
+    if bsai_skipped:
+        result["ok"] = False
+        spots = ", ".join(str(s.get("pos")) for s in bsai_skipped)
+        result["errors"].append(
+            f"{len(bsai_skipped)} BsaI site(s) (at {spots}) can't be silently "
+            "removed, but BsaI is the assembly enzyme — it would cut the "
+            "fragments mid-reaction. Golden Braid curing is impossible here; "
+            "use QuikChange, or supply a codon table so the coding site has a "
+            "synonymous alternative.")
+        return result
+    cured = result["cured_seq"]
+    if not result["edits"]:
+        result["warnings"].append(
+            "No sites needed curing — nothing to fragment.")
+        return result
+    # Junctions sit at cure clusters (tighter footprint than QuikChange so both
+    # flanking primer arms reach every cure in the cluster).
+    gb_clusters = _scrub_cluster_edits(
+        [e["pos"] for e in result["edits"]], n,
+        footprint=_SCRUB_GB_CLUSTER_FOOTPRINT)
+    cuts, reason = _scrub_gb_pick_cuts(cured, gb_clusters, n)
+    if not cuts:                       # None (no clean overhang) or empty
+        result["ok"] = False
+        result["errors"].append(reason or "could not place any junction")
+        return result
+    single = (len(cuts) == 1)
+    frags: list = []
+    for k in range(len(cuts)):
+        cut_l = cuts[k]
+        cut_r = cuts[0] if single else cuts[(k + 1) % len(cuts)]
+        frags.append(_scrub_gb_fragment(cured, cut_l, cut_r, n,
+                                        single=single, idx=k))
+    short = [fr for fr in frags if fr["span"] < _SCRUB_GB_MIN_FRAG]
+    if short:
+        result["ok"] = False
+        result["errors"].append(
+            f"{len(short)} fragment(s) shorter than {_SCRUB_GB_MIN_FRAG} bp — "
+            "the junctions are too close to PCR + gel-purify reliably; use "
+            "QuikChange or cure fewer sites.")
+        result["fragments"] = frags
+        result["n_fragments"] = len(frags)
+        return result
+    ok, errors = _scrub_gb_verify(seq, cured, frags, n, single=single)
+    result["fragments"] = frags
+    result["n_fragments"] = len(frags)
+    result["verified"] = ok
+    if not ok:
+        result["ok"] = False
+        result["errors"].extend(errors)
+    return result

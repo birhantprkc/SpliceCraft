@@ -1111,7 +1111,10 @@ class TestScrubGoldenBraid:
                     "sites_skipped": [{"enzyme": "BsaI", "pos": 42, "strand": 1,
                                        "region": "CDS", "reason": "no syn cure"}],
                     "clusters": [], "warnings": []}
-        monkeypatch.setattr(sc, "_scrub_design", _fake)
+        # _scrub_gb_design moved to splicecraft_cloning and calls _scrub_design
+        # in THAT namespace (imported from splicecraft_primer), so intercept it
+        # there — patching sc._scrub_design no longer reaches the sibling caller.
+        monkeypatch.setattr("splicecraft_cloning._scrub_design", _fake)
         plan = sc._scrub_gb_design("ACGT" * 80, [], ["BsaI"], circular=True)
         assert not plan["ok"]
         joined = " ".join(plan["errors"]).lower()
