@@ -461,9 +461,68 @@ class TestSaveHandler:
         assert "nothing to save" in payload["error"]
 
     def test_calls_do_save(self, tiny_app):
-        result = sc._h_save(tiny_app, {})
+        # The tiny_app record isn't in the library and has no source
+        # file, so saving CREATES a new entry — opt in with create:true
+        # (the homeless-new-record save gate, snag #16).
+        result = sc._h_save(tiny_app, {"create": True})
         assert result["ok"] is True
+        assert result["created"] is True
         assert tiny_app._saved is True
+
+    def test_save_gate_blocks_homeless_create(self, tiny_app):
+        # Without create:true a record with no source file that isn't in
+        # the library refuses to silently create an entry (snag #16 —
+        # the fetch->save pollution guard).
+        result = sc._h_save(tiny_app, {})
+        assert isinstance(result, tuple) and result[1] == 409
+        assert result[0].get("would_create") is True
+        assert tiny_app._saved is False
+
+    def test_save_echoes_ignored_keys(self, tiny_app):
+        # Unknown body keys are surfaced, not silently dropped (snag #14).
+        result = sc._h_save(tiny_app, {"create": True, "new_name": "x"})
+        assert result["ok"] is True
+        assert result["ignored"] == ["new_name"]
+
+
+class TestAgentApiAuditFixes:
+    """Regression coverage for the agent-API audit pass (the agent-driven
+    real-world build snags): rename-plasmid, schema discovery via
+    `doc_full`, the active-pointer getters, and the ignored-key echo.
+    The full HTTP round-trips (cross-collection load-entry name
+    preservation, rename, save-gate) are exercised by the verifier."""
+
+    def test_rename_plasmid_requires_old_and_new(self):
+        app = MockApp(record=None)
+        assert sc._h_rename_plasmid(app, {"new": "x"})[1] == 400
+        assert sc._h_rename_plasmid(app, {"old": "x"})[1] == 400
+        assert sc._h_rename_plasmid(app, {"old": "x", "new": "  "})[1] == 400
+
+    def test_load_entry_requires_key(self):
+        app = MockApp(record=None)
+        assert sc._h_load_entry(app, {})[1] == 400
+
+    def test_get_active_parity_endpoints_registered(self):
+        H = sc._state._AGENT_HANDLERS
+        for ep in ("get-active-collection", "get-active-codon-table",
+                   "get-active-primer-collection", "get-active-parts-bin",
+                   "get-active-experiment-project",
+                   "get-active-hmm-database",
+                   "get-active-enzyme-collection", "rename-plasmid"):
+            assert ep in H, f"missing endpoint {ep}"
+
+    def test_tools_emits_full_docstring(self):
+        eps = sc._h_tools(None, {})["endpoints"]
+        assert eps and all("doc_full" in e for e in eps)
+        rp = next(e for e in eps if e["name"] == "rename-plasmid")
+        # doc_full carries the body schema, not just the one-line summary.
+        assert "old" in rp["doc_full"] and "new" in rp["doc_full"]
+        assert len(rp["doc_full"]) > len(rp["doc"])
+
+    def test_ignored_keys_helper(self):
+        assert sc._agent_ignored_keys({"force": 1, "a": 2}, set()) == ["a"]
+        assert sc._agent_ignored_keys({"force": 1}, set()) == []
+        assert sc._agent_ignored_keys("not-a-dict", {"x"}) == []
 
 
 class TestFeaturesHandler:
@@ -2128,9 +2187,11 @@ class TestRequestDispatcherHardening:
             status = 200
         except urllib.error.HTTPError as exc:
             status = exc.code
-        # 422 (no record loaded) is the right error; what we care about
-        # is that the handler didn't AttributeError on a None body.
-        assert status in (200, 422)
+        # 200 (saved), 422 (no record), or 409 (the homeless-new-record
+        # create gate, snag #16) are all valid non-crash responses; what
+        # we care about is that the handler didn't AttributeError on a
+        # None body.
+        assert status in (200, 422, 409)
 
     def test_handle_rejects_non_dict_json(self, http_server):
         # Sweep #25 (2026-05-23): non-dict / malformed JSON body now

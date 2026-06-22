@@ -30,6 +30,7 @@ nothing imports it but the hub.
 """
 from __future__ import annotations
 
+import inspect
 import re
 from datetime import date as _date, datetime as _datetime
 from pathlib import Path
@@ -38,7 +39,7 @@ import splicecraft_state as _state
 from splicecraft_backup import (_list_pre_update_snapshots)
 from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len)
 from splicecraft_cloning import (_GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _scrub_gb_design, _simulate_gibson_assembly)
-from splicecraft_codon import (_codon_fetch_kazusa, _codon_optimize, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
+from splicecraft_codon import (_CODON_GENETIC_CODE, _codon_fetch_kazusa, _codon_optimize, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
 from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
 from splicecraft_experiments import (_new_experiment_id, _normalise_experiment_entry, _sanitize_experiment_id)
 from splicecraft_fileio import (_PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
@@ -53,7 +54,7 @@ from splicecraft_search import (_PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_file
 from splicecraft_seqanalysis import (_classify_part_from_plasmid, _find_orfs)
 from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
-from splicecraft_backup import (_PRE_UPDATE_NAME_RE, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
+from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
 from splicecraft_biology import (_scan_restriction_sites)
 from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _design_gb_primers)
 from splicecraft_dataaccess import (_active_enzyme_allowed_set, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
@@ -285,6 +286,21 @@ def _agent_dirty_guard(app, payload):
                   "unsaved changes — pass {\"force\": true} to override",
                   "dirty": True}, 409)
     return None
+
+
+def _agent_ignored_keys(payload, known):
+    """Body keys the handler does NOT act on — for the response's
+    ``ignored`` echo (snag #14). Silent param-dropping hid real caller
+    bugs: a ``save {name: …}`` that renamed nothing still returned
+    ``ok: true``, so the caller believed a rename happened. Surfacing the
+    unconsumed keys makes the no-op visible WITHOUT hard-rejecting
+    forward-compatible callers (a 400 on an unknown key would break an
+    agent written against a newer schema). ``force`` is always allowed
+    (the universal dirty-guard override, applied by the dispatcher)."""
+    if not isinstance(payload, dict):
+        return []
+    allowed = set(known) | {"force"}
+    return sorted(str(k) for k in payload if k not in allowed)
 
 
 @_agent_endpoint("get-sequence")
@@ -802,14 +818,28 @@ def _h_list_plasmid_statuses(app, payload):
 
 @_agent_endpoint("list-entry-vectors")
 def _h_list_entry_vectors(app, payload):
-    """Return every grammar that currently has an assigned entry vector.
-    Each item carries ``{grammar_id, name, size, source}`` — `gb_text`
-    is omitted from the listing to keep the response small; fetch it
-    via `get-entry-vector` for a specific grammar."""
+    """Return every grammar/role that currently has an assigned entry
+    vector. Each item carries ``{grammar_id, role, name, size, source}``
+    — `gb_text` is omitted to keep the response small; fetch it via
+    `get-entry-vector` for a specific grammar.
+
+    A single grammar can legitimately hold SEVERAL entry vectors under
+    different ``role`` slots (Golden Braid's Alpha1 / Alpha2 / Omega1 /
+    Omega2 acceptors, plus the empty-role L0 vector), so the listing now
+    surfaces ``role`` — what looked like "the same grammar listed twice"
+    two distinct roles. Genuine ``(grammar_id, role)`` duplicates are
+    collapsed."""
     out = []
+    seen = set()
     for e in _load_entry_vectors():
+        gid = e.get("grammar_id", "")
+        role = e.get("role", "") or ""
+        if (gid, role) in seen:
+            continue
+        seen.add((gid, role))
         out.append({
-            "grammar_id": e.get("grammar_id", ""),
+            "grammar_id": gid,
+            "role":       role,
             "name":       e.get("name", ""),
             "size":       e.get("size", 0),
             "source":     e.get("source", ""),
@@ -2127,8 +2157,10 @@ def _h_add_codon_table(app, payload):
     and timeout-bounded; the genome build downloads the CDS from the
     NCBI Datasets API (size-capped at `_NCBI_CDS_ZIP_MAX_BYTES`,
     default ``mode="heg"`` → ribosomal-protein bias); the raw path
-    caps at 64 codons (the standard genetic code) and validates each
-    value is a non-negative int.
+    caps at 64 codons, validates each value is a non-negative int, and
+    derives each codon's amino acid from the standard genetic code so
+    the stored table is the canonical ``{codon: (aa, count)}`` shape the
+    optimizer consumes (snag #17).
     """
     source = payload.get("source", "user")
     if not isinstance(source, str):
@@ -2255,7 +2287,19 @@ def _h_add_codon_table(app, payload):
             return ({"error": n}, 400)
         if n < 0:
             return ({"error": f"negative count for codon {codon!r}"}, 400)
-        cleaned[codon.upper().replace("U", "T")] = n
+        # Snag #17: the registry shape is ``{codon: (aa, count)}`` (see
+        # `_parse_codon_tsv`), NOT ``{codon: count}``. Storing a bare int
+        # used to "succeed" here, then crash the MISSION-CRITICAL codon
+        # optimizer later with "cannot unpack non-iterable int object"
+        # when it did ``for codon, (aa, n) in raw.items()``. Derive the
+        # amino acid from the standard genetic code so the table is valid
+        # and immediately usable. `.get` guards the (already excluded by
+        # the IUPAC check above) non-ACGT-after-fold case.
+        folded = codon.upper().replace("U", "T")
+        aa = _CODON_GENETIC_CODE.get(folded)
+        if aa is None:
+            return ({"error": f"{codon!r} is not a valid codon"}, 400)
+        cleaned[folded] = (aa, n)
     taxid_raw = payload.get("taxid", "")
     taxid = (_sanitize_label(taxid_raw, max_len=32) if taxid_raw else "")
     try:
@@ -3454,7 +3498,14 @@ _LANE_SOURCES: tuple[tuple[str, str], ...] = (
 
 @_agent_endpoint("tools")
 def _h_tools(app, payload):
-    """Self-describe: list of available endpoints + their write/read mode.
+    """Self-describe: every endpoint with its read/write mode and full
+    request-body documentation.
+
+    Each entry is ``{name, method, write, doc, doc_full}`` — ``doc`` is
+    the one-line summary; ``doc_full`` (snag #19) is the COMPLETE
+    docstring, which documents the request body (required / optional
+    keys, aliases, enums, size caps) so a caller forms a correct request
+    in one round-trip instead of N trial-and-error 400s.
 
     Global error-shape contract every endpoint follows:
       * Success     → ``200`` with handler-specific JSON.
@@ -3489,6 +3540,13 @@ def _h_tools(app, payload):
             "method": "POST" if write else "GET",
             "write":  write,
             "doc":    (fn.__doc__ or "").strip().split("\n")[0],
+            # Snag #19: the FULL docstring, not just its first line. Each
+            # handler's body shape (required/optional keys, aliases,
+            # enums, caps) is documented in prose here — emitting it lets
+            # an agent get the request schema in ONE self-describe call
+            # instead of N trial-and-error 400s. `inspect.getdoc` strips
+            # the uniform leading indentation so it reads cleanly.
+            "doc_full": inspect.getdoc(fn) or "",
         }
         for name, (fn, write) in sorted(_state._AGENT_HANDLERS.items())
     ]}
@@ -4013,6 +4071,11 @@ def _h_blast(app, payload):
     ``six_frame`` enables BLASTP six-frame ORF indexing (off by
     default); ``backend`` is ``auto`` / ``pyhmmer`` / ``pure``.
 
+    Snag #18: the in-process DB is built from the chosen collections, so
+    a large WHOLE library can exceed the DB build cap and 400. Pass
+    ``collections`` to scope the DB to just the collection(s) you're
+    searching — that both avoids the cap and speeds the build.
+
     Read-only — never touches the loaded record or any saved file.
     Hits are returned as a list of dicts (subject name + collection,
     coords, score, identity %, alignment fragments)."""
@@ -4216,17 +4279,42 @@ def _h_set_active_hmm_database(app, payload):
 
 @_agent_endpoint("list-backups")
 def _h_list_backups(app, payload):
-    """List recoverable backups for one user-data file. Body:
-    ``{label}`` where ``label`` is one of plasmid_library /
-    collections / parts_bin / parts_bin_collections / primers /
-    features / feature_colors / grammars / entry_vectors /
-    codon_tables / settings.
+    """List recoverable backups for user-data files. Body: ``{label?}``.
 
-    Returns rows from the four-layer JSON safety net: `legacy_bak`
-    (`<file>.bak`), `rotating_bak` (timestamped), `snapshot`
-    (daily), `lost_entries` (shrink-guard spillover). Newest first.
+    WITH ``label`` (one of plasmid_library / collections / parts_bin /
+    parts_bin_collections / primers / primer_collections / features /
+    feature_colors / grammars / entry_vectors / codon_tables / settings
+    / experiments / experiment_projects / gels / protein_motifs /
+    custom_enzymes / enzyme_collections / hmm_databases) returns the
+    individual backup rows from the four-layer JSON safety net:
+    `legacy_bak` (`<file>.bak`), `rotating_bak` (timestamped),
+    `snapshot` (daily), `lost_entries` (shrink-guard spillover). Newest
+    first.
+
+    WITHOUT ``label`` (snag #6) returns a per-label SUMMARY across every
+    user-data file — ``{labels: [{label, target_path, count, newest},
+    ...], total}`` — so this "list" verb no longer requires an argument.
+    Drill into a specific label for the full rows.
     """
-    path, msg = _resolve_backup_label(payload.get("label"))
+    raw_label = payload.get("label")
+    if raw_label in (None, ""):
+        summary = []
+        for lbl in sorted(_AGENT_BACKUP_LABELS):
+            path, _msg = _resolve_backup_label(lbl)
+            if path is None:
+                continue
+            rows = _list_recoverable_backups(path)
+            summary.append({
+                "label":       lbl,
+                "target_path": str(path),
+                "count":       len(rows),
+                # Rows are newest-first, so [0] is the most recent.
+                "newest":      (str(rows[0].get("mtime_str") or "")
+                                if rows else ""),
+            })
+        return {"ok": True, "labels": summary,
+                "total": sum(row["count"] for row in summary)}
+    path, msg = _resolve_backup_label(raw_label)
     if path is None:
         return ({"error": msg}, 400)
     rows = []
@@ -4369,6 +4457,9 @@ def _h_simulate_pcr(app, payload):
     ``{template_seq, fwd_primer, rev_primer,
         circular?: bool = true,
         max_amplicon?: int = 20000}``.
+    Natural-guess aliases accepted: ``template`` / ``sequence`` →
+    ``template_seq``; ``forward`` / ``fwd`` → ``fwd_primer``;
+    ``reverse`` / ``rev`` → ``rev_primer``.
 
     Binding model is exact-match (no mismatch tolerance, no Tm-aware
     annealing — see `_simulate_pcr` for the contract). Primers must be
@@ -4381,17 +4472,24 @@ def _h_simulate_pcr(app, payload):
     Simulator screen (which constructs a SeqRecord with primer_bind
     features at the ends) — the agent flow is meant for analysis.
     """
-    template = payload.get("template_seq")
+    # Natural-guess aliases (ergonomics nit) — canonical name wins when
+    # present, else fall back. `or` is safe: an empty/missing canonical
+    # is invalid anyway, so deferring to an alias only ever helps.
+    template = (payload.get("template_seq")
+                or payload.get("template") or payload.get("sequence"))
     if not isinstance(template, str):
-        return ({"error": "missing or non-string 'template_seq'"}, 400)
+        return ({"error": "missing or non-string 'template_seq' "
+                  "(aliases: template / sequence)"}, 400)
     if len(template) > _PCR_MAX_TEMPLATE_BP:
         return ({"error": f"'template_seq' exceeds "
                   f"{_PCR_MAX_TEMPLATE_BP:,} bp PCR-sim cap"}, 413)
-    fwd = payload.get("fwd_primer")
-    rev = payload.get("rev_primer")
+    fwd = (payload.get("fwd_primer")
+           or payload.get("forward") or payload.get("fwd"))
+    rev = (payload.get("rev_primer")
+           or payload.get("reverse") or payload.get("rev"))
     if not isinstance(fwd, str) or not isinstance(rev, str):
         return ({"error": "missing or non-string 'fwd_primer' / "
-                  "'rev_primer'"}, 400)
+                  "'rev_primer' (aliases: forward/fwd, reverse/rev)"}, 400)
     fwd_clean = fwd.upper().strip()
     rev_clean = rev.upper().strip()
     if not fwd_clean or not rev_clean:
@@ -5094,6 +5192,55 @@ def _h_get_active_enzyme_collection(app, payload):
     ``None`` if no collection is active — the scanner then uses the
     full catalog)."""
     return {"ok": True, "name": _get_active_enzyme_collection_name()}
+
+
+# Read-only `get-active-*` counterparts for the `set-active-*` family.
+# Pre-2026-06-22 only enzyme-collection had a getter, so an agent had to
+# infer the active item from list flags to no-op safely. Each getter
+# mirrors its setter's response key.
+
+
+@_agent_endpoint("get-active-collection")
+def _h_get_active_collection(app, payload):
+    """Return the active plasmid collection name (or ``None`` if none is
+    active). Read-only counterpart to ``set-active-collection``."""
+    return {"ok": True, "name": _get_active_collection_name()}
+
+
+@_agent_endpoint("get-active-codon-table")
+def _h_get_active_codon_table(app, payload):
+    """Return the active codon-table taxid preference (empty string if
+    unset → Synthesis falls back to the first registry entry, K12 by
+    convention). Counterpart to ``set-active-codon-table``."""
+    return {"ok": True, "taxid": _get_setting("active_codon_table", "")}
+
+
+@_agent_endpoint("get-active-primer-collection")
+def _h_get_active_primer_collection(app, payload):
+    """Return the active primer collection name (or ``None``).
+    Counterpart to ``set-active-primer-collection``."""
+    return {"ok": True, "name": _get_active_primer_collection_name()}
+
+
+@_agent_endpoint("get-active-parts-bin")
+def _h_get_active_parts_bin(app, payload):
+    """Return the active parts-bin name (or ``None``). Counterpart to
+    ``set-active-parts-bin``."""
+    return {"ok": True, "name": _get_active_parts_bin_name()}
+
+
+@_agent_endpoint("get-active-experiment-project")
+def _h_get_active_experiment_project(app, payload):
+    """Return the active experiment-project name (or ``None``).
+    Counterpart to ``set-active-experiment-project``."""
+    return {"ok": True, "name": _get_active_project_name()}
+
+
+@_agent_endpoint("get-active-hmm-database")
+def _h_get_active_hmm_database(app, payload):
+    """Return the active HMM database id (empty string if unset).
+    Counterpart to ``set-active-hmm-database``."""
+    return {"ok": True, "active": _get_setting("hmm_db_active_id", "")}
 
 
 @_agent_endpoint("set-active-enzyme-collection", write=True)

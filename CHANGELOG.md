@@ -14,6 +14,46 @@
 
 ---
 
+## [1.0.93] — 2026-06-22
+
+### New features
+
+- **Rename a library plasmid from the agent API / CLI.** A new `rename-plasmid` endpoint (and `splicecraft-cli call rename-plasmid`) changes a plasmid's display name in place — the fix for a name that got slugged to underscores. The GenBank LOCUS stays LOCUS-safe; only the human display name changes.
+
+- **Headless agent mode.** `splicecraft --headless` (alias `--agent-headless`, or `SPLICECRAFT_HEADLESS=1`) runs the JSON API with **no terminal UI and no pty required**, so it backgrounds cleanly in CI / automation contexts. Poll the new unauthenticated `GET /healthz` for readiness, or wait for the `ready on …` line it prints to stdout.
+
+- **Generic CLI passthrough.** `splicecraft-cli call <endpoint> --json '{...}'` calls **any** of the session's endpoints with the same auth/host/port plumbing — no more hand-rolling HTTP for the endpoints without a dedicated subcommand.
+
+- **`/tools` now self-describes the full request schema.** Each endpoint entry carries `doc_full` — its complete documentation (required/optional keys, aliases, enums, caps) — so an agent forms a correct call in one round-trip instead of probing by trial and error.
+
+- **Read endpoints accept a GET query string.** `GET /get-sequence?start=0&end=99` works alongside the POST-body form. Every `set-active-*` pointer now also has a matching `get-active-*` so a client can read the current selection before changing it.
+
+### Bug fixes
+
+- **Loading and re-saving a library plasmid no longer mangles its name.** Copying a plasmid named `My Construct A` between collections through the agent API used to silently save it as `My_Construct_A` (spaces destroyed, the real name lost). The display name is now preserved end-to-end through load → save.
+
+- **Long file names are no longer truncated on import.** A file like `My_Long_Plasmid_v2.gb` was saved to the library as `My_Long_Plasmid_` (cut to the 16-character GenBank LOCUS). The full name is now kept.
+
+- **Inspecting an NCBI record no longer pollutes your workspace.** Fetching a record just to look at it, then saving, used to silently create a mis-named entry in whatever collection was active. `fetch` is now explicitly inspect-only, and creating a new library entry on `save` requires an explicit confirmation.
+
+- **`load-entry` finds plasmids in any collection.** It resolves across all collections (active first, then the rest), names the holding collection in its reply, and asks you to disambiguate only when a name is genuinely ambiguous. The id that `search-library` returns is now a valid `load-entry` key.
+
+- **Adding a codon-usage table from raw counts is fixed.** A raw `{codon: count}` table added via the agent API was stored in the wrong shape, which could later crash the codon optimizer; it's now stored correctly and validated.
+
+- **The entry-vector list no longer looks like it has duplicates.** `list-entry-vectors` now shows each vector's role (Alpha1 / Alpha2 / Omega1 / Omega2 / L0), so a grammar with several acceptors reads clearly instead of as a repeated row.
+
+- **`list-backups` no longer requires an argument.** Called without a label it returns a per-file summary of recoverable backups.
+
+- **A GenBank with no explicit topology now reports `linear`** instead of an empty value.
+
+### Hardening
+
+- **Unknown request fields are surfaced, not silently dropped.** Write endpoints echo any unrecognized body keys back under `ignored`, so a caller who passes (say) the wrong rename field sees that nothing happened instead of a misleading `ok: true`.
+
+- **A CLI HTTP error no longer hard-kills a batch.** `_request` raises a catchable error instead of exiting the process on a 4xx/5xx; `call` surfaces the structured server error as JSON with a non-zero exit.
+
+- **App-coupled agent handlers work under a direct `python splicecraft.py` launch.** Fixed a double-import that created two copies of each widget class, which made handlers like add-to-library and rename fail with a type error when the app was started as a script (the installed `splicecraft` command was unaffected).
+
 ## [1.0.92] — 2026-06-22
 
 ### Hardening

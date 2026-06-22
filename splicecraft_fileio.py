@@ -3149,10 +3149,18 @@ def load_genbank(path: str):
         rec.id = safe_stem
     if not rec.name or rec.name.startswith("<unknown"):
         rec.name = safe_stem
-    # Display-name override: when the on-disk filename carried
-    # spaces, keep them visible in the UI even though LOCUS got
-    # underscored. _apply_record / library_load both read this attr.
-    if stem != safe_stem and " " in stem:
+    # Display-name override: whenever the LOCUS-safe form differs from
+    # the real filename stem — because the stem carried spaces, OR was
+    # longer than the 16-char LOCUS cap, OR held chars the sanitiser
+    # dropped — keep the FULL stem visible in the UI. Pre-2026-06-22 this
+    # only fired when the stem contained a space, so an underscored long
+    # filename like `My_Long_Plasmid_v2` silently saved under the
+    # 16-char truncation `My_Long_Plasmid_` (agent-API snag #15). The
+    # full stem can itself carry underscores (the user's real filename) —
+    # that's fine; the no-underscore rule only forbids LETTING the LOCUS
+    # sanitisation mangle a spaced name. _apply_record / library_load
+    # both read this attr. [INV-98 / INV-15]
+    if stem != safe_stem:
         try:
             rec._tui_display_name = _sanitize_label(stem, max_len=200)
         except Exception:

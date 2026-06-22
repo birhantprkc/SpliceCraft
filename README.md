@@ -240,11 +240,13 @@ one checksum-verified `.zip` to move between machines, and **Master Delete** is 
 triple-gated full wipe. **Settings** collects every toggle plus launchers for
 the grammar, entry-vector, enzyme-collection, and codon-table editors.
 
-Want to script all of this? A 100+ endpoint localhost JSON API
-(`splicecraft --agent`) and a stdlib-only CLI (`splicecraft-cli`) drive every
-workflow — see [`docs/agent-api.md`](docs/agent-api.md) and
-[`docs/cli.md`](docs/cli.md). Full feature reference:
-[`docs/features.md`](docs/features.md).
+Want to script all of this? A 130+ endpoint localhost JSON API
+(`splicecraft --agent`, or `--headless` for a no-UI / no-pty server with a
+`/healthz` readiness probe) and a stdlib-only CLI (`splicecraft-cli`,
+including a `call` passthrough to every endpoint) drive every workflow.
+`/tools` self-describes each endpoint's full request schema. See
+[`docs/agent-api.md`](docs/agent-api.md) and [`docs/cli.md`](docs/cli.md).
+Full feature reference: [`docs/features.md`](docs/features.md).
 
 ## Documentation
 

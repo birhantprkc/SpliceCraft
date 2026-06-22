@@ -207,7 +207,7 @@ class TestRequest:
         # FakeResp returns it from read(n). Use a slim sentinel.
         big = b"x" * (cli._CLI_RESPONSE_MAX_BYTES + 1)
         with patch("urllib.request.urlopen", return_value=_FakeResp(big)):
-            with pytest.raises(SystemExit) as excinfo:
+            with pytest.raises(cli._AgentCliError) as excinfo:
                 cli._request("status")
         msg = str(excinfo.value)
         assert "exceeds" in msg
@@ -244,7 +244,7 @@ class TestRequest:
             fp=io.BytesIO(err_payload),
         )
         with patch("urllib.request.urlopen", side_effect=fake_err):
-            with pytest.raises(SystemExit) as excinfo:
+            with pytest.raises(cli._AgentCliError) as excinfo:
                 cli._request("status")
         msg = str(excinfo.value)
         assert "Plasmid not found" in msg
@@ -262,7 +262,7 @@ class TestRequest:
             fp=io.BytesIO(b"<html>boom</html>"),
         )
         with patch("urllib.request.urlopen", side_effect=fake_err):
-            with pytest.raises(SystemExit) as excinfo:
+            with pytest.raises(cli._AgentCliError) as excinfo:
                 cli._request("status")
         msg = str(excinfo.value)
         # Falls back to raw body when JSON parse fails.
@@ -275,7 +275,7 @@ class TestRequest:
         _setup_token(tmp_path, monkeypatch)
         with patch("urllib.request.urlopen",
                     side_effect=urllib.error.URLError("Connection refused")):
-            with pytest.raises(SystemExit) as excinfo:
+            with pytest.raises(cli._AgentCliError) as excinfo:
                 cli._request("status")
         msg = str(excinfo.value)
         assert "Could not reach SpliceCraft" in msg
@@ -338,6 +338,27 @@ class TestParser:
         registered = set(subparsers_action.choices.keys())
         missing = self.EXPECTED_SUBCOMMANDS - registered
         assert not missing, f"Missing CLI subcommands: {missing}"
+
+    def test_call_passthrough_parses(self):
+        args = cli._build_parser().parse_args(
+            ["call", "rename-plasmid", "--json", '{"old":"a","new":"b"}'])
+        assert args.endpoint == "rename-plasmid"
+        assert args.json == '{"old":"a","new":"b"}'
+
+    def test_call_surfaces_structured_error_as_json(
+            self, tmp_path, monkeypatch, capsys):
+        _setup_token(tmp_path, monkeypatch)
+        err = cli._AgentCliError("boom (HTTP 404)", code=404,
+                                  payload={"error": "no such entry"})
+        args = cli._build_parser().parse_args(
+            ["call", "load-entry", "--json", '{"name":"x"}'])
+        with patch.object(cli, "_request", side_effect=err):
+            with pytest.raises(SystemExit) as exc:
+                args.fn(args)
+        assert exc.value.code == 1
+        out = json.loads(capsys.readouterr().out)
+        assert out["error"] == "no such entry"
+        assert out["http_code"] == 404
 
     def test_help_runs(self, capsys):
         parser = cli._build_parser()

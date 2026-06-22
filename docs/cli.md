@@ -70,9 +70,23 @@ The token file is two lines: `port\ntoken`. The CLI:
 | `list-restriction-sites`    | Scan the record for restriction sites                     |
 | `list-codon-tables`         | List available codon usage tables                         |
 | `optimize-protein <aa>`     | Codon-optimize AA sequence to DNA                         |
+| `call <endpoint>`           | Generic passthrough — call ANY endpoint (`--json '{...}'`, `--method`) |
 
 Most subcommands support `--json` for machine-readable output and
 `--force` to override unsaved-changes guards.
+
+The named subcommands above cover the common path, but the running
+session exposes ~135 endpoints. `call` reaches **any** of them with the
+same auth / host / port plumbing, so there's no need to hand-roll HTTP:
+
+```bash
+splicecraft-cli call rename-plasmid --json '{"old":"My Plasmid","new":"My Plasmid v2"}'
+splicecraft-cli call list-entry-vectors          # GET (no body)
+splicecraft-cli call blast --json '{"query":"ATGC...","collections":["MyCollection"]}'
+```
+
+Run `splicecraft-cli tools --json` first; each endpoint's `doc_full`
+documents its request body.
 
 ## Authentication
 
@@ -82,11 +96,15 @@ The token is the same one written to the token file by
 
 ## Error mode
 
-Errors from the server return as `Error: <message> (HTTP <code>)` on
-stderr and the CLI exits non-zero. Connection refusal (server not
-running) surfaces with a hint to start the GUI with `--agent`. Bad
-input (e.g. `--strand 2`) fails at argparse before reaching the
-network.
+Errors from a named subcommand return as `Error: <message> (HTTP
+<code>)` on stderr and the CLI exits non-zero. `call` instead emits the
+server's structured error as JSON (with an `http_code` field) and exits
+non-zero, so a calling script can parse the failure. Either way an HTTP
+4xx/5xx is now a *catchable* error inside `_request` (it raises rather
+than hard-`sys.exit`-ing), so importing the helper no longer risks a
+4xx killing a batch mid-run. Connection refusal (server not running)
+surfaces with a hint to start the GUI with `--agent`. Bad input (e.g.
+`--strand 2`) fails at argparse before reaching the network.
 
 ## Why a separate sidecar?
 

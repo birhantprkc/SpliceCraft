@@ -20,7 +20,17 @@ leaving its terminal.
 ```bash
 splicecraft --agent                  # default port 6701
 splicecraft --agent --agent-port 6800  # alternative port
+splicecraft --headless               # agent API only, NO terminal UI (CI / no-pty)
 ```
+
+`--headless` (alias `--agent-headless`, or env `SPLICECRAFT_HEADLESS=1`)
+runs the JSON API under Textual's headless driver — no pty required, so
+it backgrounds cleanly in CI / agent contexts (no `script -qfc` wrapper).
+It implies `--agent`, prints a `SpliceCraft agent API ready on …` line to
+stdout once the socket is accepting connections, and serves the same
+endpoints as the UI launch. For readiness, poll the unauthenticated
+`GET /healthz` (returns `{ok, status:"ready", version, headless}`)
+instead of racing the token-file write + first real call.
 
 The server writes a token file at
 `<DATA_DIR>/agent_token` containing the port + bearer token on the
@@ -51,8 +61,12 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   (symlink-guarded), bulk import a folder, bulk export a
   collection (`bulk-export-collection`).
 - **Library + collections** — list, search across collections,
-  delete entries, create / rename / delete collections, set the
-  active collection, list / set plasmid statuses.
+  load an entry by name or id (`load-entry` resolves cross-collection:
+  active collection first, then the others; pass `collection` to
+  disambiguate), rename a plasmid's display name (`rename-plasmid` —
+  fixes a name that got slugged to underscores), delete entries,
+  create / rename / delete collections, get / set the active collection,
+  list / set plasmid statuses.
 - **Parts** — list-parts, get-part, delete-part, classify-part
   (overhang-pair lookup against every grammar); list-parts-bins,
   set-active-parts-bin (switch the active named bin; mirrors the bin
@@ -80,7 +94,9 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 - **History** — get-history returns the parsed `<HistoryTree>`
   lineage as nested JSON.
 - **Codon tables** — list, add (Kazusa fetch or raw dict), delete.
-- **Search** — blast, hmmscan.
+- **Search** — blast (in-process BLASTN / BLASTP against your
+  collections; pass `collections` to scope the DB to a subset and stay
+  under the build cap on a large library), hmmscan.
 - **RNA structure + RBS** — fold-rna (minimum-free-energy secondary
   structure: dot-bracket fold + ΔG in kcal/mol, pure-Python Turner-2004,
   no external dependency); cofold-rna (bound-state heterodimer ΔG of two
@@ -134,12 +150,23 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   snapshots (in addition to simulate-gel for one-shot runs).
 - **Protein motifs** — list (built-ins + user overrides),
   set (copy-on-write override), delete user overrides.
-- **Entry vectors** — list, get, set, plus auto-detect across the
-  full library and clear-for-grammar.
+- **Entry vectors** — list (carries each vector's `role`; a grammar can
+  hold several — Alpha1 / Alpha2 / Omega1 / Omega2 + the L0 vector), get,
+  set, plus auto-detect across the full library and clear-for-grammar.
+- **Active pointers** — every `set-active-*` (collection, codon-table,
+  primer-collection, parts-bin, experiment-project, enzyme-collection,
+  hmm-database) has a matching `get-active-*` so a client can read the
+  current selection before changing it.
 - **Utility** — check-primer-duplicates, capture-snapshot.
 
-Call `/tools` for the live discovery endpoint that emits the current
-inventory with one-line docs per endpoint.
+Call `/tools` for the live discovery endpoint. Each entry is
+`{name, method, write, doc, doc_full}` — `doc_full` is the endpoint's
+COMPLETE docstring, which documents the request body (required / optional
+keys, aliases, enums, size caps), so a client forms a correct call in one
+round-trip instead of N trial-and-error 400s. `/tools` is authoritative:
+it lists every registered endpoint, including the ~26 app-coupled
+handlers that live in `splicecraft.py` rather than `splicecraft_agent.py`
+— don't rely on grepping a single file for `@_agent_endpoint`.
 
 ## Security posture
 
@@ -169,11 +196,29 @@ inventory with one-line docs per endpoint.
 
 ## Cross-collection lookups
 
-The `transfer-annotations` and `diff-plasmid` endpoints look up
-plasmids in the **active library only** (via `_load_library()`), not
-across collections. To target a plasmid in another collection: call
-`search-library` to locate it, then `set-active-collection`, then the
-endpoint you actually want. Documented in each handler's docstring.
+`load-entry` resolves **across collections**: it checks the active
+collection first, then the others. A unique cross-collection hit loads
+(and the response names its `collection`); an ambiguous name returns
+`409` listing the holders; pass `collection` to pin the search.
+`search-library` is cross-collection too, and the `id` it returns is a
+valid `load-entry` key.
+
+The mutation endpoints `rename-plasmid`, `set-plasmid-status`,
+`delete-from-library`, and the lookups in `transfer-annotations` /
+`diff-plasmid`, operate on the **active collection only** (via
+`_load_library()`). To target a plasmid elsewhere, `set-active-collection`
+to its home first — `search-library` shows which collection holds it.
+
+### Name integrity
+
+`load-entry` stamps the entry's stored display name onto the loaded
+record, so a later `save` / `add-current-to-library` round-trips the real
+name (spaces preserved) instead of the underscored GenBank LOCUS. A
+record pulled in with `fetch` (inspect-only, `saved:false`) is **not**
+auto-filed on `save` — creating a new library entry requires an explicit
+`{create:true}` so an inspection can't silently pollute the active
+collection. Unknown body keys are echoed back under `ignored` rather than
+silently dropped.
 
 ## Concurrency
 
@@ -191,6 +236,14 @@ endpoint you actually want. Documented in each handler's docstring.
 splicecraft-cli tools             # list every endpoint + one-line doc
 splicecraft-cli status            # current record snapshot
 splicecraft-cli features          # features on the loaded record
+splicecraft-cli call <endpoint> --json '{...}'   # call ANY endpoint
 ```
+
+`call` is a generic passthrough that reuses the same token / host / port
+plumbing as the named subcommands (method defaults to POST when `--json`
+is given, else GET), so a client never has to hand-roll HTTP against the
+private `_request`. An HTTP error surfaces as structured JSON (with
+`http_code`) plus a non-zero exit, instead of a hard exit that would kill
+a batch mid-run.
 
 See the [CLI sidecar](cli.md) for the full convenience wrapper.

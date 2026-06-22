@@ -119,6 +119,22 @@ def _read_session() -> tuple[str, int, str]:
 _CLI_RESPONSE_MAX_BYTES = 50 * 1024 * 1024
 
 
+class _AgentCliError(Exception):
+    """Raised by `_request` on an unrecoverable call failure (HTTP 4xx /
+    5xx, transport error, oversize response). CATCHABLE (snag #6) — a
+    4xx no longer hard-kills a batch that imports `_request`. `main()`
+    turns an uncaught one into a clean `sys.exit` (preserving the CLI's
+    message-and-non-zero-exit UX); `call` catches it to emit the
+    structured server error as JSON. Carries the HTTP `code` (None for
+    transport failures) and the parsed error `payload` (None if the body
+    wasn't a JSON object)."""
+
+    def __init__(self, message, *, code=None, payload=None):
+        super().__init__(message)
+        self.code = code
+        self.payload = payload
+
+
 def _request(endpoint: str, method: str = "GET",
               payload: "dict | None" = None,
               timeout: float = 30.0) -> dict:
@@ -139,7 +155,7 @@ def _request(endpoint: str, method: str = "GET",
             # rather than silently truncating.
             raw = resp.read(_CLI_RESPONSE_MAX_BYTES + 1)
             if len(raw) > _CLI_RESPONSE_MAX_BYTES:
-                sys.exit(
+                raise _AgentCliError(
                     f"Error: response from SpliceCraft exceeds "
                     f"{_CLI_RESPONSE_MAX_BYTES:,}-byte cap "
                     f"(endpoint={endpoint!r}). Refusing to read."
@@ -147,14 +163,24 @@ def _request(endpoint: str, method: str = "GET",
             body = raw.decode("utf-8")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8") if exc.fp else ""
+        err_payload: "dict | None" = None
         try:
-            err_payload = json.loads(body) if body else {}
-            msg = err_payload.get("error", body or exc.reason)
+            parsed = json.loads(body) if body else {}
+            if isinstance(parsed, dict):
+                err_payload = parsed
+                msg = parsed.get("error", body or exc.reason)
+            else:
+                msg = body or exc.reason
         except json.JSONDecodeError:
             msg = body or exc.reason
-        sys.exit(f"Error: {msg} (HTTP {exc.code})")
+        # Snag #6: raise a CATCHABLE error instead of a hard `sys.exit`,
+        # so a 4xx no longer kills an importing batch mid-run. `main()`
+        # turns an uncaught one into a clean exit; `call` catches it to
+        # surface the structured error as JSON.
+        raise _AgentCliError(f"Error: {msg} (HTTP {exc.code})",
+                              code=exc.code, payload=err_payload)
     except urllib.error.URLError as exc:
-        sys.exit(
+        raise _AgentCliError(
             f"Could not reach SpliceCraft at {host}:{port} ({exc.reason}).\n"
             f"  Is the GUI still running with --agent-api?"
         )
@@ -170,6 +196,39 @@ def _request(endpoint: str, method: str = "GET",
 
 def _emit_json(obj) -> None:
     print(json.dumps(obj, indent=2, default=str))
+
+
+def cmd_call(args) -> None:
+    """Generic passthrough: call ANY agent endpoint by name (snag #1).
+
+    Reuses the same auth / host / port plumbing as the blessed
+    subcommands, so an agent integrating SpliceCraft no longer has to
+    hand-roll HTTP against the private `_request`. `tools` lists every
+    endpoint and its `doc_full` body schema."""
+    payload = None
+    if args.json:
+        try:
+            payload = json.loads(args.json)
+        except json.JSONDecodeError as exc:
+            sys.exit(f"Error: --json is not valid JSON: {exc}")
+        if not isinstance(payload, dict):
+            sys.exit("Error: --json must be a JSON object")
+    # Default to POST when a body is supplied (writes require POST), else
+    # GET — matching the server's read/write method split.
+    method = (args.method or ("POST" if payload is not None else "GET"))
+    try:
+        result = _request(args.endpoint, method=method.upper(),
+                          payload=payload)
+    except _AgentCliError as exc:
+        # Surface the structured server error as JSON (then exit
+        # non-zero) rather than a bare message, so a calling script can
+        # parse the failure instead of scraping stderr.
+        out: dict = (dict(exc.payload) if isinstance(exc.payload, dict)
+                     else {"error": str(exc)})
+        out["http_code"] = exc.code
+        _emit_json(out)
+        raise SystemExit(1)
+    _emit_json(result)
 
 
 def cmd_status(args) -> None:
@@ -584,13 +643,35 @@ def _build_parser() -> argparse.ArgumentParser:
     p_harm.add_argument("--json", action="store_true")
     p_harm.set_defaults(fn=cmd_optimize_protein)
 
+    p_call = sub.add_parser(
+        "call",
+        help="Call ANY agent endpoint by name (generic passthrough).",
+    )
+    p_call.add_argument("endpoint",
+                         help="Endpoint name (see `tools`), e.g. "
+                              "rename-plasmid.")
+    p_call.add_argument("--method", choices=["GET", "POST", "get", "post"],
+                         default=None,
+                         help="HTTP method (default: POST when --json is "
+                              "given, else GET).")
+    p_call.add_argument("--json", default=None, metavar="JSON",
+                         help="Request body as a JSON object, e.g. "
+                              "'{\"old\": \"a\", \"new\": \"b\"}'.")
+    p_call.set_defaults(fn=cmd_call)
+
     return parser
 
 
 def main(argv=None) -> None:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    args.fn(args)
+    try:
+        args.fn(args)
+    except _AgentCliError as exc:
+        # A call failure a subcommand didn't handle itself becomes a
+        # clean message + non-zero exit (back-compat with the old
+        # `sys.exit`), not a traceback. `call` handles its own.
+        sys.exit(str(exc))
 
 
 if __name__ == "__main__":
