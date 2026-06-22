@@ -2864,3 +2864,43 @@ class TestAddCodonTableGenome:
         payload, status = result
         assert status == 502
         assert "no such assembly" in payload["error"]
+
+
+class TestAddCodonTableFile:
+    """`add-codon-table` source='file' branch — offline build from a local CDS
+    FASTA on disk. Exercises path-safety, validation, and the real save (no
+    network); the builder runs for real against an inline CDS file."""
+
+    _CDS = (">lcl|X_cds_1 [gene=rplB] [protein=50S ribosomal protein L2]\n"
+            "ATGAAAGCTCGTTGGTGT\n"
+            ">lcl|X_cds_2 [gene=dnaA] [protein=replication initiator]\n"
+            "ATGTGGGCTAAA\n")
+
+    def test_missing_path_rejected(self):
+        payload, status = sc._h_add_codon_table(None, {"source": "file"})
+        assert status == 400 and "path" in payload["error"]
+
+    def test_bad_mode_rejected(self, tmp_path):
+        p = tmp_path / "cds.fna"
+        p.write_text(self._CDS)
+        payload, status = sc._h_add_codon_table(
+            None, {"source": "file", "path": str(p), "mode": "best"})
+        assert status == 400 and "mode" in payload["error"]
+
+    def test_happy_path_builds_and_saves(self, tmp_path):
+        p = tmp_path / "ecoli_cds.fna"
+        p.write_text(self._CDS)
+        result = sc._h_add_codon_table(
+            None, {"source": "file", "path": str(p), "mode": "genome"})
+        assert result["ok"] is True
+        assert result["entry"]["source"] == "file"
+        assert result["entry"]["name"] == "ecoli_cds"   # stem -> organism default
+        key = result["entry"]["taxid"] or result["entry"]["name"]
+        got = sc._codon_tables_get(key)
+        assert got is not None and got["source"] == "file"
+
+    def test_nonexistent_file_returns_4xx(self, tmp_path):
+        payload, status = sc._h_add_codon_table(
+            None, {"source": "file", "path": str(tmp_path / "nope.fna"),
+                   "mode": "genome"})
+        assert status in (400, 502)   # build returns no data / clean read error

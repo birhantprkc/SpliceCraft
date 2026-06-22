@@ -95,7 +95,9 @@ Drive the restriction overlay — all sites, unique cutters, 6+/4+ bp, or just
 the Golden Braid connectors. Multi-cutters wear a live **superscript
 cut-count** (EcoRI², BsaI³) that ticks down as you edit a site out. Build named
 **enzyme collections** from the 200+ NEB catalog plus your own customs; the
-active collection scopes every scan.
+active collection scopes every scan. Your custom enzymes are now offered in
+every enzyme picker — the overlay list, the traditional-cloning and
+Golden-Braid / MoClo choosers — and the cloning-grammar editor accepts them too.
 
 ### Features
 
@@ -152,7 +154,7 @@ digests + ligates them, so **History** reads as a genuine assembly.
 A gene-synthesis composer in three tabs:
 
 - **DNA** — a scrolling linear editor with anti-parallel strand markers, feature stripes, restriction overlay, and live AA translation, plus a feature-library side-pane (insert / annotate) and a feature-aware paste (copy a plasmid stretch and its features ride along).
-- **Protein** — type or paste amino acids and watch codons fill in from your chosen table; a built-in motif library (His6, FLAG, HA, TEV, P2A, NLS, GS linkers, +30) inserts pre-colored tags. **Optimize → DNA** codon-optimizes (with **Stops** auto-tracking the trailing `*` run and the same **Avoid sites** scrubbing) and hands the CDS to the DNA tab. The tabbed **codon-table manager** (also at Settings ▸ Codon Tables) builds tables from an NCBI genome (highly-expressed genes or whole-genome), Kazusa, or TSV, and a **Chart** tab draws any table as the classic genetic-code grid.
+- **Protein** — type or paste amino acids and watch codons fill in from your chosen table; a built-in motif library (His6, FLAG, HA, TEV, P2A, NLS, GS linkers, +30) inserts pre-colored tags. **Optimize → DNA** codon-optimizes (with **Stops** auto-tracking the trailing `*` run and the same **Avoid sites** scrubbing) and hands the CDS to the DNA tab. The tabbed **codon-table manager** (also at Settings ▸ Codon Tables) builds tables from an NCBI genome (highly-expressed genes or whole-genome), a local CDS file (`cds_from_genomic.fna`/`.gz`, fully offline), Kazusa, or TSV, and a **Chart** tab draws any table as the classic genetic-code grid.
 - **Operon Design** — **Synthetic Operon Construction** turns the codon optimizer + a built-in pure-Python RBS engine into an expression-tuning bench: drop proteins into a lane, give each a target relative RBS strength, and **Assemble** reverse-designs every RBS *in its real assembled context* (under-drivable genes flagged), dropping a fully-annotated operon into the DNA tab. **Native Operon Domestication** lifts a *natural* operon (canvas / library / NCBI), cures the grammar's forbidden Type IIS sites (plus any extras you list) with primer-encoded synonymous edits, and clones it in with features intact.
 
 Compose a part, hit **Clone Fragment**, and pick a path: a modular grammar
@@ -186,7 +188,10 @@ reload later, or cite it as `&<gel>` in your notebook.
 
 ### Sequencing
 
-Verify constructs against real reads. Drop in a Plasmidsaurus `.zip`, walk
+Verify constructs against real reads. Drop in a Plasmidsaurus `.zip` — or
+**fetch a run by item code straight from the Plasmidsaurus API** (the button on
+the Sequencing screen; set credentials under Settings ▸ Plasmidsaurus API or via
+the `PLASMIDSAURUS_CLIENT_ID` / `_SECRET` env vars) — then walk
 run → sample → target, and **Align**: the read lands as a colored bar (blue
 match / red mismatch / gray gap) on the plasmid's linear map, named in place,
 shaded by how much of each span actually binds so even a single-base mismatch

@@ -25,7 +25,7 @@ from pathlib import Path
 import splicecraft_state as _state
 from splicecraft_logging import _log
 from splicecraft_biology import _forbidden_hit_set, _iupac_pattern, _mut_revcomp
-from splicecraft_util import _natural_sort_key
+from splicecraft_util import _natural_sort_key, _sanitize_path
 from splicecraft_net import (
     _HMM_DB_RETRY_BACKOFF_S, _NCBI_MAX_RESPONSE_BYTES, _build_hardened_url_opener,
     _sanitize_accession,
@@ -956,6 +956,9 @@ _KAZUSA_MAX_RESPONSE_BYTES = 1 * 1024 * 1024
 # CDS set trips this cap and surfaces a "use a smaller / prokaryotic genome"
 # error rather than ballooning memory.
 _NCBI_CDS_ZIP_MAX_BYTES    = 256 * 1024 * 1024
+# Local CDS FASTA cap (the offline `_file_build_codon_table` source). Matches the
+# NCBI zip cap — it's the same CDS data, just read from disk instead of fetched.
+_CDS_FILE_MAX_BYTES        = 256 * 1024 * 1024
 
 
 # A real Datasets CDS zip carries a handful of members; cap the walk so a
@@ -1164,4 +1167,60 @@ def _genome_build_codon_table(
            + f"{stats['aa_coverage']}/20 AAs, GC3 {stats['gc3']}%{bf}")
     meta = {"accession": accession, "taxid": taxid,
             "organism": organism, "stats": stats}
+    return raw, msg, meta
+
+
+def _file_build_codon_table(path: "str | Path", mode: str = "heg") -> tuple:
+    """Build a codon table from a LOCAL CDS FASTA file — the in-frame
+    `cds_from_genomic.fna` shape (nucleotide CDS records), optionally gzipped.
+    No network; the offline analogue of `_genome_build_codon_table`. `mode` is
+    'heg' (ribosomal-protein bias, for heterologous expression) or 'genome'
+    (whole-file average). Returns (raw_or_None, message, meta_or_None); meta
+    carries organism (the filename) + stats for the caller's display name + saved
+    entry.
+
+    A PROTEOME (amino-acid) FASTA can't be used — codon usage needs the nucleotide
+    CDS — so a non-ACGT file surfaces the shared builder's 'no usable CDS' error."""
+    if mode not in ("heg", "genome"):
+        return None, f"Invalid mode '{mode}' (expected 'heg' or 'genome')", None
+    import gzip
+    p = _sanitize_path(str(path) if path is not None else None)
+    if p is None:
+        return None, ("Enter a path to a CDS FASTA file "
+                      "(.fna / .fasta, optionally .gz)"), None
+    try:
+        if not p.is_file():
+            return None, f"No such file: {p}", None
+        size = p.stat().st_size
+        if size > _CDS_FILE_MAX_BYTES:
+            return None, (f"File too large ({size:,} bytes > "
+                          f"{_CDS_FILE_MAX_BYTES:,})"), None
+        data = p.read_bytes()
+    except OSError as exc:
+        return None, f"Could not read {p.name}: {exc}", None
+    if data[:2] == b"\x1f\x8b":                       # gzip magic — NCBI ships CDS .gz
+        try:
+            data = gzip.decompress(data)
+        except (OSError, EOFError) as exc:
+            return None, f"Could not gunzip {p.name}: {exc}", None
+        if len(data) > _CDS_FILE_MAX_BYTES:
+            return None, (f"Decompressed file too large "
+                          f"(> {_CDS_FILE_MAX_BYTES:,} bytes)"), None
+    try:
+        raw, stats = _build_heg_table_from_cds(
+            data.decode("utf-8", "replace"), mode)
+    except ValueError as exc:                         # no-CDS / no-rprotein / build
+        return None, str(exc), None
+    except Exception as exc:                          # pragma: no cover — defensive
+        _log.exception("Local CDS codon-table build failed for %s", p.name)
+        return None, f"Build failed: {exc}", None
+    label = "ribosomal-protein (HEG)" if mode == "heg" else "whole-genome"
+    n_cds = stats["n_cds_heg"] if mode == "heg" else stats["n_cds_total"]
+    bf = (f", backfilled {', '.join(stats['backfilled'])}"
+          if stats.get("backfilled") else "")
+    msg = (f"Built {label} table from {p.name}: "
+           f"{stats['n_codons']:,} codons from {n_cds} CDS, "
+           f"{stats['aa_coverage']}/20 AAs, GC3 {stats['gc3']}%{bf}")
+    meta = {"accession": "", "taxid": "", "organism": p.stem,
+            "source_file": p.name, "stats": stats}
     return raw, msg, meta

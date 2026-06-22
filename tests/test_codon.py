@@ -2152,6 +2152,42 @@ class TestCodonManagerTabs:
             assert modal._building is False
             app.exit()
 
+    async def test_file_build_done_adds_and_selects(self, monkeypatch):
+        """The local-CDS-file build callback persists with source='file' and folds
+        back to Library — same shape as the genome callback, driven directly."""
+        from textual.widgets import TabbedContent, DataTable
+        added = {}
+
+        def fake_add(name, taxid, raw, source="user"):
+            entry = {"name": name, "taxid": taxid, "raw": raw, "source": source}
+            added["entry"] = entry
+            return entry
+
+        monkeypatch.setattr(sc, "_codon_tables_add", fake_add)
+        monkeypatch.setattr(
+            sc, "_codon_search",
+            lambda q="": ([dict(added["entry"])] if "entry" in added else []))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SpeciesPickerModal())
+            await pilot.pause(0.3)
+            modal = app.screen
+            tabs = modal.query_one("#sp-tabs", TabbedContent)
+            await _switch_tab(pilot, tabs, "sp-tab-file")
+            meta = {"organism": "ecoli_cds", "source_file": "ecoli_cds.fna",
+                    "taxid": "", "accession": "",
+                    "stats": {"mode": "genome", "n_cds_total": 2,
+                              "n_codons": 29}}
+            modal._file_build_done("", {"GCT": ("A", 10)}, "ok", meta)
+            await _settle_foldback_to_library(pilot, tabs, modal)
+            assert added["entry"]["source"] == "file"
+            assert added["entry"]["name"] == "ecoli_cds"   # name_hint="" -> organism
+            assert tabs.active == "sp-tab-library"
+            assert len(modal.query_one("#sp-list", DataTable).rows) >= 1
+            assert modal._file_building is False
+            app.exit()
+
     async def test_build_empty_query_shows_error(self):
         """Build with no accession/taxid → red status, no worker kicked off."""
         from textual.widgets import TabbedContent, Button, Static
@@ -2719,3 +2755,33 @@ class TestHegBuilder:
             raw, msg, meta = sc._genome_build_codon_table(bad, "heg")
             assert raw is None and meta is None, bad
             assert "accession" in msg.lower() or "taxid" in msg.lower(), msg
+
+    def test_file_build_codon_table_local_and_gzip(self, tmp_path):
+        """`_file_build_codon_table` is the offline sibling of the genome build:
+        it reads a local `cds_from_genomic.fna` (plain or `.gz`) and yields the
+        same counts as the in-memory builder, stamping the file/stem as meta."""
+        import gzip
+        p = tmp_path / "ecoli_cds.fna"
+        p.write_text(self._FASTA)
+        raw, msg, meta = sc._file_build_codon_table(str(p), "genome")
+        assert raw is not None and raw["TGG"] == ("W", 3)        # == in-memory build
+        assert meta["organism"] == "ecoli_cds" and meta["source_file"] == "ecoli_cds.fna"
+        assert meta["stats"]["mode"] == "genome"
+        # NCBI ships CDS as `.fna.gz` — gzip magic auto-decompresses.
+        gz = tmp_path / "ecoli_cds.fna.gz"
+        gz.write_bytes(gzip.compress(self._FASTA.encode()))
+        rawz, _, _ = sc._file_build_codon_table(str(gz), "heg")
+        assert rawz is not None and rawz["GCT"] == ("A", 1)
+
+    def test_file_build_codon_table_rejects_bad_input(self, tmp_path):
+        """Missing file, a protein (amino-acid) FASTA, and a bogus mode all fail
+        cleanly — no exception, `(None, msg, None)`."""
+        r1, m1, x1 = sc._file_build_codon_table(str(tmp_path / "nope.fna"), "genome")
+        assert r1 is None and x1 is None and ("no such file" in m1.lower()
+                                              or "not found" in m1.lower())
+        prot = tmp_path / "proteome.faa"          # amino acids, not codons
+        prot.write_text(">p1\nMAKQFLDINQVR\n>p2\nMWWCCKAR\n")
+        r2, _, x2 = sc._file_build_codon_table(str(prot), "genome")
+        assert r2 is None and x2 is None          # no usable ACGT CDS
+        r3, _, x3 = sc._file_build_codon_table(str(prot.with_name("x.fna")), "bogus")
+        assert r3 is None and x3 is None

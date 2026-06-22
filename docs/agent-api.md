@@ -105,6 +105,18 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   blocks the request for minutes; a 409 means a download for that id is
   already in flight. `delete` un-downloads the files but keeps the
   catalog entry so `download` can re-fetch it.
+- **Plasmidsaurus** — plasmidsaurus-items (list your sequencing
+  orders, most-recent first) / download-plasmidsaurus (fetch a run's
+  results zip by its 6-character item code over Plasmidsaurus's
+  official OAuth2 REST API and import the run's `.gbk` assemblies into
+  the library as new entries, tagged
+  `source: plasmidsaurus:<code>:<sample>`, never overwriting existing
+  entries). Credentials resolve env-first
+  (`PLASMIDSAURUS_CLIENT_ID` / `_SECRET`) then the Settings values, and
+  are deliberately NOT exposed through get-settings / set-setting.
+  `download` runs synchronously and imports only `kind=results` (the
+  archive that carries assemblies); no credentials → 400, a download /
+  parse failure → 502, an archive with no samples → 422.
 - **Custom enzymes + enzyme collections** — list / get / create /
   update / delete-custom-enzyme; list / get / create / update /
   delete-enzyme-collection; get / set-active-enzyme-collection.
@@ -147,6 +159,13 @@ inventory with one-line docs per endpoint.
   (`force=true` override), agent paths capped via
   `_safe_file_size_check`, manifest reads capped at
   `_PRE_UPDATE_MANIFEST_MAX_BYTES`.
+- **Secrets stay out of the agent surface.** The Plasmidsaurus Client
+  Secret is excluded from the settings allowlist (so get-settings can't
+  read it back and set-setting can't change it) and is redacted to
+  `<redacted>` in the change log + event stream. The Plasmidsaurus
+  download endpoint streams over the same hardened, HTTPS-only,
+  size-capped fetch path as the rest of the network layer and verifies
+  a zip-archive magic header before writing to disk.
 
 ## Cross-collection lookups
 

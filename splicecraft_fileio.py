@@ -2477,6 +2477,59 @@ def _parse_plasmidsaurus_zip(zip_path: Path) -> dict:
     }
 
 
+# Display-name cap for API-imported samples (mirrors the hub-side
+# `_BULK_IMPORT_MAX_NAME_LEN`; redeclared here because that const lives in the
+# hub L7 and fileio can't import upward).
+_PLASMIDSAURUS_SAMPLE_NAME_MAX = 256
+
+
+def _plasmidsaurus_zip_to_entries(
+        zip_path: Path, *,
+        run_id: str = "") -> "tuple[list[dict], list[str]]":
+    """Turn a downloaded Plasmidsaurus results zip into ready-to-save library
+    entry dicts — the HEADLESS import behind the ``download-plasmidsaurus``
+    agent endpoint. (The GUI fetch delegates to the interactive Sequencing
+    importer instead, so it keeps alignment + the collision modal.)
+
+    Lists every .gbk/.gb/.genbank member, extracts it, parses to a record,
+    and builds the SAME entry shape ``_bulk_align_worker``'s add-path produces
+    (``name/id/size/n_feats/source/added/gb_text/status``), tagging ``source``
+    as ``plasmidsaurus:<run_id>:<sample>``. Per-member failures become warning
+    strings rather than aborting the whole import. Returns
+    ``(entries, warnings)``. Propagates ValueError only when the zip itself is
+    unreadable / oversized / not a zip (from ``_list_gbk_members_in_zip``)."""
+    entries: "list[dict]" = []
+    warnings: "list[str]" = []
+    members = _list_gbk_members_in_zip(zip_path)   # ValueError on a bad zip
+    for m in members:
+        name = m.get("name", "")
+        try:
+            gb_text = _extract_gbk_member(zip_path, name)
+            rec = _gb_text_to_record(gb_text)
+            sample = Path(name).stem
+            display = (sample or rec.name or rec.id or "plasmid").strip()
+            display = "".join(
+                c if c.isprintable() else "_" for c in display
+            )[:_PLASMIDSAURUS_SAMPLE_NAME_MAX]
+            entries.append({
+                "name":    display,
+                "id":      str(rec.id or display).strip(),
+                "size":    len(rec.seq),
+                "n_feats": len([f for f in rec.features
+                                if f.type != "source"]),
+                "source":  (f"plasmidsaurus:{run_id}:{sample}"
+                            if run_id else f"plasmidsaurus:{sample}"),
+                "added":   _date.today().isoformat(),
+                "gb_text": gb_text,
+                "status":  "",
+            })
+        except (OSError, ValueError, RuntimeError) as exc:
+            warnings.append(f"{name}: {exc}")
+            _log.warning(
+                "Plasmidsaurus import: skipped %r (%s)", name, exc)
+    return entries, warnings
+
+
 def _summarize_perbase_tsv(fh, *, max_bytes: "int | None" = None) -> dict:
     """Stream the per-base TSV file handle and return summary coverage
     stats: ``{"mean", "min", "max", "n_pos", "above_20x"}``.

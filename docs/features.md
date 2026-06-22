@@ -50,7 +50,11 @@ What you can do without leaving the terminal.
   usage-table catalog by organism / taxid and persist a preferred table
   (also via `set-active-codon-table`). **Import TSV** pastes a custom
   usage table (codon, optional amino acid, count) straight into your
-  library. **Chart** views any table as the classic genetic-code grid —
+  library. **Build** generates a fresh table from an NCBI genome
+  assembly or a local CDS FASTA (`cds_from_genomic.fna` / `.gz`, fully
+  offline) in highly-expressed-genes or whole-genome mode (also via
+  `add-codon-table` with `source: "genome" | "file"`). **Chart** views
+  any table as the classic genetic-code grid —
   each codon annotated with its within-family usage (relative synonymous
   usage), each amino-acid family's single most-used codon highlighted in
   bold green (family-wide; stops counted as one family).
@@ -187,6 +191,14 @@ What you can do without leaving the terminal.
   alignment viewer with target-feature lane, parallel target/query
   rows, match track, and mismatch-red highlighting. Length-capped at
   200 kb per side; cancellable via the standard worker pattern.
+- **Fetch sequencing runs from the Plasmidsaurus API** — Sequencing →
+  "Fetch by item code from Plasmidsaurus API". Pulls a finished run from
+  your Plasmidsaurus account over the official OAuth2 REST API and
+  imports its `.gbk` assemblies into the library as new entries
+  (tagged `plasmidsaurus:<code>:<sample>`, never overwriting). Credentials
+  resolve env-first (`PLASMIDSAURUS_CLIENT_ID` / `_SECRET`) then
+  Settings ▸ Plasmidsaurus API. Scriptable via the `plasmidsaurus-items`
+  / `download-plasmidsaurus` agent endpoints.
 - **Sanger trace viewer (`.ab1`)** — Sequencing → Sanger tab.
   Browse a directory for AB1 traces (highlighted sky-blue), pick
   one to see the base-called length, mean Phred quality, and a

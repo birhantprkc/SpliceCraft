@@ -38,10 +38,10 @@ import splicecraft_state as _state
 from splicecraft_backup import (_list_pre_update_snapshots)
 from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len)
 from splicecraft_cloning import (_GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _scrub_gb_design, _simulate_gibson_assembly)
-from splicecraft_codon import (_codon_fetch_kazusa, _codon_optimize, _codon_tables_add, _genome_build_codon_table)
-from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_features, _save_gels, _save_hmm_db_catalog, _save_parts_bin, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
+from splicecraft_codon import (_codon_fetch_kazusa, _codon_optimize, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
+from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
 from splicecraft_experiments import (_new_experiment_id, _normalise_experiment_entry, _sanitize_experiment_id)
-from splicecraft_fileio import (_PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history)
+from splicecraft_fileio import (_PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
 from splicecraft_gels import (_new_gel_id, _normalise_gel_entry)
 from splicecraft_history import (_HISTORY_NODE_MAX_DEPTH, _HISTORY_NODE_MAX_NODES)
 from splicecraft_logging import (_log, _log_event)
@@ -49,7 +49,7 @@ from splicecraft_net import (_sanitize_accession)
 from splicecraft_persistence import (_safe_file_size_check, _safe_load_json)
 from splicecraft_primer import (_mut_design_inner, _mut_design_outer, _scrub_design, _scrub_qc_primers, _scrub_qc_verify)
 from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq)
-from splicecraft_search import (_delete_hmm_db_files, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot)
+from splicecraft_search import (_PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _sanitize_plasmidsaurus_item_code)
 from splicecraft_seqanalysis import (_classify_part_from_plasmid, _find_orfs)
 from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
@@ -1407,6 +1407,123 @@ def _h_download_hmm_database(app, payload):
         _hmm_db_release_download_slot(eid)
 
 
+@_agent_endpoint("plasmidsaurus-items")
+def _h_plasmidsaurus_items(app, payload):
+    """List your Plasmidsaurus items (sequencing orders), most-recent first,
+    over the official OAuth2 REST API. Read-only; no body.
+
+    Credentials resolve env-first (``PLASMIDSAURUS_CLIENT_ID`` /
+    ``PLASMIDSAURUS_CLIENT_SECRET``) then the Settings values — returns 400
+    if neither is set. Each item carries ``{code, status, product_name,
+    quantity, done_date, gross}``; feed a ``code`` whose status is
+    ``complete`` to ``download-plasmidsaurus``. Network/credential failures
+    surface as 502 (the secret is never echoed)."""
+    cid, sec = _plasmidsaurus_credentials()
+    if not cid or not sec:
+        return ({"error": "no Plasmidsaurus API credentials — set "
+                 "PLASMIDSAURUS_CLIENT_ID / PLASMIDSAURUS_CLIENT_SECRET or "
+                 "add them in Settings"}, 400)
+    try:
+        token = _plasmidsaurus_oauth_token(cid, sec)
+        items = _plasmidsaurus_list_items(token)
+    except (OSError, ValueError) as exc:
+        _log.warning("agent plasmidsaurus-items failed: %s", exc)
+        return ({"error": f"Plasmidsaurus API error: {_scrub_path(str(exc))}"},
+                502)
+    fields = ("code", "status", "product_name", "quantity", "done_date",
+              "gross")
+    out = [{k: it.get(k) for k in fields}
+           for it in items if isinstance(it, dict)]
+    _log_event("plasmidsaurus.items", count=len(out), via="agent")
+    return {"ok": True, "count": len(out), "items": out}
+
+
+@_agent_endpoint("download-plasmidsaurus", write=True)
+def _h_download_plasmidsaurus(app, payload):
+    """Download a Plasmidsaurus item's ``results`` zip by item code and import
+    every .gbk sample into the library. Body: ``{item_code, [kind]}``.
+
+    ``item_code`` is the 6-char order code from ``plasmidsaurus-items`` /
+    your dashboard (validated against ``^[A-Z0-9]{6}$`` before any request).
+    ``kind`` defaults to ``"results"`` — only that archive carries the .gbk
+    assemblies; ``reads`` / ``pod5`` are raw data with nothing to import, so
+    they're refused here. Samples are ADDED as new library entries (never
+    overwriting existing ones), tagged ``source: plasmidsaurus:<code>:<sample>``.
+
+    Runs SYNCHRONOUSLY (download → parse → save) so a big run can take a
+    while — size your client timeout accordingly. The zip lands in a temp
+    dir and is deleted after import. Credentials resolve env-first then
+    Settings (400 if unset); download/parse failures are 502, an empty/
+    sampleless archive is 422."""
+    if not isinstance(payload, dict):
+        return ({"error": "expected a JSON object body"}, 400)
+    code = _sanitize_plasmidsaurus_item_code(payload.get("item_code"))
+    if code is None:
+        return ({"error": "invalid or missing 'item_code' (expected 6 "
+                 "characters, A-Z / 0-9)"}, 400)
+    kind = payload.get("kind", "results")
+    if kind not in _PLASMIDSAURUS_RESULT_KINDS:
+        return ({"error": "'kind' must be one of "
+                 f"{sorted(_PLASMIDSAURUS_RESULT_KINDS)}"}, 400)
+    if kind != "results":
+        return ({"error": "only kind='results' carries .gbk assemblies to "
+                 "import; 'reads'/'pod5' are raw data"}, 400)
+    cid, sec = _plasmidsaurus_credentials()
+    if not cid or not sec:
+        return ({"error": "no Plasmidsaurus API credentials — set "
+                 "PLASMIDSAURUS_CLIENT_ID / PLASMIDSAURUS_CLIENT_SECRET or "
+                 "add them in Settings"}, 400)
+    import shutil
+    import tempfile
+    tmpdir = tempfile.mkdtemp(prefix="splicecraft-ps-")
+    try:
+        try:
+            zip_path = _plasmidsaurus_fetch_item_zip(
+                code, tmpdir, kind="results",
+                client_id=cid, client_secret=sec)
+        except (OSError, ValueError) as exc:
+            _log.warning("agent download-plasmidsaurus fetch failed "
+                         "for %s: %s", code, exc)
+            return ({"error": f"download failed: {_scrub_path(str(exc))}"},
+                    502)
+        try:
+            entries, warnings = _plasmidsaurus_zip_to_entries(
+                zip_path, run_id=code)
+        except (OSError, ValueError) as exc:
+            return ({"error": "could not read results zip: "
+                     f"{_scrub_path(str(exc))}"}, 502)
+        if not entries:
+            return ({"error": "no .gbk samples found in the results zip",
+                     "warnings": warnings}, 422)
+        lib = _load_library()
+        # Uniquify the imported ids against the existing library before
+        # appending (mirrors the GUI fetch worker). Library `id` is the
+        # canonical key: `_find_library_entry_by_id` returns the first match
+        # and delete-by-id filters on `id != entry_id`, so a duplicate id
+        # would make a later single-entry delete remove BOTH copies. A
+        # re-import of the same run therefore suffix-bumps (`<id>_2`, …).
+        seen = {e.get("id") for e in lib if isinstance(e, dict)}
+        for e in entries:
+            base = e["id"]
+            n = 1
+            while e["id"] in seen:
+                n += 1
+                e["id"] = f"{base}_{n}"
+            seen.add(e["id"])
+            lib.append(e)
+        if (err := _agent_save_or_500(
+                lambda: _save_library(lib, async_sync=True), "library")):
+            return err
+        added = [{"name": e["name"], "size": e["size"],
+                  "n_feats": e["n_feats"]} for e in entries]
+        _log_event("plasmidsaurus.import", item_code=code,
+                   n_added=len(added), n_warn=len(warnings), via="agent")
+        return {"ok": True, "item_code": code, "n_added": len(added),
+                "added": added, "warnings": warnings}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _settings_validator_bool(value):
     if isinstance(value, bool):
         return value, None
@@ -2002,6 +2119,8 @@ def _h_add_codon_table(app, payload):
       * Fetch:   ``{taxid: str, name?: str, source: "kazusa"}``
       * Genome:  ``{source: "genome", accession|taxid: str,
                    mode?: "heg"|"genome", name?: str}``
+      * File:    ``{source: "file", path: str, mode?: "heg"|"genome",
+                   name?: str}`` — build from a LOCAL CDS FASTA (offline)
       * Raw:     ``{name: str, taxid?: str, raw: {<codon>: count, ...}}``
 
     The Kazusa fetch is size-capped at `_KAZUSA_MAX_RESPONSE_BYTES`
@@ -2065,6 +2184,41 @@ def _h_add_codon_table(app, payload):
         try:
             entry = _codon_tables_add(display, meta.get("taxid", ""), raw,
                                       source="genome")
+        except (OSError, RuntimeError) as exc:
+            _log.exception("agent add-codon-table: save failed")
+            return ({"error": f"save failed: {exc}"}, 500)
+        return {"ok": True, "message": msg, "entry": {
+            "name":   entry["name"],
+            "taxid":  entry["taxid"],
+            "source": entry["source"],
+        }}
+    if source == "file":
+        # Build from a LOCAL CDS FASTA on disk — offline, no NCBI.
+        path_raw = payload.get("path")
+        if not isinstance(path_raw, str) or not path_raw.strip():
+            return ({"error": "'path' required for file source"}, 400)
+        mode = payload.get("mode", "heg")
+        if mode not in ("heg", "genome"):
+            return ({"error": "'mode' must be 'heg' or 'genome'"}, 400)
+        p = _sanitize_path(path_raw)
+        if p is None:
+            return ({"error": "invalid 'path'"}, 400)
+        # Agent read-endpoint hardening: refuse an ancestor symlink redirect.
+        ancestor_err = _check_agent_read_path_ancestors(p)
+        if ancestor_err:
+            return ({"error": ancestor_err}, 400)
+        name_in = _sanitize_label(payload.get("name"), max_len=200)
+        try:
+            raw, msg, meta = _file_build_codon_table(p, mode)
+        except Exception as exc:
+            _log.exception("agent add-codon-table: file build failed")
+            return ({"error": f"file build failed: {exc}"}, 502)
+        if raw is None or meta is None:
+            return ({"error": msg or "file build returned no data"}, 400)
+        display = name_in or meta.get("organism") or "Codon table from file"
+        try:
+            entry = _codon_tables_add(display, meta.get("taxid", ""), raw,
+                                      source="file")
         except (OSError, RuntimeError) as exc:
             _log.exception("agent add-codon-table: save failed")
             return ({"error": f"save failed: {exc}"}, 500)

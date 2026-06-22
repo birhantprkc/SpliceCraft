@@ -14,6 +14,20 @@
 
 ---
 
+## [1.0.90] — 2026-06-22
+
+### New features
+
+- **Fetch sequencing results straight from Plasmidsaurus.** A new **Fetch by item code from Plasmidsaurus API** button on the Sequencing screen pulls a finished run directly from your Plasmidsaurus account over their official REST API and imports its plasmid samples into your library — no more downloading a zip and dragging it in by hand. Enter your API credentials once under **Settings → Plasmidsaurus API**, or set the `PLASMIDSAURUS_CLIENT_ID` / `PLASMIDSAURUS_CLIENT_SECRET` environment variables (these take precedence and keep the secret off disk). Imported samples are added as new library entries, never overwriting anything you already have. The same fetch is scriptable through two new agent-API endpoints (`plasmidsaurus-items` to list your runs, `download-plasmidsaurus` to fetch + import one by code).
+
+- **Build a codon-usage table from a local CDS file.** The Species picker (Settings → Codon Tables) gains a **Build from CDS file** tab: point it at a `cds_from_genomic.fna` (or `.fna.gz`) on disk and it builds a usage table entirely offline, with no NCBI round-trip — handy for an organism you've already sequenced or that isn't in NCBI. Pick highly-expressed-genes (ribosomal-protein) or whole-genome mode. Also reachable from the agent API via `add-codon-table` with `source: "file"`.
+
+- **Your custom restriction enzymes now show up everywhere.** Enzymes you've defined yourself are now offered in every enzyme picker — the restriction-overlay list, the traditional-cloning enzyme chooser, and the Golden-Braid / MoClo domestication picker — and the cloning-grammar editor accepts them as valid catalog entries. Previously those pickers only listed the built-in NEB set.
+
+### Hardening
+
+- **Plasmidsaurus credentials are handled with care.** Your Client Secret is never written to the log or the diagnostic event stream (it shows as `<redacted>`), and it is deliberately kept out of the agent settings API, so a remote agent can neither read it back nor change it. Downloads go HTTPS-only through the same hardened, SSRF-resistant fetch path as the rest of SpliceCraft's networking, are size-capped, and are checked to actually be a zip archive before a single byte is written to disk.
+
 ## [1.0.89] — 2026-06-21
 
 ### Under the hood

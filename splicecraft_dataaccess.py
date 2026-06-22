@@ -1491,6 +1491,14 @@ def _get_setting(key: str, default: "_Any" = None) -> "_Any":
         return _typed_clone(cache[key])
 
 
+# Setting keys whose VALUE is a secret — redacted in the change-log + event
+# stream by `_set_setting`, and deliberately kept out of the agent settings
+# allowlist so a remote agent can't read them back.
+_SENSITIVE_SETTING_KEYS: "frozenset[str]" = frozenset({
+    "plasmidsaurus_client_secret",
+})
+
+
 def _set_setting(key: str, value) -> None:
     """Update one setting key. Cache is updated synchronously so a
     subsequent `_load_settings()` (in this process) sees the new value
@@ -1516,12 +1524,17 @@ def _set_setting(key: str, value) -> None:
         # accidental sequence content.
         prev = settings.get(key, "<unset>")
         if prev != value:
-            _log.info("setting changed: %s = %r (was %r)",
-                        key, _repr_for_log(value), _repr_for_log(prev))
+            # Never write a secret-valued setting (e.g. the Plasmidsaurus
+            # client secret) to the log or the event stream — redact both the
+            # new value AND the previous one to a fixed marker.
+            if key in _SENSITIVE_SETTING_KEYS:
+                v_log = p_log = "<redacted>"
+            else:
+                v_log = _repr_for_log(value)
+                p_log = _repr_for_log(prev)
+            _log.info("setting changed: %s = %r (was %r)", key, v_log, p_log)
             _log_event(
-                "settings.changed",
-                key=key, value=_repr_for_log(value),
-                prev=_repr_for_log(prev),
+                "settings.changed", key=key, value=v_log, prev=p_log,
             )
         settings[key] = value
         # Sweep #9: `_typed_clone` (deepcopy), not shallow `dict(...)` — a

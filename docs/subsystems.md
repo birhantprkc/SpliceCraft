@@ -15,7 +15,7 @@ grep -ni 'experiment\|project\|gel' docs/subsystems.md
 
 | Tag | Topic keywords |
 |---|---|
-| `[SUB-plasmidsaurus]` | Plasmidsaurus zip ingestion; pairwise alignment; SequencingScreen; sub-tabs |
+| `[SUB-plasmidsaurus]` | Plasmidsaurus zip ingestion; REST API download (sweep #29); pairwise alignment; SequencingScreen; sub-tabs |
 | `[SUB-experiments]` | Experiments lab-notebook; projects; cross-refs `@`/`!`/`&`; spellcheck; ImageAttachModal |
 | `[SUB-gels]` | Gels; gels.json; GelLibraryModal; SimulatorScreen |
 | `[SUB-hmm-db]` | HMM database registry; Pfam-A / NCBIfam / custom URL download; `HmmDbCatalogModal`; `hmm_db_catalog.json`; pyhmmer hmmpress; cross-internet hardening |
@@ -146,6 +146,8 @@ Hardening (0.9.4):
 * **Per-base TSV zip-bomb defence** — `_PLASMIDSAURUS_PERBASE_MAX_BYTES = 100 MB` two-layer cap (central-directory check + chunked `codecs.getincrementaldecoder` 64 KB).
 * **Single-pass zip-open** — `_batch_extract_gbk_meta` reads every sample in one `ZipFile` open.
 * **NUL-anchored sentinels** — `_NO_GBK_KEY_PREFIX = "\x00no-gbk\x00"`, `_EMPTY_LIBRARY_SENTINEL = "\x00no-library\x00"` (collision-proof).
+
+**API download (sweep #29, 2026-06-21):** fetch a run straight from a user's Plasmidsaurus account by 6-char item code instead of a hand-downloaded zip. The network client lives in **`splicecraft_search`** (`_plasmidsaurus_*`): `_plasmidsaurus_oauth_token` (OAuth2 client-credentials `POST /oauth/token`, HTTP Basic) → `_plasmidsaurus_api_get` (Bearer JSON GET) backing `_plasmidsaurus_list_items` (`GET /api/items`) + `_plasmidsaurus_result_link` (`GET /api/item/<code>/results` → `{link}`) → `_plasmidsaurus_download_zip` (dedicated hardened streamer — HTTPS-only hardened opener, content-type guard, `PK\x03\x04` magic check, `_PLASMIDSAURUS_DOWNLOAD_MAX_BYTES = 600 MB` cap, disk pre-check, L2-chokepoint atomic write; kept SEPARATE from the HMM `_stream_download_to_path` so the shipped gzip path carries no risk). `_plasmidsaurus_fetch_item_zip` orchestrates creds→token→link→download into a temp dir. `_sanitize_plasmidsaurus_item_code` enforces `^[A-Z0-9]{6}$` before any URL interpolation. **Import:** `_plasmidsaurus_zip_to_entries(zip, run_id)` (in **`splicecraft_fileio`**) mirrors the bulk-align add-path entry shape (`source: plasmidsaurus:<code>:<sample>`), used by the agent endpoint. **Credentials** resolve env-first (`PLASMIDSAURUS_CLIENT_ID` / `_SECRET`) then settings (`_plasmidsaurus_credentials`); the secret key is in `_SENSITIVE_SETTING_KEYS` (redacted in `_set_setting`'s log/event) and absent from `_AGENT_SETTINGS_ALLOWLIST` (agent can't read/set it). **Surfaces:** GUI `PlasmidsaurusFetchModal` (opened by the **Fetch by item code from Plasmidsaurus API** button on the General sub-tab; `@work` download worker → `_load_library` append + `_save_library` → LibraryPanel refresh) + agent endpoints `plasmidsaurus-items` (read) / `download-plasmidsaurus` (write). Settings UI: **Settings → Plasmidsaurus API** (Client ID + password-masked Secret + Save/Clear). Tests: `tests/test_plasmidsaurus_api.py` (network fully mocked at `_build_hardened_url_opener`).
 
 ## [SUB-experiments] Experiments lab-notebook (0.9.6+, projects refactor 0.9.7+)
 

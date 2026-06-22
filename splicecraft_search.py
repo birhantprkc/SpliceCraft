@@ -1691,3 +1691,380 @@ def _hmm_db_perform_download(
         "version":    existing["version"],
         "bytes":      dest_gz.stat().st_size if dest_gz.exists() else 0,
     }
+
+
+# ===========================================================================
+# Plasmidsaurus REST API client (sweep #29) — fetch sequencing results by item
+# code over the official OAuth2 client-credentials API
+# (github.com/plasmidsaurus/api_docs). The downloaded `<code>_results.zip`
+# flows straight into the existing `[SUB-plasmidsaurus]` zip importer in
+# splicecraft_fileio (so an API-fetched run lands identically to one the user
+# downloaded from their dashboard and picked by hand).
+#
+# Hardened like the rest of the network layer: egress-gated (the hardened
+# opener calls `_state._demo_block_network_hook`), HTTPS-only with bounded
+# redirects + no http downgrade, credentials redacted in logs, JSON/zip size
+# capped, and the disk write goes through the L2 `_refuse_unauthorized_write`
+# chokepoint. The item code is validated against the published `^[A-Z0-9]{6}$`
+# shape BEFORE it's interpolated into any URL. Credentials resolve env-first
+# (PLASMIDSAURUS_CLIENT_ID / _SECRET) then settings (plaintext — the Settings
+# UI flags that). Kept as a DEDICATED downloader rather than generalising the
+# HMM-DB `_stream_download_to_path` so the shipped HMM path carries no risk.
+# ===========================================================================
+
+_PLASMIDSAURUS_API_URL = "https://app.plasmidsaurus.com"
+_PLASMIDSAURUS_ITEM_CODE_RE = re.compile(r"[A-Z0-9]{6}")
+_PLASMIDSAURUS_RESULT_KINDS: frozenset[str] = frozenset({
+    "results", "reads", "pod5"})
+_PLASMIDSAURUS_NETWORK_TIMEOUT_S = 120         # connect + read; per request
+_PLASMIDSAURUS_TOKEN_MAX_BYTES = 64 * 1024     # OAuth token JSON
+_PLASMIDSAURUS_API_MAX_BYTES = 16 * 1024 * 1024   # items/samples JSON listing
+# Results-zip cap a touch above the importer's 500 MB so the clearer
+# "parser refused" message wins over a raw byte-cap abort for a borderline run.
+_PLASMIDSAURUS_DOWNLOAD_MAX_BYTES = 600 * 1024 * 1024
+
+
+def _plasmidsaurus_user_agent() -> str:
+    return f"SpliceCraft/{_state._sc_version} (Plasmidsaurus API client)"
+
+
+def _plasmidsaurus_credentials() -> "tuple[str | None, str | None]":
+    """Resolve the OAuth Client ID + Secret env-first, then settings.
+
+    Env vars (``PLASMIDSAURUS_CLIENT_ID`` / ``PLASMIDSAURUS_CLIENT_SECRET``)
+    win — they match Plasmidsaurus's own official scripts and keep the secret
+    off disk. The settings fallback (plaintext in the data dir; the Settings
+    UI flags this) is the convenience path for users who'd rather not export
+    env vars. Returns ``(None, None)`` for any missing half so callers refuse
+    with a clear 'set credentials' message instead of attempting a request."""
+    cid = (os.environ.get("PLASMIDSAURUS_CLIENT_ID") or "").strip()
+    sec = (os.environ.get("PLASMIDSAURUS_CLIENT_SECRET") or "").strip()
+    if not cid:
+        cid = str(_get_setting("plasmidsaurus_client_id", "") or "").strip()
+    if not sec:
+        sec = str(_get_setting("plasmidsaurus_client_secret", "") or "").strip()
+    return (cid or None, sec or None)
+
+
+def _sanitize_plasmidsaurus_item_code(code: "str | None") -> "str | None":
+    """Validate/normalise an item code to the published ``^[A-Z0-9]{6}$``
+    shape (upper-cased). Returns None on any deviation so callers refuse it
+    BEFORE it's interpolated into a URL path (defends against
+    ``ABC123/../../etc`` and friends). Type-strict: non-string → None."""
+    if not isinstance(code, str):
+        return None
+    c = code.strip().upper()
+    if _PLASMIDSAURUS_ITEM_CODE_RE.fullmatch(c):
+        return c
+    return None
+
+
+def _plasmidsaurus_oauth_token(client_id: str, client_secret: str,
+                                *, timeout: "float | None" = None) -> str:
+    """Redeem a short-lived Bearer token via the OAuth2 client-credentials
+    grant: POST ``grant_type=client_credentials&scope=item:read`` to
+    ``/oauth/token`` with HTTP Basic auth. Raises OSError on network failure
+    or rejected credentials (400/401/403), ValueError on a malformed token
+    body."""
+    import base64
+    import json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    if not client_id or not client_secret:
+        raise ValueError("missing Plasmidsaurus client_id / client_secret")
+    if timeout is None:
+        timeout = _PLASMIDSAURUS_NETWORK_TIMEOUT_S
+
+    basic = base64.b64encode(
+        f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
+    body = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "scope": "item:read",
+    }).encode("ascii")
+    opener = _build_hardened_url_opener()
+    req = urllib.request.Request(
+        f"{_PLASMIDSAURUS_API_URL}/oauth/token",
+        data=body,
+        headers={
+            "Authorization": f"Basic {basic}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": _plasmidsaurus_user_agent(),
+        },
+    )
+    try:
+        resp = opener.open(req, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (400, 401, 403):
+            raise OSError(
+                "Plasmidsaurus rejected the API credentials "
+                f"(HTTP {exc.code}). Check PLASMIDSAURUS_CLIENT_ID / "
+                "PLASMIDSAURUS_CLIENT_SECRET (or the Settings values)."
+            ) from exc
+        raise OSError(
+            f"Plasmidsaurus token request failed: HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise OSError(
+            f"Plasmidsaurus token request failed: {exc.reason}") from exc
+    try:
+        raw = resp.read(_PLASMIDSAURUS_TOKEN_MAX_BYTES + 1)
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+    if len(raw) > _PLASMIDSAURUS_TOKEN_MAX_BYTES:
+        raise ValueError("Plasmidsaurus token response too large")
+    try:
+        token = json.loads(raw.decode("utf-8", "replace")).get("access_token")
+    except (ValueError, AttributeError) as exc:
+        raise ValueError(
+            "Plasmidsaurus token response wasn't valid JSON") from exc
+    if not isinstance(token, str) or not token:
+        raise ValueError("Plasmidsaurus token response had no access_token")
+    return token
+
+
+def _plasmidsaurus_api_get(path: str, token: str,
+                            *, timeout: "float | None" = None,
+                            max_bytes: "int | None" = None) -> "_Any":
+    """GET ``{API_URL}{path}`` with the Bearer token; return parsed JSON.
+    ``path`` MUST be server-constructed (callers build it from a sanitised
+    item code), never raw user input. Raises OSError on network / HTTP
+    failure, ValueError on an oversized or malformed JSON body."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    if timeout is None:
+        timeout = _PLASMIDSAURUS_NETWORK_TIMEOUT_S
+    if max_bytes is None:
+        max_bytes = _PLASMIDSAURUS_API_MAX_BYTES
+    opener = _build_hardened_url_opener()
+    req = urllib.request.Request(
+        f"{_PLASMIDSAURUS_API_URL}{path}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": _plasmidsaurus_user_agent(),
+        },
+    )
+    try:
+        resp = opener.open(req, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise OSError(
+                "Plasmidsaurus: item or results not found (HTTP 404)") from exc
+        if exc.code in (401, 403):
+            raise OSError(
+                f"Plasmidsaurus: not authorised for this item "
+                f"(HTTP {exc.code})") from exc
+        raise OSError(f"Plasmidsaurus API GET failed: HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise OSError(f"Plasmidsaurus API GET failed: {exc.reason}") from exc
+    try:
+        raw = resp.read(max_bytes + 1)
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+    if len(raw) > max_bytes:
+        raise ValueError("Plasmidsaurus API response too large")
+    try:
+        return json.loads(raw.decode("utf-8", "replace"))
+    except ValueError as exc:
+        raise ValueError(
+            "Plasmidsaurus API response wasn't valid JSON") from exc
+
+
+def _plasmidsaurus_list_items(token: str,
+                               *, shared: bool = False,
+                               timeout: "float | None" = None) -> "list":
+    """Return the caller's items (most-recent first). ``shared=True`` returns
+    items shared with the caller by other users. Always a list (empty if the
+    account has none / the API returns a non-list)."""
+    path = "/api/items?shared=true" if shared else "/api/items"
+    data = _plasmidsaurus_api_get(path, token, timeout=timeout)
+    return data if isinstance(data, list) else []
+
+
+def _plasmidsaurus_result_link(token: str, item_code: str,
+                                *, kind: str = "results",
+                                timeout: "float | None" = None) -> str:
+    """Return the (pre-signed, short-lived) download URL for an item's
+    results / reads / pod5 zip. ``item_code`` MUST already be sanitised."""
+    if kind not in _PLASMIDSAURUS_RESULT_KINDS:
+        raise ValueError(f"unknown Plasmidsaurus result kind: {kind!r}")
+    data = _plasmidsaurus_api_get(
+        f"/api/item/{item_code}/{kind}", token, timeout=timeout)
+    link = data.get("link") if isinstance(data, dict) else None
+    if not isinstance(link, str) or not link:
+        raise ValueError(
+            f"Plasmidsaurus returned no {kind} download link for {item_code}")
+    return link
+
+
+def _plasmidsaurus_download_zip(url: str, dest: Path,
+                                 *, max_bytes: int,
+                                 progress_cb=None,
+                                 cancel_check_cb=None,
+                                 chunk_size: int = 64 * 1024) -> str:
+    """Stream a Plasmidsaurus pre-signed zip URL to ``dest`` atomically;
+    return the SHA-256 hex. Independently hardened (mirrors the HMM-DB
+    downloader's safety machinery, kept separate so the shipped HMM path
+    carries no Plasmidsaurus risk):
+
+      * Hardened opener (HTTPS-only, bounded redirects, no http downgrade).
+      * Content-Type guard rejects HTML/JSON error interstitials.
+      * ZIP magic (``PK\\x03\\x04``) verified on the first chunk — fail fast
+        if the link served an error page or the wrong file.
+      * ``max_bytes`` cap (Content-Length pre-check + running tally) —
+        zip-bomb / wrong-URL guard.
+      * Disk-space pre-check (shared ``_hmm_db_check_disk_space``).
+      * Atomic write: tmp → fsync → os.replace → fsync_parent.
+      * L2 chokepoint via ``_refuse_unauthorized_write``.
+      * ``cancel_check_cb()`` polled between chunks (return True to abort).
+
+    Raises ValueError (cap / bad magic / bad content-type) or OSError
+    (network / disk / cancellation)."""
+    import hashlib
+    import socket
+    import urllib.error
+    import urllib.request
+
+    redacted = _redact_url_credentials(url)
+    if not url.lower().startswith("https://"):
+        raise ValueError("refusing non-HTTPS Plasmidsaurus download URL")
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _refuse_unauthorized_write(dest, "plasmidsaurus download")
+    tmp = dest.with_name(dest.name + ".download_tmp")
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+
+    opener = _build_hardened_url_opener()
+    req = urllib.request.Request(
+        url, headers={"User-Agent": _plasmidsaurus_user_agent()})
+    try:
+        resp = opener.open(req, timeout=_PLASMIDSAURUS_NETWORK_TIMEOUT_S)
+    except urllib.error.HTTPError as exc:
+        raise OSError(
+            f"Plasmidsaurus download failed: HTTP {exc.code}") from exc
+    except (urllib.error.URLError, socket.timeout) as exc:
+        raise OSError(f"Plasmidsaurus download failed: {exc}") from exc
+
+    sha = hashlib.sha256()
+    bytes_so_far = 0
+    cancelled = False
+    saw_bytes = False
+    try:
+        try:
+            _hmm_db_assert_content_type_ok(resp, url)
+            total_header = resp.headers.get("Content-Length")
+            total: "int | None"
+            try:
+                total = int(total_header) if total_header else None
+            except (TypeError, ValueError):
+                total = None
+            if total is not None and total > max_bytes:
+                raise ValueError(
+                    f"refusing download: server reports {total:,} bytes "
+                    f"> cap {max_bytes:,}")
+            _hmm_db_check_disk_space(dest, total)
+            first_chunk = True
+            with open(tmp, "wb") as fh:
+                while True:
+                    if (cancel_check_cb is not None
+                            and bool(cancel_check_cb())):
+                        cancelled = True
+                        raise OSError("download cancelled by user")
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    bytes_so_far += len(chunk)
+                    if bytes_so_far > max_bytes:
+                        raise ValueError(
+                            f"download exceeded {max_bytes:,} byte cap "
+                            f"({bytes_so_far:,} read) — likely wrong URL "
+                            f"or zip bomb")
+                    if first_chunk:
+                        first_chunk = False
+                        if not chunk.startswith(b"PK\x03\x04"):
+                            raise ValueError(
+                                "first bytes aren't a zip (PK 03 04) — the "
+                                "link didn't serve a results archive")
+                        saw_bytes = True
+                    sha.update(chunk)
+                    fh.write(chunk)
+                    if progress_cb is not None:
+                        try:
+                            progress_cb(bytes_so_far, total)
+                        except Exception:
+                            _log.exception(
+                                "Plasmidsaurus download: progress cb raised")
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        if not saw_bytes:
+            raise ValueError("download empty — server returned 0 bytes")
+        os.replace(str(tmp), str(dest))
+        _fsync_parent_dir(dest)
+    except Exception:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        if cancelled:
+            _log_event("plasmidsaurus.download.cancelled",
+                       url=redacted, bytes_read=bytes_so_far)
+        raise
+    _log_event("plasmidsaurus.download.ok", url=redacted, bytes=bytes_so_far)
+    return sha.hexdigest()
+
+
+def _plasmidsaurus_fetch_item_zip(item_code: str, dest_dir: "str | Path",
+                                   *, kind: str = "results",
+                                   client_id: "str | None" = None,
+                                   client_secret: "str | None" = None,
+                                   token: "str | None" = None,
+                                   progress_cb=None,
+                                   cancel_check_cb=None) -> Path:
+    """End-to-end: resolve creds → token → results link → stream the zip to
+    ``dest_dir/<code>_<kind>.zip``. Returns the written path. The HEADLESS
+    core shared by the agent endpoint and the GUI fetch worker, so both land
+    the same bytes on disk. Raises ValueError (bad item code / kind / cred
+    gap) or OSError (network / disk)."""
+    code = _sanitize_plasmidsaurus_item_code(item_code)
+    if code is None:
+        raise ValueError("invalid item code (expected 6 chars, A-Z / 0-9)")
+    if kind not in _PLASMIDSAURUS_RESULT_KINDS:
+        raise ValueError(f"unknown result kind: {kind!r}")
+    if token is None:
+        if not client_id or not client_secret:
+            cid, sec = _plasmidsaurus_credentials()
+            client_id = client_id or cid
+            client_secret = client_secret or sec
+        if not client_id or not client_secret:
+            raise ValueError(
+                "no Plasmidsaurus API credentials — set "
+                "PLASMIDSAURUS_CLIENT_ID / PLASMIDSAURUS_CLIENT_SECRET "
+                "or add them in Settings")
+        token = _plasmidsaurus_oauth_token(client_id, client_secret)
+    link = _plasmidsaurus_result_link(token, code, kind=kind)
+    dest = Path(dest_dir) / f"{code}_{kind}.zip"
+    _plasmidsaurus_download_zip(
+        link, dest, max_bytes=_PLASMIDSAURUS_DOWNLOAD_MAX_BYTES,
+        progress_cb=progress_cb, cancel_check_cb=cancel_check_cb)
+    return dest

@@ -1,0 +1,501 @@
+"""Plasmidsaurus REST API client + agent endpoints + GUI fetch modal
+(sweep #29).
+
+The network is fully mocked at ``splicecraft_search._build_hardened_url_opener``
+— no real egress ever happens. Tests are auto-sandboxed by the conftest
+``_protect_user_data`` fixture, so the library-import paths write to a
+throwaway data dir (the suite is also authorised for the L2 chokepoint).
+"""
+from __future__ import annotations
+
+import io
+import json
+import zipfile
+
+import pytest
+
+import splicecraft as sc
+import splicecraft_search as _search
+import splicecraft_fileio as _fileio
+
+
+# ── response / opener stubs ──────────────────────────────────────────────────
+def _resp(body: bytes, content_type: str = "application/json"):
+    class _H:
+        _d = {"Content-Type": content_type, "Content-Length": str(len(body))}
+
+        def get(self, k, default=""):
+            for kk, v in self._d.items():
+                if kk.lower() == k.lower():
+                    return v
+            return default
+
+    class _R:
+        headers = _H()
+
+        def __init__(self):
+            self._b = io.BytesIO(body)
+
+        def read(self, n=-1):
+            return self._b.read(n)
+
+        def close(self):
+            pass
+
+    return _R()
+
+
+def _mkgb(rid: str = "samp") -> str:
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    r = SeqRecord(
+        Seq("ATGAAACGCATTAGCACCACCATTACCACCACCATCGGTACCTAA" * 3),
+        id=rid, name=rid)
+    r.annotations["molecule_type"] = "DNA"
+    r.annotations["topology"] = "circular"
+    return sc._record_to_gb_text(r)
+
+
+def _zip_bytes(names=("my_sample_1.gbk", "my_sample_2.gbk")) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for i, n in enumerate(names):
+            zf.writestr(n, _mkgb(f"s{i}"))
+    return buf.getvalue()
+
+
+class _Router:
+    """Fake hardened opener; routes by URL to canned responses."""
+
+    def __init__(self, *, token="tok", items=None,
+                 link="https://files.example/x.zip", zipbytes=None):
+        self.token = token
+        self.items = items if items is not None else []
+        self.link = link
+        self.zipbytes = zipbytes if zipbytes is not None else _zip_bytes()
+        self.calls: list[str] = []
+
+    def open(self, req, timeout=None):
+        url = req.get_full_url()
+        self.calls.append(url)
+        if url.endswith("/oauth/token"):
+            assert (req.get_header("Authorization") or "").startswith("Basic ")
+            return _resp(json.dumps({"access_token": self.token}).encode())
+        if "/api/items" in url:
+            return _resp(json.dumps(self.items).encode())
+        if url.endswith("/results"):
+            return _resp(json.dumps({"link": self.link}).encode())
+        if url == self.link:
+            return _resp(self.zipbytes, content_type="application/zip")
+        raise AssertionError("unexpected URL " + url)
+
+
+@pytest.fixture
+def use_router(monkeypatch):
+    def _install(router: _Router) -> _Router:
+        monkeypatch.setattr(_search, "_build_hardened_url_opener",
+                            lambda: router)
+        return router
+    return _install
+
+
+# ── item-code sanitiser ──────────────────────────────────────────────────────
+class TestItemCodeSanitizer:
+    def test_valid_uppercased(self):
+        assert sc._sanitize_plasmidsaurus_item_code("abc123") == "ABC123"
+        assert sc._sanitize_plasmidsaurus_item_code(" ABC123 ") == "ABC123"
+
+    def test_rejects_bad_shapes(self):
+        for bad in ("ABC12", "ABCDEFG", "AB C12", "ABC123/../x",
+                    "../secr", "http://x", "", "ABC-12", None, 123):
+            assert sc._sanitize_plasmidsaurus_item_code(bad) is None, bad
+
+
+# ── credentials (env-first, then settings) ───────────────────────────────────
+class TestCredentials:
+    def test_env_first(self, monkeypatch):
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_ID", "envid")
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_SECRET", "envsec")
+        sc._set_setting("plasmidsaurus_client_id", "setid")
+        sc._set_setting("plasmidsaurus_client_secret", "setsec")
+        assert sc._plasmidsaurus_credentials() == ("envid", "envsec")
+
+    def test_settings_fallback(self, monkeypatch):
+        monkeypatch.delenv("PLASMIDSAURUS_CLIENT_ID", raising=False)
+        monkeypatch.delenv("PLASMIDSAURUS_CLIENT_SECRET", raising=False)
+        sc._set_setting("plasmidsaurus_client_id", "setid")
+        sc._set_setting("plasmidsaurus_client_secret", "setsec")
+        assert sc._plasmidsaurus_credentials() == ("setid", "setsec")
+
+    def test_partial_is_none(self, monkeypatch):
+        monkeypatch.delenv("PLASMIDSAURUS_CLIENT_ID", raising=False)
+        monkeypatch.delenv("PLASMIDSAURUS_CLIENT_SECRET", raising=False)
+        sc._set_setting("plasmidsaurus_client_id", "only-id")
+        sc._set_setting("plasmidsaurus_client_secret", "")
+        cid, sec = sc._plasmidsaurus_credentials()
+        assert cid == "only-id" and sec is None
+
+
+# ── OAuth + JSON API ─────────────────────────────────────────────────────────
+class TestApiClient:
+    def test_token_happy(self, use_router):
+        use_router(_Router(token="abc123"))
+        assert sc._plasmidsaurus_oauth_token("cid", "sec") == "abc123"
+
+    def test_token_bad_credentials_raises_oserror(self, monkeypatch):
+        import urllib.error
+
+        class _O:
+            def open(self, req, timeout=None):
+                raise urllib.error.HTTPError(
+                    req.get_full_url(), 401, "Unauthorized", {}, None)
+        monkeypatch.setattr(_search, "_build_hardened_url_opener", lambda: _O())
+        with pytest.raises(OSError, match="credential"):
+            sc._plasmidsaurus_oauth_token("cid", "bad")
+
+    def test_token_requires_both(self):
+        with pytest.raises(ValueError):
+            sc._plasmidsaurus_oauth_token("", "sec")
+
+    def test_api_get_404_raises(self, monkeypatch):
+        import urllib.error
+
+        class _O:
+            def open(self, req, timeout=None):
+                raise urllib.error.HTTPError(
+                    req.get_full_url(), 404, "Not Found", {}, None)
+        monkeypatch.setattr(_search, "_build_hardened_url_opener", lambda: _O())
+        with pytest.raises(OSError, match="404"):
+            sc._plasmidsaurus_api_get("/api/item/ABCDEF", "tok")
+
+    def test_api_get_oversize_raises(self, monkeypatch):
+        big = b"[" + b"0," * 200 + b"0]"
+
+        class _O:
+            def open(self, req, timeout=None):
+                return _resp(big)
+        monkeypatch.setattr(_search, "_build_hardened_url_opener", lambda: _O())
+        with pytest.raises(ValueError, match="too large"):
+            sc._plasmidsaurus_api_get("/api/items", "tok", max_bytes=8)
+
+    def test_list_items(self, use_router):
+        use_router(_Router(items=[{"code": "ABCDEF", "status": "complete"}]))
+        items = sc._plasmidsaurus_list_items("tok")
+        assert items and items[0]["code"] == "ABCDEF"
+
+    def test_result_link(self, use_router):
+        use_router(_Router(link="https://files/x.zip"))
+        assert sc._plasmidsaurus_result_link("tok", "ABCDEF") == \
+            "https://files/x.zip"
+
+    def test_result_link_bad_kind(self):
+        with pytest.raises(ValueError, match="kind"):
+            sc._plasmidsaurus_result_link("tok", "ABCDEF", kind="genome")
+
+    def test_result_link_missing_link(self, monkeypatch):
+        class _O:
+            def open(self, req, timeout=None):
+                return _resp(b"{}")
+        monkeypatch.setattr(_search, "_build_hardened_url_opener", lambda: _O())
+        with pytest.raises(ValueError, match="no results download link"):
+            sc._plasmidsaurus_result_link("tok", "ABCDEF")
+
+
+# ── zip download (PK magic + caps + content-type) ────────────────────────────
+class TestDownloadZip:
+    def _opener_returning(self, monkeypatch, body, ctype="application/zip"):
+        class _O:
+            def open(self, req, timeout=None):
+                return _resp(body, content_type=ctype)
+        monkeypatch.setattr(_search, "_build_hardened_url_opener", lambda: _O())
+
+    def test_accepts_real_zip(self, tmp_path, monkeypatch):
+        zb = _zip_bytes()
+        self._opener_returning(monkeypatch, zb)
+        dest = tmp_path / "ABCDEF_results.zip"
+        sha = sc._plasmidsaurus_download_zip(
+            "https://files/x.zip", dest, max_bytes=10 * 1024 * 1024)
+        assert dest.exists() and dest.read_bytes() == zb and len(sha) == 64
+
+    def test_rejects_non_zip(self, tmp_path, monkeypatch):
+        self._opener_returning(monkeypatch, b"NOT A ZIP" * 50,
+                               ctype="application/octet-stream")
+        with pytest.raises(ValueError, match="zip"):
+            sc._plasmidsaurus_download_zip(
+                "https://files/x.zip", tmp_path / "x.zip",
+                max_bytes=10 * 1024 * 1024)
+        assert not (tmp_path / "x.zip").exists()   # nothing left on disk
+
+    def test_rejects_html_error_page(self, tmp_path, monkeypatch):
+        self._opener_returning(monkeypatch, b"<html>blocked</html>",
+                               ctype="text/html")
+        with pytest.raises(ValueError, match="Content-Type"):
+            sc._plasmidsaurus_download_zip(
+                "https://files/x.zip", tmp_path / "x.zip",
+                max_bytes=10 * 1024 * 1024)
+
+    def test_enforces_cap(self, tmp_path, monkeypatch):
+        self._opener_returning(monkeypatch, _zip_bytes())
+        with pytest.raises(ValueError, match="cap"):
+            sc._plasmidsaurus_download_zip(
+                "https://files/x.zip", tmp_path / "x.zip", max_bytes=8)
+
+    def test_rejects_non_https(self, tmp_path):
+        with pytest.raises(ValueError, match="HTTPS"):
+            sc._plasmidsaurus_download_zip(
+                "http://files/x.zip", tmp_path / "x.zip",
+                max_bytes=10 * 1024 * 1024)
+
+
+# ── zip → library entries ────────────────────────────────────────────────────
+class TestZipToEntries:
+    def test_builds_entries(self, tmp_path):
+        zp = tmp_path / "run.zip"
+        zp.write_bytes(_zip_bytes(("alpha.gbk", "beta.gbk")))
+        entries, warnings = _fileio._plasmidsaurus_zip_to_entries(
+            zp, run_id="ABCDEF")
+        assert warnings == []
+        assert {e["name"] for e in entries} == {"alpha", "beta"}
+        for e in entries:
+            assert e["source"].startswith("plasmidsaurus:ABCDEF:")
+            assert e["status"] == "" and e["gb_text"] and e["size"] > 0
+            assert sc._gb_text_to_record(e["gb_text"]) is not None
+
+    def test_bad_member_becomes_warning(self, tmp_path):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("good.gbk", _mkgb("g"))
+            zf.writestr("broken.gbk", "this is not genbank at all")
+        zp = tmp_path / "run.zip"
+        zp.write_bytes(buf.getvalue())
+        entries, warnings = _fileio._plasmidsaurus_zip_to_entries(zp)
+        assert [e["name"] for e in entries] == ["good"]
+        assert len(warnings) == 1 and "broken.gbk" in warnings[0]
+
+    def test_non_zip_raises(self, tmp_path):
+        bad = tmp_path / "x.zip"
+        bad.write_bytes(b"not a zip")
+        with pytest.raises(ValueError):
+            _fileio._plasmidsaurus_zip_to_entries(bad)
+
+
+# ── fetch orchestration ──────────────────────────────────────────────────────
+class TestFetchItemZip:
+    def test_end_to_end(self, tmp_path, use_router):
+        use_router(_Router())
+        out = sc._plasmidsaurus_fetch_item_zip(
+            "abcdef", tmp_path, client_id="cid", client_secret="sec")
+        assert out.name == "ABCDEF_results.zip" and out.exists()
+
+    def test_bad_code_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="item code"):
+            sc._plasmidsaurus_fetch_item_zip(
+                "bad/x", tmp_path, client_id="c", client_secret="s")
+
+    def test_no_credentials_raises(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("PLASMIDSAURUS_CLIENT_ID", raising=False)
+        monkeypatch.delenv("PLASMIDSAURUS_CLIENT_SECRET", raising=False)
+        sc._set_setting("plasmidsaurus_client_id", "")
+        sc._set_setting("plasmidsaurus_client_secret", "")
+        with pytest.raises(ValueError, match="credential"):
+            sc._plasmidsaurus_fetch_item_zip("ABCDEF", tmp_path)
+
+
+# ── agent endpoints ──────────────────────────────────────────────────────────
+class TestAgentEndpoints:
+    def _items(self):
+        return sc._state._AGENT_HANDLERS["plasmidsaurus-items"][0]
+
+    def _download(self):
+        return sc._state._AGENT_HANDLERS["download-plasmidsaurus"][0]
+
+    def test_registered(self):
+        H = sc._state._AGENT_HANDLERS
+        assert H["plasmidsaurus-items"][1] is False     # read
+        assert H["download-plasmidsaurus"][1] is True   # write
+
+    def test_items_no_creds_400(self, monkeypatch):
+        monkeypatch.delenv("PLASMIDSAURUS_CLIENT_ID", raising=False)
+        monkeypatch.delenv("PLASMIDSAURUS_CLIENT_SECRET", raising=False)
+        sc._set_setting("plasmidsaurus_client_id", "")
+        sc._set_setting("plasmidsaurus_client_secret", "")
+        payload, status = self._items()(None, {})
+        assert status == 400 and "credential" in payload["error"].lower()
+
+    def test_items_happy(self, monkeypatch, use_router):
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_ID", "cid")
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_SECRET", "sec")
+        use_router(_Router(items=[{"code": "ABCDEF", "status": "complete",
+                                   "product_name": "plasmid_high_copy",
+                                   "quantity": 2, "done_date": "2026-06-01",
+                                   "gross": 30.0}]))
+        r = self._items()(None, {})
+        assert r["ok"] and r["count"] == 1
+        assert r["items"][0]["code"] == "ABCDEF"
+
+    def test_download_bad_code_400(self):
+        payload, status = self._download()(None, {"item_code": "bad/x"})
+        assert status == 400 and "item_code" in payload["error"]
+
+    def test_download_non_results_kind_400(self):
+        payload, status = self._download()(
+            None, {"item_code": "ABCDEF", "kind": "reads"})
+        assert status == 400 and "results" in payload["error"].lower()
+
+    def test_download_no_creds_400(self, monkeypatch):
+        monkeypatch.delenv("PLASMIDSAURUS_CLIENT_ID", raising=False)
+        monkeypatch.delenv("PLASMIDSAURUS_CLIENT_SECRET", raising=False)
+        sc._set_setting("plasmidsaurus_client_id", "")
+        sc._set_setting("plasmidsaurus_client_secret", "")
+        payload, status = self._download()(None, {"item_code": "ABCDEF"})
+        assert status == 400 and "credential" in payload["error"].lower()
+
+    def test_download_imports_into_library(self, monkeypatch, use_router):
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_ID", "cid")
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_SECRET", "sec")
+        use_router(_Router(zipbytes=_zip_bytes(("foo.gbk", "bar.gbk"))))
+        before = len(sc._load_library())
+        r = self._download()(None, {"item_code": "abcdef"})
+        assert r["ok"] and r["n_added"] == 2
+        assert {a["name"] for a in r["added"]} == {"foo", "bar"}
+        lib = sc._load_library()
+        assert len(lib) == before + 2
+        tagged = [e for e in lib if e.get("source", "").startswith(
+            "plasmidsaurus:ABCDEF:")]
+        assert len(tagged) == 2
+        # Re-import APPENDS (never overwrites / drops) → +2 more.
+        r2 = self._download()(None, {"item_code": "abcdef"})
+        assert r2["n_added"] == 2 and len(sc._load_library()) == before + 4
+        # …and every library id stays UNIQUE. Library `id` is the canonical
+        # key (delete-by-id filters on it), so a duplicate would make a later
+        # single-entry delete nuke both copies — a data-loss class bug.
+        ids = [e["id"] for e in sc._load_library() if "id" in e]
+        assert len(ids) == len(set(ids)), "duplicate library ids after re-import"
+
+
+# ── secret never reaches the log / event stream ──────────────────────────────
+class TestSecretRedaction:
+    def test_secret_redacted(self, monkeypatch):
+        import splicecraft_dataaccess as _da
+        evs = []
+        monkeypatch.setattr(_da, "_log_event",
+                            lambda ev, **kw: evs.append((ev, kw)))
+        import logging
+        records = []
+
+        class _Cap(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+        cap = _Cap()
+        sc._log.addHandler(cap)
+        sc._log.setLevel(logging.DEBUG)
+        try:
+            secret = "sk-DO-NOT-LOG-ME-123abc"
+            sc._set_setting("plasmidsaurus_client_secret", secret)
+            blob = "\n".join(records) + repr(evs)
+            assert secret not in blob, "SECRET LEAKED"
+            assert any(kw.get("key") == "plasmidsaurus_client_secret"
+                       and kw.get("value") == "<redacted>" for _, kw in evs)
+        finally:
+            sc._log.removeHandler(cap)
+
+
+# ── secret stays OUT of the agent settings surface ───────────────────────────
+class TestSecretExcludedFromAgentSurface:
+    """The CHANGELOG promises a remote agent "can neither read it back nor
+    change it." Pin that: the credential keys are absent from the settings
+    allowlist, so get-settings omits the secret and set-setting refuses it."""
+
+    def test_not_in_allowlist(self):
+        assert "plasmidsaurus_client_secret" not in sc._AGENT_SETTINGS_ALLOWLIST
+        assert "plasmidsaurus_client_id" not in sc._AGENT_SETTINGS_ALLOWLIST
+
+    def test_get_settings_omits_secret(self):
+        get = sc._state._AGENT_HANDLERS["get-settings"][0]
+        r = get(None, {})
+        assert "plasmidsaurus_client_secret" not in r["settings"]
+
+    def test_set_setting_refuses_secret(self):
+        setter = sc._state._AGENT_HANDLERS["set-setting"][0]
+        payload, status = setter(
+            None, {"key": "plasmidsaurus_client_secret", "value": "leak"})
+        assert status == 400 and "unknown setting" in payload["error"]
+        assert sc._get_setting("plasmidsaurus_client_secret", "") != "leak"
+
+
+# ── GUI: SettingsModal credential fields ─────────────────────────────────────
+class TestSettingsModalCreds:
+    async def test_save_and_clear(self, monkeypatch):
+        from textual.widgets import Input
+        monkeypatch.delenv("PLASMIDSAURUS_CLIENT_ID", raising=False)
+        monkeypatch.delenv("PLASMIDSAURUS_CLIENT_SECRET", raising=False)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.SettingsModal())
+            await pilot.pause()
+            modal = app.screen
+            modal.query_one("#set-ps-id", Input).value = "my-id"
+            modal.query_one("#set-ps-secret", Input).value = "my-secret"
+            modal._ps_save_creds(None)
+            await pilot.pause()
+            assert sc._get_setting("plasmidsaurus_client_id") == "my-id"
+            assert sc._get_setting("plasmidsaurus_client_secret") == "my-secret"
+            modal._ps_clear_creds(None)
+            await pilot.pause()
+            assert sc._get_setting("plasmidsaurus_client_id") == ""
+            assert sc._get_setting("plasmidsaurus_client_secret") == ""
+            app.exit()
+
+
+# ── GUI: PlasmidsaurusFetchModal ─────────────────────────────────────────────
+class TestFetchModal:
+    async def test_invalid_code_shows_error(self, monkeypatch):
+        from textual.widgets import Input, Static
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_ID", "cid")
+        monkeypatch.setenv("PLASMIDSAURUS_CLIENT_SECRET", "sec")
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.PlasmidsaurusFetchModal())
+            await pilot.pause()
+            modal = app.screen
+            modal.query_one("#ps-fetch-code", Input).value = "xx"
+            modal._start()
+            await pilot.pause()
+            status = str(modal.query_one("#ps-fetch-status", Static).render())
+            assert "valid" in status.lower() and modal._busy is False
+            app.exit()
+
+    async def test_done_callback_refreshes_and_reports(self):
+        from textual.widgets import Static
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.PlasmidsaurusFetchModal())
+            await pilot.pause()
+            modal = app.screen
+            entries = [{"name": "s1"}, {"name": "s2"}]
+            modal._busy = True
+            modal._fetch_done(("ok", entries, ["skipped.gbk: bad"]))
+            await pilot.pause()
+            status = str(modal.query_one("#ps-fetch-status", Static).render())
+            assert "Imported 2" in status and "1 skipped" in status
+            assert modal._busy is False
+            app.exit()
+
+    async def test_creds_hint_when_unset(self, monkeypatch):
+        from textual.widgets import Static
+        monkeypatch.delenv("PLASMIDSAURUS_CLIENT_ID", raising=False)
+        monkeypatch.delenv("PLASMIDSAURUS_CLIENT_SECRET", raising=False)
+        sc._set_setting("plasmidsaurus_client_id", "")
+        sc._set_setting("plasmidsaurus_client_secret", "")
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            await pilot.pause()
+            await app.push_screen(sc.PlasmidsaurusFetchModal())
+            await pilot.pause()
+            modal = app.screen
+            hint = str(modal.query_one("#ps-fetch-creds", Static).render())
+            assert "No API credentials" in hint
+            app.exit()
