@@ -44,6 +44,8 @@ from splicecraft_persistence import (
     _atomic_write_bytes,
     _atomic_write_text,
     _backup_info,
+    _refuse_unauthorized_delete,
+    _refuse_unauthorized_write,
     _compress_old_backups,
     _extract_entries,
     _iter_backups,
@@ -246,6 +248,12 @@ def _snapshot_data_files(data_dir: Path,
     custom list keeps the helper test-friendly without exposing fragile
     module globals to the test.
     """
+    # L2 chokepoint: these snapshot copies land under the data dir, so gate
+    # them like every other data-dir writer — an unsandboxed probe must not be
+    # able to write into the user's real data dir through this helper. A no-op
+    # in production (main() / the pytest fixture / the agent server authorise
+    # writes before this ever runs).
+    _refuse_unauthorized_write(data_dir, "daily snapshot")
     if paths is None:
         paths = []
         g = globals()
@@ -482,6 +490,24 @@ def _resolve_pre_update_backup_dir(data_dir: "Path | None" = None) -> Path:
             raise OSError(
                 f"$SPLICECRAFT_UPDATE_BACKUP_DIR points at a non-directory "
                 f"({candidate}). Set it to a writable directory path."
+            )
+        # Master Delete recursively rmtrees this directory (it's a sibling-
+        # backup target in `_master_delete_sibling_targets`). The auto-derived
+        # path below is guarded against deriving into a filesystem root; the
+        # override skipped that guard entirely, so a value like `$HOME` or the
+        # data dir would be wiped on a Master Delete. Refuse the catastrophic
+        # targets: a filesystem root, the home directory, and the data dir
+        # itself or any ancestor of it.
+        _parent = candidate.parent
+        _data = _state._DATA_DIR.resolve()
+        if (_parent == candidate or _parent.parent == _parent
+                or candidate == Path.home().resolve()
+                or candidate == _data or candidate in _data.parents):
+            raise OSError(
+                f"Refusing $SPLICECRAFT_UPDATE_BACKUP_DIR={str(candidate)!r}: "
+                "it is a filesystem root, your home directory, or the data dir "
+                "/ an ancestor of it — Master Delete would recursively wipe it. "
+                "Point it at a dedicated backup directory."
             )
         return candidate
     base = (data_dir if data_dir is not None else _state._DATA_DIR).resolve()
@@ -1133,6 +1159,14 @@ def _restore_pre_update_snapshot(snap_id_or_path: "str | Path",
     Raises FileNotFoundError if the snapshot id doesn't exist.
     Raises ValueError on unsupported schema version.
     """
+    # L2 chokepoint: this OVERWRITES and RMTREES live user data. Gate it like
+    # every other data-dir writer/deleter so an unsandboxed probe can't be
+    # tricked into clobbering the real data dir — the exact disaster the
+    # chokepoint exists to prevent. No-op in production (main() / pytest fixture
+    # / agent server authorise first); the pre-restore snapshot below keeps an
+    # authorised restore undoable.
+    _refuse_unauthorized_write(_state._DATA_DIR, "pre-update restore")
+    _refuse_unauthorized_delete(_state._DATA_DIR, "pre-update restore")
     if backup_dir is None:
         backup_dir = _resolve_pre_update_backup_dir()
     if isinstance(snap_id_or_path, Path):
@@ -1495,6 +1529,11 @@ def _import_migrate_archive(zip_path: "str | Path") -> dict:
     The caller is responsible for busting in-memory caches afterwards
     (the on-disk data has changed underneath them).
     """
+    # L2 chokepoint: this replaces live user data (its own staging plus the
+    # _restore_pre_update_snapshot call below). Gate at entry so an unsandboxed
+    # probe can't import an archive over the real data dir. No-op once writes
+    # are authorised (main() / pytest fixture / agent server).
+    _refuse_unauthorized_write(_state._DATA_DIR, "migrate-archive import")
     import zipfile as _zipfile
     import tempfile as _tempfile
     zp = Path(zip_path).expanduser()

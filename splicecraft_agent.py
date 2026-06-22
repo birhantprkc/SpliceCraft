@@ -2153,6 +2153,8 @@ def _h_add_codon_table(app, payload):
             entry = _codon_tables_add(display, taxid, raw, source="kazusa")
         except (OSError, RuntimeError) as exc:
             _log.exception("agent add-codon-table: save failed")
+            _notify_save_failure(_state._LIVE_APP_REF.get(),
+                                  "Codon tables", exc)
             return ({"error": f"save failed: {exc}"}, 500)
         return {"ok": True, "entry": {
             "name":   entry["name"],
@@ -2186,6 +2188,8 @@ def _h_add_codon_table(app, payload):
                                       source="genome")
         except (OSError, RuntimeError) as exc:
             _log.exception("agent add-codon-table: save failed")
+            _notify_save_failure(_state._LIVE_APP_REF.get(),
+                                  "Codon tables", exc)
             return ({"error": f"save failed: {exc}"}, 500)
         return {"ok": True, "message": msg, "entry": {
             "name":   entry["name"],
@@ -2221,6 +2225,8 @@ def _h_add_codon_table(app, payload):
                                       source="file")
         except (OSError, RuntimeError) as exc:
             _log.exception("agent add-codon-table: save failed")
+            _notify_save_failure(_state._LIVE_APP_REF.get(),
+                                  "Codon tables", exc)
             return ({"error": f"save failed: {exc}"}, 500)
         return {"ok": True, "message": msg, "entry": {
             "name":   entry["name"],
@@ -2292,6 +2298,8 @@ def _h_delete_codon_table(app, payload):
             _codon_tables_save(kept)
         except (OSError, RuntimeError) as exc:
             _log.exception("agent delete-codon-table: save failed")
+            _notify_save_failure(_state._LIVE_APP_REF.get(),
+                                  "Codon tables", exc)
             return ({"error": f"save failed: {exc}"}, 500)
     return {"ok": True, "removed": {
         "name":   target.get("name", ""),
@@ -4979,8 +4987,14 @@ def _h_delete_experiment_project(app, payload):
                 _safe_save_json_mirror(
                     _state._EXPERIMENTS_FILE, target_entries, "Experiments",
                 )
-            except (OSError, RuntimeError):
-                pass
+            except (OSError, RuntimeError) as exc:
+                # The primary source-of-truth write (the projects file) already
+                # succeeded above; this mirror self-heals on the next reload.
+                # Log it rather than swallowing silently so a recurring failure
+                # is at least visible in the diagnostic trail.
+                _log.warning(
+                    "agent project-delete: mirror-swap to promoted project "
+                    "failed (self-heals on next reload): %s", exc)
             _state._experiments_cache = None
     _log_event("project.deleted", name=name, via="agent",
                 promoted=promoted)

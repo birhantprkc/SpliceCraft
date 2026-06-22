@@ -42,6 +42,45 @@ _HMM_DB_BAD_CONTENT_TYPES: frozenset[str] = frozenset({
 })
 
 
+def _assert_public_host(url: str) -> None:
+    """Resolve the host in `url` and refuse private / loopback / link-local /
+    reserved / multicast / unspecified addresses — blocking SSRF to internal
+    services before any socket opens. The motivating vector: a user/agent-
+    supplied HMM-DB download URL pointing at the cloud-metadata endpoint
+    (``169.254.169.254``) or an intranet host. Raises `urllib.error.URLError`
+    on a non-public target or an unresolvable host.
+
+    Best-effort against DNS rebinding: this resolves the name and the
+    subsequent connect resolves it again, so a hostile resolver could return a
+    public IP here and a private one at connect time. For a localhost,
+    single-tenant tool that residual TOCTOU window is acceptable — the common
+    attacks (a literal private IP, or a name with a static private record) are
+    blocked, and redirect targets are re-checked in the redirect handler."""
+    import socket
+    import ipaddress
+    import urllib.error
+    from urllib.parse import urlsplit
+    host = urlsplit(url).hostname
+    if not host:
+        raise urllib.error.URLError(f"no host in URL {url!r}")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError as exc:
+        raise urllib.error.URLError(f"cannot resolve host {host!r}: {exc}")
+    for info in infos:
+        ip = str(info[4][0])  # sockaddr address (str-coerce for the type checker)
+        try:
+            addr = ipaddress.ip_address(ip.split("%", 1)[0])  # strip IPv6 zone
+        except ValueError:
+            continue
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast
+                or addr.is_unspecified):
+            raise urllib.error.URLError(
+                f"refusing fetch to non-public address {ip} (host {host!r})"
+            )
+
+
 def _build_hardened_url_opener():
     """Return a urllib `OpenerDirector` with hardened settings:
       * explicit SSL context (system trust store via
@@ -72,14 +111,33 @@ def _build_hardened_url_opener():
                     "refusing https->http redirect downgrade",
                     headers, fp,
                 )
+            # SSRF guard: a hostile/misconfigured mirror could 30x a public URL
+            # to an internal host. Re-check the redirect target's address.
+            _assert_public_host(str(newurl))
             return super().redirect_request(
                 req, fp, code, msg, headers, newurl,
             )
 
-    return urllib.request.build_opener(
+    opener = urllib.request.build_opener(
         urllib.request.HTTPSHandler(context=ctx),
         _BoundedRedirectHandler(),
     )
+    # SSRF guard on the INITIAL request: wrap `.open` so no call site can skip
+    # the host check (every redirect target is re-checked in the handler above).
+    # Forward *args/**kwargs verbatim so the wrapper is signature-agnostic (the
+    # timeout sentinel default never needs naming).
+    _orig_open = opener.open
+
+    def _guarded_open(fullurl, *args, **kwargs):
+        _u = (fullurl.get_full_url()
+              if hasattr(fullurl, "get_full_url") else fullurl)
+        _assert_public_host(_u)
+        return _orig_open(fullurl, *args, **kwargs)
+
+    # setattr (not `opener.open = …`) so a static type-checker doesn't flag the
+    # instance-level shadow of the bound method.
+    setattr(opener, "open", _guarded_open)
+    return opener
 
 
 def _hmm_db_assert_content_type_ok(resp, url: str) -> None:

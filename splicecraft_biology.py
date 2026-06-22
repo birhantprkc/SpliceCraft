@@ -1885,7 +1885,7 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
     if n == 0 or not enzyme_names:
         return []
     seq_u = seq.upper()
-    out: dict[tuple[int, int, str], dict] = {}
+    out: dict[tuple[int, int], dict] = {}
     # Combined catalog so user-added custom enzymes participate in
     # every cloning flow that funnels through `_enzyme_cuts`. Via the
     # `_state` getter so this works once the fn moves to the L0 sibling.
@@ -1939,7 +1939,22 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
             kind = ("blunt" if top_bp_raw == bot_bp_raw
                     else "5'" if top_bp_raw < bot_bp_raw
                     else "3'")
-            key = (top_bp, bot_bp, ename)
+            # Collapse COINCIDENT cuts: two enzymes that sever the identical
+            # phosphodiester bond — isoschizomers (EcoRI / EcoRI-HF) or the GATC
+            # trio (DpnII / Sau3AI / MboI) — make ONE physical cut, not two.
+            # Keying on (top, bot, enzyme) emitted a duplicate cut per enzyme,
+            # and `_fragments_from_cuts` then sliced the zero-gap span into a
+            # phantom whole-plasmid fragment (a single-cut digest reported two
+            # fragments of [n, n]). Key on the bond alone and merge the enzyme
+            # attribution so fragment topology is correct while every enzyme
+            # that makes the cut is still named.
+            key = (top_bp, bot_bp)
+            prev = out.get(key)
+            if prev is not None:
+                names = prev["enzyme"].split("/")
+                if ename not in names:
+                    prev["enzyme"] = "/".join(names + [ename])
+                return
             out[key] = {
                 "top":          top_bp,
                 "bot":          bot_bp,

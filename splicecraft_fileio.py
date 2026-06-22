@@ -32,7 +32,7 @@ from splicecraft_record import (
     _GB_LOCUS_NAME_MAX, _gb_text_to_record, _normalize_primer_seq, _record_to_gb_text,
 )
 from splicecraft_history import _CommercialSaaSHistoryNode, _history_human_dt
-from splicecraft_net import _NCBI_TIMEOUT_S
+from splicecraft_net import _NCBI_TIMEOUT_S, _sanitize_accession
 
 
 # Foreign-file ingest cap (GenBank / .dna / GFF3 the user *opens*, NOT the
@@ -1414,10 +1414,19 @@ def _extract_commercialsaas_file_date(data: bytes) -> "str | None":
             if type_byte != _COMMERCIALSAAS_PACKET_NOTES:
                 continue
             try:
-                # Parse from BYTES so an `<?xml … encoding=…?>` declaration in
-                # a real file's notes is handled (a str with a decl raises).
-                root = _ET.fromstring(payload)
-            except _ET.ParseError:
+                # Route the untrusted Notes XML through `_safe_xml_parse`
+                # (defangs billion-laughs / DOCTYPE) — the same hardening the
+                # features / primers / history packet readers already use. A
+                # raw `_ET.fromstring` here was the LONE .dna XML reader that a
+                # crafted Notes packet could detonate as an entity-expansion
+                # bomb. `_safe_xml_parse` takes str, and `ET.fromstring` rejects
+                # a str carrying an `<?xml … encoding=…?>` declaration, so
+                # transcode and strip a leading declaration first (its declared
+                # encoding is moot once the bytes are decoded to unicode).
+                _text = re.sub(r"^\s*<\?xml[^>]*\?>\s*", "",
+                                payload.decode("utf-8", "replace"), count=1)
+                root = _safe_xml_parse(_text)
+            except (_ET.ParseError, ValueError):
                 return None
             for tag in ("Created", "LastModified"):
                 el = root.find(tag)
@@ -3232,6 +3241,13 @@ def fetch_genbank(accession: str, email: str = "splicecraft@local"):
     OOM the worker without it).
     """
     _state._demo_block_network_hook("NCBI fetch")
+    # Defence-in-depth: clamp the accession to the safe charset here, not only
+    # at the agent endpoint, so the 5 local UI/CLI callers are covered too. A
+    # smuggled `;`/`/`/`..`/space can't reach Entrez's URL builder.
+    _acc = _sanitize_accession(accession)
+    if _acc is None:
+        raise ValueError(f"invalid NCBI accession: {accession!r}")
+    accession = _acc
     import io
     import socket
     import time as _time
@@ -3358,6 +3374,12 @@ def fetch_protein(accession: str, email: str = "splicecraft@local"):
     doesn't match the requested accession. Mirrors `fetch_genbank`'s
     30 s timeout, one-retry, size-cap, AND demo-mode egress guard."""
     _state._demo_block_network_hook("NCBI protein fetch")
+    # Defence-in-depth: clamp the accession to the safe charset here too (see
+    # fetch_genbank) so every local caller is covered, not just the agent path.
+    _acc = _sanitize_accession(accession)
+    if _acc is None:
+        raise ValueError(f"invalid NCBI accession: {accession!r}")
+    accession = _acc
     import io
     import socket
     import time as _time

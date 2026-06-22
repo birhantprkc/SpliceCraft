@@ -14,6 +14,30 @@
 
 ---
 
+## [1.0.91] — 2026-06-22
+
+### Bug fixes
+
+- **Multi-line feature notes no longer corrupt a plasmid.** A feature note typed across two or more lines (pressing Enter just once between them) used to write a GenBank file that SpliceCraft itself could then fail to re-open — the saved entry became unloadable. Notes now save safely (each line is kept as its own note line) and reload cleanly every time.
+
+- **Restriction digests and gels now count fragments correctly when you pick equivalent enzymes.** Selecting two enzymes that cut at the exact same position — an isoschizomer pair such as EcoRI + EcoRI-HF, or DpnII / Sau3AI / MboI — used to report doubled, phantom fragments (and extra bands on the gel simulator). Coincident cuts are now collapsed to the single physical cut they really are, while still naming every enzyme that makes it.
+
+- **"New Plasmid" keeps the spaces in the name you type.** Creating a plasmid called e.g. "my plasmid v1" now stores it under that exact name instead of silently rewriting it to "my_plasmid_v1".
+
+- **The local agent API answers a malformed request cleanly.** A deeply-nested JSON request body now returns a clear 400 error instead of dropping the connection.
+
+### Hardening
+
+- **Backup, restore, and data-migration are covered by the same write-safety guard as every other save.** The pre-update snapshot restore, the cross-machine migrate-import, and the daily snapshot writer now go through the same protection that stops an ad-hoc script from ever writing to your real data directory.
+
+- **The pre-update backup folder can't be aimed somewhere dangerous.** If you override its location, SpliceCraft now refuses a filesystem root, your home directory, or your data directory itself — places a later Master Delete could otherwise recursively wipe.
+
+- **Opening a .dna file is hardened against a malformed notes block.** The one remaining spot that read a `.dna` file's embedded notes without the XML safety checks now uses the same hardened parser as the rest of the importer, closing an entity-expansion ("billion laughs") denial-of-service on a crafted file.
+
+- **Downloading an HMM database refuses internal network addresses.** A custom database URL that resolves to a private, loopback, or link-local address (for example a cloud-metadata endpoint) is now rejected before any connection is made — on the initial request and across every redirect.
+
+- **NCBI accession lookups are validated everywhere.** The accession is now sanitised inside the fetch itself, covering the command line and every in-app fetch button, not only the agent API.
+
 ## [1.0.90] — 2026-06-22
 
 ### New features

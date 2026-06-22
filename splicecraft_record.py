@@ -150,6 +150,75 @@ def _repair_wrapped_primer_seqs(record):
     return record
 
 
+def _split_multiline_qualifiers(features):
+    """Return a features list in which no qualifier VALUE contains an embedded
+    newline.
+
+    GenBank cannot encode a newline INSIDE a single qualifier value: BioPython's
+    writer emits the raw newline with the continuation text flush against
+    column 0, and BioPython's OWN parser then rejects that on reload ("Problem
+    with '<type>' feature"). Because every plasmid persists as its GenBank text,
+    a feature ``/note`` typed with a single Enter (the everyday multi-line note)
+    would serialise to an UNPARSEABLE record — the saved entry could never be
+    loaded again.
+
+    Split every newline-bearing value into one entry per non-blank line, which
+    the GenBank "repeat the qualifier" convention round-trips cleanly (the note
+    editor already stores multi-paragraph notes as exactly such a list). This is
+    the universal guard: every serialisation path (feature editor, `.dna` / GFF3
+    import, agent API) funnels through `_record_to_gb_text`.
+
+    Pure / copy-on-write: a feature is only replaced (shallow copy + fresh
+    qualifiers dict) when it actually carries a multi-line value, so the caller's
+    record is never mutated and the common single-line case allocates nothing
+    (returns the SAME list object)."""
+    feats = features or []
+
+    def _has_multiline(quals):
+        for v in quals.values():
+            if isinstance(v, str) and "\n" in v:
+                return True
+            if isinstance(v, list) and any(
+                    isinstance(x, str) and "\n" in x for x in v):
+                return True
+        return False
+
+    def _split_value(v):
+        # Normalise CR / CRLF to LF, split on LF, drop blank lines (collapsing
+        # paragraph gaps exactly like the editor's blank-line split). Fall back
+        # to a single empty entry so an all-whitespace value still emits a
+        # parseable qualifier instead of vanishing.
+        s = v.replace("\r\n", "\n").replace("\r", "\n")
+        return [ln for ln in s.split("\n") if ln.strip()] or [""]
+
+    out: list = []
+    changed = False
+    for f in feats:
+        quals = getattr(f, "qualifiers", None)
+        if not isinstance(quals, dict) or not _has_multiline(quals):
+            out.append(f)
+            continue
+        new_quals: dict = {}
+        for k, v in quals.items():
+            if isinstance(v, str) and "\n" in v:
+                new_quals[k] = _split_value(v)
+            elif isinstance(v, list):
+                expanded: list = []
+                for x in v:
+                    if isinstance(x, str) and "\n" in x:
+                        expanded.extend(_split_value(x))
+                    else:
+                        expanded.append(x)
+                new_quals[k] = expanded
+            else:
+                new_quals[k] = v
+        nf = _shallow_copy(f)
+        nf.qualifiers = new_quals
+        out.append(nf)
+        changed = True
+    return out if changed else features
+
+
 def _record_to_gb_text(record) -> str:
     """Serialize a SeqRecord to GenBank format text.
 
@@ -194,7 +263,8 @@ def _record_to_gb_text(record) -> str:
     if not _loc:
         _loc = re.sub(r"\s+", "_", str(getattr(rec, "id", "") or "").strip())
     rec.name = _loc[:_GB_LOCUS_NAME_MAX] or "PLASMID"
-    rec.features = _arrowless_encode_features(getattr(record, "features", None))
+    rec.features = _split_multiline_qualifiers(
+        _arrowless_encode_features(getattr(record, "features", None)))
     buf = StringIO()
     SeqIO.write(rec, buf, "genbank")
     return buf.getvalue()

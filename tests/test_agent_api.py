@@ -1264,6 +1264,28 @@ class TestHTTPHardening:
         # Empty body → handler sees no `start` / `end` → 400.
         assert status == 400
 
+    def test_deeply_nested_json_body_400(self, http_server):
+        """A deeply-nested JSON body makes `json.loads` raise RecursionError
+        (a RuntimeError, NOT a JSONDecodeError). `_read_body` must catch it and
+        the dispatcher must return a clean 400 — pre-fix it escaped the handler
+        and dropped the connection with a worker-thread traceback. The body
+        stays under `_MAX_BODY_BYTES` so the server reads it fully (no half-open
+        race) and the failure is purely in the parse step."""
+        base, token, _app = http_server
+        depth = 50_000
+        data = (b"[" * depth) + (b"]" * depth)  # ~100 KB, well under 1 MiB
+        req = urllib.request.Request(
+            f"{base}/add-feature", method="POST", data=data,
+        )
+        req.add_header("Authorization", f"Bearer {token}")
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                status = resp.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        assert status == 400
+
 
 class TestHTTPAddFeature:
     def test_add_feature_round_trip(self, http_server, tiny_record):
