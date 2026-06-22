@@ -31,11 +31,11 @@ classifier),
 `splicecraft_backup` (the user-data backup / restore / migrate engine + Master
 Delete enumeration — the data-safety core), `splicecraft_render`,
 `splicecraft_history`, `splicecraft_widgets`, `splicecraft_modals` (60
-dependency-clean dialog classes), `splicecraft_agent` (all 107 data-only
+dependency-clean dialog classes), `splicecraft_agent` (all 109 data-only
 agent-API endpoints; the deep engines they call are reached via `_state` hooks),
 `splicecraft_errors` (plus the stdlib-only `splicecraft_cli` sidecar and
 `splicecraft_demo_plasmids` seed). **The flat-sibling modularization is now
-essentially complete** — the hub went from ~131k to ~99k lines (−25%) across 24
+essentially complete** — the hub went from ~131k to ~99k lines (−25%) across 25
 siblings; only the God-class application core (PlasmidApp + the big-3 panels +
 their anchored modals/handlers + the blob writers + the pyhmmer BLAST/HMM engine)
 stays hub-side, which would need in-App decomposition rather than a lift.
@@ -89,11 +89,13 @@ Test files are 1:1 named after the subsystem they cover.
 `CLAUDE.md` at the repo root is the contributor-and-agent handover
 document. It contains:
 
-- **41 numbered sacred invariants** — biology correctness, persistence
-  contracts, concurrency rules, UI conventions, lock-file
-  hardening, the `.dna` writer's expected packet inventory. Touching
-  invariant code without updating its regression test will trip the
-  test in under two seconds.
+- **10 numbered sacred invariants** — the biology-correctness rules
+  (palindromes, Type IIS, wrap features, the genetic code, the save
+  chokepoint). The wider catalog — known pitfalls, persistence /
+  concurrency / UI contracts, lock-file hardening, the `.dna` packet
+  inventory — lives in `docs/invariants.md` as `[PIT-]`/`[INV-]` tags.
+  Touching invariant code without updating its regression test will
+  trip the test in under two seconds.
 - **Known pitfalls** — wrap features, `id()` cache keys, Textual
   reactive auto-invalidation, the `_source_path` survival rule across
   in-place edits, Primer3's linear-only constraint, etc.
@@ -106,30 +108,30 @@ document. It contains:
 **Read it before touching the rendering layer, record pipeline,
 primer design, or any persisted-data save path.**
 
-## Why one file
+## Why it began as one file
 
-The constraint started as a personal preference and has held up under
-scrutiny:
+SpliceCraft started as a single `splicecraft.py`, and a few of those
+reasons still shape the hub today:
 
-- **Greppability.** Every callsite, every state mutation, every error
-  path is reachable with one grep. No "find usages" gymnastics
-  across packages.
-- **No import puzzles.** New contributors don't need to learn the
-  module layout. New subsystems can land without any package-graph
-  thinking.
-- **Editor responsiveness.** Modern editors handle 60k LoC files
-  fine; the trade-off is that the LSP / type-checker re-checks the
-  whole file on edit, which is acceptable when the suite runs in
-  ~5 minutes anyway.
-- **Refactor cost is real.** The cost is internalised, not externalised.
-  See [V1_GATE.md](
+- **Greppability.** Every callsite, state mutation, and error path is
+  reachable with one grep — still true across the hub + flat siblings
+  (no deep package tree to chase usages through).
+- **Low ceremony.** New behavior lands without package-graph
+  gymnastics; the siblings are flat and re-exported, so `sc.<name>`
+  resolves everything.
+- **Refactor cost is real.** The cost was internalised until subsystems
+  with no `PlasmidApp` coupling clearly justified extraction. See
+  [V1_GATE.md](
   https://github.com/Binomica-Labs/SpliceCraft/blob/master/V1_GATE.md)
-  soft gate S3 / S6 for the long-term plan.
+  soft gate S3 / S6.
 
-When the constraint will be reconsidered: when the file passes
-~100k LoC, or when a subsystem with no `PlasmidApp` coupling
-appears that benefits clearly from extraction. See `CONTRIBUTING.md`
-for the three-test rule on extractions.
+Once the hub approached ~131k LoC, the cleanly-separable layers WERE
+extracted into ~25 flat `splicecraft_*.py` siblings (layered L0→L7 with
+no cycles — guarded by `tests/test_import_layers.py`), bringing the hub
+to ~99k. What remains is the God-class application core (PlasmidApp +
+the big-3 panels + their anchored modals + the blob writers + the
+pyhmmer engine), which needs in-App decomposition rather than a lift.
+See `CONTRIBUTING.md` for the new-sibling three-test rule.
 
 ## Test pyramid
 
@@ -178,5 +180,5 @@ Sequence content is **never** logged — `_repr_for_log` truncates and
 tags anything DNA-shaped.
 
 Design target: **user pastes log → AI parses → patch shipped same
-loop**. The agent-friendly event taxonomy is documented in `CLAUDE.md`
-invariant #42.
+loop**. The agent-friendly event taxonomy is part of the observability
+design (see `docs/invariants.md`).

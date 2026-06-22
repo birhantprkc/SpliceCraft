@@ -34,18 +34,19 @@ real-world job.
 - [**Data safety and backups**](data-safety.md) — four-layer
   per-file backup, daily snapshots, pre-update snapshots, lock-file
   hardening.
-- [**Agent API**](agent-api.md) — 60+ HTTP endpoints for external AI
+- [**Agent API**](agent-api.md) — ~135 HTTP endpoints for external AI
   agents to drive the running session.
 - [**CLI sidecar**](cli.md) — `splicecraft-cli`, the stdlib-only
   client (~50 ms cold start).
-- [**Architecture**](architecture.md) — the single-file rationale
-  and how to navigate `splicecraft.py`.
+- [**Architecture**](architecture.md) — the hub + layered-siblings
+  layout and how to navigate it.
 
 ## At a glance
 
-- **Single-file architecture.** The entire app is `splicecraft.py` —
-  greppable, no import puzzles, one totally-ordered source of truth.
-- **2,600+ tests** anchored on 41 sacred invariants (see [CLAUDE.md](
+- **Hub + layered siblings.** A ~99k-line hub (`splicecraft.py`) plus
+  ~25 flat `splicecraft_*.py` modules in clean import layers (L0→L7) —
+  still greppable, with a no-cycle guard enforcing the layering.
+- **5,000+ tests** anchored on 10 sacred invariants (see [CLAUDE.md](
   https://github.com/Binomica-Labs/SpliceCraft/blob/master/CLAUDE.md)
   for the registry). Property-based fuzzing on biology primitives.
 - **No network in the hot path.** NCBI fetch + Kazusa codon-table

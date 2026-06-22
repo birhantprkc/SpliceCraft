@@ -191,7 +191,7 @@ reload later, or cite it as `&<gel>` in your notebook.
 Verify constructs against real reads. Drop in a Plasmidsaurus `.zip` — or
 **fetch a run by item code straight from the Plasmidsaurus API** (the button on
 the Sequencing screen; set credentials under Settings ▸ Plasmidsaurus API or via
-the `PLASMIDSAURUS_CLIENT_ID` / `_SECRET` env vars) — then walk
+the `PLASMIDSAURUS_CLIENT_ID` / `PLASMIDSAURUS_CLIENT_SECRET` env vars) — then walk
 run → sample → target, and **Align**: the read lands as a colored bar (blue
 match / red mismatch / gray gap) on the plasmid's linear map, named in place,
 shaded by how much of each span actually binds so even a single-base mismatch

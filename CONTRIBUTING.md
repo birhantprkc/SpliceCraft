@@ -6,8 +6,9 @@ merge this on the first look." This document walks through what that
 means in practice.
 
 > If you're an AI agent landing here, read `CLAUDE.md` first.
-> The 41 numbered sacred invariants are not negotiable, and most of
-> the friction-causing edge cases are documented there.
+> The 10 numbered sacred invariants are not negotiable, and most of
+> the friction-causing edge cases are documented there (and in the
+> `[PIT-]`/`[INV-]` catalog in `docs/invariants.md`).
 
 ## Table of contents
 
@@ -80,9 +81,9 @@ The application is a **hub + layered-siblings** layout: `splicecraft.py`
 is the ~99k-line hub (the application core — `PlasmidApp`, the big-3
 panels, the data-safety policy, the `.dna` blob store, the agent-API
 server, and the app-coupled modals), and the cleanly-separable layers
-live in ~24 flat `splicecraft_*.py` siblings the hub imports and
-re-exports (plus the stdlib-only `splicecraft_cli.py` agent-client
-sidecar). The hub stays greppable as one totally-ordered file; each
+live in 25 flat `splicecraft_*.py` siblings the hub imports and
+re-exports — including the stdlib-only `splicecraft_cli.py`
+agent-client sidecar. The hub stays greppable as one totally-ordered file; each
 sibling is a bounded, independently-loadable unit so a context-limited
 model can hold one whole. The Phase-D modularization that carved the
 ~131k-line monolith down to ~99k is essentially complete — see
@@ -115,20 +116,21 @@ than a lift.
 
 ## Sacred invariants
 
-`CLAUDE.md` lists 41 numbered invariants. Each has at least one
-regression test. The classes most often touched:
+`CLAUDE.md` lists 10 numbered sacred invariants (biology correctness +
+the save chokepoint); the wider catalog — known pitfalls, persistence /
+concurrency / UI contracts — lives in `docs/invariants.md` as
+`[PIT-]`/`[INV-]` tags. Each has at least one regression test. The
+classes most often touched:
 
-- **Biology correctness** (#1–#6, #8, #9, #11, #25, #27, #34, #40):
-  palindromic-enzyme scanning, IUPAC reverse-complement, wrap-feature
-  math, restriction-cloning, Type IIS digest, exact-match annotation
-  transfer.
-- **Data safety** (#7, #17, #22–#24, #31, #38, #39, #41): atomic
-  saves, deepcopy-on-read+save cache contract, four-layer backup,
-  symlink refusal, pre-update snapshots.
-- **Concurrency** (#28, #41): worker cancellation contract, RLock
-  on saves, stale-record guard, lock-file PID-alive recheck.
-- **UI / UX** (#10, #13–#16, #33): undo deepcopy, modal Ctrl+Z opt-out,
-  natural-sort row-mapping symmetry, modal stack guard.
+- **Biology correctness** (sacred #1–#6, #8, #9): palindromic-enzyme
+  scanning, IUPAC reverse-complement, wrap-feature math, restriction-
+  cloning, Type IIS digest, exact-match annotation transfer.
+- **Data safety** (sacred #7, #10 + the `[INV-]` data-safety tags):
+  atomic saves, the deepcopy-on-read+save cache contract, four-layer
+  backup, symlink refusal, pre-update snapshots.
+- **Concurrency & UI/UX** (the `[PIT-]`/`[INV-]` catalog): worker
+  cancellation contract, RLock on saves, stale-record guard, undo
+  deepcopy, modal Ctrl+Z opt-out, natural-sort row-mapping symmetry.
 
 **Touching invariant code without updating its test, or weakening
 an invariant without explicit discussion, is grounds for the PR

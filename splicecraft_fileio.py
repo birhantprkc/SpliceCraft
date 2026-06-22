@@ -3,11 +3,14 @@
 The plain file-format read/write core, extracted from the hub: FASTA / AB1 /
 FASTQ / GFF3 ingest (path -> SeqRecord) + GenBank / GFF / FASTA / EMBL export
 (record -> path), with their codec helpers. Biopython is imported lazily inside
-the entry points exactly as in the hub. This is the CLEAN single-file subset —
-the .dna CommercialSaaS reader/writer, the _save/_load_dna_original blob store,
-the network fetch_genbank, and the zip / Plasmidsaurus member handling stay
-hub-side (separate concerns / data-safety). Re-exported by the hub so `sc.<name>`
-+ every call site (modals, agent endpoints, the loader) resolves unchanged.
+the entry points exactly as in the hub. fileio now owns the WHOLE file + network
+I/O layer: the .dna CommercialSaaS codec, the _save/_load/_delete_dna_original
+blob store, the NCBI fetch_genbank / fetch_protein fetchers, and the zip /
+Plasmidsaurus handling were all migrated here from the hub (data-safety
+preserved — blob writes go through the persistence chokepoint, and NCBI fetch
+reaches the egress guard via _state._demo_block_network_hook). Re-exported by the
+hub so `sc.<name>` + every call site (modals, agent endpoints, the loader)
+resolves unchanged.
 """
 from __future__ import annotations
 

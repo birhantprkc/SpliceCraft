@@ -394,6 +394,29 @@ class _FakeResponse:
         return self._body[:amt]
 
 
+class _FakeOpener:
+    """Stand-in for `_build_hardened_url_opener()`: its `.open(req, timeout=)`
+    returns whatever the wrapped fake-urlopen function yields. The NCBI
+    taxonomy search (`_ncbi_taxid_search`) and the Kazusa codon fetch
+    (`_codon_fetch_kazusa`) both route through the shared hardened opener now,
+    not raw `urllib.request.urlopen`, so tests inject canned responses here."""
+    def __init__(self, fn):
+        self._fn = fn
+
+    def open(self, req, timeout=None):
+        return self._fn(req, timeout=timeout)
+
+
+def _patch_opener(monkeypatch, fn):
+    """Patch the hardened-opener factory in BOTH network-using siblings so a
+    test's canned response reaches `_ncbi_taxid_search` (splicecraft_search)
+    and `_codon_fetch_kazusa` (splicecraft_codon) alike — each resolves
+    `_build_hardened_url_opener` in its own namespace."""
+    op = _FakeOpener(fn)
+    monkeypatch.setattr(_search, "_build_hardened_url_opener", lambda: op)
+    monkeypatch.setattr(_codon, "_build_hardened_url_opener", lambda: op)
+
+
 # Real NCBI eutils responses open with an EXTERNAL-DTD DOCTYPE (a PUBLIC id +
 # .dtd URL, no internal `[...]` subset). `_safe_xml_parse` refuses ANY DTD
 # unless the caller passes allow_dtd=True, so mocks that OMITTED the DOCTYPE
@@ -472,8 +495,7 @@ class TestNcbiSearch:
                 return _FakeResponse(esearch_xml)
             return _FakeResponse(esummary_xml)
 
-        import urllib.request
-        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        _patch_opener(monkeypatch, fake_urlopen)
         hits, total, msg = sc._ncbi_taxid_search("Escher")
         assert [h["taxid"] for h in hits] == ["561", "562", "564"]
         assert [h["name"]  for h in hits] == [
@@ -506,8 +528,7 @@ class TestNcbiSearch:
             url = req.full_url if hasattr(req, "full_url") else str(req)
             return _FakeResponse(esearch_xml if "esearch" in url else esummary_xml)
 
-        import urllib.request
-        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        _patch_opener(monkeypatch, fake_urlopen)
         hits, total, msg = sc._ncbi_taxid_search("a")
         assert len(hits) == 1
         assert total == 1200
@@ -520,8 +541,7 @@ class TestNcbiSearch:
         def fake_urlopen(req, timeout=None):
             return _FakeResponse(xml)
 
-        import urllib.request
-        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        _patch_opener(monkeypatch, fake_urlopen)
         hits, total, msg = sc._ncbi_taxid_search("zzznope")
         assert hits == []
         assert total == 0
@@ -531,8 +551,7 @@ class TestNcbiSearch:
         def boom(req, timeout=None):
             raise OSError("connection refused")
 
-        import urllib.request
-        monkeypatch.setattr(urllib.request, "urlopen", boom)
+        _patch_opener(monkeypatch, boom)
         hits, total, msg = sc._ncbi_taxid_search("Homo sapiens")
         assert hits == []
         assert total == 0
@@ -551,8 +570,7 @@ class TestNcbiSearch:
                 return _FakeResponse(esearch_xml)
             raise OSError("esummary down")
 
-        import urllib.request
-        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        _patch_opener(monkeypatch, fake_urlopen)
         hits, total, msg = sc._ncbi_taxid_search("Saccharomyces cerevisiae")
         assert len(hits) == 1
         assert hits[0]["taxid"] == "4932"
@@ -569,8 +587,7 @@ class TestNcbiSearch:
         def fake_urlopen(req, timeout=None):
             return _FakeResponse(big_xml)
 
-        import urllib.request
-        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        _patch_opener(monkeypatch, fake_urlopen)
         hits, total, msg = sc._ncbi_taxid_search("a")
         assert hits == []
         assert total == 0
@@ -596,8 +613,7 @@ class TestNcbiSearch:
             url = req.full_url if hasattr(req, "full_url") else str(req)
             return _FakeResponse(esearch if "esearch" in url else esummary)
 
-        import urllib.request
-        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        _patch_opener(monkeypatch, fake_urlopen)
         hits, total, msg = sc._ncbi_taxid_search("Homo sapiens")
         assert [h["taxid"] for h in hits] == ["9606"]
         assert hits[0]["name"] == "Homo sapiens"
@@ -680,8 +696,7 @@ class TestNcbiSearchCascade:
                 return _FakeResponse(self._hit("9606"))
             return _FakeResponse(self._EMPTY)
 
-        import urllib.request
-        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        _patch_opener(monkeypatch, fake)
         # Genus typo — rescued by the species epithet in the OR round.
         hits, total, msg = sc._ncbi_taxid_search("Homon sapiens")
         assert [h["taxid"] for h in hits] == ["9606"]
@@ -701,8 +716,7 @@ class TestNcbiSearchCascade:
                 return _FakeResponse(self._hit("4932"))
             return _FakeResponse(self._EMPTY)
 
-        import urllib.request
-        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        _patch_opener(monkeypatch, fake)
         hits, total, msg = sc._ncbi_taxid_search("Sacchar cerev")
         assert [h["taxid"] for h in hits] == ["4932"]
         assert "broadened" in msg.lower()
@@ -718,8 +732,7 @@ class TestNcbiSearchCascade:
                 return _FakeResponse(self._summ("9606", "Homo sapiens"))
             return _FakeResponse(self._hit("9606"))   # every round would hit
 
-        import urllib.request
-        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        _patch_opener(monkeypatch, fake)
         hits, total, msg = sc._ncbi_taxid_search("Homo sapiens")
         assert [h["taxid"] for h in hits] == ["9606"]
         assert "broadened" not in msg.lower()
@@ -732,8 +745,7 @@ class TestNcbiSearchCascade:
             calls.append(self._url(req))
             return _FakeResponse(self._EMPTY)
 
-        import urllib.request
-        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        _patch_opener(monkeypatch, fake)
         hits, total, msg = sc._ncbi_taxid_search("zzz nope")
         assert hits == []
         assert total == 0
@@ -747,8 +759,7 @@ class TestNcbiSearchCascade:
             calls.append(self._url(req))
             raise OSError("connection refused")
 
-        import urllib.request
-        monkeypatch.setattr(urllib.request, "urlopen", boom)
+        _patch_opener(monkeypatch, boom)
         hits, total, msg = sc._ncbi_taxid_search("Homon sapiens")
         assert hits == []
         assert "network error" in msg.lower()
@@ -765,8 +776,7 @@ class TestKazusaSizeCap:
         def fake_urlopen(req, timeout=None):
             return _FakeResponse(big_html)
 
-        import urllib.request
-        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        _patch_opener(monkeypatch, fake_urlopen)
         raw, msg = sc._codon_fetch_kazusa("83333")
         assert raw is None
         assert "oversized" in msg.lower()
@@ -1787,34 +1797,31 @@ class TestKazusaIncompleteDownload:
         assert sc._codon_parse_kazusa_html("<html><body></body></html>") is None
 
     def test_fetch_complete_returns_full_table(self, monkeypatch):
-        import urllib.request
 
         def fake(req, timeout=None):
             return _FakeResponse(_FAKE_KAZUSA_HTML.encode())
 
-        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        _patch_opener(monkeypatch, fake)
         raw, msg = sc._codon_fetch_kazusa("83333")
         assert raw is not None and len(raw) == 64
         assert "fetched" in msg.lower()
 
     def test_fetch_truncated_returns_parse_error(self, monkeypatch):
-        import urllib.request
 
         def fake(req, timeout=None):
             return _FakeResponse(_FAKE_KAZUSA_HTML[:1400].encode())
 
-        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        _patch_opener(monkeypatch, fake)
         raw, msg = sc._codon_fetch_kazusa("83333")
         assert raw is None
         assert "parse" in msg.lower()
 
     def test_fetch_not_found_message(self, monkeypatch):
-        import urllib.request
 
         def fake(req, timeout=None):
             return _FakeResponse(b"<html><body>Species not found</body></html>")
 
-        monkeypatch.setattr(urllib.request, "urlopen", fake)
+        _patch_opener(monkeypatch, fake)
         raw, msg = sc._codon_fetch_kazusa("999999999")
         assert raw is None
         assert "not found" in msg.lower()

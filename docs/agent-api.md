@@ -151,8 +151,8 @@ inventory with one-line docs per endpoint.
 - **Symlink refusal**: write paths go through
   `_check_agent_write_path` which walks the full ancestor chain via
   `resolve()` divergence + per-segment `is_symlink()`. Pre-fix this
-  only checked the immediate parent — see `CLAUDE.md` invariant #41
-  for the regression.
+  only checked the immediate parent — see the symlink ancestor-chain
+  regression in [`docs/invariants.md`](invariants.md).
 - **Read-dir traversal** uses `lstat` + `S_ISDIR` to refuse
   directory-symlink escapes.
 - **Per-handler size caps** — `_h_load_file` 50 MB
@@ -173,10 +173,7 @@ The `transfer-annotations` and `diff-plasmid` endpoints look up
 plasmids in the **active library only** (via `_load_library()`), not
 across collections. To target a plasmid in another collection: call
 `search-library` to locate it, then `set-active-collection`, then the
-endpoint you actually want. Documented in each handler's docstring;
-see [`CLAUDE.md`](
-https://github.com/Binomica-Labs/SpliceCraft/blob/master/CLAUDE.md)
-invariant #30.
+endpoint you actually want. Documented in each handler's docstring.
 
 ## Concurrency
 

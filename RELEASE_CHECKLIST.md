@@ -101,6 +101,16 @@ python3 -m pytest -n auto -q                       # one final pass on a clean c
 pip install --user dist/splicecraft-X.Y.Z-*.whl    # install + run the published wheel
 ```
 
+`./release.py X.Y.Z` then runs the whole gate itself and aborts on any
+failure **before** it tags or pushes: a confidential-name scan
+(`.private-names`), the version bump, **ruff**, **pyright** (CI-matched),
+a dependency wheel-coverage gate (`scripts/check_dep_wheels.py`), and the
+full `pytest -n auto`. After the tag it auto-promotes the `CHANGELOG`
+section (refusing an empty stub), publishes to PyPI via GitHub Actions
+Trusted Publishing / OIDC (not a manual `twine upload`), cuts a GitHub
+Release with the wheel + sdist, and refreshes the live web demo. The
+manual matrix below is the *human* smoke pass, not the whole flow.
+
 ## Documentation freeze
 
 - [ ] `CHANGELOG.md` section for the release reads as a coherent
@@ -114,7 +124,7 @@ pip install --user dist/splicecraft-X.Y.Z-*.whl    # install + run the published
 
 ## Agent-API surface — sanity checks
 
-The agent surface is now 60+ endpoints. Smoke a representative
+The agent surface is now ~135 endpoints. Smoke a representative
 slice on a real running server (not just pytest):
 
 - `POST /list-plasmid-statuses` — vocabulary discovery

@@ -981,9 +981,13 @@ def _codon_fetch_kazusa(taxid: str, timeout: float = 15.0) -> tuple:
         return None, f"Invalid taxid '{taxid}' (must be numeric)"
     url = (f"https://www.kazusa.or.jp/codon/cgi-bin/showcodon.cgi"
            f"?species={taxid}&aa=1&style=GCG")
+    # Route through the shared hardened opener (verifying SSL, bounded
+    # redirects, https-downgrade refusal, private-IP/SSRF filter) like every
+    # other external fetch — the egress guard above already fired.
+    opener = _build_hardened_url_opener()
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with opener.open(req, timeout=timeout) as r:
             raw = r.read(_KAZUSA_MAX_RESPONSE_BYTES + 1)
         if len(raw) > _KAZUSA_MAX_RESPONSE_BYTES:
             _log.warning("Kazusa response exceeded %d bytes; aborting",

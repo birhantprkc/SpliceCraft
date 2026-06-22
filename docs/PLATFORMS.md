@@ -292,4 +292,4 @@ If SpliceCraft refuses to launch or renders badly on your terminal:
 2. Open an issue at github.com/Binomica-Labs/SpliceCraft including
    the bundle + your terminal name / version + OS version.
 3. The bundle includes the last 5 UI snapshots and sanitised
-   settings; sequence content NEVER ships (privacy invariant #38).
+   settings; sequence content NEVER ships (privacy by design).

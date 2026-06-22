@@ -23,7 +23,7 @@ rotation picker, the PCR sim, settings-flush, the master-delete + assembly-
 fragment cache busts, the experiment blob delete, the entry-vector binder). The
 "deferred chase" relocated the movable blockers — active-name getters/finders →
 dataaccess, the restore-from-backup engine → backup, the PCR caps → cloning — so
-ALL 107 data-only endpoints live here; only the 26 app-coupled handlers stay hub.
+ALL 109 data-only endpoints live here; only the 26 app-coupled handlers stay hub.
 `_sanitize_path` / `_ENZYME_CUT_RANGE` were relocated to L0 (util / biology) as
 prerequisites. Top layer among the siblings (imports the whole domain stack ≤L3);
 nothing imports it but the hub.
@@ -272,7 +272,7 @@ def _agent_save_or_500(save_fn, label: str = "library"):
         save_fn()
     except (OSError, RuntimeError) as exc:
         _notify_save_failure(_state._LIVE_APP_REF.get(), label, exc)
-        return ({"error": f"save failed for {label}: {exc}"}, 500)
+        return ({"error": f"save failed for {label}: {_scrub_path(str(exc))}"}, 500)
     return None
 
 
@@ -1279,7 +1279,7 @@ def _h_delete_hmm_database(app, payload):
         removed = _delete_hmm_db_files(eid)
     except (OSError, RuntimeError) as exc:
         _log.exception("agent delete-hmm-database failed")
-        return ({"error": f"delete failed: {exc}"}, 500)
+        return ({"error": f"delete failed: {_scrub_path(str(exc))}"}, 500)
     _log_event("hmm_db.delete", id=eid, files_removed=removed, via="agent")
     return {"ok": True, "id": eid, "files_removed": removed}
 
@@ -2145,7 +2145,7 @@ def _h_add_codon_table(app, payload):
             raw, msg = _codon_fetch_kazusa(taxid)
         except Exception as exc:
             _log.exception("agent add-codon-table: Kazusa fetch failed")
-            return ({"error": f"Kazusa fetch failed: {exc}"}, 502)
+            return ({"error": f"Kazusa fetch failed: {_scrub_path(str(exc))}"}, 502)
         if raw is None:
             return ({"error": msg or "Kazusa returned no data"}, 502)
         display = name_in or f"Species (taxid {taxid})"
@@ -2155,7 +2155,7 @@ def _h_add_codon_table(app, payload):
             _log.exception("agent add-codon-table: save failed")
             _notify_save_failure(_state._LIVE_APP_REF.get(),
                                   "Codon tables", exc)
-            return ({"error": f"save failed: {exc}"}, 500)
+            return ({"error": f"save failed: {_scrub_path(str(exc))}"}, 500)
         return {"ok": True, "entry": {
             "name":   entry["name"],
             "taxid":  entry["taxid"],
@@ -2178,7 +2178,7 @@ def _h_add_codon_table(app, payload):
             raw, msg, meta = _genome_build_codon_table(query, mode)
         except Exception as exc:
             _log.exception("agent add-codon-table: genome build failed")
-            return ({"error": f"genome build failed: {exc}"}, 502)
+            return ({"error": f"genome build failed: {_scrub_path(str(exc))}"}, 502)
         if raw is None or meta is None:
             return ({"error": msg or "genome build returned no data"}, 502)
         display = (name_in or meta.get("organism")
@@ -2190,7 +2190,7 @@ def _h_add_codon_table(app, payload):
             _log.exception("agent add-codon-table: save failed")
             _notify_save_failure(_state._LIVE_APP_REF.get(),
                                   "Codon tables", exc)
-            return ({"error": f"save failed: {exc}"}, 500)
+            return ({"error": f"save failed: {_scrub_path(str(exc))}"}, 500)
         return {"ok": True, "message": msg, "entry": {
             "name":   entry["name"],
             "taxid":  entry["taxid"],
@@ -2216,7 +2216,7 @@ def _h_add_codon_table(app, payload):
             raw, msg, meta = _file_build_codon_table(p, mode)
         except Exception as exc:
             _log.exception("agent add-codon-table: file build failed")
-            return ({"error": f"file build failed: {exc}"}, 502)
+            return ({"error": f"file build failed: {_scrub_path(str(exc))}"}, 502)
         if raw is None or meta is None:
             return ({"error": msg or "file build returned no data"}, 400)
         display = name_in or meta.get("organism") or "Codon table from file"
@@ -2227,7 +2227,7 @@ def _h_add_codon_table(app, payload):
             _log.exception("agent add-codon-table: save failed")
             _notify_save_failure(_state._LIVE_APP_REF.get(),
                                   "Codon tables", exc)
-            return ({"error": f"save failed: {exc}"}, 500)
+            return ({"error": f"save failed: {_scrub_path(str(exc))}"}, 500)
         return {"ok": True, "message": msg, "entry": {
             "name":   entry["name"],
             "taxid":  entry["taxid"],
@@ -2262,7 +2262,7 @@ def _h_add_codon_table(app, payload):
         entry = _codon_tables_add(name_in, taxid, cleaned, source="user")
     except (OSError, RuntimeError) as exc:
         _log.exception("agent add-codon-table: save failed")
-        return ({"error": f"save failed: {exc}"}, 500)
+        return ({"error": f"save failed: {_scrub_path(str(exc))}"}, 500)
     return {"ok": True, "entry": {
         "name":   entry["name"],
         "taxid":  entry["taxid"],
@@ -2300,7 +2300,7 @@ def _h_delete_codon_table(app, payload):
             _log.exception("agent delete-codon-table: save failed")
             _notify_save_failure(_state._LIVE_APP_REF.get(),
                                   "Codon tables", exc)
-            return ({"error": f"save failed: {exc}"}, 500)
+            return ({"error": f"save failed: {_scrub_path(str(exc))}"}, 500)
     return {"ok": True, "removed": {
         "name":   target.get("name", ""),
         "taxid":  target.get("taxid", ""),
@@ -2525,7 +2525,7 @@ def _h_simulate_gibson(app, payload):
         )
     except Exception as exc:
         _log.exception("agent simulate-gibson: simulator failed")
-        return ({"error": f"simulator failed: {exc}"}, 500)
+        return ({"error": f"simulator failed: {_scrub_path(str(exc))}"}, 500)
     return {"ok": True, "result": result}
 
 
@@ -2588,7 +2588,7 @@ def _h_design_mutagenesis(app, payload):
         return ({"error": f"mutagenesis design failed: {exc}"}, 422)
     except Exception as exc:
         _log.exception("agent design-mutagenesis: unexpected failure")
-        return ({"error": f"unexpected failure: {exc}"}, 500)
+        return ({"error": f"unexpected failure: {_scrub_path(str(exc))}"}, 500)
     return {"ok": True, "mutation": mut_raw, "outer": outer, "inner": inner}
 
 
@@ -2729,7 +2729,7 @@ def _h_scrub_plasmid(app, payload):
                     plan["verified"] = qv_ok
     except Exception as exc:
         _log.exception("agent scrub-plasmid: unexpected failure")
-        return ({"error": f"unexpected failure: {exc}"}, 500)
+        return ({"error": f"unexpected failure: {_scrub_path(str(exc))}"}, 500)
     if method == "golden_braid":
         return {
             "ok": plan.get("ok", False),
@@ -3099,7 +3099,7 @@ def _h_set_protein_motif(app, payload):
             )
         except Exception as exc:
             _log.exception("agent set-protein-motif: load failed")
-            return ({"error": f"load failed: {exc}"}, 500)
+            return ({"error": f"load failed: {_scrub_path(str(exc))}"}, 500)
         user_entries = [
             e for e in user_entries if isinstance(e, dict)
         ]
@@ -3143,7 +3143,7 @@ def _h_delete_protein_motif(app, payload):
             )
         except Exception as exc:
             _log.exception("agent delete-protein-motif: load failed")
-            return ({"error": f"load failed: {exc}"}, 500)
+            return ({"error": f"load failed: {_scrub_path(str(exc))}"}, 500)
         user_entries = [
             e for e in user_entries if isinstance(e, dict)
         ]
@@ -3382,7 +3382,7 @@ def _h_clear_entry_vectors_for_grammar(app, payload):
     try:
         n = _clear_entry_vectors_for_grammar(gid)
     except (OSError, RuntimeError) as exc:
-        return ({"error": f"clear failed: {exc}"}, 500)
+        return ({"error": f"clear failed: {_scrub_path(str(exc))}"}, 500)
     _log_event(
         "entry_vector.cleared",
         grammar=gid, n_cleared=n, via="agent",
@@ -3777,7 +3777,7 @@ def _h_diff_plasmid(app, payload):
         return ({"error": f"alignment rejected: {exc}"}, 400)
     except Exception as exc:
         _log.exception("diff-plasmid: pick_best_rotation raised")
-        return ({"error": f"alignment failed: {exc}"}, 500)
+        return ({"error": f"alignment failed: {_scrub_path(str(exc))}"}, 500)
     picked = result.get("picked_rotation", "none")
     target_rotation = int(result.get("target_rotation") or 0)
     return {
@@ -3945,7 +3945,7 @@ def _h_align_plasmidsaurus_zip(app, payload):
         return ({"error": f"alignment rejected: {exc}"}, 400)
     except Exception as exc:
         _log.exception("align-plasmidsaurus-zip: pick_best_rotation raised")
-        return ({"error": f"alignment failed: {exc}"}, 500)
+        return ({"error": f"alignment failed: {_scrub_path(str(exc))}"}, 500)
     # Sweep #26 (2026-05-23): post-alignment drift check. If the
     # target entry was deleted between resolve and alignment
     # completion (multi-second CPU-bound `_pairwise_align`), surface
@@ -4276,7 +4276,7 @@ def _h_restore_backup(app, payload):
         return ({"error": f"unreadable backup: {exc}"}, 422)
     except OSError as exc:
         _log.exception("agent restore-backup: write failed")
-        return ({"error": f"restore write failed: {exc}"}, 500)
+        return ({"error": f"restore write failed: {_scrub_path(str(exc))}"}, 500)
     # Bust the in-memory cache for the restored label so the next
     # read picks up the restored content.
     cache_attr = {
@@ -4346,7 +4346,7 @@ def _h_restore_pre_update_snapshot(app, payload):
         return ({"error": f"snapshot rejected: {exc}"}, 422)
     except OSError as exc:
         _log.exception("agent restore-pre-update-snapshot: write failed")
-        return ({"error": f"restore write failed: {exc}"}, 500)
+        return ({"error": f"restore write failed: {_scrub_path(str(exc))}"}, 500)
     # Bust every cached user-data so post-restore reads see the
     # restored state. Sweep #25 (2026-05-23) — drives the enumeration
     # from `_MASTER_DELETE_CACHE_ATTRS` so new caches enroll
@@ -4425,7 +4425,7 @@ def _h_simulate_pcr(app, payload):
                               circular=circular, max_amplicon=max_amp)
     except Exception as exc:
         _log.exception("agent simulate-pcr: simulator failed")
-        return ({"error": f"simulator failed: {exc}"}, 500)
+        return ({"error": f"simulator failed: {_scrub_path(str(exc))}"}, 500)
     _log_event("simulator.pcr.agent",
                 template_bp=len(template),
                 circular=circular,
@@ -4562,7 +4562,7 @@ def _h_simulate_gel(app, payload):
             })
     except Exception as exc:
         _log.exception("agent simulate-gel: band computation failed")
-        return ({"error": f"band computation failed: {exc}"}, 500)
+        return ({"error": f"band computation failed: {_scrub_path(str(exc))}"}, 500)
     response: dict = {
         "ok":          True,
         "agarose_pct": min(_AGAROSE_CHOICES,
@@ -4587,7 +4587,7 @@ def _h_simulate_gel(app, payload):
             response["image"] = rt.plain
         except Exception as exc:
             _log.exception("agent simulate-gel: image render failed")
-            return ({"error": f"image render failed: {exc}"}, 500)
+            return ({"error": f"image render failed: {_scrub_path(str(exc))}"}, 500)
     source_mix: dict[str, int] = {}
     for lane in cleaned_lanes:
         source_mix[lane["source"]] = source_mix.get(lane["source"], 0) + 1
@@ -4693,7 +4693,7 @@ def _h_design_gb_part(app, payload):
         )
     except Exception as exc:
         _log.exception("agent design-gb-part: design failed")
-        return ({"error": f"design failed: {exc}"}, 500)
+        return ({"error": f"design failed: {_scrub_path(str(exc))}"}, 500)
     if isinstance(result, dict) and result.get("error"):
         return ({"error": result["error"]}, 422)
     return {"ok": True, "result": result}
@@ -4765,7 +4765,7 @@ def _h_design_primers(app, payload):
             )
     except Exception as exc:
         _log.exception("agent design-primers: design failed")
-        return ({"error": f"design failed: {exc}"}, 500)
+        return ({"error": f"design failed: {_scrub_path(str(exc))}"}, 500)
     if isinstance(result, dict) and result.get("error"):
         return ({"error": result["error"]}, 422)
     return {"ok": True, "mode": mode, "result": result}

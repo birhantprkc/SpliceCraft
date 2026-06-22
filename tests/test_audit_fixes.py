@@ -195,6 +195,43 @@ class TestFetchAccessionSanitised:
             sc.fetch_protein("../../etc/passwd")
 
 
+# ── Previously-deferred, now fixed: NCBI taxonomy search rides the
+# shared hardened opener (verifying SSL + redirect cap + private-IP/SSRF
+# filter), not a raw urlopen. ──
+class TestTaxidSearchHardenedOpener:
+    def test_taxid_search_builds_hardened_opener(self, monkeypatch):
+        import splicecraft_search as _search
+
+        def _boom():
+            raise RuntimeError("hardened-opener-built")
+        # Intercept the opener factory: if the search reaches it, it routes
+        # through the hardened path (egress guard is a no-op outside web-demo).
+        monkeypatch.setattr(_search, "_build_hardened_url_opener", _boom)
+        with pytest.raises(RuntimeError, match="hardened-opener-built"):
+            sc._ncbi_taxid_search("coli")
+
+
+# ── Previously-deferred, now fixed: engine-500 bodies scrub filesystem
+# paths (home dir → ~) so an exception message can't leak the username. ──
+class TestEngine500PathScrub:
+    def test_simulate_pcr_500_scrubs_home_path(self, monkeypatch):
+        home = str(Path.home())
+        bad = f"engine exploded at {home}/private/secret.json"
+
+        def _boom(*a, **k):
+            raise RuntimeError(bad)
+        monkeypatch.setattr(sc._state, "_simulate_pcr_hook", _boom)
+        body, status = sc._h_simulate_pcr(None, {
+            "template_seq": "ACGT" * 25,
+            "fwd_primer": "ACGTACGTAC",
+            "rev_primer": "TGCATGCATG",
+        })
+        assert status == 500
+        assert "simulator failed" in body["error"]
+        assert home not in body["error"]   # home dir scrubbed
+        assert "~" in body["error"]        # ...replaced with ~
+
+
 # ── Namespace hygiene: the user-data registries are ONE shared object ──
 # backup, Master Delete, and migrate all drive from these; a hub/sibling drift
 # would let them disagree on what counts as user data (data-loss class).

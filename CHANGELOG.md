@@ -14,6 +14,18 @@
 
 ---
 
+## [1.0.92] — 2026-06-22
+
+### Hardening
+
+- **Agent-API error messages no longer leak filesystem paths.** When a simulation, alignment, gel, export, or other engine call fails, the error returned to the local agent API now has any home-directory path scrubbed (`/home/you/…` → `~`), matching how the rest of the API already behaved.
+
+- **Every outbound fetch now shares the same SSRF-hardened network path.** The NCBI taxonomy lookup and the Kazusa codon-table fetch were the last two calls still using a plain fetch; they now go through the shared hardened opener — verified TLS, capped redirects, refusal of https→http downgrades, and rejection of internal/private network addresses — just like the BLAST, datasets, and HMM-database fetches.
+
+### Under the hood
+
+- **Documentation accuracy pass.** Brought the README, architecture notes, contributor guide, release checklist, and in-code module docs in line with the now-complete hub + layered-siblings layout — endpoint and module counts, the sacred-invariant numbering, and the network egress-coverage list. No behavior change.
+
 ## [1.0.91] — 2026-06-22
 
 ### Bug fixes

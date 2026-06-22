@@ -25,9 +25,9 @@ chokepoint (_refuse_unauthorized_write/_delete + atomic _safe_save/load_json); t
 cross-modal download slot + lock live in _state (_HMM_DB_DOWNLOAD_INFLIGHT[_LOCK]). This
 part imports the same-layer L1 siblings dataaccess (_get_setting / _sanitize_hmm_db_id /
 catalog) + persistence (cycle-free — neither imports search). The HMMscan *search* engine
-(_hmmscan_run) + its pyhmmer helpers (_BLASTP_QUERY_ALPHABET / _pyhmmer_alignment_identity
-/ _sanitize_path) STAY hub-side. Re-exported by the hub so sc.<name> + every call site
-resolves unchanged.
+(_hmmscan_run) + its pyhmmer helpers (_BLASTP_QUERY_ALPHABET / _pyhmmer_alignment_identity)
+STAY hub-side (_sanitize_path is a shared util L0 helper, not pyhmmer-specific). Re-exported
+by the hub so sc.<name> + every call site resolves unchanged.
 """
 from __future__ import annotations
 
@@ -151,6 +151,12 @@ def _ncbi_taxid_search(query: str, retmax: int = 200,
     ids: list[str] = []
     total = 0
     broadened = False
+    # Route NCBI taxonomy traffic through the shared hardened opener (verifying
+    # SSL context, bounded redirects, https-downgrade refusal, and the private-
+    # IP/SSRF host filter) instead of a raw urlopen — parity with every other
+    # network path. The egress guard above already fired; the opener's own
+    # guard is a harmless no-op here.
+    opener = _build_hardened_url_opener()
     for idx, term in enumerate(_ncbi_taxid_search_terms(q)):
         params = urllib.parse.urlencode({
             "db": "taxonomy", "term": term,
@@ -160,7 +166,7 @@ def _ncbi_taxid_search(query: str, retmax: int = 200,
             req = urllib.request.Request(
                 f"{base}/esearch.fcgi?{params}",
                 headers={"User-Agent": "SpliceCraft/1.0"})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with opener.open(req, timeout=timeout) as r:
                 raw = r.read(_NCBI_MAX_RESPONSE_BYTES + 1)
             if len(raw) > _NCBI_MAX_RESPONSE_BYTES:
                 _log.warning("NCBI esearch response exceeded %d bytes; truncating",
@@ -212,7 +218,7 @@ def _ncbi_taxid_search(query: str, retmax: int = 200,
         })
         req = urllib.request.Request(f"{base}/esummary.fcgi?{sparams}",
                                      headers={"User-Agent": "SpliceCraft/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with opener.open(req, timeout=timeout) as r:
             sraw = r.read(_NCBI_MAX_RESPONSE_BYTES + 1)
         if len(sraw) > _NCBI_MAX_RESPONSE_BYTES:
             _log.warning("NCBI esummary response exceeded %d bytes; ignoring",
