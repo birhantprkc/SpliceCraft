@@ -14,6 +14,16 @@
 
 ---
 
+## [1.0.95] — 2026-06-23
+
+### New features
+
+- **Move a primer between collections in one call.** A new `move-primer {name|sequence, to, from?}` reassigns a primer to another collection without the old create-then-delete dance — which could lose the primer when the create hit a duplicate and the delete then removed the only copy. The move is atomic (the primer is never momentarily gone).
+
+### Bug fixes
+
+- **A primer collection is now a real partition for reads, not just writes.** `list-primers {collection: "X"}` returns only X's own primers (it used to ignore the filter and return the whole library), and `get-primer` resolves by `{name}` / `{id}` (optionally scoped to a `{collection}`), not only by exact sequence. So after filing primers into a named collection you can actually list and fetch just those.
+
 ## [1.0.94] — 2026-06-22
 
 ### New features

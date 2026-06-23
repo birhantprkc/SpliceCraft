@@ -1080,12 +1080,38 @@ def _h_delete_grammar(app, payload):
     return {"ok": True, "grammar_id": gid}
 
 
+def _agent_primer_collection_list(coll):
+    """SC-J: the primers belonging to collection `coll`. Returns
+    ``(list, None)`` or ``(None, (error_dict, status))``. ``coll`` empty / None
+    → the default (live) library via `_load_primers()`; a named collection →
+    ITS OWN stored ``primers`` (so a collection is a real partition for reads,
+    not just writes), 404 if it doesn't exist."""
+    if coll in (None, ""):
+        return _load_primers(), None
+    if not isinstance(coll, str):
+        return None, ({"error": "'collection' must be a string"}, 400)
+    target = next((c for c in _load_primer_collections()
+                   if (c.get("name") or "") == coll.strip()), None)
+    if target is None:
+        return None, ({"error":
+                        f"no primer collection named {coll.strip()!r}"}, 404)
+    return list(target.get("primers") or []), None
+
+
 @_agent_endpoint("list-primers")
 def _h_list_primers(app, payload):
     """Return the primer library. Each item: ``{name, sequence,
     source, tm, status, type, date, notes}``. Sequence + notes can
     be long; clients on small terminals should paginate via the
-    `limit` + `offset` body params."""
+    `limit` + `offset` body params.
+
+    Pass ``{collection: "X"}`` to list only collection X's OWN primers (SC-J);
+    omit it for the default/live library. The response echoes ``collection``."""
+    coll_in = payload.get("collection")
+    entries, cerr = _agent_primer_collection_list(coll_in)
+    if cerr is not None:
+        return cerr
+    assert entries is not None          # cerr is None ⇒ entries populated
     raw_limit = payload.get("limit")
     raw_offset = payload.get("offset")
     # Sweep #35 (2026-05-26): clamp pagination to sane bounds and
@@ -1106,7 +1132,6 @@ def _h_list_primers(app, payload):
     offset = _coerce_pagination(
         raw_offset, default=0, cap=_LIST_PRIMERS_LIMIT_MAX,
     )
-    entries = _load_primers()
     sliced = entries[offset:offset + limit]
     out = []
     for e in sliced:
@@ -1121,23 +1146,44 @@ def _h_list_primers(app, payload):
             "notes":    e.get("notes", ""),
         })
     return {"ok": True, "primers": out, "count": len(out),
-            "total": len(entries)}
+            "total": len(entries),
+            "collection": (coll_in.strip()
+                           if isinstance(coll_in, str) and coll_in.strip()
+                           else "")}
 
 
 @_agent_endpoint("get-primer")
 def _h_get_primer(app, payload):
-    """Return a primer-library entry by exact (case-insensitive)
-    sequence match. Body: ``{sequence}``. Returns 404 if no match
-    — the agent should `list-primers` first to discover what's
-    available."""
+    """Return a primer-library entry by ``{name|id}`` or exact
+    (case-insensitive) ``{sequence}``. Optional ``{collection}`` scopes the
+    lookup to that collection's own primers (SC-J); omit it for the default
+    library. An ambiguous name returns 409 with the candidate sequences; no
+    match returns 404."""
+    pool, cerr = _agent_primer_collection_list(payload.get("collection"))
+    if cerr is not None:
+        return cerr
+    assert pool is not None             # cerr is None ⇒ pool populated
     seq = payload.get("sequence")
-    if not isinstance(seq, str) or not seq.strip():
-        return ({"error": "missing or non-string 'sequence'"}, 400)
-    target = seq.strip().upper()
-    for e in _load_primers():
-        if (e.get("sequence") or "").upper() == target:
-            return {"ok": True, "primer": e}
-    return ({"error": "no primer with that sequence"}, 404)
+    name = payload.get("name") or payload.get("id")
+    if isinstance(seq, str) and seq.strip():
+        target = seq.strip().upper()
+        for e in pool:
+            if (e.get("sequence") or "").upper() == target:
+                return {"ok": True, "primer": e}
+        return ({"error": "no primer with that sequence"}, 404)
+    if isinstance(name, str) and name.strip():
+        key = name.strip()
+        matches = [e for e in pool if (e.get("name") or "") == key]
+        if not matches:
+            return ({"error": f"no primer named {key!r}"}, 404)
+        if len(matches) > 1:
+            return ({"error":
+                      f"{key!r} matches {len(matches)} primers — pass "
+                      f"{{\"sequence\": …}} to pick one",
+                      "sequences": [e.get("sequence", "")
+                                     for e in matches]}, 409)
+        return {"ok": True, "primer": matches[0]}
+    return ({"error": "missing 'name', 'id', or 'sequence'"}, 400)
 
 
 _PRIMER_STATUS_VALUES: tuple = ("Designed", "Ordered", "Validated")
@@ -1398,6 +1444,120 @@ def _h_create_primer_collection(app, payload):
             return err
     return {"ok": True, "name": name, "n_primers": 0,
             "ignored": _agent_ignored_keys(payload, {"name", "description"})}
+
+
+@_agent_endpoint("move-primer", write=True)
+def _h_move_primer(app, payload):
+    """Move a primer between collections WITHOUT a create/delete round-trip
+    (SC-K — that round-trip lost primers: `create-primer` rejected the
+    duplicate, then the follow-up `delete-primer` removed the only copy).
+    Body: ``{name|id|sequence, to, from?}``. ``to``/``from`` are collection
+    names (``""`` = the default / live library).
+
+    Resolves the primer in ``from`` (or searches every collection when
+    ``from`` is omitted; 409 if it lives in more than one), removes it there
+    and adds it to ``to`` — all under ONE lock, so the primer is never
+    momentarily absent. 404 if the primer or a named collection is missing;
+    409 on an ambiguous name or a sequence already present in ``to``."""
+    to_in = payload.get("to")
+    if not isinstance(to_in, str):
+        return ({"error":
+                  "missing 'to' (collection name; \"\" = default)"}, 400)
+    to_name = to_in.strip()
+    from_in = payload.get("from")
+    seq = payload.get("sequence")
+    name = payload.get("name") or payload.get("id")
+    has_seq = isinstance(seq, str) and bool(seq.strip())
+    has_name = isinstance(name, str) and bool(name.strip())
+    if not (has_seq or has_name):
+        return ({"error": "missing 'name', 'id', or 'sequence'"}, 400)
+
+    def _match(p):
+        if has_seq:
+            return (p.get("sequence") or "").upper() == seq.strip().upper()
+        return (p.get("name") or "") == name.strip()
+
+    with _state._cache_lock:
+        colls = _load_primer_collections()
+        by_name = {(c.get("name") or ""): c for c in colls}
+        default_list = _load_primers()
+        active = _get_active_primer_collection_name() or ""
+
+        def _store(cn):
+            if cn == "":
+                return default_list
+            c = by_name.get(cn)
+            return c.get("primers") if c is not None else None
+
+        if to_name and to_name not in by_name:
+            return ({"error":
+                      f"no primer collection named {to_name!r}; create it "
+                      f"with create-primer-collection"}, 404)
+        # Resolve the source collection.
+        if isinstance(from_in, str) and from_in.strip():
+            from_name = from_in.strip()
+            if from_name and from_name not in by_name:
+                return ({"error":
+                          f"no primer collection named {from_name!r}"}, 404)
+        elif from_in in (None, ""):
+            cands = [cn for cn in [""] + list(by_name)
+                     if any(_match(p) for p in (_store(cn) or []))]
+            if not cands:
+                return ({"error": "primer not found in any collection"}, 404)
+            if len(cands) > 1:
+                return ({"error":
+                          "primer is in multiple collections — pass 'from'",
+                          "collections": cands}, 409)
+            from_name = cands[0]
+        else:
+            return ({"error": "'from' must be a string"}, 400)
+        if from_name == to_name:
+            return ({"error":
+                      f"primer already in {to_name or 'default'!r}"}, 409)
+        # Mirror safety: touching the DEFAULT store while a NAMED collection
+        # is active would make `_save_primers` mis-mirror the default into the
+        # active collection. The common case (default active) is fine.
+        if active and "" in (from_name, to_name):
+            return ({"error":
+                      f"a named primer collection ({active!r}) is active — "
+                      f"switch to the default (set-active-primer-collection "
+                      f"{{\"name\": \"\"}}) before moving to/from the default "
+                      f"library, so the live mirror stays consistent"}, 409)
+        src = _store(from_name)
+        assert src is not None             # from_name validated above
+        idxs = [i for i, p in enumerate(src) if _match(p)]
+        if not idxs:
+            return ({"error":
+                      f"primer not found in {from_name or 'default'!r}"}, 404)
+        if len(idxs) > 1:
+            return ({"error":
+                      f"ambiguous — {len(idxs)} primers match in "
+                      f"{from_name or 'default'!r}; pass 'sequence'"}, 409)
+        primer = dict(src[idxs[0]])
+        tgt = _store(to_name)
+        assert tgt is not None             # to_name validated above
+        tseq = (primer.get("sequence") or "").upper()
+        if any((p.get("sequence") or "").upper() == tseq for p in tgt):
+            return ({"error":
+                      f"a primer with that sequence already exists in "
+                      f"{to_name or 'default'!r}"}, 409)
+        # The move — under the single lock, so no momentary gap.
+        del src[idxs[0]]
+        tgt.insert(0, primer)
+        if from_name != "" or to_name != "":      # a named store changed
+            if (e := _agent_save_or_500(
+                    lambda: _save_primer_collections(colls),
+                    "primer_collections")) is not None:
+                return e
+        if from_name == "" or to_name == "":       # the default changed
+            if (e := _agent_save_or_500(
+                    lambda: _save_primers(default_list), "primers")) is not None:
+                return e
+    return {"ok": True, "name": primer.get("name"),
+            "sequence": primer.get("sequence"),
+            "from": from_name, "to": to_name,
+            "ignored": _agent_ignored_keys(
+                payload, {"name", "id", "sequence", "to", "from"})}
 
 
 @_agent_endpoint("list-hmm-databases")

@@ -960,6 +960,69 @@ class TestApiTickets:
         assert sc._h_copy_plasmid(None, {"name": "FFE 1 ENTRY"})[1] == 400
 
 
+class TestPrimerCollectionReadsAndMove:
+    """SC-J (collection is a real partition for READS) + SC-K (move-primer,
+    no create/delete data-loss footgun)."""
+
+    def _h(self, name):
+        return sc._state._AGENT_HANDLERS[name][0]
+
+    def _seed(self):
+        # 5 in the default library, 3 filed into a named collection.
+        # Distinct 2-mer suffixes so the dedup-by-sequence policy keeps all 5.
+        for i, suf in enumerate(["AA", "CC", "GG", "TT", "AG"]):
+            self._h("create-primer")(None, {
+                "name": f"m{i}", "sequence": "ACGT" * 5 + suf})
+        self._h("create-primer-collection")(None, {"name": "ProjA"})
+        for i, suf in enumerate(["AA", "CC", "GG"]):
+            self._h("create-primer")(None, {
+                "name": f"p{i}", "sequence": "TTTT" * 5 + suf,
+                "collection": "ProjA"})
+
+    # ── SC-J: list-primers / get-primer honor {collection} ──────────────
+    def test_list_primers_scoped_to_collection(self):
+        self._seed()
+        assert self._h("list-primers")(None, {"collection": "ProjA"})["count"] == 3
+        assert self._h("list-primers")(None, {})["count"] == 5    # default
+        assert self._h("list-primers")(None, {"collection": "Nope"})[1] == 404
+
+    def test_get_primer_by_name_in_collection(self):
+        self._seed()
+        r = self._h("get-primer")(None, {"name": "p0", "collection": "ProjA"})
+        assert r["primer"]["name"] == "p0"
+        assert self._h("get-primer")(None, {"name": "p0"})[1] == 404  # not default
+        assert self._h("get-primer")(None,
+                                      {"name": "m0"})["primer"]["name"] == "m0"
+
+    # ── SC-K: move-primer never loses the primer ────────────────────────
+    def test_move_primer_no_data_loss(self):
+        self._seed()
+        r = self._h("move-primer")(None, {"name": "m0", "to": "ProjA"})
+        assert r["ok"] and r["from"] == "" and r["to"] == "ProjA"
+        assert self._h("list-primers")(None, {})["count"] == 4          # default −1
+        assert self._h("list-primers")(None, {"collection": "ProjA"})["count"] == 4
+        # The primer is in ProjA, not lost.
+        assert self._h("get-primer")(None,
+                                     {"name": "m0", "collection": "ProjA"})["primer"]["name"] == "m0"
+
+    def test_move_primer_errors(self):
+        self._seed()
+        assert self._h("move-primer")(None, {"name": "m1", "to": "Nope"})[1] == 404
+        assert self._h("move-primer")(None, {"to": "ProjA"})[1] == 400  # no selector
+        # Already moved → not found in default.
+        self._h("move-primer")(None, {"name": "m0", "to": "ProjA"})
+        assert self._h("move-primer")(None,
+                                      {"name": "m0", "to": "ProjA"})[1] in (404, 409)
+
+    def test_move_primer_refuses_default_while_named_active(self):
+        # Mirror-safety guard: touching the default store while a named
+        # collection is active would mis-mirror — refuse with 409.
+        self._seed()
+        self._h("set-active-primer-collection")(None, {"name": "ProjA"})
+        r = self._h("move-primer")(None, {"name": "m1", "to": "ProjA"})
+        assert isinstance(r, tuple) and r[1] == 409
+
+
 class TestDataEnvelope:
     """SC-C: the dispatcher adds a predictable `data` field to success
     responses (pure helper `_agent_data_envelope`)."""

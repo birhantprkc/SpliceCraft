@@ -60,7 +60,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ## Endpoint inventory
 
-~156 endpoints across:
+~157 endpoints across:
 
 - **Records** — `new-plasmid` (create from a raw sequence, the Ctrl+N
   flow), get / set sequence, add / update / delete features (with the full
@@ -167,8 +167,11 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 - **Feature library** — list / get / create / update /
   delete-feature-library (reusable annotation snippets).
 - **Primer collections** — list-primer-collections, create-primer-collection
-  (the primer-side parallel to create-collection), set-active-primer-collection
-  (plus per-primer CRUD).
+  (the primer-side parallel to create-collection), set-active-primer-collection,
+  move-primer (reassign a primer to another collection in one atomic call),
+  plus per-primer CRUD. `list-primers` / `get-primer` accept a `{collection}`
+  to read just that collection's own primers (a collection is a real partition
+  for reads, not only writes).
 - **Data safety** — list-backups, restore-backup,
   list-pre-update-snapshots, restore-pre-update-snapshot.
 - **Settings** — get-settings, set-setting (allowlisted toggles);
