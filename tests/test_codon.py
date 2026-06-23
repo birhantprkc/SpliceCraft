@@ -262,6 +262,64 @@ class TestFixSites:
         assert "GAGACC" not in fixed  # rc
         assert sc._mut_translate(fixed) == sc._mut_translate(seed)
 
+    def test_swap_ok_windowed_equals_fullscan(self):
+        """ZERO-TOLERANCE GUARD: the windowed forbidden-site check
+        (`_codon_swap_ok(window=True)`, production) must return the SAME verdict
+        as the full-sequence rescan (`window=False`, the oracle) for every
+        candidate swap — a divergence would let a forbidden site slip into a
+        synthetic gene. Adversarial sweep over concrete + degenerate + long +
+        reverse-complement sites, swaps anywhere in the sequence, and (as in
+        production) only REAL forbidden occurrences as the target.
+        """
+        import random
+        import splicecraft_biology as _bio
+
+        rng = random.Random(0xC0D0)
+        site_pools = [
+            ("GGTCTC",),                    # BsaI (concrete 6-mer)
+            ("GGTCTC", "GAGACC"),           # BsaI + its reverse complement
+            ("GAATTC", "GGATCC"),           # two concrete sites
+            ("GGWCC",),                     # degenerate (W = A/T)
+            ("CCANNNNNNTGG",),              # long degenerate (11-mer, XcmI-like)
+            ("GGTCTC", "GGWCC", "RGATCY"),  # mixed lengths + degeneracy
+        ]
+        cases = 0
+        for _ in range(3000):
+            all_forbidden = rng.choice(site_pools)
+            maxlen = max(len(s) for s in all_forbidden)
+            L = rng.randint(maxlen + 3, 90)
+            seq_chars = [rng.choice("ACGT") for _ in range(L)]
+            # Inject a CONCRETE forbidden site at a random spot in most cases so
+            # the real-hit target set is usually non-empty (degenerate sites are
+            # exercised via random occurrence in the 90 bp body).
+            concrete = [s for s in all_forbidden if all(c in "ACGT" for c in s)]
+            if concrete and rng.random() < 0.7:
+                s = rng.choice(concrete)
+                at = rng.randint(0, L - len(s))
+                seq_chars[at:at + len(s)] = list(s)
+            seq = "".join(seq_chars)
+            before = _bio._forbidden_hit_set(seq, all_forbidden)
+            if not before:
+                continue
+            codon_start = rng.randint(0, (L - 3) // 3) * 3
+            alt = "".join(rng.choice("ACGT") for _ in range(3))
+            for (site, idx) in before:      # only REAL hits, exactly as production
+                w = _codon._codon_swap_ok(
+                    seq, codon_start, alt, site, idx,
+                    all_forbidden, before, maxlen, window=True)
+                f = _codon._codon_swap_ok(
+                    seq, codon_start, alt, site, idx,
+                    all_forbidden, before, maxlen, window=False)
+                assert w == f, (
+                    f"window≠full: seq={seq!r} codon_start={codon_start} "
+                    f"alt={alt!r} site={site!r} idx={idx} "
+                    f"forbidden={all_forbidden} → window={w} full={f}")
+                cases += 1
+        # Deterministic (seeded RNG) → ~1500 predicate comparisons; assert a
+        # floor so a future refactor that silently stops exercising the sweep
+        # is caught.
+        assert cases > 1000
+
 
 # ── CAI / GC ──────────────────────────────────────────────────────────────────
 

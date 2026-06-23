@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 import threading
 from collections import OrderedDict as _OD
-from copy import copy as _shallow_copy, deepcopy
+from copy import copy as _shallow_copy
 from io import StringIO
 
 import splicecraft_state as _state
@@ -323,6 +323,40 @@ def _record_to_gb_text(record) -> str:
     return buf.getvalue()
 
 
+def _clone_cached_record(rec):
+    """Isolation copy for the `_GB_PARSE_CACHE` hit/store paths — the cheap,
+    provably-safe replacement for a full `deepcopy` (~7-8× faster; 57 ms → 8 ms
+    on a 5 Mb / 5000-feature chromosome, the per-hit cost every load-entry /
+    diff / part-classify used to pay).
+
+    The contract is pitfall #17: a caller may mutate the returned record freely
+    without poisoning the cache. Callers only ever (a) reassign attributes
+    (rebinds on THIS copy), (b) add/remove features (we hand back a fresh list),
+    or (c) edit qualifiers (fresh dict + fresh value lists). They NEVER mutate a
+    location, the `Seq`, `sub_features`, `letter_annotations`, or an annotation
+    VALUE in place — verified by a codebase-wide grep audit (2026-06-23) and by
+    sacred invariant #9 (feature edits rebuild whole records via
+    `_rebuild_record_with_edit`). So those immutable-in-practice objects are
+    shared by reference; only the mutable CONTAINERS are duplicated. If a future
+    caller ever mutates a shared object in place, `test_record_cache.py`'s
+    isolation test is the tripwire."""
+    out = _shallow_copy(rec)                       # shares .seq (immutable Seq)
+    out.annotations = dict(getattr(rec, "annotations", {}) or {})
+    out.dbxrefs = list(getattr(rec, "dbxrefs", []) or [])
+    la = getattr(rec, "letter_annotations", None)
+    if la:
+        # Restricted dict — assign via the public setter semantics (plain copy
+        # of the per-letter arrays; they're never mutated in place, only read).
+        out.letter_annotations = dict(la)
+    new_feats = []
+    for f in getattr(rec, "features", None) or []:
+        f2 = _shallow_copy(f)                      # shares .location (immutable)
+        f2.qualifiers = {k: list(v) for k, v in (f.qualifiers or {}).items()}
+        new_feats.append(f2)
+    out.features = new_feats
+    return out
+
+
 def _gb_text_to_record(text: str, *, cache: bool = True):
     """Parse GenBank format text back to a SeqRecord.
 
@@ -335,8 +369,10 @@ def _gb_text_to_record(text: str, *, cache: bool = True):
 
     Results are LRU-cached (`_GB_PARSE_CACHE`, capped at
     `_GB_PARSE_CACHE_MAX`) keyed on `hash(text)`. Returned records are
-    deepcopies of the cache value so callers can mutate freely (pitfall
-    #17 contract). Empty-string / oversize inputs bypass the cache.
+    isolation copies (`_clone_cached_record` — shares the immutable
+    `Seq`/locations, duplicates the mutable feature/qualifier containers)
+    so callers can mutate freely (pitfall #17 contract). Empty-string /
+    oversize inputs bypass the cache.
 
     Sweep #26 (2026-05-23) — pass ``cache=False`` for one-shot batch
     parses (Plasmidsaurus zip ingest, bulk-import folder walk) where
@@ -362,7 +398,7 @@ def _gb_text_to_record(text: str, *, cache: bool = True):
             hit = _GB_PARSE_CACHE.get(key)
             if hit is not None:
                 _GB_PARSE_CACHE.move_to_end(key)
-                return deepcopy(hit)
+                return _clone_cached_record(hit)
     from Bio import SeqIO
     rec = SeqIO.read(StringIO(text), "genbank")
     # SC-E: restore the human display name stamped into the COMMENT so it
@@ -378,7 +414,9 @@ def _gb_text_to_record(text: str, *, cache: bool = True):
     _repair_wrapped_primer_seqs(rec)
     if cache:
         with _GB_PARSE_CACHE_LOCK:
-            _GB_PARSE_CACHE[hash(text)] = deepcopy(rec)
+            # Store an isolation copy so the caller (who owns `rec`) can keep
+            # mutating it without poisoning the cache; return `rec` itself.
+            _GB_PARSE_CACHE[hash(text)] = _clone_cached_record(rec)
             while len(_GB_PARSE_CACHE) > _GB_PARSE_CACHE_MAX:
                 _GB_PARSE_CACHE.popitem(last=False)
     return rec

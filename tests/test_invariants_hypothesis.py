@@ -397,6 +397,10 @@ class TestPrimerTmFallbackProperties:
             return original_import(name, *a, **k)
 
         monkeypatch.setattr(builtins, "__import__", _fake_import)
+        # Drop any real value an earlier primer-design test memoized, so the
+        # forced-fallback path isn't shadowed by a cached primer3 result.
+        import splicecraft_primer as _p
+        _p._mut_thermo_cache_clear()
         tm = sc._mut_tm(seq)
         assert isinstance(tm, (int, float))
         # Fallback formula: 2*AT + 4*GC. Min when all AT (2*len),
@@ -421,6 +425,8 @@ class TestPrimerTmFallbackProperties:
             return original_import(name, *a, **k)
 
         monkeypatch.setattr(builtins, "__import__", _fake_import)
+        import splicecraft_primer as _p
+        _p._mut_thermo_cache_clear()
         tm_base = sc._mut_tm(seq)
         tm_plus_g = sc._mut_tm(seq + "G")
         tm_plus_a = sc._mut_tm(seq + "A")

@@ -491,7 +491,9 @@ class TestOriginHistoryBackfill:
         # Persisted to disk, count preserved there too.
         on_disk = json.loads(tmp_lib.read_text())["entries"]
         assert len(on_disk) == 2
-        assert all(e.get("history_xml") for e in on_disk)
+        # history_xml is blob-dehydrated on disk now (history_ref + blob);
+        # rehydrate to confirm the backfilled history survives the round-trip.
+        assert all(sc._rehydrate_entry(e).get("history_xml") for e in on_disk)
 
     def test_library_backfill_does_not_overwrite_existing_history(
             self, tmp_path, monkeypatch):

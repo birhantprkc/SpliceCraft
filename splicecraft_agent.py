@@ -3256,15 +3256,14 @@ def _h_get_history(app, payload):
            if isinstance(eid_raw, str) else "")
     if not name and not eid:
         return ({"error": "missing 'name' or 'id'"}, 400)
-    entries = _load_library()
-    entry = None
-    for e in entries:
-        if eid and e.get("id") == eid:
-            entry = e
-            break
-        if name and e.get("name") == name:
-            entry = e
-            break
+    # Targeted finder clones only the matched entry instead of `_load_library()`
+    # deep-cloning the ENTIRE active-collection cache just to read one entry's
+    # history_xml — the per-call full-clone anti-pattern that sweep #11's
+    # `_find_library_entry_by_*` helpers exist to kill (this read-only handler
+    # was missed). `id` wins over `name`, matching the diff-plasmid precedence.
+    entry = _find_library_entry_by_id(eid) if eid else None
+    if entry is None and name:
+        entry = _find_library_entry_by_name(name)
     if entry is None:
         return ({"error": f"no entry matching name={name!r} id={eid!r}"},
                 404)

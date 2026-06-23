@@ -1890,6 +1890,22 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
     # every cloning flow that funnels through `_enzyme_cuts`. Via the
     # `_state` getter so this works once the fn moves to the L0 sibling.
     catalog = _state._all_enzymes_hook()
+    # Hoisted out of the per-enzyme loop: build the wrap-augmented scan string
+    # ONCE, sized to the LONGEST recognition site among the named enzymes,
+    # instead of rebuilding `seq_u + seq_u[:site_len-1]` (an O(n) string copy)
+    # for every enzyme. A longer augmentation than a short-site enzyme needs is
+    # harmless — the only extra regex matches land at p >= n and are dropped by
+    # the `if p >= n: continue` guard below (each duplicates a match already
+    # found at p-n), so the cut set stays byte-identical. Mirrors
+    # `_scan_restriction_sites_impl`, which already computes max_site_len once.
+    max_site_len = max(
+        (len(catalog[e][0]) for e in enzyme_names if e in catalog),
+        default=0,
+    )
+    if circular and n > 0 and max_site_len > 1:
+        scan_seq = seq_u + seq_u[: max_site_len - 1]
+    else:
+        scan_seq = seq_u
     for ename in enzyme_names:
         if ename not in catalog:
             continue
@@ -1914,7 +1930,6 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
             )
             continue
         is_pal   = (rc_site == site_u)
-        scan_seq = (seq_u + seq_u[: site_len - 1]) if (circular and n > 0) else seq_u
 
         def _emit(top_bp_raw: int, bot_bp_raw: int):
             # Use raw (pre-modulo) values for kind detection AND to find
@@ -2342,6 +2357,21 @@ def _iupac_compatible(a: str, b: str) -> bool:
 _SEQ_SEARCH_MAX_HITS = 10_000
 
 
+# Matches the FIRST non-concrete base in a template; `None` ⇒ the template is
+# pure A/C/G/T, the precondition for `_search_subsequence`'s regex fast path.
+_NON_ACGT_RE = re.compile(r"[^ACGT]")
+
+
+@functools.lru_cache(maxsize=64)
+def _iupac_overlap_pattern(site: str) -> "re.Pattern[str]":
+    """`_iupac_pattern` wrapped in a zero-width lookahead so `finditer` yields
+    EVERY start — including overlapping repeats (the three starts of ``"ATA"``
+    in ``"ATATA"``) that a plain non-overlapping `finditer` drops. Used only by
+    `_search_subsequence`'s exact fast path; LRU-cached because find-next
+    re-queries the same needle on repeat."""
+    return re.compile("(?=(" + _iupac_pattern(site).pattern + "))")
+
+
 def _search_subsequence(
     seq: str,
     query: str,
@@ -2416,6 +2446,15 @@ def _search_subsequence(
     # meaningful and the early-exit still bounds work.
     k = min(int(max_mismatches), m)
     iupac_ok = _iupac_compatible
+    # Exact searches (no mismatch budget) over a template of only concrete
+    # bases are equivalent to a compiled-regex scan and run ~50-100× faster
+    # (C-level finditer vs a per-char Python double loop). When the TEMPLATE
+    # carries ambiguity codes the equivalence breaks — a concrete query base
+    # must still match a template `N`/`R` via `_iupac_compatible`, which a
+    # query-derived regex can't express — so that case (and any k > 0) keeps
+    # the Python loop. The match SET is identical either way (proven in
+    # test_seq_search_nav.py::test_regex_fastpath_matches_python_loop).
+    fastpath = (k == 0) and (_NON_ACGT_RE.search(s) is None)
 
     def _scan(pattern: str, strand: str, out: "list[dict]") -> None:
         # Origin-wrapping windows for circular records: a start at p in
@@ -2423,6 +2462,19 @@ def _search_subsequence(
         # appended head. Linear records stop at n-m.
         scan_text = (s + s[: m - 1]) if circular else s
         last_start = (n - 1) if circular else (n - m)
+        if fastpath:
+            # Lookahead keeps overlapping hits; finditer yields increasing
+            # positions, so `out` is built in the same order as the loop below
+            # and the downstream dedup/sort sees an identical hit set.
+            for mo in _iupac_overlap_pattern(pattern).finditer(scan_text):
+                p = mo.start()
+                if p > last_start:        # defensive — lookahead can't exceed
+                    break
+                out.append({"start": p, "end": p + m,
+                            "strand": strand, "mismatches": 0})
+                if len(out) >= max_hits:
+                    return
+            return
         for p in range(0, last_start + 1):
             mm = 0
             ok = True

@@ -167,6 +167,45 @@ class TestSearchSubsequence:
         )
         assert len(hits) == 10
 
+    def test_regex_fastpath_matches_python_loop(self):
+        """The exact-search regex fast path (concrete template, k=0) must
+        return BYTE-IDENTICAL hits to the Python char-loop fallback across
+        random queries — including circular, both-strands, degenerate query
+        codes, and overlapping repeats. The fallback is forced by patching
+        `_NON_ACGT_RE` to match every char (so `fastpath` evaluates False)."""
+        import random
+        import re as _re
+        from unittest.mock import patch
+        import splicecraft_biology as _bio
+
+        rng = random.Random(20260623)
+        force_slow = _re.compile(r".")   # always "finds" non-ACGT → slow path
+        cases = 0
+        for _ in range(400):
+            n = rng.randint(1, 64)
+            seq = "".join(rng.choice("ACGT") for _ in range(n))
+            qlen = rng.randint(1, min(n, 8))
+            # Degenerate query codes are fine for the fast path (the compiled
+            # regex expresses them); the TEMPLATE stays concrete so it stays
+            # eligible.
+            query = "".join(rng.choice("ACGTRYSWKMN") for _ in range(qlen))
+            for circular in (False, True):
+                for both in (False, True):
+                    fast = _bio._search_subsequence(
+                        seq, query, circular=circular, both_strands=both)
+                    with patch.object(_bio, "_NON_ACGT_RE", force_slow):
+                        slow = _bio._search_subsequence(
+                            seq, query, circular=circular, both_strands=both)
+                    assert fast == slow, (
+                        f"fast≠slow seq={seq!r} q={query!r} "
+                        f"circular={circular} both={both}\n"
+                        f"fast={fast}\nslow={slow}")
+                    cases += 1
+        assert cases >= 1600
+        # Explicit overlapping-repeat sanity — the lookahead's whole reason:
+        ov = sc._search_subsequence("ATATA", "ATA", both_strands=False)
+        assert [h["start"] for h in ov] == [0, 2]
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SequencePanel.focus_span — the shared jump-to-bp primitive

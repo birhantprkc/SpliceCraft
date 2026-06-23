@@ -14,6 +14,16 @@
 
 ---
 
+## [1.0.99] — 2026-06-23
+
+### Performance
+
+- **Library saves no longer stutter on large libraries.** A plasmid's construction-history tree is now kept in the content-addressed blob store alongside its sequence, instead of stored inline in the collections file — which was 94% construction-history XML and shrank by roughly 80× as a result. Every add / rename / status-change / clone-save now writes a small fraction of the data, with a fraction of the backup I/O, so committing a change to a big library is effectively instant instead of a noticeable pause. Existing libraries migrate automatically the first time each is saved; older files still load unchanged, and a referenced history is never garbage-collected out from under a plasmid.
+- **The plasmid map spins smoothly.** Holding `[` / `]` (or the scroll-wheel) to rotate the map used to rebuild the sequence panel and feature sidebar on every intermediate step, so fast rotation on a large plasmid stuttered. Those updates now coalesce to the settled position — the map spins freely and the panels catch up once, with no added lag for a single rotation.
+- **Ctrl+F sequence search is far faster on large plasmids.** Finding a subsequence in a megabase-scale record dropped from about a second to a fraction of that (~17× faster) for an exact search, by scanning with a compiled pattern instead of base-by-base. Ambiguous (IUPAC) and mismatch-tolerant searches are unchanged.
+- **Opening, diffing, and classifying large plasmids is quicker.** The parsed-record cache now returns a lightweight copy rather than a full deep copy (~7–9× faster on chromosome-scale records), so anything that re-reads a record — loading an entry, diffing, classifying a Golden Braid / MoClo part — is faster.
+- **Primer and codon design loops are quicker.** Melting-temperature and secondary-structure values are cached within a design run (a single mutagenesis design makes ~1,500 of them), and the codon optimizer's forbidden-site scrub now re-checks only the window a codon swap can affect instead of rescanning the whole gene (~3–5× faster on long sequences). Results are identical — the codon change is pinned by an exhaustive equivalence test, since it is a zero-tolerance path.
+
 ## [1.0.98] — 2026-06-23
 
 ### Bug fixes

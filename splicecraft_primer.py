@@ -129,44 +129,89 @@ def _mut_translate(dna: str) -> str:
     return "".join(aa)
 
 
+# Thermodynamic results are pure functions of the sequence (the only other
+# input, `_MUT_P3`, is a frozen module constant), but the inner-design grid
+# (up to 23×23 = 529 windows) and the QuikChange scrub (10×9×9 = 810 pairs)
+# call them ~1,500× per design over heavily-overlapping sequences. Memoize the
+# primer3 SUCCESS path only — NEVER the approximation fallback — so (a) a cached
+# real value can never shadow the fallback the property tests force by making
+# primer3 unimportable, and (b) the cache stays a pure primer3 mirror. Bounded
+# (str→float entries are tiny) with oldest-insertion eviction; clearable for
+# test isolation. NOT re-exported, so the public surface is unchanged.
+_MUT_TM_CACHE: "dict[str, float]" = {}
+_MUT_HAIRPIN_CACHE: "dict[str, float]" = {}
+_MUT_HOMODIMER_CACHE: "dict[str, float]" = {}
+_MUT_THERMO_CACHE_MAX = 8192
+
+
+def _mut_thermo_cache_put(cache: "dict[str, float]", seq: str, val: float) -> None:
+    if len(cache) >= _MUT_THERMO_CACHE_MAX:
+        cache.pop(next(iter(cache)))          # evict oldest insertion (FIFO)
+    cache[seq] = val
+
+
+def _mut_thermo_cache_clear() -> None:
+    """Drop all memoized primer3 thermodynamic results. The fallback property
+    tests call this so a real value cached by an earlier primer-design test
+    can't mask the primer3-unavailable path they deliberately force."""
+    _MUT_TM_CACHE.clear()
+    _MUT_HAIRPIN_CACHE.clear()
+    _MUT_HOMODIMER_CACHE.clear()
+
+
 def _mut_tm(seq: str) -> float:
+    hit = _MUT_TM_CACHE.get(seq)
+    if hit is not None:
+        return hit
     try:
         import primer3
-        return primer3.calc_tm(seq, **_MUT_P3)  # type: ignore[arg-type]
+        val = primer3.calc_tm(seq, **_MUT_P3)  # type: ignore[arg-type]
     except Exception:
         # Fall back to the crude 2×AT + 4×GC approximation when
         # primer3 is missing or raises (degenerate input, NaN config).
         # Log so a wave of failures shows up as one diagnosable
         # symptom in the bug-report bundle instead of silent
-        # mis-temperature on every primer.
+        # mis-temperature on every primer. NOT cached (see cache note).
         _log.exception(
             "_mut_tm: primer3.calc_tm fell back to GC approximation "
             "for %d-mer", len(seq))
         gc = sum(1 for c in seq.upper() if c in "GC")
         at = sum(1 for c in seq.upper() if c in "AT")
         return 2 * at + 4 * gc
+    _mut_thermo_cache_put(_MUT_TM_CACHE, seq, val)
+    return val
 
 
 def _mut_hairpin_dg(seq: str) -> float:
+    hit = _MUT_HAIRPIN_CACHE.get(seq)
+    if hit is not None:
+        return hit
     try:
         import primer3
-        return primer3.calc_hairpin(seq, **_MUT_P3).dg  # type: ignore[arg-type]
+        val = primer3.calc_hairpin(seq, **_MUT_P3).dg  # type: ignore[arg-type]
     except Exception:
         _log.exception(
             "_mut_hairpin_dg: primer3.calc_hairpin raised on %d-mer; "
             "returning 0.0 (no secondary-structure penalty)", len(seq))
         return 0.0
+    _mut_thermo_cache_put(_MUT_HAIRPIN_CACHE, seq, val)
+    return val
 
 
 def _mut_homodimer_dg(seq: str) -> float:
+    hit = _MUT_HOMODIMER_CACHE.get(seq)
+    if hit is not None:
+        return hit
     try:
         import primer3
-        return primer3.calc_homodimer(seq, **_MUT_P3).dg  # type: ignore[arg-type]
+        val = primer3.calc_homodimer(seq, **_MUT_P3).dg  # type: ignore[arg-type]
     except Exception:
         _log.exception(
             "_mut_homodimer_dg: primer3.calc_homodimer raised on "
             "%d-mer; returning 0.0", len(seq))
         return 0.0
+    _mut_thermo_cache_put(_MUT_HOMODIMER_CACHE, seq, val)
+    return val
 
 
 def _mut_gc_pct(seq: str) -> float:

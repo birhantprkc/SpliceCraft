@@ -248,7 +248,15 @@ _LOST_ENTRIES_TOTAL_SIZE_CAP_BYTES: int = 500 * 1024 * 1024   # 500 MB
 # `_safe_save_json` re-reads it before the atomic swap; files at/under this
 # size get a full `json.loads` + entry-count check, larger files a cheap tail
 # check so the hot path doesn't eat a multi-second re-parse + RAM spike.
-_SAVE_READBACK_FULL_PARSE_MAX_BYTES: int = 32 * 1024 * 1024   # 32 MB
+# Kept at 8 MB (was 32 MB): the real `collections.json` sat at ~27 MB — just
+# UNDER the old cutoff — so it ate a full ~55 ms `json.loads` on EVERY save,
+# while a larger file got the cheap path. The tail check already catches the
+# dominant failure mode (truncation: non-empty + valid JSON close) over an
+# already-fsynced tempfile, so structural mid-file corruption — implausible
+# after fsync — is the only thing the full reparse adds. 8 MB keeps the full
+# parse for the small files that are 99% of saves and skips it for the few big
+# ones where the cost actually bites.
+_SAVE_READBACK_FULL_PARSE_MAX_BYTES: int = 8 * 1024 * 1024   # 8 MB
 
 # Data-dir JSON load cap (the user's OWN library/collections, distinct from the
 # foreign-file ingest cap). 1 GB so accidental cap-trips are rare; the
@@ -314,7 +322,16 @@ _after_custom_grammars_save_hook: "_Callable[[], None] | None" = None
 # atomic `globals()["_SCAN_CATALOG"]` form), so it stays the hub global and the
 # sibling reads it fresh through `_scan_catalog_hook`.
 _RESTR_SCAN_CACHE: "_OrderedDict[tuple, list]" = _OrderedDict()
-_RESTR_SCAN_CACHE_MAX: int = 4
+# Bumped 4 → 16. This is the HOTTER of the two caches (it backs the restriction
+# overlay, re-consulted on every `r`-toggle / record switch) yet was capped
+# SMALLER than `_ENZYME_CUTS_CACHE`. Its key folds in the filter flags
+# (unique_only / circular / allowed-set), so ONE record viewed under a couple of
+# filter states plus a second open plasmid blew all 4 slots and forced a cold
+# O(N·n) rescan on every bounce between them. Each entry is a small list of
+# resite/recut dicts (NOT a copy of the sequence — contrast the `_rc` 4-cap,
+# where each entry IS a multi-Mb string), so 16 slots cost a few hundred KB even
+# for a heavily-cut megabase plasmid.
+_RESTR_SCAN_CACHE_MAX: int = 16
 _ENZYME_CUTS_CACHE: "_OrderedDict[tuple, list[dict]]" = _OrderedDict()
 _ENZYME_CUTS_CACHE_MAX: int = 16
 # Part-classification caches for the seq-analysis sibling. Canonical home is

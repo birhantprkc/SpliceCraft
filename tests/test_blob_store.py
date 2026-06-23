@@ -27,6 +27,13 @@ def _age(path, seconds: float):
     os.utime(path, (old, old))
 
 GB = "LOCUS       x         10 bp\nORIGIN\n1 acgtacgtac\n//\n"
+# A representative .dna construction-history tree — the field that dominated
+# collections.json (25.5 MB of 27 MB) before it joined gb_text in the blob store.
+HISTORY_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?><HistoryTree>'
+    '<Node name="p.dna" type="DNA" seqLen="10" ID="0" circular="1" '
+    'operation="createDocument" date="2026-06-13T13:58"/></HistoryTree>'
+)
 
 
 class TestBlobHash:
@@ -302,6 +309,56 @@ class TestDehydrateDedupAndLists:
                 [{"name": "C", "plasmids": [_entry()]}])) is False
 
 
+class TestHistoryFieldDehydration:
+    """`history_xml` (the .dna construction-history tree) is blob-dehydrated
+    EXACTLY like `gb_text` (2026-06-23) — it was 94% of collections.json. Same
+    content-addressed store, same inline-wins + missing-blob-keeps-ref recovery
+    semantics, GC-aware so referenced history blobs are never reclaimed."""
+
+    def test_strips_history_xml_to_ref(self):
+        out = sc._dehydrate_entry(_entry(history_xml=HISTORY_XML))
+        assert "history_xml" not in out
+        assert out["history_ref"] == sc._blob_hash(HISTORY_XML)
+        assert sc._blob_path(out["history_ref"]).is_file()
+
+    def test_dehydrates_gb_and_history_together(self):
+        out = sc._dehydrate_entry(_entry(history_xml=HISTORY_XML))
+        assert out["gb_ref"] == sc._blob_hash(GB)
+        assert out["history_ref"] == sc._blob_hash(HISTORY_XML)
+        assert out["gb_ref"] != out["history_ref"]       # distinct content
+        assert len(list(sc._plasmid_blob_dir().glob("*.gb"))) == 2
+
+    def test_history_round_trip(self):
+        e = _entry(history_xml=HISTORY_XML, status="verified")
+        assert sc._rehydrate_entry(sc._dehydrate_entry(e)) == e
+
+    def test_inline_history_wins_and_drops_stray_ref(self):
+        e = {"id": "p", "history_xml": HISTORY_XML, "history_ref": "0" * 64}
+        out = sc._rehydrate_entry(e)
+        assert out["history_xml"] == HISTORY_XML
+        assert "history_ref" not in out
+
+    def test_missing_history_blob_keeps_ref_and_empties(self):
+        dh = sc._dehydrate_entry(_entry(history_xml=HISTORY_XML))
+        ref = dh["history_ref"]
+        sc._blob_path(ref).unlink()
+        out = sc._rehydrate_entry(dh)
+        assert out["history_xml"] == ""
+        assert out["history_ref"] == ref                  # retained for recovery
+
+    def test_history_only_entry_dehydrates(self):
+        # An entry carrying history_xml but NO gb_text still dehydrates history.
+        e = {"id": "h", "name": "hist only", "history_xml": HISTORY_XML}
+        out = sc._dehydrate_entry(e)
+        assert "history_xml" not in out
+        assert out["history_ref"] == sc._blob_hash(HISTORY_XML)
+        assert sc._rehydrate_entry(out)["history_xml"] == HISTORY_XML
+
+    def test_idempotent(self):
+        once = sc._dehydrate_entry(_entry(history_xml=HISTORY_XML))
+        assert sc._dehydrate_entry(once) == once          # already refs → no-op
+
+
 class TestLibraryBoundaryIntegration:
     """End-to-end through the LIVE save/load path: dehydrate-on-save +
     rehydrate-on-load via _save_library / _load_library. conftest
@@ -375,6 +432,20 @@ class TestLibraryBoundaryIntegration:
         loaded = sc._load_collections()
         assert loaded[0]["plasmids"][0]["gb_text"] == gb
 
+    def test_history_xml_dehydrates_on_save_rehydrates_on_load(self):
+        gb = "LOCUS       hx         5 bp\nORIGIN\n1 acgta\n//\n"
+        sc._save_library([{"id": "HX", "name": "hx", "gb_text": gb,
+                           "history_xml": HISTORY_XML}])
+        disk = json.loads(sc._state._LIBRARY_FILE.read_text())["entries"][0]
+        assert "history_xml" not in disk                  # dehydrated on disk
+        assert disk["history_ref"] == sc._blob_hash(HISTORY_XML)
+        assert sc._blob_path(disk["history_ref"]).is_file()
+        sc._state._library_cache = None
+        loaded = sc._load_library()
+        assert loaded[0]["history_xml"] == HISTORY_XML     # rehydrated in cache
+        assert "history_ref" not in loaded[0]
+        assert loaded[0]["gb_text"] == gb
+
 
 def _write_lib_refs(refs):
     sc._state._LIBRARY_FILE.write_text(json.dumps({
@@ -401,6 +472,20 @@ class TestOrphanBlobGC:
         ref = sc._blob_write(GB)
         _age(sc._blob_path(ref), sc._BLOB_GC_GRACE_SECONDS + 100)
         _write_lib_refs([ref])
+        assert sc._gc_orphan_blobs() == 0
+        assert sc._blob_path(ref).is_file()
+
+    def test_keeps_blob_referenced_only_by_history_ref(self):
+        # CRITICAL data-safety: a blob referenced via `history_ref` (NOT gb_ref)
+        # must NOT be quarantined — else dehydrated construction history would be
+        # GC'd out from under a live entry. Guards the `_gc_collect_refs` ←→
+        # `_BLOB_BACKED_FIELDS` lockstep.
+        ref = sc._blob_write(HISTORY_XML)
+        _age(sc._blob_path(ref), sc._BLOB_GC_GRACE_SECONDS + 100)
+        sc._state._LIBRARY_FILE.write_text(json.dumps({
+            "_schema_version": 1,
+            "entries": [{"id": "e", "history_ref": ref}],
+        }))
         assert sc._gc_orphan_blobs() == 0
         assert sc._blob_path(ref).is_file()
 

@@ -1105,7 +1105,7 @@ def _build_commercialsaas_packet(type_byte: int, payload: bytes) -> bytes:
     return bytes([type_byte]) + _struct.pack(">I", len(payload)) + payload
 
 
-def _extract_commercialsaas_history_xml(data: bytes) -> "str | None":
+def _extract_commercialsaas_history_xml(data: bytes, *, packets=None) -> "str | None":
     """Find the 0x07 history packet in a .dna byte stream and return
     its decompressed XML (UTF-8 text) — or ``None`` if no history
     packet exists. Decompression is xz (LZMA); a malformed payload
@@ -1116,10 +1116,16 @@ def _extract_commercialsaas_history_xml(data: bytes) -> "str | None":
     aborted at ``_COMMERCIALSAAS_HISTORY_MAX_XML`` rather than
     OOM-ing the worker. The decoder reads up to ``cap + 1`` bytes; if
     it fills, we know the input exceeded the cap.
+
+    ``packets``: an already-materialised ``_iter_commercialsaas_packets(data)``
+    list, shared by the file-load path so the buffer is walked once for all
+    three .dna readers. ``None`` iterates ``data`` directly (every other caller).
     """
     import lzma as _lzma
     cap = _COMMERCIALSAAS_HISTORY_MAX_XML
-    for type_byte, length, payload in _iter_commercialsaas_packets(data):
+    for type_byte, length, payload in (
+            packets if packets is not None
+            else _iter_commercialsaas_packets(data)):
         if type_byte != _COMMERCIALSAAS_PACKET_HISTORY:
             continue
         try:
@@ -1404,17 +1410,22 @@ def _build_commercialsaas_notes_packet(record) -> bytes:
                                      body.encode("utf-8"))
 
 
-def _extract_commercialsaas_file_date(data: bytes) -> "str | None":
+def _extract_commercialsaas_file_date(data: bytes, *, packets=None) -> "str | None":
     """Best-effort: pull the source file's own date (normalised to ISO
     ``YYYY-MM-DD``) from the CommercialSaaS Notes packet's ``<Created>`` (or
     ``<LastModified>``) element — the inverse of the ``<Created>`` that
     `_build_commercialsaas_notes_packet` writes. Lets an imported plasmid's
     top History entry show WHEN the source file was made (user request
     2026-06-10), since the construction-history nodes themselves carry no
-    per-step dates. Returns None when absent / unparseable — never raises."""
+    per-step dates. Returns None when absent / unparseable — never raises.
+
+    ``packets``: shared materialised packet list (see
+    `_extract_commercialsaas_history_xml`); ``None`` iterates ``data``."""
     try:
         import xml.etree.ElementTree as _ET
-        for type_byte, _length, payload in _iter_commercialsaas_packets(data):
+        for type_byte, _length, payload in (
+                packets if packets is not None
+                else _iter_commercialsaas_packets(data)):
             if type_byte != _COMMERCIALSAAS_PACKET_NOTES:
                 continue
             try:
@@ -1576,7 +1587,7 @@ def _write_commercialsaas_dna_bytes(record, *,
 
 
 def _augment_dna_record_from_packets(
-    rec, data: bytes,
+    rec, data: bytes, *, packets=None,
 ) -> list[dict]:
     """Recover info BioPython's ``.dna`` parser drops:
       * **per-feature colours** from the 0x0A Features packet
@@ -1644,7 +1655,14 @@ def _augment_dna_record_from_packets(
     feature_names_from_xml: list[str] = []
     standalone_primers: list[dict] = []
 
-    for type_byte, _length, payload in _iter_commercialsaas_packets(data):
+    # Iterate the packet stream ONCE: the file-load path materialises
+    # `_iter_commercialsaas_packets(data)` into `packets` and shares it across
+    # this augment + the history-XML + file-date readers, collapsing three full
+    # passes over the (capped) .dna buffer into one. `packets=None` (every other
+    # caller) iterates `data` directly, exactly as before.
+    for type_byte, _length, payload in (
+            packets if packets is not None
+            else _iter_commercialsaas_packets(data)):
         if type_byte == _COMMERCIALSAAS_PACKET_FEATURES:
             try:
                 root = _safe_xml_parse(payload.decode("utf-8"))
@@ -3203,7 +3221,14 @@ def load_genbank(path: str):
                     path, _DNA_AUGMENT_MAX_BYTES // (1024 * 1024),
                 )
             else:
-                extra_primers = _augment_dna_record_from_packets(rec, _dna_bytes)
+                # Walk the packet TLV stream ONCE and share it across all three
+                # .dna readers (augment + history-XML + file-date) instead of
+                # re-parsing the (capped) buffer three times. A malformed stream
+                # raises ValueError here, caught by the outer handler exactly as
+                # the augment's own raise was before.
+                _dna_packets = list(_iter_commercialsaas_packets(_dna_bytes))
+                extra_primers = _augment_dna_record_from_packets(
+                    rec, _dna_bytes, packets=_dna_packets)
                 if extra_primers:
                     rec._dna_primer_entries = extra_primers
                 # Stash the construction-history packet + the raw bytes
@@ -3215,14 +3240,16 @@ def load_genbank(path: str):
                 # history AND every CommercialSaaS-specific packet
                 # (alignments, enzymes, …). `add_entry` consumes these.
                 try:
-                    hist_xml = _extract_commercialsaas_history_xml(_dna_bytes)
+                    hist_xml = _extract_commercialsaas_history_xml(
+                        _dna_bytes, packets=_dna_packets)
                     if hist_xml:
                         # Stamp the file's OWN date (from its Notes packet)
                         # onto the dateless history root so the import's top
                         # History entry shows when the source file was made.
                         rec._dna_history_xml = _state._stamp_history_root_date_hook(
                             hist_xml,
-                            _extract_commercialsaas_file_date(_dna_bytes))
+                            _extract_commercialsaas_file_date(
+                                _dna_bytes, packets=_dna_packets))
                 except ValueError as exc:
                     _log.warning("dna history extract failed for %s: %s",
                                  path, exc)

@@ -107,8 +107,10 @@ class TestMigrateRoundTrip:
         assert plasmids
         reh = [sc._rehydrate_entry(p) for p in plasmids]
         assert all("LOCUS" in (r.get("gb_text") or "") for r in reh)  # blobs
-        assert any("HistoryTree" in (p.get("history_xml") or "")
-                   for p in plasmids)
+        # history_xml is now blob-dehydrated too (history_ref on disk), so check
+        # the REHYDRATED entries — same as the gb_text assertion above.
+        assert any("HistoryTree" in (r.get("history_xml") or "")
+                   for r in reh)
 
     def test_archive_layout(self, tmp_path):
         _seed()

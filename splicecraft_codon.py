@@ -482,6 +482,52 @@ def _codon_optimize(protein: str, raw: dict, *, stops: int = 1) -> str:
     return "".join(codon_at) + tail
 
 
+def _codon_swap_ok(seq: str, codon_start: int, alt: str, site: str, idx: int,
+                   all_forbidden, before_hits, maxlen: int,
+                   *, window: bool = True) -> bool:
+    """Decide whether replacing ``seq[codon_start:codon_start+3]`` with the
+    synonymous codon ``alt`` is an acceptable forbidden-site fix:
+
+      (1) it must REMOVE the target forbidden occurrence ``(site, idx)``, and
+      (2) it must introduce NO new forbidden hit anywhere.
+
+    ``window=True`` (production) rescans only the slice the 3-base swap could
+    affect; ``window=False`` rescans the whole candidate (the original logic),
+    kept as the equivalence ORACLE that `test_codon` compares against on
+    adversarial inputs. Both must return identical verdicts — this is a
+    zero-tolerance subsystem (a missed forbidden site corrupts a synthetic
+    gene), so the windowing is proven, not assumed.
+
+    Why the window is exact: `_forbidden_hit_set` is a LINEAR scan, so a hit
+    spanning ``[p, p+len)`` differs between before/after ONLY if it overlaps the
+    changed bases ``[codon_start, codon_start+3)`` — i.e. its start ``p`` lies in
+    ``[codon_start-maxlen+1, codon_start+2]`` (maxlen = longest forbidden site).
+    Outside that band before≡after, so the full diff equals the windowed diff,
+    and the target at ``idx`` (if removable at all) necessarily falls in it.
+    """
+    if window:
+        a_lo = max(0, codon_start - maxlen + 1)
+        a_hi = codon_start + 3                       # exclusive; affected starts
+        s_hi = min(len(seq), a_hi + maxlen - 1)      # cover a maxlen site's tail
+        # Candidate substring with the swap applied — no full-sequence rebuild.
+        sub = seq[a_lo:codon_start] + alt + seq[codon_start + 3:s_hi]
+        sub_hits = _forbidden_hit_set(sub, all_forbidden)
+        after_win = {(p, a_lo + off) for (p, off) in sub_hits if a_lo + off < a_hi}
+        # (1) The swap must reach idx AND the site must not survive there.
+        if not (a_lo <= idx < a_hi) or (site, idx) in after_win:
+            return False
+        # (2) New forbidden hits can only appear inside the window, so compare
+        #     `before` restricted to the same band — outside it is unchanged.
+        before_win = {(p, q) for (p, q) in before_hits if a_lo <= q < a_hi}
+        return not (after_win - before_win)
+    # ── Reference: full-sequence rescan (pre-optimization logic / test oracle).
+    cand = seq[:codon_start] + alt + seq[codon_start + 3:]
+    after_hits = _forbidden_hit_set(cand, all_forbidden)
+    if (site, idx) in after_hits:
+        return False
+    return not (after_hits - before_hits)
+
+
 def _codon_fix_sites(dna: str, protein: str, raw: dict,
                      sites: "dict | None" = None,
                      *, has_appended_stop: bool = True) -> tuple:
@@ -539,6 +585,9 @@ def _codon_fix_sites(dna: str, protein: str, raw: dict,
     # pattern anywhere (different enzyme, different strand, different
     # position — the check is global).
     all_forbidden = tuple(expanded.values())
+    # Longest forbidden site = the half-width of the window a 3-base codon swap
+    # can affect (see `_codon_swap_ok`). Computed once; the catalog is fixed.
+    maxlen = max((len(s) for s in all_forbidden), default=0)
     # Precompiled (cached) IUPAC matchers for the per-enzyme outer scan, so
     # a degenerate site is actually located (not literal-substring searched).
     site_pats = {nm: _iupac_pattern(st) for nm, st in expanded.items()}
@@ -579,19 +628,14 @@ def _codon_fix_sites(dna: str, protein: str, raw: dict,
                 for alt, frac in aa_codons.get(aa, []):
                     if alt == current:
                         continue
-                    test = dna_list[:]
-                    test[codon_start:codon_start + 3] = list(alt)
-                    test_seq = "".join(test)
-                    after_hits = _forbidden_hit_set(test_seq, all_forbidden)
-                    # (1) Target site at idx must be gone.
-                    if (site, idx) in after_hits:
+                    # Windowed forbidden-site check (see `_codon_swap_ok`):
+                    # rescans only the slice the 3-base swap can affect, not the
+                    # whole candidate — provably identical to the full rescan,
+                    # and the equivalence is pinned by test_codon's oracle test.
+                    if not _codon_swap_ok(seq, codon_start, alt, site, idx,
+                                          all_forbidden, before_hits, maxlen):
                         continue
-                    # (2) No new forbidden hit appears anywhere.
-                    #     (Existing hits elsewhere are fine — later
-                    #     iterations of this loop will process them.)
-                    if after_hits - before_hits:
-                        continue
-                    dna_list = test
+                    dna_list[codon_start:codon_start + 3] = list(alt)
                     strand = " (rc)" if enzyme.endswith("_rc") else ""
                     fixes.append(
                         f"{enzyme.replace('_rc', '')}{strand} at nt {idx+1}: "
