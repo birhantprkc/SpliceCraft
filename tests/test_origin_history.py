@@ -211,6 +211,86 @@ class TestOriginHistoryIntegration:
             assert root.parents, "edit must chain the pre-edit version"
             app.exit()
 
+    async def test_canvas_ctrl_s_preserves_and_appends_history(
+            self, tiny_record, isolated_library):
+        """The async canvas Ctrl+S worker (`action_save` -> `_save_worker`)
+        must follow the SAME construction-history contract as add_entry:
+        preserve a built plasmid's prior history across a re-save AND append
+        an editSequence step when the canvas sequence changed. Regression
+        for 'no history on clonings and mods' — this path used to write the
+        library entry with NO history field at all, silently dropping a
+        clone / mod / .dna lineage on the first Ctrl+S."""
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        from Bio.Seq import Seq
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            rec = app._current_record
+            rid = rec.id
+            # Stamp a rich construction history on the stored entry, the way
+            # a clone / mod save would, so the re-save must PRESERVE it.
+            prior = sc._build_origin_history_xml(
+                name=str(rec.name), seq_len=len(rec.seq), circular=True,
+                source="constructor:gb_l0")
+            assert prior
+            entries = sc._load_library()
+            assert any(e.get("id") == rid for e in entries)
+            for e in entries:
+                if e.get("id") == rid:
+                    e["history_xml"] = prior
+            sc._save_library(entries)
+            prev_len = len(rec.seq)
+            # Edit the loaded sequence and fire the async Ctrl+S worker.
+            rec.seq = rec.seq + Seq("GGGGGG")
+            app._unsaved = True
+            app._source_path = None        # library save, not a file
+            app.action_save()
+            for _ in range(12):
+                await pilot.pause(0.05)
+            entry = sc._find_library_entry_by_id(rid)
+            assert entry and entry.get("history_xml"), \
+                "canvas Ctrl+S dropped the construction history"
+            root = sc._parse_commercialsaas_history(entry["history_xml"])
+            assert root is not None
+            # An actual edit -> editSequence root chaining the pre-edit
+            # lineage (whose subtree preserves the prior history).
+            assert root.input_summaries[0]["manipulation"] == "editSequence"
+            assert root.seq_len == prev_len + 6
+            assert root.parents, "edit must chain the pre-edit lineage"
+            app.exit()
+
+    async def test_canvas_ctrl_s_no_edit_keeps_prior_history(
+            self, tiny_record, isolated_library):
+        """A canvas Ctrl+S with NO sequence change (e.g. a feature-only
+        tweak, or a reflexive save right after loading a built plasmid)
+        must keep the prior construction history verbatim — not drop it,
+        not spuriously append an edit node."""
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            rec = app._current_record
+            rid = rec.id
+            prior = sc._build_origin_history_xml(
+                name=str(rec.name), seq_len=len(rec.seq), circular=True,
+                source="constructor:gb_l0")
+            entries = sc._load_library()
+            for e in entries:
+                if e.get("id") == rid:
+                    e["history_xml"] = prior
+            sc._save_library(entries)
+            app._unsaved = True
+            app._source_path = None
+            app.action_save()              # no seq edit
+            for _ in range(12):
+                await pilot.pause(0.05)
+            entry = sc._find_library_entry_by_id(rid)
+            assert entry and entry.get("history_xml") == prior, \
+                "re-save without an edit must keep prior history verbatim"
+            app.exit()
+
 
 # ── in-place edit appends an editSequence step (user choice 2026-06-01) ──
 

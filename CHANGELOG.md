@@ -14,6 +14,15 @@
 
 ---
 
+## [1.0.98] — 2026-06-23
+
+### Bug fixes
+
+- **Assembled Transcription Units now show their individual parts, not one block.** Building a Golden Braid / MoClo TU from multi-feature L0 parts (a domesticated operon, or any part carrying several annotated genes) used to collapse each part into a single unnamed band on the finished plasmid. The TU now carries every part's real sub-features — promoter, RBS, CDS, terminator — each keeping its own name, position, **strand** (a reverse-strand gene stays reverse), and type, all the way into the saved plasmid. Single-element parts are unchanged.
+- **Modules (MODs) inherit every sub-feature from the TUs they're built from.** Assembling TUs into a higher-level module now surfaces all of the underlying genes individually — recursively through the whole build — instead of one block per TU, and no longer stacks a redundant whole-part band on top of the real genes. Older modules whose parts weren't individually annotated still get them reconstructed as before.
+- **Construction history is no longer lost on a plain Ctrl+S.** Saving a cloned, assembled, mutagenized, or imported `.dna` plasmid from the canvas used to silently drop its History — so the History tab read "no construction history" for plasmids that were genuinely built step by step. A canvas save now preserves the existing lineage and records an explicit "edited sequence" step whenever you actually change the DNA, so every manipulation shows up in the History tab.
+- **Heavily domesticated parts keep their gene annotations.** A part whose sequence was extensively site-cured during domestication (many internal restriction sites repaired) could lose all of its feature annotations when filed away, so it later assembled into a TU as one fused block. Such parts now re-anchor their features reliably — the genes survive into the TU — without ever risking a mis-placed annotation (an ambiguous or indel-containing match is still declined rather than guessed). The same now holds for a heavily **codon-optimized** part, where the sequence is rewritten too far to re-anchor at all: its genes are carried using the optimizer's own known mapping, so the annotations survive — while an unrelated sequence, which has no such provenance, is still declined.
+
 ## [1.0.97] — 2026-06-23
 
 ### New features

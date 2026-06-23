@@ -7425,6 +7425,38 @@ def _make_l0_tu_parts(suffix: str = "a") -> list[dict]:
     ]
 
 
+def _make_l0_tu_parts_with_feats(suffix: str = "a") -> list[dict]:
+    """`_make_l0_tu_parts` but each part carries `insert_feats` — the real
+    promoter / 5'UTR / CDS / terminator sub-features. The CDS part carries
+    TWO, including a REVERSE-strand gene, so the assembled TU / MOD must
+    surface each individually with the right strand (not one block per part,
+    not the whole-part name wrapper)."""
+    parts = _make_l0_tu_parts(suffix)
+    feats = {
+        f"P_{suffix}": ("Promoter", [
+            {"start": 0, "end": 30, "type": "promoter", "strand": 1,
+             "label": f"prom_{suffix}"}]),
+        f"U_{suffix}": ("5'UTR", [
+            {"start": 0, "end": 18, "type": "misc_feature", "strand": 1,
+             "label": f"utr_{suffix}"}]),
+        f"C_{suffix}": ("CDS", [
+            {"start": 0, "end": 18, "type": "CDS", "strand": 1,
+             "label": f"geneA_{suffix}"},
+            {"start": 18, "end": 36, "type": "CDS", "strand": -1,
+             "label": f"geneB_{suffix}_rev"}]),
+        f"T_{suffix}": ("Terminator", [
+            {"start": 0, "end": 24, "type": "terminator", "strand": 1,
+             "label": f"term_{suffix}"}]),
+    }
+    for p in parts:
+        ptype, pfeats = feats[p["name"]]
+        p["type"] = ptype
+        p["level"] = 0
+        p["grammar"] = "gb_l0"
+        p["insert_feats"] = [dict(f) for f in pfeats]
+    return parts
+
+
 class TestPartLevelHelpers:
     """`_part_level`, `_part_level_label`, and `_enzyme_for_level_up`
     are the foundation for the iterative GB cycle. Coverage matters
@@ -7688,6 +7720,124 @@ class TestCloneAssemblyIntoEntryVector:
         l3_seq = str(l3.seq).upper()
         cds_a = "ATGAAA" * 6  # TU_a's CDS
         assert (cds_a in l3_seq) or (cds_a in sc._rc(l3_seq))
+
+
+class TestAssemblyFeaturePreservation:
+    """Universal feature carry (INV-135): every modular cloning step must
+    surface each parent fragment's features (name / position / STRAND /
+    type) on the final plasmid — never a single whole-part block, never a
+    part-name wrapper stacked on the genes. Covers the L0->TU and the
+    recursive TU->MOD Golden Braid / MoClo path
+    (`_clone_assembly_into_entry_vector`). MoClo shares the path, so the
+    gb_l0 coverage carries over."""
+
+    _GB = "gb_l0"
+
+    @staticmethod
+    def _labels(rec):
+        return [(f.qualifiers.get("label") or [f.type])[0]
+                for f in rec.features if f.type != "source"]
+
+    def _tu(self, sfx, vec):
+        gb = sc._BUILTIN_GRAMMARS[self._GB]
+        return sc._clone_assembly_into_entry_vector(
+            _make_l0_tu_parts_with_feats(sfx), vec, gb,
+            source_level=0, name=f"TU_{sfx}")
+
+    def test_tu_surfaces_individual_subfeatures(self):
+        tu = self._tu("a", _make_l1_alpha_vector("alpha1", "TACA", "GACT"))
+        assert tu is not None
+        labels = self._labels(tu)
+        for want in ("prom_a", "utr_a", "geneA_a", "geneB_a_rev", "term_a"):
+            assert want in labels, f"{want} missing from TU: {labels}"
+        # No whole-part name wrapper stacked on top of the genes.
+        assert not ({"P_a", "U_a", "C_a", "T_a"} & set(labels)), labels
+
+    def test_tu_preserves_reverse_strand(self):
+        tu = self._tu("a", _make_l1_alpha_vector("alpha1", "TACA", "GACT"))
+        rev = [f for f in tu.features
+               if (f.qualifiers.get("label") or [""])[0] == "geneB_a_rev"]
+        assert rev and rev[0].location.strand == -1
+
+    def test_tu_without_insert_feats_keeps_per_part_feature(self):
+        # Back-compat: a part with NO insert_feats still gets exactly one
+        # named feature per part — never a featureless black box.
+        gb = sc._BUILTIN_GRAMMARS[self._GB]
+        tu = sc._clone_assembly_into_entry_vector(
+            _make_l0_tu_parts("a"),
+            _make_l1_alpha_vector("alpha1", "TACA", "GACT"),
+            gb, source_level=0, name="TU_plain")
+        assert tu is not None
+        assert {"P_a", "U_a", "C_a", "T_a"} <= set(self._labels(tu))
+
+    def test_mod_carries_all_subfeatures_without_duplication(
+            self, isolated_parts_bin):
+        gb = sc._BUILTIN_GRAMMARS[self._GB]
+        parts_a = _make_l0_tu_parts_with_feats("a")
+        parts_b = _make_l0_tu_parts_with_feats("b")
+        sc._save_parts_bin(parts_a + parts_b)   # so recon can find the bodies
+        tu_a = sc._clone_assembly_into_entry_vector(
+            parts_a, _make_l1_alpha_vector("alpha1", "TACA", "GACT"),
+            gb, source_level=0, name="TU_a")
+        tu_b = sc._clone_assembly_into_entry_vector(
+            parts_b, _make_l1_alpha_vector("alpha2", "GACT", "CCAA"),
+            gb, source_level=0, name="TU_b")
+        assert tu_a is not None and tu_b is not None
+        tu_a_src = {"name": "TU_a", "level": 1, "grammar": self._GB,
+                    "gb_text": sc._record_to_gb_text(tu_a),
+                    "source_parts": [p["name"] for p in parts_a]}
+        tu_b_src = {"name": "TU_b", "level": 1, "grammar": self._GB,
+                    "gb_text": sc._record_to_gb_text(tu_b),
+                    "source_parts": [p["name"] for p in parts_b]}
+        mod = sc._clone_assembly_into_entry_vector(
+            [tu_a_src, tu_b_src],
+            _make_l2_omega_vector("omega", "TACA", "CCAA"),
+            gb, source_level=1, name="MOD")
+        assert mod is not None
+        feats = [f for f in mod.features if f.type != "source"]
+        labels = [(f.qualifiers.get("label") or [f.type])[0] for f in feats]
+        # Every sub-feature from BOTH parent TUs reaches the MOD.
+        for want in ("prom_a", "utr_a", "geneA_a", "geneB_a_rev", "term_a",
+                     "prom_b", "utr_b", "geneA_b", "geneB_b_rev", "term_b"):
+            assert want in labels, f"{want} missing from MOD: {labels}"
+        # The whole-part reconstruction must NOT double the real genes.
+        for wrapper in ("P_a", "U_a", "C_a", "T_a",
+                        "P_b", "U_b", "C_b", "T_b"):
+            assert wrapper not in labels, \
+                f"part wrapper {wrapper} duplicated the sub-features: {labels}"
+        # No two MOD features share an identical span (a coarse duplicate).
+        spans = [(int(f.location.start), int(f.location.end)) for f in feats]
+        assert len(spans) == len(set(spans)), f"duplicate spans: {spans}"
+        # Reverse strand survived TWO assembly levels (L0 -> TU -> MOD).
+        rev = [f for f in feats
+               if (f.qualifiers.get("label") or [""])[0] == "geneB_a_rev"]
+        assert rev and rev[0].location.strand == -1
+
+    def test_augment_gapfills_when_tu_features_collapsed(
+            self, isolated_parts_bin):
+        # Fix 3's overlap-skip must NOT suppress the source_parts
+        # reconstruction when the TU carries no fine features (legacy data)
+        # or only a single collapsed whole-insert wrapper.
+        gb = sc._BUILTIN_GRAMMARS[self._GB]
+        bodyP, bodyC = "AAATTT" * 5, "ATGAAA" * 6
+        sc._save_parts_bin([
+            {"name": "Pleg", "sequence": bodyP, "oh5": "GGAG", "oh3": "AATG",
+             "type": "Promoter", "grammar": self._GB, "level": 0},
+            {"name": "Cleg", "sequence": bodyC, "oh5": "AATG", "oh3": "CGCT",
+             "type": "CDS", "grammar": self._GB, "level": 0},
+        ])
+        seq = bodyP + bodyC
+        src = {"name": "TUleg", "source_parts": ["Pleg", "Cleg"]}
+        # No marshalled features -> both parts reconstructed (gap-fill).
+        out = sc._assembly_fragment_augment_l0_features(seq, src, gb, [])
+        assert {"Pleg", "Cleg"} <= {f.get("label") for f in out}
+        # One collapsed whole-insert wrapper -> dropped, parts surface.
+        collapsed = [{"start": 0, "end": len(seq), "strand": 1,
+                      "type": "misc_feature", "label": "WHOLE"}]
+        out2 = sc._assembly_fragment_augment_l0_features(seq, src, gb,
+                                                         collapsed)
+        labels2 = {f.get("label") for f in out2}
+        assert "WHOLE" not in labels2 and {"Pleg", "Cleg"} <= labels2
 
 
 class TestLevelMatchesTab:
@@ -10544,6 +10694,70 @@ class TestFragmentSourceFeatures:
         assert sc._attach_insert_feats_to_record(
             rec, insert, [{"start": 0, "end": len(insert), "type": "CDS"}]) == 0
         assert not rec.features
+
+    def test_best_insert_offset_heavy_local_repair_anchors(self):
+        # INV-135 edge case: a heavily but LOCALLY domesticated insert — many
+        # same-length site cures (> the absolute substitution budget) between
+        # long verbatim stretches — must re-anchor via the unique-k-mer tier,
+        # not get rejected wholesale (which fused the part into one block).
+        rng = random.Random(0xC0FFEE)
+        orig = "".join(rng.choice("ACGT") for _ in range(600))
+        full = "GGGG" + orig + "CCCC"               # source, insert at offset 4
+        heavy = list(orig)
+        for p in range(20, 600, 32):                # ~18 spread substitutions
+            heavy[p] = next(c for c in "ACGT" if c != heavy[p])
+        heavy = "".join(heavy)
+        assert sum(a != b for a, b in zip(orig, heavy)) > 12   # over budget
+        assert sc._best_insert_offset(full, heavy) == 4
+
+    def test_best_insert_offset_refuses_indel(self):
+        # A single-base indel makes the two end-anchors imply DIFFERENT
+        # offsets — no longer a same-length repair, so refuse rather than
+        # mis-place every downstream feature.
+        rng = random.Random(0x1DE1)
+        orig = "".join(rng.choice("ACGT") for _ in range(400))
+        full = "GGGG" + orig + "CCCC"
+        indel = orig[:200] + "A" + orig[200:]       # +1 insertion mid-insert
+        assert sc._best_insert_offset(full, indel) is None
+
+    def test_best_insert_offset_refuses_mutation_dense(self):
+        # No clean k-mer anchor exists (a substitution every few bases) — no
+        # safe way to pin the offset, so refuse.
+        rng = random.Random(0x5EED)
+        orig = "".join(rng.choice("ACGT") for _ in range(400))
+        full = "GGGG" + orig + "CCCC"
+        dense = list(orig)
+        for p in range(0, 400, 6):
+            dense[p] = next(c for c in "ACGT" if c != dense[p])
+        assert sc._best_insert_offset(full, "".join(dense)) is None
+
+    def test_best_insert_offset_heavy_repair_recurring_region_refused(self):
+        # Even a heavily-repaired insert is refused when its region RECURS in
+        # the source (no unique anchor) — never guess which copy.
+        rng = random.Random(0xBEEF)
+        orig = "".join(rng.choice("ACGT") for _ in range(300))
+        heavy = list(orig)
+        for p in range(15, 300, 30):
+            heavy[p] = next(c for c in "ACGT" if c != heavy[p])
+        full = "GGGG" + orig + "TT" + orig + "CCCC"      # region appears twice
+        assert sc._best_insert_offset(full, "".join(heavy)) is None
+
+    def test_stamp_heavy_domesticated_part_keeps_features(self):
+        # End-to-end payoff: a part whose stored sequence is a heavily
+        # site-cured copy of its source still gets its features stamped (so the
+        # TU surfaces its genes instead of one fused block).
+        rng = random.Random(0xF00D)
+        orig = "".join(rng.choice("ACGT") for _ in range(450))
+        cured = list(orig)
+        for p in range(25, 450, 30):
+            cured[p] = next(c for c in "ACGT" if c != cured[p])
+        part = {"sequence": "".join(cured)}
+        feats = [{"start": 0, "end": 150, "type": "CDS", "label": "g1",
+                  "strand": 1},
+                 {"start": 150, "end": 300, "type": "CDS", "label": "g2",
+                  "strand": -1}]
+        assert sc._stamp_insert_feats_on_part(part, orig, feats) == 2
+        assert {x.get("label") for x in part["insert_feats"]} == {"g1", "g2"}
 
 
 class TestDomesticatorDualSaveWorker:

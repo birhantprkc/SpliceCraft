@@ -254,6 +254,62 @@ class TestStampInsertFeatsAnchoring:
         part = {"name": "op", "sequence": garbage}
         assert sc._stamp_insert_feats_on_part(part, src, feats) == 0
 
+    def _codon_optimized(self, length=450):
+        # A ~33% rewritten copy of a random source — no clean sequence anchor
+        # survives (like a heavily codon-optimized CDS).
+        import random
+        rng = random.Random(0xF15)
+        src = "".join(rng.choice("ACGT") for _ in range(length))
+        rec = list(src)
+        for p in range(0, length, 3):
+            rec[p] = next(c for c in "ACGT" if c != rec[p])
+        return src, "".join(rec)
+
+    def test_recoded_offset_trusts_byte_identical_template(self):
+        src, insert = self._codon_optimized()
+        assert sc._best_insert_offset(src, insert) is None        # no anchor
+        # Identical template + region → KNOWN offset (whole-seq and sub-region).
+        assert sc._recoded_insert_offset(src, (0, 450), src, insert) == 0
+        assert sc._recoded_insert_offset(
+            src, (50, 200), src, insert[50:200]) == 50
+
+    def test_recoded_offset_refuses_without_solid_provenance(self):
+        src, insert = self._codon_optimized()
+        # No marker, a different template, a length-changing transform, and a
+        # wrapping region all refuse — never a guessed coordinate.
+        assert sc._recoded_insert_offset("", (0, 450), src, insert) is None
+        assert sc._recoded_insert_offset(
+            "ACGT" * 113, (0, 450), src, insert) is None
+        assert sc._recoded_insert_offset(src, (0, 450), src, insert[:200]) is None
+        assert sc._recoded_insert_offset(src, (300, 50), src, insert) is None
+
+    def test_stamp_codon_optimized_part_via_provenance(self):
+        # End-to-end: a codon-optimized part with design provenance keeps its
+        # genes even though NO sequence anchor exists; the transient markers
+        # are consumed, never persisted.
+        src, insert = self._codon_optimized()
+        part = {"sequence": insert,
+                "_recoded_src": src, "_recoded_region": (0, 450)}
+        feats = [{"start": 0, "end": 150, "type": "CDS", "label": "g1",
+                  "strand": 1},
+                 {"start": 150, "end": 300, "type": "CDS", "label": "g2",
+                  "strand": -1}]
+        assert sc._stamp_insert_feats_on_part(part, src, feats) == 2
+        got = {x["label"]: x for x in part["insert_feats"]}
+        assert set(got) == {"g1", "g2"}
+        assert got["g2"]["strand"] == -1                  # strand preserved
+        assert "_recoded_src" not in part                 # consumed, not saved
+        assert "_recoded_region" not in part
+
+    def test_stamp_codon_optimized_without_marker_still_refused(self):
+        # The catastrophic-class guard holds: the same heavily-rewritten insert
+        # WITHOUT a provenance marker is refused (the fallback only trusts a
+        # byte-identical recorded template).
+        src, insert = self._codon_optimized()
+        part = {"sequence": insert}                        # no marker
+        feats = [{"start": 0, "end": 150, "type": "CDS", "label": "x"}]
+        assert sc._stamp_insert_feats_on_part(part, src, feats) == 0
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Clone Fragment handoff routing (async / Pilot)
