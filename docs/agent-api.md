@@ -81,15 +81,25 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   disambiguate), rename a plasmid's display name (`rename-plasmid` —
   fixes a name that got slugged to underscores), delete entries,
   copy-plasmid (copy an entry into another collection, name + features
-  intact, in one call), create / rename / delete collections, get / set
+  intact, in one call), move-plasmid (RELOCATE an entry between
+  collections atomically — no copy-then-delete data-loss round-trip;
+  handles the active collection on either side, re-staging the live
+  library mirror), create / rename / delete collections, get / set
   the active collection, list / set plasmid statuses.
 - **Parts** — list-parts, get-part, create-part / update-part (full
   parity with the Part editor — name / grammar / type / level / position /
   overhangs / sequence plus `backbone`, selection `marker`, and
   `fwd_primer` / `rev_primer` domestication primers, Tms derived),
-  delete-part, classify-part (overhang-pair lookup against every grammar);
-  list-parts-bins, set-active-parts-bin (switch the active named bin;
-  mirrors the bin into the live parts file).
+  delete-part, move-part (reassign a part to another bin in one atomic
+  call), classify-part (overhang-pair lookup against every grammar).
+  `create-part` / `list-parts` / `delete-part` accept a `{bin}` to file
+  into / read / prune just that named bin's own parts (a bin is a real
+  partition, not only for writes). Parts-bin containers:
+  list-parts-bins, create-parts-bin (the parts-side parallel to
+  create-collection), set-active-parts-bin (switch the active named bin;
+  mirrors the bin into the live parts file), rename-parts-bin,
+  delete-parts-bin (the deleted bin's parts go with it; the last bin
+  can't be removed; the active bin auto-promotes + re-mirrors).
 - **Design** — gibson-assemble, simulate-gibson, traditional-clone /
   simulate-traditional-cloning (restriction digest + ligation: excise the
   insert, digest the vector, try both fragments × both orientations, and
@@ -167,7 +177,9 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 - **Feature library** — list / get / create / update /
   delete-feature-library (reusable annotation snippets).
 - **Primer collections** — list-primer-collections, create-primer-collection
-  (the primer-side parallel to create-collection), set-active-primer-collection,
+  (the primer-side parallel to create-collection), rename-primer-collection,
+  delete-primer-collection (the last collection can't be removed; the active
+  one auto-promotes + re-mirrors), set-active-primer-collection,
   move-primer (reassign a primer to another collection in one atomic call),
   plus per-primer CRUD. `list-primers` / `get-primer` / `delete-primer` accept
   a `{collection}` to read or prune just that collection's own primers (a
@@ -178,9 +190,15 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   get-feature-colors / set-feature-color (the per-feature-type render
   colour overrides).
 - **Experiments lab notebook** — list / get / create / update /
-  delete experiment entries; attach-experiment-image (attach a
+  delete experiment entries; move-experiment (relocate an entry to
+  another project in one atomic call); attach-experiment-image (attach a
   server-side image file + embed it in the entry body); list / create /
   rename / delete projects; set active project (full notebook-layer CRUD).
+  `create-experiment` / `list-experiments` / `delete-experiment` accept a
+  `{project}` to file into / read / prune just that named project's own
+  entries (a project is a real partition, not only for writes; deleting
+  from the active project by name is refused — switch away first so the
+  live mirror stays consistent).
 - **Gels** — list / get / create / update / delete saved gel
   snapshots (in addition to simulate-gel for one-shot runs).
 - **Protein motifs** — list (built-ins + user overrides),

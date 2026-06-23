@@ -1050,6 +1050,238 @@ class TestPrimerCollectionReadsAndMove:
                                         {"name": "p0", "collection": "ProjA"})[1] == 409
 
 
+class TestContainerManagement:
+    """rename-/delete- for primer collections + parts bins — the container
+    side of full-CRUD parity. Renaming/deleting the ACTIVE container must
+    follow the active-pointer and swap the live mirror ([INV-83]); deleting
+    the last container is refused."""
+
+    def _h(self, name):
+        return sc._state._AGENT_HANDLERS[name][0]
+
+    # ── primer collections ──────────────────────────────────────────────
+    def test_rename_primer_collection(self):
+        for nm in ("Alpha", "Beta"):
+            self._h("create-primer-collection")(None, {"name": nm})
+        self._h("set-active-primer-collection")(None, {"name": "Alpha"})
+        self._h("create-primer")(None,
+                                 {"name": "p1", "sequence": "ACGT" * 5 + "GG"})
+        # rename a NON-active bin (case-insensitive lookup).
+        r = self._h("rename-primer-collection")(None,
+                                                {"name": "beta", "new_name": "Gamma"})
+        assert r["name"] == "Gamma" and r["renamed_from"] == "Beta"
+        # collision + unknown.
+        assert self._h("rename-primer-collection")(None,
+                                                   {"name": "Alpha", "new_name": "Gamma"})[1] == 409
+        assert self._h("rename-primer-collection")(None,
+                                                   {"name": "nope", "new_name": "X"})[1] == 404
+        # rename the ACTIVE collection → active-pointer follows, content kept.
+        self._h("rename-primer-collection")(None,
+                                            {"name": "Alpha", "new_name": "A2"})
+        assert sc._get_active_primer_collection_name() == "A2"
+        assert self._h("list-primers")(None, {"collection": "A2"})["count"] == 1
+
+    def test_delete_primer_collection(self):
+        for nm in ("Alpha", "Beta", "Delta"):
+            self._h("create-primer-collection")(None, {"name": nm})
+        self._h("set-active-primer-collection")(None, {"name": "Alpha"})
+        # delete a NON-active collection — active pointer untouched.
+        d = self._h("delete-primer-collection")(None, {"name": "Beta"})
+        assert d["deleted"] == "Beta" and d["promoted"] == ""
+        assert sc._get_active_primer_collection_name() == "Alpha"
+        # delete the ACTIVE collection → promote first remaining + mirror-swap.
+        d2 = self._h("delete-primer-collection")(None, {"name": "Alpha"})
+        assert d2["deleted"] == "Alpha" and d2["promoted"] != ""
+        assert sc._get_active_primer_collection_name() == d2["promoted"]
+        # can't delete the last remaining named collection.
+        last = sc._load_primer_collections()[0]["name"]
+        assert self._h("delete-primer-collection")(None, {"name": last})[1] == 409
+        assert self._h("delete-primer-collection")(None, {"name": "ghost"})[1] == 404
+
+    # ── parts bins ──────────────────────────────────────────────────────
+    def test_rename_parts_bin(self):
+        for nm in ("BinA", "BinB"):
+            self._h("create-parts-bin")(None, {"name": nm})
+        self._h("set-active-parts-bin")(None, {"name": "BinA"})
+        self._h("create-part")(None, {
+            "name": "part1", "sequence": "ACGTACGTACGT", "bin": "BinA"})
+        r = self._h("rename-parts-bin")(None,
+                                        {"name": "binb", "new_name": "BinG"})
+        assert r["name"] == "BinG" and r["renamed_from"] == "BinB"
+        assert self._h("rename-parts-bin")(None,
+                                           {"name": "BinA", "new_name": "BinG"})[1] == 409
+        self._h("rename-parts-bin")(None, {"name": "BinA", "new_name": "BinA2"})
+        assert sc._get_active_parts_bin_name() == "BinA2"
+        assert self._h("list-parts")(None, {"bin": "BinA2"})["count"] == 1
+
+    def test_delete_parts_bin(self):
+        for nm in ("BinA", "BinB", "BinD"):
+            self._h("create-parts-bin")(None, {"name": nm})
+        self._h("set-active-parts-bin")(None, {"name": "BinA"})
+        d = self._h("delete-parts-bin")(None, {"name": "BinB"})
+        assert d["deleted"] == "BinB" and d["promoted"] == ""
+        d2 = self._h("delete-parts-bin")(None, {"name": "BinA"})
+        assert d2["promoted"] != ""
+        assert sc._get_active_parts_bin_name() == d2["promoted"]
+        last = sc._load_parts_bin_collections()[0]["name"]
+        assert self._h("delete-parts-bin")(None, {"name": last})[1] == 409
+        assert self._h("delete-parts-bin")(None, {"name": "ghost"})[1] == 404
+
+
+class TestExperimentProjectCRUD:
+    """SC-M-class: create/list/delete-experiment honor a ``{project}`` scope
+    (a real partition, not silently filed into the active project), and
+    move-experiment relocates an entry without a create/delete data-loss
+    round-trip. Active-project writes stay mirror-consistent ([INV-83])."""
+
+    def _h(self, name):
+        return sc._state._AGENT_HANDLERS[name][0]
+
+    def _seed(self):
+        # Two named projects; ProjA active with one live entry.
+        self._h("create-experiment-project")(None, {"name": "ProjA"})
+        self._h("create-experiment-project")(None, {"name": "ProjB"})
+        self._h("set-active-experiment-project")(None, {"name": "ProjA"})
+        self._h("create-experiment")(None, {"title": "live A"})  # active ProjA
+
+    # ── create-experiment {project} files into the named project ─────────
+    def test_create_experiment_scoped_to_project(self):
+        self._seed()
+        r = self._h("create-experiment")(None,
+                                         {"title": "filed B", "project": "ProjB"})
+        assert r["ok"] and r["project"] == "ProjB"
+        # Landed in ProjB, NOT the active ProjA.
+        assert self._h("list-experiments")(None,
+                                           {"project": "ProjB"})["experiments"][0]["title"] == "filed B"
+        assert len(self._h("list-experiments")(None,
+                                               {"project": "ProjA"})["experiments"]) == 1
+        # Unknown project + bad type.
+        assert self._h("create-experiment")(None,
+                                            {"title": "x", "project": "Nope"})[1] == 404
+        assert self._h("create-experiment")(None,
+                                            {"title": "x", "project": 5})[1] == 400
+
+    # ── list-experiments {project} is a real read partition ──────────────
+    def test_list_experiments_scoped(self):
+        self._seed()
+        self._h("create-experiment")(None, {"title": "b1", "project": "ProjB"})
+        assert len(self._h("list-experiments")(None,
+                                              {"project": "ProjB"})["experiments"]) == 1
+        assert len(self._h("list-experiments")(None, {})["experiments"]) == 1  # active
+        assert self._h("list-experiments")(None, {"project": "Nope"})[1] == 404
+
+    # ── delete-experiment {project} prunes the named project ─────────────
+    def test_delete_experiment_scoped_and_active_guard(self):
+        self._seed()
+        r = self._h("create-experiment")(None,
+                                         {"title": "doomed", "project": "ProjB"})
+        eid = r["id"]
+        d = self._h("delete-experiment")(None, {"id": eid, "project": "ProjB"})
+        assert d["ok"] and d["project"] == "ProjB" and d["remaining"] == 0
+        # Deleting from the ACTIVE project by name → 409 (switch away first).
+        live = self._h("list-experiments")(None, {})["experiments"][0]["id"]
+        assert self._h("delete-experiment")(None,
+                                           {"id": live, "project": "ProjA"})[1] == 409
+        # Unknown project / unknown id.
+        assert self._h("delete-experiment")(None,
+                                           {"id": eid, "project": "Nope"})[1] == 404
+        assert self._h("delete-experiment")(None,
+                                           {"id": "exp-ffffffff", "project": "ProjB"})[1] == 404
+
+    # ── move-experiment never loses the entry ────────────────────────────
+    def test_move_experiment_no_data_loss(self):
+        self._seed()
+        live = self._h("list-experiments")(None, {})["experiments"][0]["id"]
+        r = self._h("move-experiment")(None,
+                                      {"id": live, "to": "ProjB", "from": "ProjA"})
+        assert r["ok"] and r["from"] == "ProjA" and r["to"] == "ProjB"
+        # Gone from ProjA (active, mirror re-synced), now in ProjB.
+        assert len(self._h("list-experiments")(None, {})["experiments"]) == 0
+        assert len(self._h("list-experiments")(None,
+                                              {"project": "ProjB"})["experiments"]) == 1
+
+    def test_move_experiment_errors(self):
+        self._seed()
+        live = self._h("list-experiments")(None, {})["experiments"][0]["id"]
+        assert self._h("move-experiment")(None,
+                                         {"id": live, "to": "Nope"})[1] == 404   # bad dest
+        assert self._h("move-experiment")(None, {"to": "ProjB"})[1] == 400        # no id
+        assert self._h("move-experiment")(None, {"id": live})[1] == 400           # no dest
+        # Auto-find from active, then same-project move → 409.
+        assert self._h("move-experiment")(None,
+                                         {"id": live, "to": "ProjA"})[1] == 409
+
+
+class TestMovePlasmid:
+    """The last container-CRUD parity gap: move-plasmid relocates a plasmid
+    between collections atomically (no copy/delete data-loss round-trip).
+    Unlike copy-plasmid it handles the ACTIVE collection on either side,
+    re-staging the live plasmid_library.json mirror ([INV-83])."""
+
+    def _ent(self, name, i):
+        return {"id": f"id-{name}-{i}", "name": name, "gb_text": "", "size": 80}
+
+    def _names(self, coll):
+        c = next(c for c in sc._load_collections() if c["name"] == coll)
+        return [p["name"] for p in c["plasmids"]]
+
+    def _lib(self):
+        return [p["name"] for p in sc._load_library()]
+
+    def _seed(self):
+        # CollC is the (neutral) active collection so non-active moves leave
+        # the live mirror untouched; CollA/CollB hold the movable plasmids.
+        sc._save_collections([
+            {"name": "CollA",
+             "plasmids": [self._ent("pA1", 1), self._ent("pA2", 2)],
+             "saved": "2026-01-01"},
+            {"name": "CollB", "plasmids": [self._ent("pB1", 1)],
+             "saved": "2026-01-01"},
+            {"name": "CollC", "plasmids": [], "saved": "2026-01-01"},
+        ])
+        sc._set_active_collection_name("CollC")
+        sc._restore_library_from_active_collection()
+
+    def test_move_between_non_active_collections(self):
+        self._seed()
+        r = sc._h_move_plasmid(None, {"name": "pA1", "to": "CollB"})
+        assert r["ok"] and r["from"] == "CollA" and r["to"] == "CollB"
+        assert self._names("CollA") == ["pA2"]
+        assert "pA1" in self._names("CollB")
+        assert self._lib() == []  # active CollC mirror untouched
+
+    def test_move_into_and_out_of_active_remirrors(self):
+        self._seed()
+        # Into active CollC → live mirror gains the plasmid.
+        sc._h_move_plasmid(None, {"name": "pB1", "to": "CollC", "from": "CollB"})
+        assert "pB1" in self._names("CollC") and self._lib() == ["pB1"]
+        # Out of active CollC → live mirror shrinks (L3-safe, no guard trip).
+        sc._h_move_plasmid(None, {"name": "pB1", "to": "CollA"})
+        assert self._lib() == [] and "pB1" in self._names("CollA")
+
+    def test_move_plasmid_guards(self):
+        self._seed()
+        assert sc._h_move_plasmid(None, {"name": "ghost", "to": "CollA"})[1] == 404
+        assert sc._h_move_plasmid(None, {"name": "pA2", "to": "Nope"})[1] == 404
+        assert sc._h_move_plasmid(None, {"to": "CollA"})[1] == 400
+        # already-in-target no-op.
+        assert sc._h_move_plasmid(None,
+                                  {"name": "pA2", "to": "CollA"})[1] == 409
+
+    def test_move_plasmid_ambiguous_and_collision(self):
+        sc._save_collections([
+            {"name": "X", "plasmids": [self._ent("dup", 1)], "saved": "2026-01-01"},
+            {"name": "Y", "plasmids": [self._ent("dup", 2)], "saved": "2026-01-01"},
+        ])
+        sc._set_active_collection_name("X")
+        sc._restore_library_from_active_collection()
+        # Same name in two collections → ambiguous without 'from'.
+        assert sc._h_move_plasmid(None, {"name": "dup", "to": "Y"})[1] == 409
+        # Name already present in target → refuse (no silent rename).
+        assert sc._h_move_plasmid(None,
+                                  {"name": "dup", "to": "Y", "from": "X"})[1] == 409
+
+
 class TestDataEnvelope:
     """SC-C: the dispatcher adds a predictable `data` field to success
     responses (pure helper `_agent_data_envelope`)."""

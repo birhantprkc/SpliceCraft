@@ -2787,8 +2787,19 @@ class _PrimerCollectionDeleteConfirmModal(_OneShotDismissScreen, ModalScreen):
 
 
 class _PrimerMoveCopyModal(_OneShotDismissScreen, ModalScreen):
-    """Pick a destination primer collection to move / copy primers into.
-    Dismisses with the chosen collection name (str) or None on cancel."""
+    """Pick a destination container to move / copy items into. Dismisses
+    with the chosen container name (str) or None on cancel.
+
+    Originally primer-collection-only; now a generic destination picker
+    reused for parts→bin and notebook-entry→project moves via the
+    ``item_singular`` / ``item_plural`` / ``dest_label`` params (all
+    default to the primer-collection wording, so existing callers are
+    unchanged). The destination rows are passed in by the caller already
+    filtered (e.g. every container except the active one).
+
+    Layout: the destination table and the Cancel button sit in a padded
+    box with a 1-char void on every side; the row picks on Enter or click,
+    so the picker stays a single uncluttered column."""
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel"),
@@ -2801,20 +2812,26 @@ class _PrimerMoveCopyModal(_OneShotDismissScreen, ModalScreen):
     #pmove-title { background: $accent-darken-2; color: $text; padding: 0 1; margin-bottom: 1; text-align: center; }
     #pmove-table { height: 14; margin-bottom: 1; }
     #pmove-btns { height: 3; align: right middle; }
+    #pmove-btns Button { margin: 0 1; min-width: 12; }
     """
 
     def __init__(self, mode: str, collections: "list[str]",
-                 count: int) -> None:
+                 count: int, *, item_singular: str = "primer",
+                 item_plural: str = "primers",
+                 dest_label: str = "collection") -> None:
         super().__init__()
         self._mode = mode
         self._collections = list(collections or [])
         self._count = count
+        self._item_singular = item_singular
+        self._item_plural = item_plural
+        self._dest_label = dest_label
 
     def compose(self) -> ComposeResult:
         verb = "Copy" if self._mode == "copy" else "Move"
-        plural = "s" if self._count != 1 else ""
+        noun = self._item_singular if self._count == 1 else self._item_plural
         with Vertical(id="pmove-box"):
-            yield Static(f" {verb} {self._count} primer{plural} to… ",
+            yield Static(f" {verb} {self._count} {noun} to… ",
                          id="pmove-title")
             yield DataTable(id="pmove-table", cursor_type="row")
             with Horizontal(id="pmove-btns"):
@@ -2825,7 +2842,7 @@ class _PrimerMoveCopyModal(_OneShotDismissScreen, ModalScreen):
             t = self.query_one("#pmove-table", DataTable)
         except NoMatches:
             return
-        t.add_column("Destination collection")
+        t.add_column(f"Destination {self._dest_label}")
         for name in self._collections:
             t.add_row(name, key=name)
         t.focus()

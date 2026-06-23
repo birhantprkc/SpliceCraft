@@ -1011,3 +1011,52 @@ class TestMenuIntegration:
 
     def test_class_blocks_undo(self):
         assert sc.ExperimentsScreen._blocks_undo is True
+
+
+class TestExperimentMoveToProjectCommit:
+    """GUI side of `move-experiment` —
+    ExperimentsScreen._commit_move_entry_to_project relocates an entry from
+    the active project to another, atomically, and re-mirrors the live
+    experiments.json so the moved entry leaves the notebook view."""
+
+    def _stub(self):
+        import types
+        return types.SimpleNamespace(
+            app=types.SimpleNamespace(notify=lambda *a, **k: None))
+
+    def _seed(self):
+        sc._save_experiment_projects([
+            {"name": "ProjA", "experiments": [
+                {"id": "exp-1", "title": "one"},
+                {"id": "exp-2", "title": "two"}], "saved": ""},
+            {"name": "ProjB", "experiments": [], "saved": ""},
+        ])
+        sc._set_active_project_name("ProjA")
+        sc._save_experiments([{"id": "exp-1", "title": "one"},
+                              {"id": "exp-2", "title": "two"}])
+
+    def _proj(self, name):
+        p = next(x for x in sc._load_experiment_projects()
+                 if x["name"] == name)
+        return [e["id"] for e in p["experiments"]]
+
+    def test_move_relocates_and_remirrors(self):
+        self._seed()
+        ok = sc.ExperimentsScreen._commit_move_entry_to_project(
+            self._stub(), "exp-1", "ProjB")
+        assert ok is True
+        assert self._proj("ProjA") == ["exp-2"]
+        assert self._proj("ProjB") == ["exp-1"]
+        # live experiments.json re-synced to the active (source) project
+        assert [e["id"] for e in sc._load_experiments()] == ["exp-2"]
+
+    def test_move_guards(self):
+        self._seed()
+        # entry not in the active project → no change
+        assert sc.ExperimentsScreen._commit_move_entry_to_project(
+            self._stub(), "exp-ghost", "ProjB") is False
+        assert self._proj("ProjA") == ["exp-1", "exp-2"]
+        # unknown destination project → no change
+        assert sc.ExperimentsScreen._commit_move_entry_to_project(
+            self._stub(), "exp-2", "Nope") is False
+        assert self._proj("ProjA") == ["exp-1", "exp-2"]

@@ -14,6 +14,20 @@
 
 ---
 
+## [1.0.97] — 2026-06-23
+
+### New features
+
+- **Full parts-bin management from the agent API.** Parts bins are now first-class containers, the same as plasmid collections: `create-parts-bin` makes a new named bin, `rename-parts-bin` / `delete-parts-bin` manage it (the last bin can't be removed; deleting the active bin promotes another and re-syncs the live parts view), and `move-part` reassigns a part to another bin in one atomic call. `create-part`, `list-parts`, and `delete-part` now take a `{bin}` so you can file into, read, or prune a specific bin's own parts — a bin is a real partition, not just whichever one is active.
+- **Move a plasmid between collections in one call.** A new `move-plasmid {name|id, to, from?}` relocates a plasmid to another collection atomically — no more copy-then-delete, which could lose the plasmid if the copy landed wrong before the delete removed the original. Unlike `copy-plasmid` it works with the active collection on either side, re-staging the live library view so it never drifts.
+- **Experiment projects are full containers too.** `create-experiment`, `list-experiments`, and `delete-experiment` now accept a `{project}` to file into / read / prune a specific project's own entries (not only the active one); `move-experiment` relocates an entry to another project atomically; and `rename` / `delete` of a project round out the management set (the last project can't be removed; deleting from the active project by name is refused so the live notebook stays consistent).
+- **Manage primer collections from the agent API.** `rename-primer-collection` and `delete-primer-collection` complete primer-collection management (the last collection can't be removed; deleting the active one promotes another and re-syncs the live primer list) — matching what plasmid collections already had.
+- **Move parts and notebook entries between containers in the GUI too.** The Parts Bin and the Experiments notebook each gain a "Move" button, so you can relocate a part to another bin (count-aware, so one of two duplicates moves just one) or a notebook entry to another project without leaving the TUI — the screen side of the `move-part` / `move-experiment` endpoints, matching the MOVE button plasmids and primers already had. Built-in catalog parts can't be moved (they live in the grammar module, not your bin). The Parts Bin button row was re-spaced and slimmed so all of its buttons fit on screen with a clear gap between each (the rightmost button could clip on the old fixed-width buttons).
+
+### Hardening
+
+- **Every container type now exposes the same operations from the agent.** Plasmid collections, primer collections, parts bins, and experiment projects all support create / list / move-item / rename-container / delete-container / set-active — so anything you can reorganise in the GUI you can script, with no remaining gaps. Item moves are atomic (the item is never momentarily absent), deleting a non-existent container reports "not found" rather than a confusing "can't delete the last one", and every operation that touches an active container re-stages its live mirror so the on-disk view never drifts.
+
 ## [1.0.96] — 2026-06-23
 
 ### Bug fixes

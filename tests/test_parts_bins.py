@@ -236,3 +236,65 @@ class TestMirrorSync:
         bins = sc._load_parts_bin_collections()
         # No "Ghost" entry materialised.
         assert {b["name"] for b in bins} == {"A"}
+
+
+class TestPartsMoveToBinCommit:
+    """GUI side of `move-part` — PartsBinModal._commit_part_move_to_bin moves
+    the active bin's selected parts into another bin, count-aware + deduped,
+    re-mirroring parts_bin.json so moved rows leave the live view."""
+
+    def _stub(self):
+        import types
+        return types.SimpleNamespace(
+            app=types.SimpleNamespace(notify=lambda *a, **k: None))
+
+    def _seed(self):
+        sc._save_parts_bin_collections([
+            {"name": "BinA", "parts": [
+                {"name": "pX", "sequence": "AAAA", "user": True},
+                {"name": "pY", "sequence": "CCCC", "user": True},
+                {"name": "pX", "sequence": "AAAA", "user": True}],  # duplicate
+             "saved": ""},
+            {"name": "BinB", "parts": [], "saved": ""},
+        ])
+        sc._set_active_parts_bin_name("BinA")
+        sc._safe_save_json_mirror(
+            sc._state._PARTS_BIN_FILE,
+            sc._load_parts_bin_collections()[0]["parts"], "Parts bin")
+        sc._state._parts_bin_cache = None
+
+    def _parts(self, name):
+        b = next(x for x in sc._load_parts_bin_collections()
+                 if x["name"] == name)
+        return [(p["name"], p["sequence"]) for p in b["parts"]]
+
+    def test_count_aware_single_duplicate_move(self):
+        from collections import Counter
+        self._seed()
+        n = sc.PartsBinModal._commit_part_move_to_bin(
+            self._stub(), Counter({("pX", "AAAA"): 1}), "BinB")
+        assert n == 1
+        # one of the two pX duplicates remains in the source
+        assert self._parts("BinA").count(("pX", "AAAA")) == 1
+        assert ("pX", "AAAA") in self._parts("BinB")
+        # the live mirror shrank to match the source bin
+        live = [(p["name"], p["sequence"]) for p in sc._load_parts_bin()]
+        assert live.count(("pX", "AAAA")) == 1
+
+    def test_dest_dedup_and_missing_bin(self):
+        from collections import Counter
+        sc._save_parts_bin_collections([
+            {"name": "A", "parts": [{"name": "d", "sequence": "GG",
+                                     "user": True}], "saved": ""},
+            {"name": "B", "parts": [{"name": "d", "sequence": "GG",
+                                     "user": True}], "saved": ""},
+        ])
+        sc._set_active_parts_bin_name("A")
+        # dest already has (d, GG) → removed from source, skipped at dest
+        n = sc.PartsBinModal._commit_part_move_to_bin(
+            self._stub(), Counter({("d", "GG"): 1}), "B")
+        assert n == 1
+        assert len(self._parts("B")) == 1            # dedup, not doubled
+        # unknown destination → no move, no crash
+        assert sc.PartsBinModal._commit_part_move_to_bin(
+            self._stub(), Counter({("d", "GG"): 1}), "Nope") == 0

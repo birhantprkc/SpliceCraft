@@ -40,7 +40,7 @@ from splicecraft_backup import (_list_pre_update_snapshots)
 from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len)
 from splicecraft_cloning import (_GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi)
 from splicecraft_codon import (_CODON_GENETIC_CODE, _codon_fetch_kazusa, _codon_optimize, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
-from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
+from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_parts_bin_collections, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
 from splicecraft_experiments import (_new_experiment_id, _normalise_experiment_entry, _sanitize_experiment_id)
 from splicecraft_fileio import (_PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
 from splicecraft_gels import (_new_gel_id, _normalise_gel_entry)
@@ -1482,6 +1482,121 @@ def _h_create_primer_collection(app, payload):
             "ignored": _agent_ignored_keys(payload, {"name", "description"})}
 
 
+@_agent_endpoint("rename-primer-collection", write=True)
+def _h_rename_primer_collection(app, payload):
+    """Rename a primer collection. Body: ``{name, new_name}`` (both
+    named collections; the reserved default is the empty string and
+    can't be renamed). Matching is case-insensitive; 404 if ``name``
+    is unknown, 409 if ``new_name`` collides with another collection.
+    If the renamed collection is the active one the active-pointer
+    follows, so later ``create-primer`` mirrors land in the right slot.
+    The GUI parallel is ``_rename_primer_collection`` (active-only); the
+    agent can rename any collection by name."""
+    old_in = payload.get("name")
+    if not isinstance(old_in, str) or not old_in.strip():
+        return ({"error": "missing 'name'"}, 400)
+    old = old_in.strip()
+    new = _normalize_collection_name(payload.get("new_name"))
+    if new is None:
+        return ({"error": "missing or invalid 'new_name'"}, 400)
+    # RMW under the cache lock — a concurrent GUI/agent rename of the same
+    # collection can't clobber via last-writer-wins (mirrors create-).
+    with _state._cache_lock:
+        colls = _load_primer_collections()
+        matched = next(
+            (c.get("name") or "" for c in colls
+             if (c.get("name") or "").strip().casefold() == old.casefold()),
+            None)
+        if matched is None:
+            valid = sorted(c.get("name") or "" for c in colls if c.get("name"))
+            return ({"error":
+                      f"unknown primer collection {old!r}; valid: {valid}"},
+                    404)
+        if (new.casefold() != matched.casefold()
+                and any((c.get("name") or "").strip().casefold()
+                        == new.casefold() for c in colls)):
+            return ({"error":
+                      f"primer collection {new!r} already exists"}, 409)
+        for c in colls:
+            if (c.get("name") or "") == matched:
+                c["name"] = new
+                break
+        if (err := _agent_save_or_500(
+                lambda: _save_primer_collections(colls),
+                "primer_collections")) is not None:
+            return err
+        if (_get_active_primer_collection_name() or "") == matched:
+            _set_active_primer_collection_name(new)
+            _state._settings_flush_sync_hook()
+    _log_event("primer_collection.rename", old=matched, new=new, via="agent")
+    return {"ok": True, "name": new, "renamed_from": matched}
+
+
+@_agent_endpoint("delete-primer-collection", write=True)
+def _h_delete_primer_collection(app, payload):
+    """Delete a named primer collection + its primers. Body: ``{name}``.
+    Refuses to delete the last remaining named collection (matches the
+    GUI last-collection guard); the reserved default ("") can't be
+    deleted. Matching is case-insensitive. If the deleted collection was
+    active, the first remaining collection is promoted to active and the
+    live ``primers.json`` mirror is swapped to its primers ([INV-83]).
+    The GUI parallel is ``_delete_primer_collection`` (active-only); the
+    agent can delete any non-active collection without touching the
+    mirror."""
+    name_in = payload.get("name")
+    if not isinstance(name_in, str) or not name_in.strip():
+        return ({"error": "missing 'name'"}, 400)
+    name = name_in.strip()
+    with _state._cache_lock:
+        colls = _load_primer_collections()
+        matched = next(
+            (c.get("name") or "" for c in colls
+             if (c.get("name") or "").strip().casefold() == name.casefold()),
+            None)
+        if matched is None:
+            valid = sorted(c.get("name") or "" for c in colls if c.get("name"))
+            return ({"error":
+                      f"unknown primer collection {name!r}; valid: {valid}"},
+                    404)
+        if len(colls) <= 1:
+            return ({"error":
+                      "cannot delete the last remaining primer collection"},
+                    409)
+        n = len(next((c.get("primers") or [] for c in colls
+                      if (c.get("name") or "") == matched), []))
+        remaining = [c for c in colls if (c.get("name") or "") != matched]
+        if (err := _agent_save_or_500(
+                lambda: _save_primer_collections(remaining),
+                "primer_collections")) is not None:
+            return err
+        # Auto-promote + mirror-swap stays under the same lock hold (RLock,
+        # so the inner load/save re-enter safely) — mirrors the
+        # delete-experiment-project auto-promote.
+        promoted = ""
+        if (_get_active_primer_collection_name() or "") == matched:
+            promoted = remaining[0].get("name") or ""
+            _set_active_primer_collection_name(promoted or None)
+            _state._settings_flush_sync_hook()
+            primers = [dict(p) for p in (remaining[0].get("primers") or [])
+                       if isinstance(p, dict)]
+            try:
+                # [INV-83] Mirror-swap to the promoted collection's primers.
+                _safe_save_json_mirror(
+                    _state._PRIMERS_FILE, primers, "Primer library")
+            except (OSError, RuntimeError) as exc:
+                # Source-of-truth write already succeeded; mirror self-heals
+                # on next reload. Log rather than swallow silently.
+                _log.warning(
+                    "agent primer-collection-delete: mirror-swap to promoted "
+                    "collection failed (self-heals on next reload): %s", exc)
+            _state._primers_cache = None
+    _log_event("primer_collection.delete", name=matched,
+                n_primers=n, via="agent", promoted=promoted)
+    return {"ok": True, "deleted": matched, "n_primers": n,
+            "promoted": promoted,
+            "remaining": [c.get("name") or "" for c in remaining]}
+
+
 @_agent_endpoint("move-primer", write=True)
 def _h_move_primer(app, payload):
     """Move a primer between collections WITHOUT a create/delete round-trip
@@ -2108,11 +2223,32 @@ def _parts_bin_entry_summary(p: dict) -> dict:
     }
 
 
+def _agent_parts_bin_list(bin_name):
+    """SC-M: the parts belonging to bin `bin_name`. Returns ``(list, None)``
+    or ``(None, (error_dict, status))``. ``bin_name`` empty / None → the ACTIVE
+    bin (live); a named bin → ITS OWN stored ``parts`` (so a bin is a real
+    partition for reads), 404 if it doesn't exist. Parallels
+    `_agent_primer_collection_list`."""
+    if bin_name in (None, ""):
+        return list(_iter_parts_bin_readonly()), None
+    if not isinstance(bin_name, str):
+        return None, ({"error": "'bin' must be a string"}, 400)
+    b = _find_parts_bin(bin_name.strip())
+    if b is None:
+        return None, ({"error":
+                        f"no parts bin named {bin_name.strip()!r}"}, 404)
+    return list(b.get("parts") or []), None
+
+
 @_agent_endpoint("list-parts")
 def _h_list_parts(app, payload):
-    """List parts in the active parts bin. Optional body:
-    ``{grammar?: str, level?: int, position?: str}`` filters. Returns
+    """List parts in a parts bin. Optional body:
+    ``{bin?, grammar?: str, level?: int, position?: str}``. Pass ``{bin: "X"}``
+    to list only bin X's OWN parts (SC-M); omit it for the active bin. Returns
     compact rows (no `gb_text`); call `get-part` for full content."""
+    parts_src, berr = _agent_parts_bin_list(payload.get("bin"))
+    if berr is not None:
+        return berr
     grammar = payload.get("grammar")
     level   = payload.get("level")
     position = payload.get("position")
@@ -2127,9 +2263,8 @@ def _h_list_parts(app, payload):
     if position is not None and not isinstance(position, str):
         return ({"error": "'position' must be string"}, 400)
     rows = []
-    # Sweep #26: readonly iter — `_parts_bin_entry_summary` builds a
-    # fresh dict from `p.get(...)` reads.
-    for p in _iter_parts_bin_readonly():
+    # `_parts_bin_entry_summary` builds a fresh dict from `p.get(...)` reads.
+    for p in parts_src:
         if grammar and (p.get("grammar") or "") != grammar:
             continue
         if lvl is not None and int(p.get("level") or 0) != lvl:
@@ -2137,7 +2272,9 @@ def _h_list_parts(app, payload):
         if position and (p.get("position") or "") != position:
             continue
         rows.append(_parts_bin_entry_summary(p))
-    return {"ok": True, "parts": rows, "count": len(rows)}
+    return {"ok": True, "parts": rows, "count": len(rows),
+            "bin": (payload.get("bin") or "").strip()
+                   if isinstance(payload.get("bin"), str) else ""}
 
 
 @_agent_endpoint("get-part")
@@ -2268,14 +2405,52 @@ def _agent_part_dict(payload: dict) -> "dict | str":
 
 @_agent_endpoint("create-part", write=True)
 def _h_create_part(app, payload):
-    """Add a part to the active parts bin. Body: see `_agent_part_dict`
-    for the schema. Returns 409 if a part with the same name + grammar
-    already exists — use `update-part` or pick a different name."""
+    """Add a part to a parts bin. Body: see `_agent_part_dict` for the part
+    schema, plus optional ``{bin}``.
+
+    Without ``bin`` the part lands in the ACTIVE bin. With ``bin`` it's filed
+    into that NAMED bin — and if the bin doesn't exist the call FAILS with 404
+    (create it first with `create-parts-bin`). SC-M: ``bin`` used to be
+    silently ignored, so a part the caller believed was filed into a project
+    bin actually landed in the active one. Returns 409 if a part with the same
+    ``(name, grammar)`` already exists in the target bin."""
     p = _agent_part_dict(payload)
     if isinstance(p, str):
         return ({"error": p}, 400)
+    bin_in = payload.get("bin")
     # Sweep #26: RMW under `_state._cache_lock`.
     with _state._cache_lock:
+        if bin_in not in (None, ""):
+            if not isinstance(bin_in, str):
+                return ({"error": "'bin' must be a string"}, 400)
+            bin_name = bin_in.strip()
+            if bin_name != (_get_active_parts_bin_name() or ""):
+                # File into a SPECIFIC non-active named bin: write its stored
+                # parts list directly (the live parts_bin.json mirror belongs
+                # to the ACTIVE bin and must stay untouched).
+                bins = _load_parts_bin_collections()
+                tgt = next((b for b in bins
+                            if (b.get("name") or "") == bin_name), None)
+                if tgt is None:
+                    return ({"error":
+                              f"no parts bin named {bin_name!r}; create it "
+                              f"with create-parts-bin"}, 404)
+                bucket = tgt.setdefault("parts", [])
+                for e in bucket:
+                    if (e.get("name") == p["name"]
+                            and (e.get("grammar") or "") == p["grammar"]):
+                        return ({"error":
+                                  f"part {p['name']!r} already exists in bin "
+                                  f"{bin_name!r} (grammar {p['grammar']!r}); "
+                                  f"use update-part or rename."}, 409)
+                bucket.append(p)
+                if (err := _agent_save_or_500(
+                        lambda: _save_parts_bin_collections(bins),
+                        "parts_bin_collections")) is not None:
+                    return err
+                return {"ok": True, "name": p["name"],
+                        "grammar": p["grammar"], "bin": bin_name}
+            # bin == active → fall through to the mirrored active path.
         entries = _load_parts_bin()
         for e in entries:
             if (e.get("name") == p["name"]
@@ -2289,7 +2464,8 @@ def _h_create_part(app, payload):
                 lambda: _save_parts_bin(entries),
                 "parts_bin")) is not None:
             return err
-    return {"ok": True, "name": p["name"], "grammar": p["grammar"]}
+    return {"ok": True, "name": p["name"], "grammar": p["grammar"],
+            "bin": _get_active_parts_bin_name() or ""}
 
 
 @_agent_endpoint("update-part", write=True)
@@ -2322,6 +2498,232 @@ def _h_update_part(app, payload):
         f"no part {p_new['name']!r}"
         + (f" in grammar {target_grammar!r}" if target_grammar else "")
     )}, 404)
+
+
+@_agent_endpoint("create-parts-bin", write=True)
+def _h_create_parts_bin(app, payload):
+    """Create a new (empty) named parts bin (SC-M) — the parts-side parallel
+    to `create-collection` / `create-primer-collection`. Body:
+    ``{name, description?}``.
+
+    Parts bins were creatable only in the GUI, so an agent could
+    `set-active-parts-bin` to *switch* but not *make* one. To put a project's
+    parts in their own bin: create it here, then file with
+    ``create-part {bin}`` (or switch to it with `set-active-parts-bin`). A name
+    already in use (case-insensitive) returns 409."""
+    name = _normalize_collection_name(payload.get("name"))
+    if name is None:
+        return ({"error": "missing or invalid 'name'"}, 400)
+    desc = _sanitize_note(payload.get("description"), max_len=2000)
+    with _state._cache_lock:
+        bins = _load_parts_bin_collections()
+        if any((b.get("name") or "").strip().casefold() == name.casefold()
+               for b in bins):
+            return ({"error": f"parts bin {name!r} already exists"}, 409)
+        bins.append({
+            "name":        name,
+            "description": desc,
+            "parts":       [],
+            "saved":       _date.today().isoformat(),
+        })
+        if (err := _agent_save_or_500(
+                lambda: _save_parts_bin_collections(bins),
+                "parts_bin_collections")) is not None:
+            return err
+    return {"ok": True, "name": name, "n_parts": 0,
+            "ignored": _agent_ignored_keys(payload, {"name", "description"})}
+
+
+@_agent_endpoint("rename-parts-bin", write=True)
+def _h_rename_parts_bin(app, payload):
+    """Rename a parts bin. Body: ``{name, new_name}``. Matching is
+    case-insensitive; 404 if ``name`` is unknown, 409 if ``new_name``
+    collides with another bin. If the renamed bin is the active one the
+    active-pointer follows so later ``create-part`` mirrors land in the
+    right slot. The parts parallel to ``rename-primer-collection``."""
+    old_in = payload.get("name")
+    if not isinstance(old_in, str) or not old_in.strip():
+        return ({"error": "missing 'name'"}, 400)
+    old = old_in.strip()
+    new = _normalize_collection_name(payload.get("new_name"))
+    if new is None:
+        return ({"error": "missing or invalid 'new_name'"}, 400)
+    with _state._cache_lock:
+        bins = _load_parts_bin_collections()
+        matched = next(
+            (b.get("name") or "" for b in bins
+             if (b.get("name") or "").strip().casefold() == old.casefold()),
+            None)
+        if matched is None:
+            valid = sorted(b.get("name") or "" for b in bins if b.get("name"))
+            return ({"error": f"unknown parts bin {old!r}; valid: {valid}"},
+                    404)
+        if (new.casefold() != matched.casefold()
+                and any((b.get("name") or "").strip().casefold()
+                        == new.casefold() for b in bins)):
+            return ({"error": f"parts bin {new!r} already exists"}, 409)
+        for b in bins:
+            if (b.get("name") or "") == matched:
+                b["name"] = new
+                break
+        if (err := _agent_save_or_500(
+                lambda: _save_parts_bin_collections(bins),
+                "parts_bin_collections")) is not None:
+            return err
+        if _get_active_parts_bin_name() == matched:
+            _set_active_parts_bin_name(new)
+            _state._settings_flush_sync_hook()
+    _log_event("parts_bin.rename", old=matched, new=new, via="agent")
+    return {"ok": True, "name": new, "renamed_from": matched}
+
+
+@_agent_endpoint("delete-parts-bin", write=True)
+def _h_delete_parts_bin(app, payload):
+    """Delete a named parts bin + its parts. Body: ``{name}``. Refuses to
+    delete the last remaining bin (one must always exist). Matching is
+    case-insensitive. If the deleted bin was active, the first remaining
+    bin is promoted to active and the live ``parts_bin.json`` mirror is
+    swapped to its parts ([INV-83]). The parts parallel to
+    ``delete-primer-collection`` / ``delete-experiment-project``."""
+    name_in = payload.get("name")
+    if not isinstance(name_in, str) or not name_in.strip():
+        return ({"error": "missing 'name'"}, 400)
+    name = name_in.strip()
+    with _state._cache_lock:
+        bins = _load_parts_bin_collections()
+        matched = next(
+            (b.get("name") or "" for b in bins
+             if (b.get("name") or "").strip().casefold() == name.casefold()),
+            None)
+        if matched is None:
+            valid = sorted(b.get("name") or "" for b in bins if b.get("name"))
+            return ({"error": f"unknown parts bin {name!r}; valid: {valid}"},
+                    404)
+        if len(bins) <= 1:
+            return ({"error":
+                      "cannot delete the last remaining parts bin"}, 409)
+        n = len(next((b.get("parts") or [] for b in bins
+                      if (b.get("name") or "") == matched), []))
+        remaining = [b for b in bins if (b.get("name") or "") != matched]
+        if (err := _agent_save_or_500(
+                lambda: _save_parts_bin_collections(remaining),
+                "parts_bin_collections")) is not None:
+            return err
+        promoted = ""
+        if _get_active_parts_bin_name() == matched:
+            promoted = remaining[0].get("name") or ""
+            _set_active_parts_bin_name(promoted or None)
+            _state._settings_flush_sync_hook()
+            parts = [p for p in (remaining[0].get("parts") or [])
+                     if isinstance(p, dict)]
+            try:
+                # [INV-83] Mirror-swap to the promoted bin's parts.
+                _safe_save_json_mirror(
+                    _state._PARTS_BIN_FILE, parts, "Parts bin")
+            except (OSError, RuntimeError) as exc:
+                _log.warning(
+                    "agent parts-bin-delete: mirror-swap to promoted bin "
+                    "failed (self-heals on next reload): %s", exc)
+            _state._parts_bin_cache = None
+            _state._clear_assembly_fragment_cache_hook()
+    _log_event("parts_bin.delete", name=matched,
+                n_parts=n, via="agent", promoted=promoted)
+    return {"ok": True, "deleted": matched, "n_parts": n,
+            "promoted": promoted,
+            "remaining": [b.get("name") or "" for b in remaining]}
+
+
+@_agent_endpoint("move-part", write=True)
+def _h_move_part(app, payload):
+    """Move a part between bins without a create/delete round-trip (SC-M, the
+    parts analog of `move-primer`). Body: ``{name|id, to, from?, grammar?}``.
+
+    Identifies the part by ``name`` (+ optional ``grammar`` to disambiguate),
+    removes it from ``from`` (auto-found if omitted; 409 if it's in more than
+    one bin) and adds it to ``to`` — atomically, under one lock. The active
+    bin's live mirror is re-synced when touched, so a move into/out of the
+    active bin stays consistent. 404 if the part or a bin is missing; 409 on an
+    ambiguous name or a ``(name, grammar)`` collision in ``to``."""
+    to_in = payload.get("to")
+    if not isinstance(to_in, str) or not to_in.strip():
+        return ({"error": "missing 'to' (a parts bin name)"}, 400)
+    to_name = to_in.strip()
+    name = _sanitize_label(payload.get("name") or payload.get("id"),
+                            max_len=200)
+    if not name:
+        return ({"error": "missing 'name' or 'id'"}, 400)
+    grammar = payload.get("grammar")
+    if grammar is not None and not isinstance(grammar, str):
+        return ({"error": "'grammar' must be a string"}, 400)
+    from_in = payload.get("from")
+
+    def _match(pp):
+        if pp.get("name") != name:
+            return False
+        if grammar and (pp.get("grammar") or "") != grammar:
+            return False
+        return True
+
+    with _state._cache_lock:
+        bins = _load_parts_bin_collections()
+        by_name = {(b.get("name") or ""): b for b in bins}
+        active = _get_active_parts_bin_name() or ""
+        if to_name not in by_name:
+            return ({"error":
+                      f"no parts bin named {to_name!r}; create it with "
+                      f"create-parts-bin"}, 404)
+        if isinstance(from_in, str) and from_in.strip():
+            from_name = from_in.strip()
+            if from_name not in by_name:
+                return ({"error": f"no parts bin named {from_name!r}"}, 404)
+        elif from_in in (None, ""):
+            cands = [bn for bn, b in by_name.items()
+                     if any(_match(pp) for pp in (b.get("parts") or []))]
+            if not cands:
+                return ({"error": "part not found in any bin"}, 404)
+            if len(cands) > 1:
+                return ({"error": "part is in multiple bins — pass 'from'",
+                          "bins": cands}, 409)
+            from_name = cands[0]
+        else:
+            return ({"error": "'from' must be a string"}, 400)
+        if from_name == to_name:
+            return ({"error": f"part already in {to_name!r}"}, 409)
+        src = by_name[from_name].get("parts") or []
+        idxs = [i for i, pp in enumerate(src) if _match(pp)]
+        if not idxs:
+            return ({"error": f"part {name!r} not found in {from_name!r}"}, 404)
+        if len(idxs) > 1:
+            return ({"error":
+                      f"{name!r} matches {len(idxs)} parts in {from_name!r} — "
+                      f"pass 'grammar' to pick one"}, 409)
+        part = dict(src[idxs[0]])
+        tgt = by_name[to_name].setdefault("parts", [])
+        if any(pp.get("name") == part.get("name")
+               and (pp.get("grammar") or "") == (part.get("grammar") or "")
+               for pp in tgt):
+            return ({"error":
+                      f"a part {part.get('name')!r} (grammar "
+                      f"{part.get('grammar')!r}) already exists in "
+                      f"{to_name!r}"}, 409)
+        del by_name[from_name]["parts"][idxs[0]]
+        tgt.append(part)
+        if (err := _agent_save_or_500(
+                lambda: _save_parts_bin_collections(bins),
+                "parts_bin_collections")) is not None:
+            return err
+        # Re-sync the live mirror if the ACTIVE bin's parts changed. Idempotent
+        # on the canonical record (writes the same parts back), and keeps
+        # parts_bin.json from drifting from the bin it mirrors.
+        if active in (from_name, to_name) and active in by_name:
+            ab = by_name[active].get("parts") or []
+            if (err := _agent_save_or_500(
+                    lambda: _save_parts_bin(ab), "parts_bin")) is not None:
+                return err
+    return {"ok": True, "name": name, "from": from_name, "to": to_name,
+            "grammar": part.get("grammar"),
+            "ignored": _agent_ignored_keys(
+                payload, {"name", "id", "to", "from", "grammar"})}
 
 
 def _agent_feature_dict(payload: dict) -> "dict | str":
@@ -3453,9 +3855,31 @@ def _h_create_experiment(app, payload):
     tags  = payload.get("tags") or []
     if not isinstance(tags, list):
         return ({"error": "'tags' must be a list of strings"}, 400)
+    proj_in = payload.get("project")
     # Sweep #26: RMW under `_state._cache_lock`.
     with _state._cache_lock:
-        entries = _load_experiments()
+        # Determine the target store: a SPECIFIC named project (SC-M-class —
+        # `project` used to be silently ignored, filing into the active one),
+        # or the active project's live store.
+        named_proj = None
+        projs = None
+        if proj_in not in (None, ""):
+            if not isinstance(proj_in, str):
+                return ({"error": "'project' must be a string"}, 400)
+            pname = proj_in.strip()
+            if pname != (_get_active_project_name() or ""):
+                projs = _load_experiment_projects()
+                named_proj = next((p for p in projs
+                                   if (p.get("name") or "") == pname), None)
+                if named_proj is None:
+                    return ({"error":
+                              f"no experiment project named {pname!r}; create "
+                              f"it with create-experiment-project"}, 404)
+                entries = named_proj.setdefault("experiments", [])
+            else:
+                entries = _load_experiments()
+        else:
+            entries = _load_experiments()
         existing_ids: set[str] = {
             e.get("id") for e in entries if e.get("id")  # type: ignore[misc]
         }
@@ -3467,13 +3891,20 @@ def _h_create_experiment(app, payload):
             "tags":    tags,
         }, fresh=True)
         entries.append(entry)
-        err = _agent_save_or_500(
-            lambda: _save_experiments(entries), "Experiments",
-        )
+        if named_proj is not None:
+            err = _agent_save_or_500(
+                lambda: _save_experiment_projects(projs),
+                "experiment_projects")
+        else:
+            err = _agent_save_or_500(
+                lambda: _save_experiments(entries), "Experiments")
         if err:
             return err
     _log_event("experiments.new", eid=new_id, via="agent")
-    return {"ok": True, "id": new_id, "experiment": _typed_clone(entry)}
+    return {"ok": True, "id": new_id, "experiment": _typed_clone(entry),
+            "project": (proj_in.strip()
+                        if isinstance(proj_in, str) and proj_in.strip()
+                        else _get_active_project_name() or "")}
 
 
 @_agent_endpoint("update-experiment", write=True)
@@ -5492,14 +5923,34 @@ def _h_design_primers(app, payload):
     return {"ok": True, "mode": mode, "result": result}
 
 
+def _agent_project_experiments_list(project):
+    """SC-M-class: the experiments belonging to project `project`. Empty/None
+    → the ACTIVE project (live); a named project → its OWN stored experiments
+    (a real partition for reads), 404 if missing. Parallels
+    `_agent_primer_collection_list`/`_agent_parts_bin_list`."""
+    if project in (None, ""):
+        return list(_load_experiments()), None
+    if not isinstance(project, str):
+        return None, ({"error": "'project' must be a string"}, 400)
+    p = _find_project(project.strip())
+    if p is None:
+        return None, ({"error":
+                        f"no experiment project named {project.strip()!r}"}, 404)
+    return list(p.get("experiments") or []), None
+
+
 @_agent_endpoint("list-experiments")
 def _h_list_experiments(app, payload):
-    """List entries in the active experiment project's notebook.
-    Returns id, title, tag list, timestamps + body byte length per
-    entry (omits `body_md` itself to keep responses small — fetch
-    via ``get-experiment``)."""
+    """List entries in an experiment project's notebook. Pass ``{project: "X"}``
+    to list only project X's own entries (SC-M); omit it for the active
+    project. Returns id, title, tag list, timestamps + body byte length per
+    entry (omits `body_md` itself to keep responses small — fetch via
+    ``get-experiment``)."""
+    src, perr = _agent_project_experiments_list(payload.get("project"))
+    if perr is not None:
+        return perr
     out: "list[dict]" = []
-    for e in _load_experiments():
+    for e in src:
         body = e.get("body_md") or ""
         body_bytes = len(body.encode("utf-8", errors="replace")) \
             if isinstance(body, str) else 0
@@ -5517,19 +5968,61 @@ def _h_list_experiments(app, payload):
             "attached_actions":     list(e.get("attached_actions") or []),
             "image_paths":          list(e.get("image_paths") or []),
         })
+    pj = payload.get("project")
     return {"experiments": out,
-            "active_project": _get_active_project_name() or ""}
+            "active_project": _get_active_project_name() or "",
+            "project": (pj.strip() if isinstance(pj, str) and pj.strip()
+                        else "")}
 
 
 @_agent_endpoint("delete-experiment", write=True)
 def _h_delete_experiment(app, payload):
-    """Delete a notebook entry by id. Removes the attachment dir
-    (`_EXPERIMENTS_DIR/<id>/`) too. Body: ``{id: str}``."""
+    """Delete a notebook entry by id, optionally scoped to a ``{project}``.
+    Without ``project`` it deletes from the active project; with ``project`` it
+    removes from THAT named project (SC-M). Refuses (409) to delete from a named
+    project while it's ACTIVE — switch away first. Removes the attachment dir
+    (`_EXPERIMENTS_DIR/<id>/`) too. Body: ``{id, project?}``."""
     eid = _sanitize_experiment_id(payload.get("id"))
     if eid is None:
         return ({"error": "missing or invalid 'id'"}, 400)
+    proj_in = payload.get("project")
     # Sweep #26: RMW under `_state._cache_lock`.
     with _state._cache_lock:
+        if proj_in not in (None, ""):
+            if not isinstance(proj_in, str):
+                return ({"error": "'project' must be a string"}, 400)
+            pname = proj_in.strip()
+            if pname == (_get_active_project_name() or ""):
+                return ({"error":
+                          f"{pname!r} is the active experiment project — "
+                          f"set-active-experiment-project to another before "
+                          f"deleting from it, so the live mirror stays "
+                          f"consistent"}, 409)
+            projs = _load_experiment_projects()
+            tgt = next((p for p in projs
+                        if (p.get("name") or "") == pname), None)
+            if tgt is None:
+                return ({"error":
+                          f"no experiment project named {pname!r}"}, 404)
+            entries = tgt.get("experiments") or []
+            new_entries = [e for e in entries if e.get("id") != eid]
+            if len(new_entries) == len(entries):
+                return ({"error":
+                          f"no experiment with id {eid!r} in project "
+                          f"{pname!r}"}, 404)
+            tgt["experiments"] = new_entries
+            err = _agent_save_or_500(
+                lambda: _save_experiment_projects(projs),
+                "experiment_projects")
+            if err:
+                return err
+            try:
+                _state._delete_experiment_attach_dir_hook(eid)
+            except OSError as exc:
+                _log.warning("agent delete-experiment: attach cleanup "
+                             "failed: %s", exc)
+            return {"ok": True, "id": eid, "remaining": len(new_entries),
+                    "project": pname}
         entries = _load_experiments()
         new_entries = [e for e in entries if e.get("id") != eid]
         if len(new_entries) == len(entries):
@@ -5549,6 +6042,77 @@ def _h_delete_experiment(app, payload):
     _log_event("experiments.delete", eid=eid, via="agent")
     return {"ok": True, "id": eid,
             "remaining": len(new_entries)}
+
+
+@_agent_endpoint("move-experiment", write=True)
+def _h_move_experiment(app, payload):
+    """Move a notebook entry between projects without a create/delete round-trip
+    (SC-M, the experiment analog of `move-primer`/`move-part`). Body:
+    ``{id, to, from?}``. Removes the entry from ``from`` (auto-found if omitted;
+    409 if it's in more than one project) and adds it to ``to`` — atomically.
+    The active project's live mirror is re-synced when touched. 404 if the entry
+    or a project is missing; 409 on an ambiguous id or an id already in ``to``."""
+    eid = _sanitize_experiment_id(payload.get("id"))
+    if eid is None:
+        return ({"error": "missing or invalid 'id'"}, 400)
+    to_in = payload.get("to")
+    if not isinstance(to_in, str) or not to_in.strip():
+        return ({"error": "missing 'to' (an experiment project name)"}, 400)
+    to_name = to_in.strip()
+    from_in = payload.get("from")
+    with _state._cache_lock:
+        projs = _load_experiment_projects()
+        by_name = {(p.get("name") or ""): p for p in projs}
+        active = _get_active_project_name() or ""
+        if to_name not in by_name:
+            return ({"error":
+                      f"no experiment project named {to_name!r}; create it "
+                      f"with create-experiment-project"}, 404)
+        if isinstance(from_in, str) and from_in.strip():
+            from_name = from_in.strip()
+            if from_name not in by_name:
+                return ({"error":
+                          f"no experiment project named {from_name!r}"}, 404)
+        elif from_in in (None, ""):
+            cands = [pn for pn, p in by_name.items()
+                     if any(e.get("id") == eid
+                            for e in (p.get("experiments") or []))]
+            if not cands:
+                return ({"error": "experiment not found in any project"}, 404)
+            if len(cands) > 1:
+                return ({"error":
+                          "experiment is in multiple projects — pass 'from'",
+                          "projects": cands}, 409)
+            from_name = cands[0]
+        else:
+            return ({"error": "'from' must be a string"}, 400)
+        if from_name == to_name:
+            return ({"error": f"experiment already in {to_name!r}"}, 409)
+        src = by_name[from_name].get("experiments") or []
+        idxs = [i for i, e in enumerate(src) if e.get("id") == eid]
+        if not idxs:
+            return ({"error":
+                      f"experiment {eid!r} not found in {from_name!r}"}, 404)
+        entry = dict(src[idxs[0]])
+        tgt = by_name[to_name].setdefault("experiments", [])
+        if any(e.get("id") == eid for e in tgt):
+            return ({"error":
+                      f"an experiment with id {eid!r} already exists in "
+                      f"{to_name!r}"}, 409)
+        del by_name[from_name]["experiments"][idxs[0]]
+        tgt.append(entry)
+        if (err := _agent_save_or_500(
+                lambda: _save_experiment_projects(projs),
+                "experiment_projects")) is not None:
+            return err
+        # Re-sync the live mirror if the ACTIVE project's entries changed.
+        if active in (from_name, to_name) and active in by_name:
+            ab = by_name[active].get("experiments") or []
+            if (err := _agent_save_or_500(
+                    lambda: _save_experiments(ab), "Experiments")) is not None:
+                return err
+    return {"ok": True, "id": eid, "from": from_name, "to": to_name,
+            "ignored": _agent_ignored_keys(payload, {"id", "to", "from"})}
 
 
 @_agent_endpoint("list-experiment-projects")
@@ -5672,11 +6236,11 @@ def _h_delete_experiment_project(app, payload):
     # Sweep #26: RMW under `_state._cache_lock`.
     with _state._cache_lock:
         projs = _load_experiment_projects()
+        if not any((p.get("name") or "").strip() == name for p in projs):
+            return ({"error": f"no project named {name!r}"}, 404)
         if len(projs) <= 1:
             return ({"error":
                       "cannot delete the last remaining project"}, 409)
-        if not any((p.get("name") or "").strip() == name for p in projs):
-            return ({"error": f"no project named {name!r}"}, 404)
         was_active = _get_active_project_name() == name
         new_projs = [p for p in projs if p.get("name") != name]
         err = _agent_save_or_500(
