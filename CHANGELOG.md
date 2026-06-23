@@ -14,6 +14,12 @@
 
 ---
 
+## [1.0.96] — 2026-06-23
+
+### Bug fixes
+
+- **Prune a primer collection.** `delete-primer` now accepts a `{collection}` to remove a primer from a named collection's own primers (it was default-only). Removing a primer that also lives elsewhere is safe — the other copy stays — so you can strip stale entries from a collection without losing the originals.
+
 ## [1.0.95] — 2026-06-23
 
 ### New features

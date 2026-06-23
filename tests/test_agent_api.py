@@ -1022,6 +1022,33 @@ class TestPrimerCollectionReadsAndMove:
         r = self._h("move-primer")(None, {"name": "m1", "to": "ProjA"})
         assert isinstance(r, tuple) and r[1] == 409
 
+    # ── delete-primer {collection}: prune a collection without data loss ──
+    def test_delete_primer_from_collection_keeps_dups_elsewhere(self):
+        self._seed()
+        # File a copy of a default primer (same sequence) INTO ProjA — the
+        # "mirror pollution" shape — then prune it from ProjA only.
+        self._h("create-primer")(None, {
+            "name": "dup", "sequence": "ACGT" * 5 + "AA", "collection": "ProjA"})
+        assert self._h("list-primers")(None, {"collection": "ProjA"})["count"] == 4
+        r = self._h("delete-primer")(None, {
+            "sequence": "ACGT" * 5 + "AA", "collection": "ProjA"})
+        assert r["ok"] and r["removed"] == 1 and r["collection"] == "ProjA"
+        # Gone from ProjA, but the original copy survives in the default lib.
+        assert self._h("list-primers")(None, {"collection": "ProjA"})["count"] == 3
+        assert self._h("get-primer")(None,
+                                     {"sequence": "ACGT" * 5 + "AA"})["primer"]["name"] == "m0"
+
+    def test_delete_primer_collection_guards(self):
+        self._seed()
+        assert self._h("delete-primer")(None,
+                                        {"name": "x", "collection": "Nope"})[1] == 404
+        assert self._h("delete-primer")(None,
+                                        {"name": "absent", "collection": "ProjA"})[1] == 404
+        # Active named collection → refuse (mirror safety).
+        self._h("set-active-primer-collection")(None, {"name": "ProjA"})
+        assert self._h("delete-primer")(None,
+                                        {"name": "p0", "collection": "ProjA"})[1] == 409
+
 
 class TestDataEnvelope:
     """SC-C: the dispatcher adds a predictable `data` field to success

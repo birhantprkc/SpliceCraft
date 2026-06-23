@@ -1306,48 +1306,84 @@ def _h_create_primer(app, payload):
 
 @_agent_endpoint("delete-primer", write=True)
 def _h_delete_primer(app, payload):
-    """Remove a primer from the library by ``{name}`` (or ``{id}``), or by
-    exact ``{sequence}``. Body: one of ``{name}`` / ``{id}`` / ``{sequence}``.
+    """Remove a primer by ``{name}`` (or ``{id}``) or exact ``{sequence}``,
+    optionally scoped to a ``{collection}``. Body: one of
+    ``{name}``/``{id}``/``{sequence}`` (+ optional ``collection``).
 
-    Deleting by name removes the single primer with that name (matches the
-    other ``delete-*`` verbs); if several primers share the name it returns
-    409 with their sequences so you can pick one via ``{sequence}``. Deleting
-    by sequence removes every primer with that exact sequence. 404 if no
-    match. The library write triggers the standard ``.bak`` rotation, so a
-    misclick is recoverable via Settings → Restore from backup."""
+    Without ``collection`` it deletes from the default / live library; with
+    ``collection`` it removes from THAT named collection's OWN primers — so
+    you can prune a collection (e.g. strip stale mirror-pollution) without
+    touching the default. Removing a primer that also lives in another
+    collection is safe: the other copy stays. By name → the one named primer
+    (409 if the name is ambiguous, listing sequences); by sequence → every
+    exact match. 404 if no match. Refuses (409) to delete from a named
+    collection while it's ACTIVE — switch to the default first so the live
+    mirror stays consistent. Each write triggers the standard ``.bak``
+    rotation (Settings → Restore from backup)."""
     seq = payload.get("sequence")
     name = payload.get("name") or payload.get("id")
+    has_seq = isinstance(seq, str) and bool(seq.strip())
+    has_name = isinstance(name, str) and bool(name.strip())
+    if not (has_seq or has_name):
+        return ({"error": "missing 'name', 'id', or 'sequence'"}, 400)
+    coll = payload.get("collection")
     # Sweep #26: RMW under `_state._cache_lock`.
     with _state._cache_lock:
-        entries = _load_primers()
-        if isinstance(seq, str) and seq.strip():
+        named = None
+        colls = None
+        if coll not in (None, ""):
+            if not isinstance(coll, str):
+                return ({"error": "'collection' must be a string"}, 400)
+            coll = coll.strip()
+            if coll == (_get_active_primer_collection_name() or ""):
+                return ({"error":
+                          f"{coll!r} is the active primer collection — "
+                          f"set-active-primer-collection to \"\" (default) "
+                          f"before deleting from it, so the live mirror stays "
+                          f"consistent"}, 409)
+            colls = _load_primer_collections()
+            named = next((c for c in colls
+                          if (c.get("name") or "") == coll), None)
+            if named is None:
+                return ({"error":
+                          f"no primer collection named {coll!r}"}, 404)
+            entries = named.get("primers") or []
+        else:
+            entries = _load_primers()
+        where = f" in collection {coll!r}" if named is not None else ""
+        if has_seq:
             target = seq.strip().upper()
             new_list = [e for e in entries
                         if (e.get("sequence") or "").upper() != target]
             if len(new_list) == len(entries):
-                return ({"error": f"no primer with sequence {target!r}"}, 404)
-        elif isinstance(name, str) and name.strip():
+                return ({"error":
+                          f"no primer with sequence {target!r}{where}"}, 404)
+        else:
             key = name.strip()
             matches = [e for e in entries if (e.get("name") or "") == key]
             if not matches:
-                return ({"error": f"no primer named {key!r}"}, 404)
+                return ({"error": f"no primer named {key!r}{where}"}, 404)
             if len(matches) > 1:
                 return ({"error":
-                          f"{key!r} matches {len(matches)} primers — pass "
-                          f"{{\"sequence\": …}} to pick one",
+                          f"{key!r} matches {len(matches)} primers{where} — "
+                          f"pass {{\"sequence\": …}} to pick one",
                           "sequences": [e.get("sequence", "")
                                          for e in matches]}, 409)
             # Remove exactly the matched primer (by identity), so a different
             # primer that happens to share its sequence is left intact.
             new_list = [e for e in entries if e is not matches[0]]
+        if named is not None:
+            named["primers"] = new_list
+            if (err := _agent_save_or_500(
+                    lambda: _save_primer_collections(colls),
+                    "primer_collections")) is not None:
+                return err
         else:
-            return ({"error":
-                      "missing 'name', 'id', or 'sequence'"}, 400)
-        if (err := _agent_save_or_500(
-                lambda: _save_primers(new_list),
-                "primers")) is not None:
-            return err
-    return {"ok": True, "removed": len(entries) - len(new_list)}
+            if (err := _agent_save_or_500(
+                    lambda: _save_primers(new_list), "primers")) is not None:
+                return err
+    return {"ok": True, "removed": len(entries) - len(new_list),
+            "collection": coll if named is not None else ""}
 
 
 @_agent_endpoint("list-primer-collections")

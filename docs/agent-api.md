@@ -169,9 +169,9 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 - **Primer collections** — list-primer-collections, create-primer-collection
   (the primer-side parallel to create-collection), set-active-primer-collection,
   move-primer (reassign a primer to another collection in one atomic call),
-  plus per-primer CRUD. `list-primers` / `get-primer` accept a `{collection}`
-  to read just that collection's own primers (a collection is a real partition
-  for reads, not only writes).
+  plus per-primer CRUD. `list-primers` / `get-primer` / `delete-primer` accept
+  a `{collection}` to read or prune just that collection's own primers (a
+  collection is a real partition, not only for writes).
 - **Data safety** — list-backups, restore-backup,
   list-pre-update-snapshots, restore-pre-update-snapshot.
 - **Settings** — get-settings, set-setting (allowlisted toggles);
