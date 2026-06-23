@@ -29,7 +29,7 @@ come from real cloning, and so do the fixes.
 - **Fast and local.** No Electron, no web app, no login. `pipx install splicecraft` and you're designing in seconds.
 - **It does the whole job.** View → edit → design → clone → simulate → verify → document — one tool that understands how those steps connect.
 - **It guards your data like it's irreplaceable** (because it is — see below).
-- **It's scriptable.** A 100+ endpoint local API and a stdlib CLI let an agent or a shell script drive every workflow.
+- **It's scriptable.** A 150+ endpoint local API and a stdlib CLI let an agent or a shell script drive every workflow.
 
 ## Quick start
 
@@ -240,7 +240,7 @@ one checksum-verified `.zip` to move between machines, and **Master Delete** is 
 triple-gated full wipe. **Settings** collects every toggle plus launchers for
 the grammar, entry-vector, enzyme-collection, and codon-table editors.
 
-Want to script all of this? A 130+ endpoint localhost JSON API
+Want to script all of this? A 150+ endpoint localhost JSON API
 (`splicecraft --agent`, or `--headless` for a no-UI / no-pty server with a
 `/healthz` readiness probe) and a stdlib-only CLI (`splicecraft-cli`,
 including a `call` passthrough to every endpoint) drive every workflow.

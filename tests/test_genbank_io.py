@@ -1429,3 +1429,107 @@ class TestMultiRecordFastaImport:
             modal._submit()
             await pilot.pause()
             assert app.screen_stack[-1] is not modal
+
+
+class TestLoadFileHyphenDisplayName:
+    """Loading a hyphenated file whose LOCUS got underscored (`FRAG-Ds3.gb`
+    with `LOCUS FRAG_Ds3`, the petunia running-log) must surface the
+    HYPHENATED filename as the display name, not the underscored LOCUS.
+
+    The mechanism: the LOCUS-safe `safe_stem` folds spaces AND hyphens to
+    `_` (matching the GenBank LOCUS charset), so `stem != safe_stem` fires
+    the `_tui_display_name` override for hyphenated names. [INV-98]"""
+
+    def _write_gb(self, path, locus, seq="ATGC" * 30):
+        # Hand-write a minimal GenBank with an explicitly UNDERSCORED LOCUS,
+        # reproducing how the petunia assembler emitted PCR-/FRAG- files.
+        body = (
+            f"LOCUS       {locus:<16} {len(seq)} bp    DNA     linear   UNK\n"
+            "FEATURES             Location/Qualifiers\n"
+            "ORIGIN\n"
+            f"        1 {seq.lower()}\n"
+            "//\n"
+        )
+        path.write_text(body, encoding="utf-8")
+
+    def test_hyphenated_filename_keeps_hyphen(self, tmp_path):
+        p = tmp_path / "FRAG-Ds3.gb"
+        self._write_gb(p, "FRAG_Ds3")
+        rec = sc.load_genbank(str(p))
+        assert rec.name == "FRAG_Ds3"                     # LOCUS as written
+        assert getattr(rec, "_tui_display_name", None) == "FRAG-Ds3"
+        assert sc.PlasmidApp._record_display_name(rec) == "FRAG-Ds3"
+
+    def test_pcr_prefix_name(self, tmp_path):
+        p = tmp_path / "PCR-DODA.gb"
+        self._write_gb(p, "PCR_DODA")
+        rec = sc.load_genbank(str(p))
+        assert sc.PlasmidApp._record_display_name(rec) == "PCR-DODA"
+
+    def test_plain_name_no_spurious_override(self, tmp_path):
+        # A filename that matches its LOCUS (no spaces/hyphens/truncation)
+        # must NOT get a display-name override — the LOCUS shows as-is.
+        p = tmp_path / "pUC19.gb"
+        self._write_gb(p, "pUC19")
+        rec = sc.load_genbank(str(p))
+        assert getattr(rec, "_tui_display_name", None) is None
+        assert sc.PlasmidApp._record_display_name(rec) == "pUC19"
+
+    def test_meaningful_locus_generic_filename_unchanged(self, tmp_path):
+        # Regression guard: a generic filename with a DIFFERENT meaningful
+        # LOCUS (not a mangled form of the stem) keeps showing the LOCUS —
+        # the fix must not hijack every load to the filename.
+        p = tmp_path / "sequence.gb"
+        self._write_gb(p, "NC_001416")
+        rec = sc.load_genbank(str(p))
+        assert getattr(rec, "_tui_display_name", None) is None
+        assert sc.PlasmidApp._record_display_name(rec) == "NC_001416"
+
+
+class TestDisplayNameCommentRoundTrip:
+    """SC-E: the human display name survives a gb_text / FILE round-trip via a
+    COMMENT marker, so an exported construct re-imports under its real name —
+    no `rename-plasmid` after every save."""
+
+    def _rec(self, name="FIRE 13 CAM RUBYFIRE-Binary", locus="FIRE_13_CAM_RUBY"):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        r = SeqRecord(Seq("ATGC" * 30), id=locus, name=locus,
+                      annotations={"molecule_type": "DNA", "topology": "circular"})
+        r._tui_display_name = name
+        return r
+
+    def test_gb_text_roundtrip_preserves_display_name(self):
+        gb = sc._record_to_gb_text(self._rec())
+        assert "SpliceCraft-name: FIRE 13 CAM RUBYFIRE-Binary" in gb
+        r2 = sc._gb_text_to_record(gb)
+        assert (sc.PlasmidApp._record_display_name(r2)
+                == "FIRE 13 CAM RUBYFIRE-Binary")
+
+    def test_stamp_is_idempotent(self):
+        r = self._rec()
+        once = sc._record_to_gb_text(r)
+        twice = sc._record_to_gb_text(sc._gb_text_to_record(once))
+        assert twice.count("SpliceCraft-name:") == 1
+
+    def test_file_roundtrip_beats_mangled_filename(self, tmp_path):
+        gb = sc._record_to_gb_text(self._rec())
+        p = tmp_path / "FIRE_13_CAM_RUBY.gb"        # mangled-LOCUS filename
+        p.write_text(gb, encoding="utf-8")
+        rec = sc.load_genbank(str(p))
+        # The COMMENT name wins over the underscored filename stem.
+        assert (sc.PlasmidApp._record_display_name(rec)
+                == "FIRE 13 CAM RUBYFIRE-Binary")
+
+    def test_no_stamp_without_display_name(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        r = SeqRecord(Seq("ATGC" * 10), id="pUC19", name="pUC19",
+                      annotations={"molecule_type": "DNA"})
+        gb = sc._record_to_gb_text(r)
+        assert "SpliceCraft-name:" not in gb
+        assert getattr(sc._gb_text_to_record(gb), "_tui_display_name", None) is None
+
+    def test_no_stamp_when_display_equals_locus(self):
+        assert "SpliceCraft-name:" not in sc._record_to_gb_text(
+            self._rec(name="pUC19", locus="pUC19"))

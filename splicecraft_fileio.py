@@ -33,6 +33,7 @@ from splicecraft_util import (
 )
 from splicecraft_record import (
     _GB_LOCUS_NAME_MAX, _gb_text_to_record, _normalize_primer_seq, _record_to_gb_text,
+    _restore_display_name_from_comment,
 )
 from splicecraft_history import _CommercialSaaSHistoryNode, _history_human_dt
 from splicecraft_net import _NCBI_TIMEOUT_S, _sanitize_accession
@@ -3144,14 +3145,31 @@ def load_genbank(path: str):
     # filename stem could otherwise bake into the LOCUS (rec.name/id) or the
     # display name; it preserves internal spaces, so the no-underscore rule
     # still holds.
-    safe_stem = _sanitize_label(stem.replace(" ", "_"), max_len=16) or "plasmid"
+    #
+    # GenBank LOCUS names allow only letters/digits/underscore, and
+    # Biopython's writer maps BOTH spaces AND hyphens to "_" (so an exported
+    # `FRAG-CYP76AD6` round-trips with LOCUS `FRAG_CYP76AD6`). `_sanitize_label`
+    # KEEPS hyphens, so replacing only spaces left hyphenated filenames
+    # (`FRAG-…`/`PCR-…`, the petunia running-log) with `stem == safe_stem` —
+    # the display-name override below never fired and the underscored LOCUS
+    # won. Folding hyphens in too makes `safe_stem` a faithful LOCUS form, so
+    # the override preserves the hyphenated filename as the display name (and a
+    # backfilled rec.name/id can never carry a LOCUS-invalid hyphen). [INV-98]
+    safe_stem = _sanitize_label(
+        stem.replace(" ", "_").replace("-", "_"), max_len=16) or "plasmid"
     if not rec.id or rec.id.startswith("<unknown"):
         rec.id = safe_stem
     if not rec.name or rec.name.startswith("<unknown"):
         rec.name = safe_stem
+    # SC-E: a `.gb` SpliceCraft itself exported carries the real display name
+    # in a COMMENT marker — the MOST authoritative source (it's the construct's
+    # true identity, regardless of how the file got named). Restore it FIRST so
+    # it wins over the filename stem below. `SeqIO.parse` was used here (not
+    # `_gb_text_to_record`), so this path needs its own restore call. [INV-98]
+    _restore_display_name_from_comment(rec)
     # Display-name override: whenever the LOCUS-safe form differs from
-    # the real filename stem — because the stem carried spaces, OR was
-    # longer than the 16-char LOCUS cap, OR held chars the sanitiser
+    # the real filename stem — because the stem carried spaces or hyphens,
+    # OR was longer than the 16-char LOCUS cap, OR held chars the sanitiser
     # dropped — keep the FULL stem visible in the UI. Pre-2026-06-22 this
     # only fired when the stem contained a space, so an underscored long
     # filename like `My_Long_Plasmid_v2` silently saved under the
@@ -3159,8 +3177,9 @@ def load_genbank(path: str):
     # full stem can itself carry underscores (the user's real filename) —
     # that's fine; the no-underscore rule only forbids LETTING the LOCUS
     # sanitisation mangle a spaced name. _apply_record / library_load
-    # both read this attr. [INV-98 / INV-15]
-    if stem != safe_stem:
+    # both read this attr. Gated on the COMMENT restore: a SpliceCraft-stamped
+    # name already set above wins over the filename stem. [INV-98 / INV-15]
+    if stem != safe_stem and not getattr(rec, "_tui_display_name", None):
         try:
             rec._tui_display_name = _sanitize_label(stem, max_len=200)
         except Exception:

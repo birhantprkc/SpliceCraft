@@ -14,6 +14,36 @@
 
 ---
 
+## [1.0.94] — 2026-06-22
+
+### New features
+
+- **More of the workbench is now drivable from the agent API / CLI.** Eight new endpoints close gaps where a GUI ability had no agent counterpart:
+  - `new-plasmid` — create a plasmid from a raw sequence (the Ctrl+N "New Plasmid" flow) and load it onto the canvas, optional features included.
+  - `undo` / `redo` — revert or replay the last canvas edit (Ctrl+Z / Ctrl+Y).
+  - `create-primer-collection` — make a named primer collection (the primer-side parallel to `create-collection`); switch to it with `set-active-primer-collection` and your `create-primer` calls land there.
+  - `get-feature-colors` / `set-feature-color` — read or change the per-feature-type render colour.
+  - `multi-align` — pairwise-align the loaded plasmid (or a given sequence) against many targets at once (the Alt+A multi-align overlay).
+  - `attach-experiment-image` — attach an image file to a lab-notebook entry and embed it in the body.
+  - `copy-plasmid` — copy a plasmid into another collection (name + features intact) in one call, instead of the load → switch-collection → add dance.
+- **Add/edit a feature with its full styling from the agent API.** `add-feature` and `update-feature` now accept the **arrow type** (forward ▶ / reverse ◀ / arrowless / double-stranded ◀▶), a **colour**, and arbitrary **GenBank qualifiers** — not just the label, type, and span. Full parity with the Insert/Edit Feature dialog.
+- **Set a part's vector + domestication primers from the agent API.** `create-part` / `update-part` now accept `backbone`, `marker`, `fwd_primer`, and `rev_primer` (with the Tms derived automatically), matching the Part editor's Edit mode.
+- **Traditional restriction cloning from the agent API.** `simulate-traditional-cloning` digests a vector and insert with your chosen enzymes and ligates them (the restriction-cloning counterpart to `simulate-gibson`); `traditional-clone` runs it and saves the product to the library (counterpart to `gibson-assemble`). It's a real digest + ligation — both vector fragments and both insert orientations are tried, and when more than one product is possible the call refuses and lists the options rather than guessing by fragment size.
+- **Golden Gate / MoClo (Type IIS) assembly from the agent API.** `simulate-golden-gate` digests your parts + destination vector with a Type IIS enzyme (BsaI by default — also BsmBI / BbsI / SapI / Esp3I) and chains the released fragments by their 4-nt overhangs into a circular product; `golden-gate-assemble` runs it and saves the product. Parts can be given in **any order** — the overhangs set the order — and it flags fidelity problems (a non-unique junction overhang, a residual enzyme site that would re-cut).
+
+### Bug fixes
+
+- **Hyphenated plasmid names keep their hyphens on import.** Loading a file like `PCR-DODA.gb` or `FRAG-Ds3.gb` — whose GenBank `LOCUS` line had collapsed the name to `PCR_DODA` — used to file it under the underscored name. The real hyphenated filename is now preserved as the display name (the `LOCUS` stays underscore-safe; only the human display name changes).
+- **A plasmid's display name now survives an export → re-import.** The human name (spaces, hyphens, length the `LOCUS` line can't hold) is stamped into the GenBank `COMMENT`, so a construct you save and reload keeps its real name instead of coming back as the underscored, 16-char `LOCUS` — no more renaming after every round-trip.
+- **Delete a primer by name.** `delete-primer` now accepts `{name}` (or `{id}`), not only an exact `{sequence}` match; an ambiguous name lists the candidates so you can pick one.
+
+### Hardening
+
+- **A stale `--agent` daemon is flagged loudly — and can restart itself.** After `splicecraft update`, a long-running daemon keeps serving the OLD code until restarted. `status` now reports `installed_version` alongside the running `version` plus a `stale` flag, AND every response carries a `_stale` warning when the running version is behind the installed one. A new `restart` endpoint re-execs a **headless** daemon (it comes back on the same port — poll `/healthz`) so it picks up the update without a manual kill/relaunch; in a GUI session it refuses (it would lose the live view).
+- **A predictable `data` field on every response.** Endpoints bury their result under per-endpoint keys (`seq` / `library` / `sites` / `matches` / …). Every success response now also carries `data` = the result with the envelope/metadata stripped (a scalar or list lands directly under `data`), so a client can read one predictable path. Non-breaking — the original keys all stay.
+- **`create-primer` no longer silently drops a `collection`.** Passing `{collection}` now files the primer into that named collection (or fails with 404 if it doesn't exist) instead of returning `ok:true` while quietly filing it into the default — an outcome-changing parameter is never ignored.
+- **Consistent parameter names across endpoints.** The "DNA to act on" now accepts a common `sequence` alias on `design-primers` / `design-mutagenesis` / `design-rbs` / `rbs-strength` (alongside their existing keys), and `diff-plasmid` / `transfer-annotations` accept each other's `target_id` / `source_id` plus a plain `id` — so the natural guess works.
+
 ## [1.0.93] — 2026-06-22
 
 ### New features

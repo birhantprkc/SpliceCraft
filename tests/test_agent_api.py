@@ -38,6 +38,7 @@ import json
 import socket
 import threading
 import time
+import types
 import urllib.error
 import urllib.request
 
@@ -138,6 +139,15 @@ class MockApp:
         label = (entry.get("name") or "").strip()
         if label and "label" not in qualifiers:
             qualifiers["label"] = [label]
+        # Mirror the real `_annotate_with_feature_impl`: strand=2 (double-
+        # stranded ◀▶) persists via a SpliceCraft_strand qualifier, and a
+        # picked colour writes the ApEinfo_*color pair.
+        if strand == 2:
+            qualifiers["SpliceCraft_strand"] = ["double"]
+        new_color = entry.get("color")
+        if isinstance(new_color, str) and new_color.strip():
+            qualifiers["ApEinfo_fwdcolor"] = [new_color.strip()]
+            qualifiers["ApEinfo_revcolor"] = [new_color.strip()]
         new_feat = SeqFeature(loc, type=feat_type, qualifiers=qualifiers)
         new_rec = deepcopy(self._current_record)
         new_rec.features.append(new_feat)
@@ -218,6 +228,68 @@ class TestStatusHandler:
         assert sc._h_status(tiny_app, {})["dirty"] is True
 
 
+class TestStatusVersionSkew:
+    """Stale-daemon detection (petunia agent-API running-log): `status`
+    surfaces the on-disk installed version next to the running one so an
+    agent notices when `splicecraft update` upgraded the package under a
+    still-running `--agent` daemon (which keeps serving the old code)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_cache(self):
+        saved = dict(sc._INSTALLED_VERSION_CACHE)
+        sc._INSTALLED_VERSION_CACHE.update(version=None, ts=0.0, inflight=False)
+        yield
+        sc._INSTALLED_VERSION_CACHE.clear()
+        sc._INSTALLED_VERSION_CACHE.update(saved)
+
+    def test_running_version_present_and_aliases_version(self):
+        s = sc._h_status(MockApp(), {})
+        assert s["running_version"] == sc.__version__ == s["version"]
+
+    def test_no_live_daemon_means_no_subprocess(self, monkeypatch):
+        # Pure-handler path: no live app/daemon → installed unknown, never
+        # stale, and the background refresh is NOT spawned (keeps the whole
+        # test suite from shelling out on every status call). Force the
+        # liveness gate to "no app" — an earlier async test may have left a
+        # real `_LIVE_APP_REF` set, and that gate is what decides whether the
+        # off-thread refresh fires.
+        monkeypatch.setattr(sc._state, "_LIVE_APP_REF",
+                            types.SimpleNamespace(get=lambda: None))
+        s = sc._h_status(MockApp(), {})
+        assert s["installed_version"] is None
+        assert s["stale"] is False
+        assert sc._INSTALLED_VERSION_CACHE["inflight"] is False
+
+    def test_stale_flag_when_installed_differs(self, monkeypatch):
+        monkeypatch.setattr(sc, "_installed_version_cached",
+                            lambda: "0.0.0-other")
+        s = sc._h_status(MockApp(), {})
+        assert s["installed_version"] == "0.0.0-other"
+        assert s["stale"] is True
+
+    def test_not_stale_when_installed_matches_running(self, monkeypatch):
+        monkeypatch.setattr(sc, "_installed_version_cached",
+                            lambda: sc.__version__)
+        assert sc._h_status(MockApp(), {})["stale"] is False
+
+    def test_blocking_helper_reads_query(self, monkeypatch):
+        monkeypatch.setattr(sc, "_query_installed_version",
+                            lambda timeout=8.0: "1.2.3")
+        assert sc._installed_version_cached(blocking=True) == "1.2.3"
+
+    def test_cache_ttl_serves_without_requery(self, monkeypatch):
+        calls = []
+
+        def _q(timeout=8.0):
+            calls.append(1)
+            return "5.5.5"
+        monkeypatch.setattr(sc, "_query_installed_version", _q)
+        v1 = sc._installed_version_cached(blocking=True)   # 1 query
+        v2 = sc._installed_version_cached()                # within TTL → cache
+        assert v1 == v2 == "5.5.5"
+        assert len(calls) == 1
+
+
 class TestToolsHandler:
     def test_lists_registered_endpoints(self):
         result = sc._h_tools(None, {})
@@ -268,12 +340,61 @@ class TestAddFeatureHandler:
         assert "out of range" in payload["error"]
 
     def test_validates_strand(self, tiny_app):
+        # 7 is not a valid arrow type (only -1/0/1/2 are).
         result = sc._h_add_feature(
-            tiny_app, {"start": 0, "end": 10, "strand": 2}
+            tiny_app, {"start": 0, "end": 10, "strand": 7}
         )
         payload, status = result
         assert status == 400
         assert "strand" in payload["error"]
+
+    def test_strand_2_double_stranded_accepted(self, tiny_app):
+        # Arrow-type parity with the UI: strand=2 (double-stranded ◀▶) is
+        # valid and persists the SpliceCraft_strand qualifier.
+        result = sc._h_add_feature(
+            tiny_app, {"start": 0, "end": 9, "strand": 2, "label": "ds"})
+        assert isinstance(result, dict) and result["strand"] == 2
+        feat = tiny_app._current_record.features[-1]
+        assert feat.qualifiers.get("SpliceCraft_strand") == ["double"]
+
+    def test_strand_0_arrowless_accepted(self, tiny_app):
+        result = sc._h_add_feature(
+            tiny_app, {"start": 0, "end": 9, "strand": 0, "label": "flat"})
+        assert isinstance(result, dict) and result["strand"] == 0
+
+    def test_color_applied(self, tiny_app):
+        result = sc._h_add_feature(
+            tiny_app, {"start": 0, "end": 9, "color": "#1f77b4"})
+        assert isinstance(result, dict) and result["color"] == "#1f77b4"
+        feat = tiny_app._current_record.features[-1]
+        assert feat.qualifiers.get("ApEinfo_fwdcolor") == ["#1f77b4"]
+        assert feat.qualifiers.get("ApEinfo_revcolor") == ["#1f77b4"]
+
+    def test_invalid_color_rejected(self, tiny_app):
+        result = sc._h_add_feature(
+            tiny_app, {"start": 0, "end": 9, "color": "octarine"})
+        payload, status = result
+        assert status == 400 and "color" in payload["error"]
+
+    def test_qualifiers_applied(self, tiny_app):
+        result = sc._h_add_feature(tiny_app, {
+            "start": 0, "end": 9,
+            "qualifiers": {"gene": "bla", "note": ["a", "b"]}})
+        assert isinstance(result, dict)
+        feat = tiny_app._current_record.features[-1]
+        assert feat.qualifiers.get("gene") == ["bla"]
+        assert feat.qualifiers.get("note") == ["a", "b"]
+
+    def test_qualifiers_must_be_dict(self, tiny_app):
+        result = sc._h_add_feature(
+            tiny_app, {"start": 0, "end": 9, "qualifiers": ["nope"]})
+        payload, status = result
+        assert status == 400 and "qualifiers" in payload["error"]
+
+    def test_unknown_keys_echoed(self, tiny_app):
+        result = sc._h_add_feature(
+            tiny_app, {"start": 0, "end": 9, "bogus": 1})
+        assert isinstance(result, dict) and result["ignored"] == ["bogus"]
 
     def test_dirty_guard_refuses_without_force(self, tiny_app):
         tiny_app._unsaved = True
@@ -415,6 +536,550 @@ class TestDeleteUpdateFeatureTOCTOUSignature:
         payload, status = result
         assert status == 409
         assert "changed under us" in payload["error"]
+
+
+class TestUpdateFeatureParity:
+    """update-feature reaches the same arrow-type / colour / qualifier
+    controls as the edit dialog (the UI-parity gap the user flagged:
+    add/update-feature must set TYPE, ARROW TYPE, colour, etc.)."""
+
+    def _app_with_feature(self, tiny_app):
+        """Append a feature and return (app, idx, getter). `idx` is the
+        appended feature's row in the non-source feature list (tiny_record
+        already carries features, so it is NOT 0); `getter()` returns that
+        exact SeqFeature after an update."""
+        sc._h_add_feature(tiny_app, {"start": 0, "end": 9, "label": "f0",
+                                      "force": True})
+        tiny_app._unsaved = False
+        nonsrc = [f for f in tiny_app._current_record.features
+                  if f.type != "source"]
+        idx = len(nonsrc) - 1
+        # The appended feature is the LAST in record order (source aside).
+        getter = lambda: [f for f in tiny_app._current_record.features
+                          if f.type != "source"][idx]
+        return tiny_app, idx, getter
+
+    def test_update_strand_to_double(self, tiny_app):
+        app, idx, feat = self._app_with_feature(tiny_app)
+        r = sc._h_update_feature(app, {"idx": idx, "strand": 2, "force": True})
+        assert isinstance(r, dict), r
+        assert feat().qualifiers.get("SpliceCraft_strand") == ["double"]
+
+    def test_update_strand_away_from_double_clears_qualifier(self, tiny_app):
+        app, idx, feat = self._app_with_feature(tiny_app)
+        sc._h_update_feature(app, {"idx": idx, "strand": 2, "force": True})
+        sc._h_update_feature(app, {"idx": idx, "strand": 1, "force": True})
+        assert "SpliceCraft_strand" not in feat().qualifiers
+
+    def test_update_color_then_clear(self, tiny_app):
+        app, idx, feat = self._app_with_feature(tiny_app)
+        sc._h_update_feature(app, {"idx": idx, "color": "#abc", "force": True})
+        assert feat().qualifiers.get("ApEinfo_fwdcolor") == ["#abc"]
+        sc._h_update_feature(app, {"idx": idx, "color": "", "force": True})
+        assert "ApEinfo_fwdcolor" not in feat().qualifiers
+
+    def test_update_invalid_color_rejected(self, tiny_app):
+        app, idx, _ = self._app_with_feature(tiny_app)
+        r = sc._h_update_feature(
+            app, {"idx": idx, "color": "burgundy", "force": True})
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_update_qualifiers_merge(self, tiny_app):
+        app, idx, feat = self._app_with_feature(tiny_app)
+        sc._h_update_feature(
+            app, {"idx": idx, "qualifiers": {"gene": "x", "note": "y"},
+                  "force": True})
+        assert feat().qualifiers.get("gene") == ["x"]
+        assert feat().qualifiers.get("note") == ["y"]
+
+    def test_update_invalid_strand_rejected(self, tiny_app):
+        app, idx, _ = self._app_with_feature(tiny_app)
+        r = sc._h_update_feature(app, {"idx": idx, "strand": 9, "force": True})
+        assert isinstance(r, tuple) and r[1] == 400
+
+
+class TestNewPlasmidHandler:
+    """`new-plasmid` — create a plasmid from a raw sequence (the agent
+    counterpart to Ctrl+N), loaded onto the canvas but NOT auto-saved."""
+
+    def test_creates_and_loads(self):
+        app = MockApp(record=None)
+        r = sc._h_new_plasmid(app, {"name": "My Construct v1",
+                                     "sequence": "ATGAAA" * 8,
+                                     "circular": True})
+        assert r["ok"] and r["saved"] is False
+        assert r["topology"] == "circular" and r["length"] == 48
+        # Spaced display name preserved (not the underscored LOCUS).
+        assert sc.PlasmidApp._record_display_name(
+            app._current_record) == "My Construct v1"
+
+    def test_features_applied(self):
+        app = MockApp(record=None)
+        r = sc._h_new_plasmid(app, {
+            "name": "p", "sequence": "ATGAAATAG" * 4,
+            "features": [{"start": 0, "end": 9, "name": "orf",
+                          "feature_type": "CDS"}]})
+        assert r["n_features"] == 1
+
+    def test_missing_name_400(self):
+        assert sc._h_new_plasmid(
+            MockApp(record=None), {"sequence": "ATGC"})[1] == 400
+
+    def test_invalid_sequence_400(self):
+        assert sc._h_new_plasmid(
+            MockApp(record=None), {"name": "x", "sequence": "ZZZZ"})[1] == 400
+
+    def test_empty_sequence_400(self):
+        assert sc._h_new_plasmid(
+            MockApp(record=None), {"name": "x", "sequence": ""})[1] == 400
+
+    def test_features_must_be_list(self):
+        assert sc._h_new_plasmid(MockApp(record=None), {
+            "name": "x", "sequence": "ATGC", "features": "nope"})[1] == 400
+
+    def test_dirty_guard_without_force(self):
+        app = MockApp(record=None)
+        app._unsaved = True
+        assert sc._h_new_plasmid(
+            app, {"name": "x", "sequence": "ATGC"})[1] == 409
+
+    def test_unknown_keys_echoed(self):
+        r = sc._h_new_plasmid(MockApp(record=None), {
+            "name": "x", "sequence": "ATGC", "bogus": 1})
+        assert r["ignored"] == ["bogus"]
+
+
+_SENTINEL = object()
+
+
+class _UndoMockApp:
+    """Minimal undo/redo surface for the wrapper-logic tests. The REAL
+    snapshot semantics are covered by the UndoController tests; here we only
+    pin the endpoint's 422 / 409 / stack-delta reporting."""
+
+    def __init__(self, undo=2, redo=0, blocked=False, record=_SENTINEL):
+        if record is _SENTINEL:
+            record = types.SimpleNamespace(seq="ATGCATGCAT")
+        self._current_record = record
+        self._undo_stack = list(range(undo))
+        self._redo_stack = list(range(redo))
+        self._blocked = blocked
+
+    def _undo_blocked_by_modal(self):
+        return self._blocked
+
+    def _action_undo(self):
+        if self._undo_stack:
+            self._redo_stack.append(self._undo_stack.pop())
+
+    def _action_redo(self):
+        if self._redo_stack:
+            self._undo_stack.append(self._redo_stack.pop())
+
+    def call_from_thread(self, fn, *a, **k):
+        return fn(*a, **k)
+
+
+class TestUndoRedoHandlers:
+    def test_undo_no_record_422(self):
+        app = _UndoMockApp(record=None)
+        assert sc._h_undo(app, {})[1] == 422
+
+    def test_redo_no_record_422(self):
+        app = _UndoMockApp(record=None)
+        assert sc._h_redo(app, {})[1] == 422
+
+    def test_undo_reports_delta(self):
+        app = _UndoMockApp(undo=2, redo=0)
+        r = sc._h_undo(app, {})
+        assert r["ok"] and r["undone"] is True
+        assert r["undo_remaining"] == 1 and r["redo_available"] == 1
+
+    def test_undo_empty_stack_is_noop_not_error(self):
+        app = _UndoMockApp(undo=0)
+        r = sc._h_undo(app, {})
+        assert r["ok"] and r["undone"] is False and r["undo_remaining"] == 0
+
+    def test_undo_blocked_409(self):
+        app = _UndoMockApp(undo=2, blocked=True)
+        assert sc._h_undo(app, {})[1] == 409
+
+    def test_redo_reports_delta(self):
+        app = _UndoMockApp(undo=0, redo=2)
+        r = sc._h_redo(app, {})
+        assert r["ok"] and r["redone"] is True
+        assert r["redo_remaining"] == 1 and r["undo_available"] == 1
+
+    def test_redo_blocked_409(self):
+        app = _UndoMockApp(redo=1, blocked=True)
+        assert sc._h_redo(app, {})[1] == 409
+
+
+class TestMultiAlignHandler:
+    """`multi-align` — batch pairwise alignment (the Alt+A overlay)."""
+
+    def test_explicit_sequences(self):
+        r = sc._h_multi_align(MockApp(record=None), {
+            "query": "ATGCATGCATGCATGCATGC",
+            "targets": [{"sequence": "ATGCATGCATGCATGCATGC", "name": "same"},
+                        {"sequence": "TTTTTTTTTTGGGGGGGGGG", "name": "diff"}]})
+        assert r["ok"] and len(r["alignments"]) == 2
+        assert r["alignments"][0]["identity_pct"] == 100.0
+        # The big gapped strings are omitted to keep the batch small.
+        assert "aligned_q" not in r["alignments"][0]
+
+    def test_per_target_errors_dont_fail_batch(self):
+        r = sc._h_multi_align(MockApp(record=None), {
+            "query": "ATGCATGC",
+            "targets": [{"sequence": "ATGCATGC"}, {"sequence": "ZZZ"},
+                        {"name": "no-such-lib-entry"}]})
+        assert r["alignments"][0]["identity_pct"] == 100.0
+        assert "error" in r["alignments"][1]   # non-IUPAC
+        assert "error" in r["alignments"][2]   # unresolvable
+
+    def test_no_query_no_record_422(self):
+        assert sc._h_multi_align(MockApp(record=None),
+                                 {"targets": [{"sequence": "AT"}]})[1] == 422
+
+    def test_empty_targets_400(self):
+        assert sc._h_multi_align(MockApp(record=None),
+                                 {"query": "AT", "targets": []})[1] == 400
+
+    def test_too_many_targets_400(self):
+        assert sc._h_multi_align(MockApp(record=None), {
+            "query": "AT", "targets": [{"sequence": "AT"}] * 21})[1] == 400
+
+    def test_bad_mode_400(self):
+        assert sc._h_multi_align(MockApp(record=None), {
+            "query": "AT", "targets": [{"sequence": "AT"}],
+            "mode": "diagonal"})[1] == 400
+
+    def test_uses_loaded_record_as_query(self, tiny_app, tiny_record):
+        r = sc._h_multi_align(tiny_app, {
+            "targets": [{"sequence": str(tiny_record.seq), "name": "self"}]})
+        assert r["alignments"][0]["identity_pct"] == 100.0
+
+
+class TestAttachExperimentImage:
+    """`attach-experiment-image` — server-side image attach to a notebook
+    entry (the conftest fixture sandboxes + authorises writes)."""
+
+    def _png(self, tmp_path):
+        p = tmp_path / "fig.png"
+        p.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+        return p
+
+    def test_attach_roundtrip(self, tmp_path):
+        ce = sc._h_create_experiment(None, {"title": "E", "body_md": "x"})
+        r = sc._h_attach_experiment_image(None, {
+            "experiment_id": ce["id"], "path": str(self._png(tmp_path))})
+        assert r["ok"] and r["filename"].endswith(".png")
+        exp = next(e for e in sc._load_experiments() if e["id"] == ce["id"])
+        assert "![" in exp["body_md"]   # markdown ref embedded
+
+    def test_missing_id_400(self, tmp_path):
+        assert sc._h_attach_experiment_image(
+            None, {"path": str(self._png(tmp_path))})[1] == 400
+
+    def test_unknown_experiment_404(self, tmp_path):
+        assert sc._h_attach_experiment_image(None, {
+            "experiment_id": "nope", "path": str(self._png(tmp_path))})[1] == 404
+
+    def test_non_image_rejected_400(self, tmp_path):
+        ce = sc._h_create_experiment(None, {"title": "E"})
+        txt = tmp_path / "x.txt"
+        txt.write_text("not an image")
+        assert sc._h_attach_experiment_image(None, {
+            "experiment_id": ce["id"], "path": str(txt)})[1] == 400
+
+
+class TestTraditionalCloning:
+    """`simulate-traditional-cloning` + `traditional-clone` — a real digest +
+    ligation that NEVER picks the insert by fragment size (the catastrophic-
+    class never-assume-the-smaller-fragment rule)."""
+
+    # EcoRI · backbone(A×200) · BamHI · stuffer(C×60), as a circular vector.
+    VECTOR = "GAATTC" + "A" * 200 + "GGATCC" + "C" * 60
+    # pad · EcoRI · payload · BamHI · pad — a PCR insert with primer-added sites.
+    INSERT = "GCGC" + "GAATTC" + "ATGAAACCCGGGTTTTAA" + "GGATCC" + "GCGC"
+    PAYLOAD = "ATGAAACCCGGGTTTTAA"
+
+    def _base(self):
+        return {"vector_seq": self.VECTOR,
+                "vector_enzymes": ["EcoRI", "BamHI"],
+                "insert_seq": self.INSERT,
+                "insert_enzymes": ["EcoRI", "BamHI"]}
+
+    def test_simulate_lists_both_fragments(self):
+        r = sc._h_simulate_traditional_cloning(None, self._base())
+        assert r["ok"] and r["n_vector_fragments"] == 2
+        # The insert ligates into BOTH fragments — both reported, neither
+        # silently dropped because it's the smaller piece.
+        assert len(r["products"]) == 2
+        assert any(p["length"] == 230 for p in r["products"])   # backbone+insert
+        # Read response omits the verbose per-feature list.
+        assert "features" not in r["products"][0]
+
+    def test_simulate_bad_enzyme_400(self):
+        b = self._base()
+        b["vector_enzymes"] = ["NotAnEnzyme"]
+        assert sc._h_simulate_traditional_cloning(None, b)[1] == 400
+
+    def test_simulate_type_iis_insert_422(self):
+        b = self._base()
+        b["insert_enzymes"] = ["BsaI"]
+        assert sc._h_simulate_traditional_cloning(None, b)[1] == 422
+
+    def test_simulate_no_cuts_422(self):
+        b = self._base()
+        b["vector_seq"] = "A" * 100   # no EcoRI / BamHI sites
+        assert sc._h_simulate_traditional_cloning(None, b)[1] == 422
+
+    def test_clone_ambiguous_409(self):
+        # Both fragments accept the insert → refuse, list the options.
+        r = sc._h_traditional_clone(None, dict(self._base(), product_name="c"))
+        assert isinstance(r, tuple) and r[1] == 409
+        assert "options" in r[0] and len(r[0]["options"]) == 2
+
+    def test_clone_disambiguated_saves_circular_golden(self):
+        r = sc._h_traditional_clone(
+            None, dict(self._base(), product_name="myclone", vector_frag_idx=0))
+        assert r["ok"] and r["vector_frag_idx"] == 0
+        ent = next(e for e in sc._load_library() if e["name"] == "myclone")
+        assert ent["source"] == "agent:traditional"
+        rec = sc._gb_text_to_record(ent["gb_text"])
+        assert rec.annotations.get("topology") == "circular"
+        # GOLDEN: the saved product carries the insert payload AND the
+        # backbone — a genuine assembly, not a hand-built final ([INV-127]).
+        seq = str(rec.seq).upper()
+        assert self.PAYLOAD in seq or self.PAYLOAD in sc._rc(seq)
+        assert "A" * 150 in seq or "A" * 150 in sc._rc(seq)
+
+    def test_clone_bad_orientation_400(self):
+        r = sc._h_traditional_clone(
+            None, dict(self._base(), vector_frag_idx=0, orientation="sideways"))
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_clone_no_ligation_422(self):
+        # Vector cut only by EcoRI, insert only by BamHI → no matching ends.
+        r = sc._h_traditional_clone(None, {
+            "vector_seq": self.VECTOR, "vector_enzymes": ["EcoRI"],
+            "insert_seq": "GCGC" + "GGATCC" + "ATGCATGC" + "GGATCC" + "GCGC",
+            "insert_enzymes": ["BamHI"], "product_name": "x",
+            "vector_frag_idx": 0})
+        assert isinstance(r, tuple) and r[1] == 422
+
+
+class TestApiTickets:
+    """Regression coverage for the ProjectA constructor tickets
+    (SPLICECRAFT_API_TICKETS.md): SC-B / SC-D / SC-G / SC-I."""
+
+    def _h(self, name):
+        return sc._state._AGENT_HANDLERS[name][0]
+
+    # ── SC-B: delete-primer by name/id ──────────────────────────────────
+    def test_sc_b_delete_primer_by_name(self):
+        self._h("create-primer")(None, {"name": "oF1",
+                                          "sequence": "ACGTACGTAC"})
+        assert self._h("delete-primer")(None, {"name": "oF1"})["ok"]
+        assert self._h("delete-primer")(None, {"name": "oF1"})[1] == 404
+
+    def test_sc_b_delete_primer_ambiguous_409(self):
+        self._h("create-primer")(None, {"name": "dup",
+                                         "sequence": "AAAACCCCGG"})
+        self._h("create-primer")(None, {"name": "dup",
+                                         "sequence": "TTTTGGGGAA"})
+        r = self._h("delete-primer")(None, {"name": "dup"})
+        assert isinstance(r, tuple) and r[1] == 409
+        assert len(r[0]["sequences"]) == 2
+
+    def test_sc_b_delete_primer_missing_all_400(self):
+        assert self._h("delete-primer")(None, {})[1] == 400
+
+    # ── SC-D: create-primer honors `collection` (no silent MAIN landing) ──
+    def test_sc_d_create_primer_honors_collection(self):
+        self._h("create-primer-collection")(None, {"name": "ProjectA"})
+        r = self._h("create-primer")(None, {
+            "name": "pF", "sequence": "GGGGAAAACC", "collection": "ProjectA"})
+        assert r["collection"] == "ProjectA"
+        coll = next(c for c in sc._load_primer_collections()
+                    if c["name"] == "ProjectA")
+        assert any(p["name"] == "pF" for p in coll["primers"])
+        # And NOT in the default/active collection.
+        assert not any(p.get("name") == "pF" for p in sc._load_primers())
+
+    def test_sc_d_create_primer_unknown_collection_404(self):
+        r = self._h("create-primer")(None, {
+            "name": "x", "sequence": "CCCCGGGGAA", "collection": "NoSuch"})
+        assert isinstance(r, tuple) and r[1] == 404   # loud, not ok:true
+
+    # ── SC-G: one concept, one key (aliases accepted) ───────────────────
+    def test_sc_g_sequence_alias_on_rbs_strength(self):
+        r = self._h("rbs-strength")(None, {
+            "sequence": "AGGAGGACAACAATGAAACGT", "start": 13})
+        assert isinstance(r, dict) and r.get("ok")
+
+    def test_sc_g_sequence_alias_on_design_mutagenesis(self):
+        r = self._h("design-mutagenesis")(None, {
+            "sequence": "ATG" + "GCA" * 40 + "TAA", "mutation": "A5G"})
+        # Accepted (not a 400 about a missing cds_dna).
+        assert isinstance(r, dict) or r[1] != 400
+
+    # ── SC-I: copy-plasmid into a (non-active) collection ───────────────
+    def _seed_collections(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ATGC" * 20), id="FFE1", name="FFE_1_ENTRY",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec._tui_display_name = "FFE 1 ENTRY"
+        gb = sc._record_to_gb_text(rec)
+        sc._save_collections([
+            {"name": "ProjectB", "plasmids": [
+                {"id": "FFE1", "name": "FFE 1 ENTRY", "gb_text": gb,
+                 "size": 80}]},
+            {"name": "ProjectA", "plasmids": []},
+        ])
+
+    def test_sc_i_copy_plasmid(self):
+        self._seed_collections()
+        r = sc._h_copy_plasmid(None, {"name": "FFE 1 ENTRY",
+                                       "to": "ProjectA", "from": "ProjectB"})
+        assert r["ok"] and r["to"] == "ProjectA"
+        coll = next(c for c in sc._load_collections()
+                    if c["name"] == "ProjectA")
+        copied = next(p for p in coll["plasmids"]
+                      if p["name"] == "FFE 1 ENTRY")
+        # Name + features (gb_text, incl. the SC-E display stamp) preserved.
+        assert "SpliceCraft-name: FFE 1 ENTRY" in copied["gb_text"]
+        # Duplicate → 409, missing source → 404, missing 'to' → 400.
+        assert sc._h_copy_plasmid(None, {"name": "FFE 1 ENTRY",
+                                          "to": "ProjectA"})[1] == 409
+        assert sc._h_copy_plasmid(None, {"name": "Nope",
+                                          "to": "ProjectA"})[1] == 404
+        assert sc._h_copy_plasmid(None, {"name": "FFE 1 ENTRY"})[1] == 400
+
+
+class TestDataEnvelope:
+    """SC-C: the dispatcher adds a predictable `data` field to success
+    responses (pure helper `_agent_data_envelope`)."""
+
+    def test_single_content_key_unwraps_to_value(self):
+        assert sc._agent_data_envelope(
+            {"ok": True, "seq": "ACGT"}, 200)["data"] == "ACGT"
+        assert sc._agent_data_envelope(
+            {"ok": True, "library": [1, 2]}, 200)["data"] == [1, 2]
+
+    def test_multi_content_key_is_dict(self):
+        d = sc._agent_data_envelope({"ok": True, "a": 1, "b": 2}, 200)["data"]
+        assert d == {"a": 1, "b": 2}
+
+    def test_meta_excluded_originals_preserved(self):
+        r = sc._agent_data_envelope(
+            {"ok": True, "seq": "AC", "ignored": ["z"], "_stale": True}, 200)
+        assert r["data"] == "AC"                       # meta stripped
+        assert r["seq"] == "AC" and r["ignored"] == ["z"]   # non-breaking
+
+    def test_errors_and_non2xx_untouched(self):
+        assert "data" not in sc._agent_data_envelope({"error": "x"}, 400)
+        assert "data" not in sc._agent_data_envelope(
+            {"ok": False, "error": "y"}, 422)
+
+    def test_existing_data_not_clobbered(self):
+        assert sc._agent_data_envelope(
+            {"ok": True, "data": "keep", "x": 1}, 200)["data"] == "keep"
+
+    def test_empty_content_no_data(self):
+        assert "data" not in sc._agent_data_envelope({"ok": True}, 200)
+
+
+class TestRestartEndpoint:
+    """SC-A: `restart` re-execs a HEADLESS daemon to pick up an update;
+    refuses in a GUI session (would kill the live TUI)."""
+
+    def test_non_headless_refused_409(self):
+        called = []
+        orig = sc._agent_schedule_restart
+        sc._agent_schedule_restart = lambda: called.append(True)
+        try:
+            r = sc._h_restart(types.SimpleNamespace(_headless=False), {})
+            assert isinstance(r, tuple) and r[1] == 409
+            assert not called                # did NOT schedule a re-exec
+        finally:
+            sc._agent_schedule_restart = orig
+
+    def test_headless_schedules_restart(self):
+        called = []
+        orig = sc._agent_schedule_restart
+        sc._agent_schedule_restart = lambda: called.append(True)
+        try:
+            r = sc._h_restart(types.SimpleNamespace(_headless=True), {})
+            assert r["ok"] and r["restarting"] is True
+            assert r["running_version"] == sc.__version__
+            assert called == [True]
+        finally:
+            sc._agent_schedule_restart = orig
+
+
+class TestGoldenGate:
+    """SC-H: Type IIS (BsaI) Golden Gate / MoClo assembly — overhang-directed,
+    order-independent, a real digest + ligation."""
+
+    @staticmethod
+    def _cassette(oh5, body, oh3):
+        # The canonical L0 part: BsaI sites release a body with (oh5, oh3).
+        return "GGTCTC" + "A" + oh5 + body + oh3 + "A" + "GAGACC"
+
+    def _design(self):
+        A = self._cassette("GGAG", "ATGAAACCCGGGTTTACGT" * 2, "AATG")
+        B = self._cassette("AATG", "TTGCATGCATGCTAGCTAG" * 2, "CGCT")
+        V = self._cassette("CGCT", "GGGGCCCCAAAATTTT" * 8, "GGAG")
+        return A, B, V
+
+    def test_simulate_assembles_circle(self):
+        A, B, V = self._design()
+        r = sc._h_simulate_golden_gate(None, {"parts": [A, B], "vector": V})
+        assert r["ok"] and r["result"]["ok"]
+        assert r["result"]["circular"] and r["result"]["n_parts"] == 2
+        assert r["result"]["n_residual_sites"] == 0
+        assert r["result"]["warnings"] == []
+
+    def test_order_independent(self):
+        A, B, V = self._design()
+        r1 = sc._h_simulate_golden_gate(None, {"parts": [A, B], "vector": V})
+        r2 = sc._h_simulate_golden_gate(None, {"parts": [B, A], "vector": V})
+        assert r1["result"]["length"] == r2["result"]["length"]
+
+    def test_assemble_saves_circular_product(self):
+        A, B, V = self._design()
+        r = sc._h_golden_gate_assemble(
+            None, {"parts": [A, B], "vector": V, "product_name": "gg1"})
+        assert r["ok"] and r["saved_name"] == "gg1"
+        ent = next(e for e in sc._load_library() if e["name"] == "gg1")
+        assert ent["source"] == "agent:golden-gate"
+        rec = sc._gb_text_to_record(ent["gb_text"])
+        assert rec.annotations.get("topology") == "circular"
+        seq = str(rec.seq).upper()
+        for body in ("ATGAAACCCGGGTTTACGT", "TTGCATGCATGCTAGCTAG",
+                     "GGGGCCCCAAAATTTT"):
+            assert body in seq or body in sc._rc(seq), f"{body} missing"
+
+    def test_non_type_iis_rejected(self):
+        A, B, V = self._design()
+        assert sc._h_golden_gate_assemble(
+            None, {"parts": [A, B], "vector": V, "enzyme": "EcoRI",
+                   "product_name": "x"})[1] == 422
+
+    def test_empty_parts_400(self):
+        _, _, V = self._design()
+        assert sc._h_simulate_golden_gate(
+            None, {"parts": [], "vector": V})[1] == 400
+
+    def test_part_with_internal_site_fails(self):
+        A, B, V = self._design()
+        bad = self._cassette("GGAG", "ATG" + "GGTCTC" + "ATTTT", "AATG")
+        r = sc._h_simulate_golden_gate(None, {"parts": [bad, B], "vector": V})
+        assert r["result"]["ok"] is False and r["result"]["errors"]
 
 
 class TestReplaceSequenceSizeCap:

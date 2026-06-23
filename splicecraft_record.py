@@ -219,6 +219,37 @@ def _split_multiline_qualifiers(features):
     return out if changed else features
 
 
+# SC-E: the COMMENT marker that carries the human display name through a
+# gb_text / file round-trip (the LOCUS line can't, and the library entry's
+# name field doesn't survive an export). Written by `_record_to_gb_text`,
+# read back by `_restore_display_name_from_comment`.
+_DISPLAY_NAME_MARKER = "SpliceCraft-name:"
+
+
+def _restore_display_name_from_comment(rec) -> None:
+    """In-place: if the parsed record's COMMENT carries a SpliceCraft display-
+    name marker, stamp it onto ``rec._tui_display_name`` — UNLESS the caller
+    already set one (e.g. load-file from a hyphen-rich filename, which is
+    equally authoritative and should win when present). The marker is the
+    last line of our COMMENT stamp, so `(.+)` to the line end captures it;
+    a name long enough to have wrapped degrades to its first physical line
+    rather than being lost."""
+    if getattr(rec, "_tui_display_name", None):
+        return
+    comment = (getattr(rec, "annotations", None) or {}).get("comment", "")
+    if isinstance(comment, (list, tuple)):
+        comment = "\n".join(str(x) for x in comment)
+    m = re.search(re.escape(_DISPLAY_NAME_MARKER) + r"\s*(.+)", str(comment or ""))
+    if not m:
+        return
+    name = m.group(1).splitlines()[0].strip()
+    if name:
+        try:
+            rec._tui_display_name = name  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
 def _record_to_gb_text(record) -> str:
     """Serialize a SeqRecord to GenBank format text.
 
@@ -250,6 +281,28 @@ def _record_to_gb_text(record) -> str:
         _stamp = (f"Created by SpliceCraft v{_state._sc_version} "
                   f"on {date.today().isoformat()}")
         anns["comment"] = f"{_prov}\n{_stamp}".strip() if _prov else _stamp
+    # SC-E: persist the human display name into the COMMENT so it survives a
+    # gb_text / file round-trip. The LOCUS can't hold spaces / hyphens / >16
+    # chars, and the library entry's `name` field is GONE the moment you
+    # export to a `.gb` — so without this an exported construct re-imports
+    # under the mangled LOCUS and needs a manual `rename-plasmid` every time.
+    # The parse side (`_restore_display_name_from_comment`) reads it back onto
+    # `_tui_display_name`. Idempotent: never re-stamps on a round-trip, and
+    # only stamps when the display name actually differs from the LOCUS-safe
+    # name (no point otherwise). [INV-98]
+    _disp = getattr(record, "_tui_display_name", None)
+    if isinstance(_disp, str):
+        _disp_clean = _disp.replace("\n", " ").replace("\r", " ").strip()
+        _cur = anns.get("comment", "")
+        if isinstance(_cur, (list, tuple)):
+            _cur = "\n".join(str(x) for x in _cur)
+        _cur = str(_cur or "")
+        _locus_form = re.sub(r"\s+", "_",
+                             str(getattr(record, "name", "") or "").strip())
+        if (_disp_clean and _disp_clean != _locus_form
+                and _DISPLAY_NAME_MARKER not in _cur):
+            _nm = f"{_DISPLAY_NAME_MARKER} {_disp_clean}"
+            anns["comment"] = f"{_cur}\n{_nm}".strip() if _cur else _nm
     rec = _shallow_copy(record)
     rec.annotations = anns
     # The GenBank LOCUS line forbids whitespace and caps length — Biopython
@@ -312,6 +365,11 @@ def _gb_text_to_record(text: str, *, cache: bool = True):
                 return deepcopy(hit)
     from Bio import SeqIO
     rec = SeqIO.read(StringIO(text), "genbank")
+    # SC-E: restore the human display name stamped into the COMMENT so it
+    # survives the round-trip (the LOCUS is the underscored/truncated form).
+    # Done before caching so every caller — load-entry, add-current, diff —
+    # sees the real name without a manual rename.
+    _restore_display_name_from_comment(rec)
     # Restore arrowless (strand 0) features tagged on the write side before
     # the result is cached, so every caller sees a faithful + clean record.
     _arrowless_decode_features(rec)

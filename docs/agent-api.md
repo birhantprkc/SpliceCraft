@@ -32,6 +32,17 @@ endpoints as the UI launch. For readiness, poll the unauthenticated
 `GET /healthz` (returns `{ok, status:"ready", version, headless}`)
 instead of racing the token-file write + first real call.
 
+A long-running daemon keeps serving the code it launched with, so after a
+`splicecraft update` in another terminal it silently runs stale. `status`
+surfaces this: it reports `installed_version` (what's on disk now) next to
+the running `version`, plus a `stale` boolean (`installed_version` is `null`
+when it can't be read, e.g. running from a source checkout). Every response
+also carries a `_stale` warning when the running version is behind, so you
+notice without polling `status`. A **headless** daemon can `POST /restart`
+itself — it re-execs and the API returns on the same port (poll `/healthz`);
+a GUI `--agent` session refuses (it would lose its live view — restart it
+manually).
+
 The server writes a token file at
 `<DATA_DIR>/agent_token` containing the port + bearer token on the
 first two lines. Hand the token to any client that needs to call the
@@ -49,11 +60,15 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ## Endpoint inventory
 
-~135 endpoints across:
+~156 endpoints across:
 
-- **Records** — get / set sequence, add / update / delete features,
-  list features, find ORFs, transfer annotations, apply GFF3 features
-  to the loaded record (`apply-gff3`).
+- **Records** — `new-plasmid` (create from a raw sequence, the Ctrl+N
+  flow), get / set sequence, add / update / delete features (with the full
+  arrow type — forward ▶ / reverse ◀ / arrowless / double-stranded ◀▶ —
+  plus colour and arbitrary GenBank qualifiers, matching the Insert/Edit
+  Feature dialog), list features, find ORFs, `undo` / `redo` the last
+  edit, transfer annotations, apply GFF3 features to the loaded record
+  (`apply-gff3`).
 - **Files** — load (chromosome-scale safe via the path-based loader;
   supports `.gb` / `.gbk` / `.genbank` / `.dna` / `.embl` /
   FASTA / `.ab1` / single-record `.fastq` / `.gff3`),
@@ -65,13 +80,24 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   active collection first, then the others; pass `collection` to
   disambiguate), rename a plasmid's display name (`rename-plasmid` —
   fixes a name that got slugged to underscores), delete entries,
-  create / rename / delete collections, get / set the active collection,
-  list / set plasmid statuses.
-- **Parts** — list-parts, get-part, delete-part, classify-part
-  (overhang-pair lookup against every grammar); list-parts-bins,
-  set-active-parts-bin (switch the active named bin; mirrors the bin
-  into the live parts file).
-- **Design** — gibson-assemble, simulate-gibson, design-mutagenesis,
+  copy-plasmid (copy an entry into another collection, name + features
+  intact, in one call), create / rename / delete collections, get / set
+  the active collection, list / set plasmid statuses.
+- **Parts** — list-parts, get-part, create-part / update-part (full
+  parity with the Part editor — name / grammar / type / level / position /
+  overhangs / sequence plus `backbone`, selection `marker`, and
+  `fwd_primer` / `rev_primer` domestication primers, Tms derived),
+  delete-part, classify-part (overhang-pair lookup against every grammar);
+  list-parts-bins, set-active-parts-bin (switch the active named bin;
+  mirrors the bin into the live parts file).
+- **Design** — gibson-assemble, simulate-gibson, traditional-clone /
+  simulate-traditional-cloning (restriction digest + ligation: excise the
+  insert, digest the vector, try both fragments × both orientations, and
+  save the product — refuses to guess when more than one ligation is
+  possible), golden-gate-assemble / simulate-golden-gate (Type IIS — BsaI /
+  BsmBI / BbsI / SapI / Esp3I — overhang-directed N-part assembly: parts in
+  any order, chained by their 4-nt overhangs into a circle, with a
+  unique-overhang + no-residual-site fidelity check), design-mutagenesis,
   scrub-plasmid (clone-free restriction-site removal: silent / synonymous
   cures inside CDSes + minimal swaps elsewhere; scrubs the loaded record or
   an explicit `seq`+`features`, optional `codon_taxid` biases coding cures to
@@ -89,7 +115,9 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   wrap-aware on circular templates) and simulate-gel (per-lane band
   positions + optional rendered ASCII gel image; ladder / plasmid /
   digest / PCR-amplicon sources).
-- **Alignment** — diff-plasmid (circular rotation auto-detected),
+- **Alignment** — diff-plasmid (one target, circular rotation
+  auto-detected), multi-align (batch: the loaded plasmid or a given
+  sequence vs many targets at once — the Alt+A overlay),
   list-plasmidsaurus-members, align-plasmidsaurus-zip.
 - **History** — get-history returns the parsed `<HistoryTree>`
   lineage as nested JSON.
@@ -138,14 +166,18 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   delete-enzyme-collection; get / set-active-enzyme-collection.
 - **Feature library** — list / get / create / update /
   delete-feature-library (reusable annotation snippets).
-- **Primer collections** — list-primer-collections,
-  set-active-primer-collection (plus per-primer CRUD).
+- **Primer collections** — list-primer-collections, create-primer-collection
+  (the primer-side parallel to create-collection), set-active-primer-collection
+  (plus per-primer CRUD).
 - **Data safety** — list-backups, restore-backup,
   list-pre-update-snapshots, restore-pre-update-snapshot.
-- **Settings** — get-settings, set-setting (allowlisted toggles).
+- **Settings** — get-settings, set-setting (allowlisted toggles);
+  get-feature-colors / set-feature-color (the per-feature-type render
+  colour overrides).
 - **Experiments lab notebook** — list / get / create / update /
-  delete experiment entries; list / create / rename / delete
-  projects; set active project (full notebook-layer CRUD).
+  delete experiment entries; attach-experiment-image (attach a
+  server-side image file + embed it in the entry body); list / create /
+  rename / delete projects; set active project (full notebook-layer CRUD).
 - **Gels** — list / get / create / update / delete saved gel
   snapshots (in addition to simulate-gel for one-shot runs).
 - **Protein motifs** — list (built-ins + user overrides),
@@ -167,6 +199,13 @@ round-trip instead of N trial-and-error 400s. `/tools` is authoritative:
 it lists every registered endpoint, including the ~26 app-coupled
 handlers that live in `splicecraft.py` rather than `splicecraft_agent.py`
 — don't rely on grepping a single file for `@_agent_endpoint`.
+
+Every success response also carries a predictable **`data`** field, so you
+don't have to know each endpoint's ad-hoc key (`seq` / `library` / `sites`
+/ `matches` / …): `data` is the result with the envelope/metadata stripped,
+unwrapped to the bare value when there's a single content key (a scalar or
+list lands directly under `data`). The original keys stay too, so it's a
+superset — read whichever you prefer.
 
 ## Security posture
 

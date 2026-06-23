@@ -129,6 +129,53 @@ class TestActivePointer:
         assert default == ""
 
 
+class TestCreatePrimerCollectionEndpoint:
+    """Agent `create-primer-collection` — the plasmid `create-collection`
+    parallel that the GUI-only path previously lacked (petunia running-log:
+    "no agent way to create a primer collection")."""
+
+    def test_registered_as_write_endpoint(self):
+        assert "create-primer-collection" in sc._state._AGENT_HANDLERS
+        _fn, write = sc._state._AGENT_HANDLERS["create-primer-collection"]
+        assert write is True
+
+    def test_creates_empty_collection(self):
+        r = sc._h_create_primer_collection(None, {"name": "Petunia primers"})
+        assert r["ok"] and r["name"] == "Petunia primers" and r["n_primers"] == 0
+        names = [c["name"] for c in sc._load_primer_collections()]
+        assert "Petunia primers" in names
+        # Spaces preserved 1:1 (no underscore mangle).
+        assert "_" not in "Petunia primers"
+
+    def test_then_set_active_and_add_primer(self):
+        # The documented flow: create -> set-active -> create-primer lands
+        # the primer in the NEW collection, not the default.
+        sc._h_create_primer_collection(None, {"name": "Build A"})
+        sc._h_set_active_primer_collection(None, {"name": "Build A"})
+        sc._h_create_primer(None, {"name": "oF1", "sequence": "ACGTACGTAC"})
+        coll = next(c for c in sc._load_primer_collections()
+                    if c["name"] == "Build A")
+        assert any(p.get("name") == "oF1" for p in coll.get("primers", []))
+
+    def test_duplicate_name_409_case_insensitive(self):
+        sc._h_create_primer_collection(None, {"name": "Dup"})
+        r = sc._h_create_primer_collection(None, {"name": "dup"})
+        assert isinstance(r, tuple) and r[1] == 409
+
+    def test_blank_name_400(self):
+        for bad in ("", "   ", None, 123, {"x": 1}):
+            r = sc._h_create_primer_collection(None, {"name": bad})
+            assert isinstance(r, tuple) and r[1] == 400
+
+    def test_description_stored_and_unknown_keys_echoed(self):
+        r = sc._h_create_primer_collection(
+            None, {"name": "Desc", "description": "notes here", "bogus": 1})
+        assert r["ignored"] == ["bogus"]
+        coll = next(c for c in sc._load_primer_collections()
+                    if c["name"] == "Desc")
+        assert coll["description"] == "notes here"
+
+
 class TestRestoreFromBackupCoverage:
     def test_primer_collections_in_restore_targets(self):
         labels = [label for label, attr in sc.RestoreFromBackupModal._TARGETS]

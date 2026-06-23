@@ -38,9 +38,9 @@ from pathlib import Path
 import splicecraft_state as _state
 from splicecraft_backup import (_list_pre_update_snapshots)
 from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len)
-from splicecraft_cloning import (_GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _scrub_gb_design, _simulate_gibson_assembly)
+from splicecraft_cloning import (_GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi)
 from splicecraft_codon import (_CODON_GENETIC_CODE, _codon_fetch_kazusa, _codon_optimize, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
-from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
+from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
 from splicecraft_experiments import (_new_experiment_id, _normalise_experiment_entry, _sanitize_experiment_id)
 from splicecraft_fileio import (_PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
 from splicecraft_gels import (_new_gel_id, _normalise_gel_entry)
@@ -52,7 +52,7 @@ from splicecraft_primer import (_mut_design_inner, _mut_design_outer, _scrub_des
 from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq)
 from splicecraft_search import (_PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _sanitize_plasmidsaurus_item_code)
 from splicecraft_seqanalysis import (_classify_part_from_plasmid, _find_orfs)
-from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
+from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _safe_color_for_picker, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
 from splicecraft_biology import (_scan_restriction_sites)
@@ -303,6 +303,37 @@ def _agent_ignored_keys(payload, known):
     return sorted(str(k) for k in payload if k not in allowed)
 
 
+def _agent_sanitize_qualifiers(raw):
+    """Validate + sanitise a feature ``qualifiers`` object from an agent
+    payload. Returns ``(cleaned_dict, error_msg)`` — `error_msg` is None on
+    success, in which case `cleaned_dict` is safe to merge into a SeqFeature.
+
+    ``None`` input → ``({}, None)`` (qualifiers are optional). Keys are
+    sanitised labels; each value is coerced to a LIST of sanitised strings (a
+    bare string becomes a 1-element list, matching GenBank's repeated-
+    qualifier model). Caps at 64 keys × 32 values/key so a hostile or
+    accidental blob can't bloat the record / `.gb` export. Lets an agent set
+    arbitrary GenBank qualifiers (``gene``, ``product``, ``note``, …) the way
+    the AddFeatureModal's fields + colour picker do."""
+    if raw is None:
+        return {}, None
+    if not isinstance(raw, dict):
+        return None, "'qualifiers' must be an object (key -> string/list)"
+    if len(raw) > 64:
+        return None, "too many qualifiers (max 64)"
+    out: dict = {}
+    for k, v in raw.items():
+        key = _sanitize_label(str(k), max_len=50)
+        if not key:
+            continue
+        if isinstance(v, (list, tuple)):
+            vals = [_sanitize_note(str(x), max_len=2000) for x in list(v)[:32]]
+        else:
+            vals = [_sanitize_note(str(v), max_len=2000)]
+        out[key] = [x for x in vals if x]
+    return out, None
+
+
 @_agent_endpoint("get-sequence")
 def _h_get_sequence(app, payload):
     """Return DNA from `[start, end)`. Body: ``{start, end, bottom?}``.
@@ -389,7 +420,7 @@ def _h_rbs_strength(app, payload):
     dg_mrna, dg_hybrid, spacing, rel_strength}``. `rel_strength` is RELATIVE
     (only ratios between RBSs are meaningful — a biophysically-grounded
     ranking score, not an absolute rate). Bad input → 400."""
-    mrna = payload.get("mrna")
+    mrna = payload.get("mrna") or payload.get("sequence")   # SC-G alias
     if not isinstance(mrna, str):
         return ({"error": "missing or non-string 'mrna'"}, 400)
     if isinstance(payload.get("start"), bool):    # JSON true/false ≠ an index
@@ -416,7 +447,7 @@ def _h_design_rbs(app, payload):
     the target (nearest achievable + `on_target=false` if out of range).
     Runs ~80 fold/cofold evaluations, so it blocks for a few seconds. Bad
     input → 400."""
-    cds = payload.get("cds")
+    cds = payload.get("cds") or payload.get("sequence")   # SC-G alias
     if not isinstance(cds, str):
         return ({"error": "missing or non-string 'cds'"}, 400)
     target = payload.get("target")
@@ -1160,17 +1191,57 @@ def _agent_primer_dict(payload: dict) -> "dict | str":
 
 @_agent_endpoint("create-primer", write=True)
 def _h_create_primer(app, payload):
-    """Add a primer to the persistent library. Body: ``{name,
-    sequence, source?, status?, type?, tm?, notes?}``. Duplicate
-    sequences (case-insensitive) return 409 — use `update-primer`
-    on the existing entry or pick a fresh sequence."""
+    """Add a primer to the library. Body: ``{name, sequence, source?,
+    status?, type?, tm?, notes?, collection?}``.
+
+    Without ``collection`` the primer lands in the ACTIVE primer collection.
+    With ``collection`` it's filed into that NAMED collection — and if that
+    collection doesn't exist the call FAILS with 404 (create it first with
+    `create-primer-collection`). SC-D: ``collection`` used to be silently
+    ignored, so a primer the caller believed was filed into a project
+    collection actually landed in the default — an outcome-changing param
+    must never be dropped with ``ok:true``. Duplicate sequences
+    (case-insensitive, within the target collection) return 409."""
     p = _agent_primer_dict(payload)
     if isinstance(p, str):
         return ({"error": p}, 400)
+    target = p["sequence"]
+    coll = payload.get("collection")
     # Sweep #26: RMW under `_state._cache_lock`.
     with _state._cache_lock:
+        if coll not in (None, ""):
+            if not isinstance(coll, str):
+                return ({"error": "'collection' must be a string"}, 400)
+            coll = coll.strip()
+            active = _get_active_primer_collection_name() or ""
+            if coll != active:
+                # File into a SPECIFIC non-active named collection: write its
+                # stored primers list directly (the live primers.json mirror
+                # belongs to the ACTIVE collection and must stay untouched).
+                colls = _load_primer_collections()
+                tgt = next((c for c in colls
+                            if (c.get("name") or "") == coll), None)
+                if tgt is None:
+                    return ({"error":
+                              f"no primer collection named {coll!r}; create "
+                              f"it with create-primer-collection"}, 404)
+                bucket = tgt.setdefault("primers", [])
+                for e in bucket:
+                    if (e.get("sequence") or "").upper() == target:
+                        return ({"error": (
+                            f"primer with sequence {target!r} already exists "
+                            f"in collection {coll!r} (name "
+                            f"{e.get('name', '?')!r})"),
+                            "existing_name": e.get("name", "")}, 409)
+                bucket.insert(0, p)
+                if (err := _agent_save_or_500(
+                        lambda: _save_primer_collections(colls),
+                        "primer_collections")) is not None:
+                    return err
+                return {"ok": True, "name": p["name"],
+                        "sequence": p["sequence"], "collection": coll}
+            # coll == active → fall through to the mirrored active path.
         entries = _load_primers()
-        target = p["sequence"]
         for e in entries:
             if (e.get("sequence") or "").upper() == target:
                 return ({"error": (
@@ -1183,26 +1254,49 @@ def _h_create_primer(app, payload):
                 lambda: _save_primers(entries),
                 "primers")) is not None:
             return err
-    return {"ok": True, "name": p["name"], "sequence": p["sequence"]}
+    return {"ok": True, "name": p["name"], "sequence": p["sequence"],
+            "collection": _get_active_primer_collection_name() or ""}
 
 
 @_agent_endpoint("delete-primer", write=True)
 def _h_delete_primer(app, payload):
-    """Remove a primer from the library by exact sequence match.
-    Body: ``{sequence}``. Returns 404 if no match. The library
-    write triggers the standard `.bak` rotation, so a misclick
-    can be recovered via Settings → Restore from backup."""
+    """Remove a primer from the library by ``{name}`` (or ``{id}``), or by
+    exact ``{sequence}``. Body: one of ``{name}`` / ``{id}`` / ``{sequence}``.
+
+    Deleting by name removes the single primer with that name (matches the
+    other ``delete-*`` verbs); if several primers share the name it returns
+    409 with their sequences so you can pick one via ``{sequence}``. Deleting
+    by sequence removes every primer with that exact sequence. 404 if no
+    match. The library write triggers the standard ``.bak`` rotation, so a
+    misclick is recoverable via Settings → Restore from backup."""
     seq = payload.get("sequence")
-    if not isinstance(seq, str) or not seq.strip():
-        return ({"error": "missing or non-string 'sequence'"}, 400)
-    target = seq.strip().upper()
+    name = payload.get("name") or payload.get("id")
     # Sweep #26: RMW under `_state._cache_lock`.
     with _state._cache_lock:
         entries = _load_primers()
-        new_list = [e for e in entries
-                    if (e.get("sequence") or "").upper() != target]
-        if len(new_list) == len(entries):
-            return ({"error": f"no primer with sequence {target!r}"}, 404)
+        if isinstance(seq, str) and seq.strip():
+            target = seq.strip().upper()
+            new_list = [e for e in entries
+                        if (e.get("sequence") or "").upper() != target]
+            if len(new_list) == len(entries):
+                return ({"error": f"no primer with sequence {target!r}"}, 404)
+        elif isinstance(name, str) and name.strip():
+            key = name.strip()
+            matches = [e for e in entries if (e.get("name") or "") == key]
+            if not matches:
+                return ({"error": f"no primer named {key!r}"}, 404)
+            if len(matches) > 1:
+                return ({"error":
+                          f"{key!r} matches {len(matches)} primers — pass "
+                          f"{{\"sequence\": …}} to pick one",
+                          "sequences": [e.get("sequence", "")
+                                         for e in matches]}, 409)
+            # Remove exactly the matched primer (by identity), so a different
+            # primer that happens to share its sequence is left intact.
+            new_list = [e for e in entries if e is not matches[0]]
+        else:
+            return ({"error":
+                      "missing 'name', 'id', or 'sequence'"}, 400)
         if (err := _agent_save_or_500(
                 lambda: _save_primers(new_list),
                 "primers")) is not None:
@@ -1257,6 +1351,53 @@ def _h_set_active_primer_collection(app, payload):
             "primer_collections")) is not None:
         return err
     return {"ok": True, "active": name}
+
+
+@_agent_endpoint("create-primer-collection", write=True)
+def _h_create_primer_collection(app, payload):
+    """Create a new (empty) named primer collection. Body:
+    ``{name, description?}``.
+
+    The plasmid-side parallel to ``create-collection``. Primer
+    collections were previously creatable only through the GUI, so an
+    agent could ``set-active-primer-collection`` to *switch* but had no
+    way to *make* one (set-active 404s on an unknown name, and
+    ``create-primer`` files into whatever collection is already active).
+    To put a project's primers in their own collection: create it here,
+    switch with ``set-active-primer-collection {name}``, then
+    ``create-primer``.
+
+    A name already in use (case-insensitive) returns 409; the reserved
+    default collection is the empty string and can't be re-created. The
+    new collection is written as ``{name, description, primers: [],
+    saved}`` — the same envelope the GUI writes."""
+    name = _normalize_collection_name(payload.get("name"))
+    if name is None:
+        return ({"error": "missing or invalid 'name'"}, 400)
+    desc = _sanitize_note(payload.get("description"), max_len=2000)
+    # RMW under the cache lock: a concurrent GUI/agent create of the
+    # same name can't clobber via last-writer-wins (mirrors
+    # create-collection sweep #11). The case-insensitive check also
+    # guards the reserved "" default, which `_normalize_collection_name`
+    # already rejects as blank.
+    with _state._cache_lock:
+        colls = _load_primer_collections()
+        existing = {(c.get("name") or "").strip().casefold() for c in colls}
+        if name.casefold() in existing:
+            return ({"error":
+                      f"primer collection {name!r} already exists"}, 409)
+        colls.append({
+            "name":        name,
+            "description": desc,
+            "primers":     [],
+            "saved":       _date.today().isoformat(),
+        })
+        if (err := _agent_save_or_500(
+                lambda: _save_primer_collections(colls),
+                "primer_collections")) is not None:
+            return err
+    return {"ok": True, "name": name, "n_primers": 0,
+            "ignored": _agent_ignored_keys(payload, {"name", "description"})}
 
 
 @_agent_endpoint("list-hmm-databases")
@@ -1700,6 +1841,61 @@ def _h_set_setting(app, payload):
     return {"ok": True, "key": key, "value": cleaned}
 
 
+@_agent_endpoint("get-feature-colors")
+def _h_get_feature_colors(app, payload):
+    """Return the user's custom feature-type → colour overrides. Body: `{}`.
+
+    Each entry maps a feature `type` (e.g. ``"CDS"``, ``"promoter"``) to a
+    hex colour (``#RGB`` / ``#RRGGBB``). Types NOT listed fall back to the
+    built-in palette — this endpoint reports only the user's overrides (the
+    same set ``set-feature-color`` writes), so an empty map means "all
+    types use their defaults"."""
+    return {"ok": True, "feature_colors": _load_feature_colors()}
+
+
+@_agent_endpoint("set-feature-color", write=True)
+def _h_set_feature_color(app, payload):
+    """Set or clear the render colour for a feature type. Body:
+    ``{feature_type, color}`` — `color` is a hex string (``#1f77b4`` or the
+    short ``#abc`` form). Pass ``{feature_type, clear: true}`` (or
+    ``color: ""``/``null``) to REMOVE the override so the type falls back to
+    the built-in palette. Persisted to ``feature_colors.json``; changes how
+    that type renders on every map. Clearing a type that has no override
+    returns 404."""
+    # Validate the RAW value first: `_sanitize_feat_type` defaults None/""
+    # to "misc_feature", which would silently set a colour for the wrong
+    # type on a missing key.
+    ft_raw = payload.get("feature_type")
+    if not isinstance(ft_raw, str) or not ft_raw.strip():
+        return ({"error": "missing or invalid 'feature_type'"}, 400)
+    ft = _sanitize_feat_type(ft_raw)
+    clear = bool(payload.get("clear")) or payload.get("color") in (None, "")
+    color = None
+    if not clear:
+        color = _safe_color_for_picker(payload.get("color"))
+        if color is None:
+            return ({"error":
+                      "invalid 'color' (expected hex #RGB or #RRGGBB)"}, 400)
+    # RMW under the cache lock so a concurrent colour edit can't clobber.
+    with _state._cache_lock:
+        mapping = _load_feature_colors()
+        if clear:
+            if ft not in mapping:
+                return ({"error":
+                          f"no custom colour set for type {ft!r}"}, 404)
+            del mapping[ft]
+        else:
+            assert color is not None       # validated above (else returned 400)
+            mapping[ft] = color
+        if (err := _agent_save_or_500(
+                lambda: _save_feature_colors(mapping),
+                "Feature colors")) is not None:
+            return err
+    return {"ok": True, "feature_type": ft, "color": color, "cleared": clear,
+            "ignored": _agent_ignored_keys(
+                payload, {"feature_type", "color", "clear"})}
+
+
 def _parts_bin_entry_summary(p: dict) -> dict:
     """Compact view of a parts-bin row for list endpoints. Drops the
     `gb_text` blob so a 500-entry bin doesn't return 50+ MB; agents
@@ -1772,9 +1968,13 @@ def _h_get_part(app, payload):
 
 def _agent_part_dict(payload: dict) -> "dict | str":
     """Coerce + validate a parts-bin payload. Returns the cleaned
-    dict or a string error message. Mirrors `PartEditModal`'s save
-    path: every field except `gb_text` and `sequence` is optional;
-    one of those must be present so the part has actual content."""
+    dict or a string error message. Full parity with `PartEditModal`'s
+    Edit-mode form: ``{name, sequence|gb_text, grammar?, type?, level?,
+    position?, oh5?, oh3?, backbone?, marker?, fwd_primer?, rev_primer?,
+    notes?}``. One of ``sequence``/``gb_text`` must be present so the part
+    has content; everything else is optional. ``fwd_primer``/``rev_primer``
+    are IUPAC DNA (≤1 kb) and their Tms are DERIVED on save (the modal
+    never lets a user type a Tm directly)."""
     name = _sanitize_label(payload.get("name"), max_len=200)
     if not name:
         return "missing or non-string 'name'"
@@ -1816,20 +2016,57 @@ def _agent_part_dict(payload: dict) -> "dict | str":
     for label, val in (("oh5", oh5), ("oh3", oh3)):
         if val is not None and not isinstance(val, str):
             return f"{label!r} must be a string"
+    # Vector + domestication-primer fields — the PartEditModal exposes these
+    # in its Edit mode (backbone / selection marker / forward + reverse
+    # domestication primers), so the agent must be able to set them too. The
+    # Tms are DERIVED from the primer sequences (matching the modal, which
+    # never lets the user type a Tm directly), so they're not request params.
+    backbone = payload.get("backbone", "")
+    marker   = payload.get("marker", "")
+    for label, val in (("backbone", backbone), ("marker", marker)):
+        if val is not None and not isinstance(val, str):
+            return f"{label!r} must be a string"
+    clean_fwd = clean_rev = ""
+    for label, raw in (("fwd_primer", payload.get("fwd_primer", "")),
+                        ("rev_primer", payload.get("rev_primer", ""))):
+        if raw in (None, ""):
+            continue
+        if not isinstance(raw, str):
+            return f"{label!r} must be a string"
+        cleaned, perr = _sanitize_bases(raw.upper(), max_len=1000)
+        if perr:
+            return f"{label!r} rejected: {perr}"
+        if label == "fwd_primer":
+            clean_fwd = cleaned
+        else:
+            clean_rev = cleaned
+
+    def _tm(seq: str) -> float:
+        if not seq:
+            return 0.0
+        tm = _primer_tm_safe(seq)
+        return round(float(tm), 1) if tm is not None else 0.0
+
     notes = _sanitize_note(payload.get("notes", ""))
     return {
-        "name":      name,
-        "grammar":   _sanitize_label(grammar),
-        "type":      _sanitize_label(ptype),
-        "level":     int(level),
-        "position":  _sanitize_label(position),
-        "oh5":       (oh5 or "").upper(),
-        "oh3":       (oh3 or "").upper(),
-        "sequence":  clean_seq,
-        "size":      len(clean_seq),
-        "gb_text":   gb_text if isinstance(gb_text, str) else "",
-        "notes":     notes or "",
-        "date":      _datetime.now().strftime("%Y-%m-%d"),
+        "name":       name,
+        "grammar":    _sanitize_label(grammar),
+        "type":       _sanitize_label(ptype),
+        "level":      int(level),
+        "position":   _sanitize_label(position),
+        "oh5":        (oh5 or "").upper(),
+        "oh3":        (oh3 or "").upper(),
+        "backbone":   _sanitize_label(backbone, max_len=120),
+        "marker":     _sanitize_label(marker, max_len=120),
+        "fwd_primer": clean_fwd,
+        "rev_primer": clean_rev,
+        "fwd_tm":     _tm(clean_fwd),
+        "rev_tm":     _tm(clean_rev),
+        "sequence":   clean_seq,
+        "size":       len(clean_seq),
+        "gb_text":    gb_text if isinstance(gb_text, str) else "",
+        "notes":      notes or "",
+        "date":       _datetime.now().strftime("%Y-%m-%d"),
     }
 
 
@@ -2573,6 +2810,194 @@ def _h_simulate_gibson(app, payload):
     return {"ok": True, "result": result}
 
 
+def _agent_traditional_cloning_candidates(payload):
+    """Shared digest + ligate core for `simulate-traditional-cloning` /
+    `traditional-clone`. Returns ``(info, None)`` on success or
+    ``(None, (error_dict, status))`` on a validation / biology failure.
+
+    `info` = ``{insert, n_vector_fragments, products, incompatible}`` where
+    ``products`` lists every COMPATIBLE ligation product (each with its full
+    `features`, so the write path can build a record) and ``incompatible``
+    lists the ``(vector_frag_idx, orientation)`` pairs whose sticky ends
+    didn't match — surfaced for diagnostics.
+
+    The insert is excised as the purified middle fragment
+    (`_excise_pcr_insert` — the bench "cut + gel-purify the off-cuts" step,
+    so primer pad / outside-the-cut bases never reach the product). The
+    vector is digested with `_excise_fragment_pair`, which REFUSES an
+    ambiguous ≥3-cut circular digest. BOTH vector fragments and BOTH insert
+    orientations are tried — nothing is picked by size (the never-assume-
+    the-smaller-fragment rule); the caller disambiguates."""
+    vec_seq, e = _sanitize_bases(payload.get("vector_seq"))
+    if e:
+        return None, ({"error": f"'vector_seq' rejected: {e}"}, 400)
+    ins_seq, e = _sanitize_bases(payload.get("insert_seq"))
+    if e:
+        return None, ({"error": f"'insert_seq' rejected: {e}"}, 400)
+    vec_enz = payload.get("vector_enzymes")
+    ins_enz = payload.get("insert_enzymes")
+    if (not isinstance(vec_enz, list) or not (1 <= len(vec_enz) <= 6)
+            or not all(isinstance(x, str) and x for x in vec_enz)):
+        return None, ({"error":
+                        "'vector_enzymes' must be a list of 1-6 enzyme "
+                        "names"}, 400)
+    if (not isinstance(ins_enz, list) or not (1 <= len(ins_enz) <= 2)
+            or not all(isinstance(x, str) and x for x in ins_enz)):
+        return None, ({"error":
+                        "'insert_enzymes' must be a list of 1 or 2 enzyme "
+                        "names"}, 400)
+    catalog = _state._all_enzymes_hook()
+    for grp, field in ((vec_enz, "vector_enzymes"), (ins_enz, "insert_enzymes")):
+        for en in grp:
+            if en not in catalog:
+                return None, ({"error":
+                                f"unknown enzyme {en!r} in {field}"}, 400)
+    vector_circular = bool(payload.get("vector_circular", True))
+    # 1) Purify the insert — the unambiguous middle fragment.
+    enz_l = ins_enz[0]
+    enz_r = ins_enz[1] if len(ins_enz) > 1 else ins_enz[0]
+    insert_frag, ierr = _excise_pcr_insert(ins_seq, enz_l, enz_r,
+                                            source_label="insert")
+    if ierr is not None:
+        return None, ({"error": f"insert: {ierr}"}, 422)
+    assert insert_frag is not None         # ierr is None ⇒ frag is populated
+    # 2) Digest the vector — refuses an ambiguous ≥3-cut circular digest.
+    vec_frags, verr = _excise_fragment_pair(
+        vec_seq, list(vec_enz), circular=vector_circular,
+        source_label="vector")
+    if verr is not None:
+        return None, ({"error": f"vector: {verr['error']}",
+                        "cuts": verr.get("cuts", [])}, 422)
+    # 3) Try every (vector fragment × orientation); keep the compatible ones.
+    products: list = []
+    incompatible: list = []
+    for vi, vfrag in enumerate(vec_frags):
+        try:
+            result = _simulate_traditional_cloning_multi([insert_frag], vfrag)
+        except Exception as exc:
+            _log.exception("agent traditional-cloning: simulate failed")
+            return None, ({"error":
+                            f"simulator failed: {_scrub_path(str(exc))}"}, 500)
+        for orient in ("forward", "reverse"):
+            prod = result.get(orient) or {}
+            tag = {"vector_frag_idx": vi, "orientation": orient}
+            if prod.get("compatible"):
+                top = prod.get("top_seq", "")
+                products.append({
+                    **tag,
+                    "length":     len(top),
+                    "n_features": len(prod.get("features") or []),
+                    "sequence":   top,
+                    "features":   prod.get("features") or [],
+                })
+            else:
+                incompatible.append(tag)
+    return ({
+        "insert": {"length": len(insert_frag.get("top_seq", "")),
+                   "left_enzyme": enz_l, "right_enzyme": enz_r},
+        "n_vector_fragments": len(vec_frags),
+        "products":           products,
+        "incompatible":       incompatible,
+    }, None)
+
+
+@_agent_endpoint("simulate-traditional-cloning")
+def _h_simulate_traditional_cloning(app, payload):
+    """Dry-run a traditional restriction-cloning reaction: digest a vector
+    and an insert with the chosen enzymes, then ligate. Body:
+    ``{vector_seq, vector_enzymes, insert_seq, insert_enzymes,
+    vector_circular?=true}``.
+
+    `insert_enzymes` is 1 or 2 enzyme names (the sites your primers add to
+    each end); the insert is excised as the purified middle fragment.
+    `vector_enzymes` digests the backbone — a circular vector must cut
+    EXACTLY twice (an ambiguous ≥3-cut digest is REFUSED with the cut list,
+    because the backbone can't be picked unambiguously). Type IIS enzymes
+    (BsaI / BbsI / BsmBI …) are refused for the insert — use the
+    Golden-Braid path (`design-gb-part` / `scrub-plasmid method:golden_braid`).
+
+    Both vector fragments and both insert orientations are tried; the
+    response lists every COMPATIBLE product as ``{vector_frag_idx,
+    orientation, length, n_features, sequence}`` (nothing is picked by
+    size). ``incompatible`` lists the pairs whose sticky ends didn't match.
+    Read-only — pair with `traditional-clone` to save a chosen product."""
+    info, err = _agent_traditional_cloning_candidates(payload)
+    if err is not None:
+        return err
+    # Trim the verbose per-feature lists from the read response (the write
+    # path recomputes them); keep the product sequence for inspection.
+    products = [{k: v for k, v in p.items() if k != "features"}
+                for p in info["products"]]
+    return {"ok": True,
+            "insert":              info["insert"],
+            "n_vector_fragments":  info["n_vector_fragments"],
+            "products":            products,
+            "incompatible":        info["incompatible"],
+            "ignored": _agent_ignored_keys(payload, {
+                "vector_seq", "vector_enzymes", "insert_seq",
+                "insert_enzymes", "vector_circular"})}
+
+
+def _agent_golden_gate_inputs(payload):
+    """Parse + validate a Golden Gate payload ``{parts, vector, enzyme?}``.
+    Returns ``(parts, vector_seq, enzyme, None)`` or
+    ``(None, None, None, (error_dict, status))``. Each part / the vector may be
+    a bare sequence string or ``{sequence}``."""
+    parts = payload.get("parts")
+    if not isinstance(parts, list) or not parts:
+        return None, None, None, (
+            {"error": "'parts' must be a non-empty list of sequences"}, 400)
+    if len(parts) > 30:
+        return None, None, None, ({"error": "too many parts (max 30)"}, 400)
+    clean: list = []
+    for i, p in enumerate(parts):
+        raw = (p if isinstance(p, str)
+               else p.get("sequence") if isinstance(p, dict) else None)
+        seq, err = _sanitize_bases(raw)
+        if err:
+            return None, None, None, ({"error": f"part[{i}]: {err}"}, 400)
+        clean.append(seq)
+    vraw = payload.get("vector")
+    vraw = (vraw if isinstance(vraw, str)
+            else vraw.get("sequence") if isinstance(vraw, dict) else None)
+    vseq, verr = _sanitize_bases(vraw)
+    if verr:
+        return None, None, None, ({"error": f"'vector': {verr}"}, 400)
+    enzyme = _sanitize_label(payload.get("enzyme") or "BsaI", max_len=40)
+    if enzyme not in _state._all_enzymes_hook():
+        return None, None, None, ({"error": f"unknown enzyme {enzyme!r}"}, 400)
+    return clean, vseq, enzyme, None
+
+
+@_agent_endpoint("simulate-golden-gate")
+def _h_simulate_golden_gate(app, payload):
+    """Dry-run a Golden Gate / MoClo (Type IIS) one-pot assembly. Body:
+    ``{parts: [seq, …], vector, enzyme?="BsaI"}``.
+
+    Digests each part + the vector with the Type IIS enzyme (BsaI / BsmBI /
+    BbsI / SapI / Esp3I) and chains the released fragments by their 4 nt
+    overhangs into a circular product — parts may be in ANY order, the
+    overhangs set the order. Each part must release exactly one fragment
+    (flank it with two inward enzyme sites); the vector contributes its
+    backbone. The ``result`` carries ``{ok, product_seq, length, n_parts,
+    order, junctions:[{overhang}], n_residual_sites, warnings, errors}`` —
+    `warnings` flags a non-unique junction overhang (ambiguous assembly) or a
+    residual enzyme site (it would be re-cut). Read-only — pair with
+    `golden-gate-assemble` to save."""
+    parts, vseq, enzyme, err = _agent_golden_gate_inputs(payload)
+    if err is not None:
+        return err
+    assert parts is not None and vseq is not None and enzyme is not None
+    try:
+        result = _simulate_golden_gate(parts, vseq, enzyme=enzyme)
+    except Exception as exc:
+        _log.exception("agent simulate-golden-gate: assembler failed")
+        return ({"error": f"assembler failed: {_scrub_path(str(exc))}"}, 500)
+    return {"ok": True, "result": result,
+            "ignored": _agent_ignored_keys(payload,
+                                           {"parts", "vector", "enzyme"})}
+
+
 _AGENT_MUT_RE = re.compile(r"^([A-Z])(\d{1,5})([A-Z\*])$")
 
 
@@ -2587,7 +3012,7 @@ def _h_design_mutagenesis(app, payload):
     free to save the result via `update-primer` or by setting up a
     Constructor save flow.
     """
-    cds_dna = payload.get("cds_dna")
+    cds_dna = payload.get("cds_dna") or payload.get("sequence")  # SC-G alias
     if not isinstance(cds_dna, str) or not cds_dna.strip():
         return ({"error": "missing or non-string 'cds_dna'"}, 400)
     cds_clean = "".join(ch for ch in cds_dna.upper()
@@ -3773,7 +4198,9 @@ def _h_diff_plasmid(app, payload):
     rec = getattr(app, "_current_record", None)
     if rec is None:
         return ({"error": "no plasmid loaded"}, 422)
-    target_id = _sanitize_label(payload.get("target_id"), max_len=200)
+    target_id = _sanitize_label(   # SC-G: accept source_id / id aliases
+        payload.get("target_id") or payload.get("source_id")
+        or payload.get("id"), max_len=200)
     if not target_id:
         return ({"error": "missing 'target_id'"}, 400)
     mode = payload.get("mode", "global")
@@ -4715,7 +5142,7 @@ def _h_design_gb_part(app, payload):
     Returns the `_design_gb_primers` dict (insert_seq, primer pairs,
     mutations list, overhang labels).
     """
-    template = payload.get("template")
+    template = payload.get("template") or payload.get("sequence")  # SC-G alias
     if not isinstance(template, str) or not template.strip():
         return ({"error": "missing or non-string 'template'"}, 400)
     template_clean = "".join(ch for ch in template.upper()
@@ -4814,7 +5241,7 @@ def _h_design_primers(app, payload):
     Returns a primer dict with `fwd_full`, `rev_full`, `fwd_tm`,
     `rev_tm`, `amplicon_len`, plus mode-specific keys.
     """
-    template = payload.get("template")
+    template = payload.get("template") or payload.get("sequence")  # SC-G alias
     if not isinstance(template, str) or not template.strip():
         return ({"error": "missing or non-string 'template'"}, 400)
     template_clean = "".join(ch for ch in template.upper()

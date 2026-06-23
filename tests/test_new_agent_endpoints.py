@@ -162,6 +162,32 @@ def test_part_create_update_delete_roundtrip(mock_app):
     assert res["deleted"] == 1
 
 
+def test_part_create_with_vector_and_primer_fields(mock_app):
+    """Parameter parity with PartEditModal's Edit mode: an agent can set
+    backbone, selection marker, and forward/reverse domestication primers
+    (the Tms are derived on save, mirroring the modal)."""
+    part = {
+        "name": "parity_part", "grammar": "gb_l0", "type": "CDS",
+        "level": 0, "sequence": "ATGGCAACG" * 5,
+        "backbone": "pUPD2", "marker": "Cm",
+        "fwd_primer": "ACGTACGTACGTACGT", "rev_primer": "TGCATGCATGCATGCA",
+    }
+    assert sc._h_create_part(mock_app, part)["ok"]
+    p = sc._h_get_part(mock_app, {"name": "parity_part"})["part"]
+    assert p["backbone"] == "pUPD2" and p["marker"] == "Cm"
+    assert p["fwd_primer"] == "ACGTACGTACGTACGT"
+    assert p["rev_primer"] == "TGCATGCATGCATGCA"
+    assert isinstance(p["fwd_tm"], float) and p["fwd_tm"] > 0
+    assert isinstance(p["rev_tm"], float) and p["rev_tm"] > 0
+
+
+def test_part_rejects_non_iupac_primer(mock_app):
+    res = sc._h_create_part(mock_app, {
+        "name": "badprimer", "grammar": "gb_l0", "type": "CDS", "level": 0,
+        "sequence": "ATGGCA" * 5, "fwd_primer": "ACGTXYZ"})
+    assert isinstance(res, tuple) and res[1] == 400
+
+
 def test_part_create_duplicate_returns_409(mock_app):
     part = {
         "name":     "dup_part",

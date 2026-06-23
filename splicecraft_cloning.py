@@ -2038,6 +2038,158 @@ def _assemble_scrub_amplicons_real(amplicon_specs: list, *,
     return str(closed.get("top_seq") or "") or None
 
 
+# ═══ Golden Gate / MoClo (Type IIS) assembly — SC-H ════════════════════════════
+# Overhang-directed N-part assembly: digest every part + the destination vector
+# with the Type IIS enzyme (BsaI / BsmBI / BbsI / SapI / Esp3I), keep each
+# released body (cut on BOTH ends), then chain them by their native 4 nt
+# overhangs into a circle. Unlike the scrub assembler above the parts are NOT
+# pre-ordered — the overhangs alone dictate the order (the whole point of Golden
+# Gate). [INV-127: the design IS the product — a real digest + ligation.]
+
+
+def _gg_released_bodies(seq: str, enzyme: str, *, circular: bool) -> list[dict]:
+    """Digest `seq` with `enzyme` and return only the fragments cut on BOTH
+    ends — the released part body / vector backbone with two sticky overhangs
+    (the off-cut end stubs each keep one ``linear`` molecule-terminus edge and
+    fall away). Mirrors `_assemble_scrub_amplicons_real`'s body selection."""
+    frags = _digest_with_enzymes(seq, [enzyme], circular=circular)
+    return [f for f in frags
+            if f.get("left", {}).get("kind") != "linear"
+            and f.get("right", {}).get("kind") != "linear"]
+
+
+def _gg_greedy_chain(start: dict, parts: list[dict]) -> "list[dict] | None":
+    """Order `parts` after `start` by overhang matching: repeatedly append the
+    part whose LEFT end ligates the chain's current RIGHT end (`_ligate_fragments`
+    returns non-None). Returns the ordered chain using EVERY part, or None if it
+    ever gets stuck. A valid Golden Gate design has unique overhangs, so exactly
+    one part matches at each step (deterministic); a tie/no-match means a
+    mis-designed overhang set."""
+    chain = [start]
+    pool = list(parts)
+    while pool:
+        cur = chain[-1]
+        idx = next((i for i, f in enumerate(pool)
+                    if _ligate_fragments(cur, f) is not None), None)
+        if idx is None:
+            return None
+        chain.append(pool.pop(idx))
+    return chain
+
+
+def _simulate_golden_gate(part_seqs: list[str], vector_seq: str, *,
+                          enzyme: str = _SCRUB_GB_ENZYME) -> dict:
+    """Simulate a Golden Gate / MoClo (Type IIS) one-pot assembly.
+
+    Digests each part in `part_seqs` and the destination `vector_seq` with
+    `enzyme`, then chains the released fragments by matching 4 nt overhangs
+    into a circular product. The parts may be supplied in ANY order — the
+    overhangs determine the assembly order. Returns:
+
+    ``{ok, product_seq, length, circular, n_parts, enzyme, order,
+       junctions:[{overhang}], n_residual_sites, warnings, errors}``
+
+    `ok:false` (with `errors`) when the enzyme isn't Type IIS, a part doesn't
+    release exactly one fragment, or the overhangs don't chain into a closed
+    circle. Fidelity `warnings` flag a non-unique junction overhang (ambiguous
+    assembly) or a residual enzyme site in the product (it would be re-cut)."""
+    warnings: list[str] = []
+    if not _enzyme_is_type_iis(enzyme):
+        return {"ok": False, "errors": [
+            f"{enzyme!r} is not a Type IIS enzyme — Golden Gate / MoClo needs "
+            f"one that cuts OUTSIDE its recognition site (BsaI / BsmBI / BbsI "
+            f"/ SapI / Esp3I)."], "warnings": []}
+    if not part_seqs:
+        return {"ok": False, "errors": ["no parts supplied"], "warnings": []}
+
+    part_frags: list[dict] = []
+    for i, ps in enumerate(part_seqs):
+        try:
+            bodies = _gg_released_bodies((ps or "").upper(), enzyme,
+                                         circular=False)
+        except Exception as exc:               # pragma: no cover - defensive
+            return {"ok": False, "warnings": [],
+                    "errors": [f"part {i + 1}: digest failed: {exc}"]}
+        if len(bodies) != 1:
+            return {"ok": False, "warnings": [], "errors": [
+                f"part {i + 1} released {len(bodies)} fragment(s) when cut "
+                f"with {enzyme} (expected exactly 1 between two {enzyme} "
+                f"sites — check the part's flanking sites / orientation)."]}
+        part_frags.append(bodies[0])
+
+    try:
+        vec_bodies = _gg_released_bodies((vector_seq or "").upper(), enzyme,
+                                         circular=True)
+    except Exception as exc:                   # pragma: no cover - defensive
+        return {"ok": False, "warnings": [],
+                "errors": [f"vector: digest failed: {exc}"]}
+    if not vec_bodies:
+        return {"ok": False, "warnings": [], "errors": [
+            f"vector released no fragment when cut with {enzyme} — it needs "
+            f"two {enzyme} sites flanking the dropout."]}
+
+    # Try each vector fragment as the backbone seed (the dropout/stuffer
+    # candidate won't chain — its overhangs don't match the parts).
+    chosen: "tuple[list[dict], dict] | None" = None
+    for vstart in vec_bodies:
+        chain = _gg_greedy_chain(vstart, part_frags)
+        if chain is None:
+            continue
+        ligated = chain[0]
+        good = True
+        for f in chain[1:]:
+            ligated = _ligate_fragments(ligated, f)
+            if ligated is None:
+                good = False
+                break
+        if not good:
+            continue
+        assert ligated is not None         # `good` ⇒ no ligation returned None
+        closed = _close_circular(ligated)
+        if closed is not None:
+            chosen = (chain, closed)
+            break
+    if chosen is None:
+        return {"ok": False, "warnings": [], "errors": [
+            "the overhangs don't chain every part + the vector into a closed "
+            "circle — check that adjacent parts share a 4 nt overhang and the "
+            "vector's two overhangs match the assembly's ends."]}
+
+    chain, closed = chosen
+    product = str(closed.get("top_seq") or "")
+    # Fidelity: every junction overhang must be DISTINCT, or the reaction can
+    # mis-assemble (two junctions with the same overhang are interchangeable).
+    junctions = [f.get("right", {}).get("overhang_seq", "") for f in chain]
+    if len(set(junctions)) != len(junctions):
+        warnings.append(
+            "non-unique junction overhang(s) — the assembly is ambiguous and "
+            "can mis-assemble; redesign to all-distinct 4 nt overhangs.")
+    # Residual enzyme sites in the product would be re-cut in the one-pot rxn.
+    try:
+        residual = _enzyme_cuts(product, [enzyme], circular=True)
+    except Exception:                          # pragma: no cover - defensive
+        residual = []
+    if residual:
+        warnings.append(
+            f"{len(residual)} residual {enzyme} site(s) in the product — it "
+            f"would be re-cut during the one-pot reaction; domesticate them "
+            f"out of the parts first.")
+    return {
+        "ok":              True,
+        "product_seq":     product,
+        "length":          len(product),
+        "circular":        True,
+        "n_parts":         len(part_frags),
+        "enzyme":          enzyme,
+        "order":           [f.get("source_label") or f"frag{i}"
+                            for i, f in enumerate(chain)],
+        "junctions":       [{"overhang": j} for j in junctions],
+        "n_residual_sites": len(residual),
+        "warnings":        warnings,
+        "errors":          [],
+    }
+
+
 def _scrub_gb_design(seq: str, feats: "list | None" = None, enzymes=None, *,
                      circular: bool = True, codon_raw: "dict | None" = None
                      ) -> dict:
