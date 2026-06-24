@@ -396,23 +396,30 @@ class TestAddFeatureHandler:
             tiny_app, {"start": 0, "end": 9, "bogus": 1})
         assert isinstance(result, dict) and result["ignored"] == ["bogus"]
 
-    def test_dirty_guard_refuses_without_force(self, tiny_app):
+    def test_add_on_dirty_canvas_succeeds_without_force(self, tiny_app):
+        """P1-10 (agent-API feedback): adding a feature is an additive edit —
+        it can't discard unsaved work, so a `*`-dirty canvas accepts the
+        add WITHOUT `force`. (The stale-load counter, tested below, is the
+        real cross-plasmid protection; the dirty guard only forced
+        `force:true` on every call after the first.)"""
         tiny_app._unsaved = True
         result = sc._h_add_feature(
             tiny_app, {"start": 0, "end": 10, "label": "t"}
         )
-        payload, status = result
-        assert status == 409
-        assert "force" in payload["error"]
+        assert isinstance(result, dict), result
+        assert result["ok"] is True
 
-    def test_dirty_guard_force_overrides(self, tiny_app):
+    def test_force_is_harmless_noop(self, tiny_app):
+        """`force` is no longer required (the dirty guard is gone) but must
+        stay ACCEPTED — never 400'd, never echoed under `ignored` — so
+        existing scripts that pass it keep working."""
         tiny_app._unsaved = True
         result = sc._h_add_feature(
             tiny_app, {"start": 0, "end": 10, "label": "t",
                         "force": True}
         )
-        # Tuple == error; dict == success.
         assert isinstance(result, dict), result
+        assert "force" not in result.get("ignored", [])
 
     def test_stale_load_counter_rejects(self, tiny_app):
         """Regression guard for 2026-05-17 adversarial audit: a canvas
@@ -1738,6 +1745,33 @@ class TestTransferAnnotationsHandler:
         # exact count, the record itself must NOT have been mutated.
         assert len(tiny_record.features) == before
 
+    def test_resolves_source_by_display_name(
+        self, tiny_record, isolated_library
+    ):
+        """P1-11 (agent-API feedback): `source_id` resolves by display NAME,
+        not only the LOCUS-safe id. Every other read resolves by name OR
+        id; pre-fix a valid display name 404'd here."""
+        sc._save_library([{
+            "id":      "SRC_LOCUS_ID",
+            "name":    "Src Display Name",
+            "size":    len(tiny_record.seq),
+            "n_feats": len(tiny_record.features),
+            "added":   "2026-06-24",
+            "gb_text": sc._record_to_gb_text(tiny_record),
+        }])
+        app = MockApp(record=tiny_record)
+        # By display name (spaces, not the id) — must resolve, not 404.
+        by_name = sc._h_transfer_annotations(
+            app, {"source_id": "Src Display Name", "dry_run": True},
+        )
+        assert isinstance(by_name, dict), by_name
+        assert by_name["applied"] is False
+        # The canonical id still works too.
+        by_id = sc._h_transfer_annotations(
+            app, {"source_id": "SRC_LOCUS_ID", "dry_run": True},
+        )
+        assert isinstance(by_id, dict), by_id
+
 
 class TestDiffPlasmidHandler:
     """`_h_diff_plasmid` runs `_pairwise_align` between the loaded record
@@ -2355,18 +2389,41 @@ class TestHTTPAddFeature:
         # And the record was marked dirty (so the user sees `*`).
         assert app._unsaved is True
 
-    def test_add_feature_dirty_guard(self, http_server):
+    def test_add_feature_no_dirty_guard(self, http_server):
+        """P1-10 (agent-API feedback): an additive feature edit does NOT trip
+        the dirty guard. A `*`-dirty canvas — whether from a prior agent
+        edit or a user edit in progress — still accepts the add WITHOUT
+        `force`. Adding a feature can't discard unsaved work the way a
+        load/replace can, so the old guard only forced `force:true` on
+        every call after the first (each add re-dirties the canvas)."""
         base, token, app = http_server
         app._unsaved = True
         status, payload = _http(
             f"{base}/add-feature", method="POST",
-            body={"start": 30, "end": 40},
+            body={"start": 30, "end": 40, "label": "additive"},
             token=token,
         )
-        assert status == 409
-        assert payload["dirty"] is True
+        assert status == 200, payload
+        assert payload["ok"] is True
 
-    def test_add_feature_force_override(self, http_server):
+    def test_add_feature_loop_without_force(self, http_server):
+        """The concrete P1-10 scenario: add several features in a row.
+        The first dirties the canvas; pre-fix the second 409'd. Now every
+        add lands without per-call `force`."""
+        base, token, app = http_server
+        app._unsaved = False
+        for i in range(3):
+            status, payload = _http(
+                f"{base}/add-feature", method="POST",
+                body={"start": 10 + i, "end": 20 + i, "label": f"f{i}"},
+                token=token,
+            )
+            assert status == 200, (i, payload)
+
+    def test_add_feature_force_still_accepted(self, http_server):
+        """`force` is now a harmless no-op (the guard is gone) but must
+        still be ACCEPTED — never 400'd or echoed under `ignored` — so
+        existing agent scripts that pass it keep working."""
         base, token, app = http_server
         app._unsaved = True
         status, payload = _http(
@@ -2376,6 +2433,7 @@ class TestHTTPAddFeature:
             token=token,
         )
         assert status == 200, payload
+        assert "force" not in payload.get("ignored", [])
 
     def test_add_wrap_feature(self, http_server, tiny_record):
         """Wrap features (end < start) build a CompoundLocation."""
@@ -3154,6 +3212,362 @@ class TestNumericCoercionHardening:
         except urllib.error.HTTPError as exc:
             status = exc.code
         assert status == 200
+
+    def test_list_restriction_sites_enzyme_singular_alias(self):
+        """P1-3 (agent-API feedback): the singular `enzyme` is accepted as an
+        alias for `enzymes`, and a bare string works under either key — so
+        the natural `{enzyme: "EcoRI"}` guess is HONORED, not silently
+        dropped (which would scan the whole catalog and look authoritative
+        while answering a different question)."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        # One EcoRI (GAATTC) + one BamHI (GGATCC) site, well separated.
+        seq = "AAAAAA" + "GAATTC" + "AAAAAA" + "GGATCC" + "AAAAAA"
+        rec = SeqRecord(Seq(seq), id="t", name="t")
+        rec.annotations["topology"] = "linear"
+        app = MockApp(record=rec)
+        singular   = sc._h_list_restriction_sites(app, {"enzyme": "EcoRI"})
+        plural     = sc._h_list_restriction_sites(app, {"enzymes": ["EcoRI"]})
+        str_plural = sc._h_list_restriction_sites(app, {"enzymes": "EcoRI"})
+        # Singular alias and bare-string forms == the canonical list form.
+        assert singular == plural == str_plural
+        # And the scan is actually scoped to EcoRI (BamHI present, excluded).
+        assert {s["enzyme"] for s in singular["sites"]} == {"EcoRI"}, singular
+        # Routing the OTHER enzyme by its singular key returns a different,
+        # correctly-scoped result — proving the param is honored, not ignored.
+        bam = sc._h_list_restriction_sites(app, {"enzyme": "BamHI"})
+        assert {s["enzyme"] for s in bam["sites"]} == {"BamHI"}, bam
+
+
+class TestListLibraryCollectionScope:
+    """P1-7 (agent-API feedback): `list-library {collection}` scopes the
+    listing to ONE collection's plasmids instead of silently returning the
+    whole active-collection library (the SC-D "ignored routing param"
+    footgun where the result looks scoped but isn't)."""
+
+    def _ent(self, name, size):
+        return {"id": f"id-{name}", "name": name, "gb_text": "",
+                "size": size, "n_feats": 0}
+
+    def _seed(self):
+        sc._save_collections([
+            {"name": "Alpha",
+             "plasmids": [self._ent("pA1", 10), self._ent("pA2", 20)],
+             "saved": "2026-01-01"},
+            {"name": "Beta", "plasmids": [self._ent("pB1", 30)],
+             "saved": "2026-01-01"},
+        ])
+        sc._set_active_collection_name("Alpha")
+        sc._restore_library_from_active_collection()
+
+    def test_scopes_to_named_non_active_collection(self):
+        # Active is Alpha; asking for Beta must return Beta's plasmid, NOT
+        # Alpha's — the whole point is reading a non-active collection
+        # without a set-active round-trip.
+        self._seed()
+        r = sc._h_list_library(None, {"collection": "Beta"})
+        assert isinstance(r, dict), r
+        assert r["collection"] == "Beta"
+        assert {e["name"] for e in r["library"]} == {"pB1"}
+        assert r["count"] == 1
+
+    def test_scopes_to_active_collection(self):
+        self._seed()
+        r = sc._h_list_library(None, {"collection": "Alpha"})
+        assert {e["name"] for e in r["library"]} == {"pA1", "pA2"}
+
+    def test_unknown_collection_404(self):
+        self._seed()
+        assert sc._h_list_library(None, {"collection": "Ghost"})[1] == 404
+
+    def test_omitted_collection_returns_full_library_no_scope_key(self):
+        self._seed()
+        r = sc._h_list_library(None, {})
+        # Unscoped → the active-collection library mirror, with NO
+        # `collection` key in the response (only present when scoped).
+        assert "collection" not in r
+        assert {e["name"] for e in r["library"]} == {"pA1", "pA2"}
+
+
+class TestRateLimitRetryAfter:
+    """SC-L (agent-API feedback): a 429 carries a coarse `retry_after`
+    (whole seconds, >=1) so a batching agent can self-pace instead of
+    busy-retrying."""
+
+    def test_429_carries_retry_after(self, http_server, monkeypatch):
+        import time
+        base, token, _ = http_server
+        # Slow the refill so the bucket stays exhausted across the request
+        # round-trip — the default 30 tokens/s would refill a read's worth
+        # within the round-trip and flake the assertion.
+        monkeypatch.setattr(sc, "_AGENT_RATE_LIMIT_TOKENS_PER_SEC", 1.0)
+        sc._agent_rate_limit_reset()
+        # Drain this token's bucket (recent timestamp) so the next request
+        # 429s rather than refilling from a stale/zero timestamp.
+        sc._AGENT_RATE_LIMIT_BUCKETS[token] = (0.0, time.monotonic())
+        try:
+            status, payload = _http(f"{base}/status", token=token)
+        finally:
+            sc._agent_rate_limit_reset()
+        assert status == 429, payload
+        assert isinstance(payload.get("retry_after"), int)
+        assert payload["retry_after"] >= 1
+
+
+class TestDigestHandler:
+    """P1-4 (agent-API feedback): `digest` exposes the overhang-aware
+    restriction engine on a RAW sequence so an agent can verify junction /
+    dropout overhangs without a sandboxed `import splicecraft`."""
+
+    # Two EcoRI (GAATTC) sites in a small circular molecule (52 bp).
+    SEQ = "GAATTC" + "A" * 20 + "GAATTC" + "T" * 20
+
+    def test_circular_two_cuts_two_fragments(self):
+        r = sc._h_digest(None, {"sequence": self.SEQ, "enzymes": ["EcoRI"]})
+        assert isinstance(r, dict), r
+        assert r["n_cuts"] == 2
+        assert r["n_fragments"] == 2          # circular: N cuts → N fragments
+        assert r["circular"] is True
+        assert {c["enzyme"] for c in r["cuts"]} == {"EcoRI"}
+        # EcoRI leaves a 4-base 5' overhang (AATT) — the QC payload.
+        for c in r["cuts"]:
+            assert c["overhang_seq"] == "AATT", c
+            assert c["kind"] == "5'", c
+
+    def test_matches_real_engine(self):
+        # Feedback "done when": the count matches `_enzyme_cuts`.
+        r = sc._h_digest(None, {"sequence": self.SEQ, "enzymes": ["EcoRI"],
+                                "circular": True})
+        assert r["n_cuts"] == len(
+            sc._enzyme_cuts(self.SEQ, ["EcoRI"], circular=True))
+
+    def test_linear_n_plus_one_fragments(self):
+        r = sc._h_digest(None, {"sequence": self.SEQ, "enzymes": ["EcoRI"],
+                                "circular": False})
+        # Linear: N cuts → N+1 fragments, free ends marked `linear`.
+        assert r["n_fragments"] == r["n_cuts"] + 1
+        assert r["fragments"][0]["left"]["kind"] == "linear"
+        assert r["fragments"][-1]["right"]["kind"] == "linear"
+
+    def test_singular_enzyme_and_seq_aliases(self):
+        a = sc._h_digest(None, {"seq": self.SEQ, "enzyme": "EcoRI"})
+        b = sc._h_digest(None, {"sequence": self.SEQ, "enzymes": ["EcoRI"]})
+        assert a == b
+
+    def test_unknown_enzyme_reported_not_dropped(self):
+        r = sc._h_digest(None, {"sequence": self.SEQ,
+                                "enzymes": ["EcoRI", "NotAnEnzyme"]})
+        assert r["unknown_enzymes"] == ["NotAnEnzyme"]
+        assert r["n_cuts"] == 2                # only EcoRI cuts
+
+    def test_include_fragment_seq_toggle(self):
+        off = sc._h_digest(None, {"sequence": self.SEQ, "enzymes": ["EcoRI"]})
+        assert "seq" not in off["fragments"][0]
+        on = sc._h_digest(None, {"sequence": self.SEQ, "enzymes": ["EcoRI"],
+                                 "include_fragment_seq": True})
+        assert "seq" in on["fragments"][0]
+        # Top strands partition the circle → lengths sum to the molecule.
+        assert sum(f["length"] for f in on["fragments"]) == len(self.SEQ)
+
+    def test_validation(self):
+        assert sc._h_digest(None, {"enzymes": ["EcoRI"]})[1] == 400  # no seq
+        assert sc._h_digest(None, {"sequence": self.SEQ})[1] == 400  # no enz
+        assert sc._h_digest(None,
+                            {"sequence": self.SEQ, "enzymes": []})[1] == 400
+        assert sc._h_digest(None,
+                            {"sequence": self.SEQ,
+                             "enzymes": [1, 2]})[1] == 400
+        # Too many enzymes — DoS guard (max 500).
+        assert sc._h_digest(None,
+                            {"sequence": self.SEQ,
+                             "enzymes": ["EcoRI"] * 501})[1] == 400
+
+
+class _FakeLibPanel:
+    """Records the records handed to `add_entry` (the real LibraryPanel
+    isn't mounted under a MockApp)."""
+    def __init__(self):
+        self.added: list = []
+
+    def add_entry(self, record, **kw):
+        self.added.append(record)
+        return True
+
+
+class _AppWithFakeLib(MockApp):
+    def __init__(self, record):
+        super().__init__(record=record)
+        self.fake_lib = _FakeLibPanel()
+
+    def query_one(self, selector, *a, **k):  # type: ignore[override]
+        return self.fake_lib
+
+
+class TestAddCurrentNameIdOverride:
+    """P0-8 / P1-9 (agent-API feedback): add-current-to-library accepts
+    {id?, name?} so a batch of from-scratch builds (all id 'Cloned') can
+    each be filed under a unique LOCUS-safe id + real spaced display name
+    instead of silently overwriting each other."""
+
+    def test_override_stamps_copy_not_canvas(self, tiny_record,
+                                             isolated_library):
+        sc._save_library([])
+        app = _AppWithFakeLib(tiny_record)
+        original_id = tiny_record.id
+        r = sc._h_add_current_to_library(
+            app, {"id": "FIRE 10!", "name": "FIRE 10 Module1"})
+        assert isinstance(r, dict) and r["ok"] is True, r
+        assert r["id"] == "FIRE_10"                 # scrubbed LOCUS-safe
+        assert r["name"] == "FIRE 10 Module1"       # spaced display name
+        # The record handed to add_entry carries the override identity...
+        saved = app.fake_lib.added[-1]
+        assert saved.id == "FIRE_10"
+        assert getattr(saved, "_tui_display_name") == "FIRE 10 Module1"
+        # ...but the LIVE canvas record is untouched (override on a copy).
+        assert tiny_record.id == original_id
+        assert tiny_record is app._current_record
+
+    def test_distinct_ids_reach_add_entry(self, tiny_record,
+                                          isolated_library):
+        sc._save_library([])
+        app = _AppWithFakeLib(tiny_record)
+        sc._h_add_current_to_library(app, {"id": "build-1"})
+        sc._h_add_current_to_library(app, {"id": "build-2"})
+        assert [x.id for x in app.fake_lib.added] == ["build-1", "build-2"]
+
+    def test_invalid_id_returns_400(self, tiny_record, isolated_library):
+        app = _AppWithFakeLib(tiny_record)
+        r = sc._h_add_current_to_library(app, {"id": "!!!"})
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_no_override_preserves_old_behavior(self, tiny_record,
+                                                isolated_library):
+        sc._save_library([])
+        app = _AppWithFakeLib(tiny_record)
+        r = sc._h_add_current_to_library(app, {})
+        assert r["ok"] is True
+        # No copy made — the live record itself is filed.
+        assert app.fake_lib.added[-1] is tiny_record
+
+    def test_long_distinct_ids_dont_truncate_collide(self, tiny_record,
+                                                     isolated_library):
+        # Two distinct ids sharing a 32-char prefix must stay DISTINCT — a
+        # fixed-width truncation let them collide and silently overwrite,
+        # the exact batch-loss this override prevents (code-review CONFIRMED).
+        sc._save_library([])
+        app = _AppWithFakeLib(tiny_record)
+        r1 = sc._h_add_current_to_library(
+            app, {"id": "cloned_plasmid_batch_run_001_sampleA"})
+        r2 = sc._h_add_current_to_library(
+            app, {"id": "cloned_plasmid_batch_run_001_sampleB"})
+        assert r1["id"] != r2["id"]
+        assert {x.id for x in app.fake_lib.added} == {r1["id"], r2["id"]}
+
+
+class TestLoadFileNameIdOverride:
+    """P0-8 / P1-9: load-file accepts {name?, id?} to stamp the loaded
+    record's identity, fixing the from-scratch `.dna` 'first-word name'
+    truncation + the id-'Cloned' batch collision at the source."""
+
+    def _write_gb(self, tmp_path, locus="Cloned"):
+        from io import StringIO
+        from Bio import SeqIO as _SeqIO
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ACGT" * 20), id=locus, name=locus,
+                        description="Cloned part FIRE 10")
+        rec.annotations["molecule_type"] = "DNA"
+        sio = StringIO()
+        _SeqIO.write([rec], sio, "genbank")
+        gb = tmp_path / "build.gb"
+        gb.write_text(sio.getvalue())
+        return gb
+
+    def test_override_name_and_id(self, tmp_path):
+        gb = self._write_gb(tmp_path)
+        app = MockApp()
+        r = sc._h_load_file(app, {"path": str(gb),
+                                  "id": "FIRE 10!", "name": "FIRE 10 Module1"})
+        assert isinstance(r, dict) and r["ok"] is True, r
+        assert r["id"] == "FIRE_10"                  # scrubbed LOCUS-safe
+        assert r["name"] == "FIRE 10 Module1"        # spaced display name
+        # The loaded canvas record carries the stamped identity.
+        assert app._current_record.id == "FIRE_10"
+        assert sc.PlasmidApp._record_display_name(app._current_record) \
+            == "FIRE 10 Module1"
+
+    def test_blank_id_after_scrub_returns_400(self, tmp_path):
+        gb = self._write_gb(tmp_path)
+        app = MockApp()
+        r = sc._h_load_file(app, {"path": str(gb), "id": "!!!"})
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_no_override_loads_normally(self, tmp_path):
+        gb = self._write_gb(tmp_path, locus="MyPlasmid")
+        app = MockApp()
+        r = sc._h_load_file(app, {"path": str(gb)})
+        assert isinstance(r, dict) and r["ok"] is True
+
+
+class TestAgentAssemblyLineage:
+    """P0-2 (agent-API feedback): agent assemblies (gibson / golden-gate /
+    traditional) attach REAL parent lineage — each input fragment / part /
+    vector becomes a parent node — instead of the flat `createDocument`
+    leaf an agent-built construct used to get in the History tab."""
+
+    def test_builder_insert_fragment_with_parents(self):
+        xml = sc._build_history_for_agent_assembly(
+            name="prod", seq_len=2000, circular=True,
+            manipulation="goldenGateAssembly",
+            parents=[{"name": "partA", "size": 800},
+                     {"name": "partB", "size": 700},
+                     {"name": "vector", "size": 500}])
+        assert xml
+        root = sc._parse_commercialsaas_history(xml)
+        d = sc._history_node_to_dict(root)
+        assert d["operation"] == "insertFragment"
+        assert len(d["parents"]) == 3
+        names = " ".join(p["name"] for p in d["parents"])
+        assert "partA" in names and "partB" in names and "vector" in names
+
+    def test_builder_empty_parents_still_valid(self):
+        xml = sc._build_history_for_agent_assembly(
+            name="prod", seq_len=100, circular=True,
+            manipulation="gibsonAssembly", parents=[])
+        root = sc._parse_commercialsaas_history(xml)
+        d = sc._history_node_to_dict(root)
+        assert d["operation"] == "insertFragment"
+        assert d["parents"] == []
+
+    def test_parent_label_helper(self):
+        assert sc._agent_assembly_parent("ACGTACGT", "part 1") == {
+            "name": "part 1", "size": 8}
+        assert sc._agent_assembly_parent(
+            {"sequence": "ACGT", "name": "FFE 28"}, "part 2") == {
+            "name": "FFE 28", "size": 4}
+        assert sc._agent_assembly_parent({"sequence": "AC"}, "vector") == {
+            "name": "vector", "size": 2}
+
+    # Known-good real digest+ligation inputs (mirrors the traditional-clone
+    # test): EcoRI · backbone · BamHI · stuffer, circular vector.
+    VECTOR = "GAATTC" + "A" * 200 + "GGATCC" + "C" * 60
+    INSERT = "GCGC" + "GAATTC" + "ATGAAACCCGGGTTTTAA" + "GGATCC" + "GCGC"
+
+    def test_traditional_clone_attaches_lineage_end_to_end(self):
+        r = sc._h_traditional_clone(None, {
+            "vector_seq": self.VECTOR, "vector_enzymes": ["EcoRI", "BamHI"],
+            "insert_seq": self.INSERT, "insert_enzymes": ["EcoRI", "BamHI"],
+            "product_name": "lineageclone", "vector_frag_idx": 0,
+            "vector_name": "MyVector", "insert_name": "MyInsert"})
+        assert r["ok"], r
+        # get-history reads the saved entry's lineage tree.
+        h = sc._h_get_history(None, {"name": "lineageclone"})
+        assert h["ok"] and h["history"] is not None, h
+        tree = h["history"]
+        assert tree["operation"] == "insertFragment"   # not createDocument
+        assert len(tree["parents"]) == 2               # vector + insert
+        pnames = " ".join(p["name"] for p in tree["parents"])
+        assert "MyVector" in pnames and "MyInsert" in pnames
 
 
 class TestRequestDispatcherHardening:

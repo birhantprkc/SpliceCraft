@@ -10826,3 +10826,77 @@ class TestDomesticatorDualSaveWorker:
                 "the fragment must carry the domestication primers"
             )
             app.exit()
+
+
+class TestAssembleIntoEntryVectorEndpoint:
+    """P0-1 (agent-API feedback): the `assemble-into-entry-vector` agent
+    endpoint exposes the real multi-source level-up clone — L0 parts → α/L1
+    TU — and FAILS LOUD (422) on a missing acceptor or a chain that can't
+    close, never a stub."""
+
+    def test_l0_to_tu_clones_saves_and_attaches_lineage(self):
+        sc._set_entry_vector(
+            "gb_l0", _make_l1_alpha_vector("alpha1", "TACA", "GACT"),
+            role="Alpha1")
+        r = sc._h_assemble_into_entry_vector(None, {
+            "sources": _make_l0_tu_parts("a"), "grammar": "gb_l0",
+            "source_level": 0, "role": "Alpha1", "name": "AgentTU"})
+        assert isinstance(r, dict) and r["ok"], r
+        assert r["n_sources"] == 4 and r["source_level"] == 0
+        ent = next(e for e in sc._load_library() if e["name"] == "AgentTU")
+        assert ent["source"] == "agent:assemble"
+        rec = sc._gb_text_to_record(ent["gb_text"])
+        assert rec.annotations.get("topology") == "circular"
+        seq = str(rec.seq).upper()
+        # The chained TU insert (terminal sticky ends GGAG…CGCT) must appear.
+        chain = ("GGAG" + "AAATTT" * 5 + "TGAC" + "CCCAAA" * 3 + "AATG"
+                 + "ATGAAA" * 6 + "GCTT" + "TTTGGG" * 4 + "CGCT")
+        assert (chain in seq) or (chain in sc._rc(seq))
+        # Lineage: insertFragment root with the 4 parts + the acceptor.
+        h = sc._h_get_history(None, {"name": "AgentTU"})
+        assert h["history"]["operation"] == "insertFragment"
+        assert len(h["history"]["parents"]) == 5
+
+    def test_no_entry_vector_fails_loud(self):
+        sc._set_entry_vector("gb_l0", None, role="Alpha1")
+        r = sc._h_assemble_into_entry_vector(None, {
+            "sources": _make_l0_tu_parts("a"), "grammar": "gb_l0",
+            "source_level": 0, "role": "Alpha1", "name": "X"})
+        assert isinstance(r, tuple) and r[1] == 422, r
+        assert "entry vector" in r[0]["error"].lower()
+
+    def test_chain_mismatch_fails_loud(self):
+        sc._set_entry_vector(
+            "gb_l0", _make_l1_alpha_vector("alpha1", "TACA", "GACT"),
+            role="Alpha1")
+        parts = _make_l0_tu_parts("a")
+        parts[0]["oh3"] = "GGTT"   # break the chain (was TGAC)
+        r = sc._h_assemble_into_entry_vector(None, {
+            "sources": parts, "grammar": "gb_l0", "source_level": 0,
+            "role": "Alpha1", "name": "Broken"})
+        assert isinstance(r, tuple) and r[1] == 422, r
+        assert not any(e.get("name") == "Broken" for e in sc._load_library())
+
+    def test_validation(self):
+        sc._set_entry_vector(
+            "gb_l0", _make_l1_alpha_vector("alpha1", "TACA", "GACT"),
+            role="Alpha1")
+        # missing name
+        assert sc._h_assemble_into_entry_vector(None, {
+            "sources": _make_l0_tu_parts("a"), "role": "Alpha1"})[1] == 400
+        # empty sources
+        assert sc._h_assemble_into_entry_vector(None, {
+            "sources": [], "role": "Alpha1", "name": "x"})[1] == 400
+        # unknown grammar (checked before the acceptor lookup)
+        assert sc._h_assemble_into_entry_vector(None, {
+            "sources": _make_l0_tu_parts("a"), "grammar": "nope",
+            "role": "Alpha1", "name": "x"})[1] == 400
+        # L0 source missing its overhangs
+        assert sc._h_assemble_into_entry_vector(None, {
+            "sources": [{"name": "p", "sequence": "ACGTACGT"}],
+            "role": "Alpha1", "name": "x"})[1] == 400
+        # Absurd overhang length in a source is rejected (≤50 nt).
+        assert sc._h_assemble_into_entry_vector(None, {
+            "sources": [{"name": "p", "sequence": "ACGTACGT",
+                         "oh5": "A" * 51, "oh3": "AATG"}],
+            "role": "Alpha1", "name": "x"})[1] == 400

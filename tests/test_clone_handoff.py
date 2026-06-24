@@ -1386,3 +1386,127 @@ class TestCloneNamingAndRowCarry:
         assert match is not None
         assert match.get("run_primers"), \
             "row projection dropped run_primers — only flanks reach the clone"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# domesticate-part agent endpoint (P0-1 + P1-5)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestDomesticatePartEndpoint:
+    """P0-1 / P1-5 (agent-API feedback): the `domesticate-part` agent endpoint
+    runs the REAL Synthesis-tab L0 clone (digest the entry vector + ligate
+    the insert) and saves the L0 plasmid with construction lineage — and
+    FAILS LOUD (422) instead of silently stubbing a pUPD2 backbone when no
+    compatible entry vector is configured."""
+
+    def _configure_vector_and_design(self):
+        g = sc._BUILTIN_GRAMMARS["gb_l0"]
+        sc._set_entry_vector("gb_l0", {
+            "name": "TESTUPD", "size": 0, "source": "test",
+            "id": "TESTUPD", "gb_text": _make_acceptor_gb(2),
+        })
+        cds_type = next((p["type"] for p in g["positions"]
+                         if p["type"] in (g.get("coding_types") or [])),
+                        g["positions"][0]["type"])
+        d = sc._design_gb_primers(_INSERT, 0, len(_INSERT), cds_type,
+                                  codon_raw=None, grammar=g)
+        assert not d.get("error"), d.get("error")
+        return d
+
+    def test_clones_saves_and_attaches_lineage(self):
+        d = self._configure_vector_and_design()
+        r = sc._h_domesticate_part(None, {
+            "sequence": d["insert_seq"], "oh5": d["oh5"], "oh3": d["oh3"],
+            "name": "AgentTCDS", "grammar": "gb_l0", "type": d["part_type"],
+            "fwd_primer": d["fwd_full"], "rev_primer": d["rev_full"]})
+        assert isinstance(r, dict) and r["ok"], r
+        ent = next(e for e in sc._load_library() if e["name"] == "AgentTCDS")
+        assert ent["source"] == "agent:domesticate"
+        rec = sc._gb_text_to_record(ent["gb_text"])
+        assert rec.annotations.get("topology") == "circular"
+        cls = str(rec.seq).upper()
+        # REAL clone, not the pUPD2 stub: full plasmid carrying the insert.
+        stub = sc._simulate_cloned_plasmid(d["insert_seq"], d["oh5"], d["oh3"],
+                                           d["part_type"]).upper()
+        assert cls != stub, "domesticate-part degraded to the stub backbone"
+        assert d["insert_seq"][6:-6] in cls
+        assert len(cls) > len(d["insert_seq"]) + 1000
+        # L0 lineage attached: insertFragment root (not a flat createDocument).
+        h = sc._h_get_history(None, {"name": "AgentTCDS"})
+        assert h["history"] is not None
+        assert h["history"]["operation"] == "insertFragment"
+
+    def test_no_entry_vector_fails_loud(self):
+        sc._set_entry_vector("gb_l0", None)            # fresh-install: no vector
+        r = sc._h_domesticate_part(None, {
+            "sequence": _INSERT, "oh5": "GGAG", "oh3": "AATG",
+            "name": "NoVec", "grammar": "gb_l0"})
+        assert isinstance(r, tuple) and r[1] == 422, r
+        assert "entry vector" in r[0]["error"].lower()
+        # No stub leaked into the library.
+        assert not any(e.get("name") == "NoVec" for e in sc._load_library())
+
+    def test_allow_stub_false_raises_when_tiers_fail(self):
+        # A configured-but-USELESS vector (poly-A: no Esp3I site to cut, and
+        # none of the part's overhangs to splice against) makes both real-
+        # clone tiers fail — so allow_stub=False must RAISE (the agent path)
+        # while allow_stub=True (the GUI default) still returns the
+        # unbreakable stub record.
+        sc._set_entry_vector("gb_l0", {
+            "name": "EMPTY", "id": "EMPTY", "size": 0, "source": "test",
+            "gb_text": sc._record_to_gb_text(_SeqRecord(
+                _Seq("A" * 1500), id="EMPTY", name="EMPTY",
+                annotations={"molecule_type": "DNA", "topology": "circular"})),
+        })
+        bad = {"name": "X", "sequence": _INSERT,
+               "oh5": "GGAG", "oh3": "AATG", "grammar": "gb_l0"}
+        with pytest.raises(ValueError):
+            sc._part_to_cloned_seqrecord(bad, allow_stub=False)
+        assert sc._part_to_cloned_seqrecord(bad, allow_stub=True) is not None
+
+    def test_validation(self):
+        # sequence / oh5 / oh3 / name / grammar are all required up front,
+        # each before the entry-vector check (no vector setup needed).
+        assert sc._h_domesticate_part(
+            None, {"oh5": "GGAG", "oh3": "AATG", "name": "x"})[1] == 400
+        assert sc._h_domesticate_part(
+            None, {"sequence": _INSERT, "oh3": "AATG", "name": "x"})[1] == 400
+        assert sc._h_domesticate_part(
+            None, {"sequence": _INSERT, "oh5": "GGAG", "oh3": "AATG"})[1] == 400
+        assert sc._h_domesticate_part(
+            None, {"sequence": _INSERT, "oh5": "GGAG", "oh3": "AATG",
+                   "name": "x", "grammar": "nope"})[1] == 400
+        # Absurd overhang length is rejected (≤50 nt).
+        assert sc._h_domesticate_part(
+            None, {"sequence": _INSERT, "oh5": "A" * 51, "oh3": "AATG",
+                   "name": "x"})[1] == 400
+
+    def test_whitespace_collection_is_clean_400(self):
+        # A whitespace-only `collection` is a clean 400 "invalid 'collection'"
+        # — not a confusing 409 naming None as a collection (code-review).
+        d = self._configure_vector_and_design()
+        r = sc._h_domesticate_part(None, {
+            "sequence": d["insert_seq"], "oh5": d["oh5"], "oh3": d["oh3"],
+            "name": "x", "grammar": "gb_l0", "collection": "   "})
+        assert isinstance(r, tuple) and r[1] == 400, r
+
+    def test_distinct_long_names_get_distinct_ids(self):
+        # Two distinct names sharing a 32-char prefix must NOT collide on the
+        # canonical id (the endpoint inserts directly, bypassing add_entry's
+        # id-dedup, so a truncated-id collision would make load-by-id return
+        # the wrong plasmid) — code-review CONFIRMED bug.
+        d = self._configure_vector_and_design()
+        long_a = "AlphaConstruct_VeryLongDescriptiveName_A"  # share 32 prefix
+        long_b = "AlphaConstruct_VeryLongDescriptiveName_B"
+        r1 = sc._h_domesticate_part(None, {
+            "sequence": d["insert_seq"], "oh5": d["oh5"], "oh3": d["oh3"],
+            "name": long_a, "grammar": "gb_l0", "type": d["part_type"]})
+        r2 = sc._h_domesticate_part(None, {
+            "sequence": d["insert_seq"], "oh5": d["oh5"], "oh3": d["oh3"],
+            "name": long_b, "grammar": "gb_l0", "type": d["part_type"]})
+        assert r1["ok"] and r2["ok"], (r1, r2)
+        assert r1["saved_id"] != r2["saved_id"]
+        # Both retrievable by their distinct ids.
+        assert sc._find_library_entry_by_id(r1["saved_id"]) is not None
+        assert sc._find_library_entry_by_id(r2["saved_id"]) is not None

@@ -55,7 +55,7 @@ from splicecraft_seqanalysis import (_classify_part_from_plasmid, _find_orfs)
 from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _safe_color_for_picker, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
-from splicecraft_biology import (_scan_restriction_sites)
+from splicecraft_biology import (_digest_with_enzymes, _enzyme_cuts, _scan_restriction_sites)
 from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _design_gb_primers)
 from splicecraft_dataaccess import (_active_enzyme_allowed_set, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
 from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, _export_gff_to_path, _extract_gbk_member)
@@ -568,6 +568,14 @@ def _h_list_library(app, payload):
     n_features, topology, source for each. Subset of the on-disk JSON
     tuned for an agent's "what plasmids do I have" question.
 
+    Body: ``{collection?}``. Pass ``collection`` to scope the listing to
+    ONE collection's plasmids (``404`` if no such collection, ``400`` if
+    blank); omit it for the full library across all collections. P1-7
+    (agent-API feedback): pre-fix a ``collection`` arg was silently ignored
+    and the full library returned — the SC-D footgun where the result
+    looks scoped but isn't. The response echoes the resolved
+    ``collection`` when scoped.
+
     Sweep #26 (2026-05-25): fixed projection bug. Pre-fix the handler
     read non-existent JSON fields (`sequence`, `features`, `topology`,
     `source_path`) and returned `{length: 0, n_features: 0, topology:
@@ -577,11 +585,35 @@ def _h_list_library(app, payload):
     of the LOCUS line when available (defaults to "circular" — the
     overwhelming majority of library entries).
     """
+    # P1-7: scope to a single collection when asked. Resolve the name the
+    # same way `load-entry` does (`_normalize_collection_name` + exact
+    # match on the readonly cache view, mirroring `_find_collection`) so
+    # `{collection: "RUBYFIRE"}` behaves identically across endpoints.
+    coll_in = payload.get("collection")
+    scope: "str | None" = None
+    if coll_in not in (None, ""):
+        coll_name = _normalize_collection_name(coll_in)
+        if coll_name is None:
+            return ({"error": "invalid 'collection'"}, 400)
+        col = next((c for c in _iter_collections_readonly()
+                    if isinstance(c, dict) and c.get("name") == coll_name),
+                   None)
+        if col is None:
+            return ({"error": f"no collection named {coll_name!r}"}, 404)
+        # Read-only projection of the collection's own plasmid entries —
+        # never mutate them (pitfall #17).
+        source_entries: "list[dict]" = [
+            e for e in (col.get("plasmids") or []) if isinstance(e, dict)
+        ]
+        scope = coll_name
+    else:
+        # Sweep #25 (2026-05-23): read-only iterator — pre-fix paid full
+        # library deepcopy just to project six fields. Build the output
+        # list from immutable reads.
+        source_entries = _iter_library_readonly()
+
     out: list[dict] = []
-    # Sweep #25 (2026-05-23): read-only iterator — pre-fix paid full
-    # library deepcopy just to project six fields. Build the output
-    # list from immutable reads.
-    for e in _iter_library_readonly():
+    for e in source_entries:
         # Topology: scan the LOCUS line for "circular" or "linear".
         # Library entries omit explicit topology in the JSON — we get
         # it from the embedded gb_text. Default to "circular" since
@@ -601,7 +633,10 @@ def _h_list_library(app, payload):
             "topology":    topology,
             "source":      e.get("source", "") or "",
         })
-    return {"library": out, "count": len(out)}
+    result = {"library": out, "count": len(out)}
+    if scope is not None:
+        result["collection"] = scope
+    return result
 
 
 @_agent_endpoint("list-collections")
@@ -4742,9 +4777,19 @@ def _h_list_restriction_sites(app, payload):
     if rec is None:
         return ({"error": "no plasmid loaded"}, 422)
     enzymes = payload.get("enzymes")
+    # Accept the singular `enzyme` as an alias and a bare string under
+    # either key (agent-API feedback P1-3): the natural first guess is
+    # `{enzyme: "BsaI"}`, and silently dropping it (then scanning the whole
+    # catalog) is the SC-D "ignored routing param" footgun — the result
+    # looks authoritative while answering a different question.
+    if enzymes is None and payload.get("enzyme") not in (None, ""):
+        enzymes = payload.get("enzyme")
+    if isinstance(enzymes, str):
+        enzymes = [enzymes]
     if enzymes is not None:
         if not isinstance(enzymes, list):
-            return ({"error": "'enzymes' must be a list"}, 400)
+            return ({"error":
+                      "'enzymes' must be a list (or 'enzyme' a string)"}, 400)
         # Reject non-string elements up front — otherwise a mixed-type
         # list (e.g. `[1, 2.5, null]`) builds a set whose `not in` check
         # silently filters every hit to zero. The endpoint owes agents
@@ -4788,6 +4833,123 @@ def _h_list_restriction_sites(app, payload):
             "cut_bp":  s.get("top_cut_bp", -1),
         })
     return {"sites": out, "count": len(out)}
+
+
+@_agent_endpoint("digest")
+def _h_digest(app, payload):
+    """Digest a RAW sequence with restriction enzymes and report the cuts
+    + resulting fragments with their overhangs — the overhang-aware QC a
+    Golden-Braid / restriction build needs, on ANY sequence, without a
+    sandboxed `import splicecraft` (agent-API feedback P1-4).
+
+    Operates on the sequence in the BODY, not the loaded canvas, so an
+    agent can verify a junction or a dropout overhang it just designed.
+
+    Body: ``{sequence|seq, enzymes[]|enzyme, circular?=true,
+             include_fragment_seq?=false}``.
+
+    * ``sequence`` — IUPAC DNA, capped at 5 Mb (``seq`` accepted as alias).
+    * ``enzymes`` — list of names from the combined catalog (built-in NEB ∪
+      your custom enzymes); a singular ``enzyme`` string is accepted. Names
+      the catalog doesn't know are reported under ``unknown_enzymes`` (and
+      contribute no cuts) rather than silently dropped.
+    * ``circular`` (default ``true``) — origin-spanning cuts + fragment
+      count (a circular molecule with N cuts → N fragments; linear → N+1).
+    * ``include_fragment_seq`` (default ``false``) — include each fragment's
+      top-strand sequence; off by default so a megabase digest doesn't echo
+      its whole self back.
+
+    Returns:
+      * ``cuts`` — ``[{enzyme, top, bottom, kind, overhang_seq}]`` in cut
+        order; ``top``/``bottom`` are absolute 0-based top/bottom-strand cut
+        coordinates, ``kind`` ∈ ``5'`` / ``3'`` / ``blunt``.
+      * ``fragments`` — ``[{index, length, left, right}]`` in cut order
+        around the molecule (5'→3' for linear); ``left``/``right`` are
+        ``{overhang_seq, kind, enzyme}`` (the empty-enzyme ``linear`` kind
+        marks a free end of a linear input). ``seq`` is added per fragment
+        only when ``include_fragment_seq`` is set.
+      * ``n_cuts``, ``n_fragments``, ``circular``, ``unknown_enzymes``.
+    """
+    raw = (payload.get("sequence")
+           if payload.get("sequence") not in (None, "")
+           else payload.get("seq"))
+    # `_sanitize_bases` enforces the cap (and IUPAC charset) itself — pass
+    # the 5 Mb digest ceiling so it bounds the work (an HTTP caller is also
+    # limited by the ~1 MiB JSON body cap upstream).
+    bases, berr = _sanitize_bases(raw, max_len=_PCR_MAX_TEMPLATE_BP)
+    if berr is not None:
+        # `_sanitize_bases` speaks "'bases'"; this endpoint's field is
+        # 'sequence' — translate so the error names a key the agent sent.
+        return ({"error": berr.replace("'bases'", "'sequence'")}, 400)
+    if not bases:
+        return ({"error": "missing/empty 'sequence' (IUPAC DNA)"}, 400)
+    enzymes = payload.get("enzymes")
+    if enzymes is None and payload.get("enzyme") not in (None, ""):
+        enzymes = payload.get("enzyme")
+    if isinstance(enzymes, str):
+        enzymes = [enzymes]
+    if not isinstance(enzymes, list) or not enzymes:
+        return ({"error":
+                  "'enzymes' must be a non-empty list (or 'enzyme' a string)"},
+                400)
+    if len(enzymes) > 500:
+        return ({"error": "too many enzymes (max 500)"}, 400)
+    if not all(isinstance(e, str) and e for e in enzymes):
+        return ({"error": "'enzymes' must contain only non-empty strings"}, 400)
+    circular = bool(payload.get("circular", True))
+    include_seq = bool(payload.get("include_fragment_seq", False))
+
+    # Report names the catalog doesn't know (they contribute no cuts) so a
+    # typo'd enzyme is visible instead of silently scanning nothing — the
+    # SC-D "looks authoritative while answering a different question" trap.
+    try:
+        catalog = _state._all_enzymes_hook() or {}
+    except Exception:
+        catalog = {}
+    unknown = sorted({e for e in enzymes if e not in catalog})
+
+    try:
+        cuts = _enzyme_cuts(bases, enzymes, circular=circular)
+        frags = _digest_with_enzymes(bases, enzymes, circular=circular)
+    except Exception as exc:
+        _log.exception("agent digest failed")
+        return ({"error": f"digest failed: {_scrub_path(str(exc))}"}, 500)
+
+    cuts_out = [{
+        "enzyme":       c.get("enzyme", ""),
+        "top":          c.get("top"),
+        "bottom":       c.get("bot"),
+        "kind":         c.get("kind", ""),
+        "overhang_seq": c.get("overhang_seq", ""),
+    } for c in cuts]
+
+    frags_out = []
+    for i, f in enumerate(frags):
+        left  = f.get("left",  {}) or {}
+        right = f.get("right", {}) or {}
+        top_seq = f.get("top_seq", "") or ""
+        entry = {
+            "index":  i,
+            "length": len(top_seq),
+            "left":  {"overhang_seq": left.get("overhang_seq", ""),
+                       "kind": left.get("kind", ""),
+                       "enzyme": left.get("enzyme", "")},
+            "right": {"overhang_seq": right.get("overhang_seq", ""),
+                       "kind": right.get("kind", ""),
+                       "enzyme": right.get("enzyme", "")},
+        }
+        if include_seq:
+            entry["seq"] = top_seq
+        frags_out.append(entry)
+
+    return {
+        "cuts":            cuts_out,
+        "fragments":       frags_out,
+        "n_cuts":          len(cuts_out),
+        "n_fragments":     len(frags_out),
+        "circular":        circular,
+        "unknown_enzymes": unknown,
+    }
 
 
 @_agent_endpoint("diff-plasmid")

@@ -116,7 +116,20 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   primer pair per locus) or `"golden_braid"` (split into BsaI-tailed
   fragments that Golden-Gate back together; force-cures every BsaI site,
   returns per-fragment primers + native junction overhangs + a digest+ligate
-  `verified` flag)), design-gb-part (Golden Braid / MoClo), design-primers
+  `verified` flag)), design-gb-part (Golden Braid / MoClo), domesticate-part
+  (the real Synthesis-tab L0 clone: digest the grammar's CONFIGURED entry
+  vector + the part's primed amplicon at the Type IIS enzyme, ligate the
+  insert into the backbone, and save the circular L0 plasmid with its
+  insert + entry-vector lineage — pass `{sequence, oh5, oh3, name,
+  grammar?, type?, fwd_primer?, rev_primer?}`. **Fails loud** (422) when no
+  compatible entry vector is configured rather than silently emitting a
+  pUPD2-stub backbone, so an agent never files a wrong construct),
+  assemble-into-entry-vector (the multi-source level-up clone: chain L0
+  parts into an α/L1 TU, or TUs into an Ω/L2 module, by their fusion
+  overhangs and ligate into the configured `role` acceptor at the level-up
+  Type IIS enzyme — pass `{sources, grammar?, source_level?, role, name}`.
+  Also **fails loud** (422) on a missing acceptor or a chain that can't
+  close; the L2→binary hop is a known engine gap), design-primers
   (generic Primer3 detection or restriction cloning), optimize-protein
   (codon-optimise an AA sequence to a chosen table; optional `stops`
   0–3 appends that many stop codons, and a trailing `*` run in the
@@ -125,12 +138,25 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   wrap-aware on circular templates) and simulate-gel (per-lane band
   positions + optional rendered ASCII gel image; ladder / plasmid /
   digest / PCR-amplicon sources).
+- **Digest** — digest (cut a RAW sequence with named enzymes and report
+  the cuts + resulting fragments with their **overhangs** — overhang-aware
+  QC for a Golden-Braid / restriction junction without loading the
+  sequence onto the canvas; `circular` defaults true, a singular `enzyme`
+  is accepted, and names the catalog doesn't know are reported under
+  `unknown_enzymes` rather than silently dropped).
 - **Alignment** — diff-plasmid (one target, circular rotation
   auto-detected), multi-align (batch: the loaded plasmid or a given
   sequence vs many targets at once — the Alt+A overlay),
   list-plasmidsaurus-members, align-plasmidsaurus-zip.
 - **History** — get-history returns the parsed `<HistoryTree>`
-  lineage as nested JSON.
+  lineage as nested JSON. Agent assemblies (`gibson-assemble`,
+  `traditional-clone`, `golden-gate-assemble`) attach real parent
+  lineage — each input fragment / part / vector becomes a parent node, so
+  the product reads as a genuine `insertFragment` assembly instead of a
+  flat `createDocument` leaf. Name your inputs (a `{name}` on a gibson
+  fragment / golden-gate part, or `vector_name` / `insert_name` on a
+  traditional clone) and a parent that matches a saved library entry
+  nests that entry's own sub-lineage.
 - **Codon tables** — list, add (Kazusa fetch or raw dict), delete.
 - **Search** — blast (in-process BLASTN / BLASTP against your
   collections; pass `collections` to scope the DB to a subset and stay
@@ -268,6 +294,12 @@ The mutation endpoints `rename-plasmid`, `set-plasmid-status`,
 `diff-plasmid`, operate on the **active collection only** (via
 `_load_library()`). To target a plasmid elsewhere, `set-active-collection`
 to its home first — `search-library` shows which collection holds it.
+Within that scope, `transfer-annotations` resolves its `source_id` by
+display **name or id** (like `load-entry`), not id-only.
+
+`list-library` lists the active-collection library by default; pass
+`{collection}` to scope it to any one collection's plasmids without
+switching the active collection (`404` if there's no such collection).
 
 ### Name integrity
 
@@ -279,6 +311,16 @@ auto-filed on `save` — creating a new library entry requires an explicit
 `{create:true}` so an inspection can't silently pollute the active
 collection. Unknown body keys are echoed back under `ignored` rather than
 silently dropped.
+
+`load-file` and `add-current-to-library` accept optional `{id, name}`
+overrides to stamp the record's identity directly. This is the
+deterministic fix for a **batch build loop**: a from-scratch `.dna`
+carries no name packet, so without an override every such file loads as
+id `Cloned` and a loop of `add-current` calls silently REPLACES each
+prior entry (the library dedups by id) down to a single survivor. Pass a
+unique `id` (scrubbed to `[A-Za-z0-9_-]`, 32-char cap) per build — and a
+spaced `name` for the display name — and all N persist. The override is
+applied to a copy, so the live canvas record is untouched.
 
 ## Concurrency
 

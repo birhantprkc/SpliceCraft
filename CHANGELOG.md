@@ -14,6 +14,25 @@
 
 ---
 
+## [1.0.100] — 2026-06-24
+
+### New features
+
+- **Digest any sequence from the agent API.** A new `digest` endpoint cuts a sequence with the enzymes you name and reports every cut plus the resulting fragments and their overhangs — the overhang QC a Golden-Braid or restriction junction needs, on any sequence, without loading it onto the canvas. A singular `enzyme` works as well as a list, and names the catalog doesn't recognise are reported back rather than silently ignored.
+- **Domesticate a part from the agent API.** `domesticate-part` runs the real Synthesis-tab L0 clone — digests the configured entry vector, ligates your part's insert into the backbone, and saves the finished L0 plasmid with its construction lineage (insert + entry vector). It refuses with a clear error when no compatible entry vector is configured, instead of silently filing a placeholder backbone an automation can't tell apart from a real clone.
+- **Assemble parts into an entry vector from the agent API.** `assemble-into-entry-vector` chains L0 parts into an α/L1 Transcription Unit, or TUs into an Ω/L2 module, by their fusion overhangs and ligates the chain into the configured acceptor — the multi-source level-up clone the GUI Constructor's "Save To Library" performs. Like domesticate-part it fails loudly on a missing acceptor or a chain that can't close, never a stub.
+- **Name a construct when importing or filing it.** `load-file` and `add-current-to-library` take optional `id` and `name`, so a script building many constructs in a loop can give each a unique identity instead of a batch quietly collapsing to a single survivor.
+
+### Bug fixes
+
+- **Agent-built assemblies show their real construction tree.** A Gibson, Golden-Gate, or traditional-cloning product made through the agent API now records each input fragment, part, and vector as a parent in its History — instead of appearing as a lone "created" document with no lineage.
+- **Library and design reads honour their parameters.** Listing the library by collection now scopes to that collection instead of returning everything; transferring annotations accepts a plasmid's display name, not only its internal id; restriction-site and digest queries accept a single `enzyme`; and adding several features to a plasmid in a row no longer needs a "force" flag on every call after the first.
+
+### Hardening
+
+- **Rate-limit responses say how long to wait.** A throttled agent request now reports how many seconds to back off, so a batch operation can pace itself instead of hammering.
+- **Every new construction endpoint files each build under a genuinely unique identifier** — two constructs with long, similar names no longer collide on the canonical key and overwrite each other — validates its inputs (sequence and overhang sizes are bounded), and reports an invalid collection or other routing parameter with a clear error rather than a confusing one.
+
 ## [1.0.99] — 2026-06-23
 
 ### Performance

@@ -58,6 +58,12 @@ class TestOriginHistoryDescriptor:
         ("sequencing", "sequencingRead"),
         ("plasmidsaurus:run:s", "sequencingRead"),
         ("constructor:gb_l0:backbone", "assembly"),
+        # P0-2 (agent-API feedback): agent assembly endpoints save with an
+        # `agent:<method>` source — they must map to an assembly node, not
+        # the flat `createDocument` they fell through to pre-fix.
+        ("agent:golden-gate", "assembly"),
+        ("agent:traditional", "assembly"),
+        ("agent:gibson", "assembly"),
         ("id:Demo311", "createDocument"),
         ("", "createDocument"),
         ("something-unexpected", "createDocument"),
@@ -66,6 +72,16 @@ class TestOriginHistoryDescriptor:
         op, m = sc._origin_history_descriptor(source)
         assert m == manip
         assert op in ("createDocument", "importFile", "insertFragment")
+
+    @pytest.mark.parametrize("source", [
+        "agent:golden-gate", "agent:traditional", "agent:gibson",
+    ])
+    def test_agent_assembly_is_insert_fragment(self, source):
+        """The operation (not just the manipulation) must be the assembly
+        `insertFragment` so an agent-built construct reads as an assembly
+        in the History tab."""
+        op, _m = sc._origin_history_descriptor(source)
+        assert op == "insertFragment"
 
 
 # ── XML builder ─────────────────────────────────────────────────────────
