@@ -14,6 +14,17 @@
 
 ---
 
+## [1.0.101] — 2026-06-24
+
+### New features
+
+- **Transfer annotations from a plasmid in any collection.** The agent API's `transfer-annotations` now finds its source plasmid by name or id across every collection — with an optional `source_collection` to pin the search — so features from a backbone or vector that lives in a different collection copy straight onto your loaded construct, instead of having to first duplicate that source into the active collection.
+- **File a domesticated or assembled construct into any collection.** `domesticate-part` and `assemble-into-entry-vector` now accept a `collection` destination and save the finished construct there, not only into the active collection.
+
+### Bug fixes
+
+- **A clear switch for applying annotation transfers.** `transfer-annotations` now accepts a plain `apply: true` to commit a transfer (the original `dry_run: false` still works too); a request that tries to apply through an unrecognised switch such as `commit` or `write` is now turned away with a pointer to `apply`, rather than quietly staying a preview and reporting that nothing was applied.
+
 ## [1.0.100] — 2026-06-24
 
 ### New features

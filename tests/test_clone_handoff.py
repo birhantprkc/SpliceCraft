@@ -1510,3 +1510,35 @@ class TestDomesticatePartEndpoint:
         # Both retrievable by their distinct ids.
         assert sc._find_library_entry_by_id(r1["saved_id"]) is not None
         assert sc._find_library_entry_by_id(r2["saved_id"]) is not None
+
+    def test_routes_to_non_active_collection(self):
+        # Honor a non-active `collection` as a real destination (agent-API
+        # feedback): the L0 files into THAT collection like copy-plasmid {to},
+        # not the active one, and never touches the active live mirror.
+        d = self._configure_vector_and_design()
+        sc._save_collections([
+            {"name": "Active", "plasmids": [], "saved": "2026-01-01"},
+            {"name": "Dest", "plasmids": [], "saved": "2026-01-01"},
+        ])
+        sc._set_active_collection_name("Active")
+        sc._restore_library_from_active_collection()
+        r = sc._h_domesticate_part(None, {
+            "sequence": d["insert_seq"], "oh5": d["oh5"], "oh3": d["oh3"],
+            "name": "RoutedCDS", "grammar": "gb_l0", "type": d["part_type"],
+            "collection": "Dest"})
+        assert isinstance(r, dict) and r["ok"], r
+        assert r["collection"] == "Dest"
+        colls = {c["name"]: c for c in sc._load_collections()}
+        assert any(e.get("name") == "RoutedCDS"
+                   for e in colls["Dest"]["plasmids"]), colls
+        # NOT in the active collection nor its live mirror.
+        assert not any(e.get("name") == "RoutedCDS"
+                       for e in colls["Active"]["plasmids"])
+        assert not any(e.get("name") == "RoutedCDS" for e in sc._load_library())
+
+    def test_unknown_collection_is_404(self):
+        d = self._configure_vector_and_design()
+        r = sc._h_domesticate_part(None, {
+            "sequence": d["insert_seq"], "oh5": d["oh5"], "oh3": d["oh3"],
+            "name": "x", "grammar": "gb_l0", "collection": "NoSuchColl"})
+        assert isinstance(r, tuple) and r[1] == 404, r

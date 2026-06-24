@@ -10900,3 +10900,36 @@ class TestAssembleIntoEntryVectorEndpoint:
             "sources": [{"name": "p", "sequence": "ACGTACGT",
                          "oh5": "A" * 51, "oh3": "AATG"}],
             "role": "Alpha1", "name": "x"})[1] == 400
+
+    def test_routes_to_non_active_collection(self):
+        # Honor a non-active `collection` as a real destination (agent-API
+        # feedback): the TU files into THAT collection, not the active mirror.
+        sc._set_entry_vector(
+            "gb_l0", _make_l1_alpha_vector("alpha1", "TACA", "GACT"),
+            role="Alpha1")
+        sc._save_collections([
+            {"name": "Active", "plasmids": [], "saved": "2026-01-01"},
+            {"name": "Dest", "plasmids": [], "saved": "2026-01-01"},
+        ])
+        sc._set_active_collection_name("Active")
+        sc._restore_library_from_active_collection()
+        r = sc._h_assemble_into_entry_vector(None, {
+            "sources": _make_l0_tu_parts("a"), "grammar": "gb_l0",
+            "source_level": 0, "role": "Alpha1", "name": "RoutedTU",
+            "collection": "Dest"})
+        assert isinstance(r, dict) and r["ok"], r
+        assert r["collection"] == "Dest"
+        colls = {c["name"]: c for c in sc._load_collections()}
+        assert any(e.get("name") == "RoutedTU"
+                   for e in colls["Dest"]["plasmids"]), colls
+        assert not any(e.get("name") == "RoutedTU" for e in sc._load_library())
+
+    def test_unknown_collection_is_404(self):
+        sc._set_entry_vector(
+            "gb_l0", _make_l1_alpha_vector("alpha1", "TACA", "GACT"),
+            role="Alpha1")
+        r = sc._h_assemble_into_entry_vector(None, {
+            "sources": _make_l0_tu_parts("a"), "grammar": "gb_l0",
+            "source_level": 0, "role": "Alpha1", "name": "x",
+            "collection": "NoSuchColl"})
+        assert isinstance(r, tuple) and r[1] == 404, r

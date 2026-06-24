@@ -121,13 +121,16 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   vector + the part's primed amplicon at the Type IIS enzyme, ligate the
   insert into the backbone, and save the circular L0 plasmid with its
   insert + entry-vector lineage — pass `{sequence, oh5, oh3, name,
-  grammar?, type?, fwd_primer?, rev_primer?}`. **Fails loud** (422) when no
+  grammar?, type?, fwd_primer?, rev_primer?, collection?}` (saves to the
+  active collection, or the non-active `collection` if given). **Fails
+  loud** (422) when no
   compatible entry vector is configured rather than silently emitting a
   pUPD2-stub backbone, so an agent never files a wrong construct),
   assemble-into-entry-vector (the multi-source level-up clone: chain L0
   parts into an α/L1 TU, or TUs into an Ω/L2 module, by their fusion
   overhangs and ligate into the configured `role` acceptor at the level-up
-  Type IIS enzyme — pass `{sources, grammar?, source_level?, role, name}`.
+  Type IIS enzyme — pass `{sources, grammar?, source_level?, role, name,
+  collection?}` (active collection by default, or the named one).
   Also **fails loud** (422) on a missing acceptor or a chain that can't
   close; the L2→binary hop is a known engine gap), design-primers
   (generic Primer3 detection or restriction cloning), optimize-protein
@@ -290,12 +293,18 @@ collection first, then the others. A unique cross-collection hit loads
 valid `load-entry` key.
 
 The mutation endpoints `rename-plasmid`, `set-plasmid-status`,
-`delete-from-library`, and the lookups in `transfer-annotations` /
-`diff-plasmid`, operate on the **active collection only** (via
-`_load_library()`). To target a plasmid elsewhere, `set-active-collection`
-to its home first — `search-library` shows which collection holds it.
-Within that scope, `transfer-annotations` resolves its `source_id` by
-display **name or id** (like `load-entry`), not id-only.
+`delete-from-library`, and the lookup in `diff-plasmid` operate on the
+**active collection only** (via `_load_library()`). To target a plasmid
+elsewhere, `set-active-collection` to its home first — `search-library`
+shows which collection holds it.
+
+`transfer-annotations` resolves its `source_id` **across collections**
+(like `load-entry`): the active collection first, then the others, by
+display **name or id**. Pass `source_collection` to pin the search, and an
+ambiguous key across collections returns `409`. So a backbone in a
+non-active collection transfers onto the loaded record without a temp copy.
+To apply (not preview) pass `apply: true` — or the legacy `dry_run: false`;
+the default is a dry run.
 
 `list-library` lists the active-collection library by default; pass
 `{collection}` to scope it to any one collection's plasmids without

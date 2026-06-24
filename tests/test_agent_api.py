@@ -87,6 +87,26 @@ class MockApp:
         self._current_record = record
         self._unsaved = False
 
+    def _apply_annotation_transfers(self, transfers, target_record):
+        """Minimal mirror of `PlasmidApp._apply_annotation_transfers`: append
+        one feature per accepted transfer (using its target span) and reseat
+        via `_apply_record`, so the transfer-annotations apply path can be
+        exercised here. The real method also handles wrap features; the test
+        records don't wrap."""
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        from copy import deepcopy
+        new_record = deepcopy(target_record)
+        n = len(new_record.seq)
+        for tr in transfers:
+            t_s, t_e = int(tr["target_start"]), int(tr["target_end"])
+            loc = (FeatureLocation(t_s, t_e,
+                                   strand=int(tr.get("target_strand", 1)))
+                   if t_e > t_s else FeatureLocation(t_s, n))
+            new_record.features.append(SeqFeature(
+                loc, type=tr.get("feature_type") or "misc_feature",
+                qualifiers={"label": [tr.get("label", "")]}))
+        self._apply_record(new_record)
+
     def _do_save(self):
         self._saved = True
         self._unsaved = False
@@ -1771,6 +1791,131 @@ class TestTransferAnnotationsHandler:
             app, {"source_id": "SRC_LOCUS_ID", "dry_run": True},
         )
         assert isinstance(by_id, dict), by_id
+
+    # ── Apply switch (agent-API feedback) ──────────────────────────────
+    def _seed_self_source(self, tiny_record):
+        """A source library entry that mirrors the loaded record, so every
+        feature finds itself (≥ 1 transfer at the default min_len)."""
+        sc._save_library([{
+            "id": "src", "name": "src", "size": len(tiny_record.seq),
+            "n_feats": len(tiny_record.features), "added": "2026-06-24",
+            "gb_text": sc._record_to_gb_text(tiny_record),
+        }])
+
+    def test_apply_true_applies(self, tiny_record, isolated_library):
+        # `apply:true` is the discoverable affirmative — pre-fix it was
+        # silently ignored and the call stayed a dry run.
+        self._seed_self_source(tiny_record)
+        app = MockApp(record=tiny_record)
+        before = len(app._current_record.features)
+        r = sc._h_transfer_annotations(app, {"source_id": "src", "apply": True})
+        assert isinstance(r, dict), r
+        assert r["applied"] is True and r["count"] >= 1
+        assert len(app._current_record.features) > before
+
+    def test_dry_run_false_still_applies(self, tiny_record, isolated_library):
+        # Backward compat: the legacy dry_run:false still applies.
+        self._seed_self_source(tiny_record)
+        app = MockApp(record=tiny_record)
+        r = sc._h_transfer_annotations(
+            app, {"source_id": "src", "dry_run": False})
+        assert isinstance(r, dict) and r["applied"] is True, r
+
+    def test_apply_false_is_dry_run(self, tiny_record, isolated_library):
+        self._seed_self_source(tiny_record)
+        app = MockApp(record=tiny_record)
+        before = len(app._current_record.features)
+        r = sc._h_transfer_annotations(
+            app, {"source_id": "src", "apply": False})
+        assert isinstance(r, dict) and r["applied"] is False, r
+        assert len(app._current_record.features) == before
+
+    def test_apply_overrides_dry_run(self, tiny_record, isolated_library):
+        # An explicit apply wins over a (conflicting) dry_run.
+        self._seed_self_source(tiny_record)
+        app = MockApp(record=tiny_record)
+        r = sc._h_transfer_annotations(
+            app, {"source_id": "src", "apply": True, "dry_run": True})
+        assert isinstance(r, dict) and r["applied"] is True, r
+
+    def test_bare_apply_synonym_rejected(self, tiny_record, isolated_library):
+        # A `commit`/`write`/`persist` with no apply/dry_run is a loud 400,
+        # not a silent dry run (SC-D outcome-changing-ignored-key footgun).
+        self._seed_self_source(tiny_record)
+        app = MockApp(record=tiny_record)
+        for syn in ("commit", "write", "persist"):
+            r = sc._h_transfer_annotations(
+                app, {"source_id": "src", syn: True})
+            assert isinstance(r, tuple) and r[1] == 400, (syn, r)
+            assert "apply" in r[0]["error"].lower()
+        # A FALSY synonym means "don't apply" — the dry-run default, not a 400.
+        ok = sc._h_transfer_annotations(
+            app, {"source_id": "src", "commit": False})
+        assert isinstance(ok, dict) and ok["applied"] is False, ok
+
+    # ── Cross-collection source resolution (agent-API feedback) ─────────
+    def _seed_source_in_other(self, tiny_record):
+        """Active collection empty; the source lives in a NON-active one."""
+        gb = sc._record_to_gb_text(tiny_record)
+        sc._save_collections([
+            {"name": "Active", "plasmids": [], "saved": "2026-01-01"},
+            {"name": "Other", "plasmids": [{
+                "id": "BACKBONE", "name": "Backbone Src",
+                "size": len(tiny_record.seq),
+                "n_feats": len(tiny_record.features), "gb_text": gb,
+            }], "saved": "2026-01-01"},
+        ])
+        sc._set_active_collection_name("Active")
+        sc._restore_library_from_active_collection()
+
+    def test_resolves_source_in_non_active_collection(
+            self, tiny_record, isolated_library):
+        # The win: a source in a NON-active collection resolves (pre-fix it
+        # 404'd, forcing a temp-copy dance).
+        self._seed_source_in_other(tiny_record)
+        app = MockApp(record=tiny_record)
+        r = sc._h_transfer_annotations(
+            app, {"source_id": "Backbone Src", "dry_run": True})
+        assert isinstance(r, dict), r        # resolved, not 404
+        assert r["applied"] is False
+        # The canonical id resolves cross-collection too.
+        assert isinstance(sc._h_transfer_annotations(
+            app, {"source_id": "BACKBONE", "dry_run": True}), dict)
+
+    def test_source_collection_pins(self, tiny_record, isolated_library):
+        self._seed_source_in_other(tiny_record)
+        app = MockApp(record=tiny_record)
+        # Pin to the right collection → resolves.
+        assert isinstance(sc._h_transfer_annotations(app, {
+            "source_id": "Backbone Src", "source_collection": "Other",
+            "dry_run": True}), dict)
+        # Pin to a collection that lacks it → 404 (no mirror fallback when
+        # the search is explicitly scoped).
+        r = sc._h_transfer_annotations(app, {
+            "source_id": "Backbone Src", "source_collection": "Active",
+            "dry_run": True})
+        assert isinstance(r, tuple) and r[1] == 404, r
+
+    def test_cross_collection_ambiguity_409(
+            self, tiny_record, isolated_library):
+        gb = sc._record_to_gb_text(tiny_record)
+        dup = lambda i: {"id": f"dup{i}", "name": "Dup Src",
+                         "size": len(tiny_record.seq), "gb_text": gb}
+        sc._save_collections([
+            {"name": "Active", "plasmids": [], "saved": "2026-01-01"},
+            {"name": "X", "plasmids": [dup(1)], "saved": "2026-01-01"},
+            {"name": "Y", "plasmids": [dup(2)], "saved": "2026-01-01"},
+        ])
+        sc._set_active_collection_name("Active")
+        sc._restore_library_from_active_collection()
+        app = MockApp(record=tiny_record)
+        r = sc._h_transfer_annotations(
+            app, {"source_id": "Dup Src", "dry_run": True})
+        assert isinstance(r, tuple) and r[1] == 409, r
+        # source_collection disambiguates.
+        assert isinstance(sc._h_transfer_annotations(app, {
+            "source_id": "Dup Src", "source_collection": "X",
+            "dry_run": True}), dict)
 
 
 class TestDiffPlasmidHandler:
