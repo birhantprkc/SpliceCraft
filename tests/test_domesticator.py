@@ -7542,6 +7542,45 @@ class TestCloneAssemblyIntoEntryVector:
         seq = str(result.seq).upper()
         assert (expected_chain in seq) or (expected_chain in sc._rc(seq))
 
+    def test_l0_cds_with_start_codon_collapses_double_atg(self):
+        """INV-136 / 2026-06-25 double-Met assembly bug: a Golden Braid /
+        MoClo CDS L0 part carries its OWN start codon, and its 5' fusion
+        overhang AATG embeds a start codon too (AATG = A spacer + ATG start).
+        Chaining the part behind its upstream neighbour must COLLAPSE that
+        overlap — emit AATG·[codon2] (single N-terminal Met), NOT
+        AATG·ATG·[codon2] (the M-M artifact that hit real α/Ω
+        assemblies). Mirrors `_fuse_overhang_body` on the domestication
+        path; fires for a coding part type behind an AATG-family overhang
+        whose body still carries its leading ATG."""
+        gb = sc._BUILTIN_GRAMMARS["gb_l0"]
+        vec = _make_l1_alpha_vector("alpha1", "TACA", "GACT")
+        parts = _make_l0_tu_parts("z")
+        # Full CDS body (starts with its OWN ATG) + tag it CDS so the AATG
+        # start-codon collapse fires. The base fixture leaves type unset.
+        cds_body = "ATGGATAACGCAACCCTGGCAGTGATTTAA"   # M-D-N-A-T-… starts ATG
+        for p in parts:
+            if p["name"] == "C_z":
+                p["sequence"] = cds_body
+                p["type"] = "CDS"
+        tu = sc._clone_assembly_into_entry_vector(
+            parts, vec, gb, source_level=0, name="TU_z")
+        assert tu is not None
+        seq = str(tu.seq).upper()
+        single  = "AATG" + cds_body[3:]   # collapsed: AATG·GAT… (one Met)
+        doubled = "AATG" + cds_body        # the bug:   AATG·ATG·GAT… (M-M)
+        in_seq = lambda s: (s in seq) or (s in sc._rc(seq))
+        assert in_seq(single), "collapsed AATG·codon2 junction missing"
+        assert not in_seq(doubled), "double-ATG (M-M start) survived assembly"
+        # The CDS feature must annotate a SINGLE start codon (the overhang's
+        # ATG IS the CDS start), so the user reads the intended protein.
+        cds = [f for f in tu.features
+               if (f.qualifiers.get("label") or [""])[0] == "C_z"]
+        assert cds, "CDS feature missing from TU"
+        cseq = str(cds[0].extract(tu.seq)).upper()
+        assert not cseq.startswith("ATGATG"), f"feature spans doubled ATG: {cseq[:12]}"
+        assert cseq == cds_body or cseq == sc._rc(cds_body), \
+            f"CDS feature != intended single-Met CDS: {cseq[:15]}"
+
     def test_l0_to_tu_returns_none_on_chain_mismatch(self):
         gb = sc._BUILTIN_GRAMMARS["gb_l0"]
         vec = _make_l1_alpha_vector("alpha1", "TACA", "GACT")

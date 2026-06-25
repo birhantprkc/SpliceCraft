@@ -14,6 +14,12 @@
 
 ---
 
+## [1.0.102] — 2026-06-25
+
+### Bug fixes
+
+- **Assembled coding sequences no longer gain an extra start codon.** When an L0 CDS part was assembled into a transcription unit or higher-level module (`assemble-into-entry-vector` / the Constructor's Save To Library), the Golden Braid / MoClo `AATG` fusion overhang and the CDS's own start codon were both kept — so every assembled CDS picked up a spurious extra N-terminal methionine (M‑M‑…), shifting the protein by one residue even though the L0 part itself was correct. The assembler now collapses that overlap, matching what part domestication already does, so an assembled CDS carries exactly the single start codon its part does.
+
 ## [1.0.101] — 2026-06-24
 
 ### New features
