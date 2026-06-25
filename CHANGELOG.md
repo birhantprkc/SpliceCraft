@@ -14,6 +14,12 @@
 
 ---
 
+## [1.0.103] — 2026-06-25
+
+### Bug fixes
+
+- **The agent daemon no longer pins a CPU core.** Running `splicecraft --agent` could leave a core spinning at 100% indefinitely: after a version update — or when the primer library held duplicate entries — a startup dialog (the "What's New" notes, or the duplicate-primer cleanup prompt) was shown even in headless agent mode, where there's no keyboard to dismiss it, so it sat on screen and the redraw loop ran flat-out (and the What's New dialog re-armed on every restart). The daemon now suppresses those startup dialogs — recording the new version as already seen, and leaving duplicate primers untouched — so it stays idle when idle.
+
 ## [1.0.102] — 2026-06-25
 
 ### Bug fixes

@@ -10271,6 +10271,32 @@ class TestShiftClickFeatureExtend:
         sc.PlasmidApp._preload_record = None
         sc.PlasmidApp._skip_splash = True
 
+    async def test_whats_new_suppressed_in_agent_mode(
+            self, tiny_record, isolated_library):
+        """[INV-137] Headless / --agent mode must NOT push the What's New modal
+        on a version change — there's no TTY to dismiss it, so it sits on the
+        screen stack and the render loop spins a core (the daemon "100% CPU"
+        bug). The version is still recorded as seen so the suppressed modal
+        can't re-arm + re-spin on the next daemon restart."""
+        assert sc._get_setting("last_seen_version", None) is None
+        sc.PlasmidApp._preload_record = tiny_record
+        sc.PlasmidApp._skip_splash = False
+        app = sc.PlasmidApp()
+        app._agent_api_port = 6701   # simulate the --agent daemon
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            assert isinstance(app.screen, sc.SplashScreen)
+            app.screen.action_dismiss_splash()
+            await pilot.pause()
+            await pilot.pause(0.1)
+            # No What's New modal in agent mode …
+            assert not isinstance(app.screen, sc.WhatsNewModal)
+            # … but the version is recorded so it won't re-arm next restart.
+            assert sc._get_setting("last_seen_version") == sc.__version__
+        sc.PlasmidApp._preload_record = None
+        sc.PlasmidApp._skip_splash = True
+
     def test_pairwise_align_basic(self):
         """1-bp substitution in a 300 bp sequence aligns with no gaps,
         99.67% identity, 1 mismatch, 0 gaps."""
