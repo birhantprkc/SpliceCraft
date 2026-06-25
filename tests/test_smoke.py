@@ -10297,6 +10297,16 @@ class TestShiftClickFeatureExtend:
         sc.PlasmidApp._preload_record = None
         sc.PlasmidApp._skip_splash = True
 
+    def test_agent_headless_for_no_tty(self):
+        """[INV-138] A detached --agent daemon (no controlling TTY) is forced
+        headless so Textual's input thread can't busy-loop on the non-TTY
+        stdin (the daemon "100% CPU" bug); an interactive --agent on a real
+        terminal keeps its TUI; non-agent launches are never forced."""
+        assert sc._agent_headless_for_no_tty(True, False) is True    # daemon, no tty
+        assert sc._agent_headless_for_no_tty(True, True) is False    # interactive agent
+        assert sc._agent_headless_for_no_tty(False, False) is False  # not agent
+        assert sc._agent_headless_for_no_tty(False, True) is False   # not agent
+
     def test_pairwise_align_basic(self):
         """1-bp substitution in a 300 bp sequence aligns with no gaps,
         99.67% identity, 1 mismatch, 0 gaps."""

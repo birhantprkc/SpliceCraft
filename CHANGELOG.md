@@ -14,6 +14,12 @@
 
 ---
 
+## [1.0.104] — 2026-06-25
+
+### Bug fixes
+
+- **The agent daemon stays idle when idle — for real this time.** A `splicecraft --agent` daemon launched in the background (no terminal attached) ran the full interactive interface, whose keyboard-input loop spun a CPU core at 100% with nothing to read. The daemon now detects that it has no controlling terminal and runs fully headless (interface off, HTTP API on), so a plain background launch no longer pins a core — no terminal-emulator wrapper needed. An `--agent` session started in a real terminal still shows the live interface.
+
 ## [1.0.103] — 2026-06-25
 
 ### Bug fixes
