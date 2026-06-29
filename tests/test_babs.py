@@ -352,6 +352,44 @@ class TestBabsUI:
                         "#babs-scrape-note"):
                 scr.query_one(sel)
 
+    async def test_panes_fill_height_not_collapsed(self, monkeypatch):
+        """Regression: the pane content boxes shipped with `height: 100%`, which
+        resolves against the TabPane's default `height: auto` and collapses to 0
+        — blanking every tab (no buttons, no table, just a black void). The
+        existing compose test only checks widgets EXIST, not that they're laid
+        out with non-zero size, so it missed this. Assert the panes actually
+        fill the height between Header and Footer."""
+        monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            # Chat is the initial active tab. All three content boxes share one
+            # CSS rule, so a collapse here is a collapse everywhere.
+            assert scr.query_one("#babs-chat-box").region.height > 20, \
+                "chat pane collapsed (height: 100% inside auto TabPane?)"
+            assert scr.query_one("#babs-log").region.height > 15, \
+                "transcript log collapsed"
+            # Model tab: switch, wait for the load worker, then pin focus inside
+            # the pane so the mount-time #babs-input focus race can't yank the
+            # active tab back to Chat before we measure the regions.
+            tabs = scr.query_one("#babs-tabs", sc.TabbedContent)
+            tabs.active = "babs-tab-model"
+            for _ in range(60):
+                await pilot.pause(); await asyncio.sleep(0.02)
+                if scr._active_model_coll:
+                    break
+            scr.query_one("#babs-models").focus()
+            tabs.active = "babs-tab-model"
+            for _ in range(6):
+                await pilot.pause(); await asyncio.sleep(0.02)
+            for sel in ("#babs-model-box", "#babs-coll-select",
+                        "#babs-models", "#babs-use"):
+                r = scr.query_one(sel).region
+                assert r.width > 0 and r.height > 0, f"{sel} collapsed: {r}"
+
     async def test_chat_turn_strips_think_and_commits_history(self, monkeypatch):
         monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
         monkeypatch.setattr(B, "chat_stream", _fake_chat)

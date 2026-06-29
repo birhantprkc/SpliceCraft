@@ -14,6 +14,12 @@
 
 ---
 
+## [1.0.107] — 2026-06-29
+
+### Bug fixes
+
+- **The BABS tabs render correctly again.** Opening BABS and switching to the **Model** or **Paper scraper** tab showed an empty black screen, and the **Chat** transcript was squeezed down to a couple of rows — the collection picker, model list, and every button were there, but laid out with zero height, so nothing was visible. All three tabs now fill the screen properly and match the rest of the app's styling.
+
 ## [1.0.106] — 2026-06-29
 
 ### New features
