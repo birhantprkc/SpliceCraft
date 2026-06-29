@@ -4569,6 +4569,7 @@ _MASTER_DELETE_CACHE_ATTRS: tuple = (
     "_enzyme_collections_cache",  # enzyme-set collections
     "_hmm_db_catalog_cache",      # sweep #28: HMM database registry
     "_protein_collections_cache",  # named protein-sequence collections (operon workbench)
+    "_model_collections_cache",   # BABS model-picker collections (INV-139)
 )
 
 
@@ -5603,6 +5604,7 @@ def _h_restore_backup(app, payload):
         "enzyme_collections":    "_enzyme_collections_cache",
         "hmm_db_catalog":        "_hmm_db_catalog_cache",
         "protein_collections":   "_protein_collections_cache",
+        "model_collections":     "_model_collections_cache",
     }.get(msg)
     if cache_attr is not None:
         _state._reset_master_delete_cache_hook(cache_attr)

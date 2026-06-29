@@ -14,6 +14,17 @@
 
 ---
 
+## [1.0.106] — 2026-06-29
+
+### New features
+
+- **Organize your local AI models into collections — just like plasmids.** The BABS **Model** tab is now a collection workbench: make, rename, and delete collections of models; **mark** rows (Space) to **move** them between collections or **uninstall** them in bulk; and **file a model into a collection before you've even downloaded it** — search HuggingFace, add the result, pull it later. Every model you already have is auto-filed into a default "My Models" collection so nothing is hidden, each row shows whether it's installed or not, and **Use** still picks the model BABS chats with. Deleting marked models runs a real uninstall behind a confirmation (it frees disk, and you'll re-download to use them again).
+- **Model downloads now show speed and size, not just a percent.** When BABS pulls a model, the progress bar reads like `1.2 GB / 5.5 GB · 21% · 18.4 MB/s`, so you can see a multi-gigabyte download is genuinely moving — and roughly how long it has to go.
+
+### Hardening
+
+- Model collections are saved with the same safety net as your plasmid library (atomic writes + backup rotation) and are included in backups, restore-from-backup, and migrate. They survive Ollama being offline — your filed models still show, marked "not pulled" — and a missing or stale model degrades to a clear message instead of a crash. Model names and refs are length-capped and stripped of stray control characters, and uninstalling the model you're currently chatting with now warns you instead of failing silently on your next message.
+
 ## [1.0.105] — 2026-06-29
 
 ### New features

@@ -42,7 +42,8 @@ _MIGRATED = [
     "_codon_tables_cache", "_collections_cache", "_custom_enzymes_cache",
     "_entry_vectors_cache", "_enzyme_collections_cache", "_experiment_projects_cache",
     "_experiments_cache", "_feature_colors_cache", "_features_cache", "_gels_cache",
-    "_grammars_cache", "_hmm_db_catalog_cache", "_library_cache", "_parts_bin_cache",
+    "_grammars_cache", "_hmm_db_catalog_cache", "_library_cache",
+    "_model_collections_cache", "_parts_bin_cache",
     "_parts_bin_collections_cache", "_primer_collections_cache", "_primers_cache",
     "_protein_collections_cache", "_protein_motifs_cache", "_settings_cache",
     # Phase A2b: one-shot backfill / name-trim flags
@@ -59,7 +60,8 @@ _MIGRATED = [
     "_CUSTOM_ENZYMES_FILE", "_DATA_VERSION_FILE", "_ENTRY_VECTORS_FILE",
     "_ENZYME_COLLECTIONS_FILE", "_EXPERIMENTS_FILE", "_EXPERIMENT_PROJECTS_FILE",
     "_FEATURES_FILE", "_FEATURE_COLORS_FILE", "_GELS_FILE", "_GRAMMARS_FILE",
-    "_HMM_DB_CATALOG_FILE", "_LIBRARY_FILE", "_PARTS_BIN_COLLECTIONS_FILE",
+    "_HMM_DB_CATALOG_FILE", "_LIBRARY_FILE", "_MODEL_COLLECTIONS_FILE",
+    "_PARTS_BIN_COLLECTIONS_FILE",
     "_PARTS_BIN_FILE", "_PRIMERS_FILE", "_PRIMER_COLLECTIONS_FILE",
     "_PROTEIN_COLLECTIONS_FILE", "_PROTEIN_MOTIFS_FILE", "_SETTINGS_FILE",
     # Phase B-main: persistence-engine config tunables (monkeypatched by the

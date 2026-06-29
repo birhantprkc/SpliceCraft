@@ -1192,6 +1192,79 @@ def _save_collections(entries: list[dict]) -> None:
         _after()
 
 
+# ── Model collections (BABS model picker — Ollama model refs, see [INV-139]) ──
+# Mirrors the library/collections architecture but MUCH lighter: a collection
+# groups model REFERENCES (Ollama tags / `hf.co/<repo>` pull strings) under a
+# name, never embedded model data (the models live in Ollama's own store). A
+# collection dict is {name, description, models:[{ref, note, added}], saved};
+# install status is resolved LIVE at display time, so a ref may sit in a
+# collection before (or after) the model is pulled. Same safe-save chokepoint
+# (#7) + deep-copy-on-read/save cache discipline (#17) as every accessor here.
+# No migration hook (schema v1, new file) — self-populating, double-checked.
+def _load_model_collections() -> "list[dict]":
+    """Deep-copy on read so callers can freely mutate the collections + their
+    model lists (pitfall #17). Lock-free cache-hit fast path."""
+    cached = _state._model_collections_cache
+    if cached is not None:
+        return _typed_clone(cached)
+    with _state._cache_lock:
+        if _state._model_collections_cache is None:
+            entries, warning = _safe_load_json(_state._MODEL_COLLECTIONS_FILE, "Model collections")
+            if warning:
+                _log.warning(warning)
+            _state._model_collections_cache = _typed_clone(
+                [e for e in entries if isinstance(e, dict)])
+        return _typed_clone(_state._model_collections_cache)
+
+
+def _save_model_collections(entries: "list[dict]") -> None:
+    """Persist the model-collection list (atomic write + .bak via the
+    chokepoint, invariant #7) and re-seat the cache via `_typed_clone`
+    (invariant #17 — a caller mutating its list post-save can't leak edits
+    into the next reader)."""
+    with _state._cache_lock:
+        _safe_save_json(_state._MODEL_COLLECTIONS_FILE, entries, "Model collections")
+        _state._model_collections_cache = _typed_clone(entries)
+
+
+def _iter_model_collections_readonly() -> "list[dict]":
+    """Read-only view of the model-collection cache (NO clone). Callers MUST
+    NOT mutate any returned dict/list — that poisons the cache (#17). For hot
+    reads (name-collision checks, listing). Mutators use `_load_model_collections`."""
+    cached = _state._model_collections_cache
+    if cached is not None:
+        return cached
+    with _state._cache_lock:
+        if _state._model_collections_cache is None:
+            entries, warning = _safe_load_json(_state._MODEL_COLLECTIONS_FILE, "Model collections")
+            if warning:
+                _log.warning(warning)
+            _state._model_collections_cache = _typed_clone(
+                [e for e in entries if isinstance(e, dict)])
+        return _state._model_collections_cache
+
+
+def _find_model_collection(name: str) -> "dict | None":
+    """O(N) walk + clone of the collection matching `name` (trimmed, exact),
+    or None. Clone so the caller can mutate safely (#17)."""
+    name = (name or "").strip()
+    if not name:
+        return None
+    for c in _iter_model_collections_readonly():
+        if isinstance(c, dict) and (c.get("name") or "").strip() == name:
+            return _typed_clone(c)
+    return None
+
+
+def _model_collection_name_taken(name: str) -> bool:
+    """Case-insensitive name-collision check over the readonly view."""
+    key = (name or "").strip().lower()
+    if not key:
+        return False
+    return any(isinstance(c, dict) and (c.get("name") or "").strip().lower() == key
+               for c in _iter_model_collections_readonly())
+
+
 # ── Parts bin / parts-bin collections (multi-bin part storage) ───────────────
 # Same architecture as library/collections: `parts_bin.json` holds the ACTIVE
 # bin's parts; `parts_bin_collections.json` is the canonical multi-bin record.

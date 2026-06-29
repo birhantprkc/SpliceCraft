@@ -15,12 +15,14 @@ the [CONV] patch-the-sibling rule).
 """
 import asyncio
 import json
+import os
+import time
 
 import pytest
 
 import splicecraft as sc
 import splicecraft_babs as B
-from textual.widgets import DataTable, Input
+from textual.widgets import DataTable, Input, ProgressBar
 
 _TERM = (170, 50)
 
@@ -67,6 +69,14 @@ def _fake_chat(model, messages, **kwargs):
 
 _ONE_MODEL = [{"name": "qwen2.5:7b", "size": 4_600_000_000, "family": "qwen2",
                "params": "7.6B", "quant": "Q4_K_M", "modified": ""}]
+
+# The "Mythos dupe" — a real public GGUF on HuggingFace (qwen3.5-9B, 1M ctx):
+# a concrete fixture for the pull-progress pipeline AND (opt-in) a genuine
+# end-to-end download test of the BABS backend. MYTHOS_Q4_BYTES is its
+# MTP-Q4_K_M layer size — the quant Ollama resolves by default — so the human
+# readout is asserted against a real model's byte counts.
+MYTHOS_MODEL = "hf.co/empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF"
+MYTHOS_Q4_BYTES = 5_887_668_064
 
 
 # ── engine ──────────────────────────────────────────────────────────────────────
@@ -147,6 +157,118 @@ class TestBabsEngine:
         assert B.pull_progress_fraction({"status": "pulling manifest"}) is None
         assert B.pull_progress_fraction({"total": 0, "completed": 0}) is None
 
+    def test_fmt_speed(self):
+        assert B.fmt_speed(0) == "" and B.fmt_speed(None) == ""
+        assert B.fmt_speed(-5) == "" and B.fmt_speed("x") == ""
+        assert B.fmt_speed(12 * 1024 * 1024) == "12.0 MB/s"
+
+    def test_pull_meter_mythos_readout(self):
+        # Replay a Mythos-shaped pull on a synthetic clock: manifest, then the
+        # big Q4 layer downloading at a steady 50 MiB/s. The readout must carry
+        # bytes-pulled, percent AND a real speed so a user sees it MOVING.
+        m = B.PullMeter(window=3.0)
+        assert m.update({"status": "pulling manifest"}, 0.0)["bps"] is None
+        rate = 50 * 1024 * 1024
+        last = None
+        for i in range(1, 9):
+            last = m.update({"status": "pulling 671c430bf18c", "digest": "671c430bf18c",
+                             "total": MYTHOS_Q4_BYTES, "completed": i * rate}, float(i))
+        assert last["fraction"] is not None and 0.0 < last["fraction"] < 1.0
+        assert abs(last["bps"] - rate) < 1.0                  # linear ramp ⇒ exact
+        assert B.fmt_speed(last["bps"]) == "50.0 MB/s"
+        assert "50.0 MB/s" in last["text"] and "%" in last["text"]
+        assert "/5.5 GB" in last["text"]                      # bytes pulled / total
+        # the success phase carries no bytes ⇒ no bogus trailing speed
+        done = m.update({"status": "success"}, 99.0)
+        assert done["bps"] is None and done["text"] == "success"
+
+    def test_pull_meter_no_negative_speed_across_layers(self):
+        # Real-world trap (observed in a live Mythos pull): a 5.5 GB layer
+        # finishes, then a tiny new layer starts at a low byte count. A naive
+        # (completed-prev)/dt reads a huge NEGATIVE rate (-78 MB/s was seen);
+        # the meter resets its speed baseline per layer (digest changes) so a
+        # negative / spiked speed can never surface.
+        m = B.PullMeter()
+        m.update({"status": "pulling AAA", "digest": "AAA",
+                  "total": MYTHOS_Q4_BYTES, "completed": 1_000_000_000}, 0.0)
+        m.update({"status": "pulling AAA", "digest": "AAA",
+                  "total": MYTHOS_Q4_BYTES, "completed": MYTHOS_Q4_BYTES}, 1.0)
+        info = m.update({"status": "pulling BBB", "digest": "BBB",
+                         "total": 481, "completed": 481}, 1.1)
+        assert info["bps"] is None                            # fresh-layer baseline
+        assert "-" not in (B.fmt_speed(info["bps"]) or "")
+        info2 = m.update({"status": "pulling BBB", "digest": "BBB",
+                          "total": 481, "completed": 481}, 1.2)
+        assert info2["bps"] is None or info2["bps"] >= 0      # never negative
+
+    def test_pull_meter_tolerates_garbage(self):
+        m = B.PullMeter()
+        for obj in ({}, {"status": "x", "total": "nan", "completed": None},
+                    {"total": 0, "completed": 0}, {"completed": 5}, {"total": 9}):
+            info = m.update(obj, 1.0)
+            assert info["bps"] is None                        # never a rate, never raises
+            assert isinstance(info["text"], str)
+
+    def test_delete_model_validates_and_bounds(self, monkeypatch):
+        # Empty name → BabsError (no request). Unreachable host → OllamaUnavailable.
+        with pytest.raises(B.BabsError):
+            B.delete_model("")
+        monkeypatch.setenv("SPLICECRAFT_OLLAMA_HOST", "http://127.0.0.1:6")  # dead port
+        with pytest.raises(B.OllamaUnavailable):
+            B.delete_model("ghost:1b", timeout=2)
+
+    def test_model_collections_roundtrip(self):
+        # The new data layer mirrors plasmid collections: safe-save envelope,
+        # deep-copy-on-read independence (#17), case-insensitive name check.
+        # (The autouse _protect_user_data fixture sandboxes + authorizes writes.)
+        sc._save_model_collections([])
+        assert sc._load_model_collections() == []
+        colls = [{"name": "My Models", "description": "", "saved": "2026-06-29",
+                  "models": [{"ref": "qwen2.5:7b", "note": "", "added": "2026-06-29"}]}]
+        sc._save_model_collections(colls)
+        assert sc._load_model_collections() == colls
+        assert sc._find_model_collection("My Models")["models"][0]["ref"] == "qwen2.5:7b"
+        assert sc._find_model_collection("nope") is None
+        assert sc._model_collection_name_taken("MY MODELS") is True   # case-insensitive
+        assert sc._model_collection_name_taken("other") is False
+        # mutating a loaded copy must not poison the cache (#17)
+        got = sc._load_model_collections()
+        got[0]["models"].append({"ref": "EVIL"})
+        assert len(sc._load_model_collections()[0]["models"]) == 1
+
+    @pytest.mark.skipif(
+        not os.environ.get("SPLICECRAFT_BABS_LIVE"),
+        reason="live Ollama pull — set SPLICECRAFT_BABS_LIVE=1 (downloads from HuggingFace)")
+    def test_qwythos_live_pull_shows_real_speed(self):
+        # Genuine end-to-end: pull the Mythos GGUF THROUGH the engine, drive a
+        # real PullMeter, and assert bytes advance at a measurable speed — then
+        # cancel so we don't fetch the whole multi-GB blob. Staleguarded: skips
+        # cleanly when Ollama is down OR the model is already cached locally.
+        import threading
+        if not B.ping():
+            pytest.skip("no local Ollama server")
+        cancel = threading.Event()
+        meter = B.PullMeter()
+        saw_speed = False
+        max_completed = 0.0
+        try:
+            for obj in B.pull_stream(MYTHOS_MODEL, cancel=cancel):
+                if obj.get("error"):
+                    pytest.skip(f"pull error (network/model): {obj['error']}")
+                info = meter.update(obj, time.monotonic())
+                if info["completed"]:
+                    max_completed = max(max_completed, info["completed"])
+                if info["bps"] and info["bps"] > 0:
+                    saw_speed = True
+                if saw_speed and max_completed > 4_000_000:    # ~4 MB in ⇒ enough
+                    break
+        finally:
+            cancel.set()
+        if not saw_speed:
+            pytest.skip("no live download observed (model already cached) — "
+                        "`ollama rm hf.co/empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF` to re-test")
+        assert max_completed > 0
+
     def test_hf_search_sorted_normalized(self):
         opener = _FakeOpener([
             {"id": "TheBloke/Foo-GGUF", "downloads": 1000, "likes": 5},
@@ -225,8 +347,9 @@ class TestBabsUI:
             scr = app.screen
             assert isinstance(scr, sc.BabsScreen)
             for sel in ("#babs-log", "#babs-ctx-bar", "#babs-jobs-bar",
-                        "#babs-input", "#babs-installed", "#babs-hf",
-                        "#babs-jobs", "#babs-scrape-note"):
+                        "#babs-input", "#babs-coll-select", "#babs-models",
+                        "#babs-addname", "#babs-hf", "#babs-jobs",
+                        "#babs-scrape-note"):
                 scr.query_one(sel)
 
     async def test_chat_turn_strips_think_and_commits_history(self, monkeypatch):
@@ -340,7 +463,158 @@ class TestBabsUI:
             assert "ingest running" in text and "rice" in text
             assert scr._indicator_idle_shown is False
 
-    async def test_model_tab_lists_installed(self, monkeypatch):
+    async def _open_model_tab(self, monkeypatch, pilot, app, models=None):
+        """Open BABS + activate the Model tab, wait for the load worker to seed
+        the default collection. Returns the BabsScreen."""
+        monkeypatch.setattr(B, "list_installed",
+                            lambda **k: (models if models is not None else _ONE_MODEL))
+        app.action_open_babs()
+        await pilot.pause(); await pilot.pause()
+        scr = app.screen
+        scr.query_one("#babs-tabs", sc.TabbedContent).active = "babs-tab-model"
+        for _ in range(60):
+            await pilot.pause(); await asyncio.sleep(0.02)
+            if scr._active_model_coll:
+                break
+        return scr
+
+    async def test_model_tab_seeds_default_collection(self, monkeypatch):
+        # Opening the Model tab auto-creates "My Models" and files every
+        # installed model into it (mirrors "the library holds all plasmids").
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            scr = await self._open_model_tab(monkeypatch, pilot, app)
+            assert scr._active_model_coll == "My Models"
+            assert "qwen2.5:7b" in [r for r in scr._model_refs if r]
+            t = scr.query_one("#babs-models", sc._BabsModelTable)
+            assert t.row_count == 1
+            assert sc._find_model_collection("My Models") is not None
+
+    async def test_model_collection_crud_and_marking(self, monkeypatch):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            scr = await self._open_model_tab(monkeypatch, pilot, app)
+            # New collection
+            scr._on_coll_new_name("Bio")
+            await pilot.pause()
+            assert scr._active_model_coll == "Bio" and scr._model_refs == [None]
+            # name collision rejected (no dup created)
+            scr._on_coll_new_name("my models")
+            assert sum(1 for c in sc._iter_model_collections_readonly()
+                       if c["name"].lower() == "my models") == 1
+            # add a ref + dedupe
+            assert scr._add_ref_to_active("llama3.2:3b") is True
+            assert scr._add_ref_to_active("llama3.2:3b") is False     # dedupe
+            scr._repopulate_after_change(); await pilot.pause()
+            assert "llama3.2:3b" in scr._model_refs
+            # mark + move Bio → My Models
+            scr._marked_refs.add("llama3.2:3b")
+            scr._move_commit(["llama3.2:3b"], "My Models")
+            await pilot.pause()
+            assert all(m["ref"] != "llama3.2:3b"
+                       for m in sc._find_model_collection("Bio")["models"])
+            assert any(m["ref"] == "llama3.2:3b"
+                       for m in sc._find_model_collection("My Models")["models"])
+            # rename Bio
+            scr._active_model_coll = "Bio"
+            scr._on_coll_renamed("Plants")
+            assert sc._find_model_collection("Plants") is not None
+            assert sc._find_model_collection("Bio") is None
+
+    async def test_uninstall_unfiles_and_calls_delete(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(B, "delete_model", lambda ref, **k: calls.append(ref) or True)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            scr = await self._open_model_tab(monkeypatch, pilot, app)
+            # an INSTALLED ref → ollama rm is called, then it's unfiled
+            scr._installed_index = {"qwen2.5:7b": _ONE_MODEL[0]}
+            scr._uninstall_confirm(["qwen2.5:7b"], True)
+            for _ in range(50):
+                await pilot.pause(); await asyncio.sleep(0.02)
+                if not scr._busy_models:
+                    break
+            assert calls == ["qwen2.5:7b"]
+            assert all(m["ref"] != "qwen2.5:7b"
+                       for m in sc._find_model_collection("My Models")["models"])
+            # a NOT-installed ref → just unfiled, ollama rm NOT called (staleguard)
+            calls.clear()
+            scr._on_coll_new_name("Wishlist")
+            scr._add_ref_to_active("hf.co/some/ghost-GGUF")
+            scr._installed_index = {}
+            scr._uninstall_confirm(["hf.co/some/ghost-GGUF"], True)
+            for _ in range(50):
+                await pilot.pause(); await asyncio.sleep(0.02)
+                if not scr._busy_models:
+                    break
+            assert calls == []        # nothing on disk → no ollama rm
+            assert sc._find_model_collection("Wishlist")["models"] == []
+
+    async def test_model_tab_staleguard_ollama_down(self, monkeypatch):
+        # Ollama unreachable: the picker still creates the default collection,
+        # shows any filed refs as "not pulled", and never crashes.
+        def _down(**k):
+            raise B.OllamaUnavailable("connection refused")
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            # pre-seed a collection with a ref so there's something to show
+            sc._save_model_collections([
+                {"name": "My Models", "description": "", "saved": "2026-06-29",
+                 "models": [{"ref": "llama3.2:3b", "note": "", "added": "2026-06-29"}]}])
+            monkeypatch.setattr(B, "list_installed", _down)
+            app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            scr.query_one("#babs-tabs", sc.TabbedContent).active = "babs-tab-model"
+            for _ in range(60):
+                await pilot.pause(); await asyncio.sleep(0.02)
+                if scr._active_model_coll:
+                    break
+            assert scr._active_model_coll == "My Models"
+            assert "llama3.2:3b" in scr._model_refs          # ref shown despite Ollama down
+            status = str(scr.query_one("#babs-pull-status", sc.Static).render())
+            assert "Ollama" in status
+
+    async def test_ref_and_collection_name_sanitized(self, monkeypatch):
+        # Control chars / pathological length on a collection name or model ref
+        # are stripped + capped (no newline can break the Select, no 1 MB paste).
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            scr = await self._open_model_tab(monkeypatch, pilot, app)
+            scr._on_coll_new_name("Bio\x07\x01models" + "z" * 400)
+            nm = scr._active_model_coll
+            assert nm.startswith("Bio") and len(nm) <= 200
+            assert all(ord(ch) >= 0x20 for ch in nm)          # no control chars
+            # NUL stripped from a ref, but '/' ':' '.' '-' preserved
+            assert scr._add_ref_to_active("hf.co/o\x00wner/repo-GGUF:Q4") is True
+            refs = [m["ref"] for m in sc._find_model_collection(nm)["models"]]
+            assert "hf.co/owner/repo-GGUF:Q4" in refs
+            # an all-control-char ref sanitizes to empty → rejected, no row
+            assert scr._add_ref_to_active("\x00\x07\x01") is False
+
+    async def test_delete_last_collection_is_safe(self, monkeypatch):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            scr = await self._open_model_tab(monkeypatch, pilot, app)
+            for _ in range(8):                                # delete every collection
+                if not scr._active_model_coll:
+                    break
+                scr._on_coll_del_confirm(True)
+                await pilot.pause()
+            assert scr._active_model_coll == ""
+            assert scr._model_refs == [None]                  # placeholder row, no crash
+            scr._on_coll_new_name("Fresh")                    # New still works
+            assert scr._active_model_coll == "Fresh"
+
+    async def test_pull_progress_renders_speed_and_bytes(self, monkeypatch):
+        # The pull status line must surface bytes-pulled + percent + speed (not
+        # a bare percent) and advance the bar, so a big download visibly moves.
         monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
@@ -348,11 +622,15 @@ class TestBabsUI:
             app.action_open_babs()
             await pilot.pause(); await pilot.pause()
             scr = app.screen
-            scr._load_installed()
-            for _ in range(40):
-                await pilot.pause(); await asyncio.sleep(0.02)
-                if scr._installed_names:
-                    break
-            assert "qwen2.5:7b" in scr._installed_names
-            t = scr.query_one("#babs-installed", DataTable)
-            assert t.row_count == 1
+            meter = B.PullMeter()
+            meter.update({"status": "pulling X", "digest": "X",
+                          "total": MYTHOS_Q4_BYTES, "completed": 0}, 0.0)
+            info = meter.update({"status": "pulling X", "digest": "X",
+                                 "total": MYTHOS_Q4_BYTES,
+                                 "completed": MYTHOS_Q4_BYTES // 5}, 2.0)
+            scr._pull_progress(info)
+            await pilot.pause()
+            status = str(scr.query_one("#babs-pull-status", sc.Static).render())
+            assert "/s" in status and "%" in status and "GB" in status
+            bar = scr.query_one("#babs-pull-bar", ProgressBar)
+            assert (bar.percentage or 0) > 0

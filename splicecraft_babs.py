@@ -398,6 +398,32 @@ def pull_stream(name: str, *, cancel=None, register=None, timeout: float = _PULL
             pass
 
 
+def delete_model(name: str, *, timeout: float = _SHORT_TIMEOUT) -> bool:
+    """Uninstall a model from the local Ollama store (``DELETE /api/delete``).
+
+    Ollama answers ``200`` with an EMPTY body on success, so this does NOT route
+    through ``_request_json`` (which expects JSON and would raise on the empty
+    body). Returns True on success. Raises ``OllamaUnavailable`` if the server
+    is unreachable, ``BabsError`` on an HTTP error (404 = model not installed)."""
+    name = (name or "").strip()
+    if not name:
+        raise BabsError("no model name given")
+    url = ollama_base() + "/api/delete"
+    # Send both keys: newer Ollama wants "model", older wants "name".
+    data = json.dumps({"model": name, "name": name}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="DELETE",
+        headers={"User-Agent": _user_agent(), "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read(1024)        # drain (bounded); body is empty on success
+    except urllib.error.HTTPError as exc:
+        raise BabsError(_http_error_message(exc))
+    except (urllib.error.URLError, OSError) as exc:
+        raise _conn_error(exc)
+    return True
+
+
 # ── HuggingFace Hub search (public; hardened opener) ───────────────────────────
 def hf_search_gguf(query: str, *, limit: int = HF_SEARCH_LIMIT, opener=None,
                    timeout: float = _HF_TIMEOUT) -> "list[dict]":
@@ -712,3 +738,89 @@ def pull_progress_fraction(obj: dict) -> "float | None":
     if total <= 0:
         return None
     return max(0.0, min(1.0, completed / total))
+
+
+def fmt_speed(bps: "int | float | None") -> str:
+    """Human download rate ('18.4 MB/s'); '' when not yet measurable so the UI
+    can simply omit it on the first ('pulling manifest') ticks."""
+    try:
+        n = float(bps)
+    except (TypeError, ValueError):
+        return ""
+    if not (n > 0):
+        return ""
+    return f"{fmt_size(n)}/s"
+
+
+class PullMeter:
+    """Turns the raw Ollama ``/api/pull`` progress stream into a human readout
+    with a smoothed download speed, so a user can SEE a multi-GB pull is real
+    and ongoing rather than staring at a bar that only ticks a percent.
+
+    PURE + deterministic: the caller passes a monotonic timestamp on every
+    ``update`` (the single time source, INV-78), so tests drive it with a
+    synthetic clock and need no network or real clock. One meter per pull.
+
+    Speed is averaged over a trailing ``window`` of wall-clock seconds within
+    the CURRENT layer; the baseline resets when Ollama moves to a new layer
+    (``digest`` changes) or the byte count jumps backwards, so a multi-layer
+    pull never reports a bogus negative or spiked rate."""
+
+    def __init__(self, *, window: float = 3.0) -> None:
+        self._window = float(window)
+        self._digest: "str | None" = None
+        self._samples: "list[tuple[float, float]]" = []   # (t, completed) this layer
+
+    def update(self, obj: dict, t: float) -> dict:
+        """Feed one Ollama progress object + a monotonic timestamp. Returns
+        ``{status, fraction, completed, total, bps, text}`` — ``bps`` is None
+        until two byte samples in one layer make a rate measurable, ``text`` is
+        the ready-to-display status line (status · bytes · percent · speed)."""
+        status = (obj.get("status") or "").strip()
+        frac = pull_progress_fraction(obj)
+        try:
+            completed = float(obj.get("completed"))
+        except (TypeError, ValueError):
+            completed = None
+        try:
+            total = float(obj.get("total"))
+        except (TypeError, ValueError):
+            total = None
+        digest = obj.get("digest")
+
+        bps = None
+        if completed is not None and total and total > 0:
+            # New layer, or bytes went backwards → start a fresh speed baseline.
+            if digest != self._digest or (self._samples and completed < self._samples[-1][1]):
+                self._digest = digest
+                self._samples = []
+            self._samples.append((t, completed))
+            # Keep only the trailing window (but always ≥2 samples to measure a rate).
+            cutoff = t - self._window
+            while len(self._samples) > 2 and self._samples[0][0] < cutoff:
+                self._samples.pop(0)
+            if len(self._samples) >= 2:
+                dt = self._samples[-1][0] - self._samples[0][0]
+                dc = self._samples[-1][1] - self._samples[0][1]
+                if dt > 0 and dc >= 0:
+                    bps = dc / dt
+        # else: non-byte phase (manifest / verifying / writing manifest / success)
+        # — leave the bar where it is and show no speed.
+
+        text = self._compose(status, frac, completed, total, bps)
+        return {"status": status, "fraction": frac, "completed": completed,
+                "total": total, "bps": bps, "text": text}
+
+    @staticmethod
+    def _compose(status, frac, completed, total, bps) -> str:
+        parts = []
+        if status:
+            parts.append(status)
+        if completed is not None and total:
+            parts.append(f"{fmt_size(completed)}/{fmt_size(total)}")
+        if frac is not None:
+            parts.append(f"{int(frac * 100)}%")
+        spd = fmt_speed(bps)
+        if spd:
+            parts.append(spd)
+        return "  ".join(parts) if parts else "…"

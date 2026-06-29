@@ -36,7 +36,8 @@ _SACRED = [
     # data-dir safety / persistence chokepoint (_DATA_DIR now in _state)
     "_safe_save_json", "_authorize_writes",
     "_authorize_writes_for_sandbox",
-    "_save_collections", "_save_library", "_save_primers", "_save_parts_bin",
+    "_save_collections", "_save_model_collections",
+    "_save_library", "_save_primers", "_save_parts_bin",
     "_save_features", "_save_custom_grammars", "_save_entry_vectors",
     "_codon_tables_save", "_save_protein_motifs", "_save_experiments",
     "_save_experiment_projects", "_save_gels", "_save_custom_enzymes",

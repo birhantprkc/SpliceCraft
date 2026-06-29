@@ -235,10 +235,17 @@ transcript keeps a long, selectable, copy-pasteable history, and **Ctrl+E**
 exports the whole conversation to markdown. Three tabs:
 
 - **Chat** — ask anything; the answer streams in, contextually colored.
-- **Model** — browse your installed Ollama models, **search HuggingFace** for
-  GGUF models, and **pull** the one you want on demand with a live progress bar
-  (`ollama pull` / `hf.co/<repo>`, all over Ollama's local HTTP — no extra
-  dependency).
+- **Model** — organize your models into **collections**, exactly like plasmids:
+  make/rename/delete collections, **mark** rows (Space) to **move** them between
+  collections or **uninstall** them in bulk, and file a model into a collection
+  before you've even pulled it. Every installed model is auto-filed into a
+  default "My Models" collection so nothing's hidden. **Search HuggingFace** for
+  GGUF models and add results to a collection, then **pull** on demand with a
+  live progress bar that shows **bytes pulled and download speed** (e.g. `1.2 GB
+  / 5.5 GB · 21% · 18.4 MB/s`) so you can see a multi-gigabyte model is really
+  downloading. **Use** sets a model as the chat model. Deleting a marked model
+  runs `ollama rm` (behind a confirm — it frees disk and needs a re-pull).
+  Everything runs over Ollama's local HTTP — no extra dependency.
 - **Paper scraper** — launch [Babs'](https://github.com/ATinyGreenCell/babs)
   real background paper search (open-access crawl → re-index) to grow her
   knowledge corpus, with a live, self-correcting **"ingest running" indicator**

@@ -119,6 +119,7 @@ _USER_DATA_FILE_ATTRS: tuple = (
     "_ENZYME_COLLECTIONS_FILE",  # enzyme_collections.json — named subsets of master catalog
     "_HMM_DB_CATALOG_FILE",   # hmm_db_catalog.json — registry of HMM databases (sweep #28)
     "_PROTEIN_COLLECTIONS_FILE",  # protein_collections.json — named protein-sequence collections
+    "_MODEL_COLLECTIONS_FILE",  # model_collections.json — BABS model-picker collections (INV-139)
 )
 
 
@@ -1812,6 +1813,8 @@ _AGENT_BACKUP_LABELS: dict = {
     # the .bak rotation backup chain).
     "hmm_db_catalog":          "_HMM_DB_CATALOG_FILE",
     "protein_collections":     "_PROTEIN_COLLECTIONS_FILE",
+    # BABS model-picker collections (INV-139, 2026-06-29).
+    "model_collections":       "_MODEL_COLLECTIONS_FILE",
 }
 
 
