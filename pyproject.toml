@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name            = "splicecraft"
-version         = "1.0.104"
+version         = "1.0.105"
 description     = "Terminal-based circular plasmid map viewer, sequence editor, and Primer3/Golden Braid primer design workbench"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -210,6 +210,7 @@ only-include = [
     "splicecraft_primer.py",
     "splicecraft_backup.py",
     "splicecraft_agent.py",
+    "splicecraft_babs.py",
     "CHANGELOG.md",
 ]
 
@@ -241,6 +242,7 @@ include = [
     "splicecraft_primer.py",
     "splicecraft_backup.py",
     "splicecraft_agent.py",
+    "splicecraft_babs.py",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",

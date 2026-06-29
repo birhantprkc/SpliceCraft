@@ -223,6 +223,34 @@ can drill into as deep as you like. Each step is dated and shows its detail
 once and then referenced. The lineage rides along through CommercialSaaS `.dna`
 import / export too.
 
+### BABS
+
+A chat assistant that lives in the terminal next to your plasmids. **BABS** is a
+direct conversation with a **local [Ollama](https://ollama.com) model** — no
+cloud, no API key, nothing leaves your machine — wearing the Babs chat UX:
+streaming answers with markdown highlighting, reasoning (`<think>`) hidden by
+default, a **❤ context lifebar** that shows how much chat memory is left, and
+slash commands (`/help`, `/model`, `/system`, `/temp`, `/reset`, `/retry`). The
+transcript keeps a long, selectable, copy-pasteable history, and **Ctrl+E**
+exports the whole conversation to markdown. Three tabs:
+
+- **Chat** — ask anything; the answer streams in, contextually colored.
+- **Model** — browse your installed Ollama models, **search HuggingFace** for
+  GGUF models, and **pull** the one you want on demand with a live progress bar
+  (`ollama pull` / `hf.co/<repo>`, all over Ollama's local HTTP — no extra
+  dependency).
+- **Paper scraper** — launch [Babs'](https://github.com/ATinyGreenCell/babs)
+  real background paper search (open-access crawl → re-index) to grow her
+  knowledge corpus, with a live, self-correcting **"ingest running" indicator**
+  and a jobs view + log tail. Switching models warns you (default **No**) that a
+  changed *embedding* model needs the corpus re-ingested to match, and can run
+  that re-embed for you. Shown only when the Babs repo is present (`~/babs`, or
+  `$SPLICECRAFT_BABS_HOME`).
+
+The toolbar scrolls horizontally when the terminal is too narrow to fit every
+menu, so BABS at the far right is always reachable. Requires Ollama running
+locally (`ollama serve`); point elsewhere with `$SPLICECRAFT_OLLAMA_HOST`.
+
 ### File & Settings
 
 **File** opens / fetches (NCBI) / saves / exports (GenBank · FASTA · GFF3),

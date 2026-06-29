@@ -132,6 +132,7 @@ def _make_record():
 # (label, factory_callable) — factory returns a newly-constructed modal.
 # Every modal listed here must be constructible without I/O.
 _MODAL_CASES = [
+    ("BabsReembedModal",           lambda: sc.BabsReembedModal("qwen2.5:7b", "nomic-embed-text")),
     ("FetchModal",                 lambda: sc.FetchModal()),
     ("OpenFileModal",              lambda: sc.OpenFileModal()),
     ("ExportGenBankModal",         lambda: sc.ExportGenBankModal(_make_record())),

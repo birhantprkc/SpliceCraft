@@ -14,6 +14,13 @@
 
 ---
 
+## [1.0.105] — 2026-06-29
+
+### New features
+
+- **BABS — a chat assistant in the terminal, powered by your local Ollama.** A new **BABS** item at the end of the toolbar opens an in-app assistant: a direct conversation with a local [Ollama](https://ollama.com) model (no cloud, no API key — nothing leaves your machine), wearing the Babs chat experience. Answers stream in with markdown color/bold, model reasoning is hidden by default, a **❤ context gauge** shows how much chat memory is left before it trims, and slash commands drive it (`/help`, `/model`, `/system`, `/temp`, `/reset`, `/retry`). The transcript keeps a long, selectable, **copy-pasteable** history, and **Ctrl+E** exports the whole conversation to a markdown file. Three tabs: **Chat**; **Model** — browse your installed Ollama models, **search HuggingFace** for GGUF models, and **pull** the one you want on demand with a live progress bar; and **Paper scraper** — launch Babs' real background open-access paper search to grow her knowledge corpus, with a live **"ingest running" indicator** (self-correcting if a job dies) and a jobs view (shown when the Babs repo is present). Switching models warns you (default **No**) that a changed *embedding* model means the corpus must be re-ingested to match, and can kick off that re-embed for you. Needs Ollama running locally (`ollama serve`); point elsewhere with `$SPLICECRAFT_OLLAMA_HOST`.
+- **The toolbar scrolls on a narrow window.** When the terminal is too narrow to fit every menu, the top toolbar now scrolls horizontally (mouse wheel / drag) so the items clipped off the right — including BABS — stay reachable.
+
 ## [1.0.104] — 2026-06-25
 
 ### Bug fixes

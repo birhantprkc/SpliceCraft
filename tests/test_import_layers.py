@@ -43,6 +43,7 @@ _LAYER_RULES = [
     ("splicecraft_gels", 1),        # [SUB-gels] agarose-gel sim/render: imports biology L0 + util L0
     ("splicecraft_experiments", 1), # [SUB-experiments] entry normalise/id/cross-ref/migrate: imports util L0
     ("splicecraft_backup", 1),      # user-data backup/restore/migrate engine: imports persistence/util/logging/state L0
+    ("splicecraft_babs", 1),        # BABS chat engine: Ollama HTTP + HF search + chat protocol; imports net/util/logging/state L0
     ("splicecraft_cli_parser", 0),
     ("splicecraft_biology", 0),
     ("splicecraft_cli", 0),        # stdlib-only sidecar (standalone client)
