@@ -234,7 +234,12 @@ slash commands (`/help`, `/model`, `/system`, `/temp`, `/reset`, `/retry`). The
 transcript keeps a long, selectable, copy-pasteable history, and **Ctrl+E**
 exports the whole conversation to markdown. Three tabs:
 
-- **Chat** — ask anything; the answer streams in, contextually colored.
+- **Chat** — ask anything; the answer streams in, contextually colored. Toggle
+  **Corpus** on (enabled once a Babs corpus exists) and answers come **grounded
+  in your research corpus, with cited sources** — the same hybrid retrieval Babs'
+  own `rag_bot` does, streamed into the chat. Off, it's a plain local-model chat.
+  So you can grow a corpus in the Paper scraper *and query it* without leaving
+  SpliceCraft.
 - **Model** — organize your models into **collections**, exactly like plasmids:
   make/rename/delete collections, **mark** rows (Space) to **move** them between
   collections or **uninstall** them in bulk, and file a model into a collection
@@ -247,8 +252,9 @@ exports the whole conversation to markdown. Three tabs:
   runs `ollama rm` (behind a confirm — it frees disk and needs a re-pull).
   Everything runs over Ollama's local HTTP — no extra dependency.
 - **Paper scraper** — launch [Babs'](https://github.com/ATinyGreenCell/babs)
-  real background paper search (open-access crawl → re-index) to grow her
-  knowledge corpus, with a live, self-correcting **"ingest running" indicator**
+  real background paper search — Europe PMC **plus OpenAlex, CORE, CGSpace and
+  DOAJ** (all legitimately-open APIs) → re-index — to grow her knowledge corpus,
+  with a live, self-correcting **"ingest running" indicator**
   and a jobs view + log tail. Switching models warns you (default **No**) that a
   changed *embedding* model needs the corpus re-ingested to match, and can run
   that re-embed for you. Shown only when the Babs repo is present (`~/babs`, or
@@ -256,7 +262,10 @@ exports the whole conversation to markdown. Three tabs:
 
 The toolbar scrolls horizontally when the terminal is too narrow to fit every
 menu, so BABS at the far right is always reachable. Requires Ollama running
-locally (`ollama serve`); point elsewhere with `$SPLICECRAFT_OLLAMA_HOST`.
+locally (`ollama serve`); point elsewhere with `$SPLICECRAFT_OLLAMA_HOST`. New to
+it? Run **`splicecraft babs-setup`** to clone + bootstrap the Babs engine (venv,
+deps, models) in one command, and the Chat tab shows a numbered first-run
+checklist whenever Ollama or a model is missing.
 
 ### File & Settings
 

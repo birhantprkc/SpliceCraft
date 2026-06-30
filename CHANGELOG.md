@@ -14,6 +14,20 @@
 
 ---
 
+## [1.0.108] — 2026-06-29
+
+### New features
+
+- **Ask your own research corpus, right inside BABS.** The Chat tab has a new **Corpus** toggle: turn it on (it lights up once you've grown a corpus) and BABS answers from *your* papers — retrieved and **cited** — instead of just the model's memory, streamed into the chat like a normal reply. Turn it off for a plain local-model chat. Paired with the Paper scraper, you can now grow a knowledge corpus **and query it** without ever leaving SpliceCraft.
+- **The Paper scraper reaches far more open-access literature.** A topic search now grows your corpus from Europe PMC **plus OpenAlex, CORE, CGSpace and DOAJ** — all legitimately-open public APIs — so it finds papers (and full text) the old Europe-PMC-only search missed, while staying entirely on open-access rails.
+- **One-command setup: `splicecraft babs-setup`.** Installs the Babs research engine for you — clones the repo and runs its bootstrap (virtualenv, dependencies, models) — so the Paper scraper and corpus-grounded chat work without any manual steps. Re-run any time to refresh.
+- **BABS feels like part of the app.** It now carries SpliceCraft's toolbar (and header) across all three tabs, so the menus are always reachable, and an animated **"Babs is thinking…"** indicator turns while an answer is being generated — including the silent reasoning phase — so a long reply no longer looks frozen.
+
+### Hardening
+
+- **A first-run checklist when something's missing.** If Ollama isn't running, or no model is installed, the Chat tab now shows a numbered setup checklist (install Ollama → pull a model → `splicecraft babs-setup`) instead of a bare connection error.
+- Harmonized the BABS tab styling — consistent borders, spacing, and status bar — to match the rest of the app, and opening a menu while BABS is up now reliably targets the visible screen's menu bar.
+
 ## [1.0.107] — 2026-06-29
 
 ### Bug fixes

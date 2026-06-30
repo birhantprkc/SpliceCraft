@@ -412,6 +412,124 @@ class TestBabsUI:
             assert "secret" not in answer and "world" in answer
             assert scr._transcript[-1][0] == "babs"
 
+    async def test_corpus_toggle_gates_on_corpus(self, monkeypatch):
+        """The Corpus toggle is disabled (and forced off) without a corpus, and flips on when one
+        exists — it can't promise grounding it can't deliver."""
+        monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            monkeypatch.setattr(scr, "_corpus_available", lambda: False)
+            scr._refresh_ground_button()
+            btn = scr.query_one("#babs-ground")
+            assert btn.disabled and scr._grounded is False
+            monkeypatch.setattr(scr, "_corpus_available", lambda: True)
+            scr._refresh_ground_button()
+            assert not scr.query_one("#babs-ground").disabled
+            scr._on_ground_toggle()
+            assert scr._grounded and "on" in str(scr.query_one("#babs-ground").label)
+
+    async def test_grounded_chat_streams_rag_bot(self, monkeypatch, tmp_path):
+        """With Corpus on, a question shells rag_bot --plain and streams its cited answer into the
+        bubble + history — and the plain Ollama chat path is NOT used."""
+        import subprocess as _sp
+        import types as _types
+        monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
+        monkeypatch.setattr(B, "chat_stream", lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("plain chat path used while grounded")))
+        out = b"Callus forms on MS + 2,4-D [1].\n\nSources:\n  [1] (CORE) Plant growth regulators\n"
+
+        def fake_popen(*a, **k):
+            r, w = os.pipe(); os.write(w, out); os.close(w)
+            p = _types.SimpleNamespace(stdout=os.fdopen(r, "rb", 0))
+            p.wait = lambda timeout=None: 0
+            p.terminate = lambda: None
+            p.kill = lambda: None
+            return p
+        monkeypatch.setattr(_sp, "Popen", fake_popen)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            monkeypatch.setattr(scr, "_resolve_babs_home", lambda: tmp_path)
+            monkeypatch.setattr(scr, "_corpus_available", lambda: True)
+            scr._grounded = True
+            scr.query_one("#babs-input", Input).value = "2,4-D for callus?"
+            scr._submit_current()
+            for _ in range(80):
+                await pilot.pause(); await asyncio.sleep(0.03)
+                if not scr._generating:
+                    break
+            assert not scr._generating
+            ans = scr._history[-1]["content"]
+            assert "Callus forms" in ans and "Sources:" in ans     # streamed + cited
+
+    async def test_setup_checklist_on_ollama_down(self, monkeypatch):
+        """When Ollama is unreachable, the Chat tab shows a numbered first-run checklist
+        (install Ollama → pull a model → babs-setup) instead of a bare connection error."""
+        def _down(**k):
+            raise B.OllamaUnavailable("connection refused")
+        monkeypatch.setattr(B, "list_installed", _down)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_babs()
+            for _ in range(20):
+                await pilot.pause(); await asyncio.sleep(0.02)
+            scr = app.screen          # opened cleanly despite Ollama being down (no crash)
+            cl = scr._setup_checklist("connection refused")
+            assert "Install Ollama" in cl and "ollama pull" in cl and "babs-setup" in cl
+
+    async def test_thinking_spinner_animates_until_first_token(self, monkeypatch):
+        """The braille 'thinking' spinner turns while a turn is in flight — in
+        both the assistant bubble and the jobs-bar — and stops the moment a
+        visible token streams, so it never clobbers the answer."""
+        monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            SPIN = sc._BABS_SPINNER
+            plain = lambda w: getattr(w.visual, "plain", str(w.visual))
+            # Simulate the start of a turn without a real Ollama call.
+            scr._think_i = 0
+            scr._got_visible = False
+            scr._cur_assistant = scr._mount_bubble(
+                f"[yellow]{SPIN[0]}[/yellow] thinking", "babs-asst")
+            scr._generating = True
+            await pilot.pause()            # let the bubble actually mount
+            scr._refresh_jobs_bar()
+            # Each tick advances the braille frame in the bubble + jobs-bar
+            # (update() applies on the next refresh, so pause before reading).
+            scr._tick_thinking()
+            await pilot.pause()
+            assert scr._think_i == 1
+            assert SPIN[1] in plain(scr._cur_assistant)
+            jb = scr.query_one("#babs-jobs-bar")
+            assert SPIN[1] in plain(jb) and "answering" in plain(jb)
+            scr._tick_thinking()
+            await pilot.pause()
+            assert scr._think_i == 2 and SPIN[2] in plain(scr._cur_assistant)
+            # First visible token replaces the spinner; later ticks keep the text.
+            scr._render_assistant("hello world")
+            await pilot.pause()
+            assert scr._got_visible is True
+            scr._tick_thinking()
+            await pilot.pause()
+            assert "hello world" in plain(scr._cur_assistant)
+            # Ending the turn freezes the spinner (tick becomes a no-op).
+            scr._generating = False
+            frozen = scr._think_i
+            scr._tick_thinking()
+            assert scr._think_i == frozen
+
     async def test_slash_commands(self, monkeypatch):
         monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
         app = sc.PlasmidApp()
@@ -672,3 +790,14 @@ class TestBabsUI:
             assert "/s" in status and "%" in status and "GB" in status
             bar = scr.query_one("#babs-pull-bar", ProgressBar)
             assert (bar.percentage or 0) > 0
+
+
+def test_babs_setup_cli_help_and_git_missing(monkeypatch, capsys):
+    """`splicecraft babs-setup --help` prints its own help (exit 0); a missing `git` fails cleanly
+    (exit 1) without attempting a clone."""
+    import shutil
+    assert sc._run_babs_setup_subcommand(["--help"]) == 0
+    assert "babs-setup" in capsys.readouterr().out
+    monkeypatch.setattr(shutil, "which", lambda _x: None)   # pretend git isn't installed
+    assert sc._run_babs_setup_subcommand(["--dir", "/tmp/sc-no-babs-xyz"]) == 1
+    assert "git" in capsys.readouterr().err.lower()
