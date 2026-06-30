@@ -801,3 +801,167 @@ def test_babs_setup_cli_help_and_git_missing(monkeypatch, capsys):
     monkeypatch.setattr(shutil, "which", lambda _x: None)   # pretend git isn't installed
     assert sc._run_babs_setup_subcommand(["--dir", "/tmp/sc-no-babs-xyz"]) == 1
     assert "git" in capsys.readouterr().err.lower()
+
+
+# ── Agentic Babs: the in-process tool-loop that gives internal Babs the same
+#    power as the external HTTP side-door (2026-06-30) ───────────────────────────
+class TestBabsAgentic:
+    # — engine: chat_stream tool support —
+    def test_chat_stream_passes_tools_and_surfaces_tool_calls(self, monkeypatch):
+        captured = {}
+
+        def fake_open_stream(path, payload, *, timeout, register=None):
+            captured["payload"] = payload
+            return object()         # opaque resp; _iter_ndjson is mocked below
+
+        def fake_iter(resp, *, cancel, max_total, max_line):
+            yield {"message": {"content": "", "tool_calls": [
+                {"function": {"name": "splicecraft_call",
+                              "arguments": {"endpoint": "status"}}}]},
+                   "done": False}
+            yield {"message": {"content": "done"}, "done": True,
+                   "done_reason": "stop"}
+
+        monkeypatch.setattr(B, "_open_stream", fake_open_stream)
+        monkeypatch.setattr(B, "_iter_ndjson", fake_iter)
+        tools = [{"type": "function", "function": {"name": "x", "parameters": {}}}]
+        chunks = list(B.chat_stream("m", [{"role": "user", "content": "hi"}],
+                                    tools=tools))
+        assert captured["payload"].get("tools") == tools
+        assert chunks[0]["tool_calls"][0]["function"]["name"] == "splicecraft_call"
+        assert chunks[-1]["done"] is True and chunks[-1]["done_reason"] == "stop"
+
+    def test_chat_stream_omits_tools_when_none(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(B, "_open_stream",
+                            lambda p, payload, **k: captured.update(payload=payload) or object())
+        monkeypatch.setattr(B, "_iter_ndjson", lambda *a, **k: iter([]))
+        list(B.chat_stream("m", [{"role": "user", "content": "hi"}]))
+        assert "tools" not in captured["payload"]   # plain chat is unchanged
+
+    # — hub: the 3 meta-tools + endpoint catalog —
+    def test_tool_manifest_shape(self):
+        names = {t["function"]["name"] for t in sc._babs_tool_manifest()}
+        assert names == {"splicecraft_list_endpoints",
+                         "splicecraft_describe_endpoint", "splicecraft_call"}
+
+    def test_list_endpoints_catalog_and_filter(self):
+        full = sc._babs_list_endpoints({})
+        assert full["count"] > 150 and full["count"] == len(full["endpoints"])
+        primers = sc._babs_list_endpoints({"filter": "primer"})
+        assert primers["count"] >= 1
+        assert all("primer" in e["name"] for e in primers["endpoints"])
+
+    def test_describe_endpoint(self):
+        out = sc._babs_describe_endpoint({"endpoint": "status"})
+        assert out["name"] == "status" and out["doc_full"]
+        miss = sc._babs_describe_endpoint({"endpoint": "no-such"})
+        assert "error" in miss
+
+    # — hub: _run_tool_call routing (no app needed for meta-tools) —
+    def test_run_tool_call_meta_and_unknown(self):
+        scr = sc.BabsScreen()
+        out = scr._run_tool_call(
+            {"function": {"name": "splicecraft_list_endpoints", "arguments": {}}})
+        assert out["count"] > 150
+        out2 = scr._run_tool_call(
+            {"function": {"name": "splicecraft_describe_endpoint",
+                          "arguments": '{"endpoint": "status"}'}})   # JSON-string args
+        assert out2["name"] == "status"
+        assert "error" in scr._run_tool_call({"function": {"name": "bogus"}})
+
+    # — hub: the autonomy policy gate —
+    def test_dispatch_readonly_refuses_writes(self):
+        scr = sc.BabsScreen()
+        scr._autonomy = "readonly"
+        out = scr._dispatch_agent_endpoint(
+            "set-feature-color", {"feature_type": "CDS", "color": "#123456"})
+        assert "error" in out and "read-only" in out["error"]
+
+    def test_dispatch_unknown_endpoint(self):
+        scr = sc.BabsScreen()
+        out = scr._dispatch_agent_endpoint("no-such-endpoint", {})
+        assert "error" in out and "unknown endpoint" in out["error"]
+
+    def test_summarize_tool_result(self):
+        assert "error" in sc.BabsScreen._summarize_tool_result({"error": "boom"})
+        s = sc.BabsScreen._summarize_tool_result({"status": 200, "result": {"ok": True}})
+        assert "200" in s
+        assert "3 item" in sc.BabsScreen._summarize_tool_result(
+            {"count": 3, "endpoints": []})
+
+    # — UI: the Agent toggle + /autonomy command drive the persisted state —
+    async def test_agent_toggle_and_autonomy_command(self, monkeypatch):
+        monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
+        monkeypatch.setattr(B, "show", lambda *a, **k: {})
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            assert isinstance(scr, sc.BabsScreen)
+            assert scr._agent_enabled is False           # default off
+            scr._on_agent_toggle()                       # arm it
+            await pilot.pause()
+            assert scr._agent_enabled is True
+            scr._handle_command("/autonomy auto")        # full autonomy
+            await pilot.pause()
+            assert scr._autonomy == "auto" and scr._agent_enabled is True
+            btn = scr.query_one("#babs-agent", sc.Button)
+            assert "auto" in str(btn.label)
+            scr._handle_command("/autonomy off")         # disarm via command
+            await pilot.pause()
+            assert scr._agent_enabled is False
+
+    # — persistence: the session survives close → reopen —
+    async def test_session_persists_across_close_reopen(self, monkeypatch):
+        monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
+        monkeypatch.setattr(B, "show", lambda *a, **k: {})
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            scr1 = app.screen
+            assert isinstance(scr1, sc.BabsScreen)
+            # simulate a completed turn + arm agent mode
+            scr1._history.extend([{"role": "user", "content": "hi"},
+                                  {"role": "assistant", "content": "hello there"}])
+            scr1._transcript.extend([("you", "hi"), ("babs", "hello there")])
+            scr1._on_agent_toggle()
+            await pilot.pause()
+            assert scr1._agent_enabled is True
+            # close Babs (Esc / dismiss)
+            scr1.dismiss()
+            await pilot.pause(); await pilot.pause()
+            assert not isinstance(app.screen, sc.BabsScreen)
+            # reopen → SAME instance reused, session restored, transcript rehydrated
+            app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            scr2 = app.screen
+            assert scr2 is scr1                       # persistent instance
+            assert len(scr2._history) == 2            # chat memory survived
+            assert scr2._agent_enabled is True        # agent mode survived
+            log = scr2.query_one("#babs-log")
+            assert len(log.children) >= 2             # transcript rehydrated into bubbles
+
+    async def test_open_resurfaces_buried_babs(self, monkeypatch):
+        monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
+        monkeypatch.setattr(B, "show", lambda *a, **k: {})
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            babs = app.screen
+            assert isinstance(babs, sc.BabsScreen)
+            # bury Babs under another pushed screen
+            app.push_screen(sc.Screen())
+            await pilot.pause()
+            assert not isinstance(app.screen, sc.BabsScreen)   # buried
+            # BABS again → resurfaces the SAME instance, no duplicate
+            app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            assert app.screen is babs
+            assert sum(isinstance(s, sc.BabsScreen) for s in app.screen_stack) == 1

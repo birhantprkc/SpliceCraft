@@ -4775,3 +4775,212 @@ class TestAddCodonTableFile:
             None, {"source": "file", "path": str(tmp_path / "nope.fna"),
                    "mode": "genome"})
         assert status in (400, 502)   # build returns no data / clean read error
+
+
+class TestAgentRegistryIntegrity:
+    """Guard the agent-endpoint registry as a whole (audit 2026-06-30).
+
+    The endpoint count had silently drifted (docs said ~135; the registry
+    held 172) because nothing pinned it. These checks catch an accidental
+    mass-unregistration (e.g. a sibling that stops importing its `_h_*`
+    handlers) and keep the `/tools` self-describe usable — every handler
+    must carry a docstring so an agent can form a request from `doc_full`."""
+
+    def test_registry_has_full_surface(self):
+        # A FLOOR, not an exact pin (endpoints are added often). Dropping
+        # below this means a whole sibling failed to register — a real bug,
+        # not a routine addition.
+        assert len(sc._AGENT_HANDLERS) >= 160, (
+            f"agent registry shrank to {len(sc._AGENT_HANDLERS)} — did a "
+            f"sibling stop importing / registering its _h_* handlers?")
+
+    def test_every_handler_is_wellformed_and_documented(self):
+        for name, entry in sc._AGENT_HANDLERS.items():
+            assert isinstance(name, str) and name, f"bad endpoint name {name!r}"
+            assert isinstance(entry, tuple) and len(entry) == 2, (
+                f"{name}: registry value must be (fn, write)")
+            fn, write = entry
+            assert callable(fn), f"{name}: handler not callable"
+            assert isinstance(write, bool), f"{name}: write flag not bool"
+            # /tools emits doc_full from the docstring — a missing one makes
+            # the endpoint undiscoverable to an agent forming a request.
+            assert (fn.__doc__ or "").strip(), (
+                f"{name}: handler has no docstring (breaks /tools doc_full)")
+
+    def test_tools_endpoint_describes_every_handler(self):
+        tools_fn = sc._AGENT_HANDLERS["tools"][0]
+        out = tools_fn(None, {})
+        described = {e["name"] for e in out["endpoints"]}
+        assert described == set(sc._AGENT_HANDLERS), (
+            "tools self-describe is out of sync with the registry")
+
+    def test_heavy_endpoint_set_is_registered(self):
+        # A typo in _AGENT_HEAVY_ENDPOINTS would silently fail to gate a heavy
+        # op behind the concurrency semaphore (audit 2026-06-30, MED-2a).
+        unknown = sc._AGENT_HEAVY_ENDPOINTS - set(sc._AGENT_HANDLERS)
+        assert not unknown, (
+            f"_AGENT_HEAVY_ENDPOINTS names not in the registry: {unknown}")
+
+    def test_refresh_map_names_are_registered_writes(self):
+        # Every live-refresh entry must name a real WRITE endpoint, else a
+        # rename would silently stop the open TUI from updating.
+        for name in sc._AGENT_REFRESH_MAP:
+            entry = sc._AGENT_HANDLERS.get(name)
+            assert entry is not None, f"refresh map names unknown endpoint {name!r}"
+            assert entry[1] is True, f"refresh map names a READ endpoint {name!r}"
+
+
+class TestAgentInvokeCore:
+    """The shared in-process dispatch core (audit 2026-06-30, Phase 2) that
+    gives the HTTP server and the in-process Babs tool-loop identical
+    behaviour — same handler, same heavy-op cap, same post-write live refresh."""
+
+    def test_unknown_endpoint_404(self):
+        payload, status = sc._agent_invoke(None, "no-such-endpoint", {})
+        assert status == 404 and "unknown endpoint" in payload["error"]
+
+    def test_read_passthrough_no_app(self):
+        # A read endpoint runs with app=None, returns its payload + 200, and
+        # attempts no live-refresh (app is None).
+        payload, status = sc._agent_invoke(None, "get-settings", {})
+        assert status == 200 and payload.get("ok") is True
+
+    def test_non_dict_body_coerced(self):
+        payload, status = sc._agent_invoke(None, "get-settings", "not-a-dict")
+        assert status == 200
+
+    def test_write_in_refresh_map_fires_refresh(self):
+        # A write endpoint listed in _AGENT_REFRESH_MAP must dispatch a UI-thread
+        # repaint via call_from_thread. The stub's `_current_record is None`, so
+        # the refresh itself no-ops cleanly — we only assert it was dispatched.
+        calls = []
+
+        class _Stub:
+            _current_record = None
+
+            def call_from_thread(self, fn, *a, **k):
+                calls.append(fn)
+                return fn(*a, **k)
+
+        payload, status = sc._agent_invoke(
+            _Stub(), "set-feature-color",
+            {"feature_type": "CDS", "color": "#123456"})
+        assert status == 200
+        assert calls, "live-refresh was not dispatched for a mapped write"
+
+    def test_read_does_not_fire_refresh(self):
+        calls = []
+
+        class _Stub:
+            _current_record = None
+
+            def call_from_thread(self, fn, *a, **k):
+                calls.append(fn)
+                return fn(*a, **k)
+
+        sc._agent_invoke(_Stub(), "get-settings", {})
+        assert not calls, "a read endpoint must not trigger a live-refresh"
+
+
+class TestFindSequenceEndpoint:
+    """`find-sequence` (2026-06-30): locate a DNA subseq / IUPAC motif on the
+    loaded record — situational awareness for an autonomous agent."""
+
+    def _app(self, seq, topology="linear"):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq(seq), id="x", name="x",
+                        annotations={"topology": topology})
+        return types.SimpleNamespace(_current_record=rec)
+
+    def test_no_record_422(self):
+        _, st = sc._h_find_sequence(
+            types.SimpleNamespace(_current_record=None), {"query": "GAATTC"})
+        assert st == 422
+
+    def test_invalid_query_400(self):
+        _, st = sc._h_find_sequence(self._app("ACGT" * 10), {"query": "XYZ!"})
+        assert st == 400
+
+    def test_forward_hits(self):
+        seq = "TT" + "GAATTC" + "AAAA" + "GAATTC" + "TT"
+        res = sc._h_find_sequence(self._app(seq),
+                                  {"query": "GAATTC", "both_strands": False})
+        assert res["n_hits"] == 2
+        assert all(h["strand"] == 1 for h in res["hits"])
+        assert res["hits"][0]["start"] == 2 and res["hits"][0]["end"] == 8
+
+    def test_reverse_strand_hit(self):
+        # query ACGGT (RC = ACCGT); only ACCGT is present → one reverse hit
+        seq = "TTTT" + "ACCGT" + "TTTT"
+        res = sc._h_find_sequence(self._app(seq), {"query": "ACGGT"})
+        assert res["n_hits"] == 1
+        assert res["hits"][0]["strand"] == -1 and res["hits"][0]["start"] == 4
+
+    def test_palindrome_reported_once(self):
+        seq = "TT" + "GAATTC" + "TT"           # GAATTC is palindromic
+        res = sc._h_find_sequence(self._app(seq),
+                                  {"query": "GAATTC", "both_strands": True})
+        assert res["n_hits"] == 1 and res["hits"][0]["strand"] == 1
+
+    def test_iupac_motif(self):
+        seq = "GGACC" + "AA" + "GGTCC"         # GGWCC matches both
+        res = sc._h_find_sequence(self._app(seq),
+                                  {"query": "GGWCC", "both_strands": False})
+        assert res["n_hits"] == 2
+
+    def test_circular_wrap(self):
+        seq = "TTC" + "AAAA" + "GAA"           # GAATTC spans the origin
+        res = sc._h_find_sequence(self._app(seq, "circular"),
+                                  {"query": "GAATTC", "both_strands": False})
+        wrap = [h for h in res["hits"] if h["wraps"]]
+        assert len(wrap) == 1 and wrap[0]["start"] == 7 and wrap[0]["end"] == 3
+
+
+class TestExportMigrateArchiveEndpoint:
+    """`export-migrate-archive` (2026-06-30): zip the whole workspace. Read-only
+    to the data dir; import is deliberately NOT exposed."""
+
+    def test_writes_zip(self, tmp_path):
+        out = tmp_path / "ws.zip"
+        res = sc._h_export_migrate_archive(None, {"path": str(out)})
+        if isinstance(res, tuple):
+            payload, status = res
+            assert status == 200, payload
+        else:
+            payload = res
+        assert payload.get("ok") is True
+        assert out.exists() and out.stat().st_size > 0
+
+    def test_rejects_non_zip(self, tmp_path):
+        _, st = sc._h_export_migrate_archive(None, {"path": str(tmp_path / "ws.txt")})
+        assert st == 400
+
+    def test_missing_path_400(self):
+        _, st = sc._h_export_migrate_archive(None, {})
+        assert st == 400
+
+
+class TestStatusViewState:
+    """`status` now carries a `view` block (selection / cursor / map view) so an
+    agent can act on what the user has highlighted (2026-06-30)."""
+
+    def test_status_includes_view(self):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ACGT" * 10), id="x", name="x",
+                        annotations={"topology": "circular"})
+        app = types.SimpleNamespace(_current_record=rec, _source_path=None,
+                                    _unsaved=False)
+        res = sc._h_status(app, {})
+        assert "view" in res and isinstance(res["view"], dict)
+        # no panels mounted on this shim → all view fields null, but the shape
+        # is stable so an agent can rely on it.
+        assert set(res["view"]) == {"selection", "cursor_bp", "origin_bp",
+                                    "map_mode", "selected_feature"}
+
+    def test_status_view_null_when_no_record(self):
+        app = types.SimpleNamespace(_current_record=None, _source_path=None,
+                                    _unsaved=False)
+        res = sc._h_status(app, {})
+        assert res["view"] is None

@@ -31,7 +31,7 @@ classifier),
 `splicecraft_backup` (the user-data backup / restore / migrate engine + Master
 Delete enumeration — the data-safety core), `splicecraft_render`,
 `splicecraft_history`, `splicecraft_widgets`, `splicecraft_modals` (60
-dependency-clean dialog classes), `splicecraft_agent` (all 109 data-only
+dependency-clean dialog classes), `splicecraft_agent` (~130 data-only
 agent-API endpoints; the deep engines they call are reached via `_state` hooks),
 `splicecraft_errors` (plus the stdlib-only `splicecraft_cli` sidecar and
 `splicecraft_demo_plasmids` seed). **The flat-sibling modularization is now

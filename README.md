@@ -230,7 +230,8 @@ direct conversation with a **local [Ollama](https://ollama.com) model** — no
 cloud, no API key, nothing leaves your machine — wearing the Babs chat UX:
 streaming answers with markdown highlighting, reasoning (`<think>`) hidden by
 default, a **❤ context lifebar** that shows how much chat memory is left, and
-slash commands (`/help`, `/model`, `/system`, `/temp`, `/reset`, `/retry`). The
+slash commands (`/help`, `/model`, `/system`, `/temp`, `/reset`, `/retry`,
+`/agent`, `/autonomy`). The
 transcript keeps a long, selectable, copy-pasteable history, and **Ctrl+E**
 exports the whole conversation to markdown. Three tabs:
 
@@ -240,6 +241,13 @@ exports the whole conversation to markdown. Three tabs:
   own `rag_bot` does, streamed into the chat. Off, it's a plain local-model chat.
   So you can grow a corpus in the Paper scraper *and query it* without leaving
   SpliceCraft.
+- **Agent mode** — flip **Agent** on (or `/agent`) and Babs can *drive
+  SpliceCraft herself*: she calls the same scripting endpoints the external
+  `--agent` API exposes — read the loaded plasmid, find a motif, design primers,
+  run a digest, clone, manage the library — and **everything she does shows up
+  live in the app**. By default she **asks before every write** (a one-tap
+  approve/deny); `/autonomy auto` lets her run unattended, `/autonomy readonly`
+  keeps her to read-only. Destructive whole-library wipes are never reachable.
 - **Model** — organize your models into **collections**, exactly like plasmids:
   make/rename/delete collections, **mark** rows (Space) to **move** them between
   collections or **uninstall** them in bulk, and file a model into a collection
@@ -259,6 +267,11 @@ exports the whole conversation to markdown. Three tabs:
   changed *embedding* model needs the corpus re-ingested to match, and can run
   that re-embed for you. Shown only when the Babs repo is present (`~/babs`, or
   `$SPLICECRAFT_BABS_HOME`).
+
+The BABS tab is **persistent** — switch to another part of SpliceCraft or close
+it and your conversation, model choice and agent mode are still there when you
+come back, and a model download you kicked off keeps running while you work
+elsewhere.
 
 The toolbar scrolls horizontally when the terminal is too narrow to fit every
 menu, so BABS at the far right is always reachable. Requires Ollama running

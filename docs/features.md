@@ -342,7 +342,7 @@ details. In short:
 
 - **Agent API** (`splicecraft --agent`) exposes a localhost JSON API
   with bearer-token auth, covering every GUI action external AI
-  agents need. ~135 endpoints; symlink-guarded write paths;
+  agents need. ~170 endpoints; symlink-guarded write paths;
   length/range/shape validation at the boundary.
 - **`splicecraft-cli`** — stdlib-only sidecar (~50 ms cold start)
   that reads connection details from the running session's token

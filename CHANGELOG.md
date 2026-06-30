@@ -14,6 +14,22 @@
 
 ---
 
+## [1.0.111] — 2026-06-30
+
+### New features
+
+- **Babs can now drive SpliceCraft for you.** Turn on **Agent** mode in the BABS tab (or `/agent`) and the assistant can operate the app on your behalf — read the loaded plasmid, find a sequence motif, design primers, run a digest, clone, manage your library — using the same operations the scripting API exposes, all in-process. Everything she does shows up **live** in the app. By default she **asks before every change** with a one-tap approve/deny; `/autonomy auto` lets her work unattended and `/autonomy readonly` keeps her read-only. Whole-library wipes are never reachable.
+- **The BABS tab is now persistent.** Switch to another part of SpliceCraft, or close BABS entirely, and your conversation, model choice and agent mode are still there when you come back — the transcript is restored. A model download you started keeps running while you work in another tab, and reopening BABS while it's open elsewhere brings it back to the front instead of doing nothing.
+- **Find a sequence on the loaded plasmid (scripting API).** A new `find-sequence` endpoint locates a DNA subsequence or IUPAC motif on the current record — both strands, wrap-aware across the origin — returning every hit's position and strand.
+- **Back up your whole workspace to one file (scripting API).** A new `export-migrate-archive` endpoint packages all your data into a single portable `.zip` — handy before a risky batch build, or to move to another machine. It only reads your data, never modifies it.
+- **Richer `status` for assistants.** The scripting API's `status` now reports what you have selected, the cursor position, and the map view — so an assistant can act on "the highlighted region" instead of needing explicit coordinates.
+
+### Hardening
+
+- **The local assistant won't lose its persona on a long paste.** A very long message no longer pushes Babs' instructions out of the model's context window — the chat reserves room for your message and the reply, and sizes itself to the model's real context length, so the ❤ memory gauge is accurate even on large-context models.
+- **Tighter network safety for a remote Ollama.** If you point Babs at a remote Ollama server, it now refuses to follow redirects (which a hostile or intercepted endpoint could use to reach your internal network). The default local setup is unaffected.
+- **The scripting API resists overload and a few edge cases.** Concurrent heavy operations (BLAST / HMM / alignment) are capped so a burst can't peg the machine (excess calls get a clean "busy, retry shortly"); transient server errors and edit-conflicts are no longer wrongly cached for retries; and a couple of file-path checks were tightened. Chat exports now save to your Downloads folder (or home) rather than wherever the app happened to be launched from.
+
 ## [1.0.110] — 2026-06-30
 
 ### New features

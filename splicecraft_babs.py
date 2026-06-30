@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import functools
 import json
+import math
 import os
 import re
 import urllib.error
@@ -52,6 +53,11 @@ _log = _logging._log
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 DEFAULT_CHAT_MODEL = "qwen2.5:7b"   # == bb_config.CHAT_MODEL default
 DEFAULT_NUM_CTX = 4096              # == bb_config.ANSWER_NUM_CTX default
+# Conservative ceiling when AUTO-sizing num_ctx to a model's real window: lift
+# the working window above the 4096 floor (so the ❤ lifebar and chat memory
+# reflect a large-context model) without requesting a giant KV cache that could
+# balloon RAM on modest hardware.
+MAX_AUTO_NUM_CTX = 16384
 DEFAULT_TEMP = 0.0                  # == bb_config.ANSWER_TEMP default (deterministic)
 
 # Timeouts (seconds). The *connect/short-call* budget is tight (a missing Ollama
@@ -178,6 +184,33 @@ def _user_agent() -> str:
     return f"SpliceCraft/{_state._sc_version or '?'} (BABS chat client)"
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow 3xx redirects on the Ollama opener.
+
+    The Ollama REST API never legitimately redirects. Following one blindly (what
+    the default opener does) would let a hostile or MITM'd *remote* endpoint —
+    only reachable when ``$OLLAMA_HOST`` points off-loopback — bounce the client
+    into the internal network (a classic SSRF pivot to ``169.254.169.254`` /
+    intranet hosts). The default-loopback config is unaffected. Surfaced as an
+    ``HTTPError`` so the existing error mapping shows a clean message."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        raise urllib.error.HTTPError(
+            req.full_url, code,
+            f"Ollama endpoint attempted a redirect to {newurl!r} — refused "
+            f"(possible SSRF). Point $OLLAMA_HOST straight at the server.",
+            headers, fp)
+
+
+@functools.lru_cache(maxsize=1)
+def _ollama_opener() -> "urllib.request.OpenerDirector":
+    """A urllib opener for the local Ollama server identical to the default
+    EXCEPT it refuses redirects (see :class:`_NoRedirectHandler`). Cached — one
+    opener for the process. Localhost still works; only off-loopback redirect
+    chains are blocked."""
+    return urllib.request.build_opener(_NoRedirectHandler())
+
+
 # ── Low-level HTTP (localhost-allowed; bounded) ────────────────────────────────
 def _request_json(path: str, *, method: str = "GET", payload: "dict | None" = None,
                   timeout: float = _SHORT_TIMEOUT, max_bytes: int = _TAGS_MAX_BYTES) -> dict:
@@ -192,7 +225,7 @@ def _request_json(path: str, *, method: str = "GET", payload: "dict | None" = No
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _ollama_opener().open(req, timeout=timeout) as resp:
             raw = resp.read(max_bytes + 1)
     except urllib.error.HTTPError as exc:
         raise BabsError(_http_error_message(exc))
@@ -265,7 +298,7 @@ def _open_stream(path: str, payload: dict, *, timeout: float, register=None):
                  "Accept": "application/x-ndjson"},
     )
     try:
-        resp = urllib.request.urlopen(req, timeout=timeout)
+        resp = _ollama_opener().open(req, timeout=timeout)
     except urllib.error.HTTPError as exc:
         raise BabsError(_http_error_message(exc))
     except (urllib.error.URLError, OSError) as exc:
@@ -318,6 +351,24 @@ def show(name: str, *, timeout: float = _SHORT_TIMEOUT) -> dict:
         return {}
 
 
+def context_length_from_show(meta: "dict | None") -> "int | None":
+    """Pull the model's real context window from a ``/api/show`` payload, or
+    ``None``. Ollama nests it as ``model_info["<arch>.context_length"]`` (e.g.
+    ``qwen2.context_length``); scan for the architecture-prefixed key so no arch
+    is hard-coded. Lets the UI size the ❤ lifebar to the ACTUAL window instead of
+    the 4096 default (a 128k model otherwise reads as nearly-full far too soon)."""
+    if not isinstance(meta, dict):
+        return None
+    info = meta.get("model_info")
+    if isinstance(info, dict):
+        for k, v in info.items():
+            if isinstance(k, str) and k.endswith(".context_length"):
+                n = _to_int(v)
+                if n and n > 0:
+                    return n
+    return None
+
+
 def ping(*, timeout: float = _SHORT_TIMEOUT) -> bool:
     """True iff the Ollama server answers. Never raises."""
     try:
@@ -347,17 +398,30 @@ def model_is_installed(name: str, installed: "list[dict] | None" = None) -> bool
     return False
 
 
-def chat_stream(model: str, messages: "list[dict]", *, options: "dict | None" = None,
+def chat_stream(model: str, messages: "list[dict]", *, tools: "list[dict] | None" = None,
+                options: "dict | None" = None,
                 think: "bool | None" = None, cancel=None, register=None,
                 timeout: float = _CHAT_TIMEOUT):
     """Stream a chat completion (``POST /api/chat``). Yields
-    ``{"content": str, "thinking": str, "done": bool, "error": str|None}`` per
-    chunk — ``content`` is visible answer text, ``thinking`` is the model's
-    separate reasoning channel (newer Ollama) which the UI hides by default.
+    ``{"content": str, "thinking": str, "tool_calls": list, "done": bool,
+    "done_reason": str|None, "error": str|None}`` per chunk — ``content`` is
+    visible answer text, ``thinking`` is the model's separate reasoning channel
+    (newer Ollama) which the UI hides by default, ``tool_calls`` is any
+    function-call(s) the model emitted this chunk (present only when ``tools``
+    is supplied AND the model decides to call one).
+
+    ``tools`` (optional) is the Ollama function-tool manifest — a list of
+    ``{"type":"function","function":{name, description, parameters}}`` — that
+    powers the autonomous Babs tool-loop. Streamed tool calls require a
+    tool-capable model (e.g. qwen2.5) and Ollama ≳0.4; older servers simply
+    never populate ``tool_calls`` and the loop degrades to plain chat.
+
     ``cancel`` (Event) + ``register`` (receives the response for ``.close()``)
     give a responsive stop."""
     payload: dict = {"model": model, "messages": messages, "stream": True,
                      "options": options or {"temperature": DEFAULT_TEMP, "num_ctx": DEFAULT_NUM_CTX}}
+    if tools:
+        payload["tools"] = tools
     if think is not None:
         payload["think"] = bool(think)
     resp = _open_stream("/api/chat", payload, timeout=timeout, register=register)
@@ -366,10 +430,13 @@ def chat_stream(model: str, messages: "list[dict]", *, options: "dict | None" = 
                                 max_total=_STREAM_MAX_TOTAL_BYTES,
                                 max_line=_STREAM_MAX_LINE_BYTES):
             msg = obj.get("message") or {}
+            tcs = msg.get("tool_calls")
             yield {
                 "content": msg.get("content") or "",
                 "thinking": msg.get("thinking") or "",
+                "tool_calls": tcs if isinstance(tcs, list) else [],
                 "done": bool(obj.get("done")),
+                "done_reason": obj.get("done_reason"),
                 "error": obj.get("error"),
             }
     finally:
@@ -415,7 +482,7 @@ def delete_model(name: str, *, timeout: float = _SHORT_TIMEOUT) -> bool:
         url, data=data, method="DELETE",
         headers={"User-Agent": _user_agent(), "Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _ollama_opener().open(req, timeout=timeout) as resp:
             resp.read(1024)        # drain (bounded); body is empty on success
     except urllib.error.HTTPError as exc:
         raise BabsError(_http_error_message(exc))
@@ -461,13 +528,16 @@ def hf_search_gguf(query: str, *, limit: int = HF_SEARCH_LIMIT, opener=None,
     for m in data:
         if not isinstance(m, dict):
             continue
-        mid = (m.get("id") or m.get("modelId") or "").strip()
+        mid = m.get("id") or m.get("modelId") or ""
+        if not isinstance(mid, str):     # hostile/malformed JSON: id not a string
+            continue
+        mid = mid.strip()
         if not mid:
             continue
         out.append({
             "id": mid,
-            "downloads": int(m.get("downloads") or 0),
-            "likes": int(m.get("likes") or 0),
+            "downloads": _to_int(m.get("downloads")) or 0,
+            "likes": _to_int(m.get("likes")) or 0,
             "gated": bool(m.get("gated")),
             "pull": f"hf.co/{mid}",
         })
@@ -478,6 +548,11 @@ def hf_search_gguf(query: str, *, limit: int = HF_SEARCH_LIMIT, opener=None,
 # ── Reasoning-channel handling (mirror bb_config.strip_think + rag_bot stream) ──
 _THINK_BLOCK = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
 _THINK_OPEN, _THINK_CLOSE = "<think>", "</think>"
+# Case-insensitive locators for the streaming stripper (a model may emit
+# <THINK>/<Think>). Regex search keeps correct indices on the ORIGINAL buffer
+# regardless of any Unicode elsewhere in it (str.lower() can change length).
+_THINK_OPEN_RE = re.compile(re.escape(_THINK_OPEN), re.IGNORECASE)
+_THINK_CLOSE_RE = re.compile(re.escape(_THINK_CLOSE), re.IGNORECASE)
 
 
 def strip_think(text: str) -> str:
@@ -498,9 +573,10 @@ def strip_think(text: str) -> str:
 
 def _held_suffix(buf: str, tag: str) -> int:
     """Length of the longest suffix of ``buf`` that is a proper prefix of ``tag``
-    — bytes held back because they might begin a tag split across two chunks."""
+    (compared case-insensitively; ``tag`` is lowercase) — bytes held back because
+    they might begin a tag split across two chunks."""
     for k in range(min(len(buf), len(tag) - 1), 0, -1):
-        if buf[-k:] == tag[:k]:
+        if buf[-k:].lower() == tag[:k]:
             return k
     return 0
 
@@ -525,25 +601,25 @@ class ThinkStripper:
         out: "list[str]" = []
         while self.buf:
             if self.in_think:
-                i = self.buf.find(_THINK_CLOSE)
-                if i == -1:
+                m = _THINK_CLOSE_RE.search(self.buf)
+                if m is None:
                     hold = _held_suffix(self.buf, _THINK_CLOSE)
                     self.buf = self.buf[len(self.buf) - hold:] if hold else ""
                     break
-                self.buf = self.buf[i + len(_THINK_CLOSE):].lstrip()
+                self.buf = self.buf[m.end():].lstrip()
                 self.in_think = False
             else:
-                i = self.buf.find(_THINK_OPEN)
-                if i == -1:
+                m = _THINK_OPEN_RE.search(self.buf)
+                if m is None:
                     hold = _held_suffix(self.buf, _THINK_OPEN)
                     visible = self.buf[:len(self.buf) - hold] if hold else self.buf
                     if visible:
                         out.append(visible)
                     self.buf = self.buf[len(self.buf) - hold:] if hold else ""
                     break
-                if i:
-                    out.append(self.buf[:i])
-                self.buf = self.buf[i + len(_THINK_OPEN):]
+                if m.start():
+                    out.append(self.buf[:m.start()])
+                self.buf = self.buf[m.end():]
                 self.in_think = True
         return "".join(out)
 
@@ -598,12 +674,20 @@ def lifebar(history: "list[dict] | None", reserve_tokens: int,
 
 
 def trim_history(history: "list[dict]", reserve_tokens: int,
-                 num_ctx: int = DEFAULT_NUM_CTX) -> bool:
+                 num_ctx: int = DEFAULT_NUM_CTX, query_tokens: int = 0) -> bool:
     """Drop the oldest user+assistant pairs in place until this turn fits the
-    window (port of rag_bot's hard-trim backstop). Returns True if it trimmed."""
-    ceiling = int(num_ctx * _CTX_SAFETY)
+    window (port of rag_bot's hard-trim backstop). Returns True if it trimmed.
+
+    ``reserve_tokens`` is the system-prompt budget and ``query_tokens`` THIS
+    turn's user message — both are counted (alongside ``_ANSWER_RESERVE`` room
+    for the reply) so the assembled prompt can't overflow ``num_ctx`` once the
+    query is appended. Pre-fix the query was omitted, so a large paste pushed the
+    total past the window and llama.cpp silently evicted the FRONT — i.e. the
+    ``BABS_SYSTEM`` persona. The ceiling now mirrors :func:`lifebar` exactly."""
+    ceiling = max(256, int(num_ctx * _CTX_SAFETY) - _ANSWER_RESERVE)
     trimmed = False
-    while len(history) >= 2 and reserve_tokens + history_tokens(history) > ceiling:
+    while (len(history) >= 2
+           and reserve_tokens + query_tokens + history_tokens(history) > ceiling):
         del history[0:2]
         trimmed = True
     return trimmed
@@ -677,6 +761,8 @@ HELP_COMMANDS = [
     ("/retry", "regenerate the last answer"),
     ("/reset", "forget the conversation so far (clear chat memory)"),
     ("/clear", "clear the transcript on screen (keeps memory)"),
+    ("/agent", "toggle agent mode — let Babs drive SpliceCraft (call its endpoints)"),
+    ("/autonomy [ask|auto|readonly|off]", "set the write policy in agent mode"),
     ("/exit  /quit  /q", "close the BABS tab"),
 ]
 
@@ -717,25 +803,50 @@ def fmt_size(nbytes: "int | float") -> str:
     return f"{n:.1f} TB"
 
 
-def clamp_prompt(text: str) -> "tuple[str, bool]":
-    """Clamp an over-long prompt to ``MAX_PROMPT_CHARS``; returns (text, truncated)."""
+def clamp_prompt(text: str, *, num_ctx: "int | None" = None,
+                 reserve_tokens: int = 0) -> "tuple[str, bool]":
+    """Clamp an over-long prompt; returns ``(text, truncated)``.
+
+    Always enforces the ``MAX_PROMPT_CHARS`` paste-bomb guard. When ``num_ctx``
+    is given it ALSO clamps the query so it can't, on its own, exceed the room
+    left in the window (``num_ctx*_CTX_SAFETY − reserve_tokens − _ANSWER_RESERVE``)
+    — otherwise a single huge message forces llama.cpp to evict the persona even
+    after history is trimmed. The token→char trim chops the tail until it fits
+    (``est_tokens`` is lru-cached, so the few iterations are cheap)."""
     text = text or ""
+    truncated = False
     if len(text) > MAX_PROMPT_CHARS:
-        return text[:MAX_PROMPT_CHARS], True
-    return text, False
+        text = text[:MAX_PROMPT_CHARS]
+        truncated = True
+    if num_ctx:
+        budget = max(128, int(num_ctx * _CTX_SAFETY) - reserve_tokens - _ANSWER_RESERVE)
+        while text and est_tokens(text) > budget:
+            text = text[:max(1, int(len(text) * 0.9))]
+            truncated = True
+    return text, truncated
 
 
 def _to_float(x: object) -> "float | None":
     """Best-effort float coercion → ``None`` for None / non-numeric / a bad
-    numeric string, so a malformed Ollama progress value never raises. A
-    type-clean stand-in for ``try: float(x) except (TypeError, ValueError)``
-    (pyright models ``float()``'s argument strictly)."""
+    numeric string / a non-finite (inf, nan), so a malformed Ollama or HF value
+    never raises and never propagates a bogus inf/nan into size / speed /
+    fraction math. Type-clean stand-in for ``try: float(x) except ...`` (pyright
+    models ``float()``'s argument strictly)."""
     if isinstance(x, (int, float, str)):
         try:
-            return float(x)
+            f = float(x)
         except ValueError:
             return None
+        return f if math.isfinite(f) else None
     return None
+
+
+def _to_int(x: object) -> "int | None":
+    """Best-effort int coercion via :func:`_to_float` (so it inherits the
+    inf/nan rejection). ``None`` for non-numeric — used to tolerate HuggingFace
+    JSON whose ``downloads``/``likes`` may arrive as strings or junk."""
+    f = _to_float(x)
+    return None if f is None else int(f)
 
 
 def pull_progress_fraction(obj: dict) -> "float | None":

@@ -261,7 +261,7 @@ Call `/tools` for the live discovery endpoint. Each entry is
 COMPLETE docstring, which documents the request body (required / optional
 keys, aliases, enums, size caps), so a client forms a correct call in one
 round-trip instead of N trial-and-error 400s. `/tools` is authoritative:
-it lists every registered endpoint, including the ~26 app-coupled
+it lists every registered endpoint, including the ~42 app-coupled
 handlers that live in `splicecraft.py` rather than `splicecraft_agent.py`
 — don't rely on grepping a single file for `@_agent_endpoint`.
 

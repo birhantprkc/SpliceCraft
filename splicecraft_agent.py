@@ -37,7 +37,7 @@ from pathlib import Path
 
 import splicecraft_state as _state
 from splicecraft_backup import (_list_pre_update_snapshots)
-from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len)
+from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _iupac_pattern, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len)
 from splicecraft_cloning import (_GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi)
 from splicecraft_codon import (_CODON_GENETIC_CODE, _codon_fetch_kazusa, _codon_optimize, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
 from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_parts_bin_collections, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
@@ -54,7 +54,7 @@ from splicecraft_search import (_PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_file
 from splicecraft_seqanalysis import (_classify_part_from_plasmid, _find_orfs)
 from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _safe_color_for_picker, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
-from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
+from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
 from splicecraft_biology import (_digest_with_enzymes, _enzyme_cuts, _scan_restriction_sites)
 from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _design_gb_primers)
 from splicecraft_dataaccess import (_active_enzyme_allowed_set, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
@@ -279,8 +279,10 @@ def _agent_save_or_500(save_fn, label: str = "library"):
 
 def _agent_dirty_guard(app, payload):
     """Return None if writes may proceed, else (error_dict, 409). The
-    `force` field in the payload (or `?force=1` in the query, applied
-    by the request handler) overrides the dirty check."""
+    ``force`` field in the POST JSON body overrides the dirty check.
+    (Writes are POST-only and the dispatcher parses only the JSON body
+    for POST, so a ``?force=1`` query param is NOT honoured — pass
+    ``{"force": true}`` in the body.)"""
     if getattr(app, "_unsaved", False) and not bool(payload.get("force")):
         return ({"error":
                   "unsaved changes — pass {\"force\": true} to override",
@@ -4910,6 +4912,105 @@ def _h_bulk_export_collection(app, payload):
     return {"ok": True, **result}
 
 
+@_agent_endpoint("find-sequence")
+def _h_find_sequence(app, payload):
+    """Locate a DNA subsequence / IUPAC motif on the loaded record. Body:
+    ``{query, both_strands?, max_hits?}``.
+
+    * ``query`` — ACGT/U or IUPAC bases (e.g. ``GAATTC``, ``GGWCC``,
+      ``NNNGATCNNN``); case-insensitive, U treated as T.
+    * ``both_strands`` — also search the reverse-complement strand (default
+      ``true``); reverse hits report the FORWARD coordinate with ``strand: -1``
+      (sacred invariant #2). A palindromic match is reported ONCE, on the
+      forward strand (mirrors invariant #1).
+    * ``max_hits`` — cap on returned hits (default 100, max 10000).
+
+    Wrap-aware on a circular plasmid (a motif spanning the origin is found).
+    Matches are non-overlapping (``re.finditer``). Returns ``hits:
+    [{start, end, strand, match, wraps}]`` — 0-based half-open ``[start, end)``
+    in FORWARD coordinates; ``end <= start`` with ``wraps: true`` when the hit
+    crosses the origin. Read-only — does not change the record."""
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    raw = payload.get("query")
+    if not isinstance(raw, str) or not raw.strip():
+        return ({"error": "missing 'query' (ACGT / IUPAC bases)"}, 400)
+    q = raw.strip().upper().replace("U", "T")
+    if not re.fullmatch(r"[ACGTRYSWKMBDHVN]+", q):
+        return ({"error": "'query' must be ACGT / IUPAC bases"}, 400)
+    seq = str(getattr(rec, "seq", "") or "").upper()
+    n = len(seq)
+    if n == 0 or len(q) > n:
+        return {"ok": True, "query": q, "n_hits": 0, "hits": []}
+    both = payload.get("both_strands", True)
+    if not isinstance(both, bool):
+        both = str(both).strip().lower() not in ("false", "0", "no", "off", "")
+    max_hits = _coerce_int(payload.get("max_hits", 100), name="max_hits")
+    if isinstance(max_hits, str):
+        return ({"error": max_hits}, 400)
+    max_hits = max(1, min(int(max_hits), 10000))
+    circular = (rec.annotations.get("topology") or "linear") == "circular"
+    extra = (len(q) - 1) if circular else 0
+    search = (seq + seq[:extra]) if extra else seq
+    hits: "list[dict]" = []
+    seen: "set[tuple[int, int]]" = set()
+
+    def _scan(pattern, strand) -> bool:
+        for m in pattern.finditer(search):
+            s = m.start()
+            if s >= n:                       # duplicate from the wrap region
+                break
+            e = s + len(q)
+            wraps = e > n
+            end = (e - n) if wraps else e
+            key = (s, end)
+            if key in seen:                  # palindrome already found forward
+                continue
+            seen.add(key)
+            hits.append({"start": s, "end": end, "strand": strand,
+                         "match": m.group(), "wraps": wraps})
+            if len(hits) >= max_hits:
+                return True
+        return False
+
+    full = _scan(_iupac_pattern(q), 1)
+    if both and not full:
+        _scan(_iupac_pattern(_rc(q)), -1)
+    hits.sort(key=lambda h: (h["start"], -h["strand"]))
+    return {"ok": True, "query": q, "circular": circular,
+            "n_hits": len(hits), "hits": hits[:max_hits]}
+
+
+@_agent_endpoint("export-migrate-archive", write=True)
+def _h_export_migrate_archive(app, payload):
+    """Package ALL user data into one portable, compressed ``.zip`` (backup, or
+    moving to another machine). Body: ``{path, include_hmm?}``. ``path`` must end
+    in ``.zip``; ``include_hmm`` (default false) bundles the large HMM databases
+    too (re-derivable from the always-included catalog otherwise).
+
+    READ-ONLY with respect to the data dir — it only copies user data OUT, never
+    modifies it. The inverse (IMPORT) is deliberately NOT exposed over the agent
+    API: it replaces ALL data, the same risk class as Master Delete. Returns
+    ``{path, bytes, n_files, n_dirs, included_hmm}``."""
+    path = _sanitize_path(payload.get("path"))
+    if path is None:
+        return ({"error": "missing 'path'"}, 400)
+    if (ext_err := _check_export_extension(
+            path, (".zip",), "migrate archive")) is not None:
+        return ({"error": ext_err}, 400)
+    err = _check_agent_write_path(path)
+    if err is not None:
+        return ({"error": err}, 403)
+    include_hmm = bool(payload.get("include_hmm"))
+    try:
+        result = _export_migrate_archive(path, include_hmm=include_hmm)
+    except OSError as exc:
+        return ({"error": f"export failed: {_scrub_path(str(exc))}"}, 500)
+    return {"ok": True, **result,
+            "ignored": _agent_ignored_keys(payload, {"path", "include_hmm"})}
+
+
 @_agent_endpoint("list-restriction-sites")
 def _h_list_restriction_sites(app, payload):
     """Scan the loaded record for restriction sites. Body:
@@ -5536,6 +5637,12 @@ def _h_hmmscan(app, payload):
     _generic_rejection = (
         {"error": "hmm file not acceptable (see splicecraft log)"}, 400,
     )
+    # Ancestor-symlink parity (audit 2026-06-30): the size/symlink check below
+    # covers the target itself, but a PARENT being a symlink (Documents → /etc)
+    # would still redirect the open. Same generic rejection — no probe leak.
+    if _check_agent_read_path_ancestors(hmm_path) is not None:
+        _log.info("hmmscan: refused path (ancestor symlink): %s", hmm_path)
+        return _generic_rejection
     if not hmm_path.exists():
         _log.info("hmmscan: refused path (not found): %s", hmm_path)
         return _generic_rejection
