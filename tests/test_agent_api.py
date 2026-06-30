@@ -4984,3 +4984,336 @@ class TestStatusViewState:
                                     _unsaved=False)
         res = sc._h_status(app, {})
         assert res["view"] is None
+
+
+# A 600 bp template (all ACGT, GFP block + a distinct mCherry block) used by
+# the primer tests below. Long enough for `design-primers` detection mode
+# (≥ 450 bp min product) and non-repeating so check-primer slices stay unique.
+_PRIMER_TMPL = (
+    "ATGAGCAAAGGAGAAGAACTTTTCACTGGAGTTGTCCCAATTCTTGTTGAATTAGATGGT"
+    "GATGTTAATGGGCACAAATTTTCTGTCAGTGGAGAGGGTGAAGGTGATGCAACATACGGA"
+    "AAACTTACCCTTAAATTTATTTGCACTACTGGAAAACTACCTGTTCCATGGCCAACACTT"
+    "GTCACTACTTTCGGTTATGGTGTTCAATGCTTTGCGAGATACCCAGATCATATGAAACAG"
+    "ATGGTGAGCAAGGGCGAGGAGGATAACATGGCCATCATCAAGGAGTTCATGCGCTTCAAG"
+    "GTGCACATGGAGGGCTCCGTGAACGGCCACGAGTTCGAGATCGAGGGCGAGGGCGAGGGC"
+    "CGCCCCTACGAGGGCACCCAGACCGCCAAGCTGAAGGTGACCAAGGGTGGCCCCCTGCCC"
+    "TTCGCCTGGGACATCCTGTCCCCTCAGTTCATGTACGGCTCCAAGGCCTACGTGAAGCAC"
+    "CCCGCCGACATCCCCGACTACTTGAAGCTGTCCTTCCCCGAGGGCTTCAAGTGGGAGCGC"
+    "GTGATGAACTTCGAGGACGGCGGCGTGGTGACCGTGACCCAGGACTCCTCCCTGCAGGAC"
+)
+
+
+class TestDesignPrimersModes:
+    """`design-primers` — detection (default), cloning, and the NEW
+    generic (binding-only) mode. The endpoint had no test before this."""
+
+    def test_missing_or_bad_template_400(self):
+        assert sc._h_design_primers(None, {})[1] == 400
+        assert sc._h_design_primers(None, {"template": "ZZZ", "start": 0,
+                                           "end": 3})[1] == 400   # no IUPAC
+
+    def test_bad_mode_400(self):
+        r = sc._h_design_primers(None, {"template": _PRIMER_TMPL, "start": 0,
+                                        "end": len(_PRIMER_TMPL),
+                                        "mode": "wat"})
+        assert r[1] == 400
+
+    def test_detection_default(self):
+        r = sc._h_design_primers(None, {"template": _PRIMER_TMPL,
+                                        "start": 0, "end": len(_PRIMER_TMPL)})
+        assert isinstance(r, dict) and r["ok"] and r["mode"] == "detection"
+        # detection picks a diagnostic amplicon → fwd_seq/rev_seq + product_size
+        assert r["result"].get("fwd_seq") and r["result"].get("rev_seq")
+        assert r["result"].get("product_size")
+
+    def test_generic_binding_only(self):
+        n = len(_PRIMER_TMPL)
+        r = sc._h_design_primers(None, {"template": _PRIMER_TMPL, "start": 0,
+                                        "end": n, "mode": "generic"})
+        assert isinstance(r, dict) and r["ok"] and r["mode"] == "generic"
+        res = r["result"]
+        # Binding-only: the forward primer IS a prefix of the template (no
+        # 5' tail / RE site / overhang), and positions are reported.
+        assert res["fwd_seq"] and _PRIMER_TMPL.startswith(res["fwd_seq"])
+        assert "fwd_pos" in res and "rev_pos" in res
+        assert res["fwd_tm"] and res["rev_tm"]
+        # No tail keys leak in from the other modes.
+        assert "fwd_full" not in res
+
+    def test_generic_region_too_short_422(self):
+        r = sc._h_design_primers(None, {"template": _PRIMER_TMPL, "start": 0,
+                                        "end": 10, "mode": "generic"})
+        assert r[1] == 422        # < 18 bp region
+
+    def test_cloning_runs(self):
+        # Pre-existing mode — just confirm it dispatches (ok, or a clean 422).
+        r = sc._h_design_primers(None, {"template": _PRIMER_TMPL, "start": 20,
+                                        "end": 220, "mode": "cloning",
+                                        "site_5": "GAATTC", "site_3": "GGATCC"})
+        assert isinstance(r, dict) or r[1] == 422
+
+
+class TestCheckPrimer:
+    """`check-primer` — single primer vs a template: Tm, GC%, and every
+    3'-anchored binding site (both strands, wrap-aware)."""
+
+    def test_missing_args_400(self):
+        assert sc._h_check_primer(None, {})[1] == 400
+        assert sc._h_check_primer(None, {"primer": "ACGTACGT"})[1] == 400
+        assert sc._h_check_primer(None, {"primer": "ZZZ",
+                                         "template": _PRIMER_TMPL})[1] == 400
+        assert sc._h_check_primer(None, {"primer": "ACGTACGT",
+                                         "template": "ZZZ"})[1] == 400
+
+    def test_forward_site_exact(self):
+        fwd = _PRIMER_TMPL[40:62]
+        r = sc._h_check_primer(None, {"primer": fwd, "template": _PRIMER_TMPL,
+                                      "circular": False})
+        assert r["ok"] and r["binds"] and r["length"] == 22
+        fwd_sites = [s for s in r["sites"] if s["orientation"] == "forward"]
+        assert any(s["foot_start"] == 40 and s["ident_pct"] == 100.0
+                   for s in fwd_sites)
+        assert r["best_identity"] == 100.0
+        assert r["tm"] is not None and 0 <= r["gc_pct"] <= 100
+        assert fwd_sites[0]["confidence"] == "✓"   # 100% → check
+
+    def test_reverse_site(self):
+        rc = sc._rc(_PRIMER_TMPL[40:62])
+        r = sc._h_check_primer(None, {"primer": rc, "template": _PRIMER_TMPL,
+                                      "circular": False})
+        rev = [s for s in r["sites"] if s["orientation"] == "reverse"]
+        assert any(s["foot_start"] == 40 and s["ident_pct"] == 100.0
+                   for s in rev)
+
+    def test_no_binding(self):
+        r = sc._h_check_primer(None, {"primer": "GGGGGGGGGGGGGGGGGGGG",
+                                      "template": "ATATATATATATATATATATAT",
+                                      "circular": False})
+        assert (r["ok"] and not r["binds"] and r["n_sites"] == 0
+                and r["best_identity"] is None)
+
+    def test_internal_mismatch_partial_identity(self):
+        # A single mismatch in the 5' half (3' seed intact → site still found)
+        # gives identity over the FULL primer, not 100% — exactly what catches
+        # a tailed / mutagenic primer. Deterministic: 1 of 22 bases differs.
+        core = _PRIMER_TMPL[40:62]
+        flip = "T" if core[2] != "T" else "G"
+        primer = core[:2] + flip + core[3:]
+        r = sc._h_check_primer(None, {"primer": primer,
+                                      "template": _PRIMER_TMPL,
+                                      "circular": False})
+        fwd = [s for s in r["sites"]
+               if s["orientation"] == "forward" and s["foot_start"] == 40]
+        assert fwd and fwd[0]["mismatches"] == 1
+        assert 90.0 < fwd[0]["ident_pct"] < 100.0
+
+    def test_circular_wrap(self):
+        # A primer spanning the origin binds only on a circular template.
+        n = len(_PRIMER_TMPL)
+        wrapper = _PRIMER_TMPL[-10:] + _PRIMER_TMPL[:12]
+        circ = sc._h_check_primer(None, {"primer": wrapper,
+                                         "template": _PRIMER_TMPL,
+                                         "circular": True})
+        lin = sc._h_check_primer(None, {"primer": wrapper,
+                                        "template": _PRIMER_TMPL,
+                                        "circular": False})
+        assert any(s["foot_start"] == n - 10 and s["ident_pct"] == 100.0
+                   for s in circ["sites"] if s["orientation"] == "forward")
+        assert not any(s["foot_start"] == n - 10
+                       for s in lin["sites"] if s["orientation"] == "forward")
+
+
+class TestBatchMoveCopyPlasmids:
+    """`copy-plasmids` / `move-plasmids` — bulk move/copy in ONE locked save
+    (agent-API feedback P1-6). Per-item results; [INV-83] mirror re-stage on
+    move with the active collection on either side."""
+
+    def _ent(self, name, i):
+        return {"id": f"id-{name}-{i}", "name": name, "gb_text": "",
+                "size": 80}
+
+    def _names(self, coll):
+        c = next(c for c in sc._load_collections() if c["name"] == coll)
+        return [p["name"] for p in c["plasmids"]]
+
+    def _lib(self):
+        return [p["name"] for p in sc._load_library()]
+
+    def _seed(self):
+        # CollC is the (neutral) active collection so non-active ops leave the
+        # live mirror untouched; CollA/CollB hold the movable plasmids.
+        sc._save_collections([
+            {"name": "CollA", "plasmids": [self._ent("pA1", 1),
+                                           self._ent("pA2", 2),
+                                           self._ent("pA3", 3)],
+             "saved": "2026-01-01"},
+            {"name": "CollB", "plasmids": [self._ent("pB1", 1)],
+             "saved": "2026-01-01"},
+            {"name": "CollC", "plasmids": [], "saved": "2026-01-01"},
+        ])
+        sc._set_active_collection_name("CollC")
+        sc._restore_library_from_active_collection()
+
+    # ── validation ──────────────────────────────────────────────────────
+    def test_bad_inputs(self):
+        self._seed()
+        assert sc._h_copy_plasmids(None, {})[1] == 400
+        assert sc._h_copy_plasmids(None, {"names": [], "to": "CollB"})[1] == 400
+        assert sc._h_copy_plasmids(None, {"names": ["pA1"]})[1] == 400
+        assert sc._h_copy_plasmids(None,
+                                   {"names": [1, 2], "to": "CollB"})[1] == 400
+        assert sc._h_copy_plasmids(None,
+                                   {"names": ["pA1"], "to": "Nope"})[1] == 404
+        assert sc._h_move_plasmids(
+            None, {"names": ["pA1"], "to": "CollA", "from": "Nope"})[1] == 404
+
+    def test_copy_refuses_active_target(self):
+        self._seed()
+        assert sc._h_copy_plasmids(None,
+                                   {"names": ["pA1"], "to": "CollC"})[1] == 409
+
+    def test_copy_batch_per_item(self):
+        self._seed()
+        r = sc._h_copy_plasmids(
+            None, {"names": ["pA1", "pA2", "ghost", "pB1"], "to": "CollB"})
+        assert r["ok"] and r["copied"] == 2
+        assert set(r["copied_names"]) == {"pA1", "pA2"}
+        assert r["not_found"] == ["ghost"]
+        assert r["conflict"] == ["pB1"]            # already in CollB
+        assert set(self._names("CollA")) == {"pA1", "pA2", "pA3"}  # source kept
+        assert set(self._names("CollB")) == {"pB1", "pA1", "pA2"}
+
+    def test_copy_dedups_repeats(self):
+        self._seed()
+        r = sc._h_copy_plasmids(None,
+                                {"names": ["pA1", "pA1", "pA1"], "to": "CollB"})
+        assert r["copied"] == 1
+
+    def test_copy_ambiguous_needs_from(self):
+        sc._save_collections([
+            {"name": "X", "plasmids": [self._ent("dup", 1)],
+             "saved": "2026-01-01"},
+            {"name": "Y", "plasmids": [self._ent("dup", 2)],
+             "saved": "2026-01-01"},
+            {"name": "W", "plasmids": [], "saved": "2026-01-01"},
+            {"name": "Act", "plasmids": [], "saved": "2026-01-01"},
+        ])
+        sc._set_active_collection_name("Act")
+        sc._restore_library_from_active_collection()
+        r = sc._h_copy_plasmids(None, {"names": ["dup"], "to": "W"})
+        assert r["ok"] and r["copied"] == 0 and r["ambiguous"] == ["dup"]
+        r2 = sc._h_copy_plasmids(None,
+                                 {"names": ["dup"], "to": "W", "from": "X"})
+        assert r2["copied"] == 1
+
+    # ── move ────────────────────────────────────────────────────────────
+    def test_move_batch_per_item(self):
+        self._seed()
+        r = sc._h_move_plasmids(
+            None, {"names": ["pA1", "pA3", "ghost"], "to": "CollB"})
+        assert r["ok"] and r["moved"] == 2
+        assert set(r["moved_names"]) == {"pA1", "pA3"}
+        assert r["not_found"] == ["ghost"]
+        assert self._names("CollA") == ["pA2"]        # pA1, pA3 removed
+        assert set(self._names("CollB")) == {"pB1", "pA1", "pA3"}
+
+    def test_move_into_active_remirrors(self):
+        self._seed()
+        r = sc._h_move_plasmids(None, {"names": ["pA1", "pA2"], "to": "CollC"})
+        assert r["moved"] == 2
+        assert set(self._names("CollC")) == {"pA1", "pA2"}
+        assert set(self._lib()) == {"pA1", "pA2"}     # active mirror gained
+
+    def test_move_out_of_active_remirrors(self):
+        self._seed()
+        sc._set_active_collection_name("CollA")
+        sc._restore_library_from_active_collection()
+        assert set(self._lib()) == {"pA1", "pA2", "pA3"}
+        r = sc._h_move_plasmids(None, {"names": ["pA1", "pA2"], "to": "CollB"})
+        assert r["moved"] == 2
+        assert self._names("CollA") == ["pA3"]
+        assert self._lib() == ["pA3"]                 # mirror shrank, L3-safe
+
+    def test_move_name_collision_conflict_no_data_loss(self):
+        sc._save_collections([
+            {"name": "S", "plasmids": [
+                {"id": "s1", "name": "shared", "gb_text": "", "size": 80}],
+             "saved": "2026-01-01"},
+            {"name": "T", "plasmids": [
+                {"id": "t1", "name": "shared", "gb_text": "", "size": 80}],
+             "saved": "2026-01-01"},
+            {"name": "Act", "plasmids": [], "saved": "2026-01-01"},
+        ])
+        sc._set_active_collection_name("Act")
+        sc._restore_library_from_active_collection()
+        r = sc._h_move_plasmids(None,
+                                {"names": ["shared"], "to": "T", "from": "S"})
+        assert r["moved"] == 0 and r["conflict"] == ["shared"]
+        # The source entry must NOT have been removed — no data loss.
+        assert self._names("S") == ["shared"]
+        assert self._names("T") == ["shared"]
+
+
+class TestOnlineSearchGate:
+    """`blast-online` / `hmmer-web` — the two-key egress gate + validation.
+    The remote engines are monkeypatched so no network is touched."""
+
+    def test_disarmed_by_default_403(self):
+        sc._set_setting("allow_online_search", False)
+        assert sc._h_blast_online(
+            None, {"query": "ATGCATGCATGCATGCATGC"})[1] == 403
+        assert sc._h_hmmer_web(None, {"query": "MKVLAAGG"})[1] == 403
+
+    def test_setting_is_not_agent_settable(self):
+        # The HUMAN half of the two-key gate: the setting exists but an agent
+        # cannot flip it via set-setting (absent from the allowlist).
+        assert "allow_online_search" not in sc._AGENT_SETTINGS_ALLOWLIST
+        r = sc._h_set_setting(
+            None, {"key": "allow_online_search", "value": True})
+        assert r[1] == 400
+
+    def test_armed_blast_calls_engine(self, monkeypatch):
+        sc._set_setting("allow_online_search", True)
+        calls = {}
+
+        def fake(query, program, database, max_hits):
+            calls.update(query=query, program=program,
+                         database=database, max_hits=max_hits)
+            return [{"accession": "X1", "description": "hit",
+                     "identity_pct": 99.0}]
+        monkeypatch.setattr("splicecraft_agent._ncbi_blast_online", fake)
+        r = sc._h_blast_online(None,
+                               {"query": "ATGCATGCATGCATGCATGCATGC"})
+        assert r["ok"] and r["n_hits"] == 1 and r["program"] == "blastn"
+        assert r["database"] == "nt" and calls["max_hits"] == 25
+
+    def test_armed_blast_validation(self, monkeypatch):
+        sc._set_setting("allow_online_search", True)
+        monkeypatch.setattr("splicecraft_agent._ncbi_blast_online",
+                            lambda *a: [])
+        assert sc._h_blast_online(
+            None, {"query": "ATGC", "program": "wat"})[1] == 400
+        assert sc._h_blast_online(None, {})[1] == 400        # missing query
+        assert sc._h_blast_online(
+            None, {"query": "ATGCATGC", "database": "../etc"})[1] == 400
+
+    def test_armed_blast_upstream_error_502(self, monkeypatch):
+        sc._set_setting("allow_online_search", True)
+
+        def boom(*a):
+            raise RuntimeError("NCBI down")
+        monkeypatch.setattr("splicecraft_agent._ncbi_blast_online", boom)
+        assert sc._h_blast_online(
+            None, {"query": "ATGCATGCATGC"})[1] == 502
+
+    def test_armed_hmmer_calls_engine(self, monkeypatch):
+        sc._set_setting("allow_online_search", True)
+        seen = {}
+
+        def fake(protein, max_hits):
+            seen.update(protein=protein, max_hits=max_hits)
+            return [{"acc": "PF00001", "name": "Pkinase"}]
+        monkeypatch.setattr("splicecraft_agent._hmmer_web_hmmscan", fake)
+        r = sc._h_hmmer_web(None,
+                            {"query": "MKVLAAGGAGGSPVT", "max_hits": 5})
+        assert r["ok"] and r["n_hits"] == 1 and seen["max_hits"] == 5

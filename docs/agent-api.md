@@ -60,7 +60,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ## Endpoint inventory
 
-~172 endpoints across:
+~179 endpoints across:
 
 - **Records** — `new-plasmid` (create from a raw sequence, the Ctrl+N
   flow), get / set sequence, add / update / delete features (with the full
@@ -89,8 +89,12 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   intact, in one call), move-plasmid (RELOCATE an entry between
   collections atomically — no copy-then-delete data-loss round-trip;
   handles the active collection on either side, re-staging the live
-  library mirror), create / rename / delete collections, get / set
-  the active collection, list / set plasmid statuses.
+  library mirror), copy-plasmids / move-plasmids (the BULK form — a
+  whole `{names:[…]}` list into one collection in a single locked save,
+  the machine-friendly path that sidesteps the rate limiter; per-item
+  results report copied/moved, not_found, ambiguous, and conflict, never
+  silently renaming or dropping), create / rename / delete collections,
+  get / set the active collection, list / set plasmid statuses.
 - **Parts** — list-parts, get-part, create-part / update-part (full
   parity with the Part editor — name / grammar / type / level / position /
   overhangs / sequence plus `backbone`, selection `marker`, and
@@ -145,7 +149,13 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   collection?}` (active collection by default, or the named one).
   Also **fails loud** (422) on a missing acceptor or a chain that can't
   close; the L2→binary hop is a known engine gap), design-primers
-  (generic Primer3 detection or restriction cloning), optimize-protein
+  (Primer3 primer-pair design over a region: `detection` picks a
+  diagnostic amplicon, `cloning` appends RE-site tails, `generic`
+  returns binding-only primers — no tails / overhangs), check-primer
+  (a SINGLE oligo vs a template: Tm, GC%, and every 3'-anchored binding
+  site — both strands, wrap-aware on a circular template, the tail
+  scored as mismatches — to confirm a designed primer binds exactly once
+  before saving), optimize-protein
   (codon-optimise an AA sequence to a chosen table; optional `stops`
   0–3 appends that many stop codons, and a trailing `*` run in the
   protein is honored as-is and overrides it).
@@ -175,7 +185,16 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 - **Codon tables** — list, add (Kazusa fetch or raw dict), delete.
 - **Search** — blast (in-process BLASTN / BLASTP against your
   collections; pass `collections` to scope the DB to a subset and stay
-  under the build cap on a large library), hmmscan.
+  under the build cap on a large library), hmmscan. **Online** (off by
+  default): blast-online (remote NCBI BLAST vs `nt`/`nr`/…) and
+  hmmer-web (remote hmmscan vs Pfam at EBI) SHIP the query sequence to
+  an external server, so they are refused `403` unless the SpliceCraft
+  user has armed Settings → "Allow agent online BLAST/HMMER". That
+  setting is the HUMAN half of a two-key gate — it is deliberately NOT
+  in the agent settings allowlist, so an autonomous agent can never flip
+  it on itself; the in-process blast / hmmscan stay local and never
+  consult it. Both block for minutes on the remote job (502 on a
+  network / server error) and are concurrency-capped.
 - **RNA structure + RBS** — fold-rna (minimum-free-energy secondary
   structure: dot-bracket fold + ΔG in kcal/mol, pure-Python Turner-2004,
   no external dependency); cofold-rna (bound-state heterodimer ΔG of two
@@ -230,7 +249,11 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   reporting `removed` / `not_found` / `ambiguous`.
 - **Data safety** — list-backups, restore-backup,
   list-pre-update-snapshots, restore-pre-update-snapshot.
-- **Settings** — get-settings, set-setting (allowlisted toggles);
+- **Settings** — get-settings, set-setting (allowlisted toggles only;
+  a handful of settings — the Plasmidsaurus secret, the online-search
+  egress gate `allow_online_search` — are deliberately NOT in the
+  allowlist, so an agent can neither read nor flip them; those are
+  human-armed via the GUI Settings dialog);
   get-feature-colors / set-feature-color (the per-feature-type render
   colour overrides).
 - **Experiments lab notebook** — list / get / create / update /

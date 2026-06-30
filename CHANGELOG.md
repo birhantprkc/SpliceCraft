@@ -14,6 +14,19 @@
 
 ---
 
+## [1.0.112] — 2026-06-30
+
+### New features
+
+- **Bulk move/copy plasmids (scripting API).** New `copy-plasmids` and `move-plasmids` endpoints relocate or duplicate a whole list of library entries into a collection in a single call, instead of one call per plasmid (which the rate limiter would throttle). Each item is reported back individually — copied/moved, not found, ambiguous, or already-present — so a batch never silently renames or drops anything.
+- **Check a single primer (scripting API).** A new `check-primer` endpoint takes one oligo and a template and reports its melting temperature, GC%, and every place it anneals — both strands, wrapping across a circular origin — so an agent can confirm a designed primer binds exactly once before saving it. A 5′ tail is scored as mismatches, just like the in-app Primer Check.
+- **Binding-only primer design (scripting API).** `design-primers` gained a `generic` mode that returns plain binding primers with no restriction tails or overhangs, alongside the existing diagnostic-amplicon (`detection`) and restriction-cloning (`cloning`) modes.
+- **Optional online BLAST / HMMER for agents.** New `blast-online` (remote NCBI BLAST) and `hmmer-web` (remote Pfam hmmscan) scripting endpoints — **off by default**. Because they send your query sequence to an external server, they stay refused until you tick the new *Settings → "Allow agent online BLAST/HMMER"*. Only you can arm it from the GUI — an autonomous agent can't flip it on itself — and the in-process BLAST/HMMscan that never leave your machine are unaffected.
+
+### Hardening
+
+- The online-search endpoints are concurrency-capped (a burst can't pin every worker on a slow remote job), validate the NCBI database name (no path-like tokens), and enforce the egress gate on every single call.
+
 ## [1.0.111] — 2026-06-30
 
 ### New features

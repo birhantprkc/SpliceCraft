@@ -87,7 +87,10 @@ single feature — to NCBI or EMBL-EBI Pfam and tables the hits, with a live
 poll counter and a Cancel that really stops. **Add to collection** pulls a
 highlighted nucleotide hit's full GenBank record straight from NCBI into a
 plasmid collection you pick. (Native Windows: HMMscan needs WSL2; BLASTN/BLASTP
-run in-process.)
+run in-process.) Scripting agents can run online search too — but only once
+you tick *Settings → "Allow agent online BLAST/HMMER"*, so a script or an
+autonomous assistant can never silently ship your sequences off-box; the
+in-process BLAST/HMMscan they always have stays on your machine.
 
 ### Enzymes
 

@@ -50,7 +50,7 @@ from splicecraft_net import (_sanitize_accession)
 from splicecraft_persistence import (_safe_file_size_check, _safe_load_json)
 from splicecraft_primer import (_mut_design_inner, _mut_design_outer, _scrub_design, _scrub_qc_primers, _scrub_qc_verify)
 from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq)
-from splicecraft_search import (_PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _sanitize_plasmidsaurus_item_code)
+from splicecraft_search import (_PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _online_clean_query, _online_max_query_len, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _sanitize_plasmidsaurus_item_code)
 from splicecraft_seqanalysis import (_classify_part_from_plasmid, _find_orfs)
 from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _safe_color_for_picker, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
@@ -61,7 +61,7 @@ from splicecraft_dataaccess import (_active_enzyme_allowed_set, _find_enzyme_col
 from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, _export_gff_to_path, _extract_gbk_member)
 from splicecraft_gels import (_AGAROSE_CHOICES, _GEL_HEIGHT_MAX, _GEL_HEIGHT_MIN, _GEL_LANE_WIDTH_MAX, _GEL_LANE_WIDTH_MIN, _GEL_MAX_LANES, _agarose_mobility, _gel_bands_for_lane, _render_gel_image)
 from splicecraft_persistence import (_safe_save_json_mirror)
-from splicecraft_primer import (_design_cloning_primers_raw, _design_detection_primers)
+from splicecraft_primer import (_design_cloning_primers_raw, _design_detection_primers, _design_generic_primers, _primer_binding_sites, _primer_check_confidence, _primer_tm)
 
 
 def _custom_enzyme_meta(name: str) -> "dict | None":
@@ -3429,6 +3429,95 @@ def _h_get_history(app, payload):
     }
 
 
+@_agent_endpoint("check-primer")
+def _h_check_primer(app, payload):
+    """Check ONE primer against a template: melting temp, GC%, and every
+    3'-anchored binding site (both strands, wrap-aware on a circular
+    template). Body: ``{primer, template, circular?: bool = true,
+    min_identity?: float = 0, max_sites?: int = 50}``.
+
+    The read-only analog of the GUI "Primer Check" tab for a single
+    oligo: `simulate-pcr` needs a PAIR; this answers "does this one
+    primer anneal, where, and how well." A site requires an EXACT match
+    over the primer's 3' seed; identity is then scored over the FULL
+    primer, so a primer carrying a 5' tail (cloning / mutagenesis)
+    still reports its site with the tail counted as mismatches. Use it
+    to confirm a designed primer binds exactly once (unique) before
+    saving, or to locate where a mystery oligo lands.
+
+    Read-only — never touches the loaded record or any saved file.
+    Returns ``{ok, primer, length, tm, gc_pct, circular, n_sites,
+    binds, best_identity, sites:[{orientation, strand, foot_start,
+    length, ident_pct, mismatches, confidence}]}`` — `foot_start` is the
+    0-based footprint start on the cleaned template; sites are
+    best-first (highest identity)."""
+    primer_raw = payload.get("primer")
+    if not isinstance(primer_raw, str) or not primer_raw.strip():
+        return ({"error": "missing or non-string 'primer'"}, 400)
+    template_raw = payload.get("template") or payload.get("sequence")
+    if not isinstance(template_raw, str) or not template_raw.strip():
+        return ({"error": "missing or non-string 'template'"}, 400)
+    _iupac = "ACGTRYWSMKBDHVN"
+    primer = "".join(ch for ch in primer_raw.upper() if ch in _iupac)
+    if not primer:
+        return ({"error": "no IUPAC bases in 'primer'"}, 400)
+    if len(primer) > 1000:
+        return ({"error": "'primer' too long (max 1000 bp)"}, 413)
+    template = "".join(ch for ch in template_raw.upper() if ch in _iupac)
+    if not template:
+        return ({"error": "no IUPAC bases in 'template'"}, 400)
+    if len(template) > _PAIRWISE_MAX_LEN:
+        return ({"error":
+                  f"'template' exceeds {_PAIRWISE_MAX_LEN:,} bp cap"}, 413)
+    circular = bool(payload.get("circular", True))
+    min_identity = payload.get("min_identity", 0.0)
+    try:
+        min_identity = float(min_identity)
+    except (TypeError, ValueError):
+        return ({"error": "'min_identity' must be a number"}, 400)
+    if not (0.0 <= min_identity <= 100.0):
+        return ({"error": "'min_identity' must be in [0, 100]"}, 400)
+    max_sites = _coerce_int(payload.get("max_sites", 50), name="max_sites")
+    if isinstance(max_sites, str):
+        return ({"error": max_sites}, 400)
+    max_sites = max(1, min(max_sites, 500))
+    try:
+        sites = _primer_binding_sites(
+            primer, template, len(template), circular=circular,
+            min_identity_pct=min_identity, max_sites=max_sites,
+        )
+    except ValueError as exc:
+        return ({"error": f"alignment failed: {_scrub_path(str(exc))}"}, 400)
+    out_sites = []
+    for s in sites:
+        glyph, _color = _primer_check_confidence(s.get("ident_pct"))
+        out_sites.append({
+            "orientation": "forward" if s.get("strand") == 1 else "reverse",
+            "strand":      s.get("strand"),
+            "foot_start":  s.get("foot_start"),
+            "length":      s.get("length"),
+            "ident_pct":   round(float(s.get("ident_pct") or 0.0), 1),
+            "mismatches":  s.get("mismatches"),
+            "confidence":  glyph,
+        })
+    # S = G|C, so count it toward GC for the ambiguous-base case.
+    gc = sum(1 for c in primer if c in "GCS")
+    gc_pct = round(100.0 * gc / len(primer), 1)
+    best = max((s["ident_pct"] for s in out_sites), default=None)
+    return {
+        "ok":            True,
+        "primer":        primer,
+        "length":        len(primer),
+        "tm":            _primer_tm(primer),
+        "gc_pct":        gc_pct,
+        "circular":      circular,
+        "n_sites":       len(out_sites),
+        "binds":         bool(out_sites),
+        "best_identity": best,
+        "sites":         out_sites,
+    }
+
+
 @_agent_endpoint("check-primer-duplicates")
 def _h_check_primer_duplicates(app, payload):
     """Scan the primer library for duplicate sequences. Returns a
@@ -5685,6 +5774,162 @@ def _h_hmmscan(app, payload):
     return {"ok": True, "n_hits": len(hits), "hits": hits}
 
 
+# ── Online search (NCBI BLAST URL-API + EBI HMMER web) ─────────────────────
+# Off by default. The TWO-KEY egress gate: (1) the human arms
+# `allow_online_search` (Settings → "Allow agent online BLAST/HMMER" — the
+# setting is DELIBERATELY absent from `_AGENT_SETTINGS_ALLOWLIST`, so an
+# autonomous agent cannot flip it on itself), AND (2) an agent calls the
+# endpoint by name. Even when armed, the engines route through the hardened
+# opener (`_online_http` → `_build_hardened_url_opener`) whose egress is
+# fail-closed-gated by `_state._demo_block_network_hook`, so the web demo
+# (DEMO_MODE) stays offline regardless. Both are HEAVY (a remote job can
+# block several minutes) and so sit in `_AGENT_HEAVY_ENDPOINTS` (hub) to
+# bound concurrency. The in-process `blast` / `hmmscan` never consult the
+# gate — they keep everything local.
+_ONLINE_SEARCH_MAX_HITS = 100          # polite cap for a public service
+_VALID_ONLINE_BLAST_PROGRAMS = frozenset(
+    {"blastn", "blastp", "blastx", "tblastn", "tblastx"})
+
+
+def _online_search_armed() -> bool:
+    """The human half of the two-key gate: True only when the user has armed
+    `allow_online_search` (Settings → "Allow agent online BLAST/HMMER", or a
+    hand-edited settings.json). Read live at call time so a fresh toggle takes
+    effect without a restart."""
+    return bool(_get_setting("allow_online_search", False))
+
+
+def _online_search_refusal():
+    """Uniform 403 for a disarmed online-search call, pointing at the human-
+    only arming path so the caller knows it can't self-enable."""
+    return ({"error":
+              "online search is disarmed — an agent may not send sequences "
+              "off-box. The SpliceCraft user must enable Settings → \"Allow "
+              "agent online BLAST/HMMER\" (or set allow_online_search in "
+              "settings.json) first. The in-process `blast` / `hmmscan` "
+              "endpoints stay available and never leave the machine."}, 403)
+
+
+@_agent_endpoint("blast-online")
+def _h_blast_online(app, payload):
+    """Remote NCBI BLAST via the public URL API. Body:
+    ``{query, program?, database?, max_hits?}``.
+
+    EGRESS WARNING: this SHIPS your query sequence to NCBI's servers
+    (unlike the in-process `blast`, which never leaves the box). Refused
+    403 unless the SpliceCraft user has armed Settings → "Allow agent
+    online BLAST/HMMER" — an autonomous agent cannot enable it itself
+    (the setting is not in the agent allowlist).
+
+    ``program`` is one of blastn / blastp / blastx / tblastn / tblastx
+    (auto-detected as blastn or blastp from the query alphabet when
+    omitted; the translated programs need an explicit ask); ``database``
+    defaults to NCBI `nt` (nucleotide programs) or `nr` (protein) and
+    may be any short NCBI db name; ``max_hits`` defaults to 25, capped
+    at 100. Blocks until NCBI returns (up to a few minutes) or errors —
+    502 on a network / server failure. Read-only; never touches the
+    loaded record or any saved file. Hits: accession, description,
+    identity %, e-value, bit score, query/subject coords."""
+    if not _online_search_armed():
+        return _online_search_refusal()
+    raw_query = payload.get("query")
+    if not raw_query or not isinstance(raw_query, str):
+        return ({"error": "missing or non-string 'query'"}, 400)
+    program_hint = str(payload.get("program") or "").lower().strip()
+    if program_hint:
+        if program_hint not in _VALID_ONLINE_BLAST_PROGRAMS:
+            return ({"error":
+                      f"'program' must be one of "
+                      f"{sorted(_VALID_ONLINE_BLAST_PROGRAMS)}"}, 400)
+        program = program_hint
+    else:
+        # Auto-detect blastn/blastp from the alphabet (the in-process
+        # detector); the three translated programs need an explicit ask.
+        program, _unused = _state._detect_query_program_hook(raw_query, "")
+    cleaned = _online_clean_query(raw_query, program)
+    if not cleaned:
+        return ({"error": "query is empty after sanitisation"}, 400)
+    cap = _online_max_query_len(program)
+    if len(cleaned) > cap:
+        return ({"error":
+                  f"query is {len(cleaned):,} chars; NCBI's {program} limit "
+                  f"is {cap:,} — search a shorter region"}, 413)
+    database = payload.get("database")
+    if database in (None, ""):
+        database = _ncbi_blast_db_for(program)
+    elif not isinstance(database, str):
+        return ({"error": "'database' must be a string"}, 400)
+    else:
+        database = database.strip()
+        # NCBI db NAMES (not paths): letters/digits/_.- only. No slash and no
+        # ".." so a hostile `database` can't smuggle a path-ish token into the
+        # outbound DATABASE param.
+        if (not database or len(database) > 64 or ".." in database
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+", database)):
+            return ({"error":
+                      "'database' must be a short NCBI db name "
+                      "(e.g. nt, nr, refseq_rna)"}, 400)
+    max_hits = _coerce_int(payload.get("max_hits", 25), name="max_hits")
+    if isinstance(max_hits, str):
+        return ({"error": max_hits}, 400)
+    max_hits = max(1, min(max_hits, _ONLINE_SEARCH_MAX_HITS))
+    try:
+        hits = _ncbi_blast_online(cleaned, program, database, max_hits)
+    except RuntimeError as exc:
+        # Network / NCBI-server error (timeout, rejected job, 5xx). Upstream
+        # failure, not a caller bug → 502.
+        return ({"error": f"NCBI BLAST failed: {_scrub_path(str(exc))}"}, 502)
+    except Exception as exc:
+        _log.exception("agent-api blast-online failed")
+        return ({"error": f"blast-online failed: {_scrub_path(str(exc))}",
+                 "type": type(exc).__name__}, 500)
+    return {"ok": True, "program": program, "database": database,
+            "query_length": len(cleaned), "n_hits": len(hits), "hits": hits}
+
+
+@_agent_endpoint("hmmer-web")
+def _h_hmmer_web(app, payload):
+    """Remote hmmscan vs Pfam via the EBI HMMER web API. Body:
+    ``{query, max_hits?}`` — `query` is a PROTEIN sequence.
+
+    EGRESS WARNING: this SHIPS your protein query to EBI's servers
+    (unlike the in-process `hmmscan` against a locally-downloaded Pfam
+    database). Refused 403 unless the SpliceCraft user has armed
+    Settings → "Allow agent online BLAST/HMMER"; an autonomous agent
+    cannot enable it itself.
+
+    ``max_hits`` defaults to 25, capped at 100. Blocks until EBI
+    returns (up to a few minutes) or errors — 502 on a network / server
+    failure. Read-only. Hits: Pfam accession + family name +
+    description, e-value, bit score, # domains, clan."""
+    if not _online_search_armed():
+        return _online_search_refusal()
+    raw_query = payload.get("query")
+    if not raw_query or not isinstance(raw_query, str):
+        return ({"error": "missing or non-string 'query'"}, 400)
+    protein = _online_clean_query(raw_query, "hmmscan")
+    if not protein:
+        return ({"error": "query is empty after sanitisation"}, 400)
+    cap = _online_max_query_len("hmmscan")
+    if len(protein) > cap:
+        return ({"error":
+                  f"query is {len(protein):,} aa; the cap is {cap:,}"}, 413)
+    max_hits = _coerce_int(payload.get("max_hits", 25), name="max_hits")
+    if isinstance(max_hits, str):
+        return ({"error": max_hits}, 400)
+    max_hits = max(1, min(max_hits, _ONLINE_SEARCH_MAX_HITS))
+    try:
+        hits = _hmmer_web_hmmscan(protein, max_hits)
+    except RuntimeError as exc:
+        return ({"error": f"EBI HMMER failed: {_scrub_path(str(exc))}"}, 502)
+    except Exception as exc:
+        _log.exception("agent-api hmmer-web failed")
+        return ({"error": f"hmmer-web failed: {_scrub_path(str(exc))}",
+                 "type": type(exc).__name__}, 500)
+    return {"ok": True, "query_length": len(protein),
+            "n_hits": len(hits), "hits": hits}
+
+
 @_agent_endpoint("list-parts-bins")
 def _h_list_parts_bins(app, payload):
     """Every named parts bin. Each item: ``{name, n_parts, description}``;
@@ -6276,20 +6521,29 @@ def _h_design_gb_part(app, payload):
 
 @_agent_endpoint("design-primers")
 def _h_design_primers(app, payload):
-    """Generic primer-pair design over a target region. Body:
-    ``{template, start, end, mode?: "cloning"|"detection",
+    """Primer-pair design over a target region. Body:
+    ``{template, start, end, mode?: "detection"|"cloning"|"generic",
         target_tm?: float, site_5?: str, site_3?: str}``.
 
-    Wraps `_design_detection_primers` and
-    `_design_cloning_primers_raw`. **Detection** mode picks a
-    diagnostic amplicon WITHIN the selected region (no overhangs).
-    **Cloning** mode requires `site_5` + `site_3` recognition-site
-    strings and appends them to the primers as RE-cloning tails;
-    for cloning-grammar overhangs (Golden Braid / MoClo Type IIS)
-    use `design-gb-part` instead.
+    Wraps `_design_detection_primers`, `_design_cloning_primers_raw`,
+    and `_design_generic_primers`:
 
-    Returns a primer dict with `fwd_full`, `rev_full`, `fwd_tm`,
-    `rev_tm`, `amplicon_len`, plus mode-specific keys.
+      * **detection** (default) — picks a diagnostic amplicon WITHIN
+        the selected region (no overhangs). Returns `fwd_seq`/`rev_seq`
+        + `product_size`. Needs a region ≥ the minimum product size.
+      * **cloning** — requires `site_5` + `site_3` recognition-site
+        strings and appends them to the primers as RE-cloning tails.
+        Returns `fwd_full`/`rev_full` (tail + binding) + `fwd_binding`/
+        `rev_binding`. For cloning-grammar overhangs (Golden Braid /
+        MoClo Type IIS) use `design-gb-part` instead.
+      * **generic** — binding-only primers (NO tails / RE sites /
+        overhangs): the forward anneals at the region start, the
+        reverse (reverse-complement) at the end. The whole amplicon is
+        the selected region. Returns `fwd_seq`/`rev_seq` +
+        `fwd_pos`/`rev_pos`. Needs ≥ 18 bp.
+
+    All modes return `fwd_tm`/`rev_tm`. The primer dict is under the
+    `result` key, with `mode` echoed alongside.
     """
     template = payload.get("template") or payload.get("sequence")  # SC-G alias
     if not isinstance(template, str) or not template.strip():
@@ -6312,8 +6566,9 @@ def _h_design_primers(app, payload):
         return ({"error": f"start/end out of range for "
                   f"{n}-bp template"}, 400)
     mode = payload.get("mode", "detection")
-    if mode not in ("cloning", "detection"):
-        return ({"error": "'mode' must be 'cloning' or 'detection'"},
+    if mode not in ("cloning", "detection", "generic"):
+        return ({"error":
+                  "'mode' must be 'cloning', 'detection', or 'generic'"},
                 400)
     target_tm = payload.get("target_tm", 60.0)
     try:
@@ -6325,6 +6580,12 @@ def _h_design_primers(app, payload):
     try:
         if mode == "detection":
             result = _design_detection_primers(
+                template_clean, start, end, target_tm=target_tm,
+            )
+        elif mode == "generic":
+            # Binding-only primers (no tails / RE sites / overhangs): the
+            # forward anneals at the region start, the reverse at the end.
+            result = _design_generic_primers(
                 template_clean, start, end, target_tm=target_tm,
             )
         else:
