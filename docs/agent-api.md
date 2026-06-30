@@ -60,14 +60,19 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ## Endpoint inventory
 
-~157 endpoints across:
+~172 endpoints across:
 
 - **Records** — `new-plasmid` (create from a raw sequence, the Ctrl+N
   flow), get / set sequence, add / update / delete features (with the full
   arrow type — forward ▶ / reverse ◀ / arrowless / double-stranded ◀▶ —
   plus colour and arbitrary GenBank qualifiers, matching the Insert/Edit
-  Feature dialog), list features, find ORFs, `undo` / `redo` the last
-  edit, transfer annotations, apply GFF3 features to the loaded record
+  Feature dialog; `add-features` inserts MANY at once under one lock + one
+  dirty-check), list features, find ORFs (length cutoff in AMINO ACIDS —
+  `min_aa`; `min_length`/`min_bp` are rejected so a bp-vs-aa mix-up can't
+  silently return a default-length result), `undo` / `redo` the last edit,
+  `discard-changes` (revert the canvas to its library-stored copy / clear a
+  stuck-dirty flag so the next load / new-plasmid proceeds without `force`),
+  transfer annotations, apply GFF3 features to the loaded record
   (`apply-gff3`).
 - **Files** — load (chromosome-scale safe via the path-based loader;
   supports `.gb` / `.gbk` / `.genbank` / `.dna` / `.embl` /
@@ -125,7 +130,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   active collection, or the non-active `collection` if given). **Fails
   loud** (422) when no
   compatible entry vector is configured rather than silently emitting a
-  pUPD2-stub backbone, so an agent never files a wrong construct),
+  pUPD2-stub backbone, so an agent never files a wrong construct;
+  `domesticate-parts` runs the same engine over a `{parts:[…]}` batch in
+  ONE call — dirty-guard checked once, per-item results so one part that
+  can't clone doesn't abort the rest),
   assemble-into-entry-vector (the multi-source level-up clone: chain L0
   parts into an α/L1 TU, or TUs into an Ω/L2 module, by their fusion
   overhangs and ligate into the configured `role` acceptor at the level-up
@@ -212,7 +220,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   move-primer (reassign a primer to another collection in one atomic call),
   plus per-primer CRUD. `list-primers` / `get-primer` / `delete-primer` accept
   a `{collection}` to read or prune just that collection's own primers (a
-  collection is a real partition, not only for writes).
+  collection is a real partition, not only for writes). `delete-primers`
+  prunes a whole `{names:[…]}` batch in ONE locked save (the machine-friendly
+  path for a large cleanup that would otherwise trip the rate limiter),
+  reporting `removed` / `not_found` / `ambiguous`.
 - **Data safety** — list-backups, restore-backup,
   list-pre-update-snapshots, restore-pre-update-snapshot.
 - **Settings** — get-settings, set-setting (allowlisted toggles);

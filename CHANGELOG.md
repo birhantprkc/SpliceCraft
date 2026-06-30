@@ -14,6 +14,19 @@
 
 ---
 
+## [1.0.109] — 2026-06-30
+
+### New features
+
+- **Batch operations for the scripting API.** New `--agent` endpoints do in one call what used to take a loop: `add-features` annotates a whole record's worth of features at once, `delete-primers` prunes many primers by name in a single save (no more rate-limit stalls on a big cleanup), and `domesticate-parts` builds a batch of Golden-Braid L0 parts — each reporting per-item results so one bad item doesn't sink the rest.
+- **Recover an unsaved canvas from a script.** A new `discard-changes` endpoint reverts the loaded plasmid to its saved copy (or just clears the unsaved flag), so an automated workflow can unstick a canvas that's blocking the next load.
+
+### Bug fixes
+
+- **The scripting API reports the plasmid's real name again.** `status` was returning the internal underscored, truncated id (e.g. `Zephyr_Reporter_`) as the loaded record's name instead of its real display name (`Zephyr Reporter Construct`) — even right after loading it. It now reports the display name, matching the library and the name you load it by.
+- **Saving a plasmid to the library no longer leaves it flagged "unsaved."** After adding the current plasmid to the library via the scripting API, the canvas stayed marked as having unsaved changes, so the very next load or new-plasmid was wrongly refused — and an automated build loop could silently skip plasmids. The save now clears the flag.
+- **`find-orfs` no longer silently ignores a `min_length` parameter.** Its length cutoff is in amino acids (`min_aa`); passing `min_length` / `min_bp` (base pairs, as used elsewhere) now returns a clear error instead of quietly applying the default and looking authoritative.
+
 ## [1.0.108] — 2026-06-29
 
 ### New features

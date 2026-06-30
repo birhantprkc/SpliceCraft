@@ -742,13 +742,30 @@ def _h_list_plasmidsaurus_members(app, payload):
 def _h_find_orfs(app, payload):
     """Six-frame ORF scan over the loaded record. Body:
     ``{min_aa?: int, include_alt_starts?: bool}``. Defaults: 30 aa,
-    ATG only. Returns ``{orfs: [{start, end, strand, length_aa, aa_seq}, ...]}``
+    ATG only. The length cutoff is in AMINO ACIDS (`min_aa`); `min_length` /
+    `min_bp` are rejected (400) so a bp-vs-aa unit mix-up can't silently return
+    a default-length result. Returns
+    ``{orfs: [{start, end, strand, length_aa, aa_seq}, ...]}``
     sorted by length descending. ORFs that cross the origin on a
     circular plasmid are reported with `end < start` — the same
     wrap-feature convention used elsewhere."""
     rec = getattr(app, "_current_record", None)
     if rec is None:
         return ({"error": "no plasmid loaded"}, 422)
+    # find-orfs filters by AMINO-ACID length (`min_aa`). `min_length` / `min_bp`
+    # are the natural-but-wrong guesses — `list-restriction-sites` uses
+    # `min_length` in BASE PAIRS, so an agent reusing that key here would have
+    # it silently dropped (read endpoints don't echo `ignored`) and get a
+    # default-30 ORF set that LOOKS authoritative — the SC-D / SC-G footgun the
+    # agent-API feedback flags as most dangerous. Fail loud so the caller fixes
+    # both the key AND the aa-vs-bp unit, rather than trusting a wrong answer.
+    for _wrong in ("min_length", "min_bp", "min_len"):
+        if _wrong in payload:
+            return ({"error":
+                      f"unknown parameter {_wrong!r}; find-orfs filters by "
+                      f"amino-acid length — use 'min_aa' (amino acids, "
+                      f"default 30). Note: ORF length here is in aa, not bp."},
+                    400)
     min_aa = _coerce_int(payload.get("min_aa", 30), name="min_aa")
     if isinstance(min_aa, str):
         return ({"error": min_aa}, 400)
@@ -1418,6 +1435,94 @@ def _h_delete_primer(app, payload):
                     lambda: _save_primers(new_list), "primers")) is not None:
                 return err
     return {"ok": True, "removed": len(entries) - len(new_list),
+            "collection": coll if named is not None else ""}
+
+
+@_agent_endpoint("delete-primers", write=True)
+def _h_delete_primers(app, payload):
+    """Batch-delete primers by name in ONE locked save — the machine-friendly
+    path for a large cleanup (agent-API feedback SC-L), so a 600-item prune
+    completes in a single call instead of N rate-limited `delete-primer`s.
+    Body: ``{names: [str, …]}`` (``ids`` accepted as an alias), optional
+    ``{collection}`` to scope to that named collection's OWN primers (refused
+    409 if it's ACTIVE — same rule as `delete-primer`, so the live mirror
+    stays consistent).
+
+    Each name is matched against the target list: exactly one match → removed;
+    zero → reported under ``not_found``; more than one → reported under
+    ``ambiguous`` and NOT removed (pass the single `delete-primer {sequence}`
+    to disambiguate). Every removal commits under a single ``_cache_lock`` +
+    one ``.bak``-rotating save.
+
+    Returns ``{ok, removed, removed_names, not_found, ambiguous, collection}``."""
+    names = payload.get("names")
+    if names is None:
+        names = payload.get("ids")
+    if not isinstance(names, list) or not names:
+        return ({"error": "'names' (or 'ids') must be a non-empty list"}, 400)
+    if len(names) > 5000:
+        return ({"error": "too many names (max 5000 per batch)"}, 400)
+    cleaned = []
+    for nm in names:
+        if not isinstance(nm, str) or not nm.strip():
+            return ({"error":
+                      "'names' must contain only non-empty strings"}, 400)
+        cleaned.append(nm.strip())
+    coll = payload.get("collection")
+    with _state._cache_lock:
+        named = None
+        colls = None
+        if coll not in (None, ""):
+            if not isinstance(coll, str):
+                return ({"error": "'collection' must be a string"}, 400)
+            coll = coll.strip()
+            if coll == (_get_active_primer_collection_name() or ""):
+                return ({"error":
+                          f"{coll!r} is the active primer collection — "
+                          f"set-active-primer-collection to \"\" (default) "
+                          f"before deleting from it, so the live mirror stays "
+                          f"consistent"}, 409)
+            colls = _load_primer_collections()
+            named = next((c for c in colls
+                          if (c.get("name") or "") == coll), None)
+            if named is None:
+                return ({"error":
+                          f"no primer collection named {coll!r}"}, 404)
+            entries = named.get("primers") or []
+        else:
+            entries = _load_primers()
+        # Index by name so multiplicity (→ ambiguous) is detected in one pass.
+        by_name: "dict[str, list]" = {}
+        for e in entries:
+            by_name.setdefault(e.get("name") or "", []).append(e)
+        remove_ids: "set[int]" = set()
+        removed_names, not_found, ambiguous = [], [], []
+        for key in cleaned:
+            matches = by_name.get(key, [])
+            if not matches:
+                not_found.append(key)
+            elif len(matches) > 1:
+                ambiguous.append(key)
+            else:
+                # Mark by identity so a different primer sharing this one's
+                # sequence is left intact (mirrors `delete-primer`).
+                remove_ids.add(id(matches[0]))
+                removed_names.append(key)
+        if remove_ids:
+            new_list = [e for e in entries if id(e) not in remove_ids]
+            if named is not None:
+                named["primers"] = new_list
+                if (err := _agent_save_or_500(
+                        lambda: _save_primer_collections(colls),
+                        "primer_collections")) is not None:
+                    return err
+            else:
+                if (err := _agent_save_or_500(
+                        lambda: _save_primers(new_list), "primers")) is not None:
+                    return err
+    return {"ok": True, "removed": len(removed_names),
+            "removed_names": removed_names, "not_found": not_found,
+            "ambiguous": ambiguous,
             "collection": coll if named is not None else ""}
 
 

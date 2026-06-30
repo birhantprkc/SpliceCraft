@@ -118,6 +118,18 @@ class MockApp:
     def _mark_dirty(self):
         self._unsaved = True
 
+    def _mark_clean(self):
+        # Mirror of the real controller's `mark_clean` effect on the dirty
+        # flag (the part the agent dirty-guard reads); no title/panel/autosave
+        # side-effects to mock here.
+        self._unsaved = False
+
+    def _discard_changes(self):
+        # Minimal mirror: the real method reverts to the library-stored copy,
+        # or just marks clean when the record has no entry. The test library
+        # is empty, so the no-entry → mark-clean path is what's exercised.
+        self._unsaved = False
+
     def _notify_success(self, msg, **kwargs):
         pass
 
@@ -246,6 +258,15 @@ class TestStatusHandler:
     def test_reports_dirty_flag(self, tiny_app):
         tiny_app._unsaved = True
         assert sc._h_status(tiny_app, {})["dirty"] is True
+
+    def test_name_is_display_name_not_locus_slug(self, tiny_app, tiny_record):
+        # [INV-98] Agent-API audit (2026-06): status must report the DISPLAY
+        # name (spaces / case preserved), not the underscored 16-char GenBank
+        # LOCUS slug `rec.name`. The display name is the valid `load-entry`
+        # key; the slug is not. Was: `status.name` returned `Zephyr_Reporter_`
+        # for a `Zephyr Reporter Construct` entry even after a clean load.
+        tiny_record._tui_display_name = "Zephyr Reporter Construct"
+        assert sc._h_status(tiny_app, {})["name"] == "Zephyr Reporter Construct"
 
 
 class TestStatusVersionSkew:
@@ -895,6 +916,119 @@ class TestTraditionalCloning:
             "insert_enzymes": ["BamHI"], "product_name": "x",
             "vector_frag_idx": 0})
         assert isinstance(r, tuple) and r[1] == 422
+
+
+class TestDiscardChangesHandler:
+    """`discard-changes` — agent recovery for a stuck-dirty canvas
+    (agent-API feedback P1-10)."""
+
+    def test_no_record_422(self):
+        assert sc._h_discard_changes(MockApp(record=None), {})[1] == 422
+
+    def test_marks_clean_when_no_entry(self, tiny_app, isolated_library):
+        sc._save_library([])           # tiny_record is NOT in the library
+        tiny_app._unsaved = True
+        r = sc._h_discard_changes(tiny_app, {})
+        assert r["ok"] is True
+        assert r["dirty"] is False     # canvas no longer dirty
+        assert r["reverted"] is False  # nothing stored to revert to
+
+
+class TestAddFeaturesBatch:
+    """`add-features` — batch insert under one lock + one stale-load check
+    (agent-API feedback P1-10)."""
+
+    def test_no_record_422(self):
+        assert sc._h_add_features(
+            MockApp(record=None), {"features": [{"start": 0, "end": 3}]})[1] == 422
+
+    def test_features_must_be_nonempty_list(self, tiny_app):
+        assert sc._h_add_features(tiny_app, {})[1] == 400
+        assert sc._h_add_features(tiny_app, {"features": []})[1] == 400
+        assert sc._h_add_features(tiny_app, {"features": "x"})[1] == 400
+
+    def test_batch_adds_all_in_one_call(self, tiny_app, tiny_record):
+        before = len([f for f in tiny_record.features if f.type != "source"])
+        r = sc._h_add_features(tiny_app, {"features": [
+            {"start": 0, "end": 9, "label": "a"},
+            {"start": 9, "end": 18, "label": "b", "strand": -1},
+        ]})
+        assert r["ok"] is True and r["added"] == 2
+        assert all(f["ok"] for f in r["features"])
+        after = len([f for f in tiny_app._current_record.features
+                     if f.type != "source"])
+        assert after == before + 2
+
+    def test_malformed_item_rejects_whole_call(self, tiny_app):
+        # A caller bug (non-int start) fails the call before ANY feature lands.
+        r = sc._h_add_features(tiny_app, {"features": [{"start": "x", "end": 3}]})
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_out_of_range_item_reported_per_item(self, tiny_app):
+        # A valid item lands; a biologically-rejected span is reported per-item
+        # without aborting the rest.
+        r = sc._h_add_features(tiny_app, {"features": [
+            {"start": 0, "end": 9, "label": "ok"},
+            {"start": 0, "end": 10 ** 9, "label": "bad"},
+        ]})
+        assert r["ok"] is True and r["added"] == 1
+        assert r["features"][0]["ok"] is True
+        assert r["features"][1]["ok"] is False and "error" in r["features"][1]
+
+
+class TestDeletePrimersBatch:
+    """`delete-primers` — one-call batch prune (agent-API feedback SC-L)."""
+
+    def test_names_must_be_nonempty_list(self):
+        assert sc._h_delete_primers(None, {})[1] == 400
+        assert sc._h_delete_primers(None, {"names": []})[1] == 400
+
+    def test_batch_delete_by_name(self):
+        sc._save_primers([])
+        for nm, sq in (("b1", "ACGTACGTAA"), ("b2", "ACGTACGTCC"),
+                       ("b3", "ACGTACGTGG")):
+            sc._h_create_primer(None, {"name": nm, "sequence": sq})
+        r = sc._h_delete_primers(None, {"names": ["b1", "b3", "nope"]})
+        assert r["ok"] is True and r["removed"] == 2
+        assert set(r["removed_names"]) == {"b1", "b3"}
+        assert r["not_found"] == ["nope"]
+        remaining = {p["name"] for p in sc._load_primers()}
+        assert remaining == {"b2"}
+
+    def test_ambiguous_name_not_deleted(self):
+        sc._save_primers([])
+        sc._h_create_primer(None, {"name": "dup", "sequence": "AAAACCCCGG"})
+        sc._h_create_primer(None, {"name": "dup", "sequence": "TTTTGGGGAA"})
+        r = sc._h_delete_primers(None, {"names": ["dup"]})
+        assert r["ambiguous"] == ["dup"] and r["removed"] == 0
+        assert len(sc._load_primers()) == 2   # both kept (ambiguous → skipped)
+
+    def test_unknown_collection_404(self):
+        r = sc._h_delete_primers(None, {"names": ["x"], "collection": "NoSuch"})
+        assert isinstance(r, tuple) and r[1] == 404
+
+
+class TestDomesticatePartsBatch:
+    """`domesticate-parts` — batch domestication (agent-API feedback P1-6)."""
+
+    def test_parts_must_be_nonempty_list(self):
+        assert sc._h_domesticate_parts(MockApp(), {})[1] == 400
+        assert sc._h_domesticate_parts(MockApp(), {"parts": []})[1] == 400
+
+    def test_per_item_failure_without_entry_vector(self, isolated_library):
+        # No entry vector configured → each part fails 422, reported per-item;
+        # the batch itself returns ok with built=0 (it does NOT abort).
+        sc._save_entry_vectors([])
+        app = MockApp()
+        parts = [
+            {"sequence": "ATGAAACGTTAA", "oh5": "GGAG", "oh3": "AATG", "name": "p1"},
+            {"sequence": "ATGGGGCCCTAA", "oh5": "GGAG", "oh3": "AATG", "name": "p2"},
+        ]
+        r = sc._h_domesticate_parts(app, {"parts": parts})
+        assert r["ok"] is True
+        assert r["built"] == 0 and r["total"] == 2
+        assert all(item["ok"] is False for item in r["results"])
+        assert all(item.get("code") == 422 for item in r["results"])
 
 
 class TestApiTickets:
@@ -2282,6 +2416,23 @@ class TestFindOrfsHandler:
         result = sc._h_find_orfs(app, {"min_aa": 0})
         assert isinstance(result, tuple) and result[1] == 400
 
+    def test_min_length_rejected_not_silently_ignored(self):
+        # Agent-API audit (2026-06): `min_length` / `min_bp` are the
+        # natural-but-wrong keys — `list-restriction-sites` uses `min_length`
+        # in BASE PAIRS, so reusing it here used to be silently dropped (read
+        # endpoints don't echo `ignored`) and return a default-30 ORF set that
+        # looked authoritative. Now it 400s so the bp-vs-aa mix-up is loud.
+        from Bio.SeqRecord import SeqRecord
+        from Bio.Seq import Seq
+        rec = SeqRecord(Seq("ATG" + "GCC" * 30 + "TAA"), id="t", name="t")
+        app = MockApp(record=rec)
+        for wrong in ("min_length", "min_bp", "min_len"):
+            result = sc._h_find_orfs(app, {wrong: 10})
+            assert isinstance(result, tuple) and result[1] == 400, (wrong, result)
+            assert "min_aa" in result[0]["error"]
+        # The correct key still works (no false trip).
+        assert sc._h_find_orfs(app, {"min_aa": 20})["count"] >= 1
+
     def test_empty_seq_returns_empty_orf_list(self):
         """Regression guard for 2026-05-06: an empty `rec.seq` used to
         traverse `(rec.annotations or {})` — fine — but
@@ -3593,6 +3744,30 @@ class TestAddCurrentNameIdOverride:
         assert r["ok"] is True
         # No copy made — the live record itself is filed.
         assert app.fake_lib.added[-1] is tiny_record
+
+    def test_save_clears_dirty_flag(self, tiny_record, isolated_library):
+        # Agent-API audit (2026-06): add-current persists the canvas, so the
+        # canvas is no longer dirty. WITHOUT clearing it, a batch loop's next
+        # new-plasmid / load-entry / set-active-collection 409s on the
+        # dirty-guard and silently strands the build on the previous plasmid.
+        sc._save_library([])
+        app = _AppWithFakeLib(tiny_record)
+        app._unsaved = True
+        r = sc._h_add_current_to_library(app, {})
+        assert r["ok"] is True
+        assert app._unsaved is False
+
+    def test_id_override_copy_leaves_canvas_dirty(self, tiny_record,
+                                                  isolated_library):
+        # An id/name override files a COPY (the live canvas keeps its own
+        # identity), so the canvas is genuinely still unsaved and must stay
+        # dirty — only a save of the LIVE record itself clears the flag.
+        sc._save_library([])
+        app = _AppWithFakeLib(tiny_record)
+        app._unsaved = True
+        r = sc._h_add_current_to_library(app, {"id": "build-x"})
+        assert r["ok"] is True
+        assert app._unsaved is True
 
     def test_long_distinct_ids_dont_truncate_collide(self, tiny_record,
                                                      isolated_library):
