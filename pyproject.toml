@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name            = "splicecraft"
-version         = "1.0.109"
+version         = "1.0.110"
 description     = "Terminal-based circular plasmid map viewer, sequence editor, and Primer3/Golden Braid primer design workbench"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -307,10 +307,12 @@ exclude = ["*"]
 # lets genuine errors on the application surface stay visible. Real
 # test breakage is caught by `pytest -n auto -q`.
 include = [
-    "splicecraft.py",
-    "splicecraft_biology.py",
-    "splicecraft_cli.py",
-    "splicecraft_demo_plasmids.py",
+    # The hub + EVERY flat `splicecraft_*` sibling (2026-06-30): the siblings
+    # were previously un-gated (only the hub + a few were listed), so latent
+    # Optional-handling errors crept into `splicecraft_agent` / `_babs` unseen.
+    # The whole module surface is now strictly type-checked; a new sibling is
+    # auto-covered (and `test_import_layers` guards that it's a real module).
+    "splicecraft*.py",
     "tests",
 ]
 exclude = [

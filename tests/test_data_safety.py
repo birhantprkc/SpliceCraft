@@ -874,6 +874,32 @@ class TestRealFilesNeverTouched:
             f"expected a tmp dir!"
         )
 
+    def test_sandbox_covers_every_registered_user_data_file(self):
+        """[regression guard] The conftest sandbox (`_SANDBOXED_DATA_FILE_ATTRS`)
+        MUST redirect EVERY production user-data file — the canonical
+        `_USER_DATA_FILE_ATTRS` registry — or tests read+write that file in the
+        user's REAL data dir. `model_collections.json` (BABS, INV-139) shipped
+        registered-but-UN-sandboxed, so babs UI tests polluted the user's real
+        file (a stress-test collection leaked in) until this guard + the
+        sandbox entry landed (2026-06-30)."""
+        from tests.conftest import _SANDBOXED_DATA_FILE_ATTRS
+        sandboxed = {attr for attr, _cache in _SANDBOXED_DATA_FILE_ATTRS}
+        missing = set(sc._USER_DATA_FILE_ATTRS) - sandboxed
+        assert not missing, (
+            f"user-data file(s) NOT sandboxed by _protect_user_data: "
+            f"{sorted(missing)} — add each (attr, cache_attr) to "
+            f"_SANDBOXED_DATA_FILE_ATTRS in tests/conftest.py, or tests will "
+            f"read+write the user's REAL data dir.")
+        # And the LIVE effect: every registered path is actually redirected to
+        # tmp by the autouse fixture (not pointing at the real data dir).
+        unredirected = [
+            (attr, str(getattr(sc._state, attr)))
+            for attr in sc._USER_DATA_FILE_ATTRS
+            if not any(m in str(getattr(sc._state, attr))
+                       for m in ("/tmp", "pytest"))]
+        assert not unredirected, (
+            f"registered user-data path(s) not redirected to tmp: {unredirected}")
+
     def test_save_library_writes_to_tmp(self):
         """Actually call _save_library and verify the write landed in /tmp,
         not in the repo directory."""

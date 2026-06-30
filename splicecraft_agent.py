@@ -1425,6 +1425,7 @@ def _h_delete_primer(app, payload):
             # primer that happens to share its sequence is left intact.
             new_list = [e for e in entries if e is not matches[0]]
         if named is not None:
+            assert colls is not None     # `named` set ⇒ colls was loaded
             named["primers"] = new_list
             if (err := _agent_save_or_500(
                     lambda: _save_primer_collections(colls),
@@ -1511,6 +1512,7 @@ def _h_delete_primers(app, payload):
         if remove_ids:
             new_list = [e for e in entries if id(e) not in remove_ids]
             if named is not None:
+                assert colls is not None     # `named` set ⇒ colls was loaded
                 named["primers"] = new_list
                 if (err := _agent_save_or_500(
                         lambda: _save_primer_collections(colls),
@@ -2389,6 +2391,7 @@ def _h_list_parts(app, payload):
     parts_src, berr = _agent_parts_bin_list(payload.get("bin"))
     if berr is not None:
         return berr
+    assert parts_src is not None         # berr is None ⇒ parts_src is populated
     grammar = payload.get("grammar")
     level   = payload.get("level")
     position = payload.get("position")
@@ -3558,13 +3561,16 @@ def _agent_traditional_cloning_candidates(payload):
     lists the ``(vector_frag_idx, orientation)`` pairs whose sticky ends
     didn't match — surfaced for diagnostics.
 
-    The insert is excised as the purified middle fragment
+    A LINEAR insert (default) is excised as the purified middle fragment
     (`_excise_pcr_insert` — the bench "cut + gel-purify the off-cuts" step,
-    so primer pad / outside-the-cut bases never reach the product). The
-    vector is digested with `_excise_fragment_pair`, which REFUSES an
-    ambiguous ≥3-cut circular digest. BOTH vector fragments and BOTH insert
-    orientations are tried — nothing is picked by size (the never-assume-
-    the-smaller-fragment rule); the caller disambiguates."""
+    so primer pad / outside-the-cut bases never reach the product). A CIRCULAR
+    insert (``insert_circular=true`` — cutting a cassette OUT of a plasmid) is
+    digested with `_excise_fragment_pair` into its candidate fragments, EACH a
+    candidate cassette (`insert_frag_idx`). The vector is likewise digested
+    with `_excise_fragment_pair`, which REFUSES an ambiguous ≥3-cut circular
+    digest. EVERY (vector fragment × insert fragment × orientation) is tried —
+    nothing is picked by size (the never-assume-the-smaller-fragment rule); the
+    caller disambiguates with ``vector_frag_idx`` / ``insert_frag_idx``."""
     vec_seq, e = _sanitize_bases(payload.get("vector_seq"))
     if e:
         return None, ({"error": f"'vector_seq' rejected: {e}"}, 400)
@@ -3590,14 +3596,31 @@ def _agent_traditional_cloning_candidates(payload):
                 return None, ({"error":
                                 f"unknown enzyme {en!r} in {field}"}, 400)
     vector_circular = bool(payload.get("vector_circular", True))
-    # 1) Purify the insert — the unambiguous middle fragment.
+    insert_circular = bool(payload.get("insert_circular", False))
     enz_l = ins_enz[0]
     enz_r = ins_enz[1] if len(ins_enz) > 1 else ins_enz[0]
-    insert_frag, ierr = _excise_pcr_insert(ins_seq, enz_l, enz_r,
+    # 1) Build the candidate insert fragment(s).
+    #   * Linear insert (default — a PCR product): the unambiguous purified
+    #     MIDDLE fragment (`_excise_pcr_insert`), so primer pad / off-cut bases
+    #     never reach the product. ONE candidate (insert_frag_idx 0).
+    #   * Circular insert (`insert_circular=true` — excising a cassette OUT of a
+    #     plasmid, e.g. an Ω multigene): a 2-cut digest leaves TWO fragments and
+    #     EITHER could be the cassette, so enumerate both (insert_frag_idx 0/1)
+    #     and let the caller pick — the same never-assume-the-smaller-fragment
+    #     rule the vector side honours (a ≥3-cut circular insert is refused).
+    if insert_circular:
+        ins_frags, ierr = _excise_fragment_pair(
+            ins_seq, list(ins_enz), circular=True, source_label="insert")
+        if ierr is not None:
+            return None, ({"error": f"insert: {ierr['error']}",
+                            "cuts": ierr.get("cuts", [])}, 422)
+    else:
+        single, ierr = _excise_pcr_insert(ins_seq, enz_l, enz_r,
                                             source_label="insert")
-    if ierr is not None:
-        return None, ({"error": f"insert: {ierr}"}, 422)
-    assert insert_frag is not None         # ierr is None ⇒ frag is populated
+        if ierr is not None:
+            return None, ({"error": f"insert: {ierr}"}, 422)
+        assert single is not None          # ierr is None ⇒ frag is populated
+        ins_frags = [single]
     # 2) Digest the vector — refuses an ambiguous ≥3-cut circular digest.
     vec_frags, verr = _excise_fragment_pair(
         vec_seq, list(vec_enz), circular=vector_circular,
@@ -3605,34 +3628,51 @@ def _agent_traditional_cloning_candidates(payload):
     if verr is not None:
         return None, ({"error": f"vector: {verr['error']}",
                         "cuts": verr.get("cuts", [])}, 422)
-    # 3) Try every (vector fragment × orientation); keep the compatible ones.
+    # 3) Try every (vector fragment × insert fragment × orientation); keep the
+    #    compatible ones, each tagged with BOTH fragment indices.
     products: list = []
     incompatible: list = []
     for vi, vfrag in enumerate(vec_frags):
-        try:
-            result = _simulate_traditional_cloning_multi([insert_frag], vfrag)
-        except Exception as exc:
-            _log.exception("agent traditional-cloning: simulate failed")
-            return None, ({"error":
-                            f"simulator failed: {_scrub_path(str(exc))}"}, 500)
-        for orient in ("forward", "reverse"):
-            prod = result.get(orient) or {}
-            tag = {"vector_frag_idx": vi, "orientation": orient}
-            if prod.get("compatible"):
-                top = prod.get("top_seq", "")
-                products.append({
-                    **tag,
-                    "length":     len(top),
-                    "n_features": len(prod.get("features") or []),
-                    "sequence":   top,
-                    "features":   prod.get("features") or [],
-                })
-            else:
-                incompatible.append(tag)
+        for ii, ifrag in enumerate(ins_frags):
+            try:
+                result = _simulate_traditional_cloning_multi([ifrag], vfrag)
+            except Exception as exc:
+                _log.exception("agent traditional-cloning: simulate failed")
+                return None, ({"error":
+                                f"simulator failed: {_scrub_path(str(exc))}"},
+                              500)
+            for orient in ("forward", "reverse"):
+                prod = result.get(orient) or {}
+                tag = {"vector_frag_idx": vi, "insert_frag_idx": ii,
+                       "orientation": orient}
+                if prod.get("compatible"):
+                    top = prod.get("top_seq", "")
+                    products.append({
+                        **tag,
+                        "length":     len(top),
+                        "n_features": len(prod.get("features") or []),
+                        "sequence":   top,
+                        "features":   prod.get("features") or [],
+                    })
+                else:
+                    incompatible.append(tag)
+    # Per-candidate insert summary (insert_frag_idx → length + cut ends).
+    insert_fragments = [
+        {"insert_frag_idx": ii,
+         "length":      len(f.get("top_seq", "")),
+         "left_enzyme":  (f.get("left")  or {}).get("enzyme", "") or enz_l,
+         "right_enzyme": (f.get("right") or {}).get("enzyme", "") or enz_r}
+        for ii, f in enumerate(ins_frags)]
     return ({
-        "insert": {"length": len(insert_frag.get("top_seq", "")),
+        # `insert` keeps the single-fragment summary for back-compat (the
+        # linear/default case has exactly one candidate); `insert_fragments`
+        # lists every candidate — the disambiguation set when the insert is
+        # circular.
+        "insert": {"length": len(ins_frags[0].get("top_seq", "")),
                    "left_enzyme": enz_l, "right_enzyme": enz_r},
+        "insert_fragments":   insert_fragments,
         "n_vector_fragments": len(vec_frags),
+        "n_insert_fragments": len(ins_frags),
         "products":           products,
         "incompatible":       incompatible,
     }, None)
@@ -3643,36 +3683,43 @@ def _h_simulate_traditional_cloning(app, payload):
     """Dry-run a traditional restriction-cloning reaction: digest a vector
     and an insert with the chosen enzymes, then ligate. Body:
     ``{vector_seq, vector_enzymes, insert_seq, insert_enzymes,
-    vector_circular?=true}``.
+    vector_circular?=true, insert_circular?=false}``.
 
-    `insert_enzymes` is 1 or 2 enzyme names (the sites your primers add to
-    each end); the insert is excised as the purified middle fragment.
-    `vector_enzymes` digests the backbone — a circular vector must cut
-    EXACTLY twice (an ambiguous ≥3-cut digest is REFUSED with the cut list,
-    because the backbone can't be picked unambiguously). Type IIS enzymes
-    (BsaI / BbsI / BsmBI …) are refused for the insert — use the
-    Golden-Braid path (`design-gb-part` / `scrub-plasmid method:golden_braid`).
+    `insert_enzymes` is 1 or 2 enzyme names (the sites flanking the cassette).
+    A LINEAR insert (default — e.g. a PCR product whose primers add the sites)
+    is excised as the purified middle fragment. Set ``insert_circular=true`` to
+    cut a cassette OUT of a PLASMID (e.g. an Ω multigene): the insert is
+    digested like the vector, leaving TWO candidate fragments — each surfaced
+    in ``insert_fragments`` with an ``insert_frag_idx`` — and NEITHER is picked
+    by size. `vector_enzymes` digests the backbone — a circular vector (or
+    insert) must cut EXACTLY twice (an ambiguous ≥3-cut digest is REFUSED with
+    the cut list). Type IIS enzymes (BsaI / BbsI / BsmBI …) are refused for the
+    insert — use the Golden-Braid path (`design-gb-part` /
+    `scrub-plasmid method:golden_braid`).
 
-    Both vector fragments and both insert orientations are tried; the
+    EVERY (vector fragment × insert fragment × orientation) is tried; the
     response lists every COMPATIBLE product as ``{vector_frag_idx,
-    orientation, length, n_features, sequence}`` (nothing is picked by
-    size). ``incompatible`` lists the pairs whose sticky ends didn't match.
-    Read-only — pair with `traditional-clone` to save a chosen product."""
+    insert_frag_idx, orientation, length, n_features, sequence}`` (nothing is
+    picked by size). ``incompatible`` lists the combos whose sticky ends didn't
+    match. Read-only — pair with `traditional-clone` to save a chosen product."""
     info, err = _agent_traditional_cloning_candidates(payload)
     if err is not None:
         return err
+    assert info is not None             # err is None ⇒ info is populated
     # Trim the verbose per-feature lists from the read response (the write
     # path recomputes them); keep the product sequence for inspection.
     products = [{k: v for k, v in p.items() if k != "features"}
                 for p in info["products"]]
     return {"ok": True,
             "insert":              info["insert"],
+            "insert_fragments":    info["insert_fragments"],
             "n_vector_fragments":  info["n_vector_fragments"],
+            "n_insert_fragments":  info["n_insert_fragments"],
             "products":            products,
             "incompatible":        info["incompatible"],
             "ignored": _agent_ignored_keys(payload, {
                 "vector_seq", "vector_enzymes", "insert_seq",
-                "insert_enzymes", "vector_circular"})}
+                "insert_enzymes", "vector_circular", "insert_circular"})}
 
 
 def _agent_golden_gate_inputs(payload):
@@ -4031,6 +4078,7 @@ def _h_create_experiment(app, payload):
         }, fresh=True)
         entries.append(entry)
         if named_proj is not None:
+            assert projs is not None     # `named_proj` set ⇒ projs was loaded
             err = _agent_save_or_500(
                 lambda: _save_experiment_projects(projs),
                 "experiment_projects")
@@ -6217,6 +6265,7 @@ def _h_list_experiments(app, payload):
     src, perr = _agent_project_experiments_list(payload.get("project"))
     if perr is not None:
         return perr
+    assert src is not None               # perr is None ⇒ src is populated
     out: "list[dict]" = []
     for e in src:
         body = e.get("body_md") or ""

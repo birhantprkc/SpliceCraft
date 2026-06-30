@@ -25,6 +25,38 @@ import pytest
 # AUTOUSE: protect user data files from every single test
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# (file_attr_on__state, cache_attr_or_None) for EVERY user-data JSON file the
+# autouse `_protect_user_data` fixture redirects to a temp dir. Hoisted to
+# module scope so `test_data_safety` can assert it covers EVERY production
+# user-data file (`sc._USER_DATA_FILE_ATTRS`) — the guard that was MISSING when
+# `model_collections.json` (BABS, INV-139) shipped registered-but-unsandboxed,
+# so babs UI tests read+wrote the user's REAL file (2026-06-30).
+_SANDBOXED_DATA_FILE_ATTRS = [
+    ("_LIBRARY_FILE",         "_library_cache"),
+    ("_PARTS_BIN_FILE",       "_parts_bin_cache"),
+    ("_PARTS_BIN_COLLECTIONS_FILE", "_parts_bin_collections_cache"),
+    ("_PRIMERS_FILE",         "_primers_cache"),
+    ("_PRIMER_COLLECTIONS_FILE", "_primer_collections_cache"),
+    ("_CODON_TABLES_FILE",    "_codon_tables_cache"),
+    ("_FEATURES_FILE",        "_features_cache"),
+    ("_FEATURE_COLORS_FILE",  "_feature_colors_cache"),
+    ("_GRAMMARS_FILE",        "_grammars_cache"),
+    ("_ENTRY_VECTORS_FILE",   "_entry_vectors_cache"),
+    ("_SETTINGS_FILE",        "_settings_cache"),
+    ("_COLLECTIONS_FILE",     "_collections_cache"),
+    ("_EXPERIMENTS_FILE",     "_experiments_cache"),
+    ("_EXPERIMENT_PROJECTS_FILE", "_experiment_projects_cache"),
+    ("_GELS_FILE",            "_gels_cache"),
+    ("_PROTEIN_MOTIFS_FILE",  "_protein_motifs_cache"),
+    ("_CUSTOM_ENZYMES_FILE",  "_custom_enzymes_cache"),
+    ("_ENZYME_COLLECTIONS_FILE", "_enzyme_collections_cache"),
+    ("_HMM_DB_CATALOG_FILE",  "_hmm_db_catalog_cache"),   # sweep #28
+    ("_PROTEIN_COLLECTIONS_FILE", "_protein_collections_cache"),
+    ("_MODEL_COLLECTIONS_FILE", "_model_collections_cache"),  # BABS model picker (INV-139)
+    ("_AGENT_TOKEN_FILE",     None),   # written when --agent-api is on
+]
+
+
 @pytest.fixture(autouse=True, scope="function")
 def _protect_user_data(tmp_path, monkeypatch):
     """Redirect ALL user-data JSON files to tmp_path for EVERY test.
@@ -50,29 +82,7 @@ def _protect_user_data(tmp_path, monkeypatch):
         owner = sc._state if hasattr(sc._state, name) else sc
         monkeypatch.setattr(owner, name, value)
 
-    _DATA_FILES = [
-        ("_LIBRARY_FILE",         "_library_cache"),
-        ("_PARTS_BIN_FILE",       "_parts_bin_cache"),
-        ("_PARTS_BIN_COLLECTIONS_FILE", "_parts_bin_collections_cache"),
-        ("_PRIMERS_FILE",         "_primers_cache"),
-        ("_PRIMER_COLLECTIONS_FILE", "_primer_collections_cache"),
-        ("_CODON_TABLES_FILE",    "_codon_tables_cache"),
-        ("_FEATURES_FILE",        "_features_cache"),
-        ("_FEATURE_COLORS_FILE",  "_feature_colors_cache"),
-        ("_GRAMMARS_FILE",        "_grammars_cache"),
-        ("_ENTRY_VECTORS_FILE",   "_entry_vectors_cache"),
-        ("_SETTINGS_FILE",        "_settings_cache"),
-        ("_COLLECTIONS_FILE",     "_collections_cache"),
-        ("_EXPERIMENTS_FILE",     "_experiments_cache"),
-        ("_EXPERIMENT_PROJECTS_FILE", "_experiment_projects_cache"),
-        ("_GELS_FILE",            "_gels_cache"),
-        ("_PROTEIN_MOTIFS_FILE",  "_protein_motifs_cache"),
-        ("_CUSTOM_ENZYMES_FILE",  "_custom_enzymes_cache"),
-        ("_ENZYME_COLLECTIONS_FILE", "_enzyme_collections_cache"),
-        ("_HMM_DB_CATALOG_FILE",  "_hmm_db_catalog_cache"),   # sweep #28
-        ("_PROTEIN_COLLECTIONS_FILE", "_protein_collections_cache"),
-        ("_AGENT_TOKEN_FILE",     None),   # written when --agent-api is on
-    ]
+    _DATA_FILES = _SANDBOXED_DATA_FILE_ATTRS
 
     for file_attr, cache_attr in _DATA_FILES:
         # Redirect the file path to a temp location

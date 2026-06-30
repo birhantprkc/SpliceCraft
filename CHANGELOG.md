@@ -14,6 +14,16 @@
 
 ---
 
+## [1.0.110] — 2026-06-30
+
+### New features
+
+- **Clone a cassette straight out of a plasmid (scripting API).** `traditional-clone` / `simulate-traditional-cloning` now accept `insert_circular: true` to cut an insert out of a *circular* plasmid — e.g. lifting a multigene cassette from a Golden-Braid Ω into a binary vector — instead of only treating the insert as a linear PCR product. Both fragments the digest releases are offered, and you choose the cassette with `insert_frag_idx` (the symmetric partner to `vector_frag_idx`); it still refuses to guess by size. Previously a plasmid insert silently grabbed the wrong fragment. Linear inserts are unchanged.
+
+### Hardening
+
+- Tightened the static type-checking gate to cover **every** module (it previously checked only the core file plus a few), and cleared the latent `None`-handling warnings that had accumulated in the un-checked ones — no behavior change, but a whole class of potential edge-case crashes can no longer slip in unnoticed.
+
 ## [1.0.109] — 2026-06-30
 
 ### New features

@@ -918,6 +918,73 @@ class TestTraditionalCloning:
         assert isinstance(r, tuple) and r[1] == 422
 
 
+class TestTraditionalCloningCircularInsert:
+    """`insert_circular` + `insert_frag_idx` — cut a cassette OUT of a CIRCULAR
+    plasmid (e.g. an Ω multigene → binary vector) and pick which fragment is the
+    cassette. The symmetric counterpart to `vector_frag_idx` (verified against a
+    real GoldenBraid Ω→pCambia binary build off-suite)."""
+    # circular vector: EcoRI · backbone(A×200) · KpnI · stuffer(C×40)
+    VECTOR = "GAATTC" + "A" * 200 + "GGTACC" + "C" * 40
+    PAYLOAD = "ATGAAACCCGGGTTTAAACCCGGG" * 3            # 72 bp cassette
+    # ins-backbone: a DISTINCTIVE non-homopolymer marker (a homopolymer's
+    # reverse-complement would alias the vector's A-run and confuse the check).
+    INS_BACKBONE = "TCGATCGATCGA" * 7                   # 84 bp, no EcoRI/KpnI
+    # circular insert PLASMID: EcoRI · cassette · KpnI · ins-backbone.
+    # EcoRI+KpnI cuts it into TWO fragments (the cassette AND the ins-backbone).
+    INSERT = "GAATTC" + PAYLOAD + "GGTACC" + INS_BACKBONE
+
+    def _base(self):
+        return {"vector_seq": self.VECTOR, "vector_enzymes": ["EcoRI", "KpnI"],
+                "insert_seq": self.INSERT, "insert_enzymes": ["EcoRI", "KpnI"],
+                "insert_circular": True}
+
+    def test_simulate_enumerates_both_insert_fragments(self):
+        r = sc._h_simulate_traditional_cloning(None, self._base())
+        assert r["ok"] and r["n_insert_fragments"] == 2
+        assert len(r["insert_fragments"]) == 2
+        # products carry BOTH fragment indices — neither insert piece dropped.
+        assert {p["insert_frag_idx"] for p in r["products"]} == {0, 1}
+
+    def test_clone_ambiguous_lists_insert_frag_idx(self):
+        # >1 candidate (2 vec × 2 ins frags) → refuse + list, never guess.
+        r = sc._h_traditional_clone(None, dict(self._base(), product_name="amb"))
+        assert isinstance(r, tuple) and r[1] == 409
+        assert all("insert_frag_idx" in o for o in r[0]["options"])
+
+    def test_clone_picks_cassette_not_ins_backbone(self):
+        # Find the product that carries the cassette ON the vector backbone,
+        # then build exactly that (vector_frag_idx + insert_frag_idx + orient).
+        sim = sc._h_simulate_traditional_cloning(None, self._base())
+        tgt = next(p for p in sim["products"]
+                   if (self.PAYLOAD in p["sequence"]
+                       or self.PAYLOAD in sc._rc(p["sequence"]))
+                   and ("A" * 150 in p["sequence"]
+                        or "A" * 150 in sc._rc(p["sequence"])))
+        r = sc._h_traditional_clone(None, dict(
+            self._base(), product_name="circ_cassette_clone",
+            vector_frag_idx=tgt["vector_frag_idx"],
+            insert_frag_idx=tgt["insert_frag_idx"],
+            orientation=tgt["orientation"]))
+        assert isinstance(r, dict) and r["ok"], r
+        assert r["insert_frag_idx"] == tgt["insert_frag_idx"]
+        ent = next(e for e in sc._load_library() if e["name"] == "circ_cassette_clone")
+        seq = str(sc._gb_text_to_record(ent["gb_text"]).seq).upper()
+        # cassette IN, ins-backbone OUT — the WRONG insert fragment wasn't used.
+        assert self.PAYLOAD in seq or self.PAYLOAD in sc._rc(seq)
+        assert (self.INS_BACKBONE not in seq
+                and self.INS_BACKBONE not in sc._rc(seq))
+
+    def test_linear_insert_default_single_candidate(self):
+        # insert_circular defaults False → the linear PCR insert still yields a
+        # single candidate (insert_frag_idx 0); back-compat with old callers.
+        r = sc._h_simulate_traditional_cloning(None, {
+            "vector_seq": self.VECTOR, "vector_enzymes": ["EcoRI", "KpnI"],
+            "insert_seq": "GCGC" + "GAATTC" + self.PAYLOAD + "GGTACC" + "GCGC",
+            "insert_enzymes": ["EcoRI", "KpnI"]})
+        assert r["n_insert_fragments"] == 1
+        assert all(p["insert_frag_idx"] == 0 for p in r["products"])
+
+
 class TestDiscardChangesHandler:
     """`discard-changes` — agent recovery for a stuck-dirty canvas
     (agent-API feedback P1-10)."""

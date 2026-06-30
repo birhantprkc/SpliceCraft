@@ -107,9 +107,13 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   can't be removed; the active bin auto-promotes + re-mirrors).
 - **Design** — gibson-assemble, simulate-gibson, traditional-clone /
   simulate-traditional-cloning (restriction digest + ligation: excise the
-  insert, digest the vector, try both fragments × both orientations, and
-  save the product — refuses to guess when more than one ligation is
-  possible), golden-gate-assemble / simulate-golden-gate (Type IIS — BsaI /
+  insert, digest the vector, try every vector-fragment × insert-fragment ×
+  orientation, and save the product — refuses to guess when more than one
+  ligation is possible, pick with `vector_frag_idx` / `insert_frag_idx`. Pass
+  `insert_circular:true` to cut a cassette OUT of a *plasmid* insert — e.g. an
+  Ω multigene into a binary vector — so its two digest fragments are both
+  offered instead of treating the insert as a linear PCR product),
+  golden-gate-assemble / simulate-golden-gate (Type IIS — BsaI /
   BsmBI / BbsI / SapI / Esp3I — overhang-directed N-part assembly: parts in
   any order, chained by their 4-nt overhangs into a circle, with a
   unique-overhang + no-residual-site fidelity check), design-mutagenesis,

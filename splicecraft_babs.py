@@ -725,17 +725,25 @@ def clamp_prompt(text: str) -> "tuple[str, bool]":
     return text, False
 
 
+def _to_float(x: object) -> "float | None":
+    """Best-effort float coercion → ``None`` for None / non-numeric / a bad
+    numeric string, so a malformed Ollama progress value never raises. A
+    type-clean stand-in for ``try: float(x) except (TypeError, ValueError)``
+    (pyright models ``float()``'s argument strictly)."""
+    if isinstance(x, (int, float, str)):
+        try:
+            return float(x)
+        except ValueError:
+            return None
+    return None
+
+
 def pull_progress_fraction(obj: dict) -> "float | None":
     """Extract a 0..1 download fraction from an Ollama pull progress object, or
     None when the phase has no measurable total (e.g. 'pulling manifest')."""
-    total = obj.get("total")
-    completed = obj.get("completed")
-    try:
-        total = float(total)
-        completed = float(completed)
-    except (TypeError, ValueError):
-        return None
-    if total <= 0:
+    total = _to_float(obj.get("total"))
+    completed = _to_float(obj.get("completed"))
+    if total is None or completed is None or total <= 0:
         return None
     return max(0.0, min(1.0, completed / total))
 
@@ -743,11 +751,8 @@ def pull_progress_fraction(obj: dict) -> "float | None":
 def fmt_speed(bps: "int | float | None") -> str:
     """Human download rate ('18.4 MB/s'); '' when not yet measurable so the UI
     can simply omit it on the first ('pulling manifest') ticks."""
-    try:
-        n = float(bps)
-    except (TypeError, ValueError):
-        return ""
-    if not (n > 0):
+    n = _to_float(bps)
+    if n is None or not (n > 0):
         return ""
     return f"{fmt_size(n)}/s"
 
@@ -778,14 +783,8 @@ class PullMeter:
         the ready-to-display status line (status · bytes · percent · speed)."""
         status = (obj.get("status") or "").strip()
         frac = pull_progress_fraction(obj)
-        try:
-            completed = float(obj.get("completed"))
-        except (TypeError, ValueError):
-            completed = None
-        try:
-            total = float(obj.get("total"))
-        except (TypeError, ValueError):
-            total = None
+        completed = _to_float(obj.get("completed"))
+        total = _to_float(obj.get("total"))
         digest = obj.get("digest")
 
         bps = None
