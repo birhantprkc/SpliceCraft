@@ -14,6 +14,18 @@
 
 ---
 
+## [1.0.113] — 2026-07-01
+
+### Bug fixes
+
+- **Saving no longer scrolls the library back to the top.** Pressing Ctrl+S kept the plasmid you just saved selected, but jumped the library list's scrollbar up to the first entry. It now stays exactly where it was, on your selection.
+- **Comparing a plasmid to an origin-shifted variant now aligns correctly.** When you overlaid one plasmid on another (Alt+A multi-align) and the two shared a backbone but started at different origins — a construct versus a re-cut version of it, say — the shared region (origin of replication, selection marker, backbone) was drawn as one big "no alignment" gap, because the overlay laid the second plasmid down from base 1 without trying a rotation. It now rotates to find the real shared region, so the backbone lines up and only the genuinely different stretch (an inserted or deleted piece) reads as a gap. Single-target compares (diff-plasmid) already did this.
+- **The full-screen alignment view labels the right features.** Its annotation lane could tag columns with the wrong feature — or none — whenever the alignment had been rotated to line the two plasmids up, so a feature sitting squarely inside a matched region looked unannotated. The lane now follows the rotation and labels every column against the correct position on the target.
+
+### Hardening
+
+- The batch alignment scripting endpoint (`multi-align`) is now rotation-aware to match the in-app overlay: it reports which rotation it chose for each target, accepts an explicit `circular` flag to force or skip the rotation search, and no longer lets one target that fails to align abort the whole batch. An empty query is now rejected up front with a clear message.
+
 ## [1.0.112] — 2026-06-30
 
 ### New features

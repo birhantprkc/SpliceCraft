@@ -807,6 +807,47 @@ class TestMultiAlignHandler:
             "targets": [{"sequence": str(tiny_record.seq), "name": "self"}]})
         assert r["alignments"][0]["identity_pct"] == 100.0
 
+    def test_origin_shifted_target_is_rotation_aware(self):
+        """A circular target whose origin differs from the query's must
+        align on its shared backbone via the rotation picker — not smear
+        off bp 0 like bare `_pairwise_align` did (2026-07-01 "ori shows
+        no alignment" report). Raw-sequence targets default to circular,
+        and the row now carries the rotation metadata."""
+        import random
+        seq = "".join(random.Random(31).choices("ACGT", k=1000))
+        shifted = seq[400:] + seq[:400]   # same molecule, origin +400
+        r = sc._h_multi_align(MockApp(record=None), {
+            "query": seq,
+            "targets": [{"sequence": shifted, "name": "origin-shift"}]})
+        row = r["alignments"][0]
+        assert row["ungapped_identity_pct"] == 100.0
+        assert row["picked_rotation"] in ("query", "target")
+        assert row["circular"] is True
+
+    def test_circular_false_disables_rotation(self):
+        """`circular: false` forces the naive (non-rotation) path — an
+        origin-shifted pair then can't reach 100%, matching the old
+        behaviour for callers that relied on it."""
+        import random
+        seq = "".join(random.Random(31).choices("ACGT", k=1000))
+        shifted = seq[400:] + seq[:400]
+        r = sc._h_multi_align(MockApp(record=None), {
+            "query": seq, "circular": False,
+            "targets": [{"sequence": shifted, "name": "origin-shift"}]})
+        row = r["alignments"][0]
+        assert row["picked_rotation"] == "none"
+        assert row["ungapped_identity_pct"] < 100.0
+
+    def test_empty_loaded_record_query_422(self):
+        """A loaded record with an empty sequence fails once, upfront,
+        with a clear 422 — not N identical per-target picker errors."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        empty_rec = SeqRecord(Seq(""), id="empty", name="empty")
+        r = sc._h_multi_align(MockApp(record=empty_rec),
+                              {"targets": [{"sequence": "ATGC"}]})
+        assert r[1] == 422 and "empty" in r[0]["error"].lower()
+
 
 class TestAttachExperimentImage:
     """`attach-experiment-image` — server-side image attach to a notebook

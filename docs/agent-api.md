@@ -171,8 +171,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   `unknown_enzymes` rather than silently dropped).
 - **Alignment** — diff-plasmid (one target, circular rotation
   auto-detected), multi-align (batch: the loaded plasmid or a given
-  sequence vs many targets at once — the Alt+A overlay),
-  list-plasmidsaurus-members, align-plasmidsaurus-zip.
+  sequence vs many targets at once — the Alt+A overlay; rotation-aware
+  per target, circular auto-detected from each target's topology or
+  forced with a `circular` flag, with `picked_rotation` reported per
+  row), list-plasmidsaurus-members, align-plasmidsaurus-zip.
 - **History** — get-history returns the parsed `<HistoryTree>`
   lineage as nested JSON. Agent assemblies (`gibson-assemble`,
   `traditional-clone`, `golden-gate-assemble`) attach real parent

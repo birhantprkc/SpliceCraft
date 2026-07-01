@@ -1879,6 +1879,63 @@ class TestDeleteFocusRouting:
             assert t.cursor_row == 0
             assert sc._cursor_row_key(t) == "pA2"
 
+    async def test_save_repopulate_keeps_cursor_on_selection(
+        self, isolated_library
+    ):
+        """`_repopulate_plasmids_keeping_view` (the Ctrl+S save path)
+        keeps the cursor on the SAME plasmid instead of snapping to row
+        0 — regression for the 2026-07-01 "Ctrl+S shifts the scrollbar
+        to the very top" report. The cursor row-key is deterministic in
+        headless `run_test`; the exact scroll offset isn't (Textual
+        clamps scroll after `clear()`), so this asserts the
+        visible-selection half of the fix."""
+        self._seed_lib(["pA1", "pA2", "pA3", "pA4", "pA5"])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            t = await self._await_row_count(app, 5, pilot)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            t.focus()
+            t.move_cursor(row=2)  # pA3
+            await pilot.pause(0.05)
+            assert sc._cursor_row_key(t) == "pA3"
+            lib._repopulate_plasmids_keeping_view()
+            await pilot.pause(0.05)
+            # Still on pA3 — not snapped back to row 0 like a bare
+            # `_repopulate_plasmids` would leave it.
+            assert sc._cursor_row_key(t) == "pA3"
+
+    async def test_save_repopulate_reseats_cursor_by_key_after_sort_shift(
+        self, isolated_library
+    ):
+        """The cursor is re-anchored by KEY, not raw index, so it
+        follows its entry even when a new row sorts in above it between
+        repopulates (e.g. saving a brand-new plasmid that sorts first)."""
+        self._seed_lib(["pB2", "pB4", "pB6"])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            t = await self._await_row_count(app, 3, pilot)
+            lib = app.query_one("#library", sc.LibraryPanel)
+            t.focus()
+            t.move_cursor(row=1)  # pB4
+            await pilot.pause(0.05)
+            assert sc._cursor_row_key(t) == "pB4"
+            # A new entry sorts in at the TOP (pB1 < pB4). If the restore
+            # anchored on the raw index it would land on pB2; anchoring
+            # by key must follow pB4 to its new index.
+            sc._save_library(sc._load_library() + [{
+                "name": "pB1", "id": "pB1", "size": 100, "n_feats": 0,
+                "source": "test", "added": "2026-07-01", "gb_text": "",
+            }])
+            lib._repopulate_plasmids_keeping_view()
+            await pilot.pause(0.05)
+            assert t.row_count == 4
+            assert sc._cursor_row_key(t) == "pB4"
+            assert t.cursor_row == 2  # pB1, pB2, pB4, pB6
+
     async def test_delete_bottom_row_cursor_lands_above(
         self, isolated_library
     ):

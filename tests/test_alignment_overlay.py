@@ -3973,6 +3973,36 @@ class TestRotateAlignedToOriginalQueryFrame:
         assert new_at == "ABCDEFGH"
 
 
+class TestTargetRowOffsetHelper:
+    """`_target_row_offset_after_query_restore` — the offset that lets
+    the drill-in annotation lane realign a cyclically-rotated target row
+    after the query rotate-back (2026-07-01)."""
+
+    def test_zero_rotation_returns_zero(self):
+        assert sc._target_row_offset_after_query_restore(
+            "ACGT", "ACGT", 0, 4) == 0
+
+    def test_degenerate_inputs_return_zero(self):
+        assert sc._target_row_offset_after_query_restore("", "", 5, 0) == 0
+        # q_rot a full multiple of qn → no effective rotation.
+        assert sc._target_row_offset_after_query_restore(
+            "ACGT", "ACGT", 4, 4) == 0
+
+    def test_counts_target_nongaps_before_cut(self):
+        # qn=6, q_rot=2 → cut at the 4th (0-indexed) non-gap of aligned_q
+        # (column 4 in a gapless row); the target non-gaps before that
+        # column = 4, so the restored target row's first base is original
+        # target bp 4.
+        assert sc._target_row_offset_after_query_restore(
+            "AAAAAA", "CCCCCC", 2, 6) == 4
+
+    def test_cut_not_found_returns_zero(self):
+        # aligned_q shorter than the cut point (only reachable via a
+        # local-mode alignment) → defensive 0, no crash.
+        assert sc._target_row_offset_after_query_restore(
+            "AC", "AC", 5, 100) == 0
+
+
 class TestPickBestRotation:
     def test_picks_best_by_overall_identity(self):
         """When plain + rotation candidates are available, pick by
@@ -4069,6 +4099,59 @@ class TestPickBestRotation:
                 "target-axis canvas: aligned_t non-gap chars must "
                 "encode the original target sequence in order"
             )
+
+    def test_target_row_offset_maps_columns_for_query_axis(self):
+        """`target_row_offset` lets the drill-in annotation lane map
+        alignment columns → ORIGINAL target bp when canvas_axis="query"
+        leaves the target row as a cyclic rotation of the target.
+
+        Regression for 2026-07-01: an origin-shifted circular pair
+        annotated its target features (e.g. an ori) at the wrong columns
+        — reading as "no alignment" over the real feature — because
+        `AlignmentScreen._body_text` assumed the target row's k-th
+        non-gap was original bp k. The invariant it now relies on: for
+        every non-gap target column, ``aligned_t[col]`` equals
+        ``target[(target_row_offset + non_gap_index) % tn]``.
+        """
+        import random
+        random.seed(4242)
+        target_seq = "".join(random.choices("ACGT", k=1200))
+        # Query = target with a different origin — forces a non-zero
+        # target_row_offset in the canvas="query" frame.
+        query_seq = target_seq[500:] + target_seq[:500]
+        result = sc._pick_best_rotation(
+            query_seq, target_seq,
+            is_circular=True, mode="global", canvas_axis="query",
+        )
+        # The scenario must actually rotate (else the offset is a
+        # trivial 0 and the test proves nothing).
+        assert result["picked_rotation"] != "none"
+        tn = len(target_seq)
+        off = int(result.get("target_row_offset", 0) or 0) % tn
+        assert off > 0, "expected a non-zero target_row_offset to exercise"
+        at = result["aligned_t"]
+        bp = 0
+        for ch in at:
+            if ch == "-":
+                continue
+            assert ch == target_seq[(off + bp) % tn], (
+                f"target_row_offset={off} mis-maps the non-gap at "
+                f"index {bp}"
+            )
+            bp += 1
+        assert bp == tn, "global alignment must cover every target base"
+
+    def test_target_row_offset_zero_when_unrotated(self):
+        """The common case (plain / no rotation picked) leaves the
+        target row in its native frame — offset 0, so Plasmidsaurus and
+        same-origin pairs annotate exactly as before the fix."""
+        import random
+        seq = "".join(random.Random(7).choices("ACGT", k=900))
+        result = sc._pick_best_rotation(
+            seq, seq, is_circular=True, mode="global", canvas_axis="query",
+        )
+        assert result["picked_rotation"] == "none"
+        assert result["target_row_offset"] == 0
 
     def test_empty_query_raises_clear_error(self):
         """Empty input is a programmer error — surface it clearly
@@ -5364,12 +5447,15 @@ class TestDeserializeStoredAlignmentArgs:
             self, tiny_record):
         """Pre-rotation-picker stored alignments lack the
         `picked_rotation` / `query_rotation` / `target_rotation` /
-        `query_rc` fields. Hydration must inject defaults so
-        downstream code can treat all stored entries uniformly."""
+        `query_rc` / `target_row_offset` fields. Hydration must inject
+        defaults so downstream code can treat all stored entries
+        uniformly."""
         stored = self._minimal_stored(tiny_record)
-        # Strip the rotation fields (simulate pre-2026-05-24 stored).
+        # Strip the rotation fields (simulate pre-2026-05-24 stored,
+        # + the 2026-07-01 target_row_offset).
         for field in ("picked_rotation", "query_rotation",
-                       "target_rotation", "query_rc"):
+                       "target_rotation", "query_rc",
+                       "target_row_offset"):
             stored["result"].pop(field, None)
         args = sc._deserialize_stored_alignment_args(stored)
         assert args is not None
@@ -5378,6 +5464,32 @@ class TestDeserializeStoredAlignmentArgs:
         assert result["query_rotation"] == 0
         assert result["target_rotation"] == 0
         assert result["query_rc"] is False
+        # target_row_offset defaults to 0 → drill-in annotates a legacy
+        # stored alignment as an unrotated (bp-0-aligned) target row,
+        # exactly how it rendered before the field existed.
+        assert result["target_row_offset"] == 0
+
+    def test_invalid_target_row_offset_coerces_to_zero(
+            self, tiny_record):
+        """A corrupted `target_row_offset` (negative / non-int) must
+        coerce to 0 rather than mis-map the drill-in annotation."""
+        stored = self._minimal_stored(tiny_record)
+        stored["result"]["target_row_offset"] = -5
+        result = sc._deserialize_stored_alignment_args(stored)["result"]
+        assert result["target_row_offset"] == 0
+        stored["result"]["target_row_offset"] = "oops"
+        result = sc._deserialize_stored_alignment_args(stored)["result"]
+        assert result["target_row_offset"] == 0
+
+    def test_valid_target_row_offset_round_trips(self, tiny_record):
+        """A valid `target_row_offset` survives hydrate verbatim (the
+        whole result dict is copied), so a rehydrated rotated alignment
+        annotates its drill-in correctly after a reload — not reset to
+        the unrotated bp-0 mapping."""
+        stored = self._minimal_stored(tiny_record)
+        stored["result"]["target_row_offset"] = 137
+        result = sc._deserialize_stored_alignment_args(stored)["result"]
+        assert result["target_row_offset"] == 137
 
 
 class TestRegisterAlignmentLengthGuard:
