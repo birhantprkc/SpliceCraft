@@ -14,6 +14,28 @@
 
 ---
 
+## [1.0.116] — 2026-07-02
+
+### Bug fixes
+
+- **Babs now actually searches online when you ask it to.** Even with online
+  lookups armed, asking Babs to "look up *&lt;name&gt;* online" could still fail — a
+  local model would hunt through the whole endpoint list, reach for online
+  BLAST (which needs a full **sequence**, not a name), and give up with "I can't
+  fetch by name." Babs now has a dedicated one-step online-search tool, so it
+  goes straight to the right database by name: **FPbase** for fluorescent
+  proteins, **GenBank** for sequence records, **UniProt** for proteins, plus
+  Europe PMC, Wikipedia, web, and patents. Still gated by *Settings → "Allow
+  Babs online database lookups"* — only your query string is sent, never your
+  sequence.
+- **Bug-report snapshots no longer expose your saved secrets.** The diagnostic
+  UI snapshot (`Alt+D` / `Ctrl+U` / `F9`) listed your settings verbatim, so a
+  saved Plasmidsaurus client secret — or an optional Brave Search / PatentsView
+  API key — showed up in **plaintext** in a file meant to be emailed or pasted
+  into a bug report. Those values are now redacted, matching how they're already
+  hidden in the logs. If you shared a snapshot before this fix, rotate the
+  exposed secret.
+
 ## [1.0.115] — 2026-07-01
 
 ### New features

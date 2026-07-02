@@ -13950,6 +13950,32 @@ class TestEventLogAndSnapshot:
         # Source path scrubbed.
         assert "/home/user" not in formatted
 
+    def test_collect_ui_snapshot_redacts_secret_settings(self, monkeypatch):
+        # A shareable snapshot must NEVER carry secret-valued settings
+        # (Plasmidsaurus client secret, optional web/patent provider API
+        # keys) in plaintext. The log tail is redacted at write time, so
+        # the settings dump was the remaining leak; this mirrors the
+        # `_SENSITIVE_SETTING_KEYS` redaction the log/event stream applies.
+        fake = {
+            "active_collection": "MyColl",
+            "plasmidsaurus_client_secret": "SUPER-SECRET-9000",
+            "brave_search_api_key": "brave-KEY-abc",
+            "patentsview_api_key": "pv-KEY-xyz",
+        }
+        monkeypatch.setattr(sc, "_load_settings", lambda: dict(fake))
+        snap = sc._collect_ui_snapshot(None)
+        s = snap["settings"]
+        assert s["active_collection"] == "MyColl"          # non-secret kept
+        for k in ("plasmidsaurus_client_secret",
+                  "brave_search_api_key", "patentsview_api_key"):
+            assert s[k] == "<redacted>", f"{k} not redacted in snapshot dict"
+        formatted = sc._format_ui_snapshot(snap)
+        for secret in ("SUPER-SECRET-9000", "brave-KEY-abc", "pv-KEY-xyz"):
+            assert secret not in formatted, (
+                "INVARIANT VIOLATED: secret setting value leaked into the "
+                "shareable UI snapshot"
+            )
+
     def test_collect_ui_snapshot_handles_broken_app(self):
         # Pathological stub that raises from every attribute access.
         # Must NOT crash _collect_ui_snapshot — we'd be hiding a real

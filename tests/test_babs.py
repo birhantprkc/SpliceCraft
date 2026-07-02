@@ -839,11 +839,31 @@ class TestBabsAgentic:
         list(B.chat_stream("m", [{"role": "user", "content": "hi"}]))
         assert "tools" not in captured["payload"]   # plain chat is unchanged
 
-    # — hub: the 3 meta-tools + endpoint catalog —
+    # — hub: the 3 meta-tools + the first-class online-search tool + catalog —
     def test_tool_manifest_shape(self):
         names = {t["function"]["name"] for t in sc._babs_tool_manifest()}
         assert names == {"splicecraft_list_endpoints",
-                         "splicecraft_describe_endpoint", "splicecraft_call"}
+                         "splicecraft_describe_endpoint", "splicecraft_call",
+                         "splicecraft_search_online"}
+
+    def test_search_tool_enum_matches_sources(self):
+        # The tool's `source` enum must stay in lockstep with the endpoint map,
+        # so the model can never offer a source that doesn't route anywhere.
+        tool = next(t for t in sc._babs_tool_manifest()
+                    if t["function"]["name"] == "splicecraft_search_online")
+        enum = tool["function"]["parameters"]["properties"]["source"]["enum"]
+        assert set(enum) == set(sc._BABS_SEARCH_SOURCES)
+        assert "required" in tool["function"]["parameters"]
+        assert set(tool["function"]["parameters"]["required"]) == {"source", "query"}
+
+    def test_babs_search_sources_map_to_real_readonly_endpoints(self):
+        # Every source must dispatch to a REGISTERED, READ-ONLY endpoint — a
+        # name lookup never writes, so it must not trip the write-approval gate,
+        # and a typo'd endpoint would 'unknown endpoint' at runtime.
+        for src, ep in sc._BABS_SEARCH_SOURCES.items():
+            entry = sc._AGENT_HANDLERS.get(ep)
+            assert entry is not None, f"{src} → {ep!r} is not a registered endpoint"
+            assert entry[1] is False, f"{ep!r} must be read-only (write flag set)"
 
     def test_list_endpoints_catalog_and_filter(self):
         full = sc._babs_list_endpoints({})
@@ -869,6 +889,65 @@ class TestBabsAgentic:
                           "arguments": '{"endpoint": "status"}'}})   # JSON-string args
         assert out2["name"] == "status"
         assert "error" in scr._run_tool_call({"function": {"name": "bogus"}})
+
+    # — hub: splicecraft_search_online routes source → the right *-search endpoint —
+    def test_run_tool_call_search_online_routes_source_to_endpoint(self):
+        scr = sc.BabsScreen()
+        seen: dict = {}
+        # Shadow the dispatcher so we assert the ROUTING without an app / network.
+        scr._dispatch_agent_endpoint = (
+            lambda ep, body: seen.update(ep=ep, body=body) or {"ok": True})
+        for src, ep in sc._BABS_SEARCH_SOURCES.items():
+            seen.clear()
+            scr._run_tool_call({"function": {
+                "name": "splicecraft_search_online",
+                "arguments": {"source": src, "query": "GFP"}}})
+            assert seen["ep"] == ep, f"source {src!r} routed to {seen.get('ep')!r}"
+            assert seen["body"]["query"] == "GFP"
+            assert "max_hits" not in seen["body"]        # omitted when unset
+        # max_hits threads through when the model supplies it.
+        seen.clear()
+        scr._run_tool_call({"function": {
+            "name": "splicecraft_search_online",
+            "arguments": {"source": "genbank", "query": "cas9", "max_hits": 5}}})
+        assert seen["ep"] == "genbank-search" and seen["body"]["max_hits"] == 5
+
+    def test_run_tool_call_search_online_unknown_source(self):
+        scr = sc.BabsScreen()
+        out = scr._run_tool_call({"function": {
+            "name": "splicecraft_search_online",
+            "arguments": {"source": "nope", "query": "x"}}})
+        assert "error" in out and "unknown search source" in out["error"]
+
+    async def test_search_online_flows_through_dispatch_to_agent_invoke(
+            self, monkeypatch):
+        # End-to-end wiring inside a live app: a model `splicecraft_search_online`
+        # tool call must flow _run_tool_call → _dispatch_agent_endpoint →
+        # _agent_invoke against the real (read-only) *-search endpoint, with NO
+        # write-approval gate. `_agent_invoke` is stubbed so no network is hit.
+        monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
+        monkeypatch.setattr(B, "show", lambda *a, **k: {})
+        seen: dict = {}
+
+        def fake_invoke(app, endpoint, body, source=None):
+            seen.update(endpoint=endpoint, body=body, source=source)
+            return {"ok": True, "source": "fpbase", "hits": []}, 200
+
+        monkeypatch.setattr(sc, "_agent_invoke", fake_invoke)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            assert isinstance(scr, sc.BabsScreen)
+            out = scr._run_tool_call({"function": {
+                "name": "splicecraft_search_online",
+                "arguments": {"source": "fpbase", "query": "GFP"}}})
+        assert seen["endpoint"] == "fpbase-search"
+        assert seen["body"] == {"query": "GFP"}
+        assert seen["source"] == "babs"                     # side-door parity
+        assert out["status"] == 200 and out["result"]["ok"] is True
 
     # — hub: the autonomy policy gate —
     def test_dispatch_readonly_refuses_writes(self):
