@@ -839,12 +839,20 @@ class TestBabsAgentic:
         list(B.chat_stream("m", [{"role": "user", "content": "hi"}]))
         assert "tools" not in captured["payload"]   # plain chat is unchanged
 
-    # — hub: the 3 meta-tools + the first-class online-search tool + catalog —
+    # — hub: the 3 meta-tools + online-search + fetch-page + catalog —
     def test_tool_manifest_shape(self):
         names = {t["function"]["name"] for t in sc._babs_tool_manifest()}
         assert names == {"splicecraft_list_endpoints",
                          "splicecraft_describe_endpoint", "splicecraft_call",
-                         "splicecraft_search_online"}
+                         "splicecraft_search_online", "splicecraft_fetch_page"}
+
+    def test_fetch_page_tool_requires_url(self):
+        # The page-reader tool must take a `url` (required) so the model always
+        # supplies a target; it dispatches to the read-only `read-url` endpoint.
+        tool = next(t for t in sc._babs_tool_manifest()
+                    if t["function"]["name"] == "splicecraft_fetch_page")
+        assert set(tool["function"]["parameters"]["required"]) == {"url"}
+        assert sc._AGENT_HANDLERS["read-url"][1] is False
 
     def test_search_tool_enum_matches_sources(self):
         # The tool's `source` enum must stay in lockstep with the endpoint map,
@@ -918,6 +926,30 @@ class TestBabsAgentic:
             "name": "splicecraft_search_online",
             "arguments": {"source": "nope", "query": "x"}}})
         assert "error" in out and "unknown search source" in out["error"]
+
+    # — hub: splicecraft_fetch_page routes to the read-url endpoint —
+    def test_run_tool_call_fetch_page_routes_to_read_url(self):
+        scr = sc.BabsScreen()
+        seen: dict = {}
+        scr._dispatch_agent_endpoint = (
+            lambda ep, body: seen.update(ep=ep, body=body) or {"ok": True})
+        scr._run_tool_call({"function": {
+            "name": "splicecraft_fetch_page",
+            "arguments": {"url": "https://example.com"}}})
+        assert seen["ep"] == "read-url"
+        assert seen["body"]["url"] == "https://example.com"
+        # max_chars threads through when the model supplies it.
+        seen.clear()
+        scr._run_tool_call({"function": {
+            "name": "splicecraft_fetch_page",
+            "arguments": {"url": "https://e.com", "max_chars": 4000}}})
+        assert seen["body"]["max_chars"] == 4000
+
+    def test_run_tool_call_fetch_page_missing_url(self):
+        scr = sc.BabsScreen()
+        out = scr._run_tool_call({"function": {
+            "name": "splicecraft_fetch_page", "arguments": {"url": "  "}}})
+        assert "error" in out and "url" in out["error"]
 
     async def test_search_online_flows_through_dispatch_to_agent_invoke(
             self, monkeypatch):

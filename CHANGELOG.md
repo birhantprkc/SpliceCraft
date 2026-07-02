@@ -14,6 +14,32 @@
 
 ---
 
+## [1.0.117] — 2026-07-02
+
+### New features
+
+- **Babs can now open a search result and read the page.** After a web search,
+  Babs can follow a link and read the actual page text — not just the snippet —
+  so she can summarise an article, pull details off a vendor or reference page,
+  and cite what she found. Only public pages over http/https are fetched, binary
+  files (PDFs, images) are declined, and page scripts are never run. Needs
+  *Settings → "Allow Babs online database lookups"* armed, exactly like web
+  search; only the URL is sent. Scriptable too, via the new `read-url` agent
+  endpoint.
+
+### Hardening
+
+- Web page reads route through the same SSRF-hardened network path as every
+  other online lookup — private, loopback and link-local addresses are refused
+  (on the initial URL and every redirect hop), the response size is capped, and
+  the returned text is length-bounded so a huge page can't flood the model.
+- Gzip/deflate-compressed pages are decoded (some sites compress even when not
+  asked to, which would otherwise come back as garbled text; decompression is
+  size-bounded so a compression bomb can't blow memory), protocol-relative and
+  scheme-less URLs are normalised, and each fetch is noted in the log (host
+  only — never the query string) so a failed read is easy to diagnose from a
+  bug report.
+
 ## [1.0.116] — 2026-07-02
 
 ### Bug fixes

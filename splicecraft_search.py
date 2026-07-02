@@ -2435,6 +2435,219 @@ def _web_search(query: str, max_hits: int = 10,
     return _ddg_parse_html(body)[:max_hits]
 
 
+# ── read-url: fetch ONE page → readable text ─────────────────────────────────
+# Babs' "open a search result and actually read it" primitive (pairs with
+# web-search). SSRF-hardened through the same `_build_hardened_url_opener` as
+# every other egress path — public http(s) hosts only, on the initial URL AND
+# every redirect hop. It is a READER, not a browser: no JavaScript is run.
+_READ_URL_MAX_URL_LEN = 2048
+_READ_URL_DEFAULT_CHARS = 20000       # default returned-text budget
+_READ_URL_MAX_CHARS = 100000          # hard ceiling (keep _h_read_url doc in sync)
+# Content types we can turn into text. Anything else (PDF, images, octet-stream)
+# is refused rather than decoded into mojibake; `text/*` is allowed broadly.
+_READ_URL_TEXT_TYPES = frozenset({
+    "text/html", "application/xhtml+xml", "application/xml", "text/xml",
+    "text/plain",
+})
+# Tags whose TEXT content is dropped entirely (scripts/styles/non-content).
+_HTML_DROP_TAGS = frozenset({
+    "script", "style", "noscript", "template", "svg", "head", "iframe",
+    "object", "canvas", "math",
+})
+# Tags that imply a line break around their content (readability).
+_HTML_BLOCK_TAGS = frozenset({
+    "p", "div", "br", "li", "tr", "section", "article", "header", "footer",
+    "nav", "aside", "main", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol",
+    "table", "thead", "tbody", "blockquote", "pre", "hr", "figure",
+    "figcaption", "dd", "dt", "dl", "form",
+})
+
+
+def _html_to_text(html_text: str) -> "tuple[str, str]":
+    """Extract ``(title, readable_text)`` from an HTML document using ONLY the
+    stdlib parser — script/style/head text dropped, block tags become line
+    breaks, whitespace collapsed, entities decoded. NO JavaScript is executed
+    (this is a reader, not a browser). Pure + deterministic → unit-tested."""
+    from html.parser import HTMLParser
+
+    class _Extractor(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.parts: "list[str]" = []
+            self.title_parts: "list[str]" = []
+            self._drop = 0
+            self._in_title = False
+
+        def handle_starttag(self, tag, attrs):
+            if tag in _HTML_DROP_TAGS:
+                self._drop += 1
+            elif tag == "title":
+                self._in_title = True
+            elif tag in _HTML_BLOCK_TAGS:
+                self.parts.append("\n")
+
+        def handle_startendtag(self, tag, attrs):
+            if tag in _HTML_BLOCK_TAGS:
+                self.parts.append("\n")
+
+        def handle_endtag(self, tag):
+            if tag in _HTML_DROP_TAGS:
+                self._drop = max(0, self._drop - 1)
+            elif tag == "title":
+                self._in_title = False
+            elif tag in _HTML_BLOCK_TAGS:
+                self.parts.append("\n")
+
+        def handle_data(self, data):
+            # Title first: it lives inside <head> (a drop tag) but we want it.
+            if self._in_title:
+                self.title_parts.append(data)
+                return
+            if self._drop:
+                return
+            # Collapse whitespace WITHIN the text node (incl. source newlines,
+            # which are just whitespace in HTML) so only the "\n" markers we
+            # inject for block tags become real line breaks.
+            self.parts.append(re.sub(r"\s+", " ", data))
+
+    p = _Extractor()
+    try:
+        p.feed(html_text)
+        p.close()
+    except Exception:
+        # A malformed document must not sink the fetch — keep what parsed.
+        pass
+    title = re.sub(r"\s+", " ", "".join(p.title_parts)).strip()
+    out_lines: "list[str]" = []
+    blank = False
+    for ln in "".join(p.parts).split("\n"):
+        ln = re.sub(r"[^\S\n]+", " ", ln).strip()   # collapse intra-line spaces
+        if ln:
+            out_lines.append(ln)
+            blank = False
+        elif not blank:
+            out_lines.append("")                    # one blank between paragraphs
+            blank = True
+    return title, "\n".join(out_lines).strip()
+
+
+def _maybe_decompress(raw: bytes, encoding: str, cap: int) -> bytes:
+    """Decompress a gzip / deflate response body. Unlike the fixed-domain API
+    lookups, `read-url` fetches arbitrary pages and a CDN may compress the body
+    even though we never advertise ``Accept-Encoding`` — so decode it here or
+    the charset step would return mojibake. Output is bounded to 4× the byte cap
+    so a decompression bomb can't blow memory; anything we can't decode
+    (brotli / unknown / corrupt) is passed through unchanged for the
+    replace-decode to handle."""
+    if not encoding or encoding == "identity":
+        return raw
+    import zlib
+    limit = cap * 4
+    try:
+        if encoding in ("gzip", "x-gzip"):
+            return zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(raw, limit)
+        if encoding == "deflate":                      # zlib-wrapped or raw
+            try:
+                return zlib.decompressobj().decompress(raw, limit)
+            except zlib.error:
+                return zlib.decompressobj(-zlib.MAX_WBITS).decompress(raw, limit)
+    except (zlib.error, OSError, EOFError):
+        return raw
+    return raw                                          # br / unknown → passthrough
+
+
+def _fetch_page_raw(url: str) -> "tuple[str, str, str]":
+    """GET one http(s) ``url`` through the SSRF-hardened opener and return
+    ``(final_url, content_type, decoded_body)``. Split out from `_read_url` so
+    the extraction layer is unit-testable without network. Enforces the shared
+    response-size cap, decompresses gzip/deflate, and decodes per the response
+    charset (utf-8 fallback). Raises RuntimeError on any network / HTTP failure
+    (incl. a refused non-public host — the opener blocks SSRF before the socket
+    opens)."""
+    import socket
+    import urllib.error
+    import urllib.request
+    cap = _ONLINE_LOOKUP_MAX_RESPONSE_BYTES
+    req = urllib.request.Request(url, headers={
+        "User-Agent": _ONLINE_LOOKUP_BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5",
+    })
+    opener = _build_hardened_url_opener()
+    try:
+        with opener.open(req, timeout=_ONLINE_LOOKUP_TIMEOUT_S) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").split(
+                ";", 1)[0].strip().lower()
+            enc = (resp.headers.get("Content-Encoding") or "").strip().lower()
+            raw = resp.read(cap + 1)
+            charset = resp.headers.get_content_charset() or "utf-8"
+            final_url = resp.geturl() or url
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HTTP {exc.code} fetching the page") from exc
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, socket.timeout):
+            raise RuntimeError("Connection timed out fetching the page.") from exc
+        raise RuntimeError(f"cannot fetch the page: {reason}") from exc
+    except socket.timeout as exc:
+        raise RuntimeError("Connection timed out fetching the page.") from exc
+    if len(raw) > cap:
+        raise RuntimeError(
+            f"page exceeded the {cap // (1024 * 1024)} MB fetch cap — "
+            f"refusing it.")
+    raw = _maybe_decompress(raw, enc, cap)
+    try:
+        body = raw.decode(charset, "replace")
+    except (LookupError, TypeError):
+        body = raw.decode("utf-8", "replace")
+    return final_url, ctype, body
+
+
+def _read_url(url: str, max_chars: int = _READ_URL_DEFAULT_CHARS) -> dict:
+    """Fetch ONE http(s) page and return its readable text (HTML → text; NO
+    JavaScript). Normalises a bare host to https, rejects non-http(s) schemes,
+    SSRF-hardened via `_fetch_page_raw`, refuses binary content types, and caps
+    the returned text at `max_chars`. Returns
+    ``{url, title, content_type, text, chars, truncated}``. Raises RuntimeError
+    on a network/HTTP failure, a bad scheme, or an unsupported content type."""
+    if not isinstance(url, str) or not url.strip():
+        raise RuntimeError("missing URL")
+    url = url.strip()
+    if url.startswith("//"):
+        url = "https:" + url                         # protocol-relative → https
+    m = re.match(r"(?i)^([a-z][a-z0-9+.\-]*):", url)
+    if m:
+        if m.group(1).lower() not in ("http", "https"):
+            raise RuntimeError(
+                f"unsupported URL scheme {m.group(1).lower()!r} — read-url "
+                f"fetches http/https pages only.")
+    else:
+        url = "https://" + url                       # bare host/path → assume https
+    if len(url) > _READ_URL_MAX_URL_LEN:
+        raise RuntimeError(f"URL too long (max {_READ_URL_MAX_URL_LEN} chars).")
+    try:
+        max_chars = int(max_chars)
+    except (TypeError, ValueError):
+        max_chars = _READ_URL_DEFAULT_CHARS
+    max_chars = max(500, min(max_chars, _READ_URL_MAX_CHARS))
+
+    final_url, ctype, body = _fetch_page_raw(url)
+    if ctype and ctype not in _READ_URL_TEXT_TYPES and not ctype.startswith(
+            "text/"):
+        raise RuntimeError(
+            f"unsupported content type {ctype!r} — read-url returns page TEXT "
+            f"(HTML / plain text), not binary files (PDF, images, downloads).")
+    if ctype == "text/plain":
+        title, text = "", body
+    else:
+        title, text = _html_to_text(body)
+    text = text.strip()
+    truncated = len(text) > max_chars
+    if truncated:
+        text = text[:max_chars].rstrip() + "\n…[truncated]"
+    return {"url": final_url, "title": title, "content_type": ctype or None,
+            "text": text, "chars": len(text), "truncated": truncated}
+
+
 def _google_patents_parse(data: "_Any",
                           max_hits: int) -> "tuple[list[dict], int | None]":
     res = (data or {}).get("results") or {} if isinstance(data, dict) else {}

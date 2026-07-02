@@ -60,7 +60,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ## Endpoint inventory
 
-~179 endpoints across:
+~180 endpoints across:
 
 - **Records** — `new-plasmid` (create from a raw sequence, the Ctrl+N
   flow), get / set sequence, add / update / delete features (with the full
@@ -203,9 +203,13 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   literature-search (Europe PMC papers: title/authors/journal/DOI/abstract),
   genbank-search (NCBI `nucleotide`/`protein` term search → accessions you can
   `fetch`; returns `total_matches`), wikipedia-search (lead-section summaries),
-  web-search (general web) and patent-search. All read-only. They send only a
-  QUERY STRING to the public database — never your sequence (distinct from the
-  BLAST/HMMER egress above) — but egress still requires the SpliceCraft user to
+  web-search (general web), patent-search, and read-url (open ONE page by URL
+  and return its readable text — HTML stripped to text, no JavaScript run; the
+  companion to web-search, so Babs can open a result and actually read it, and
+  it refuses binary / PDF pages with a `502`). All read-only. The `*-search`
+  endpoints send only a QUERY STRING to the public database — read-url sends
+  only the URL you give it — never your sequence (distinct from the BLAST/HMMER
+  egress above), but egress still requires the SpliceCraft user to
   arm Settings → "Allow Babs online database lookups" (`403` otherwise). That
   setting is the HUMAN half of the gate: deliberately NOT in the agent settings
   allowlist, so an agent can't self-arm. web-search uses the Brave Search API

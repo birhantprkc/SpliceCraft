@@ -50,7 +50,7 @@ from splicecraft_net import (_sanitize_accession)
 from splicecraft_persistence import (_safe_file_size_check, _safe_load_json)
 from splicecraft_primer import (_mut_design_inner, _mut_design_outer, _scrub_design, _scrub_qc_primers, _scrub_qc_verify)
 from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq)
-from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
+from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
 from splicecraft_seqanalysis import (_classify_part_from_plasmid, _find_orfs)
 from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _safe_color_for_picker, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
@@ -6140,6 +6140,54 @@ def _h_web_search(app, payload):
     return {"ok": True, "source": "web", "query": query,
             "provider": "Brave" if brave_key else "DuckDuckGo (best-effort)",
             "count": len(results), "results": results}
+
+
+def _url_host(url) -> str:
+    """Just the hostname of a URL, for privacy-preserving egress logging — no
+    path or query string (a query can carry sensitive search terms)."""
+    try:
+        from urllib.parse import urlsplit
+        return urlsplit(str(url)).hostname or "?"
+    except (ValueError, TypeError):
+        return "?"
+
+
+@_agent_endpoint("read-url")
+def _h_read_url(app, payload):
+    """Open ONE web page and return its readable text (HTML → text; NO
+    JavaScript). Body: ``{url, max_chars?}``.
+
+    Pairs with web-search: open a result URL and actually READ the page, not
+    just its snippet. Requires arming Settings → "Allow Babs online database
+    lookups" (403 otherwise); only the URL is sent. Read-only, egress.
+    SSRF-hardened — public http(s) hosts only (private / loopback / link-local
+    refused) on the initial URL AND every redirect hop, the response size is
+    capped, and page scripts are never run. Binary pages (PDF, images,
+    downloads) are refused with a 502. ``max_chars`` bounds the returned text
+    (default 20000, hard max 100000). Returns ``{url (final, post-redirect),
+    title, content_type, text, chars, truncated}``."""
+    if not _online_lookups_armed():
+        return _online_lookups_refusal()
+    url = payload.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return {"error": "missing or non-string 'url'"}, 400
+    mc = payload.get("max_chars")
+    if mc is not None:
+        mc = _coerce_int(mc, name="max_chars")
+        if isinstance(mc, str):
+            return {"error": mc}, 400
+    try:
+        data = _read_url(url) if mc is None else _read_url(url, mc)
+    except Exception as exc:
+        # Audit arbitrary-URL egress (host only — no query string) so a failed
+        # fetch is diagnosable from the log the user attaches to a bug report.
+        _log_event("agent.read_url.fail", host=_url_host(url),
+                   reason=_scrub_path(str(exc))[:200], via="agent")
+        return _online_lookup_error(exc, "read-url")
+    _log_event("agent.read_url.ok", host=_url_host(data.get("url") or url),
+               content_type=data.get("content_type"), chars=data.get("chars"),
+               truncated=data.get("truncated"), via="agent")
+    return {"ok": True, "source": "web", **data}
 
 
 @_agent_endpoint("patent-search")

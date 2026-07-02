@@ -334,3 +334,226 @@ def test_patent_patentsview_parse(monkeypatch):
 def test_ddg_parse_no_results_returns_empty(monkeypatch):
     # A genuine no-hits page (no result__a, no block markers) -> [] not an error.
     assert ss._ddg_parse_html("<html><body>No results.</body></html>") == []
+
+
+# ── read-url: open ONE page → readable text (companion to web-search) ─────────
+def test_read_url_registered_readonly_and_discoverable():
+    assert "read-url" in H
+    assert H["read-url"][1] is False, "read-url must be read-only"
+    names = {e["name"] for e in sc._babs_list_endpoints({"filter": "url"})["endpoints"]}
+    assert "read-url" in names
+
+
+def test_read_url_is_a_babs_tool():
+    tools = {t["function"]["name"] for t in sc._babs_tool_manifest()}
+    assert "splicecraft_fetch_page" in tools
+
+
+def test_read_url_disarmed_403(monkeypatch):
+    monkeypatch.setattr(sa, "_get_setting", lambda k, d=None: False)
+    body, status = H["read-url"][0](None, {"url": "https://example.com"})
+    assert status == 403 and "allow_online_lookups" in body["error"]
+
+
+def test_read_url_missing_or_bad_url_400(monkeypatch):
+    _arm(monkeypatch)
+    assert H["read-url"][0](None, {})[1] == 400
+    assert H["read-url"][0](None, {"url": "  "})[1] == 400
+    assert H["read-url"][0](None, {"url": 5})[1] == 400
+
+
+def test_read_url_bad_max_chars_400(monkeypatch):
+    _arm(monkeypatch)
+    assert H["read-url"][0](None, {"url": "https://e.com", "max_chars": "lots"})[1] == 400
+
+
+def test_read_url_success_shape(monkeypatch):
+    _arm(monkeypatch)
+    monkeypatch.setattr(sa, "_read_url", lambda u, *a: {
+        "url": u, "title": "T", "content_type": "text/html",
+        "text": "hello", "chars": 5, "truncated": False})
+    body = H["read-url"][0](None, {"url": "https://example.com"})
+    assert body["ok"] and body["source"] == "web" and body["title"] == "T"
+    assert body["text"] == "hello" and body["truncated"] is False
+
+
+def test_read_url_runtimeerror_maps_502(monkeypatch):
+    _arm(monkeypatch)
+
+    def boom(*a, **k):
+        raise RuntimeError("Connection timed out fetching the page.")
+    monkeypatch.setattr(sa, "_read_url", boom)
+    body, status = H["read-url"][0](None, {"url": "https://e.com"})
+    assert status == 502 and "timed out" in body["error"]
+
+
+# ── engine: _html_to_text + _read_url (no network — _fetch_page_raw mocked) ───
+def test_html_to_text_strips_scripts_extracts_title_decodes_entities():
+    html = ("<html><head><title>  My  Page </title><style>.x{color:red}</style>"
+            "</head><body><script>alert('x')</script><h1>Heading</h1>"
+            "<p>First para.</p><p>Second &amp; last.</p>"
+            "<noscript>enable js</noscript></body></html>")
+    title, text = ss._html_to_text(html)
+    assert title == "My Page"                       # collapsed, and kept despite <head>
+    assert "Heading" in text and "First para." in text
+    assert "Second & last." in text                 # entity decoded
+    assert "alert" not in text and "color:red" not in text and "enable js" not in text
+    assert "First para." in text and "Second & last." in text
+    # block tags separate paragraphs onto their own lines
+    assert "First para." in text.split("\n")
+
+
+def test_html_to_text_collapses_intraline_whitespace():
+    _title, text = ss._html_to_text("<p>a   b\n\t c</p>")
+    assert "a b c" in text
+
+
+def test_read_url_refuses_binary_content_type(monkeypatch):
+    monkeypatch.setattr(ss, "_fetch_page_raw",
+                        lambda u: ("https://e.com/f.pdf", "application/pdf", "%PDF-1.4"))
+    with pytest.raises(RuntimeError, match="unsupported content type"):
+        ss._read_url("https://e.com/f.pdf")
+
+
+def test_read_url_extracts_and_truncates(monkeypatch):
+    big = "<p>" + ("word " * 5000) + "</p>"      # ~25k chars of text
+    monkeypatch.setattr(ss, "_fetch_page_raw",
+                        lambda u: ("https://e.com", "text/html", big))
+    out = ss._read_url("https://e.com", max_chars=800)   # above the 500-char floor
+    assert out["truncated"] is True and out["chars"] <= 820   # 800 + marker
+    assert out["text"].endswith("[truncated]") and out["url"] == "https://e.com"
+
+
+def test_read_url_max_chars_has_floor(monkeypatch):
+    # A pathologically small request is clamped up to the 500-char floor.
+    monkeypatch.setattr(ss, "_fetch_page_raw",
+                        lambda u: ("https://e.com", "text/html", "<p>" + "x " * 5000 + "</p>"))
+    out = ss._read_url("https://e.com", max_chars=1)
+    assert out["truncated"] is True and out["chars"] >= 500
+
+
+def test_read_url_plain_text_passthrough(monkeypatch):
+    monkeypatch.setattr(ss, "_fetch_page_raw",
+                        lambda u: ("https://e.com/x.txt", "text/plain", "raw <not> parsed"))
+    out = ss._read_url("https://e.com/x.txt")
+    assert out["text"] == "raw <not> parsed" and out["title"] == ""
+
+
+def test_read_url_rejects_non_http_scheme():
+    with pytest.raises(RuntimeError, match="scheme"):
+        ss._read_url("file:///etc/passwd")
+
+
+def test_read_url_prepends_https_for_bare_host(monkeypatch):
+    seen = {}
+
+    def fake(u):
+        seen["u"] = u
+        return (u, "text/html", "<p>ok</p>")
+    monkeypatch.setattr(ss, "_fetch_page_raw", fake)
+    out = ss._read_url("example.com/path")
+    assert seen["u"] == "https://example.com/path" and "ok" in out["text"]
+
+
+def test_read_url_ssrf_refuses_loopback():
+    # Real hardened opener, but offline-safe: _assert_public_host refuses
+    # 127.0.0.1 via getaddrinfo (numeric, no DNS) before any socket connects.
+    with pytest.raises(RuntimeError):
+        ss._read_url("http://127.0.0.1/admin")
+
+
+# ── read-url hardening: compression, odd URLs, empty/huge bodies ─────────────
+def _fake_opener(body: bytes, *, content_type="text/html",
+                 content_encoding="", charset=None, url="https://e.com"):
+    """Stand-in for _build_hardened_url_opener exposing the http.client surface
+    _fetch_page_raw uses (headers.get / get_content_charset / geturl / read /
+    context-manager). Lets us drive gzip/deflate/charset without a socket."""
+    import io as _io
+    from email.message import Message
+    h = Message()
+    h["Content-Type"] = content_type + (f"; charset={charset}" if charset else "")
+    if content_encoding:
+        h["Content-Encoding"] = content_encoding
+
+    class _Resp:
+        headers = h
+
+        def __init__(self):
+            self._b = _io.BytesIO(body)
+
+        def read(self, n=-1):
+            return self._b.read(n)
+
+        def geturl(self):
+            return url
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Resp()
+
+    return _Opener()
+
+
+def test_fetch_page_decompresses_gzip(monkeypatch):
+    import gzip
+    payload = gzip.compress(b"<title>Zipped</title><p>hello gzip</p>")
+    monkeypatch.setattr(ss, "_build_hardened_url_opener",
+                        lambda: _fake_opener(payload, content_encoding="gzip"))
+    out = ss._read_url("https://e.com")
+    assert out["title"] == "Zipped" and "hello gzip" in out["text"]
+
+
+def test_fetch_page_decompresses_deflate(monkeypatch):
+    import zlib
+    payload = zlib.compress(b"<p>hello deflate</p>")
+    monkeypatch.setattr(ss, "_build_hardened_url_opener",
+                        lambda: _fake_opener(payload, content_encoding="deflate"))
+    out = ss._read_url("https://e.com")
+    assert "hello deflate" in out["text"]
+
+
+def test_fetch_page_bad_gzip_passes_through_without_crash(monkeypatch):
+    # A body that lies about being gzip must not raise — it degrades to a
+    # replace-decode rather than 500'ing the whole read.
+    monkeypatch.setattr(ss, "_build_hardened_url_opener",
+                        lambda: _fake_opener(b"not really gzip", content_encoding="gzip"))
+    out = ss._read_url("https://e.com")
+    assert isinstance(out["text"], str)
+
+
+def test_fetch_page_honours_declared_charset(monkeypatch):
+    body = "café ☕".encode("latin-1", "replace")   # NB: not utf-8
+    monkeypatch.setattr(ss, "_build_hardened_url_opener",
+                        lambda: _fake_opener(b"<p>" + body + b"</p>", charset="latin-1"))
+    out = ss._read_url("https://e.com")
+    assert "caf" in out["text"]                      # decoded without raising
+
+
+def test_read_url_protocol_relative_becomes_https(monkeypatch):
+    seen = {}
+
+    def fake(u):
+        seen["u"] = u
+        return (u, "text/html", "<p>ok</p>")
+    monkeypatch.setattr(ss, "_fetch_page_raw", fake)
+    ss._read_url("//cdn.example.com/x")
+    assert seen["u"] == "https://cdn.example.com/x"
+
+
+def test_read_url_empty_body_is_ok_not_error(monkeypatch):
+    monkeypatch.setattr(ss, "_fetch_page_raw",
+                        lambda u: ("https://e.com", "text/html", ""))
+    out = ss._read_url("https://e.com")
+    assert out["text"] == "" and out["chars"] == 0 and out["truncated"] is False
+
+
+def test_read_url_non_finite_max_chars_400(monkeypatch):
+    _arm(monkeypatch)
+    assert H["read-url"][0](
+        None, {"url": "https://e.com", "max_chars": float("inf")})[1] == 400

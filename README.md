@@ -254,9 +254,12 @@ exports the whole conversation to markdown. Three tabs:
 - **Online lookups** — in Agent mode Babs can also look things up on the web:
   **FPbase** (fluorescent-protein spectra), **UniProt** (proteins), **Europe
   PMC** (papers), **NCBI/GenBank** (sequence records), **Wikipedia**, general
-  **web search**, and **patents**. Off until you tick *Settings → "Allow Babs
-  online database lookups"* — and even then only your **query string** is sent,
-  never your sequence (a local model has no internet on its own). Web + patent
+  **web search**, and **patents** — and she can **open a result and read the
+  page itself** (the full text, not just the snippet; HTML stripped to text, no
+  JavaScript, and PDFs/images are declined). Off until you tick *Settings →
+  "Allow Babs online database lookups"* — and even then only your **query
+  string** (or the URL you're reading) is sent, never your sequence (a local
+  model has no internet on its own). Web + patent
   search use the free official APIs if you add a **Brave Search** / **PatentsView**
   key in Settings, otherwise fall back to keyless Google/DuckDuckGo (best-effort,
   rate-limited).
