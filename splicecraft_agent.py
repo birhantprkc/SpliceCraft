@@ -50,7 +50,7 @@ from splicecraft_net import (_sanitize_accession)
 from splicecraft_persistence import (_safe_file_size_check, _safe_load_json)
 from splicecraft_primer import (_mut_design_inner, _mut_design_outer, _scrub_design, _scrub_qc_primers, _scrub_qc_verify)
 from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq)
-from splicecraft_search import (_PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _online_clean_query, _online_max_query_len, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _sanitize_plasmidsaurus_item_code)
+from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
 from splicecraft_seqanalysis import (_classify_part_from_plasmid, _find_orfs)
 from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _safe_color_for_picker, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
@@ -5823,6 +5823,59 @@ def _online_search_refusal():
               "endpoints stay available and never leave the machine."}, 403)
 
 
+# ── Online reference-database lookups (Babs / agent-API) ───────────────────
+# A SEPARATE egress gate from `allow_online_search` above: these lookups send
+# only a short QUERY STRING to public databases (FPbase, UniProt, Europe PMC,
+# NCBI, Wikipedia, patents, the web) — never the user's sequence. Armed by the
+# human-only `allow_online_lookups` setting (NOT in `_AGENT_SETTINGS_ALLOWLIST`,
+# so an autonomous agent can't self-arm). Read-only, but egress → arm-required.
+def _online_lookups_armed() -> bool:
+    """True only when the user has armed `allow_online_lookups` (Settings →
+    "Allow Babs online database lookups", or a hand-edited settings.json).
+    Read live so a fresh toggle takes effect without a restart."""
+    return bool(_get_setting("allow_online_lookups", False))
+
+
+def _online_lookups_refusal():
+    """Uniform 403 for a disarmed online-lookup call, telling the caller the
+    human-only path to arm it (so Babs can relay it to the user)."""
+    return ({"error":
+              "online lookups are disarmed — Babs may not query external "
+              "databases. The SpliceCraft user must enable Settings → \"Allow "
+              "Babs online database lookups\" (or set allow_online_lookups in "
+              "settings.json) first. Only a short query string is ever sent; "
+              "your sequences never leave the machine."}, 403)
+
+
+def _validate_lookup_payload(payload, cap):
+    """Validate the shared ``{query, max_hits?}`` body. Returns
+    ``(query, max_hits, None)`` on success or ``(None, 0, (err, status))`` so a
+    caller can ``if err: return err``. `cap` bounds max_hits per service."""
+    q = payload.get("query")
+    if not isinstance(q, str) or not q.strip():
+        return None, 0, ({"error": "missing or non-string 'query'"}, 400)
+    q = q.strip()
+    if len(q) > _ONLINE_LOOKUP_QUERY_MAX:
+        return None, 0, ({"error":
+                          f"'query' too long (max "
+                          f"{_ONLINE_LOOKUP_QUERY_MAX} chars)"}, 400)
+    n = _coerce_int(payload.get("max_hits", 10), name="max_hits")
+    if isinstance(n, str):
+        return None, 0, ({"error": n}, 400)
+    return q, max(1, min(n, cap)), None
+
+
+def _online_lookup_error(exc, label):
+    """Map an engine exception to an agent-API error tuple. Network / upstream
+    failures (RuntimeError, incl. the rate-limit hints) → 502; anything else is
+    logged and 500'd. Paths scrubbed either way."""
+    if isinstance(exc, RuntimeError):
+        return ({"error": f"{label} lookup failed: {_scrub_path(str(exc))}"}, 502)
+    _log.exception("agent-api %s failed", label)
+    return ({"error": f"{label} lookup failed: {_scrub_path(str(exc))}",
+             "type": type(exc).__name__}, 500)
+
+
 @_agent_endpoint("blast-online")
 def _h_blast_online(app, payload):
     """Remote NCBI BLAST via the public URL API. Body:
@@ -5941,6 +5994,179 @@ def _h_hmmer_web(app, payload):
                  "type": type(exc).__name__}, 500)
     return {"ok": True, "query_length": len(protein),
             "n_hits": len(hits), "hits": hits}
+
+
+@_agent_endpoint("fpbase-search")
+def _h_fpbase_search(app, payload):
+    """Search FPbase (fpbase.org) for FLUORESCENT PROTEINS by name. Body:
+    ``{query, max_hits?}`` (`query` is a substring, e.g. "mCherry", "GFP").
+
+    Requires the user to arm Settings → "Allow Babs online database lookups"
+    (403 otherwise); only the query string is sent — never your sequence.
+    Read-only. Each hit: name, spectra (ex/em maxima, quantum yield, extinction
+    coefficient, brightness), oligomerization, switch type, GenBank/UniProt
+    xrefs, the amino-acid sequence, and the FPbase URL."""
+    if not _online_lookups_armed():
+        return _online_lookups_refusal()
+    query, n, err = _validate_lookup_payload(payload, _ONLINE_LOOKUP_MAX_HITS)
+    if err:
+        return err
+    assert query is not None  # validated non-None above; narrows for the engine
+    try:
+        results = _fpbase_search(query, n)
+    except Exception as exc:
+        return _online_lookup_error(exc, "fpbase-search")
+    return {"ok": True, "source": "FPbase", "query": query,
+            "count": len(results), "results": results}
+
+
+@_agent_endpoint("uniprot-search")
+def _h_uniprot_search(app, payload):
+    """Search UniProtKB for PROTEINS. Body: ``{query, max_hits?}`` (`query` is
+    a UniProt query, e.g. "Cas9", "NPTII", "gene:BAR AND organism_id:3702").
+
+    Requires arming Settings → "Allow Babs online database lookups" (403
+    otherwise); only the query string leaves the box. Read-only. Each hit:
+    accession, protein name, organism, the curated FUNCTION annotation,
+    keywords, reviewed (Swiss-Prot) flag, and the UniProt URL."""
+    if not _online_lookups_armed():
+        return _online_lookups_refusal()
+    query, n, err = _validate_lookup_payload(payload, _ONLINE_LOOKUP_MAX_HITS)
+    if err:
+        return err
+    assert query is not None  # validated non-None above; narrows for the engine
+    try:
+        results = _uniprot_search(query, n)
+    except Exception as exc:
+        return _online_lookup_error(exc, "uniprot-search")
+    return {"ok": True, "source": "UniProt", "query": query,
+            "count": len(results), "results": results}
+
+
+@_agent_endpoint("literature-search")
+def _h_literature_search(app, payload):
+    """Search the scientific literature via Europe PMC (PubMed + PMC +
+    preprints). Body: ``{query, max_hits?}``.
+
+    Requires arming Settings → "Allow Babs online database lookups" (403
+    otherwise); only the query string leaves the box. Read-only. Each hit:
+    title, authors, journal, year, DOI/PMID/PMCID, a truncated abstract,
+    open-access flag, and a resolvable URL."""
+    if not _online_lookups_armed():
+        return _online_lookups_refusal()
+    query, n, err = _validate_lookup_payload(payload, _ONLINE_LOOKUP_MAX_HITS)
+    if err:
+        return err
+    assert query is not None  # validated non-None above; narrows for the engine
+    try:
+        results = _europepmc_search(query, n)
+    except Exception as exc:
+        return _online_lookup_error(exc, "literature-search")
+    return {"ok": True, "source": "Europe PMC", "query": query,
+            "count": len(results), "results": results}
+
+
+@_agent_endpoint("genbank-search")
+def _h_genbank_search(app, payload):
+    """Search NCBI for SEQUENCE RECORDS by term. Body:
+    ``{query, db?, max_hits?}`` — `db` is "nucleotide" (default) or "protein".
+
+    Requires arming Settings → "Allow Babs online database lookups" (403
+    otherwise); only the query string leaves the box. Read-only. Returns
+    `total_matches` plus records (accession, title, organism, length, URL) —
+    feed a hit's accession to the `fetch` endpoint to load the full record."""
+    if not _online_lookups_armed():
+        return _online_lookups_refusal()
+    query, n, err = _validate_lookup_payload(payload, _ONLINE_LOOKUP_MAX_HITS)
+    if err:
+        return err
+    assert query is not None  # validated non-None above; narrows for the engine
+    db = str(payload.get("db") or "nucleotide").lower().strip()
+    if db == "nuccore":
+        db = "nucleotide"
+    if db not in ("nucleotide", "protein"):
+        return ({"error": "'db' must be 'nucleotide' or 'protein'"}, 400)
+    try:
+        results, total = _ncbi_db_search(query, db, n)
+    except Exception as exc:
+        return _online_lookup_error(exc, "genbank-search")
+    return {"ok": True, "source": "NCBI", "db": db, "query": query,
+            "total_matches": total, "count": len(results), "results": results}
+
+
+@_agent_endpoint("wikipedia-search")
+def _h_wikipedia_search(app, payload):
+    """Search Wikipedia for encyclopedic background. Body:
+    ``{query, max_hits?}``.
+
+    Requires arming Settings → "Allow Babs online database lookups" (403
+    otherwise); only the query string leaves the box. Read-only. Each hit:
+    title, a lead-section summary (or search snippet), and the article URL."""
+    if not _online_lookups_armed():
+        return _online_lookups_refusal()
+    query, n, err = _validate_lookup_payload(payload, _ONLINE_LOOKUP_MAX_HITS)
+    if err:
+        return err
+    assert query is not None  # validated non-None above; narrows for the engine
+    try:
+        results = _wikipedia_search(query, n)
+    except Exception as exc:
+        return _online_lookup_error(exc, "wikipedia-search")
+    return {"ok": True, "source": "Wikipedia", "query": query,
+            "count": len(results), "results": results}
+
+
+@_agent_endpoint("web-search")
+def _h_web_search(app, payload):
+    """General web search. Body: ``{query, max_hits?}``.
+
+    Requires arming Settings → "Allow Babs online database lookups" (403
+    otherwise); only the query string leaves the box. Read-only. Uses the
+    official Brave Search API when a `brave_search_api_key` is set in Settings
+    (robust); otherwise falls back to DuckDuckGo's keyless HTML endpoint, which
+    is BEST-EFFORT and rate-limited (a 502 with a "rate-limited" hint if
+    blocked). Each hit: title, url, snippet."""
+    if not _online_lookups_armed():
+        return _online_lookups_refusal()
+    query, n, err = _validate_lookup_payload(payload, _ONLINE_LOOKUP_MAX_HITS)
+    if err:
+        return err
+    assert query is not None  # validated non-None above; narrows for the engine
+    brave_key = (_get_setting("brave_search_api_key", "") or "").strip()
+    try:
+        results = _web_search(query, n, brave_key)
+    except Exception as exc:
+        return _online_lookup_error(exc, "web-search")
+    return {"ok": True, "source": "web", "query": query,
+            "provider": "Brave" if brave_key else "DuckDuckGo (best-effort)",
+            "count": len(results), "results": results}
+
+
+@_agent_endpoint("patent-search")
+def _h_patent_search(app, payload):
+    """Search patents. Body: ``{query, max_hits?}``.
+
+    Requires arming Settings → "Allow Babs online database lookups" (403
+    otherwise); only the query string leaves the box. Read-only. Uses the
+    official PatentsView API when a `patentsview_api_key` is set in Settings
+    (robust, US patents); otherwise falls back to Google Patents' keyless XHR
+    endpoint, which is BEST-EFFORT and rate-limited (a 502 with a "rate-limited"
+    hint if blocked). Returns `total_matches` plus records (number, title,
+    snippet, assignee, dates, Google Patents URL)."""
+    if not _online_lookups_armed():
+        return _online_lookups_refusal()
+    query, n, err = _validate_lookup_payload(payload, _ONLINE_LOOKUP_MAX_HITS)
+    if err:
+        return err
+    assert query is not None  # validated non-None above; narrows for the engine
+    pv_key = (_get_setting("patentsview_api_key", "") or "").strip()
+    try:
+        results, total = _patent_search(query, n, pv_key)
+    except Exception as exc:
+        return _online_lookup_error(exc, "patent-search")
+    return {"ok": True, "source": "patents", "query": query,
+            "provider": "PatentsView" if pv_key else "Google Patents (best-effort)",
+            "total_matches": total, "count": len(results), "results": results}
 
 
 @_agent_endpoint("list-parts-bins")

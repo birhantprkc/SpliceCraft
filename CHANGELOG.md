@@ -14,6 +14,27 @@
 
 ---
 
+## [1.0.115] — 2026-07-01
+
+### New features
+
+- **Babs can look things up online.** In Agent mode, Babs can now search the
+  web and public databases directly instead of relying only on what a local
+  model happens to remember: **FPbase** (fluorescent-protein spectra &
+  properties), **UniProt** (proteins), **Europe PMC** (papers), **NCBI /
+  GenBank** (sequence records — hand the accession to a fetch to load it),
+  **Wikipedia**, general **web search**, and **patents**.
+  - **Off by default.** Turn it on with *Settings → "Allow Babs online database
+    lookups"*. Only your **query string** is ever sent — your sequences never
+    leave the machine (this is separate from the BLAST/HMMER online toggle,
+    which stays off). An automated agent can't flip it on itself.
+  - **Optional keys for robust web + patent search.** Add a free **Brave
+    Search** key and/or a **PatentsView** key under *Settings → "Online lookup
+    API keys"* to use the official APIs. Without keys, web/patent search fall
+    back to keyless Google/DuckDuckGo, which are best-effort and get
+    rate-limited. Keys are stored locally, redacted from logs, and never
+    readable by an agent.
+
 ## [1.0.114] — 2026-07-01
 
 Codebase-wide adversarial audit — correctness, edge-case, security, and performance fixes.

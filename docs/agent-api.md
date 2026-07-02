@@ -197,6 +197,25 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   it on itself; the in-process blast / hmmscan stay local and never
   consult it. Both block for minutes on the remote job (502 on a
   network / server error) and are concurrency-capped.
+- **Online reference-database lookups** (off by default) — fpbase-search
+  (FPbase fluorescent proteins: spectra, oligomerization, xrefs, sequence),
+  uniprot-search (UniProtKB proteins: function, organism, keywords),
+  literature-search (Europe PMC papers: title/authors/journal/DOI/abstract),
+  genbank-search (NCBI `nucleotide`/`protein` term search → accessions you can
+  `fetch`; returns `total_matches`), wikipedia-search (lead-section summaries),
+  web-search (general web) and patent-search. All read-only. They send only a
+  QUERY STRING to the public database — never your sequence (distinct from the
+  BLAST/HMMER egress above) — but egress still requires the SpliceCraft user to
+  arm Settings → "Allow Babs online database lookups" (`403` otherwise). That
+  setting is the HUMAN half of the gate: deliberately NOT in the agent settings
+  allowlist, so an agent can't self-arm. web-search uses the Brave Search API
+  when a `brave_search_api_key` is set (else keyless DuckDuckGo, best-effort);
+  patent-search uses PatentsView when a `patentsview_api_key` is set (else
+  keyless Google Patents, best-effort). Both keys are secret — redacted in logs
+  and unreadable via the agent settings surface. A keyless provider that is
+  rate-limited returns `502` with a hint to add a key. Upstream/network failures
+  → `502`. Every fetch routes through the SSRF-hardened opener with the
+  fail-closed DEMO_MODE egress gate.
 - **RNA structure + RBS** — fold-rna (minimum-free-energy secondary
   structure: dot-bracket fold + ΔG in kcal/mol, pure-Python Turner-2004,
   no external dependency); cofold-rna (bound-state heterodimer ΔG of two

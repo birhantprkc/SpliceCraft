@@ -1569,6 +1569,10 @@ def _get_setting(key: str, default: "_Any" = None) -> "_Any":
 # allowlist so a remote agent can't read them back.
 _SENSITIVE_SETTING_KEYS: "frozenset[str]" = frozenset({
     "plasmidsaurus_client_secret",
+    # Optional online-lookup provider keys (web + patent search). Secret, and
+    # kept out of `_AGENT_SETTINGS_ALLOWLIST` so an agent can't read them back.
+    "brave_search_api_key",
+    "patentsview_api_key",
 })
 
 

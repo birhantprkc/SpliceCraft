@@ -2074,3 +2074,458 @@ def _plasmidsaurus_fetch_item_zip(item_code: str, dest_dir: "str | Path",
         link, dest, max_bytes=_PLASMIDSAURUS_DOWNLOAD_MAX_BYTES,
         progress_cb=progress_cb, cancel_check_cb=cancel_check_cb)
     return dest
+
+
+# ── Online reference-database lookups (Babs / agent-API `*-search`) ─────────
+# DISTINCT from the BLAST/HMMER egress path above: these send only a short
+# QUERY STRING (a name / search term) to public databases — never the user's
+# sequence. Armed by the SEPARATE `allow_online_lookups` setting (see the
+# agent-side `_online_lookups_armed`). Every fetch still routes through the
+# shared hardened opener (`_online_http` → `_build_hardened_url_opener`): SSRF
+# host filter, bounded redirects, https-only, and the fail-closed DEMO_MODE
+# egress gate. Never log query/response content ([INV-38]).
+_ONLINE_LOOKUP_MAX_HITS = 25              # polite hit cap per public service
+_ONLINE_LOOKUP_TIMEOUT_S = _NCBI_TIMEOUT_S
+_ONLINE_LOOKUP_MAX_RESPONSE_BYTES = _NCBI_MAX_RESPONSE_BYTES   # 4 MB
+_ONLINE_LOOKUP_QUERY_MAX = 400            # reject absurd query strings
+# Google Patents' XHR and DuckDuckGo's HTML endpoint refuse a non-browser UA
+# (they answer a "Sorry…" block page instead). Used ONLY for those keyless
+# best-effort scrapers; the official JSON APIs get the honest SpliceCraft UA.
+_ONLINE_LOOKUP_BROWSER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+)
+# FPbase stores oligomerization + switching as short codes; map the common
+# ones to readable words, pass an unknown code through unchanged.
+_FPBASE_AGG = {"m": "monomer", "d": "dimer", "td": "tandem dimer",
+               "wd": "weak dimer", "t": "tetramer"}
+_FPBASE_SWITCH = {"b": "basic", "pa": "photoactivatable",
+                  "ps": "photoswitchable", "pc": "photoconvertible",
+                  "tf": "timer", "o": "other", "c": "chromoprotein"}
+
+
+def _lookup_clean_html(s: "_Any") -> str:
+    """Strip HTML tags + unescape entities from a snippet/abstract fragment
+    (search APIs and scrapers return `<b>`-marked-up text). Non-string → ''."""
+    import html as _html
+    if not isinstance(s, str):
+        return ""
+    return _html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
+
+
+def _online_lookup_json(url: str, *, headers: "dict | None" = None,
+                        browser_ua: bool = False) -> "_Any":
+    """GET `url` through the hardened opener and parse JSON. `browser_ua`
+    swaps in a browser User-Agent for the endpoints that refuse ours. Raises
+    RuntimeError on a network/HTTP failure or a non-JSON body — the agent
+    handlers map that to a 502."""
+    hdrs: "dict[str, str]" = {"Accept": "application/json"}
+    if browser_ua:
+        hdrs["User-Agent"] = _ONLINE_LOOKUP_BROWSER_UA
+    if headers:
+        hdrs.update(headers)
+    body = _online_http(url, headers=hdrs, timeout=_ONLINE_LOOKUP_TIMEOUT_S,
+                        max_bytes=_ONLINE_LOOKUP_MAX_RESPONSE_BYTES)
+    try:
+        return json.loads(body)
+    except ValueError as exc:
+        raise RuntimeError(f"non-JSON response from server: {exc}")
+
+
+def _fpbase_search(query: str,
+                   max_hits: int = _ONLINE_LOOKUP_MAX_HITS) -> "list[dict]":
+    """FPbase (fpbase.org) fluorescent-protein lookup by name (substring).
+    Returns compact records: spectra (ex/em maxima, QY, extinction,
+    brightness), oligomerization, switch type, GenBank/UniProt xrefs, the
+    aa sequence, and the FPbase URL."""
+    import urllib.parse as _up
+    qs = _up.urlencode({"format": "json", "name__icontains": query})
+    data = _online_lookup_json(f"https://www.fpbase.org/api/proteins/?{qs}")
+    rows = data.get("results", data) if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return []
+    out: "list[dict]" = []
+    for p in rows[:max_hits]:
+        if not isinstance(p, dict):
+            continue
+        name = (p.get("name") or "").strip()
+        slug = (p.get("slug") or "").strip()
+        if not name:
+            continue
+        states = p.get("states") or []
+        default = next((s for s in states if isinstance(s, dict)
+                        and s.get("slug") == p.get("default_state")), None)
+        if default is None:
+            default = states[0] if states and isinstance(states[0], dict) else {}
+        agg = p.get("agg")
+        switch = p.get("switch_type")
+        out.append({
+            "name": name,
+            "ex_max": default.get("ex_max"),
+            "em_max": default.get("em_max"),
+            "quantum_yield": default.get("qy"),
+            "ext_coeff": default.get("ext_coeff"),
+            "brightness": default.get("brightness"),
+            "oligomerization": (_FPBASE_AGG.get(agg, agg)
+                                if isinstance(agg, str) else agg),
+            "switch_type": (_FPBASE_SWITCH.get(switch, switch)
+                            if isinstance(switch, str) else switch),
+            "genbank": p.get("genbank") or None,
+            "uniprot": p.get("uniprot") or None,
+            "seq": p.get("seq") or None,
+            "url": (f"https://www.fpbase.org/protein/{slug}/"
+                    if slug else "https://www.fpbase.org/"),
+        })
+    return out
+
+
+def _uniprot_name(entry: dict) -> str:
+    desc = entry.get("proteinDescription") or {}
+    for slot in ("recommendedName", "submissionNames"):
+        v = desc.get(slot)
+        if isinstance(v, list):
+            v = v[0] if v else None
+        if isinstance(v, dict):
+            fn = (v.get("fullName") or {}).get("value")
+            if fn:
+                return fn
+    return entry.get("uniProtkbId") or entry.get("primaryAccession") or "protein"
+
+
+def _uniprot_function(entry: dict) -> "str | None":
+    for c in (entry.get("comments") or []):
+        if isinstance(c, dict) and c.get("commentType") == "FUNCTION":
+            vals = [str(t.get("value")) for t in (c.get("texts") or [])
+                    if isinstance(t, dict) and t.get("value")]
+            if vals:
+                s = " ".join(vals)
+                return s[:600] + ("…" if len(s) > 600 else "")
+    return None
+
+
+def _uniprot_search(query: str,
+                    max_hits: int = _ONLINE_LOOKUP_MAX_HITS) -> "list[dict]":
+    """UniProtKB protein lookup. Returns accession, protein name, organism,
+    the curated FUNCTION comment, keywords, and reviewed (Swiss-Prot) flag."""
+    import urllib.parse as _up
+    qs = _up.urlencode({
+        "query": query, "format": "json", "size": max_hits,
+        "fields": "accession,id,protein_name,organism_name,cc_function,keyword",
+    })
+    data = _online_lookup_json(f"https://rest.uniprot.org/uniprotkb/search?{qs}")
+    results = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(results, list):
+        return []
+    out: "list[dict]" = []
+    for e in results[:max_hits]:
+        if not isinstance(e, dict):
+            continue
+        acc = (e.get("primaryAccession") or "").strip()
+        et = e.get("entryType") or ""
+        out.append({
+            "accession": acc,
+            "name": _uniprot_name(e),
+            "organism": (e.get("organism") or {}).get("scientificName"),
+            "function": _uniprot_function(e),
+            "keywords": [k.get("name") for k in (e.get("keywords") or [])
+                         if isinstance(k, dict) and k.get("name")][:12],
+            "reviewed": "Swiss-Prot" in et,
+            "url": (f"https://www.uniprot.org/uniprotkb/{acc}"
+                    if acc else "https://www.uniprot.org/"),
+        })
+    return out
+
+
+def _europepmc_search(query: str,
+                      max_hits: int = _ONLINE_LOOKUP_MAX_HITS) -> "list[dict]":
+    """Europe PMC literature search (PubMed + PMC + Agricola + preprints).
+    Returns title, authors, journal, year, DOI/PMID/PMCID, a truncated
+    abstract, open-access flag, and a resolvable URL."""
+    import urllib.parse as _up
+    qs = _up.urlencode({"query": query, "format": "json",
+                        "pageSize": max_hits, "resultType": "core"})
+    data = _online_lookup_json(
+        f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?{qs}")
+    results = ((data.get("resultList") or {}).get("result")
+               if isinstance(data, dict) else None)
+    if not isinstance(results, list):
+        return []
+    out: "list[dict]" = []
+    for r in results[:max_hits]:
+        if not isinstance(r, dict):
+            continue
+        doi, pmid, pmcid = r.get("doi"), r.get("pmid"), r.get("pmcid")
+        if doi:
+            url = f"https://doi.org/{doi}"
+        elif pmid:
+            url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+        elif pmcid:
+            url = f"https://europepmc.org/article/PMC/{pmcid}"
+        else:
+            url = "https://europepmc.org/"
+        abstract = r.get("abstractText") or ""
+        out.append({
+            "title": _lookup_clean_html(r.get("title")),
+            "authors": r.get("authorString"),
+            "journal": r.get("journalTitle") or r.get("source"),
+            "year": r.get("pubYear"),
+            "doi": doi, "pmid": pmid, "pmcid": pmcid,
+            "abstract": ((_lookup_clean_html(abstract)[:800]
+                          + ("…" if len(abstract) > 800 else ""))
+                         if abstract else None),
+            "is_open_access": r.get("isOpenAccess") == "Y",
+            "url": url,
+        })
+    return out
+
+
+def _ncbi_db_search(query: str, db: str = "nucleotide",
+                    max_hits: int = 10) -> "tuple[list[dict], int | None]":
+    """NCBI Entrez term search over `nucleotide` or `protein` (esearch →
+    esummary). Returns (records, total_matches); each record carries
+    accession, title, organism, length, and an ncbi.nlm.nih.gov URL — the
+    accession feeds the existing `fetch` endpoint to pull the full record."""
+    import urllib.parse as _up
+    eutils = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+    es = eutils + "esearch.fcgi?" + _up.urlencode(
+        {"db": db, "term": query, "retmode": "json", "retmax": max_hits})
+    data = _online_lookup_json(es)
+    er = data.get("esearchresult") or {} if isinstance(data, dict) else {}
+    ids = [i for i in (er.get("idlist") or []) if isinstance(i, str)]
+    cnt = er.get("count")
+    total: "int | None" = (int(cnt) if isinstance(cnt, str)
+                           and cnt.isdigit() else None)
+    if not ids:
+        return [], total
+    su = eutils + "esummary.fcgi?" + _up.urlencode(
+        {"db": db, "id": ",".join(ids), "retmode": "json"})
+    sdata = _online_lookup_json(su)
+    res = (sdata.get("result") or {}) if isinstance(sdata, dict) else {}
+    is_prot = db == "protein"
+    out: "list[dict]" = []
+    for uid in (res.get("uids") or ids):
+        e = res.get(uid)
+        if not isinstance(e, dict):
+            continue
+        acc = (e.get("accessionversion") or e.get("caption") or "").strip()
+        out.append({
+            "accession": acc,
+            "title": (e.get("title") or "").strip(),
+            "organism": e.get("organism"),
+            "length": e.get("slen"),
+            "moltype": e.get("moltype") or e.get("biomol"),
+            "update_date": e.get("updatedate"),
+            "url": (f"https://www.ncbi.nlm.nih.gov/"
+                    f"{'protein' if is_prot else 'nuccore'}/{acc}"
+                    if acc else "https://www.ncbi.nlm.nih.gov/"),
+        })
+    return out, total
+
+
+def _wikipedia_search(query: str,
+                      max_hits: int = _ONLINE_LOOKUP_MAX_HITS) -> "list[dict]":
+    """Wikipedia (MediaWiki) search. One search call for the hit list, then a
+    bounded second call for the lead-section plaintext of the top results;
+    hits beyond that carry the search snippet. Returns title, summary, URL."""
+    import urllib.parse as _up
+    api = "https://en.wikipedia.org/w/api.php?"
+    s = api + _up.urlencode({
+        "action": "query", "list": "search", "srsearch": query,
+        "srlimit": max_hits, "srprop": "snippet", "format": "json"})
+    data = _online_lookup_json(s)
+    hits = ((data.get("query") or {}).get("search")
+            if isinstance(data, dict) else None)
+    if not isinstance(hits, list) or not hits:
+        return []
+    top = [str(h.get("pageid")) for h in hits[:5]
+           if isinstance(h, dict) and h.get("pageid")]
+    extracts: "dict[str, str]" = {}
+    if top:
+        ex = api + _up.urlencode({
+            "action": "query", "prop": "extracts", "exintro": 1,
+            "explaintext": 1, "redirects": 1, "format": "json",
+            "pageids": "|".join(top)})
+        try:
+            pages = (((_online_lookup_json(ex).get("query") or {})
+                      .get("pages")) or {})
+            for pid, pg in pages.items():
+                if isinstance(pg, dict) and pg.get("extract"):
+                    extracts[str(pg.get("pageid") or pid)] = pg["extract"]
+        except RuntimeError:
+            pass    # extracts are best-effort enrichment; snippets still ship
+    out: "list[dict]" = []
+    for h in hits[:max_hits]:
+        if not isinstance(h, dict):
+            continue
+        pid = h.get("pageid")
+        ext = extracts.get(str(pid))
+        summary = ((ext[:600] + ("…" if len(ext) > 600 else "")) if ext
+                   else _lookup_clean_html(h.get("snippet")))
+        out.append({
+            "title": (h.get("title") or "").strip(),
+            "summary": summary,
+            "url": (f"https://en.wikipedia.org/?curid={pid}"
+                    if pid else "https://en.wikipedia.org/"),
+        })
+    return out
+
+
+def _ddg_parse_html(html_text: str) -> "list[dict]":
+    """Parse the DuckDuckGo HTML-endpoint result page into {title, url,
+    snippet} dicts. Raises RuntimeError if DDG served a block/anomaly page
+    (keyless search is rate-limited)."""
+    import urllib.parse as _up
+    if "result__a" not in html_text:
+        low = html_text.lower()
+        if ("anomaly" in low or "blocked" in low
+                or "<title>sorry" in low[:600]):
+            raise RuntimeError(
+                "DuckDuckGo blocked the request (keyless search is "
+                "rate-limited). Try again shortly, or set a Brave Search "
+                "API key in Settings for robust web search.")
+        return []
+    anchors = re.findall(
+        r'result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html_text, re.DOTALL)
+    snippets = re.findall(
+        r'result__snippet"[^>]*>(.*?)</a>', html_text, re.DOTALL)
+    out: "list[dict]" = []
+    for i, (href, title) in enumerate(anchors):
+        url = href
+        if "uddg=" in href:
+            try:
+                probe = ("https:" + href) if href.startswith("//") else href
+                q = _up.parse_qs(_up.urlsplit(probe).query)
+                if q.get("uddg"):
+                    url = q["uddg"][0]
+            except Exception:
+                pass
+        out.append({
+            "title": _lookup_clean_html(title),
+            "url": url,
+            "snippet": _lookup_clean_html(snippets[i]) if i < len(snippets) else "",
+        })
+    return out
+
+
+def _web_search(query: str, max_hits: int = 10,
+                brave_key: str = "") -> "list[dict]":
+    """General web search. With a Brave Search API key → the official Brave
+    API (robust). Without → DuckDuckGo's HTML endpoint (keyless, best-effort,
+    rate-limited). Returns {title, url, snippet}."""
+    import urllib.parse as _up
+    if brave_key:
+        qs = _up.urlencode({"q": query, "count": max_hits})
+        data = _online_lookup_json(
+            f"https://api.search.brave.com/res/v1/web/search?{qs}",
+            headers={"X-Subscription-Token": brave_key})
+        results = ((data.get("web") or {}).get("results")
+                   if isinstance(data, dict) else None) or []
+        out: "list[dict]" = []
+        for r in results[:max_hits]:
+            if not isinstance(r, dict):
+                continue
+            out.append({"title": _lookup_clean_html(r.get("title")),
+                        "url": r.get("url"),
+                        "snippet": _lookup_clean_html(r.get("description"))})
+        return out
+    body = _online_http(
+        "https://html.duckduckgo.com/html/?" + _up.urlencode({"q": query}),
+        headers={"User-Agent": _ONLINE_LOOKUP_BROWSER_UA},
+        timeout=_ONLINE_LOOKUP_TIMEOUT_S,
+        max_bytes=_ONLINE_LOOKUP_MAX_RESPONSE_BYTES)
+    return _ddg_parse_html(body)[:max_hits]
+
+
+def _google_patents_parse(data: "_Any",
+                          max_hits: int) -> "tuple[list[dict], int | None]":
+    res = (data or {}).get("results") or {} if isinstance(data, dict) else {}
+    total = res.get("total_num_results")
+    out: "list[dict]" = []
+    for cl in (res.get("cluster") or []):
+        for item in (cl.get("result") or []):
+            if not isinstance(item, dict):
+                continue
+            p = item.get("patent") or {}
+            num = (p.get("publication_number") or "").strip()
+            pid = (item.get("id") or "").strip()          # "patent/XX/en"
+            if not num and pid.startswith("patent/"):
+                parts = pid.split("/")
+                num = parts[1] if len(parts) > 1 else ""
+            if not num:
+                continue
+            out.append({
+                "number": num,
+                "title": _lookup_clean_html(p.get("title")),
+                "snippet": _lookup_clean_html(p.get("snippet")),
+                "assignee": _lookup_clean_html(p.get("assignee")) or None,
+                "inventor": _lookup_clean_html(p.get("inventor")) or None,
+                "priority_date": p.get("priority_date") or None,
+                "grant_date": p.get("grant_date") or None,
+                "filing_date": p.get("filing_date") or None,
+                "url": f"https://patents.google.com/patent/{num}/en",
+            })
+            if len(out) >= max_hits:
+                return out, total
+    return out, total
+
+
+def _patentsview_search(query: str, max_hits: int,
+                        key: str) -> "tuple[list[dict], int | None]":
+    import urllib.parse as _up
+    qs = _up.urlencode({
+        "q": json.dumps({"_text_any": {"patent_title": query}}),
+        "f": json.dumps(["patent_id", "patent_title", "patent_date",
+                         "patent_abstract", "assignees.assignee_organization"]),
+        "o": json.dumps({"size": max_hits}),
+    })
+    data = _online_lookup_json(
+        f"https://search.patentsview.org/api/v1/patent/?{qs}",
+        headers={"X-Api-Key": key})
+    patents = (data.get("patents")
+               if isinstance(data, dict) else None) or []
+    total = (data.get("total_hits") or data.get("count")
+             if isinstance(data, dict) else None)
+    out: "list[dict]" = []
+    for p in patents[:max_hits]:
+        if not isinstance(p, dict):
+            continue
+        num = (p.get("patent_id") or "").strip()
+        assignees = p.get("assignees") or []
+        org = None
+        if assignees and isinstance(assignees[0], dict):
+            org = assignees[0].get("assignee_organization")
+        abstract = p.get("patent_abstract") or ""
+        out.append({
+            "number": num,
+            "title": _lookup_clean_html(p.get("patent_title")),
+            "snippet": ((_lookup_clean_html(abstract)[:600]
+                         + ("…" if len(abstract) > 600 else ""))
+                        if abstract else ""),
+            "assignee": org,
+            "grant_date": p.get("patent_date") or None,
+            "url": (f"https://patents.google.com/patent/US{num}/en"
+                    if num else "https://patentsview.org/"),
+        })
+    return out, total
+
+
+def _patent_search(query: str, max_hits: int = 10,
+                   patentsview_key: str = "") -> "tuple[list[dict], int | None]":
+    """Patent search. With a PatentsView API key → the official PatentsView
+    API (robust, US patents). Without → Google Patents' XHR endpoint (keyless,
+    best-effort, rate-limited). Returns (records, total_matches)."""
+    import urllib.parse as _up
+    if patentsview_key:
+        return _patentsview_search(query, max_hits, patentsview_key)
+    url = ("https://patents.google.com/xhr/query?url=q%3D"
+           + _up.quote(query) + "&exp=")
+    body = _online_http(url, headers={"User-Agent": _ONLINE_LOOKUP_BROWSER_UA},
+                        timeout=_ONLINE_LOOKUP_TIMEOUT_S,
+                        max_bytes=_ONLINE_LOOKUP_MAX_RESPONSE_BYTES)
+    try:
+        data = json.loads(body)
+    except ValueError:
+        raise RuntimeError(
+            "Google Patents blocked the request (keyless search is "
+            "rate-limited). Try again shortly, or set a PatentsView API key "
+            "in Settings for robust patent search.")
+    return _google_patents_parse(data, max_hits)

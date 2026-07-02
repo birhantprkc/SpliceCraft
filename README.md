@@ -251,6 +251,15 @@ exports the whole conversation to markdown. Three tabs:
   live in the app**. By default she **asks before every write** (a one-tap
   approve/deny); `/autonomy auto` lets her run unattended, `/autonomy readonly`
   keeps her to read-only. Destructive whole-library wipes are never reachable.
+- **Online lookups** — in Agent mode Babs can also look things up on the web:
+  **FPbase** (fluorescent-protein spectra), **UniProt** (proteins), **Europe
+  PMC** (papers), **NCBI/GenBank** (sequence records), **Wikipedia**, general
+  **web search**, and **patents**. Off until you tick *Settings → "Allow Babs
+  online database lookups"* — and even then only your **query string** is sent,
+  never your sequence (a local model has no internet on its own). Web + patent
+  search use the free official APIs if you add a **Brave Search** / **PatentsView**
+  key in Settings, otherwise fall back to keyless Google/DuckDuckGo (best-effort,
+  rate-limited).
 - **Model** — organize your models into **collections**, exactly like plasmids:
   make/rename/delete collections, **mark** rows (Space) to **move** them between
   collections or **uninstall** them in bulk, and file a model into a collection
