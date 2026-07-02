@@ -357,6 +357,18 @@ def _clone_cached_record(rec):
     return out
 
 
+def _gb_cache_key(text: str) -> str:
+    """128-bit content key for `_GB_PARSE_CACHE`. Plain `hash(text)` is only
+    64-bit, so a collision between two DIFFERENT GenBank texts would return the
+    WRONG cached SeqRecord from this mission-critical serialization path.
+    blake2b-128 makes that collision astronomically impossible without the
+    memory cost of storing every source text or a per-hit full-string compare."""
+    import hashlib
+    return hashlib.blake2b(
+        text.encode("utf-8", "surrogatepass"), digest_size=16,
+    ).hexdigest()
+
+
 def _gb_text_to_record(text: str, *, cache: bool = True):
     """Parse GenBank format text back to a SeqRecord.
 
@@ -368,7 +380,7 @@ def _gb_text_to_record(text: str, *, cache: bool = True):
     otherwise allocate intermediate parser objects without ceiling.
 
     Results are LRU-cached (`_GB_PARSE_CACHE`, capped at
-    `_GB_PARSE_CACHE_MAX`) keyed on `hash(text)`. Returned records are
+    `_GB_PARSE_CACHE_MAX`) keyed on a 128-bit content hash. Returned records are
     isolation copies (`_clone_cached_record` — shares the immutable
     `Seq`/locations, duplicates the mutable feature/qualifier containers)
     so callers can mutate freely (pitfall #17 contract). Empty-string /
@@ -393,7 +405,7 @@ def _gb_text_to_record(text: str, *, cache: bool = True):
             f"{_GB_TEXT_MAX_BYTES:,} cap)"
         )
     if cache:
-        key = hash(text)
+        key = _gb_cache_key(text)
         with _GB_PARSE_CACHE_LOCK:
             hit = _GB_PARSE_CACHE.get(key)
             if hit is not None:
@@ -416,7 +428,10 @@ def _gb_text_to_record(text: str, *, cache: bool = True):
         with _GB_PARSE_CACHE_LOCK:
             # Store an isolation copy so the caller (who owns `rec`) can keep
             # mutating it without poisoning the cache; return `rec` itself.
-            _GB_PARSE_CACHE[hash(text)] = _clone_cached_record(rec)
+            # Recompute the key here (rather than reuse the lookup block's
+            # `key`) so it's unconditionally bound in this separate `if cache:`
+            # block — miss-path only, so the extra hash is dwarfed by the parse.
+            _GB_PARSE_CACHE[_gb_cache_key(text)] = _clone_cached_record(rec)
             while len(_GB_PARSE_CACHE) > _GB_PARSE_CACHE_MAX:
                 _GB_PARSE_CACHE.popitem(last=False)
     return rec

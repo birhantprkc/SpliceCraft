@@ -42,6 +42,36 @@ _HMM_DB_BAD_CONTENT_TYPES: frozenset[str] = frozenset({
 })
 
 
+def _ip_is_non_public(addr) -> bool:
+    """True if an ``ipaddress`` object is private / loopback / link-local /
+    reserved / multicast / unspecified — i.e. must NOT be fetched.
+
+    For IPv6 addresses that EMBED an IPv4 address — IPv4-mapped
+    ``::ffff:a.b.c.d``, 6to4 (``2002::/16``), Teredo — the embedded IPv4 is
+    classified TOO. CPython's ``is_private`` / ``is_link_local`` only delegate
+    to the embedded address on 3.13+ and the 3.12.4 / 3.11.9 / 3.10.14
+    backports (gh-113171); older still-shipping LTS interpreters (Ubuntu
+    24.04's 3.12.3, 22.04's 3.10.6, Debian bookworm's 3.11.2) report
+    ``::ffff:169.254.169.254`` as PUBLIC — an SSRF straight to the cloud-
+    metadata endpoint. We do that delegation ourselves so this security
+    boundary never depends on the interpreter's exact point release."""
+    def _flagged(a) -> bool:
+        return (a.is_private or a.is_loopback or a.is_link_local
+                or a.is_reserved or a.is_multicast or a.is_unspecified)
+    if _flagged(addr):
+        return True
+    for _attr in ("ipv4_mapped", "sixtofour"):
+        embedded = getattr(addr, _attr, None)
+        if embedded is not None and _flagged(embedded):
+            return True
+    teredo = getattr(addr, "teredo", None)   # (server_ip, client_ip) or None
+    if teredo:
+        for t in teredo:
+            if t is not None and _flagged(t):
+                return True
+    return False
+
+
 def _assert_public_host(url: str) -> None:
     """Resolve the host in `url` and refuse private / loopback / link-local /
     reserved / multicast / unspecified addresses — blocking SSRF to internal
@@ -73,12 +103,26 @@ def _assert_public_host(url: str) -> None:
             addr = ipaddress.ip_address(ip.split("%", 1)[0])  # strip IPv6 zone
         except ValueError:
             continue
-        if (addr.is_private or addr.is_loopback or addr.is_link_local
-                or addr.is_reserved or addr.is_multicast
-                or addr.is_unspecified):
+        if _ip_is_non_public(addr):
             raise urllib.error.URLError(
                 f"refusing fetch to non-public address {ip} (host {host!r})"
             )
+
+
+def _require_http_scheme(url: str) -> None:
+    """Reject any non-http(s) URL scheme. ``urllib.request.build_opener``
+    still installs urllib's DEFAULT ``file://`` / ``ftp://`` / ``data:``
+    handlers alongside the ones we pass, so without this a caller — or an
+    http-origin redirect that the https→http downgrade guard doesn't cover —
+    could reach the local filesystem or an internal FTP service. The hardened
+    opener only ever fetches http/https; enforce that explicitly."""
+    from urllib.parse import urlsplit
+    import urllib.error
+    scheme = (urlsplit(url).scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise urllib.error.URLError(
+            f"refusing non-http(s) URL scheme {scheme!r} in {url!r}"
+        )
 
 
 def _build_hardened_url_opener():
@@ -112,7 +156,10 @@ def _build_hardened_url_opener():
                     headers, fp,
                 )
             # SSRF guard: a hostile/misconfigured mirror could 30x a public URL
-            # to an internal host. Re-check the redirect target's address.
+            # to an internal host (or to a non-http scheme — the parent handler
+            # permits http/https/ftp, so re-check to drop ftp). Re-validate the
+            # redirect target's scheme AND resolved address.
+            _require_http_scheme(str(newurl))
             _assert_public_host(str(newurl))
             return super().redirect_request(
                 req, fp, code, msg, headers, newurl,
@@ -131,6 +178,7 @@ def _build_hardened_url_opener():
     def _guarded_open(fullurl, *args, **kwargs):
         _u = (fullurl.get_full_url()
               if hasattr(fullurl, "get_full_url") else fullurl)
+        _require_http_scheme(_u)
         _assert_public_host(_u)
         return _orig_open(fullurl, *args, **kwargs)
 

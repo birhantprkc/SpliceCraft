@@ -1503,6 +1503,33 @@ def _assemble_operon(genes, *, promoter='', terminator='',
 # ──────────────────────────────────────────────────────────────────────────
 
 @_timed("op.scan_restriction", threshold_ms=25)
+def _iter_match_starts(pat, s: str):
+    """Yield the start index of EVERY match of `pat` in `s`, INCLUDING
+    self-overlapping tandem matches.
+
+    `re.finditer` is non-overlapping: it resumes each search past the end of
+    the previous match, so it silently drops the second of two overlapping
+    recognition sites — a site whose string has a border (a proper prefix that
+    equals a proper suffix), e.g. NotI ``GCGGCCGC`` (border "GC"), BstUI
+    ``CGCG``, HhaI ``GCGC``. That undercounts cutters: a real 2-cutter is
+    badged ``unique`` (the user then linearises on a site that actually cuts
+    twice) and `_enzyme_cuts` hands too few fragments into the cloning
+    simulation. Advancing the search ONE base past each match's start recovers
+    every occurrence — the same overlap-preserving intent as the ``(?=...)``
+    lookahead already used by `_forbidden_hit_set` / `_search_subsequence`.
+    Yields in ascending start order (like `finditer`), so downstream `seen`
+    dedup and result ordering are unchanged bar the recovered sites."""
+    pos = 0
+    slen = len(s)
+    while pos <= slen:
+        m = pat.search(s, pos)
+        if m is None:
+            break
+        start = m.start()
+        yield start
+        pos = start + 1   # +1 (not m.end()) keeps overlapping tandem hits
+
+
 def _scan_restriction_sites(
     seq: str,
     min_recognition_len: int = 6,
@@ -1685,8 +1712,7 @@ def _scan_restriction_sites_impl(
         hits: list[dict] = []
 
         # Forward strand scan (over augmented sequence if circular)
-        for m in pat.finditer(scan_seq):
-            p = m.start()
+        for p in _iter_match_starts(pat, scan_seq):
             if p >= n:
                 continue   # duplicate of match already found at p - n
             key = (name, p, 1)
@@ -1731,8 +1757,7 @@ def _scan_restriction_sites_impl(
         if not is_palindrome:
             # Non-palindromic: scan for RC on forward strand to find
             # reverse-strand binding sites at their correct positions.
-            for m in rc_pat.finditer(scan_seq):
-                p = m.start()
+            for p in _iter_match_starts(rc_pat, scan_seq):
                 if p >= n:
                     continue   # duplicate of match already found at p - n
                 key = (name, p, -1)
@@ -1978,8 +2003,7 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
                 "enzyme":       ename,
             }
 
-        for m in pat.finditer(scan_seq):
-            p = m.start()
+        for p in _iter_match_starts(pat, scan_seq):
             if p >= n:
                 continue
             # Linear molecules: skip a negative-cut enzyme whose cut would wrap
@@ -1992,8 +2016,7 @@ def _enzyme_cuts_impl(seq: str, enzyme_names: list[str], *,
             _emit(p + fwd_cut, p + rev_cut)
         if not is_pal:
             rc_pat = _iupac_pattern(rc_site)
-            for m in rc_pat.finditer(scan_seq):
-                p = m.start()
+            for p in _iter_match_starts(rc_pat, scan_seq):
                 if p >= n:
                     continue
                 # On a reverse-strand binding, the cut positions mirror

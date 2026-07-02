@@ -169,12 +169,17 @@ def ollama_base() -> str:
         raw = "http://" + raw
     try:
         p = urllib.parse.urlparse(raw)
+        # `.port` raises ValueError on an out-of-range / non-numeric port
+        # (e.g. "host:999999" or "host:abc"); read it INSIDE the guard so a
+        # malformed $OLLAMA_HOST / $SPLICECRAFT_OLLAMA_HOST degrades to the
+        # loopback default instead of raising from every Babs call
+        # (ping / list / chat / pull / delete), per this function's contract.
+        if p.scheme not in ("http", "https") or not p.hostname:
+            return DEFAULT_OLLAMA_HOST
+        port = p.port or (443 if p.scheme == "https" else 11434)
+        host = p.hostname
     except ValueError:
         return DEFAULT_OLLAMA_HOST
-    if p.scheme not in ("http", "https") or not p.hostname:
-        return DEFAULT_OLLAMA_HOST
-    port = p.port or (443 if p.scheme == "https" else 11434)
-    host = p.hostname
     if ":" in host:                 # an IPv6 literal needs brackets in a URL
         host = f"[{host}]"
     return f"{p.scheme}://{host}:{port}"
@@ -794,7 +799,9 @@ def fmt_size(nbytes: "int | float") -> str:
     """Human file size for the model table ('4.4 GB')."""
     try:
         n = float(nbytes)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a hijacked endpoint can deliver `size` as a
+        # 300+-digit JSON integer, which `float()` rejects with OverflowError.
         return "?"
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024 or unit == "TB":
@@ -835,7 +842,9 @@ def _to_float(x: object) -> "float | None":
     if isinstance(x, (int, float, str)):
         try:
             f = float(x)
-        except ValueError:
+        except (ValueError, OverflowError):
+            # OverflowError: a huge (300+-digit) JSON integer from a
+            # misbehaving Ollama/HF endpoint can't be cast to float.
             return None
         return f if math.isfinite(f) else None
     return None

@@ -14,6 +14,33 @@
 
 ---
 
+## [1.0.114] — 2026-07-01
+
+Codebase-wide adversarial audit — correctness, edge-case, security, and performance fixes.
+
+### Bug fixes
+
+- **Enzymes that cut at overlapping/tandem sites are now counted correctly.** A recognition site that repeats with an overlap — NotI's `GCGGCCGC`, or a `CGCG` / `GCGC` run in a CpG-rich region — could be found only once. It could then be mislabeled a "unique cutter", and a digest could report too few fragments (and hand too few pieces to a cloning simulation). Every overlapping site is now found, both on the map/overlay and in the digest.
+- **Names with superscript digits no longer crash the list.** A plasmid, collection, or file name containing a character like "10²" raised an error and blanked the whole library panel, picker, or file browser while sorting. Such names now sort safely.
+- **Importing a codon table with an "X" column works.** A codon-usage table whose amino-acid column used `X` (any amino acid) was wrongly rejected as if `X` meant "stop". `X` and other ambiguity codes are now ignored, as intended.
+- **Domestication flags an edge-case primer mutation.** When domesticating a coding part into a Golden Braid L0 position, a synonymous fix landing on the last codon of the forward primer's binding region is now correctly flagged as "order the mutated insert as a gBlock" — that single position was previously missed. The reported amplicon length for a start-codon-fusion part is now exact too (it read 3 bp long).
+- **Redefining a custom enzyme refreshes classification.** After correcting a custom enzyme's cut position, part-level and entry-vector detection now recompute instead of showing a stale answer until an unrelated save happens to clear it.
+- **Backup recovery is more resilient.** If a previous interrupted recovery left a data file missing but its backup intact, the next launch now restores from the backup instead of starting empty.
+- **Babs survives a bad Ollama address.** A malformed `OLLAMA_HOST` / `SPLICECRAFT_OLLAMA_HOST` value now falls back to the local default instead of raising on every Babs command.
+
+### Performance
+
+- **Large libraries feel snappier.** Opening the cloning/assembly source pickers, saving, and cross-collection lookups no longer deep-copy the entire library or collections file just to read or check a single entry — a real win on multi-thousand-entry, 100 MB+ libraries.
+- Parsing large embedded XML (SnapGene-style `.dna` history/feature blocks) now parses once instead of twice.
+
+### Hardening
+
+- **SSRF: IPv4-mapped and 6to4 addresses are blocked.** A remote-download or fetch URL resolving to an IPv4-mapped IPv6 form (e.g. a cloud-metadata endpoint) could slip past the private-address guard on some still-shipping Linux Python builds. The guard now classifies the embedded IPv4 itself, and the hardened fetcher only follows `http`/`https` (never `file://` / `ftp://`), on redirects too.
+- **Malicious files can't exhaust memory.** A crafted `.dna` with an oversized feature/primer/notes block, or a FASTQ far over the read cap, is now bounded before it can blow up memory; a pathological per-base coverage file is bounded too.
+- **Operon assembly (scripting API) is bounded.** The `assemble-operon` endpoint now caps the gene count and is concurrency-limited, so a giant request can't pin the CPU.
+- **Display-spoofing characters are stripped from names.** Names carrying invisible bidirectional / right-to-left control characters (Trojan-Source-style) are now removed so they can't reorder how a name renders in the terminal or in exported files.
+- **Data-safety and concurrency edge cases.** Hardened backup restore (unique staging so a concurrent or interrupted restore can't wipe a live folder; restores now serialize with saves), the active-collection mirror (the last change is no longer dropped in a rare shutdown race), and the single-instance lock (a rare relaunch race could otherwise allow two instances). The pre-update backup-directory override now refuses shared system folders.
+
 ## [1.0.113] — 2026-07-01
 
 ### Bug fixes

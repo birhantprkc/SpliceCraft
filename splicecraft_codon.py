@@ -225,8 +225,14 @@ def _parse_codon_tsv(text: str) -> dict:
         numeric: list[str] = []
         for t in toks[1:]:
             tu = t.upper()
-            if len(tu) == 1 and (tu in "ACDEFGHIKLMNPQRSTVWY" or tu in "*.X"):
-                aa_given = "*" if tu in "*.X" else tu
+            if len(tu) == 1 and (tu in "ACDEFGHIKLMNPQRSTVWY" or tu in ("*", ".")):
+                # Only `*` / `.` denote stop. Ambiguity codes — X (any AA),
+                # B/Z/J, Sec `U`, Pyl `O` — must fall through and be ignored
+                # (same as any other non-standard letter). The old substring
+                # test `tu in "*.X"` matched `X` too, mis-mapping an "X" AA
+                # column onto stop and spuriously rejecting the whole table
+                # ("codon GCT encodes A but the file says *").
+                aa_given = "*" if tu in ("*", ".") else tu
             elif tu in _CODON_TSV_AA3:
                 aa_given = _CODON_TSV_AA3[tu]
             else:
@@ -476,7 +482,7 @@ def _codon_optimize(protein: str, raw: dict, *, stops: int = 1) -> str:
         tail = "TAA" * n_stops
     else:
         stop_codons = sorted(
-            ((c, codon_frac[c]) for c, (a, _ct) in raw.items() if a == "*"),
+            ((c, codon_frac.get(c, 0.0)) for c, (a, _ct) in raw.items() if a == "*"),
             key=lambda x: -x[1])
         tail = "".join(_codon_allocate(stop_codons or [("TAA", 1.0)], n_stops))
     return "".join(codon_at) + tail

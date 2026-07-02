@@ -974,19 +974,28 @@ def _fastq_path_to_records(path: str) -> "list":
     )
     if not ok:
         raise ValueError(reason or "FASTQ file rejected")
+    # Iterate + stop one past the cap instead of `list(SeqIO.parse(...))`: the
+    # 50 MB file cap does NOT bound RAM, because 50 MB of short reads — each
+    # carrying a Biopython phred-quality int list — materialises to ~1 GB
+    # before a post-hoc len() check could fire. Breaking at the cap keeps peak
+    # memory to _FASTQ_MAX_READS+1 records.
+    records = []
     try:
-        records = list(SeqIO.parse(path, "fastq"))
+        for rec in SeqIO.parse(path, "fastq"):
+            records.append(rec)
+            if len(records) > _FASTQ_MAX_READS:
+                break
     except (OSError, ValueError) as exc:
         raise ValueError(f"could not parse FASTQ: {exc}") from exc
-    if not records:
-        raise ValueError(f"no reads in {Path(path).name}")
     if len(records) > _FASTQ_MAX_READS:
         raise ValueError(
-            f"FASTQ contains {len(records):,} reads; cap is "
+            f"FASTQ contains more than {_FASTQ_MAX_READS:,} reads; cap is "
             f"{_FASTQ_MAX_READS:,} per file. Split the file or use a "
             f"dedicated read aligner — the plasmid library isn't "
             f"designed for raw sequencing reads."
         )
+    if not records:
+        raise ValueError(f"no reads in {Path(path).name}")
     for rec in records:
         rec.annotations["molecule_type"] = "DNA"
         rec.annotations["topology"]      = "linear"
@@ -1024,6 +1033,14 @@ _COMMERCIALSAAS_HISTORY_MAX_XML = 32 * 1024 * 1024   # 32 MB hard cap on
                                                 # protects against
                                                 # decompression-bomb
                                                 # crafted .dna files.
+
+# Per-packet cap for the OTHER (uncompressed) XML packets — features (0x0A),
+# primers (0x05), notes (0x06). ElementTree materialises a tree ~30x the raw
+# XML byte size, so an uncapped ~100 MB flat-`<Feature>` packet (which fits
+# inside the whole-file cap) would balloon to multiple GB and OOM the worker
+# (the hosted demo droplet / small VMs fall over). Real feature/primer/notes
+# XML is a few KB; 8 MB is wildly generous but bounds the amplification.
+_COMMERCIALSAAS_PACKET_MAX_XML = 8 * 1024 * 1024
 
 
 def _iter_commercialsaas_packets(data: bytes):
@@ -1428,6 +1445,10 @@ def _extract_commercialsaas_file_date(data: bytes, *, packets=None) -> "str | No
                 else _iter_commercialsaas_packets(data)):
             if type_byte != _COMMERCIALSAAS_PACKET_NOTES:
                 continue
+            if len(payload) > _COMMERCIALSAAS_PACKET_MAX_XML:
+                _log.warning("commercialsaas file-date: notes packet too "
+                             "large (%d bytes) — skipping", len(payload))
+                return None
             try:
                 # Route the untrusted Notes XML through `_safe_xml_parse`
                 # (defangs billion-laughs / DOCTYPE) — the same hardening the
@@ -1664,6 +1685,11 @@ def _augment_dna_record_from_packets(
             packets if packets is not None
             else _iter_commercialsaas_packets(data)):
         if type_byte == _COMMERCIALSAAS_PACKET_FEATURES:
+            if len(payload) > _COMMERCIALSAAS_PACKET_MAX_XML:
+                _log.warning("dna augment: 0x0A features packet too large "
+                             "(%d bytes) — skipping to avoid XML-expansion OOM",
+                             len(payload))
+                continue
             try:
                 root = _safe_xml_parse(payload.decode("utf-8"))
             except (_ET.ParseError, UnicodeDecodeError, ValueError):
@@ -1691,6 +1717,11 @@ def _augment_dna_record_from_packets(
                 xml_name = _CONTROL_CHARS_RE.sub("", xml_name)[:200]
                 feature_names_from_xml.append(xml_name)
         elif type_byte == _COMMERCIALSAAS_PACKET_PRIMERS:
+            if len(payload) > _COMMERCIALSAAS_PACKET_MAX_XML:
+                _log.warning("dna augment: 0x05 primers packet too large "
+                             "(%d bytes) — skipping to avoid XML-expansion OOM",
+                             len(payload))
+                continue
             try:
                 root = _safe_xml_parse(payload.decode("utf-8"))
             except (_ET.ParseError, UnicodeDecodeError, ValueError):
@@ -2258,24 +2289,44 @@ def _parse_plasmidsaurus_zip(zip_path: Path) -> dict:
     corrupt — same surface as `_list_gbk_members_in_zip`.
     """
     import zipfile
+    import stat as _stat
     p = Path(zip_path)
-    if not p.exists():
-        raise ValueError(f"zip not found: {p}")
-    if not p.is_file():
-        raise ValueError(f"not a regular file: {p}")
+    # TOCTOU-safe open (sweep #26 pattern): open the fd ONCE, fstat it (immune
+    # to a concurrent path swap / symlink), then hand the fileobj to ZipFile —
+    # mirrors `_list_gbk_members_in_zip` / `_extract_gbk_member` instead of the
+    # path-based exists()/is_file()/stat() + ZipFile(str(p)) it used to use.
     try:
-        size = p.stat().st_size
+        fd = os.open(str(p), os.O_RDONLY)
+    except FileNotFoundError as exc:
+        raise ValueError(f"zip not found: {p}") from exc
     except OSError as exc:
-        raise ValueError(f"could not stat zip: {exc}") from exc
-    if size > _PLASMIDSAURUS_ZIP_MAX_BYTES:
-        raise ValueError(
-            f"zip too large ({size:,} bytes; cap "
-            f"{_PLASMIDSAURUS_ZIP_MAX_BYTES:,})"
-        )
-    try:
-        zf = zipfile.ZipFile(str(p), "r")
-    except (zipfile.BadZipFile, OSError) as exc:
         raise ValueError(f"could not open zip: {exc}") from exc
+    fobj = None
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            raise ValueError(f"not a regular file: {p}")
+        if st.st_size > _PLASMIDSAURUS_ZIP_MAX_BYTES:
+            raise ValueError(
+                f"zip too large ({st.st_size:,} bytes; cap "
+                f"{_PLASMIDSAURUS_ZIP_MAX_BYTES:,})"
+            )
+        try:
+            fobj = os.fdopen(fd, "rb")
+            fd = -1   # ownership transferred to fobj
+        except OSError as exc:
+            raise ValueError(f"could not open zip: {exc}") from exc
+        try:
+            zf = zipfile.ZipFile(fobj, "r")
+        except (zipfile.BadZipFile, OSError) as exc:
+            fobj.close()
+            raise ValueError(f"could not open zip: {exc}") from exc
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     # Sweep #35 (2026-05-26): everything from here through the loop
     # is inside the try/finally that closes `zf`. Pre-fix, the
@@ -2488,6 +2539,13 @@ def _parse_plasmidsaurus_zip(zip_path: Path) -> dict:
                     )
     finally:
         zf.close()
+        # ZipFile(fileobj) does NOT close the caller-supplied fileobj (stdlib
+        # docs) — close it explicitly so the underlying fd isn't leaked.
+        try:
+            if fobj is not None:
+                fobj.close()
+        except OSError:
+            pass
 
     # Resolve the run ID by majority vote on the prefixes we saw.
     run_id = ""
@@ -2559,6 +2617,12 @@ def _plasmidsaurus_zip_to_entries(
             _log.warning(
                 "Plasmidsaurus import: skipped %r (%s)", name, exc)
     return entries, warnings
+
+
+# A single per-base TSV row is ~tens of chars; a run this long with no newline
+# is malformed / a zip-bomb line. Bounds `pending` so the streaming split stays
+# O(n) instead of O(n^2) re-splitting an ever-growing buffer every chunk.
+_PERBASE_MAX_LINE_BYTES = 1 * 1024 * 1024
 
 
 def _summarize_perbase_tsv(fh, *, max_bytes: "int | None" = None) -> dict:
@@ -2645,10 +2709,19 @@ def _summarize_perbase_tsv(fh, *, max_bytes: "int | None" = None) -> dict:
                 truncated = True
             text = utf8_decoder.decode(chunk, final=truncated)
             pending += text
-            lines = pending.split("\n")
-            pending = lines.pop()  # last fragment may be partial
-            for line in lines:
-                _consume_line(line, header_seen)
+            if "\n" in text:
+                lines = pending.split("\n")
+                pending = lines.pop()  # last fragment may be partial
+                for line in lines:
+                    _consume_line(line, header_seen)
+            elif len(pending) > _PERBASE_MAX_LINE_BYTES:
+                # No newline yet and `pending` has grown past a sane line
+                # length: bail rather than keep O(n^2)-growing + re-splitting it.
+                _log.warning(
+                    "plasmidsaurus: perbase TSV line exceeds %d bytes with no "
+                    "newline - aborting summary", _PERBASE_MAX_LINE_BYTES,
+                )
+                return {}
             if truncated:
                 # Flush any partial tail we have, then stop.
                 if pending:

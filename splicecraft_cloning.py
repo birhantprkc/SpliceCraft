@@ -2357,6 +2357,7 @@ def _gb_binding_region_advisory(
     insert_len: int,
     fwd_bind_len: int,
     rev_bind_len: int,
+    fwd_skip: int = 0,
 ) -> list[dict]:
     """Return one entry per mutation that lands inside a primer binding
     window. Each entry is ``{"text", "region", "codon_start"}`` where
@@ -2371,15 +2372,23 @@ def _gb_binding_region_advisory(
     if not mutations or insert_len <= 0:
         return []
     positions = _codon_fix_mutation_positions(mutations)
-    fwd_hi = max(0, fwd_bind_len)             # [0, fwd_hi) covers fwd binding
+    # The forward primer binds `insert[fwd_skip : fwd_skip+fwd_bind_len]` — an
+    # ATG-fusion part (GB L0 `AATG`) sets fwd_skip=3, so the real binding does
+    # NOT start at 0. Anchoring the window at 0 (the old behaviour) both
+    # over-flagged mutations in the skipped overhang region AND missed the one
+    # at the 3′ terminus of the binding (codon in [fwd_bind_len, fwd_bind_len+3)),
+    # silently omitting the "order this as a gBlock" warning for the common
+    # Golden-Braid L0 CDS path.
+    fwd_lo = max(0, fwd_skip)                    # [fwd_lo, fwd_hi) covers fwd binding
+    fwd_hi = fwd_lo + max(0, fwd_bind_len)
     rev_lo = insert_len - max(0, rev_bind_len)  # [rev_lo, insert_len) covers rev binding
     out: list[dict] = []
     for text, codon_start in zip(mutations, positions):
         if codon_start < 0:
             continue
         codon_end = codon_start + 3
-        # A 3-nt codon overlaps the fwd window if any nt is in [0, fwd_hi).
-        in_fwd = codon_start < fwd_hi
+        # A 3-nt codon overlaps the fwd window if it intersects [fwd_lo, fwd_hi).
+        in_fwd = codon_start < fwd_hi and codon_end > fwd_lo
         # Overlaps the rev window if any nt is in [rev_lo, insert_len).
         in_rev = codon_end > rev_lo
         if in_fwd:
@@ -2603,6 +2612,13 @@ def _design_gb_primers(
     # Amplicon = pad + Esp3I + spacer + oh + insert + oh_rc + spacer_rc
     #          + Esp3I_rc + pad_rc
     amplicon_len = len(fwd_tail) + len(insert) + len(rev_tail)
+    # `_simulate_primed_amplicon` fuses the duplicated start codon (the AATG
+    # overhang's ATG + the insert's leading ATG collapse via
+    # `_fuse_overhang_body`), so the real amplicon is `fwd_skip` bp shorter
+    # whenever that fusion fires. Mirror its exact condition so the displayed
+    # length matches the fragment actually built + saved.
+    if fwd_skip and insert[:3].upper() == "ATG":
+        amplicon_len -= fwd_skip
 
     # Positions of the primer binding regions on the TEMPLATE (not the
     # full amplicon). The forward primer binds the top strand at the
@@ -2643,6 +2659,7 @@ def _design_gb_primers(
     # the original template — as the PCR template.
     binding_region_mutations = _gb_binding_region_advisory(
         mutations, len(insert), len(fwd_bind), len(rev_bind),
+        fwd_skip=fwd_skip,
     )
     return {
         "part_type":    part_type,
@@ -2671,6 +2688,13 @@ def _design_gb_primers(
         # PrimerDesignScreen) that don't iterate the list yet.
         **pair,
     }
+
+
+# Standard column oligo synthesis tops out ~60-100 nt; a mutagenic SOE window
+# spanning several clustered edits can exceed that. We WARN (never truncate —
+# dropping cured bases would be catastrophic) so the user orders an ultramer or
+# splits the edits.
+_SOE_PRIMER_WARN_LEN = 100
 
 
 def _design_operon_soe_primers(
@@ -2832,6 +2856,7 @@ def _design_operon_soe_primers(
     #    Window = cluster span ± overlap_arm (clamped); the fwd primer IS the
     #    cured window, the rev its reverse-complement → a fully-complementary
     #    SOE overlap that anneals during the assembly PCR.
+    warnings = list(scrub.get("warnings") or [])
     for j, cl in enumerate(clusters, start=2):
         ws = max(0, cl[0] - overlap_arm)
         we = min(n, cl[-1] + 1 + overlap_arm)
@@ -2841,6 +2866,11 @@ def _design_operon_soe_primers(
             else:
                 ws = max(0, n - 2 * overlap_arm if we == n else we - 2 * overlap_arm)
         win = cured[ws:we]
+        if len(win) > _SOE_PRIMER_WARN_LEN:
+            warnings.append(
+                f"cluster {j - 1}: SOE mutagenic primer is {len(win)} nt "
+                f"(> {_SOE_PRIMER_WARN_LEN}) — near/over the standard oligo-"
+                f"synthesis limit; order as an ultramer or split the edits.")
         fj, rj = _dom_primer_pair_names("operon", j)
         primers.append({"name": fj, "seq": win, "kind": "soe-fwd",
                         "tm": round(_primer_tm(win) or 0.0, 1),
@@ -2864,7 +2894,7 @@ def _design_operon_soe_primers(
             "n_clusters": len(clusters), "overhangs": [op_oh5, op_oh3],
             "fwd_skip": fwd_skip,
             "amplicon_len": len(fwd_tail) + (n - fwd_skip) + len(rev_tail),
-            "warnings": scrub.get("warnings", [])}
+            "warnings": warnings}
 
 
 def _grammar_tu_overhangs(grammar: dict) -> tuple[str, str]:

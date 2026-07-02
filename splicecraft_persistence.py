@@ -1357,6 +1357,40 @@ def _safe_load_json(path: Path, label: str) -> "tuple[list, str | None]":
       (bak_entries, warning). If .bak also corrupt → ([], warning).
     """
     if not path.exists():
+        # Normal first run (no file AND no backups) → empty, no warning.
+        # But a surviving `.bak` / rotated backup while the main file is GONE is
+        # the signature of a failed recovery-rewrite (a prior load renamed the
+        # corrupt main aside, then the bak→main copy hit ENOSPC / RO mount, so
+        # the main is absent but the good data is intact in the backup). The old
+        # early-return then reported an EMPTY library though the data survived.
+        # Recover from the backup chain (legacy `.bak` first, then rotations
+        # newest→oldest) and re-materialise the main file for the next save.
+        for _cand in ([path.with_suffix(path.suffix + ".bak")]
+                      + list(reversed(_iter_backups(path)))):
+            if not _cand.exists():
+                continue
+            ok_c, _r = _safe_file_size_check(
+                _cand, _state._SAFE_LOAD_JSON_MAX_BYTES, label)
+            if not ok_c:
+                continue
+            try:
+                _raw = json.loads(_read_backup_bytes(_cand))
+            except Exception:
+                continue
+            _entries, _ = _extract_entries(_raw, label)
+            if _entries is None:
+                continue
+            _log.warning(
+                "%s: main file %s is missing but recovered %d entries from "
+                "backup %s.", label, path, len(_entries), _cand.name)
+            try:
+                _atomic_write_bytes(path, _read_backup_bytes(_cand))
+            except OSError:
+                _log.warning("Could not rewrite %s from backup %s",
+                             path, _cand.name)
+            return _entries, (
+                f"{label} main file was missing — restored "
+                f"{len(_entries)} entries from backup {_cand.name}.")
         return [], None
 
     # Size cap + symlink rejection — refuse to read multi-GB files

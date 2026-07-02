@@ -711,12 +711,17 @@ class TestSweep26GBParseCacheFlag:
         buf = StringIO()
         SeqIO.write([rec], buf, "genbank")
         text = buf.getvalue()
+        # Parse cache is keyed on a 128-bit content hash (audit 2026-07-01 —
+        # was `hash(text)`, which a 64-bit collision could poison), so probe
+        # with the same key helper the implementation uses.
+        import splicecraft_record as _record
+        key = _record._gb_cache_key(text)
         sc._GB_PARSE_CACHE.clear()
         sc._gb_text_to_record(text, cache=False)
-        assert hash(text) not in sc._GB_PARSE_CACHE
+        assert key not in sc._GB_PARSE_CACHE
         # And cache=True (default) populates.
         sc._gb_text_to_record(text)
-        assert hash(text) in sc._GB_PARSE_CACHE
+        assert key in sc._GB_PARSE_CACHE
 
 
 class TestSweep26GrammarsReadonly:

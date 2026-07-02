@@ -467,6 +467,25 @@ def _fsync_path(path: Path) -> None:
         pass
 
 
+# Well-known SHARED system directories that Master Delete's recursive rmtree of
+# the pre-update backup dir must never target. The auto-derived path + the
+# filesystem-root guard already refuse `/`, depth-1 dirs (whose parent IS the
+# root), the home dir, and the data dir / its ancestors; this closes the
+# depth-2+ gap (`/usr/local`, `/var/lib`, `/opt/x` would otherwise pass). A
+# DEDICATED subdir under one of these (e.g. `/opt/splicecraft-backups`) is still
+# allowed — only the shared dir itself is refused.
+_UNSAFE_BACKUP_DIRS: "frozenset[str]" = frozenset(
+    str(Path(p)) for p in (
+        "/usr", "/usr/local", "/usr/bin", "/usr/sbin", "/usr/lib",
+        "/usr/share", "/opt", "/etc", "/var", "/var/lib", "/var/log",
+        "/var/tmp", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/sys",
+        "/proc", "/dev", "/run", "/root", "/home", "/tmp", "/mnt",
+        "/media", "/srv",
+        "/Applications", "/System", "/Library", "/Users",   # macOS
+    )
+)
+
+
 def _resolve_pre_update_backup_dir(data_dir: "Path | None" = None) -> Path:
     """Where pre-update snapshots are stored. Sibling of `_state._DATA_DIR` by
     default so a recursive wipe of `_state._DATA_DIR` doesn't take the
@@ -503,7 +522,8 @@ def _resolve_pre_update_backup_dir(data_dir: "Path | None" = None) -> Path:
         _data = _state._DATA_DIR.resolve()
         if (_parent == candidate or _parent.parent == _parent
                 or candidate == Path.home().resolve()
-                or candidate == _data or candidate in _data.parents):
+                or candidate == _data or candidate in _data.parents
+                or str(candidate) in _UNSAFE_BACKUP_DIRS):
             raise OSError(
                 f"Refusing $SPLICECRAFT_UPDATE_BACKUP_DIR={str(candidate)!r}: "
                 "it is a filesystem root, your home directory, or the data dir "
@@ -1390,31 +1410,40 @@ def _restore_pre_update_snapshot(snap_id_or_path: "str | Path",
                 (name, f"size-check failed: {exc}"),
             )
             continue
-        stash = target.with_name(target.name + ".restoring-old")
+        # Randomised staging (mirrors the file branch's `mkstemp`): move the
+        # live dir INTO a UNIQUE `mkdtemp` stash so two concurrent restores
+        # (UI + agent API in the same process) can't collide on a deterministic
+        # `.restoring-old` path and rmtree each other's only copy — and a
+        # leftover stash from a killed prior restore is never blindly deleted.
+        # The pre-restore snapshot taken above is the ultimate backstop.
+        import tempfile as _tempfile
+        stash_parent: "Path | None" = None
+        stashed: "Path | None" = None
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            if stash.exists():
-                shutil.rmtree(stash, ignore_errors=True)
             if target.exists():
-                os.rename(target, stash)
+                stash_parent = Path(_tempfile.mkdtemp(
+                    prefix=f".{target.name}.restoring-",
+                    dir=str(target.parent)))
+                stashed = stash_parent / target.name
+                os.rename(target, stashed)
             shutil.copytree(src, target)
-            if stash.exists():
-                shutil.rmtree(stash, ignore_errors=True)
+            _fsync_path(target.parent)
+            if stash_parent is not None:
+                shutil.rmtree(stash_parent, ignore_errors=True)
             summary["restored_dirs"].append(name)
         except (OSError, shutil.Error) as exc:
-            # Hardening #4: rollback handles the partial-copytree
-            # case. Previous logic only rolled back if `not target.
-            # exists()` — but copytree often creates `target` first
-            # and then fails partway through, leaving a partial dir.
-            # Now: always rmtree the partial target, then move stash
-            # back. The `try` around `os.rename(stash, target)` is
-            # belt-and-suspenders since the previous `shutil.rmtree`
-            # would have raised if it couldn't clean up.
+            # Rollback (handles a partial copytree): remove the partial target,
+            # move the stashed original back, then clean up the stash parent.
+            # Only touch `target` when we actually stashed a copy — never
+            # destroy the live dir when there was nothing to stash.
             try:
-                if target.exists():
-                    shutil.rmtree(target, ignore_errors=True)
-                if stash.exists():
-                    os.rename(stash, target)
+                if stashed is not None and stashed.exists():
+                    if target.exists():
+                        shutil.rmtree(target, ignore_errors=True)
+                    os.rename(stashed, target)
+                if stash_parent is not None and stash_parent.exists():
+                    shutil.rmtree(stash_parent, ignore_errors=True)
             except OSError:
                 pass
             summary["failed"].append((name, str(exc)))
@@ -1773,7 +1802,12 @@ def _restore_from_backup(target_path: Path, source_path: Path,
     # bulk add). Opt in to the L3 catastrophic-shrink bypass so the
     # restore isn't blocked by the same guard that catches accidental
     # wipes.
-    with _allow_catastrophic_shrink():
+    # Hold `_state._cache_lock` across the write so this restore serialises
+    # against the domain `_save_X` mirror saves (which take the same lock around
+    # `_safe_save_json` + the sibling mirror) — otherwise a concurrent agent-
+    # thread save could interleave and drift the library<->collections mirror
+    # (INV-50). `_safe_save_json` takes no lock itself, so there is no re-entry.
+    with _state._cache_lock, _allow_catastrophic_shrink():
         _safe_save_json(target_path, entries, label)
     return len(entries)
 

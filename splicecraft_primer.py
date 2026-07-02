@@ -1486,11 +1486,20 @@ def _scrub_design(seq: str, feats: "list | None" = None,
     initial = _scrub_scan_targets(seq, allowed, circular)
     max_iter = 2 * len(initial) + 8
     it = 0
+    # Rescan the whole plasmid only when the sequence actually CHANGED. A
+    # skipped (un-curable) site leaves `working` untouched, so the next round's
+    # scan would return the identical target set minus the just-failed one —
+    # re-running the full `_scan_restriction_sites` there was pure O(n)-per-skip
+    # waste. `targets is None` means "sequence changed, rescan"; after a skip we
+    # reuse the current scan and just drop the failed head.
+    targets: "list | None" = None
+    cur = "".join(working)   # bound before the loop; recomputed on each rescan
     while it < max_iter:
         it += 1
-        cur = "".join(working)
-        targets = [t for t in _scrub_scan_targets(cur, allowed, circular)
-                   if (t["enzyme"], t["rec_start"], t["strand"]) not in failed]
+        if targets is None:
+            cur = "".join(working)
+            targets = [t for t in _scrub_scan_targets(cur, allowed, circular)
+                       if (t["enzyme"], t["rec_start"], t["strand"]) not in failed]
         if not targets:
             break
         t = targets[0]
@@ -1502,6 +1511,7 @@ def _scrub_design(seq: str, feats: "list | None" = None,
                 "enzyme": t["enzyme"], "pos": t["rec_start"],
                 "strand": t["strand"], "region": region, "reason": reason})
             failed.add(ident)
+            targets = targets[1:]   # seq unchanged → reuse scan, drop failed head
             continue
         for g, nb in sorted(changes.items()):
             result["edits"].append({
@@ -1511,6 +1521,7 @@ def _scrub_design(seq: str, feats: "list | None" = None,
         result["sites_removed"].append({
             "enzyme": t["enzyme"], "pos": t["rec_start"],
             "strand": t["strand"], "region": region})
+        targets = None   # sequence changed → rescan on the next round
 
     cured = "".join(working)
 

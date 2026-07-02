@@ -68,7 +68,15 @@ _FASTA_EXTS: frozenset[str] = frozenset({
 _SEQ_ZIP_EXTS: frozenset[str] = frozenset({".zip"})
 
 _CONTROL_CHARS_RE = re.compile(
-    r"[\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]+"
+    # C0 + DEL/C1 + surrogates + line/para separators AND the Unicode
+    # DIRECTIONAL format controls - bidi embeddings/overrides (U+202A-202E),
+    # isolates (U+2066-2069), LRM/RLM (U+200E/200F), BOM/ZWNBSP (U+FEFF). A
+    # name carrying U+202E (RIGHT-TO-LEFT OVERRIDE) visually reorders DataTable
+    # cells + `.gb` qualifiers (Trojan-Source-style spoofing) and has no
+    # legitimate use in a plasmid / feature name. ZWNJ/ZWJ (U+200C/200D) are
+    # deliberately LEFT intact - they legitimately join scripts + emoji.
+    r"[\x00-\x1f\x7f-\x9f\u200e\u200f\u2028-\u202e\u2066-\u2069\ufeff"
+    r"\ud800-\udfff]+"
 )
 
 
@@ -96,7 +104,16 @@ def _natural_sort_key(s: str) -> tuple:
         if not part:
             continue
         if part.isdigit():
-            out.append((1, int(part)))
+            # `\d+` (str-mode) captures ASCII + Unicode Nd digits, all
+            # int()-able. But a *text* run can ALSO be `.isdigit()`-True for
+            # No-category chars (superscripts ²³⁴, category No) that `int()`
+            # REJECTS — a plasmid / collection / file name like "10²" would
+            # otherwise raise ValueError and take down every sort routed
+            # through this key (library panel, pickers, file browser). Guard it.
+            try:
+                out.append((1, int(part)))
+            except ValueError:
+                out.append((0, part))
         else:
             out.append((0, part))
     result = tuple(out)
@@ -1155,24 +1172,34 @@ def _safe_xml_parse(xml_data: str, *, allow_dtd: bool = False):
     # Python stack in downstream consumers (HistoryTree walkers,
     # qualifier readers). 256 levels is more than any legitimate
     # plasmid annotation tree ever produces.
+    #
+    # Parse ONCE: iterparse builds the tree while we check depth, so we capture
+    # and RETURN its root instead of re-running `ET.fromstring` over the same
+    # document. The old form parsed twice — a full iterparse tree for the depth
+    # scan, then a second full `fromstring` build — doubling CPU and peak memory
+    # on multi-MB XML (the amplifier behind the .dna packet-parse OOM).
     _MAX_DEPTH = 256
     depth = 0
-    max_depth_seen = 0
-    for event, _elem in ET.iterparse(
+    root = None
+    for event, elem in ET.iterparse(
             io.StringIO(xml_data), events=("start", "end"),
     ):
         if event == "start":
             depth += 1
-            if depth > max_depth_seen:
-                max_depth_seen = depth
-                if depth > _MAX_DEPTH:
-                    raise ET.ParseError(
-                        f"XML nesting exceeds {_MAX_DEPTH} levels "
-                        f"(unbounded recursion guard)"
-                    )
-        elif event == "end":
+            if depth > _MAX_DEPTH:
+                raise ET.ParseError(
+                    f"XML nesting exceeds {_MAX_DEPTH} levels "
+                    f"(unbounded recursion guard)"
+                )
+        else:  # "end"
             depth -= 1
-    return ET.fromstring(xml_data)
+            if depth == 0:
+                root = elem   # the document root's end event fires last
+    if root is None:
+        # Empty / element-less input — defer to fromstring for the canonical
+        # "no element found" ParseError so callers see the same diagnostic.
+        return ET.fromstring(xml_data)
+    return root
 
 
 # ── Windows-reserved-filename guard (relocated from hub, blob/export prereq) ──

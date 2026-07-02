@@ -466,6 +466,15 @@ def _h_design_rbs(app, payload):
     return {"ok": True, **result}
 
 
+# Real bacterial operons carry a handful of genes; each gene triggers a
+# multi-eval context-aware RBS design (~seconds of pure-Python folding), so an
+# unbounded `genes` list is an authenticated-local CPU DoS (~20k minimal genes
+# fit inside the 1 MiB body cap). Cap it like the sibling assembly endpoints
+# (simulate-gibson ≤64, simulate-golden-gate ≤30); the endpoint is also
+# heavy-classified (`_AGENT_HEAVY_ENDPOINTS`) so a burst can't pin every worker.
+_ASSEMBLE_OPERON_MAX_GENES = 32
+
+
 @_agent_endpoint("assemble-operon")
 def _h_assemble_operon(app, payload):
     """Assemble a contiguous bacterial operon from CDSs, each RBS
@@ -479,6 +488,10 @@ def _h_assemble_operon(app, payload):
     genes = payload.get("genes")
     if not isinstance(genes, list) or not genes:
         return ({"error": "missing or empty 'genes' list"}, 400)
+    if len(genes) > _ASSEMBLE_OPERON_MAX_GENES:
+        return ({"error": f"too many genes ({len(genes)}); cap is "
+                 f"{_ASSEMBLE_OPERON_MAX_GENES}. Each gene runs a multi-eval "
+                 f"RBS design — split the operon or assemble in stages."}, 400)
     kw = {}
     for key in ("promoter", "terminator"):
         val = payload.get(key)
