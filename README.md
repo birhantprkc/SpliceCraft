@@ -126,7 +126,9 @@ canvas at the binding site.
 The primer library organises into **collections** with a fuzzy **search bar**.
 **Space** cycles a primer's mark (★ select · $ cart · M move); **MOVE** /
 bulk-delete / re-status the marked sets, and **export** a collection or your $
-**cart** to an order-ready **CSV** (then **import** one back). Marks track the
+**cart** to an order-ready **CSV** — generic (Name/Sequence/Length/Tm) or the
+**IDT bulk-upload** template (Name/Sequence/Scale/Purification) — (then
+**import** one back). Marks track the
 primer itself, so filtering never strays them; malformed oligos are refused on
 export and skipped on import. **Ctrl+C** copies the highlighted primer's
 sequence (with a base-count toast).

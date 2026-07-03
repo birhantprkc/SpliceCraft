@@ -51,7 +51,7 @@ from splicecraft_persistence import (_safe_file_size_check, _safe_load_json)
 from splicecraft_primer import (_mut_design_inner, _mut_design_outer, _scrub_design, _scrub_qc_primers, _scrub_qc_verify)
 from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq)
 from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
-from splicecraft_seqanalysis import (_classify_part_from_plasmid, _find_orfs)
+from splicecraft_seqanalysis import (_classify_part_from_plasmid, _find_orfs, _synthesis_lint)
 from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _safe_color_for_picker, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
@@ -303,6 +303,42 @@ def _agent_ignored_keys(payload, known):
         return []
     allowed = set(known) | {"force"}
     return sorted(str(k) for k in payload if k not in allowed)
+
+
+# Routing / selection params that change WHERE or HOW an operation applies.
+# Silently dropping one is the SC-D footgun (a call that "succeeds" while
+# routing somewhere else). This is a CLOSED vocabulary of current API params —
+# NOT a catch-all for unknown keys, so a newer-schema caller passing a brand-new
+# key still gets the forward-compat leniency `_agent_ignored_keys` documents.
+# Exact-match (case-sensitive) on the CURRENT param names — add any NEW
+# routing/selection param here as it's introduced so the guard keeps covering it.
+_AGENT_DANGEROUS_PARAMS = frozenset({
+    "collection", "source_collection", "bin", "parts_bin",
+    "enzyme", "enzymes", "orientation", "rename",
+})
+
+
+def _agent_reject_dangerous_unknowns(payload, allowed):
+    """Fail loud (400) when ``payload`` carries a routing/selection param from
+    `_AGENT_DANGEROUS_PARAMS` that this endpoint does NOT accept — the "silent
+    ok:true while doing something else" footgun (agent-API feedback SC-D). Any
+    OTHER unknown key stays soft (forward-compat — same policy as
+    `_agent_ignored_keys`). ``allowed`` is the endpoint's recognised key-set
+    (the same one it passes to `_agent_ignored_keys`). Returns ``(err, 400)``
+    or None; call it EARLY, before any state change."""
+    if not isinstance(payload, dict):
+        return None
+    ok = set(allowed) | {"force"}
+    bad = sorted(str(k) for k in payload
+                 if k in _AGENT_DANGEROUS_PARAMS and k not in ok)
+    if bad:
+        keys = ", ".join(repr(k) for k in bad)
+        return ({"error":
+                  f"unrecognized routing/selection parameter(s) {keys} for "
+                  "this endpoint — they would change WHERE or HOW the operation "
+                  "applies, but this endpoint doesn't accept them (check the "
+                  "spelling / the endpoint). Nothing was changed."}, 400)
+    return None
 
 
 def _agent_sanitize_qualifiers(raw):
@@ -751,6 +787,81 @@ def _h_list_plasmidsaurus_members(app, payload):
         return ({"error": "zip rejected (see splicecraft log)"}, 400)
     return {"ok": True, "path": str(path),
             "members": members, "count": len(members)}
+
+
+@_agent_endpoint("lint-synthesis")
+def _h_lint_synthesis(app, payload):
+    """Synthesis / assembly-readiness pre-flight for a construct — the "is it
+    safe to order + assemble?" check. Body:
+    ``{sequence | id | name, circular?=true, expect_cds?=false,
+        forbidden_enzymes?: [str]}``.
+
+    Resolves the sequence from a bare ``sequence`` OR a saved library entry
+    (``id``/``name`` — its stored topology sets ``circular`` unless you pass
+    ``circular`` explicitly). Scans for internal Type IIS sites (Golden Gate /
+    MoClo assembly killers → errors), extreme overall + windowed GC, long
+    homopolymer runs, tandem repeats, degenerate bases, and — with
+    ``expect_cds`` — a clean full-length ORF. Returns ``{ok, score, warnings,
+    stats}`` where ``score`` is 0-100 (100 = clean) and each ``warnings`` entry
+    is ``{level, kind, message, start?, end?}``. Read-only."""
+    circular = bool(payload.get("circular", True))
+    raw_seq = payload.get("sequence")
+    if isinstance(raw_seq, str) and raw_seq.strip():
+        seq, e = _sanitize_bases(raw_seq)
+        if e:
+            return ({"error": f"'sequence' rejected: {e}"}, 400)
+    else:
+        key = _sanitize_label(payload.get("id") or payload.get("name"),
+                              max_len=200)
+        if not key:
+            return ({"error": "provide 'sequence', or 'id'/'name' of a saved "
+                              "library entry to lint"}, 400)
+        entry = (_find_library_entry_by_id(key)
+                 or _find_library_entry_by_name(key))
+        if entry is None:
+            return ({"error": f"no library entry named {key!r}"}, 404)
+        try:
+            rec = _gb_text_to_record(entry.get("gb_text") or "")
+        except Exception as exc:
+            return ({"error":
+                      f"couldn't parse {key!r}: {_scrub_path(str(exc))}"}, 500)
+        seq = str(getattr(rec, "seq", "") or "")
+        if "circular" not in payload:
+            circular = (rec.annotations.get("topology") or "").lower() != "linear"
+    if not seq:
+        return ({"error": "sequence is empty"}, 422)
+    if len(seq) > _PAIRWISE_MAX_LEN:
+        return ({"error": f"sequence exceeds {_PAIRWISE_MAX_LEN:,} bp cap"}, 413)
+    kwargs: dict = {}
+    fenz = payload.get("forbidden_enzymes")
+    if fenz is not None:
+        if not isinstance(fenz, list) or not all(isinstance(x, str) and x
+                                                  for x in fenz):
+            return ({"error":
+                      "'forbidden_enzymes' must be a list of enzyme names"}, 400)
+        if len(fenz) > 32:
+            return ({"error": "'forbidden_enzymes' too long (max 32)"}, 400)
+        # Fail loud on an unknown/typo'd enzyme: a synthesis-SAFETY check must
+        # never silently skip a site it was asked to scan for (a clean score
+        # would be false confidence).
+        catalog = _state._all_enzymes_hook()
+        unknown = [x for x in fenz if x not in catalog]
+        if unknown:
+            return ({"error":
+                      f"unknown enzyme(s) in 'forbidden_enzymes': {unknown[:8]}"},
+                    400)
+        kwargs["forbidden_enzymes"] = tuple(fenz)
+    try:
+        result = _synthesis_lint(seq, circular=circular,
+                                 expect_cds=bool(payload.get("expect_cds")),
+                                 **kwargs)
+    except Exception as exc:
+        _log.exception("agent lint-synthesis: lint failed")
+        return ({"error": f"lint failed: {_scrub_path(str(exc))}"}, 500)
+    return {"ok": True, **result,
+            "ignored": _agent_ignored_keys(payload, {
+                "sequence", "id", "name", "circular", "expect_cds",
+                "forbidden_enzymes"})}
 
 
 @_agent_endpoint("find-orfs")
@@ -1767,6 +1878,9 @@ def _h_move_primer(app, payload):
     and adds it to ``to`` — all under ONE lock, so the primer is never
     momentarily absent. 404 if the primer or a named collection is missing;
     409 on an ambiguous name or a sequence already present in ``to``."""
+    if (derr := _agent_reject_dangerous_unknowns(
+            payload, {"name", "id", "sequence", "to", "from"})) is not None:
+        return derr
     to_in = payload.get("to")
     if not isinstance(to_in, str):
         return ({"error":
@@ -2802,6 +2916,9 @@ def _h_move_part(app, payload):
     bin's live mirror is re-synced when touched, so a move into/out of the
     active bin stays consistent. 404 if the part or a bin is missing; 409 on an
     ambiguous name or a ``(name, grammar)`` collision in ``to``."""
+    if (derr := _agent_reject_dangerous_unknowns(
+            payload, {"name", "id", "to", "from", "grammar"})) is not None:
+        return derr
     to_in = payload.get("to")
     if not isinstance(to_in, str) or not to_in.strip():
         return ({"error": "missing 'to' (a parts bin name)"}, 400)
@@ -3654,6 +3771,114 @@ def _h_simulate_gibson(app, payload):
     return {"ok": True, "result": result}
 
 
+def _agent_carry_feature_dicts(rec) -> "list[dict]":
+    """Convert a SeqRecord's annotations into the simple
+    ``{start, end, strand, type, label, color}`` dicts the traditional-cloning
+    engine carries through a digest→ligate (the same shape
+    `_gibson_record_from_result` reads back). Skips the ``source`` feature;
+    wrap features are emitted with ``end < start`` so the engine's
+    `_split_features_at_cuts` halves them at the origin. Feeds
+    ``carry_annotations`` on `traditional-clone`."""
+    out: "list[dict]" = []
+    total = _seq_len(rec)
+    for f in getattr(rec, "features", None) or []:
+        if getattr(f, "type", "") == "source":
+            continue
+        bounds = _feat_bounds(f, total)
+        if bounds is None:
+            continue
+        s, e, strand = bounds
+        quals = getattr(f, "qualifiers", {}) or {}
+        label = (quals.get("label") or quals.get("product") or [f.type])[0]
+        d = {"start": int(s), "end": int(e), "strand": int(strand or 1),
+             "type": f.type, "label": str(label)[:200]}
+        color = (quals.get("ApEinfo_fwdcolor") or [""])[0] or ""
+        if color:
+            d["color"] = str(color)
+        note = (quals.get("note") or [None])[0]
+        if note:
+            d["note"] = str(note)
+        out.append(d)
+    return out
+
+
+def _agent_carry_clean_bases(seq: str) -> str:
+    """Uppercase + strip to the IUPAC alphabet (matching `_sanitize_bases`'s
+    cleaning) so a passed ``vector_seq`` and a saved entry's stored sequence
+    compare on equal footing for the carry_annotations exact-match gate."""
+    return "".join(c for c in (seq or "").upper() if c in "ACGTRYWSMKBDHVN")
+
+
+def _agent_carry_source_features(payload, vec_seq, ins_seq):
+    """Source feature dicts for ``carry_annotations`` on `traditional-clone`
+    from the ``vector_name`` / ``insert_name`` library entries the caller
+    already passes for lineage. Returns
+    ``(vec_feats, ins_feats, warnings, carried_any, err)`` where ``err`` is
+    ``(dict, status)`` or None. A no-op (empty lists) unless
+    ``carry_annotations`` is set.
+
+    Fail-loud where it matters (agent-API feedback — never a silent ok:true):
+      * ``carry_annotations:true`` with NEITHER name → 400 (nothing to source
+        from).
+      * A named entry that doesn't resolve → 404 (the caller named a
+        non-existent entry).
+    Soft-skip (reported in ``warnings``, never corrupts coordinates):
+      * A named entry whose stored sequence doesn't EXACTLY match the passed
+        seq — carrying rotated/edited coordinates would mis-place every feature
+        ([INV-127] catastrophic-class), so that side is skipped with a warning.
+        Rotation-matching is intentionally NOT attempted."""
+    if not bool(payload.get("carry_annotations")):
+        return [], [], [], False, None
+    vname = _sanitize_label(payload.get("vector_name"), max_len=200)
+    iname = _sanitize_label(payload.get("insert_name"), max_len=200)
+    if not vname and not iname:
+        return None, None, None, False, (
+            {"error": "carry_annotations:true needs 'vector_name' and/or "
+                      "'insert_name' to source features from a saved library "
+                      "entry"}, 400)
+    warnings: "list[str]" = []
+    carried = {"any": False}
+
+    def _one(name, target_clean, which):
+        if not name:
+            return [], None
+        entry = (_find_library_entry_by_id(name)
+                 or _find_library_entry_by_name(name))
+        if entry is None:
+            return None, ({"error": f"no library entry named {name!r} to "
+                                    f"carry {which} annotations from"}, 404)
+        gb = entry.get("gb_text") or ""
+        if not gb:
+            warnings.append(f"{which} entry {name!r} has no stored sequence; "
+                            "annotations not carried")
+            return [], None
+        try:
+            rec = _gb_text_to_record(gb)
+        except Exception:
+            warnings.append(f"{which} entry {name!r} could not be parsed; "
+                            "annotations not carried")
+            return [], None
+        if _agent_carry_clean_bases(str(getattr(rec, "seq", "") or "")) \
+                != target_clean:
+            warnings.append(
+                f"{which}_seq doesn't match saved entry {name!r} "
+                "(rotation-matching not supported) — annotations not carried; "
+                "pass the entry's sequence verbatim")
+            return [], None
+        feats = _agent_carry_feature_dicts(rec)
+        if feats:
+            carried["any"] = True
+        return feats, None
+
+    vec_feats, verr = _one(vname, _agent_carry_clean_bases(vec_seq), "vector")
+    if verr is not None:
+        return None, None, None, False, verr
+    ins_feats, ierr = _one(iname, _agent_carry_clean_bases(ins_seq), "insert")
+    if ierr is not None:
+        return None, None, None, False, ierr
+    return vec_feats, ins_feats, warnings, carried["any"], None
+
+
 def _agent_traditional_cloning_candidates(payload):
     """Shared digest + ligate core for `simulate-traditional-cloning` /
     `traditional-clone`. Returns ``(info, None)`` on success or
@@ -3699,6 +3924,18 @@ def _agent_traditional_cloning_candidates(payload):
             if en not in catalog:
                 return None, ({"error":
                                 f"unknown enzyme {en!r} in {field}"}, 400)
+    # carry_annotations (agent-API feedback): lift the vector/insert entries'
+    # own features onto the ligated product so a raw cut/ligate clone isn't
+    # feature-bare (no follow-up transfer-annotations pass needed). Sourced
+    # from the `vector_name`/`insert_name` entries; fails loud when it can't be
+    # honored, soft-skips (reported) on a seq mismatch. No-op (empty) unless
+    # `carry_annotations` is set — the engine already splits + shifts these onto
+    # the product coordinates.
+    (carry_vec_feats, carry_ins_feats, carry_warnings,
+     annotations_carried, carry_err) = _agent_carry_source_features(
+        payload, vec_seq, ins_seq)
+    if carry_err is not None:
+        return None, carry_err
     vector_circular = bool(payload.get("vector_circular", True))
     insert_circular = bool(payload.get("insert_circular", False))
     enz_l = ins_enz[0]
@@ -3714,12 +3951,14 @@ def _agent_traditional_cloning_candidates(payload):
     #     rule the vector side honours (a ≥3-cut circular insert is refused).
     if insert_circular:
         ins_frags, ierr = _excise_fragment_pair(
-            ins_seq, list(ins_enz), circular=True, source_label="insert")
+            ins_seq, list(ins_enz), circular=True,
+            features=carry_ins_feats, source_label="insert")
         if ierr is not None:
             return None, ({"error": f"insert: {ierr['error']}",
                             "cuts": ierr.get("cuts", [])}, 422)
     else:
         single, ierr = _excise_pcr_insert(ins_seq, enz_l, enz_r,
+                                            features=carry_ins_feats,
                                             source_label="insert")
         if ierr is not None:
             return None, ({"error": f"insert: {ierr}"}, 422)
@@ -3728,7 +3967,7 @@ def _agent_traditional_cloning_candidates(payload):
     # 2) Digest the vector — refuses an ambiguous ≥3-cut circular digest.
     vec_frags, verr = _excise_fragment_pair(
         vec_seq, list(vec_enz), circular=vector_circular,
-        source_label="vector")
+        features=carry_vec_feats, source_label="vector")
     if verr is not None:
         return None, ({"error": f"vector: {verr['error']}",
                         "cuts": verr.get("cuts", [])}, 422)
@@ -3779,6 +4018,8 @@ def _agent_traditional_cloning_candidates(payload):
         "n_insert_fragments": len(ins_frags),
         "products":           products,
         "incompatible":       incompatible,
+        "carry_warnings":     carry_warnings,
+        "annotations_carried": annotations_carried,
     }, None)
 
 
@@ -3821,9 +4062,12 @@ def _h_simulate_traditional_cloning(app, payload):
             "n_insert_fragments":  info["n_insert_fragments"],
             "products":            products,
             "incompatible":        info["incompatible"],
+            "annotations_carried": info["annotations_carried"],
+            "carry_warnings":      info["carry_warnings"],
             "ignored": _agent_ignored_keys(payload, {
                 "vector_seq", "vector_enzymes", "insert_seq",
-                "insert_enzymes", "vector_circular", "insert_circular"})}
+                "insert_enzymes", "vector_circular", "insert_circular",
+                "carry_annotations", "vector_name", "insert_name"})}
 
 
 def _agent_golden_gate_inputs(payload):
@@ -5430,6 +5674,112 @@ def _h_diff_plasmid(app, payload):
     }
 
 
+_VERIFY_READS_MAX = 200   # one alignment per read — cap the batch size
+
+
+@_agent_endpoint("verify-against-reads")
+def _h_verify_against_reads(app, payload):
+    """Verify a designed construct against sequencing reads — the "I built X, I
+    got reads back, do they match?" check. Body:
+    ``{reference | reference_id | reference_name, reads: [str, ...],
+        circular?, mode?="global", min_identity?=99.0}``.
+
+    ``reference`` is a bare sequence, OR resolve a saved plasmid via
+    ``reference_id`` / ``reference_name`` (its stored topology sets
+    ``circular`` unless you pass ``circular``). Each read in ``reads`` (bare
+    sequences — Nanopore / Sanger / a Plasmidsaurus consensus) is aligned to
+    the reference with the SAME rotation + RC-aware picker the Plasmidsaurus
+    aligner and the UI use, and its identity% reported. Returns
+    ``{ok, reference_len, n_reads, min_identity, verdict, circular,
+    reads:[{index, length, identity_pct, rc, passes}], summary:{mean, min, max,
+    n_pass, n_fail}}``. ``verdict`` is "match" when EVERY read ≥
+    ``min_identity``, else "mismatch" (failing reads flagged ``passes:false``).
+    Read-only, heavy — one alignment per read, capped at 200 reads."""
+    mode = payload.get("mode", "global")
+    if mode not in ("global", "local"):
+        return ({"error": "'mode' must be 'global' or 'local'"}, 400)
+    try:
+        min_identity = float(payload.get("min_identity", 99.0))
+    except (TypeError, ValueError):
+        return ({"error": "'min_identity' must be a number"}, 400)
+    if not (0.0 <= min_identity <= 100.0):
+        return ({"error": "'min_identity' must be in [0, 100]"}, 400)
+    circular_override = payload.get("circular")
+    circular = bool(circular_override) if circular_override is not None else True
+    ref_raw = payload.get("reference")
+    if isinstance(ref_raw, str) and ref_raw.strip():
+        ref_seq, e = _sanitize_bases(ref_raw)
+        if e:
+            return ({"error": f"'reference' rejected: {e}"}, 400)
+    else:
+        key = _sanitize_label(payload.get("reference_id")
+                              or payload.get("reference_name"), max_len=200)
+        if not key:
+            return ({"error": "provide 'reference' (a sequence) or "
+                              "'reference_id' / 'reference_name'"}, 400)
+        entry = (_find_library_entry_by_id(key)
+                 or _find_library_entry_by_name(key))
+        if entry is None:
+            return ({"error": f"no library entry named {key!r}"}, 404)
+        try:
+            rec = _gb_text_to_record(entry.get("gb_text") or "")
+        except Exception as exc:
+            return ({"error":
+                      f"couldn't parse {key!r}: {_scrub_path(str(exc))}"}, 500)
+        ref_seq = str(getattr(rec, "seq", "") or "")
+        if circular_override is None:
+            circular = (rec.annotations.get("topology") or "").lower() != "linear"
+    if not ref_seq:
+        return ({"error": "reference sequence is empty"}, 422)
+    if len(ref_seq) > _PAIRWISE_MAX_LEN:
+        return ({"error": f"reference exceeds {_PAIRWISE_MAX_LEN:,} bp"}, 413)
+    reads = payload.get("reads")
+    if not isinstance(reads, list) or not reads:
+        return ({"error": "'reads' must be a non-empty list of sequences"}, 400)
+    if len(reads) > _VERIFY_READS_MAX:
+        return ({"error": f"too many reads (max {_VERIFY_READS_MAX})"}, 413)
+    clean_reads = []
+    for i, r in enumerate(reads):
+        rs, e = _sanitize_bases(r if isinstance(r, str) else "")
+        if e or not rs:
+            return ({"error": f"reads[{i}] rejected: {e or 'empty'}"}, 400)
+        if len(rs) > _PAIRWISE_MAX_LEN:
+            return ({"error": f"reads[{i}] exceeds {_PAIRWISE_MAX_LEN:,} bp"},
+                    413)
+        clean_reads.append(rs)
+    out_reads = []
+    for i, rs in enumerate(clean_reads):
+        try:
+            res = _state._pick_best_rotation_hook(
+                rs, ref_seq, is_circular=circular, mode=mode,
+                canvas_axis="target")
+            # Coerce inside the try: a non-numeric identity_pct would otherwise
+            # escape the scrubbed-500 guard as a raw float() traceback.
+            ident = round(float(res.get("identity_pct") or 0.0), 2)
+        except ValueError as exc:
+            return ({"error": f"reads[{i}] alignment rejected: {exc}"}, 400)
+        except Exception as exc:
+            _log.exception("verify-against-reads: alignment raised")
+            return ({"error": f"alignment failed: {_scrub_path(str(exc))}"}, 500)
+        out_reads.append({"index": i, "length": len(rs), "identity_pct": ident,
+                          "rc": bool(res.get("query_rc", False)),
+                          "passes": ident >= min_identity})
+    idents = [r["identity_pct"] for r in out_reads]
+    n_pass = sum(1 for r in out_reads if r["passes"])
+    verdict = "match" if n_pass == len(out_reads) else "mismatch"
+    _log_event("verify.reads.agent", n_reads=len(out_reads), verdict=verdict,
+               min_identity=min_identity, via="agent")
+    return {"ok": True, "reference_len": len(ref_seq),
+            "n_reads": len(out_reads), "min_identity": min_identity,
+            "verdict": verdict, "circular": circular, "reads": out_reads,
+            "summary": {"mean": round(sum(idents) / len(idents), 2),
+                        "min": min(idents), "max": max(idents),
+                        "n_pass": n_pass, "n_fail": len(out_reads) - n_pass},
+            "ignored": _agent_ignored_keys(payload, {
+                "reference", "reference_id", "reference_name", "reads",
+                "circular", "mode", "min_identity"})}
+
+
 @_agent_endpoint("align-plasmidsaurus-zip")
 def _h_align_plasmidsaurus_zip(app, payload):
     """Align a Plasmidsaurus zip member against a library plasmid.
@@ -6707,11 +7057,89 @@ def _h_simulate_gel(app, payload):
     return response
 
 
+def _agent_entry_vector_check(grammar, gid, role, part):
+    """For `design-gb-part`'s ``check_entry_vector``: would the designed
+    ``part`` (its 4-nt ``oh5``/``oh3``) actually drop into the CONFIGURED entry
+    vector for ``(gid, role)``? Digests that vector with the grammar's Type IIS
+    enzyme and checks whether either released fragment's acceptor overhangs
+    match the part's — in either orientation — using the exact `overhang_seq`
+    equality that real ligation uses (the STRICT compatibility rule of
+    `_clone_part_into_entry_vector`'s primer path).
+
+    NB we deliberately do NOT run the full clone engine: it has a synthetic-
+    insert FALLBACK that force-fits a closed product even when the overhangs
+    don't match, so "it produced a plasmid" can't answer "is this compatible?".
+    The overhang match is the actual MoClo/Golden-Braid compatibility criterion.
+
+    Advisory — NEVER fails the design; the verdict rides in the response so a
+    mismatch surfaces at DESIGN time not only at the clone step (agent-API
+    feedback P1-5 residual)."""
+    role = role or ""
+    oh5 = (part.get("oh5") or "").upper()
+    oh3 = (part.get("oh3") or "").upper()
+    ev = _get_entry_vector(gid, role)
+    if ev is None:
+        return {"configured": False, "role": role,
+                "part_oh5": oh5, "part_oh3": oh3,
+                "note": f"no entry vector configured for grammar {gid!r}"
+                        + (f" role {role!r}" if role else "")
+                        + " — nothing to check the part against"}
+    ev_name = ev.get("name") or "?"
+    enzyme = grammar.get("enzyme") if isinstance(grammar, dict) else None
+    if not enzyme:
+        return {"configured": True, "checkable": False, "vector_name": ev_name,
+                "role": role, "part_oh5": oh5, "part_oh3": oh3,
+                "note": f"grammar {gid!r} declares no Type IIS enzyme to "
+                        "digest the entry vector with"}
+    try:
+        ev_seq = str(getattr(_gb_text_to_record(ev.get("gb_text") or ""),
+                             "seq", "") or "").upper()
+        frags, err = (_excise_fragment_pair(ev_seq, [enzyme], circular=True)
+                      if ev_seq else ([], {"error": "no sequence"}))
+    except Exception as exc:
+        _log.exception("agent design-gb-part: entry-vector digest failed")
+        return {"configured": True, "checkable": False, "vector_name": ev_name,
+                "role": role, "part_oh5": oh5, "part_oh3": oh3,
+                "note": f"couldn't digest entry vector: {_scrub_path(str(exc))}"}
+    if err is not None or len(frags) != 2:
+        return {"configured": True, "checkable": False, "vector_name": ev_name,
+                "role": role, "enzyme": enzyme, "part_oh5": oh5, "part_oh3": oh3,
+                "note": f"digesting {ev_name!r} with {enzyme} didn't yield a "
+                        "clean 2-fragment acceptor (misconfigured / extra "
+                        "sites?)"}
+    # The stuffer (smaller fragment) carries the acceptor's boundary overhangs;
+    # report them either way. Compatibility checks BOTH fragments (fwd + RC),
+    # matching how the real clone locates the dropout regardless of size.
+    stuffer = min(frags, key=lambda f: len(f.get("top_seq", "")))
+    acc5 = ((stuffer.get("left") or {}).get("overhang_seq") or "").upper()
+    acc3 = ((stuffer.get("right") or {}).get("overhang_seq") or "").upper()
+    orientation = None
+    for f in frags:
+        fl = ((f.get("left") or {}).get("overhang_seq") or "").upper()
+        fr = ((f.get("right") or {}).get("overhang_seq") or "").upper()
+        if not (oh5 and oh3 and fl and fr):
+            continue
+        if oh5 == fl and oh3 == fr:
+            orientation = "forward"; break
+        if oh5 == _rc(fr) and oh3 == _rc(fl):
+            orientation = "reverse"; break
+    compatible = orientation is not None
+    return {"configured": True, "checkable": True, "compatible": compatible,
+            "orientation": orientation, "vector_name": ev_name, "role": role,
+            "enzyme": enzyme, "acceptor_oh5": acc5, "acceptor_oh3": acc3,
+            "part_oh5": oh5, "part_oh3": oh3,
+            "note": ("part overhangs match the acceptor — it will drop in"
+                     if compatible else
+                     f"part overhangs {oh5}/{oh3} don't match the {ev_name!r} "
+                     f"acceptor {acc5}/{acc3} — it won't assemble into that "
+                     "vector")}
+
+
 @_agent_endpoint("design-gb-part")
 def _h_design_gb_part(app, payload):
     """Design Golden Braid / MoClo domestication primers. Body:
     ``{template, start, end, part_type, grammar?, target_tm?,
-        codon_taxid?}``.
+        codon_taxid?, check_entry_vector?, entry_vector_role?}``.
 
     `template` is the source DNA sequence; `start`/`end` are 0-based
     half-open coords (wrap-aware: end < start means origin-spanning
@@ -6720,6 +7148,17 @@ def _h_design_gb_part(app, payload):
     coding type and `codon_taxid` resolves to a codon table,
     internal forbidden sites are silently repaired via synonymous
     substitution.
+
+    Pass ``check_entry_vector: true`` to validate the designed part's 4-nt
+    overhangs against the CONFIGURED entry vector for the grammar (agent-API
+    feedback) — the design digests that vector, reads its acceptor overhangs,
+    and reports whether the part will actually drop in, so a mismatch surfaces
+    HERE instead of only at the clone step. ``entry_vector_role`` picks a
+    Golden-Braid role (``Alpha1`` / ``Alpha2`` / ``Omega1`` / ``Omega2``;
+    default ``""`` = the singleton L0 acceptor). The verdict rides under
+    ``result.entry_vector_check`` (``compatible`` / ``acceptor_oh5`` /
+    ``acceptor_oh3`` / ``part_oh5`` / ``part_oh3`` / ``note``); it's advisory
+    and never fails the design.
 
     Returns the `_design_gb_primers` dict (insert_seq, primer pairs,
     mutations list, overhang labels).
@@ -6803,6 +7242,22 @@ def _h_design_gb_part(app, payload):
         return ({"error": f"design failed: {_scrub_path(str(exc))}"}, 500)
     if isinstance(result, dict) and result.get("error"):
         return ({"error": result["error"]}, 422)
+    # Optional entry-vector compatibility check (agent-API feedback): does the
+    # part's (oh5, oh3) actually match the configured acceptor? Advisory —
+    # attached to the result, never fails the design.
+    if isinstance(result, dict) and payload.get("check_entry_vector"):
+        role = payload.get("entry_vector_role", "") or ""
+        if not isinstance(role, str):
+            return ({"error": "'entry_vector_role' must be a string"}, 400)
+        try:
+            result["entry_vector_check"] = _agent_entry_vector_check(
+                grammar, gid, role,
+                {"oh5": result.get("oh5") or "", "oh3": result.get("oh3") or ""})
+        except Exception as exc:
+            _log.exception("agent design-gb-part: entry-vector check failed")
+            result["entry_vector_check"] = {
+                "checkable": False,
+                "note": f"entry-vector check failed: {_scrub_path(str(exc))}"}
     return {"ok": True, "result": result}
 
 
@@ -7024,6 +7479,9 @@ def _h_move_experiment(app, payload):
     409 if it's in more than one project) and adds it to ``to`` — atomically.
     The active project's live mirror is re-synced when touched. 404 if the entry
     or a project is missing; 409 on an ambiguous id or an id already in ``to``."""
+    if (derr := _agent_reject_dangerous_unknowns(
+            payload, {"id", "to", "from"})) is not None:
+        return derr
     eid = _sanitize_experiment_id(payload.get("id"))
     if eid is None:
         return ({"error": "missing or invalid 'id'"}, 400)

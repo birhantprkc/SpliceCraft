@@ -706,6 +706,8 @@ class TestPanelCollectionCRUD:
             await pilot.pause(0.2)
             # Stage 2: scary red second confirm
             assert isinstance(app.screen, sc.ScaryDeleteConfirmModal)
+            await pilot.pause()   # drain mount messages so the modal's buttons
+            await pilot.pause()   # exist before we query them (flakes under -n auto)
             app.screen.query_one("#btn-scarydel-yes").action_press()
             await pilot.pause(0.2)
             names = [c["name"] for c in sc._load_collections()]
@@ -1343,6 +1345,8 @@ class TestCollectionDeleteKeyFlow:
             app.screen.query_one("#btn-colldel-yes").action_press()
             await pilot.pause(0.2)
             assert isinstance(app.screen, sc.ScaryDeleteConfirmModal)
+            await pilot.pause()   # drain mount messages so the modal's buttons
+            await pilot.pause()   # exist before we query them (flakes under -n auto)
             app.screen.query_one("#btn-scarydel-yes").action_press()
             await pilot.pause(0.2)
             assert sc._load_collections() == []

@@ -34,6 +34,7 @@ import os
 import re
 import shutil
 import sys
+from collections import namedtuple as _namedtuple
 from datetime import date as _date
 from pathlib import Path
 
@@ -96,8 +97,60 @@ _SNAPSHOT_FILE_SIZE_CAP  = 50 * 1024 * 1024  # 50 MB
 _SNAPSHOT_TOTAL_SIZE_CAP = 500 * 1024 * 1024  # 500 MB
 
 
+# ── The canonical persistent-cache registry (single source of truth) ──────────
+# One entry per persistent cache / user-data file. The parallel enumerations
+# across the data-safety machinery are all VIEWS of this ONE table:
+#   * `_USER_DATA_FILE_ATTRS` (backup / wipe / migrate)  = the `file_attr`s where `user_data`
+#   * `_MASTER_DELETE_CACHE_ATTRS` (agent; cache-bust)   = the `cache_attr`s where `master_delete`
+#   * `_AGENT_BACKUP_LABELS` (backup list/restore)        = `{label: file_attr}` where `label`
+#   * the pytest sandbox pairs (conftest `_protect_user_data`) = `(file_attr, cache_attr)` where `user_data`
+# The runtime lists below are kept EXPLICIT (not derived) so the data-safety
+# code stays auditable, but the `test_registry_*` cases in
+# `tests/test_data_safety.py` (class TestRealFilesNeverTouched) assert each one
+# matches this registry EXACTLY — so the recurring cache-bust / backup-label
+# enumeration drift (INV-43 / 50 / 64 / 66 / 142) can't return: add a cache HERE
+# and the failing test names precisely which views still need it. The pytest
+# sandbox (conftest `_SANDBOXED_DATA_FILE_ATTRS`) is its OWN hand-maintained
+# list — NOT derived from this registry — cross-checked against it by
+# `test_registry_matches_sandbox_pairs` (so a new cache still needs a conftest
+# entry, and the guard fails loudly until it has one; no silent data-loss).
+#
+# Order follows `_USER_DATA_FILE_ATTRS`; `_MASTER_DELETE_CACHE_ATTRS` preserves it
+# and interleaves the two index-only caches (`file_attr`/`label` = None — a
+# derived lookup index with no on-disk file, busted on restore but never backed up).
+_CacheSpec = _namedtuple(
+    "_CacheSpec", ("label", "file_attr", "cache_attr", "user_data", "master_delete"))
+_PERSISTENT_CACHE_REGISTRY: "tuple[_CacheSpec, ...]" = (
+    _CacheSpec("plasmid_library",       "_LIBRARY_FILE",               "_library_cache",               True,  True),
+    _CacheSpec("collections",           "_COLLECTIONS_FILE",           "_collections_cache",           True,  True),
+    _CacheSpec("parts_bin",             "_PARTS_BIN_FILE",             "_parts_bin_cache",             True,  True),
+    _CacheSpec("parts_bin_collections", "_PARTS_BIN_COLLECTIONS_FILE", "_parts_bin_collections_cache", True,  True),
+    _CacheSpec("primers",               "_PRIMERS_FILE",               "_primers_cache",               True,  True),
+    _CacheSpec("primer_collections",    "_PRIMER_COLLECTIONS_FILE",    "_primer_collections_cache",    True,  True),
+    _CacheSpec(None,                    None,                          "_primer_usage_cache",          False, True),   # index (sweep #20)
+    _CacheSpec("features",              "_FEATURES_FILE",              "_features_cache",              True,  True),
+    _CacheSpec("feature_colors",        "_FEATURE_COLORS_FILE",        "_feature_colors_cache",        True,  True),
+    _CacheSpec(None,                    None,                          "_feature_library_index_cache", False, True),   # index (sweep #20)
+    _CacheSpec("grammars",              "_GRAMMARS_FILE",              "_grammars_cache",              True,  True),
+    _CacheSpec("entry_vectors",         "_ENTRY_VECTORS_FILE",         "_entry_vectors_cache",         True,  True),
+    _CacheSpec("codon_tables",          "_CODON_TABLES_FILE",          "_codon_tables_cache",          True,  True),
+    _CacheSpec("settings",              "_SETTINGS_FILE",              "_settings_cache",              True,  True),
+    _CacheSpec("experiments",           "_EXPERIMENTS_FILE",           "_experiments_cache",           True,  True),
+    _CacheSpec("experiment_projects",   "_EXPERIMENT_PROJECTS_FILE",   "_experiment_projects_cache",   True,  True),
+    _CacheSpec("gels",                  "_GELS_FILE",                  "_gels_cache",                  True,  True),
+    _CacheSpec("protein_motifs",        "_PROTEIN_MOTIFS_FILE",        "_protein_motifs_cache",        True,  True),
+    _CacheSpec("custom_enzymes",        "_CUSTOM_ENZYMES_FILE",        "_custom_enzymes_cache",        True,  True),
+    _CacheSpec("enzyme_collections",    "_ENZYME_COLLECTIONS_FILE",    "_enzyme_collections_cache",    True,  True),
+    _CacheSpec("hmm_db_catalog",        "_HMM_DB_CATALOG_FILE",        "_hmm_db_catalog_cache",        True,  True),
+    _CacheSpec("protein_collections",   "_PROTEIN_COLLECTIONS_FILE",   "_protein_collections_cache",   True,  True),
+    _CacheSpec("model_collections",     "_MODEL_COLLECTIONS_FILE",     "_model_collections_cache",     True,  True),
+)
+
+
 # Canonical user-data files. Order matters for the manifest so a future
 # audit can replay the snapshot in deterministic sequence; do not reorder.
+# (Must equal the `user_data` `file_attr`s of `_PERSISTENT_CACHE_REGISTRY` above —
+# enforced by test_registry_matches_user_data_file_attrs.)
 _USER_DATA_FILE_ATTRS: tuple = (
     "_LIBRARY_FILE",          # plasmid_library.json — the user's plasmids
     "_COLLECTIONS_FILE",      # collections.json — collection definitions

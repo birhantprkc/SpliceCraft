@@ -528,7 +528,7 @@ Four parallel sub-agents covered footguns/correctness, performance, resource uti
 
 * **Lockfile unlink on graceful exit.** `_release_data_dir_lock` now best-effort-unlinks `splicecraft.lock` after the `LOCK_UN`. Cosmetic on local filesystems (PID-alive recheck handles stale lockfiles), but cleaner on NFS/SMB shares.
 
-* **Architectural recommendation deferred to v1.1.** The recurring cache-bust enumeration drift (caught 4 times: INV-43, INV-50, INV-64, here) and `_AGENT_BACKUP_LABELS` parity drift (INV-64) suggest a `_PERSISTENT_CACHE_REGISTRY: dict[str, CacheSpec]` with `attr_name`, `file_attr`, `backup_label`, `restore_handler`. The single source of truth would eliminate the entire bug class. Not landed this sweep — touches 5+ subsystems; defer until v1.0.0 ships.
+* **Architectural recommendation — LANDED (2026-07-03).** The recurring cache-bust enumeration drift (caught 4 times: INV-43, INV-50, INV-64, here) and `_AGENT_BACKUP_LABELS` parity drift (INV-64) suggested a `_PERSISTENT_CACHE_REGISTRY` with `label` / `file_attr` / `cache_attr` / `user_data` / `master_delete`. Now shipped in `splicecraft_backup.py`: one canonical `_CacheSpec` table (23 entries — 21 user-data files + 2 index-only caches) that every parallel enumeration (`_USER_DATA_FILE_ATTRS`, `_MASTER_DELETE_CACHE_ATTRS`, `_AGENT_BACKUP_LABELS`, the conftest sandbox pairs) is a documented VIEW of. **Deliberately NOT a runtime rewire** — the backup / wipe / master-delete enumeration stays explicit + auditable (SACRED data-safety code); instead the `test_registry_*` cases in `tests/test_data_safety.py` (class `TestRealFilesNeverTouched`, 5 cases) assert each runtime list matches the registry EXACTLY, so a future addition that drifts any view fails loudly and is named. Add a cache to the registry → the test tells you precisely which lists still need it. Kills the drift bug class without touching the data-safety runtime.
 
 ### Sweep #26 follow-up (same INV-66; 2026-05-23 same-day)
 
@@ -576,7 +576,7 @@ User asked for "fix all deferred" after sweep #25's first pass landed v0.9.20. T
 
 * **Removed unused `uuid` import** (left over from sweep #25 L3 switching to `secrets.token_urlsafe(32)`). Caught by `ruff check` in `release.py`'s gate.
 
-* **Architectural cache-registry refactor remains v1.1.** Same conclusion as sweep #25's first pass.
+* **Architectural cache-registry refactor — LANDED 2026-07-03** (`_PERSISTENT_CACHE_REGISTRY` in `splicecraft_backup.py` + the `test_registry_*` guards in `test_data_safety.py`); see the INV-66 note above.
 
 ---
 

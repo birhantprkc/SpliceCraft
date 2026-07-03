@@ -958,6 +958,75 @@ class TestTraditionalCloning:
             "vector_frag_idx": 0})
         assert isinstance(r, tuple) and r[1] == 422
 
+    # ── carry_annotations (agent-API feedback) ─────────────────────────────
+    def _seed_vector_entry(self, name="MyVector", label="backbone_marker",
+                            seq=None):
+        """Save a vector library entry carrying one misc_feature over the
+        backbone, so carry_annotations has something to source. ``seq`` lets a
+        test store a MISMATCHED sequence to exercise the soft-skip gate."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        s = self.VECTOR if seq is None else seq
+        rec = SeqRecord(Seq(s), id="MYVEC", name="MYVEC",
+                        annotations={"molecule_type": "DNA",
+                                       "topology": "circular"})
+        rec.features.append(SeqFeature(
+            FeatureLocation(10, 200, strand=1), type="misc_feature",
+            qualifiers={"label": [label]}))
+        sc._save_library([{
+            "id": "MYVEC", "name": name, "size": len(s), "n_feats": 1,
+            "added": "2026-07-02", "gb_text": sc._record_to_gb_text(rec)}])
+        return label
+
+    def test_carry_annotations_lifts_vector_features(self, isolated_library):
+        # vector_frag_idx=0 is the A×200 backbone; its misc_feature must ride
+        # onto the ligated product (no follow-up transfer-annotations needed).
+        label = self._seed_vector_entry()
+        r = sc._h_traditional_clone(None, dict(
+            self._base(), product_name="carried", vector_frag_idx=0,
+            carry_annotations=True, vector_name="MyVector"))
+        assert r["ok"], r
+        assert r["annotations_carried"] is True
+        assert not r["carry_warnings"], r["carry_warnings"]
+        ent = next(e for e in sc._load_library() if e["name"] == "carried")
+        rec = sc._gb_text_to_record(ent["gb_text"])
+        labels = [(f.qualifiers.get("label") or [""])[0] for f in rec.features]
+        assert label in labels, labels
+
+    def test_carry_annotations_reported_in_simulate(self, isolated_library):
+        self._seed_vector_entry()
+        r = sc._h_simulate_traditional_cloning(None, dict(
+            self._base(), carry_annotations=True, vector_name="MyVector"))
+        assert r["ok"] and r["annotations_carried"] is True
+
+    def test_carry_annotations_requires_a_name(self):
+        # Asked to carry but gave nothing to source from → fail loud (never a
+        # silent ok:true with a feature-bare product).
+        r = sc._h_traditional_clone(None, dict(
+            self._base(), product_name="x", vector_frag_idx=0,
+            carry_annotations=True))
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_carry_annotations_unknown_name_404(self, isolated_library):
+        sc._save_library([])
+        r = sc._h_traditional_clone(None, dict(
+            self._base(), product_name="x", vector_frag_idx=0,
+            carry_annotations=True, vector_name="ghost"))
+        assert isinstance(r, tuple) and r[1] == 404
+
+    def test_carry_annotations_seq_mismatch_soft_skips(self, isolated_library):
+        # The entry exists but its stored sequence differs from the passed
+        # vector_seq → carrying rotated/edited coords would mis-place features,
+        # so skip that side with a warning (the clone still succeeds).
+        self._seed_vector_entry(seq="ACGT" * 80)
+        r = sc._h_traditional_clone(None, dict(
+            self._base(), product_name="mismatch", vector_frag_idx=0,
+            carry_annotations=True, vector_name="MyVector"))
+        assert r["ok"], r
+        assert r["annotations_carried"] is False
+        assert r["carry_warnings"], "expected a carry warning on seq mismatch"
+
 
 class TestTraditionalCloningCircularInsert:
     """`insert_circular` + `insert_frag_idx` — cut a cassette OUT of a CIRCULAR
@@ -3996,6 +4065,347 @@ class TestAgentAssemblyLineage:
         assert len(tree["parents"]) == 2               # vector + insert
         pnames = " ".join(p["name"] for p in tree["parents"])
         assert "MyVector" in pnames and "MyInsert" in pnames
+
+
+class TestDesignGbPartEntryVector:
+    """`design-gb-part` ``check_entry_vector``: does the designed part actually
+    drop into the CONFIGURED entry vector? Runs the REAL clone sim so the
+    verdict matches the clone step (agent-API feedback P1-5 residual)."""
+
+    INSERT = "ATG" + "GGCTCAGGCGGT" * 5 + "TAA"   # 66 bp, no Esp3I/BsaI sites
+
+    def _cds_type(self):
+        g = sc._BUILTIN_GRAMMARS["gb_l0"]
+        return next((p["type"] for p in g["positions"]
+                     if p["type"] in (g.get("coding_types") or [])),
+                    g["positions"][0]["type"])
+
+    def _design(self):
+        g = sc._BUILTIN_GRAMMARS["gb_l0"]
+        d = sc._design_gb_primers(self.INSERT, 0, len(self.INSERT),
+                                  self._cds_type(), grammar=g)
+        assert not d.get("error"), d.get("error")
+        return d
+
+    def _bind_vector(self, oh5, oh3, name="CompatUPD"):
+        # An Esp3I acceptor whose dropout releases EXACTLY (oh5, oh3); backbone
+        # + dropout are Esp3I/BsaI-free so there are precisely two cut sites.
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        backbone = "AAAACCCC" * 100
+        dropout = "GGGGTTTT" * 20
+        cassette = "CGTCTCA" + oh5 + dropout + oh3 + "AGAGACG"
+        seq = backbone[:400] + cassette + backbone[400:]
+        rec = SeqRecord(Seq(seq), id="TESTUPD", name="TESTUPD",
+                        annotations={"molecule_type": "DNA",
+                                       "topology": "circular"})
+        sc._set_entry_vector("gb_l0", {
+            "name": name, "id": "TESTUPD", "size": len(seq),
+            "source": "test", "gb_text": sc._record_to_gb_text(rec)})
+
+    def _call(self, **extra):
+        return sc._h_design_gb_part(None, dict(
+            {"template": self.INSERT, "start": 0, "end": len(self.INSERT),
+             "part_type": self._cds_type(), "grammar": "gb_l0"}, **extra))
+
+    def test_compatible_part_drops_in(self):
+        d = self._design()
+        self._bind_vector(d["oh5"], d["oh3"])
+        chk = self._call(check_entry_vector=True)["result"]["entry_vector_check"]
+        assert chk["checkable"] is True
+        assert chk["compatible"] is True, chk
+        assert chk["vector_name"] == "CompatUPD"
+        assert chk["acceptor_oh5"] == d["oh5"] and chk["acceptor_oh3"] == d["oh3"]
+
+    def test_incompatible_vector_reported(self):
+        # A vector whose dropout releases overhangs the part doesn't carry.
+        d = self._design()
+        assert (d["oh5"], d["oh3"]) != ("AAAA", "TTTT")
+        self._bind_vector("AAAA", "TTTT", name="WrongUPD")
+        chk = self._call(check_entry_vector=True)["result"]["entry_vector_check"]
+        assert chk["checkable"] is True
+        assert chk["compatible"] is False, chk
+
+    def test_no_vector_configured_reported(self):
+        sc._set_entry_vector("gb_l0", None)
+        chk = self._call(check_entry_vector=True)["result"]["entry_vector_check"]
+        assert chk["configured"] is False
+
+    def test_check_omitted_leaves_no_key(self):
+        self._bind_vector("AATG", "GCTT")
+        r = self._call()
+        assert r["ok"] and "entry_vector_check" not in r["result"]
+
+
+class TestProteinMotifEndpoints:
+    """Agent endpoints list/set/delete-protein-motif — the merge + builtin-
+    override + delete-restores-builtin behaviors. The GUI/synthesis side is
+    covered in test_synthesis.py; the agent side was untested."""
+
+    def _builtin_name(self):
+        # User file is empty under the sandbox → _load_protein_motifs is just
+        # the built-ins.
+        motifs = sc._load_protein_motifs()
+        assert motifs, "no builtin motifs"
+        return motifs[0]["name"]
+
+    def _merged(self):
+        return {m["name"]: m
+                for m in sc._h_list_protein_motifs(None, {})["motifs"]}
+
+    def test_list_returns_builtins(self):
+        r = sc._h_list_protein_motifs(None, {})
+        assert len(r["motifs"]) >= 1
+        assert all("name" in m and "sequence" in m for m in r["motifs"])
+
+    def test_set_creates_user_motif(self):
+        r = sc._h_set_protein_motif(None, {
+            "name": "MyTag", "sequence": "gsgsgs", "feature_type": "Tag",
+            "color": "#ff0000", "description": "a linker"})
+        assert r == {"ok": True, "name": "MyTag"}
+        assert self._merged()["MyTag"]["sequence"] == "GSGSGS"   # upper-cased
+
+    def test_set_missing_name_400(self):
+        assert sc._h_set_protein_motif(None, {"sequence": "GS"})[1] == 400
+        assert sc._h_set_protein_motif(
+            None, {"name": "   ", "sequence": "GS"})[1] == 400
+
+    def test_set_missing_sequence_400(self):
+        assert sc._h_set_protein_motif(None, {"name": "X"})[1] == 400
+
+    def test_set_noncanonical_aa_400(self):
+        r = sc._h_set_protein_motif(None, {"name": "Bad", "sequence": "GSBZ1"})
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_set_overrides_builtin(self):
+        bn = self._builtin_name()
+        assert sc._h_set_protein_motif(
+            None, {"name": bn, "sequence": "WWWWWW"})["ok"]
+        assert self._merged()[bn]["sequence"] == "WWWWWW"       # override wins
+
+    def test_delete_override_restores_builtin(self):
+        bn = self._builtin_name()
+        orig = self._merged()[bn]["sequence"]
+        sc._h_set_protein_motif(None, {"name": bn, "sequence": "WWWWWW"})
+        assert sc._h_delete_protein_motif(None, {"name": bn}) == {
+            "ok": True, "name": bn}
+        assert self._merged()[bn]["sequence"] == orig            # restored
+
+    def test_delete_builtin_without_override_404(self):
+        r = sc._h_delete_protein_motif(None, {"name": self._builtin_name()})
+        assert isinstance(r, tuple) and r[1] == 404
+
+    def test_delete_missing_name_400(self):
+        assert sc._h_delete_protein_motif(None, {})[1] == 400
+
+    def test_set_copy_on_write_keeps_others(self):
+        sc._h_set_protein_motif(None, {"name": "A", "sequence": "AA"})
+        sc._h_set_protein_motif(None, {"name": "B", "sequence": "CC"})
+        sc._h_set_protein_motif(None, {"name": "A", "sequence": "DD"})  # override
+        merged = self._merged()
+        assert merged["A"]["sequence"] == "DD"
+        assert merged["B"]["sequence"] == "CC"
+
+
+class TestDangerousParamGuard:
+    """`_agent_reject_dangerous_unknowns`: a routing/selection param passed to
+    an endpoint that doesn't accept it fails loud (the SC-D silent-ok:true
+    footgun) instead of being quietly dropped. Benign forward-compat unknowns
+    stay soft — the endpoint still runs."""
+
+    def test_move_part_rejects_bin_param(self):
+        # move-part routes by to/from, not `bin` — a `bin` key is a mistake.
+        r = sc._h_move_part(None, {"to": "B", "name": "p", "bin": "wrong"})
+        assert isinstance(r, tuple) and r[1] == 400
+        assert "bin" in r[0]["error"]
+
+    def test_move_part_benign_unknown_passes_guard(self):
+        # A benign unknown doesn't trip the guard; the call proceeds and 404s on
+        # the missing bin (NOT the guard's 400).
+        r = sc._h_move_part(None, {"to": "Nope", "name": "p", "notes": "hi"})
+        assert isinstance(r, tuple) and r[1] == 404
+
+    def test_move_part_normal_call_unaffected(self):
+        r = sc._h_move_part(None, {"to": "Nope", "name": "p"})
+        assert isinstance(r, tuple) and r[1] == 404
+
+    def test_move_primer_rejects_collection_typo(self):
+        r = sc._h_move_primer(None, {"to": "C", "name": "p",
+                                     "source_collection": "x"})
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_move_experiment_rejects_collection(self):
+        r = sc._h_move_experiment(None, {"id": "e1", "to": "P",
+                                         "collection": "x"})
+        assert isinstance(r, tuple) and r[1] == 400
+
+
+class TestLintSynthesis:
+    """`lint-synthesis` — synthesis/assembly readiness pre-flight (internal
+    Type IIS sites, GC extremes, homopolymers, tandem repeats, ORF integrity)."""
+
+    def _lint(self, seq, **extra):
+        return sc._h_lint_synthesis(None, dict({"sequence": seq}, **extra))
+
+    def test_flags_internal_bsai_site(self):
+        r = self._lint("ATCGATCGAT" + "GGTCTC" + "ATCGATCGATTAGCTAGCTAGC")
+        assert r["ok"]
+        assert any(w["kind"] == "type_iis_site" and w["level"] == "error"
+                   for w in r["warnings"])
+        assert r["score"] < 100
+
+    def test_clean_mcs_no_type_iis(self):
+        # HindIII/BamHI/EcoRI/XbaI/SmaI MCS — none are BsaI/Esp3I/BbsI/SapI.
+        r = self._lint("AAGCTTGGATCCGAATTCTCTAGACCCGGG")
+        assert not any(w["kind"] == "type_iis_site" for w in r["warnings"])
+
+    def test_flags_homopolymer(self):
+        r = self._lint("ATCGATCG" + "A" * 15 + "GCTAGCTA")
+        assert any(w["kind"] == "homopolymer" for w in r["warnings"])
+
+    def test_flags_extreme_gc(self):
+        r = self._lint("GC" * 60)
+        assert any(w["kind"] == "gc_overall" for w in r["warnings"])
+        assert r["stats"]["gc"] > 0.9
+
+    def test_expect_cds_clean_orf_ok(self):
+        r = self._lint("ATG" + "GCTACG" * 16 + "TAA", expect_cds=True,
+                       circular=False)
+        assert not any(w["kind"] == "orf_integrity" for w in r["warnings"])
+
+    def test_expect_cds_no_orf_errors(self):
+        r = self._lint("TAA" * 20, expect_cds=True, circular=False)
+        assert any(w["kind"] == "orf_integrity" and w["level"] == "error"
+                   for w in r["warnings"])
+
+    def test_forbidden_enzymes_override(self):
+        seq = "ATCGAT" + "GAATTC" + "ATCGATCGTAGCTAGC"      # EcoRI site
+        assert not any(w["kind"] == "type_iis_site"
+                       for w in self._lint(seq)["warnings"])          # default
+        r = self._lint(seq, forbidden_enzymes=["EcoRI"])
+        assert any(w["kind"] == "type_iis_site" for w in r["warnings"])
+
+    def test_resolves_by_library_entry(self, isolated_library):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq("ATCGATCG" + "GGTCTC" + "ATCGATCGTAGC"),
+                        id="LINTME", name="LINTME",
+                        annotations={"molecule_type": "DNA",
+                                       "topology": "circular"})
+        sc._save_library([{"id": "LINTME", "name": "Lint Me", "size": 0,
+                           "n_feats": 0, "added": "2026-07-03",
+                           "gb_text": sc._record_to_gb_text(rec)}])
+        r = sc._h_lint_synthesis(None, {"name": "Lint Me"})
+        assert r["ok"] and r["stats"]["circular"] is True
+        assert any(w["kind"] == "type_iis_site" for w in r["warnings"])
+
+    def test_missing_input_400(self):
+        r = sc._h_lint_synthesis(None, {})
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_unknown_entry_404(self, isolated_library):
+        sc._save_library([])
+        r = sc._h_lint_synthesis(None, {"id": "ghost"})
+        assert isinstance(r, tuple) and r[1] == 404
+
+    def test_bad_forbidden_enzymes_type_400(self):
+        r = sc._h_lint_synthesis(None, {"sequence": "ATCG",
+                                        "forbidden_enzymes": "BsaI"})
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_length_cap_413(self):
+        r = self._lint("A" * 200_001)
+        assert isinstance(r, tuple) and r[1] == 413
+
+    def test_empty_or_invalid_sequence_rejected(self):
+        # A sequence with no valid IUPAC bases is rejected, not linted as empty.
+        r = sc._h_lint_synthesis(None, {"sequence": "123456"})
+        assert isinstance(r, tuple) and r[1] in (400, 422)
+
+    def test_too_many_forbidden_enzymes_400(self):
+        r = self._lint("ATCGATCG", forbidden_enzymes=["BsaI"] * 33)
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_unknown_forbidden_enzyme_400(self):
+        # A safety check must fail loud on a typo, not silently skip the site.
+        r = self._lint("ATCGATCG", forbidden_enzymes=["BsaI", "Bsal"])
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_lint_synthesis_is_heavy_classified(self):
+        assert "lint-synthesis" in sc._AGENT_HEAVY_ENDPOINTS
+
+
+class TestVerifyAgainstReads:
+    """`verify-against-reads` — align sequencing reads to a designed construct
+    and report per-read identity + a match/mismatch verdict."""
+
+    REF = "ATGGCAAGCGGTGGTTCTGGTAGCGGTAGCGGTAGCGGTAGCGGTACCGATCGATCGTAA"  # 60
+
+    def _verify(self, reads, **extra):
+        return sc._h_verify_against_reads(
+            None, dict({"reference": self.REF, "reads": reads,
+                        "circular": False}, **extra))
+
+    def _one_mismatch(self):
+        i = 30
+        return self.REF[:i] + ("T" if self.REF[i] != "T" else "A") + self.REF[i + 1:]
+
+    def test_perfect_read_matches(self):
+        r = self._verify([self.REF])
+        assert r["ok"] and r["verdict"] == "match"
+        assert r["reads"][0]["identity_pct"] == 100.0
+        assert r["reads"][0]["passes"] is True
+
+    def test_mismatch_read_flagged(self):
+        r = self._verify([self._one_mismatch()])
+        assert r["verdict"] == "mismatch"
+        assert r["reads"][0]["passes"] is False and r["summary"]["n_fail"] == 1
+
+    def test_rc_read_still_matches(self):
+        r = self._verify([sc._rc(self.REF)])
+        assert r["reads"][0]["identity_pct"] >= 99.0
+        assert r["reads"][0]["rc"] is True
+
+    def test_min_identity_threshold(self):
+        # The same single-mismatch read passes under a lenient threshold.
+        assert self._verify([self._one_mismatch()],
+                            min_identity=90.0)["verdict"] == "match"
+
+    def test_mixed_reads_verdict(self):
+        r = self._verify([self.REF, self._one_mismatch()])
+        assert r["n_reads"] == 2 and r["verdict"] == "mismatch"
+        assert r["summary"]["n_pass"] == 1 and r["summary"]["n_fail"] == 1
+
+    def test_resolve_reference_by_entry(self, isolated_library):
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        rec = SeqRecord(Seq(self.REF), id="REFME", name="REFME",
+                        annotations={"molecule_type": "DNA",
+                                       "topology": "linear"})
+        sc._save_library([{"id": "REFME", "name": "Ref Me", "size": 0,
+                           "n_feats": 0, "added": "2026-07-03",
+                           "gb_text": sc._record_to_gb_text(rec)}])
+        r = sc._h_verify_against_reads(
+            None, {"reference_name": "Ref Me", "reads": [self.REF]})
+        assert r["ok"] and r["reads"][0]["identity_pct"] == 100.0
+
+    def test_missing_reference_400(self):
+        r = sc._h_verify_against_reads(None, {"reads": ["ACGT"]})
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_missing_reads_400(self):
+        r = sc._h_verify_against_reads(None, {"reference": self.REF})
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_unknown_reference_404(self, isolated_library):
+        sc._save_library([])
+        r = sc._h_verify_against_reads(
+            None, {"reference_id": "ghost", "reads": [self.REF]})
+        assert isinstance(r, tuple) and r[1] == 404
+
+    def test_too_many_reads_413(self):
+        r = self._verify([self.REF] * 201)
+        assert isinstance(r, tuple) and r[1] == 413
 
 
 class TestRequestDispatcherHardening:

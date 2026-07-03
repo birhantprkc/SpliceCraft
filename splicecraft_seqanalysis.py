@@ -22,7 +22,7 @@ Re-exported by the hub so `sc.<name>` + every call site resolves unchanged.
 from __future__ import annotations
 
 import splicecraft_state as _state
-from splicecraft_biology import _rc
+from splicecraft_biology import _rc, _enzyme_cuts
 from splicecraft_codon import _CODON_TABLE, _STOP_CODONS
 from splicecraft_record import _gb_text_to_record
 from splicecraft_dataaccess import _all_grammars, _load_entry_vectors
@@ -312,6 +312,182 @@ def _check_vector_match(
 
 
 _ACCEPTOR_TU_PAIRS_CACHE_MAX = 64
+
+
+# ── Synthesis / assembly readiness lint ─────────────────────────────────────
+# The "is it safe to order + assemble?" pre-flight: internal Type IIS sites
+# (kill Golden Gate / MoClo), GC extremes + homopolymer / tandem runs (kill
+# gene synthesis), degenerate bases, and optional ORF integrity. Read-only;
+# composes `_enzyme_cuts` (biology) + `_find_orfs` with a few local scans.
+_SYNTHESIS_FORBIDDEN_ENZYMES = ("BsaI", "BsmBI", "BbsI", "SapI", "Esp3I")
+
+
+def _lint_homopolymer_runs(seq: str, min_len: int
+                           ) -> "list[tuple[int, str, int]]":
+    """``[(start, base, length), …]`` for each single-base run ≥ ``min_len``."""
+    out: "list[tuple[int, str, int]]" = []
+    n, i = len(seq), 0
+    while i < n:
+        j = i + 1
+        while j < n and seq[j] == seq[i]:
+            j += 1
+        if j - i >= min_len:
+            out.append((i, seq[i], j - i))
+        i = j
+    return out
+
+
+def _lint_tandem_repeats(seq: str, *, unit_min: int, unit_max: int,
+                         min_copies: int) -> "list[tuple[int, str, int]]":
+    """``[(start, unit, copies), …]`` for tandem k-mer repeats (``unit_min ≤ k
+    ≤ unit_max``) of ≥ ``min_copies`` copies. Greedy + non-overlapping;
+    single-base units are skipped (homopolymers are reported separately)."""
+    out: "list[tuple[int, str, int]]" = []
+    n, i = len(seq), 0
+    while i < n:
+        best = None
+        for u in range(unit_min, unit_max + 1):
+            if i + u > n:
+                break
+            unit = seq[i:i + u]
+            if len(set(unit)) == 1:
+                continue
+            copies, j = 1, i + u
+            while j + u <= n and seq[j:j + u] == unit:
+                copies, j = copies + 1, j + u
+            if copies >= min_copies and (best is None
+                                          or copies * u > best[2] * len(best[1])):
+                best = (i, unit, copies)
+        if best is not None:
+            out.append(best)
+            i += best[2] * len(best[1])
+        else:
+            i += 1
+    return out
+
+
+def _lint_gc(seq: str) -> float:
+    return (seq.count("G") + seq.count("C")) / len(seq) if seq else 0.0
+
+
+def _lint_worst_gc_window(seq: str, window: int) -> "tuple[int, float] | None":
+    """``(start, gc_fraction)`` of the window whose GC is furthest from 0.5, or
+    None when the sequence is shorter than ``window``. O(n) sliding sum."""
+    n = len(seq)
+    if window <= 0 or n < window:
+        return None
+    cur = sum(1 for c in seq[:window] if c in "GC")
+    worst_i, worst_gc = 0, cur / window
+    for i in range(1, n - window + 1):
+        if seq[i - 1] in "GC":
+            cur -= 1
+        if seq[i + window - 1] in "GC":
+            cur += 1
+        frac = cur / window
+        if abs(frac - 0.5) > abs(worst_gc - 0.5):
+            worst_i, worst_gc = i, frac
+    return worst_i, worst_gc
+
+
+def _synthesis_lint(seq, *, circular: bool = True, expect_cds: bool = False,
+                    forbidden_enzymes=_SYNTHESIS_FORBIDDEN_ENZYMES,
+                    min_gc: float = 0.30, max_gc: float = 0.70,
+                    gc_window: int = 50, gc_window_lo: float = 0.20,
+                    gc_window_hi: float = 0.80, homopolymer_max: int = 9,
+                    repeat_unit_max: int = 4, repeat_min_copies: int = 5,
+                    max_warnings_per_kind: int = 20) -> dict:
+    """Synthesis / assembly readiness lint. Returns
+    ``{"score": int, "warnings": [...], "stats": {...}}``. Read-only.
+
+    ``warnings`` are ``{level, kind, message, start?, end?}`` with
+    ``level ∈ {"error","warn","info"}``. Checks: internal Type IIS sites
+    (assembly killers → error), extreme overall + windowed GC, long homopolymer
+    runs, tandem repeats, degenerate/non-ACGT bases, and — when ``expect_cds``
+    — a clean full-length ORF. ``score`` starts at 100; each finding deducts by
+    severity (error −20, warn −8, info −2, floored at 0)."""
+    raw = (seq or "").upper()
+    s = "".join(c for c in raw if c in "ACGT")
+    warnings: "list[dict]" = []
+
+    def add(level, kind, message, start=None, end=None):
+        w = {"level": level, "kind": kind, "message": message}
+        if start is not None:
+            w["start"] = int(start)
+        if end is not None:
+            w["end"] = int(end)
+        warnings.append(w)
+
+    n_degenerate = len(raw) - len(s)
+    if n_degenerate:
+        add("warn", "degenerate_bases",
+            f"{n_degenerate} non-ACGT / ambiguous base(s) — most synthesis "
+            "vendors reject degenerate positions")
+
+    catalog = _state._all_enzymes_hook()
+    for enz in forbidden_enzymes:
+        if enz not in catalog:
+            continue
+        try:
+            cuts = _enzyme_cuts(s, [enz], circular=circular)
+        except Exception:
+            continue
+        for c in cuts[:max_warnings_per_kind]:
+            add("error", "type_iis_site",
+                f"internal {enz} site — cut during Golden Gate / MoClo assembly "
+                "(domesticate it out)", start=c.get("top"))
+        if len(cuts) > max_warnings_per_kind:
+            add("info", "type_iis_site",
+                f"…and {len(cuts) - max_warnings_per_kind} more {enz} site(s)")
+
+    gc = _lint_gc(s)
+    if s and (gc < min_gc or gc > max_gc):
+        add("warn", "gc_overall",
+            f"overall GC {gc*100:.0f}% is outside the {min_gc*100:.0f}–"
+            f"{max_gc*100:.0f}% synthesis-friendly range")
+    ww = _lint_worst_gc_window(s, gc_window)
+    if ww is not None and (ww[1] < gc_window_lo or ww[1] > gc_window_hi):
+        add("warn", "gc_window",
+            f"a {gc_window} bp window at +{ww[0]} is {ww[1]*100:.0f}% GC — local "
+            "extremes hurt synthesis + PCR", start=ww[0], end=ww[0] + gc_window)
+
+    for start, base, length in _lint_homopolymer_runs(
+            s, homopolymer_max)[:max_warnings_per_kind]:
+        add("warn", "homopolymer",
+            f"{length}×{base} homopolymer run — synthesis-hard (slippage)",
+            start=start, end=start + length)
+
+    for start, unit, copies in _lint_tandem_repeats(
+            s, unit_min=2, unit_max=repeat_unit_max,
+            min_copies=repeat_min_copies)[:max_warnings_per_kind]:
+        add("warn", "tandem_repeat",
+            f"{copies}×({unit}) tandem repeat — synthesis + assembly hazard",
+            start=start, end=start + copies * len(unit))
+
+    orf_count = 0
+    if s:
+        try:
+            orfs = _find_orfs(s, circular=circular)
+        except Exception:
+            orfs = []
+        orf_count = len(orfs)
+        if expect_cds:
+            def _span(o):
+                st, en = int(o["start"]), int(o["end"])
+                return (len(s) - st) + en if en < st else en - st
+            if not any(_span(o) >= 0.9 * len(s) for o in orfs):
+                add("error", "orf_integrity",
+                    "no full-length ORF spanning ~the whole sequence — a "
+                    "premature stop or frame shift would truncate the protein")
+
+    penalty = sum({"error": 20, "warn": 8, "info": 2}.get(w["level"], 0)
+                  for w in warnings)
+    return {
+        "score": max(0, 100 - penalty),
+        "warnings": warnings,
+        "stats": {"length": len(s), "gc": round(gc, 4),
+                  "degenerate_bases": n_degenerate, "orf_count": orf_count,
+                  "circular": bool(circular)},
+    }
 
 
 def _grammar_acceptor_tu_pairs(

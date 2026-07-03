@@ -469,6 +469,48 @@ class TestBabsUI:
             ans = scr._history[-1]["content"]
             assert "Callus forms" in ans and "Sources:" in ans     # streamed + cited
 
+    async def test_grounded_plus_agent_surfaces_conflict(self, monkeypatch, tmp_path):
+        """Both Corpus and Agent on: grounded wins (corpus is a separate cited-answer
+        subprocess), but the Agent toggle is NOT silently ignored — a note says agent
+        actions are paused this turn."""
+        import subprocess as _sp
+        import types as _types
+        monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
+        monkeypatch.setattr(B, "chat_stream", lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("agentic/plain chat path used while grounded")))
+        out = b"Answer [1].\n\nSources:\n  [1] (CORE) x\n"
+
+        def fake_popen(*a, **k):
+            r, w = os.pipe(); os.write(w, out); os.close(w)
+            p = _types.SimpleNamespace(stdout=os.fdopen(r, "rb", 0))
+            p.wait = lambda timeout=None: 0
+            p.terminate = lambda: None
+            p.kill = lambda: None
+            return p
+        monkeypatch.setattr(_sp, "Popen", fake_popen)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            monkeypatch.setattr(scr, "_resolve_babs_home", lambda: tmp_path)
+            monkeypatch.setattr(scr, "_corpus_available", lambda: True)
+            notes: "list[str]" = []
+            monkeypatch.setattr(scr, "_sys_note",
+                                lambda m, *a, **k: notes.append(m))
+            scr._grounded = True
+            scr._agent_enabled = True                # both toggles on
+            scr.query_one("#babs-input", Input).value = "q?"
+            scr._submit_current()
+            for _ in range(80):
+                await pilot.pause(); await asyncio.sleep(0.03)
+                if not scr._generating:
+                    break
+            assert not scr._generating
+            assert any("paused this turn" in n for n in notes)   # conflict surfaced
+            assert "Answer" in scr._history[-1]["content"]        # grounded still ran
+
     async def test_setup_checklist_on_ollama_down(self, monkeypatch):
         """When Ollama is unreachable, the Chat tab shows a numbered first-run checklist
         (install Ollama → pull a model → babs-setup) instead of a bare connection error."""

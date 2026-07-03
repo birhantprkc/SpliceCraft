@@ -874,6 +874,57 @@ class TestRealFilesNeverTouched:
             f"expected a tmp dir!"
         )
 
+    def test_registry_matches_user_data_file_attrs(self):
+        """[single source of truth] `_USER_DATA_FILE_ATTRS` is EXACTLY the
+        user-data `file_attr`s of `_PERSISTENT_CACHE_REGISTRY`, in order (backup /
+        wipe / migrate iterate it — a drift here silently drops a file from
+        backup or wipe). Add a cache to the registry and this names the gap."""
+        derived = tuple(e.file_attr for e in sc._PERSISTENT_CACHE_REGISTRY
+                        if e.user_data)
+        assert derived == tuple(sc._USER_DATA_FILE_ATTRS)
+
+    def test_registry_matches_master_delete_cache_attrs(self):
+        """`_MASTER_DELETE_CACHE_ATTRS` is EXACTLY the `master_delete` `cache_attr`s
+        of the registry, in order — the cache-bust enumeration whose drift leaves
+        a stale cache that overwrites a fresh restore (INV-50)."""
+        derived = tuple(e.cache_attr for e in sc._PERSISTENT_CACHE_REGISTRY
+                        if e.master_delete)
+        assert derived == tuple(sc._MASTER_DELETE_CACHE_ATTRS)
+
+    def test_registry_matches_agent_backup_labels(self):
+        """`_AGENT_BACKUP_LABELS` is EXACTLY `{label: file_attr}` for the labelled
+        registry entries — the backup list/restore label map (INV-64 parity)."""
+        derived = {e.label: e.file_attr for e in sc._PERSISTENT_CACHE_REGISTRY
+                   if e.label is not None}
+        assert derived == dict(sc._AGENT_BACKUP_LABELS)
+
+    def test_registry_matches_sandbox_pairs(self):
+        """The pytest sandbox pairs `(file_attr, cache_attr)` for user-data files
+        equal the registry's — the INV-142 file↔cache correspondence that, when
+        it drifted, let babs tests write the user's real model_collections.json."""
+        from tests.conftest import _SANDBOXED_DATA_FILE_ATTRS
+        reg = {(e.file_attr, e.cache_attr)
+               for e in sc._PERSISTENT_CACHE_REGISTRY if e.user_data}
+        sandbox = {(f, c) for f, c in _SANDBOXED_DATA_FILE_ATTRS if c is not None}
+        assert reg == sandbox
+
+    def test_registry_internally_consistent(self):
+        """No duplicate labels / cache_attrs / file_attrs; every file_attr names a
+        real `_state` attribute; a file-backed entry is labelled + user-data, an
+        index-only entry (no file) is neither labelled nor user-data."""
+        for kind, vals in (("label", [e.label for e in sc._PERSISTENT_CACHE_REGISTRY if e.label]),
+                           ("cache", [e.cache_attr for e in sc._PERSISTENT_CACHE_REGISTRY if e.cache_attr]),
+                           ("file", [e.file_attr for e in sc._PERSISTENT_CACHE_REGISTRY if e.file_attr])):
+            assert len(vals) == len(set(vals)), f"duplicate {kind} in registry"
+        for e in sc._PERSISTENT_CACHE_REGISTRY:
+            if e.file_attr is not None:
+                assert hasattr(sc._state, e.file_attr), f"no _state.{e.file_attr}"
+                assert e.label is not None and e.user_data, \
+                    f"file-backed {e.file_attr} must be labelled + user_data"
+            else:
+                assert e.label is None and not e.user_data, \
+                    "an index-only cache (no file) must not be labelled/user_data"
+
     def test_sandbox_covers_every_registered_user_data_file(self):
         """[regression guard] The conftest sandbox (`_SANDBOXED_DATA_FILE_ATTRS`)
         MUST redirect EVERY production user-data file — the canonical

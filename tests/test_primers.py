@@ -1634,6 +1634,34 @@ class TestPrimerCsvExport:
         with pytest.raises(ValueError, match="BadOne"):
             sc._export_primers_to_csv(primers, tmp_path / "o.csv")
 
+    def test_idt_format_columns(self, tmp_path):
+        import csv as _csv
+        primers = [
+            {"name": "P1", "sequence": "ACGTACGT", "tm": 58.3},
+            {"name": "P2", "sequence": "TTTT", "scale": "100nm",
+             "purification": "HPLC"},                       # per-oligo override
+        ]
+        out = tmp_path / "idt.csv"
+        res = sc._export_primers_to_csv(primers, out, order_format="idt")
+        assert res["count"] == 2
+        rows = list(_csv.reader(out.open()))
+        assert rows[0] == ["Name", "Sequence", "Scale", "Purification"]
+        assert rows[1] == ["P1", "ACGTACGT", "25nm", "STD"]     # defaults
+        assert rows[2] == ["P2", "TTTT", "100nm", "HPLC"]       # overridden
+
+    def test_unknown_format_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="order_format"):
+            sc._export_primers_to_csv(
+                [{"name": "a", "sequence": "ACGT"}], tmp_path / "x.csv",
+                order_format="snapgene")
+
+    def test_idt_still_refuses_malformed_oligo(self, tmp_path):
+        # The catastrophic-class refusal holds regardless of order format.
+        with pytest.raises(ValueError, match="Bad"):
+            sc._export_primers_to_csv(
+                [{"name": "Bad", "sequence": "ACGTXZ"}], tmp_path / "o.csv",
+                order_format="idt")
+
 
 class TestPrimerCsvImport:
     """`_import_primers_from_csv` round-trips the export and HARDENS against

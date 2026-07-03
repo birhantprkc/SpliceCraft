@@ -116,11 +116,21 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   ligation is possible, pick with `vector_frag_idx` / `insert_frag_idx`. Pass
   `insert_circular:true` to cut a cassette OUT of a *plasmid* insert — e.g. an
   Ω multigene into a binary vector — so its two digest fragments are both
-  offered instead of treating the insert as a linear PCR product),
+  offered instead of treating the insert as a linear PCR product. Pass
+  `carry_annotations:true` to lift the `vector_name` / `insert_name` entries'
+  own features onto the ligated product — split at the cuts and shifted to
+  product coordinates — so the clone isn't feature-bare; a side whose passed
+  sequence doesn't exactly match its named entry is reported in
+  `carry_warnings` rather than mis-placed),
   golden-gate-assemble / simulate-golden-gate (Type IIS — BsaI /
   BsmBI / BbsI / SapI / Esp3I — overhang-directed N-part assembly: parts in
   any order, chained by their 4-nt overhangs into a circle, with a
-  unique-overhang + no-residual-site fidelity check), design-mutagenesis,
+  unique-overhang + no-residual-site fidelity check),
+  lint-synthesis (an "is it safe to order + assemble?" pre-flight over a bare
+  `sequence` or a library `id`/`name`: internal Type IIS sites, extreme
+  overall + windowed GC, long homopolymer runs, tandem repeats, degenerate
+  bases, and — with `expect_cds` — a full-length ORF check, rolled into a
+  0-100 `score` + line-item `warnings`; read-only), design-mutagenesis,
   scrub-plasmid (clone-free restriction-site removal: silent / synonymous
   cures inside CDSes + minimal swaps elsewhere; scrubs the loaded record or
   an explicit `seq`+`features`, optional `codon_taxid` biases coding cures to
@@ -129,7 +139,12 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   primer pair per locus) or `"golden_braid"` (split into BsaI-tailed
   fragments that Golden-Gate back together; force-cures every BsaI site,
   returns per-fragment primers + native junction overhangs + a digest+ligate
-  `verified` flag)), design-gb-part (Golden Braid / MoClo), domesticate-part
+  `verified` flag)), design-gb-part (Golden Braid / MoClo domestication
+  primers; pass `check_entry_vector:true` — plus optional `entry_vector_role`
+  for a Golden-Braid role — to validate at DESIGN time that the part's
+  overhangs actually match the configured entry vector's acceptor, so a
+  mismatch surfaces here instead of at the clone step; verdict rides under
+  `result.entry_vector_check`), domesticate-part
   (the real Synthesis-tab L0 clone: digest the grammar's CONFIGURED entry
   vector + the part's primed amplicon at the Type IIS enzyme, ligate the
   insert into the backbone, and save the circular L0 plasmid with its
@@ -174,7 +189,11 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   sequence vs many targets at once — the Alt+A overlay; rotation-aware
   per target, circular auto-detected from each target's topology or
   forced with a `circular` flag, with `picked_rotation` reported per
-  row), list-plasmidsaurus-members, align-plasmidsaurus-zip.
+  row), list-plasmidsaurus-members, align-plasmidsaurus-zip,
+  verify-against-reads (the "I built X, I got reads back — do they match?"
+  check: a bare or library-resolved `reference` vs a list of raw `reads`
+  (Nanopore / Sanger / a consensus), each aligned rotation + RC-aware; returns
+  per-read identity% + a `match`/`mismatch` `verdict` against `min_identity`).
 - **History** — get-history returns the parsed `<HistoryTree>`
   lineage as nested JSON. Agent assemblies (`gibson-assemble`,
   `traditional-clone`, `golden-gate-assemble`) attach real parent
@@ -382,7 +401,13 @@ record pulled in with `fetch` (inspect-only, `saved:false`) is **not**
 auto-filed on `save` — creating a new library entry requires an explicit
 `{create:true}` so an inspection can't silently pollute the active
 collection. Unknown body keys are echoed back under `ignored` rather than
-silently dropped.
+silently dropped. A stricter guard applies to a closed set of **routing /
+selection** params (`collection`, `source_collection`, `bin`, `parts_bin`,
+`enzyme`, `enzymes`, `orientation`, `rename`): passing one to an endpoint that
+doesn't accept it is a hard **400** (it would change *where/how* the op applies,
+so a silent drop is the SC-D footgun) — while any *other* unknown key stays soft
+for forward-compat. Currently enforced on the `move-primer` / `move-part` /
+`move-experiment` routers.
 
 `load-file` and `add-current-to-library` accept optional `{id, name}`
 overrides to stamp the record's identity directly. This is the

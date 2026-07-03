@@ -14,6 +14,52 @@
 
 ---
 
+## [1.0.118] — 2026-07-03
+
+### New features
+
+- **Synthesis-readiness check.** A new `lint-synthesis` scripting endpoint
+  pre-flights a construct before you order or assemble it: it flags internal
+  Golden Gate / MoClo enzyme sites, extreme or locally-skewed GC, long
+  homopolymer runs, tandem repeats, and degenerate bases, and — on request —
+  confirms a CDS still has one clean full-length reading frame, rolled into a
+  0–100 readiness score with line-by-line warnings.
+- **Verify a build against sequencing reads.** The new `verify-against-reads`
+  endpoint takes a designed construct and a batch of reads (Nanopore, Sanger, or
+  a Plasmidsaurus consensus), aligns each one rotation- and reverse-complement-
+  aware, and reports per-read identity plus a plain match / mismatch verdict
+  against your identity threshold.
+- **IDT bulk-order primer export.** The primer-export dialog now offers an
+  *IDT bulk* format (Name / Sequence / Scale / Purification) alongside the
+  generic spreadsheet CSV, so a large oligo order uploads straight into IDT's
+  bulk tool; per-primer scale/purification overrides are honoured.
+- **Annotations carry through a restriction clone.** `traditional-clone` takes
+  `carry_annotations` to lift the vector's and insert's own features onto the
+  ligated product, so a cut-and-paste clone comes out annotated instead of bare.
+- **Design-time entry-vector check.** `design-gb-part` takes `check_entry_vector`
+  to confirm a domesticated part's overhangs actually drop into your configured
+  entry vector — so a mismatch surfaces at design time, not at the bench.
+
+### Bug fixes
+
+- **Babs no longer silently ignores a toggle.** With both Corpus grounding and
+  Agent mode on, Babs now tells you agent actions are paused for that answer
+  (which comes from your corpus, with sources) instead of quietly skipping the
+  agent tools.
+
+### Hardening
+
+- Scripting endpoints that route by collection / bin / enzyme now reject an
+  unrecognised routing parameter with a clear error instead of quietly
+  succeeding while doing something else — so an automation can't believe it
+  moved or selected something it didn't.
+- The synthesis-readiness check caps sequence length and enzyme-list size and
+  can't error out on a malformed input.
+- The data-safety machinery that decides which files get backed up, wiped, and
+  isolated during tests now derives from one canonical table, guarded so it
+  fails loudly the instant any of those lists drift apart — closing the class of
+  bug that once let a test touch a real data file.
+
 ## [1.0.117] — 2026-07-02
 
 ### New features
