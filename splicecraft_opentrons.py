@@ -407,15 +407,20 @@ def _ot2_normalize_plan(plan: "dict[str, Any]") -> "dict[str, Any]":
     tips_in = plan.get("tips", [])
     if isinstance(tips_in, dict):
         tips_in = [tips_in]
+    if not isinstance(tips_in, list):     # malformed plan: tips is a scalar / junk
+        tips_in = []
     tips: "list[dict[str, Any]]" = []
-    for t in tips_in or []:
+    for t in tips_in:
         if isinstance(t, dict):
             tips.append({"labware": _ot2_resolve_labware(str(t.get("labware", ""))),
                          "slot": t.get("slot")})
     p["tips"] = tips
 
     labware: "dict[str, dict[str, Any]]" = {}
-    for lid, lw in (plan.get("labware") or {}).items():
+    lw_map = plan.get("labware")
+    if not isinstance(lw_map, dict):      # malformed plan: labware is a list / junk
+        lw_map = {}
+    for lid, lw in lw_map.items():
         if isinstance(lw, dict):
             entry: "dict[str, Any]" = {
                 "labware": _ot2_resolve_labware(str(lw.get("labware", ""))),
@@ -426,7 +431,10 @@ def _ot2_normalize_plan(plan: "dict[str, Any]") -> "dict[str, Any]":
     p["labware"] = labware
 
     transfers: "list[dict[str, Any]]" = []
-    for t in (plan.get("transfers") or []):
+    transfers_in = plan.get("transfers")
+    if not isinstance(transfers_in, list):   # malformed plan: transfers is a scalar
+        transfers_in = []
+    for t in transfers_in:
         if not isinstance(t, dict):
             continue
         src = _ot2_split_ref(str(t.get("from", "")))
@@ -857,8 +865,23 @@ def _ot2_build_labware_def(name: str, rows: int, cols: int, *,
     defaults. A1 is back-left; wells march right (columns) and toward the front
     (rows). ALWAYS analyse on the robot before running — the geometry defaults
     are generic, not a substitute for the official Labware Creator's calibration."""
-    rows = max(1, min(int(rows), len(_ROW_LETTERS)))
-    cols = max(1, min(int(cols), 99))
+    def _fin(v: Any, default: float, lo: float, hi: float) -> float:
+        """Clamp to a finite value in [lo, hi]; reject inf/nan/junk (guards
+        int(inf)/int(nan) crashes + inf/nan well coordinates)."""
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return default
+        return max(lo, min(v, hi)) if math.isfinite(v) else default
+
+    rows = max(1, min(int(_fin(rows, 1, 1, len(_ROW_LETTERS))), len(_ROW_LETTERS)))
+    cols = max(1, min(int(_fin(cols, 1, 1, 99)), 99))
+    spacing = _fin(spacing, 9.0, 0.1, 100.0)
+    x_off, y_off = _fin(x_off, 14.38, 0.0, 200.0), _fin(y_off, 11.24, 0.0, 200.0)
+    diameter, depth = _fin(diameter, 6.5, 0.1, 100.0), _fin(depth, 14.0, 0.1, 300.0)
+    volume = _fin(volume, 200.0, 0.0, 1e7)
+    x_dim, y_dim = _fin(x_dim, 127.76, 1.0, 1000.0), _fin(y_dim, 85.48, 1.0, 1000.0)
+    z_dim = _fin(z_dim, 15.0, 1.0, 1000.0)
     ordering: "list[list[str]]" = []
     wells: "dict[str, Any]" = {}
     for c in range(cols):

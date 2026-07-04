@@ -14,6 +14,30 @@
 
 ---
 
+## [1.0.121] — 2026-07-03
+
+### Hardening
+
+- **OT-2 designer edge-case sweep.** A fresh audit of the new OT-2 protocol
+  designer tightened a batch of edge cases:
+  - Two deck slots can no longer share a nickname — the picker auto-suffixes and
+    tells you — so a slot's labware can't be silently dropped from the compiled
+    protocol.
+  - `delete-protocol` / `delete-custom-labware` now delete a **single** item
+    (optionally scoped to a `collection`) and match case-insensitively, instead of
+    stripping every same-named item across all collections.
+  - A malformed or hand-edited protocol (wrong types for `tips` / `labware` /
+    `transfers`) loads with a clean message instead of crashing, and
+    out-of-range or trash-slot labware in a loaded plan is dropped rather than
+    reaching the robot.
+  - Non-finite grid dimensions (inf/NaN) in the custom-labware designer are
+    clamped instead of erroring, and the save-protocol / save-custom-labware
+    endpoints enforce a per-item size cap.
+  - Live robot status/analyze no longer cancel the UI's tracking of an in-flight
+    physical run.
+
+---
+
 ## [1.0.120] — 2026-07-03
 
 ### New features

@@ -510,6 +510,30 @@ class TestAgentEndpoints:
         assert H["save-custom-labware"][0](None, {"name": "Y", "definition": {"no": 1}})[1] == 400
         assert H["delete-custom-labware"][0](None, {"name": "LW1"})["deleted"] == "LW1"
 
+    def test_delete_protocol_is_scoped_and_case_insensitive(self):
+        # audit #2 + #5: delete must remove ONE item (optionally collection-scoped),
+        # case-insensitively — not strip the name from every collection.
+        H = self._handlers()
+        H["save-protocol"][0](None, {"name": "prep", "plan": _good_plan(), "collection": "A"})
+        H["save-protocol"][0](None, {"name": "prep", "plan": _good_plan(), "collection": "B"})
+        assert H["delete-protocol"][0](None, {"name": "prep", "collection": "B"})["deleted"] == "prep"
+        got = H["list-protocols"][0](None, {})["protocols"]
+        assert any(p["name"] == "prep" and p["collection"] == "A" for p in got)
+        assert not any(p["name"] == "prep" and p["collection"] == "B" for p in got)
+        assert H["delete-protocol"][0](None, {"name": "PREP"})["deleted"] == "PREP"   # case-insensitive
+        assert not any(p["name"] == "prep" for p in H["list-protocols"][0](None, {})["protocols"])
+
+    def test_save_endpoints_reject_oversized_and_malformed(self):
+        # audit #6: per-item byte cap; audit #3: malformed plan types must not 500.
+        H = self._handlers()
+        big = {"pipette": "p300_single", "labware": {}, "tips": [],
+               "steps": [{"type": "comment", "text": "x" * 600_000}]}
+        assert H["save-protocol"][0](None, {"name": "big", "plan": big})[1] == 413
+        r = H["save-protocol"][0](None, {"name": "m", "plan": {"tips": 5, "labware": ["x"], "steps": []}})
+        assert (isinstance(r, dict) and r.get("ok")) or (isinstance(r, tuple) and r[1] in (400, 413))
+        bigdef = {"wells": {"A1": {}}, "blob": "y" * 600_000}
+        assert H["save-custom-labware"][0](None, {"name": "bl", "definition": bigdef})[1] == 413
+
 
 # ── AUTOLAB toolbar screen ──────────────────────────────────────────────────────
 class TestAutolabScreen:
@@ -669,3 +693,68 @@ class TestAutolabScreen:
             scr.query_one("#autolab-proto-pick", Select).value = str(names().index("P2"))
             scr._delete_protocol()
             assert "P2" not in names()
+
+    async def test_duplicate_nickname_is_disambiguated(self):
+        # audit #1: two deck slots must never share a nickname (else _build_plan
+        # collapses the dict key and silently drops a slot's labware).
+        import splicecraft as sc
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab(); await pilot.pause()
+            scr = app.screen
+            scr._on_picker_result(5, {"action": "place", "labware": "plate_96", "nickname": "src"})
+            assert scr._deck[5]["id"] != "src" and scr._deck[5]["id"].startswith("src")
+            plan = scr._build_plan()
+            slots = {lw["slot"] for lw in plan["labware"].values()}
+            assert 1 in slots and 5 in slots and len(plan["labware"]) >= 3
+
+    async def test_create_labware_nonfinite_dims_no_crash(self):
+        # audit #4: inf/nan in Rows/Cols must not crash the button handler.
+        import math
+        import splicecraft as sc
+        from textual.widgets import Input
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab(); await pilot.pause()
+            scr = app.screen
+            scr.query_one("#autolab-lw-name", Input).value = "Weird"
+            scr.query_one("#autolab-lw-rows", Input).value = "inf"
+            scr.query_one("#autolab-lw-cols", Input).value = "nan"
+            scr._create_labware()
+            d = scr._find_custom_labware_def("Weird")
+            assert d is not None and all(math.isfinite(w["x"]) for w in d["wells"].values())
+
+
+class TestHardeningSweep2:
+    """Edge-case hardening from the 2026-07-04 fresh audit of the OT-2 subsystem."""
+
+    def test_normalize_survives_malformed_plan_types(self):
+        # audit #3: tips as scalar, labware as list, transfers as scalar must not raise.
+        for bad in [{"tips": 5}, {"labware": ["x"]}, {"transfers": 7},
+                    {"tips": True, "labware": 3, "transfers": "no"}]:
+            p = ot2._ot2_normalize_plan(bad)
+            assert isinstance(p["tips"], list) and isinstance(p["labware"], dict)
+
+    def test_labware_def_clamps_non_finite_and_bounds(self):
+        # audit #4: inf/nan dims -> finite coords, no crash; rows/cols clamp.
+        import math
+        d = ot2._ot2_build_labware_def("X", float("inf"), float("nan"),
+                                       spacing=float("inf"), depth=float("nan"),
+                                       volume=float("-inf"))
+        assert len(d["wells"]) >= 1
+        for w in d["wells"].values():
+            assert all(math.isfinite(w[k]) for k in ("x", "y", "z", "depth", "diameter"))
+        assert len(ot2._ot2_build_labware_def("Z", 0, 0)["wells"]) == 1
+        rmax = len(ot2._ROW_LETTERS)
+        assert len(ot2._ot2_build_labware_def("B", 999, 999)["wells"]) == rmax * 99
+
+    def test_deck_from_plan_survives_garbage_and_drops_bad_slots(self):
+        # audit #3/#7: garbage types + out-of-range/trash slots don't crash or leak.
+        import splicecraft as sc
+        d = sc.AutolabScreen._deck_from_plan({"tips": 5, "labware": ["x"], "steps": "no"})
+        assert isinstance(d, dict) and d
+        d2 = sc.AutolabScreen._deck_from_plan(
+            {"labware": {"a": {"labware": "plate_24", "slot": 12},
+                         "b": {"labware": "eppi_24", "slot": 99},
+                         "c": {"labware": "eppi_24", "slot": 3}}})
+        assert set(d2) == {3}

@@ -8096,6 +8096,19 @@ def _cstore_collections(load_fn, item_key: str) -> "list[dict]":
             for c in load_fn()]
 
 
+_OT2_MAX_STORE_BYTES = 512 * 1024   # per-item cap for the protocol / custom-labware stores
+
+
+def _cstore_too_big(obj) -> bool:
+    """True if `obj` serialises past the per-item store cap (defence-in-depth on
+    top of the 1 MiB HTTP body cap — bounds a single pathological plan/def)."""
+    import json
+    try:
+        return len(json.dumps(obj, default=str).encode("utf-8", "replace")) > _OT2_MAX_STORE_BYTES
+    except (TypeError, ValueError):
+        return False
+
+
 def _cstore_save_item(load_fn, save_fn, item_key, coll, item, label):
     with _state._cache_lock:
         colls = load_fn()
@@ -8110,18 +8123,24 @@ def _cstore_save_item(load_fn, save_fn, item_key, coll, item, label):
         return _agent_save_or_500(lambda: save_fn(colls), label)
 
 
-def _cstore_delete_item(load_fn, save_fn, item_key, name, label):
+def _cstore_delete_item(load_fn, save_fn, item_key, name, label, collection=None):
+    # Delete ONE item — the first case-insensitive name match, optionally scoped to
+    # a collection. Was: strip the name from EVERY collection, which silently nuked
+    # same-named items elsewhere and used case-sensitive matching (find was not).
+    # (Audit 2026-07-04, findings #2 + #5.)
+    key = str(name or "").strip().casefold()
+    coll_key = str(collection).strip().casefold() if collection else None
     with _state._cache_lock:
         colls = load_fn()
-        found = False
         for c in colls:
-            kept = [x for x in c.get(item_key, []) or [] if x.get("name") != name]
-            if len(kept) != len(c.get(item_key, []) or []):
-                found = True
-            c[item_key] = kept
-        if not found:
-            return ({"error": f"{name!r} not found"}, 404)
-        return _agent_save_or_500(lambda: save_fn(colls), label)
+            if coll_key is not None and (c.get("name") or "").strip().casefold() != coll_key:
+                continue
+            items = c.get(item_key, []) or []
+            for i, x in enumerate(items):
+                if str(x.get("name", "")).strip().casefold() == key:
+                    c[item_key] = items[:i] + items[i + 1:]
+                    return _agent_save_or_500(lambda: save_fn(colls), label)
+        return ({"error": f"{name!r} not found"}, 404)
 
 
 def _cstore_create_collection(load_fn, save_fn, item_key, name, label):
@@ -8173,6 +8192,8 @@ def _h_save_protocol(app, payload):
     report = _ot2._ot2_validate_plan(plan)
     if report["errors"]:
         return ({"error": "invalid plan", "errors": report["errors"]}, 400)
+    if _cstore_too_big(plan):
+        return ({"error": f"plan too large (> {_OT2_MAX_STORE_BYTES // 1024} KB serialized)"}, 413)
     coll = _normalize_collection_name(payload.get("collection")) or "Default"
     err = _cstore_save_item(_load_protocol_collections, _save_protocol_collections, "protocols",
                             coll, {"name": name, "plan": plan}, "protocol_collections")
@@ -8181,12 +8202,13 @@ def _h_save_protocol(app, payload):
 
 @_agent_endpoint("delete-protocol", write=True)
 def _h_delete_protocol(app, payload):
-    """Delete a saved protocol by name. Body: ``{name}``."""
+    """Delete a saved protocol — the FIRST match for ``name`` (case-insensitive),
+    optionally scoped to ``collection``. Body: ``{name, collection?}``."""
     name = payload.get("name")
     if not isinstance(name, str) or not name.strip():
         return ({"error": "missing 'name'"}, 400)
     err = _cstore_delete_item(_load_protocol_collections, _save_protocol_collections, "protocols",
-                              name, "protocol_collections")
+                              name, "protocol_collections", payload.get("collection"))
     return err if err else {"ok": True, "deleted": name}
 
 
@@ -8246,6 +8268,8 @@ def _h_save_custom_labware(app, payload):
     definition = payload.get("definition")
     if not isinstance(definition, dict) or not isinstance(definition.get("wells"), dict):
         return ({"error": "'definition' must be an Opentrons labware object with a 'wells' map"}, 400)
+    if _cstore_too_big(definition):
+        return ({"error": f"definition too large (> {_OT2_MAX_STORE_BYTES // 1024} KB)"}, 413)
     coll = _normalize_collection_name(payload.get("collection")) or "Default"
     err = _cstore_save_item(_load_custom_labware, _save_custom_labware, "labware", coll,
                             {"name": name, "definition": definition}, "custom_labware")
@@ -8254,12 +8278,13 @@ def _h_save_custom_labware(app, payload):
 
 @_agent_endpoint("delete-custom-labware", write=True)
 def _h_delete_custom_labware(app, payload):
-    """Delete a custom labware by name. Body: ``{name}``."""
+    """Delete a custom labware — the FIRST match for ``name`` (case-insensitive),
+    optionally scoped to ``collection``. Body: ``{name, collection?}``."""
     name = payload.get("name")
     if not isinstance(name, str) or not name.strip():
         return ({"error": "missing 'name'"}, 400)
     err = _cstore_delete_item(_load_custom_labware, _save_custom_labware, "labware", name,
-                              "custom_labware")
+                              "custom_labware", payload.get("collection"))
     return err if err else {"ok": True, "deleted": name}
 
 
