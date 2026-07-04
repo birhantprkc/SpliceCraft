@@ -348,6 +348,23 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   returned `run_id` to watch it live. Host comes from the body's `host` or the
   persisted `ot2_host` setting. (Compiler + client live in the app-free
   `splicecraft_opentrons` sibling.)
+- **OT-2 run control** — `ot2-run-control` (a **write** endpoint) pauses, resumes,
+  or stops a live run: `{"host": ..., "action": "pause"|"resume"|"stop",
+  "run_id"?: ...}`. The active run is resolved automatically when `run_id` is
+  omitted (so it also controls a run started from the Opentrons App). This is the
+  manual counterpart to `ot2-run`'s automatic stop-on-fault.
+- **OT-2 concentration normalisation** — `ot2-normalize` computes per-sample
+  volumes to equalise DNA mass or hit a target concentration, no robot needed:
+  `{"items": [{"name", "well", "concentration" (ng/µL)}, ...], "target_ng" | ("target_conc" + "final_volume"), "pipette"?}`.
+  It respects the pipette's volume floor/ceiling (from `pipette`, or `min_vol` /
+  `max_vol`), flags samples too dilute/concentrated to reach target (never dropping
+  them), and — when a `src` + `dst` (+ `dst_wells` or `dst_labware`, optional
+  `diluent_ref`) is given — also returns compile-ready `steps`.
+- **OT-2 plate map** — `ot2-plate-map` maps a plasmid collection onto a labware's
+  wells row-major (the "a plate IS a collection" link): `{"collection", "labware"}`
+  → `{map: {well: {id, name}}, wells, n, overflow}`. Feed the result into
+  `ot2-normalize` / `ot2-compile` to cherry-pick or replate a collection by
+  identity.
 - **OT-2 protocol + custom-labware libraries** — manage saved designs and custom
   labware headlessly, mirroring the AUTOLAB Deck/Labware tabs. Protocols:
   `list-protocols`, `get-protocol` (returns a compile-able `plan`), `save-protocol`

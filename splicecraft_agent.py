@@ -8068,6 +8068,141 @@ def _h_ot2_run(app, payload):
         return ({"error": str(exc)}, 502)
 
 
+@_agent_endpoint("ot2-run-control", write=True)
+def _h_ot2_run_control(app, payload):
+    """Pause / resume / stop the OT-2's current run — MANUAL run control (the
+    counterpart to ``ot2-run``'s automatic stop-on-fault). Lets you hold a run to
+    intervene, resume it, or abort it without waiting for a fault.
+
+    Body: ``{"host": ..., "action": "pause"|"resume"|"stop", "run_id"?: "..."}``.
+    The active run is resolved automatically when ``run_id`` is omitted (so this
+    also controls a run started from the Opentrons App).
+
+    A ``write`` endpoint: needs the agent bearer token; a dirty library blocks it
+    unless you also pass ``{"force": true}``.
+    """
+    host = _agent_ot2_host(payload)
+    if not host:
+        return ({"error": "no OT-2 host (pass 'host' or set the 'ot2_host' setting)"}, 400)
+    action = str(payload.get("action", "") or "").strip().lower()
+    if action not in ("pause", "resume", "stop", "cancel"):
+        return ({"error": "missing/invalid 'action' (use pause | resume | stop)"}, 400)
+    rid = payload.get("run_id")
+    rid = str(rid) if rid else _ot2._ot2_active_run(host)
+    if not rid:
+        return ({"error": "no active run to control (nothing is running on the robot)"}, 409)
+    try:
+        return _ot2._ot2_run_control(host, action, run_id=rid)
+    except _ot2.OT2Error as exc:
+        return ({"error": str(exc)}, 502)
+
+
+def _ot2_opt_float(payload, key, default=None):
+    """Read an optional finite positive-or-any float from a payload (None if absent
+    / unparseable)."""
+    v = payload.get(key, default)
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    import math as _m
+    return f if _m.isfinite(f) else None
+
+
+@_agent_endpoint("ot2-normalize")
+def _h_ot2_normalize(app, payload):
+    """Compute per-sample volumes to NORMALISE concentration across a set of wells —
+    the everyday plate-prep task (equalise DNA mass, or hit a target ng/µL). Pure
+    compute; no robot needed.
+
+    Body::
+
+        {"items": [{"name": "pGFP-1", "well": "A1", "concentration": 82.0}, ...],
+         "target_ng": 200,          # OR "target_conc": 20 + "final_volume": 20
+         "final_volume"?: 20,       # µL, required for target_conc / diluent top-up
+         "pipette"?: "p300_single", # its min/max default the volume floor/ceiling
+         "min_vol"?, "max_vol"?, "resolution"?: 0.1,
+         # optional — also emit transfer steps ready for ot2-compile:
+         "src"?: "src", "dst"?: "dst", "dst_labware"?: "plate_96",
+         "dst_wells"?: ["A1", ...], "diluent_ref"?: "buf:A1", "new_tip"?: "always"}
+
+    Returns ``{normalized: [{name, well, sample_ul, diluent_ul, achieved_ng,
+    achieved_conc, ok, warning}], warnings, n_ok}`` — plus ``steps`` when a
+    ``src`` + ``dst`` (+ wells) target is given. Concentrations too low/high to hit
+    target within the pipette range are flagged, never silently dropped.
+    """
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:
+        return ({"error": "missing 'items' (a list of {name, well, concentration})"}, 400)
+    spec = _ot2._OT2_PIPETTES.get(str(payload.get("pipette", "p300_single")))
+    min_vol = _ot2_opt_float(payload, "min_vol", spec[0] if spec else 0.0) or 0.0
+    max_vol = _ot2_opt_float(payload, "max_vol", spec[1] if spec else None)
+    try:
+        normalized = _ot2._ot2_normalize_volumes(
+            items,
+            target_ng=_ot2_opt_float(payload, "target_ng"),
+            target_conc=_ot2_opt_float(payload, "target_conc"),
+            final_volume=_ot2_opt_float(payload, "final_volume"),
+            min_vol=min_vol, max_vol=max_vol,
+            resolution=_ot2_opt_float(payload, "resolution", 0.1) or 0.1)
+    except _ot2.OT2Error as exc:
+        return ({"error": str(exc)}, 400)
+    out = {"ok": True, "normalized": normalized,
+           "n_ok": sum(1 for r in normalized if r.get("ok")),
+           "warnings": [f"{r['name'] or r.get('well')}: {r['warning']}"
+                        for r in normalized if r.get("warning")]}
+    src, dst = payload.get("src"), payload.get("dst")
+    if src and dst:
+        dst_wells = payload.get("dst_wells")
+        if not (isinstance(dst_wells, list) and dst_wells):
+            dst_wells = _ot2._ot2_entry_wells({"labware": str(payload.get("dst_labware", "") or "")})
+        diluent_ref = str(payload["diluent_ref"]) if payload.get("diluent_ref") else None
+        # A dilution target with no diluent well would build undiluted samples while
+        # the `normalized` preview reports the diluted concentration — warn loudly.
+        if not diluent_ref and any((r.get("diluent_ul") or 0) > 0
+                                   for r in normalized if r.get("ok")):
+            out["warnings"].append(
+                "samples need diluent to reach target but no 'diluent_ref' was given — "
+                "the steps deliver undiluted sample only; set 'diluent_ref' (e.g. 'buf:A1')")
+        out["steps"] = _ot2._ot2_normalize_steps(
+            normalized, src_id=str(src), dst_id=str(dst),
+            dst_wells=[str(w) for w in (dst_wells or [])],
+            diluent_ref=diluent_ref, new_tip=str(payload.get("new_tip", "always")))
+    return out
+
+
+@_agent_endpoint("ot2-plate-map")
+def _h_ot2_plate_map(app, payload):
+    """Map a plasmid collection onto a labware's wells (row-major) — the "a plate IS
+    a collection" link. Body: ``{"collection": "MyPlasmids", "labware": "eppi_24"}``.
+    Returns ``{map: {well: {id, name}}, wells, n, overflow}`` (``overflow`` = how
+    many plasmids didn't fit). Feed the wells into ``ot2-normalize`` / ``ot2-compile``
+    to cherry-pick or replate the collection by identity, not bare coordinates.
+    """
+    coll = _normalize_collection_name(payload.get("collection"))
+    if coll is None:
+        return ({"error": "missing or invalid 'collection'"}, 400)
+    col = next((c for c in _iter_collections_readonly()
+                if isinstance(c, dict) and c.get("name") == coll), None)
+    if col is None:
+        return ({"error": f"no collection named {coll!r}"}, 404)
+    labware = str(payload.get("labware", "") or "")
+    if not labware:
+        return ({"error": "missing 'labware' (a load name or alias)"}, 400)
+    wells = _ot2._ot2_entry_wells({"labware": labware})
+    if not wells:
+        return ({"error": f"unknown labware {labware!r} — no known geometry"}, 400)
+    plasmids = [p for p in (col.get("plasmids") or []) if isinstance(p, dict)]
+    mapping = {w: {"id": p.get("id", ""), "name": p.get("name", "")}
+               for w, p in zip(wells, plasmids)}
+    return {"ok": True, "collection": coll,
+            "labware": _ot2._ot2_resolve_labware(labware), "map": mapping,
+            "wells": wells, "n": len(mapping),
+            "overflow": max(0, len(plasmids) - len(wells))}
+
+
 # ── OT-2 protocol library + custom-labware library endpoints ────────────────────
 # Two single-file collection stores (collections embed items): protocols carry a
 # "plan" (a compile-able multi-step design), custom labware carry a "definition"

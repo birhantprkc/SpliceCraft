@@ -85,6 +85,7 @@ _OT2_MAX_TRANSFERS = 10000        # far beyond any real plate-prep run
 _OT2_MAX_VOLUME_UL = 100000.0     # 100 mL — reject absurd volumes (typos, Infinity)
 _OT2_MAX_STEPS = 5000             # a multi-step protocol far beyond any real run
 _OT2_MAX_DELAY_S = 86400.0        # 24 h — reject absurd delays
+_OT2_MAX_ITEMS = 10000            # normalise: far beyond any real plate-prep run
 
 # The multi-step "protocol designer" model (a plan may carry `steps` instead of
 # the legacy `transfers`). LIQUID steps need a pipette + tip rack + labware;
@@ -205,7 +206,9 @@ def _ot2_parse_well(well: str) -> "tuple[int, int] | None":
     """Split a well like ``B7`` into (row_index, column_number), or ``None`` if it
     is not a well name at all."""
     well = well.strip().upper()
-    if len(well) < 2 or well[0] not in _ROW_LETTERS or not well[1:].isdigit():
+    # `.isdecimal()` not `.isdigit()`: superscripts (²) are isdigit-true but
+    # `int()`-invalid, so isdigit would let a bad well past the gate → crash at int().
+    if len(well) < 2 or well[0] not in _ROW_LETTERS or not well[1:].isdecimal():
         return None
     return _ROW_LETTERS.index(well[0]), int(well[1:])
 
@@ -242,6 +245,25 @@ def _ot2_well_ok_entry(entry: "dict[str, Any]", well: str) -> "bool | None":
         cw = _ot2_custom_wells(definition)
         return None if cw is None else well.strip().upper() in cw
     return _ot2_well_ok(str(entry.get("labware", "")), well)
+
+
+def _ot2_entry_wells(entry: "dict[str, Any]") -> "list[str]":
+    """Ordered well names (row-major: A1, A2, …, B1, …) for a deck labware ENTRY —
+    from a custom definition's ``wells`` map or the built-in catalog geometry.
+    Empty when neither is known. This is the fill order used to lay a collection's
+    plasmids onto a plate/rack (identity-linking)."""
+    definition = entry.get("definition")
+    if isinstance(definition, dict):
+        cw = _ot2_custom_wells(definition)
+        if cw:
+            def _key(w: str) -> "tuple[int, int]":
+                p = _ot2_parse_well(w)
+                return p if p is not None else (len(_ROW_LETTERS), 0)
+            return sorted(cw, key=_key)
+    spec = _OT2_LABWARE.get(_ot2_resolve_labware(str(entry.get("labware", ""))))
+    if spec and "rows" in spec and "cols" in spec:
+        return _ot2_wells(int(spec["rows"]), int(spec["cols"]))
+    return []
 
 
 # ── Plan normalisation ──────────────────────────────────────────────────────────
@@ -427,6 +449,12 @@ def _ot2_normalize_plan(plan: "dict[str, Any]") -> "dict[str, Any]":
                 "slot": lw.get("slot")}
             if isinstance(lw.get("definition"), dict):
                 entry["definition"] = lw["definition"]   # custom Opentrons labware def
+            # Identity-linking metadata (a plate bound to a library collection).
+            # Carried through for provenance + round-trip; the compiler ignores it.
+            if isinstance(lw.get("map"), dict):
+                entry["map"] = {str(k): v for k, v in lw["map"].items()}
+            if lw.get("collection"):
+                entry["collection"] = str(lw["collection"])
             labware[str(lid)] = entry
     p["labware"] = labware
 
@@ -761,7 +789,7 @@ def _ot2_plan_summary(plan: "dict[str, Any]") -> "dict[str, Any]":
     report = _ot2_validate_plan(p)
 
     def _num(v: Any) -> bool:
-        return isinstance(v, (int, float)) and not isinstance(v, bool)
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
     if p["uses_steps"]:
         liquid = [s for s in p["steps"] if s["type"] in _OT2_LIQUID_STEPS]
@@ -791,10 +819,242 @@ def _ot2_plan_summary(plan: "dict[str, Any]") -> "dict[str, Any]":
         "total_volume_ul": total_vol,
         "new_tip": p["new_tip"],
         "tips_needed": tips_needed,
+        # Pre-flight: how much liquid each source well must hold (so you know what
+        # to load and whether a well will run dry) + a rough wall-clock estimate.
+        "source_volumes": _ot2_source_volumes(p),
+        "est_seconds": round(_ot2_estimate_seconds(p), 1),
         "valid": not report["errors"],
         "errors": report["errors"],
         "warnings": report["warnings"],
     }
+
+
+# ── Resource pre-flight ─────────────────────────────────────────────────────────
+# Rough time model: a nominal single-channel flow rate + fixed per-move / per-tip
+# overheads. Wall-clock on a real OT-2 varies with speeds + travel, so this is a
+# ballpark ("~4 min"), not a promise.
+_OT2_TIME_TIP_S = 7.0          # pick up + drop one tip
+_OT2_TIME_MOVE_S = 4.0         # one aspirate or dispense (approach + plunger)
+_OT2_FLOW_UL_PER_S = 150.0     # nominal single-channel flow
+
+
+def _ot2_num(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _ot2_source_volumes(p: "dict[str, Any]") -> "dict[str, float]":
+    """Total µL drawn from each source well across the plan — the load budget.
+    Keyed by ``labwareId:well``. A mix returns liquid to its own well, so it draws
+    nothing net and is skipped."""
+    draws: "dict[str, float]" = {}
+
+    def _add(ref: "tuple[str, str] | None", vol: Any) -> None:
+        if ref is None or not _ot2_num(vol) or vol <= 0:
+            return
+        key = f"{ref[0]}:{ref[1]}"
+        draws[key] = round(draws.get(key, 0.0) + float(vol), 4)
+
+    if p["uses_steps"]:
+        for s in p["steps"]:
+            st = s["type"]
+            if st == "transfer":
+                _add(s.get("_src"), s.get("volume"))
+            elif st == "distribute":
+                n = len([r for r in (s.get("_dsts") or []) if r])
+                _add(s.get("_src"), (s.get("volume") or 0) * n if _ot2_num(s.get("volume")) else None)
+            elif st == "consolidate":
+                for r in (s.get("_srcs") or []):
+                    _add(r, s.get("volume"))
+    else:
+        for t in p["transfers"]:
+            _add(t.get("_src"), t.get("volume"))
+    return draws
+
+
+def _ot2_estimate_seconds(p: "dict[str, Any]") -> float:
+    """A rough wall-clock estimate for the plan (see the time model above)."""
+    total = 0.0
+
+    def _liquid(vol: Any, moves: int, tips: float) -> float:
+        v = float(vol) if _ot2_num(vol) and vol > 0 else 0.0
+        return tips * _OT2_TIME_TIP_S + moves * (_OT2_TIME_MOVE_S + v / _OT2_FLOW_UL_PER_S)
+
+    if p["uses_steps"]:
+        for s in p["steps"]:
+            st = s["type"]
+            tips = 0.0 if s.get("new_tip") == "never" else 1.0
+            if st == "transfer":
+                total += _liquid(s.get("volume"), 2, tips)
+            elif st == "distribute":
+                total += _liquid(s.get("volume"), 1 + len([r for r in (s.get("_dsts") or []) if r]), tips)
+            elif st == "consolidate":
+                total += _liquid(s.get("volume"), len([r for r in (s.get("_srcs") or []) if r]) + 1, tips)
+            elif st == "mix":
+                reps = s.get("repetitions") if isinstance(s.get("repetitions"), int) else 1
+                total += _OT2_TIME_TIP_S + max(1, reps) * (_OT2_TIME_MOVE_S)
+            elif st == "delay":
+                secs = s.get("seconds")
+                total += float(secs) if _ot2_num(secs) and secs > 0 else 0.0
+    else:
+        for i, t in enumerate(p["transfers"]):
+            tips = 1.0 if (p["new_tip"] == "always" or (p["new_tip"] == "once" and i == 0)) else 0.0
+            total += _liquid(t.get("volume"), 2, tips)
+    return total
+
+
+# ── Concentration normalisation ─────────────────────────────────────────────────
+def _ot2_normalize_volumes(items: "list[dict[str, Any]]", *,
+                           target_ng: "float | None" = None,
+                           target_conc: "float | None" = None,
+                           final_volume: "float | None" = None,
+                           min_vol: float = 0.0,
+                           max_vol: "float | None" = None,
+                           resolution: float = 0.1) -> "list[dict[str, Any]]":
+    """Per-item sample (+ optional diluent) volumes to normalise concentration.
+    Pure — no robot, no plan.
+
+    Each ``item``: ``{"name", "concentration" (ng/µL), "well"?}``.
+
+    Exactly one target mode:
+      * ``target_ng`` — deliver a fixed MASS: ``sample = target_ng / conc``. With
+        ``final_volume`` set, the rest is diluent (top-up to that volume).
+      * ``target_conc`` + ``final_volume`` — deliver ``final_volume`` at
+        ``target_conc``: ``sample = target_conc·final_volume / conc``,
+        ``diluent = final_volume − sample``.
+
+    Volumes round to ``resolution`` and clamp into ``[min_vol, max_vol]`` (when
+    given); an item too dilute to reach target within ``max_vol`` (or so
+    concentrated it needs less than ``min_vol``) is FLAGGED + clamped, never
+    silently dropped. Returns a per-item list with ``sample_ul`` / ``diluent_ul``
+    / ``achieved_ng`` / ``achieved_conc`` / ``ok`` / ``warning``. Raises
+    ``OT2Error`` on a contradictory or non-finite request."""
+    def _round(v: float) -> float:
+        if resolution and resolution > 0:
+            return round(round(v / resolution) * resolution, 6)
+        return round(v, 6)
+
+    def _pos(v: Any, label: str) -> float:
+        if not (isinstance(v, (int, float)) and not isinstance(v, bool)
+                and math.isfinite(v) and v > 0):
+            raise OT2Error(f"normalise: {label} must be a positive number, got {v!r}")
+        return float(v)
+
+    has_ng, has_conc = target_ng is not None, target_conc is not None
+    if has_ng == has_conc:
+        raise OT2Error("normalise: pass exactly one of 'target_ng' or 'target_conc'")
+    tgt_ng = _pos(target_ng, "target_ng") if has_ng else 0.0
+    tgt_conc = _pos(target_conc, "target_conc") if has_conc else 0.0
+    fv: "float | None" = (_pos(final_volume, "final_volume")
+                          if final_volume is not None else None)
+    if has_conc and fv is None:
+        raise OT2Error("normalise: 'target_conc' mode needs a positive 'final_volume'")
+    mv: "float | None" = _pos(max_vol, "max_vol") if max_vol is not None else None
+
+    def _nonneg(v: Any, label: str) -> float:
+        if not (isinstance(v, (int, float)) and not isinstance(v, bool)
+                and math.isfinite(v) and v >= 0):
+            raise OT2Error(f"normalise: {label} must be a non-negative number, got {v!r}")
+        return float(v)
+
+    min_vol = _nonneg(min_vol, "min_vol")
+    resolution = _nonneg(resolution, "resolution")
+    if mv is not None and min_vol > mv:
+        raise OT2Error(f"normalise: min_vol ({min_vol:g}) exceeds max_vol ({mv:g})")
+    if not isinstance(items, list):
+        raise OT2Error("normalise: 'items' must be a list")
+    if len(items) > _OT2_MAX_ITEMS:
+        raise OT2Error(f"normalise: too many items ({len(items)}); "
+                       f"the max is {_OT2_MAX_ITEMS}")
+
+    out: "list[dict[str, Any]]" = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        conc = it.get("concentration", it.get("conc"))
+        rec: "dict[str, Any]" = {
+            "name": str(it.get("name", "") or ""), "well": it.get("well"),
+            "concentration": conc, "sample_ul": None, "diluent_ul": None,
+            "achieved_ng": None, "achieved_conc": None, "ok": False, "warning": None}
+        if not (isinstance(conc, (int, float)) and not isinstance(conc, bool)
+                and math.isfinite(conc) and conc > 0):
+            rec["warning"] = "no / invalid concentration — skipped"
+            out.append(rec)
+            continue
+        conc = float(conc)
+        sample = (tgt_ng / conc) if has_ng else (tgt_conc * (fv or 0.0) / conc)
+        warn: "str | None" = None
+        if mv is not None and sample > mv:
+            warn = (f"needs {sample:.1f} µL to hit target but the max is "
+                    f"{mv:g} µL — clamped (under-target)")
+            sample = mv
+        if sample < min_vol:
+            if min_vol > 0:
+                warn = (f"only {sample:.2f} µL needed (below the {min_vol:g} µL "
+                        "pipette floor) — dilute the stock first")
+            sample = max(sample, min_vol)
+        sample_r = _round(sample)
+        if sample_r <= 0:
+            rec["warning"] = warn or "computed volume rounds to zero — skipped"
+            out.append(rec)
+            continue
+        diluent_r = _round(max(0.0, fv - sample_r)) if fv is not None else None
+        if fv is not None and sample_r > fv and warn is None:
+            warn = (f"sample {sample_r:g} µL exceeds the {fv:g} µL final volume — "
+                    "stock too dilute for this target; the well is not diluted")
+        mass = sample_r * conc
+        total = sample_r + (diluent_r or 0.0)
+        rec.update(sample_ul=sample_r, diluent_ul=diluent_r,
+                   achieved_ng=round(mass, 3),
+                   achieved_conc=(round(mass / total, 4) if total > 0 else None),
+                   ok=True, warning=warn)
+        out.append(rec)
+    return out
+
+
+def _ot2_normalize_steps(normalized: "list[dict[str, Any]]", *, src_id: str,
+                         dst_id: str, dst_wells: "list[str]",
+                         diluent_ref: "str | None" = None,
+                         new_tip: str = "always") -> "list[dict[str, Any]]":
+    """Turn ``_ot2_normalize_volumes`` output into transfer steps: for each OK item,
+    diluent first (from ``diluent_ref`` if given) then sample (from ``src_id:well``)
+    into the next destination well. Items without a source well, or once the
+    destination wells are exhausted, are skipped."""
+    steps: "list[dict[str, Any]]" = []
+    di = 0
+    for rec in normalized:
+        if not rec.get("ok"):
+            continue
+        well = rec.get("well")
+        if not well or di >= len(dst_wells):
+            continue
+        dst = f"{dst_id}:{dst_wells[di]}"
+        di += 1
+        dil = rec.get("diluent_ul")
+        if (diluent_ref and isinstance(dil, (int, float))
+                and not isinstance(dil, bool) and dil > 0):
+            steps.append({"type": "transfer", "new_tip": new_tip,
+                          "from": diluent_ref, "to": dst, "volume": dil})
+        steps.append({"type": "transfer", "new_tip": new_tip,
+                      "from": f"{src_id}:{well}", "to": dst, "volume": rec["sample_ul"]})
+    return steps
+
+
+def _ot2_cherrypick_steps(picks: "list[dict[str, Any]]", *, src_id: str, dst_id: str,
+                          dst_wells: "list[str]", volume: Any,
+                          new_tip: str = "always") -> "list[dict[str, Any]]":
+    """Transfer ``volume`` from each pick's source well (``src_id:well``) into
+    sequential destination wells — the equal-volume cherry-pick / replate."""
+    steps: "list[dict[str, Any]]" = []
+    di = 0
+    for p in picks:
+        well = p.get("well") if isinstance(p, dict) else None
+        if not well or di >= len(dst_wells):
+            continue
+        steps.append({"type": "transfer", "new_tip": new_tip,
+                      "from": f"{src_id}:{well}", "to": f"{dst_id}:{dst_wells[di]}",
+                      "volume": volume})
+        di += 1
+    return steps
 
 
 # ── Deck visualizer ─────────────────────────────────────────────────────────────
@@ -1224,10 +1484,55 @@ def _ot2_state(host: str, *, run_id: "str | None" = None) -> "dict[str, Any]":
     return state
 
 
+# ── Run control (in-flight actuation: pause / resume / stop) ─────────────────────
+# The only three commands you can send a live run. "resume" is the same "play"
+# action that starts a run — the robot picks up where a pause left off. These are
+# the manual counterpart to the automatic stop-on-fault the run monitor performs.
+_OT2_RUN_ACTIONS: "dict[str, str]" = {
+    "pause": "pause", "resume": "play", "stop": "stop",
+    "play": "play", "cancel": "stop",   # aliases
+}
+# A run id is interpolated into the request path — keep it to the UUID-shaped
+# charset so a crafted value (slashes / '..') can't manipulate the URL path.
+_OT2_RUN_ID_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+
+
+def _ot2_valid_run_id(rid: Any) -> str:
+    rid = str(rid)
+    if not rid or len(rid) > 128 or any(c not in _OT2_RUN_ID_CHARS for c in rid):
+        raise OT2Error(f"invalid run id {rid!r}")
+    return rid
+
+
+def _ot2_run_action(host: str, rid: str, action: str) -> "dict[str, Any]":
+    """Send a run-control action to an in-flight run — ``pause`` / ``resume`` /
+    ``stop`` (``cancel`` is an alias for ``stop``). Raises ``OT2Error`` on an
+    unknown action or a path-unsafe run id."""
+    act = _OT2_RUN_ACTIONS.get(str(action).strip().lower())
+    if act is None:
+        raise OT2Error(f"unknown run action {action!r} (use pause / resume / stop)")
+    rid = _ot2_valid_run_id(rid)
+    return _ot2_request_json(host, f"/runs/{rid}/actions", method="POST",
+                             payload={"data": {"actionType": act}})
+
+
 def _ot2_stop_run(host: str, rid: str) -> "dict[str, Any]":
     """Halt a run (stop action) — used to abort the instant a fault is detected."""
-    return _ot2_request_json(host, f"/runs/{rid}/actions", method="POST",
-                             payload={"data": {"actionType": "stop"}})
+    return _ot2_run_action(host, rid, "stop")
+
+
+def _ot2_run_control(host: str, action: str, *,
+                     run_id: "str | None" = None) -> "dict[str, Any]":
+    """Resolve the current run (or use ``run_id``) and send it a control action.
+    Returns ``{"ok", "action", "run_id"}``; raises ``OT2Error`` when there is no
+    active run, the action is unknown, or the transport fails."""
+    rid = run_id or _ot2_active_run(host)
+    if not rid:
+        raise OT2Error("no active run to control (nothing is running on the robot)")
+    _ot2_run_action(host, rid, action)
+    _log.info("[ot2] run-control %s on %s (run %s)", str(action).strip().lower(), host, rid)
+    return {"ok": True, "action": str(action).strip().lower(), "run_id": rid}
 
 
 def _ot2_monitor(host: str, *, run_id: "str | None" = None,

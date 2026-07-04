@@ -758,3 +758,463 @@ class TestHardeningSweep2:
                          "b": {"labware": "eppi_24", "slot": 99},
                          "c": {"labware": "eppi_24", "slot": 3}}})
         assert set(d2) == {3}
+
+
+# ── Run control: pause / resume / stop (2026-07-04) ─────────────────────────────
+class TestRunControl:
+    def test_action_map_and_aliases(self, monkeypatch):
+        sent = {}
+        def fake_json(host, path, *, method="GET", payload=None, **kw):
+            sent["path"] = path
+            sent["action"] = (payload or {})["data"]["actionType"]
+            return {"data": {}}
+        monkeypatch.setattr(ot2, "_ot2_request_json", fake_json)
+        ot2._ot2_run_action("h", "R1", "pause")
+        assert sent["path"] == "/runs/R1/actions" and sent["action"] == "pause"
+        ot2._ot2_run_action("h", "R1", "resume")
+        assert sent["action"] == "play"       # resume maps to play
+        ot2._ot2_run_action("h", "R1", "cancel")
+        assert sent["action"] == "stop"       # cancel is an alias for stop
+        ot2._ot2_stop_run("h", "R1")
+        assert sent["action"] == "stop"       # stop_run delegates to the action layer
+
+    def test_unknown_action_raises(self):
+        with pytest.raises(ot2.OT2Error):
+            ot2._ot2_run_action("h", "R1", "frobnicate")
+
+    def test_run_control_resolves_active_run(self, monkeypatch):
+        calls = {}
+        def fake_json(host, path, *, method="GET", payload=None, **kw):
+            if path == "/runs":
+                return {"data": [{"id": "RUN9", "current": True}]}
+            calls["path"] = path
+            calls["action"] = (payload or {})["data"]["actionType"]
+            return {"data": {}}
+        monkeypatch.setattr(ot2, "_ot2_request_json", fake_json)
+        res = ot2._ot2_run_control("h", "pause")   # no run_id -> resolve the active run
+        assert res["ok"] and res["run_id"] == "RUN9" and res["action"] == "pause"
+        assert calls["path"] == "/runs/RUN9/actions"
+
+    def test_run_control_no_active_run_raises(self, monkeypatch):
+        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host: None)
+        with pytest.raises(ot2.OT2Error):
+            ot2._ot2_run_control("h", "stop")
+
+
+# ── Identity-linking: ordered wells + plate map (2026-07-04) ────────────────────
+class TestEntryWells:
+    def test_catalog_geometry_row_major(self):
+        w = ot2._ot2_entry_wells({"labware": "eppi_24"})   # 4x6 -> A1..D6, row-major
+        assert w[0] == "A1" and w[6] == "B1" and len(w) == 24
+
+    def test_alias_plate96(self):
+        assert len(ot2._ot2_entry_wells({"labware": "plate_96"})) == 96
+
+    def test_custom_def_sorted(self):
+        d = {"wells": {"B1": {}, "A1": {}, "A2": {}}}
+        assert ot2._ot2_entry_wells({"definition": d}) == ["A1", "A2", "B1"]
+
+    def test_unknown_labware_empty(self):
+        assert ot2._ot2_entry_wells({"labware": "no_such_labware"}) == []
+
+
+class TestPlanMetadataPassthrough:
+    def test_map_and_collection_preserved(self):
+        plan = {"pipette": "p300_single",
+                "labware": {"src": {"labware": "eppi_24", "slot": 1,
+                                    "collection": "FFE",
+                                    "map": {"A1": {"id": "x1", "name": "pA"}}}},
+                "steps": []}
+        p = ot2._ot2_normalize_plan(plan)
+        assert p["labware"]["src"]["collection"] == "FFE"
+        assert p["labware"]["src"]["map"]["A1"]["name"] == "pA"
+
+    def test_map_non_dict_ignored(self):
+        p = ot2._ot2_normalize_plan(
+            {"labware": {"s": {"labware": "eppi_24", "slot": 1, "map": 5}}, "steps": []})
+        assert "map" not in p["labware"]["s"]
+
+
+# ── Concentration normalisation (2026-07-04) ────────────────────────────────────
+class TestNormalize:
+    def test_target_ng_basic(self):
+        items = [{"name": "a", "well": "A1", "concentration": 100.0},
+                 {"name": "b", "well": "A2", "concentration": 50.0}]
+        r = ot2._ot2_normalize_volumes(items, target_ng=200.0)
+        assert r[0]["sample_ul"] == 2.0 and r[0]["achieved_ng"] == 200.0 and r[0]["ok"]
+        assert r[1]["sample_ul"] == 4.0
+
+    def test_target_conc_with_diluent(self):
+        items = [{"name": "a", "well": "A1", "concentration": 100.0}]
+        r = ot2._ot2_normalize_volumes(items, target_conc=20.0, final_volume=50.0)
+        assert r[0]["sample_ul"] == 10.0 and r[0]["diluent_ul"] == 40.0
+        assert r[0]["achieved_conc"] == 20.0
+
+    def test_low_conc_clamps_and_warns(self):
+        r = ot2._ot2_normalize_volumes([{"name": "a", "well": "A1", "concentration": 5.0}],
+                                       target_ng=1000.0, max_vol=100.0)
+        assert r[0]["sample_ul"] == 100.0 and r[0]["warning"] and r[0]["ok"]
+
+    def test_high_conc_below_floor_warns(self):
+        r = ot2._ot2_normalize_volumes([{"name": "a", "well": "A1", "concentration": 1000.0}],
+                                       target_ng=100.0, min_vol=30.0)
+        assert r[0]["sample_ul"] == 30.0 and r[0]["warning"]
+
+    def test_invalid_concentration_skipped(self):
+        r = ot2._ot2_normalize_volumes(
+            [{"name": "a", "concentration": 0}, {"name": "b", "concentration": "n/a"}],
+            target_ng=200.0)
+        assert all(not x["ok"] and x["warning"] for x in r)
+
+    def test_contradictory_or_missing_target_raises(self):
+        with pytest.raises(ot2.OT2Error):
+            ot2._ot2_normalize_volumes([], target_ng=10, target_conc=10)
+        with pytest.raises(ot2.OT2Error):
+            ot2._ot2_normalize_volumes([])
+
+    def test_conc_mode_needs_final_volume(self):
+        with pytest.raises(ot2.OT2Error):
+            ot2._ot2_normalize_volumes([{"name": "a", "concentration": 10}], target_conc=5)
+
+    def test_non_finite_target_raises(self):
+        with pytest.raises(ot2.OT2Error):
+            ot2._ot2_normalize_volumes([], target_ng=float("inf"))
+
+    def test_normalize_steps_diluent_then_sample(self):
+        norm = ot2._ot2_normalize_volumes(
+            [{"name": "a", "well": "A1", "concentration": 100.0}],
+            target_conc=20.0, final_volume=50.0)
+        steps = ot2._ot2_normalize_steps(norm, src_id="src", dst_id="dst",
+                                         dst_wells=["A1", "A2"], diluent_ref="buf:A1")
+        assert len(steps) == 2
+        assert steps[0]["from"] == "buf:A1" and steps[0]["volume"] == 40.0   # diluent first
+        assert steps[1]["from"] == "src:A1" and steps[1]["to"] == "dst:A1"
+        assert steps[1]["volume"] == 10.0
+
+    def test_normalize_steps_compile(self):
+        norm = ot2._ot2_normalize_volumes(
+            [{"name": "a", "well": "A1", "concentration": 100.0}], target_ng=200.0)
+        steps = ot2._ot2_normalize_steps(norm, src_id="src", dst_id="dst", dst_wells=["A1"])
+        plan = {"pipette": "p300_single", "tips": {"labware": "tiprack_300", "slot": 8},
+                "labware": {"src": {"labware": "eppi_24", "slot": 1},
+                            "dst": {"labware": "plate_24", "slot": 2}}, "steps": steps}
+        assert "pipette.transfer(2.0" in ot2._ot2_compile_protocol(plan)
+
+    def test_cherrypick_steps_skip_bad_wells(self):
+        picks = [{"well": "A1"}, {"well": "B3"}, {"well": None}]
+        steps = ot2._ot2_cherrypick_steps(picks, src_id="src", dst_id="dst",
+                                          dst_wells=["A1", "A2"], volume=5)
+        assert len(steps) == 2
+        assert steps[0]["from"] == "src:A1" and steps[0]["to"] == "dst:A1"
+        assert steps[1]["from"] == "src:B3" and steps[1]["to"] == "dst:A2"
+
+
+# ── Resource pre-flight: source volumes + time estimate (2026-07-04) ────────────
+class TestPreflight:
+    def test_source_volumes_aggregate_steps(self):
+        plan = {"pipette": "p300_single", "tips": {"labware": "tiprack_300", "slot": 8},
+                "labware": {"src": {"labware": "eppi_24", "slot": 1},
+                            "dst": {"labware": "plate_24", "slot": 2}},
+                "steps": [{"type": "transfer", "from": "src:A1", "to": "dst:A1", "volume": 30},
+                          {"type": "transfer", "from": "src:A1", "to": "dst:A2", "volume": 50},
+                          {"type": "distribute", "from": "src:B1",
+                           "to": ["dst:A1", "dst:A2"], "volume": 40}]}
+        s = ot2._ot2_plan_summary(plan)
+        assert s["source_volumes"]["src:A1"] == 80.0
+        assert s["source_volumes"]["src:B1"] == 80.0   # 40 uL to each of 2 dests
+        assert s["est_seconds"] > 0
+
+    def test_source_volumes_legacy_transfers(self):
+        s = ot2._ot2_plan_summary(_good_plan())
+        assert s["source_volumes"] == {"src:A1": 50.0, "src:A2": 50.0}
+        assert s["est_seconds"] > 0
+
+    def test_mix_draws_nothing(self):
+        plan = {"pipette": "p300_single", "tips": {"labware": "tiprack_300", "slot": 8},
+                "labware": {"dst": {"labware": "plate_24", "slot": 2}},
+                "steps": [{"type": "mix", "at": "dst:A1", "volume": 100, "repetitions": 3}]}
+        assert ot2._ot2_plan_summary(plan)["source_volumes"] == {}
+
+
+# ── New agent endpoints (2026-07-04) ────────────────────────────────────────────
+class TestOT2NewAgentEndpoints:
+    def _handlers(self):
+        import splicecraft as sc
+        return sc._AGENT_HANDLERS
+
+    def test_registered_with_write_flags(self):
+        H = self._handlers()
+        assert "ot2-run-control" in H and H["ot2-run-control"][1] is True
+        assert "ot2-normalize" in H and H["ot2-normalize"][1] is False
+        assert "ot2-plate-map" in H and H["ot2-plate-map"][1] is False
+
+    def test_run_control_needs_host_and_action(self):
+        H = self._handlers()
+        assert H["ot2-run-control"][0](None, {})[1] == 400
+        assert H["ot2-run-control"][0](None, {"host": "1.2.3.4"})[1] == 400
+        assert H["ot2-run-control"][0](None, {"host": "1.2.3.4", "action": "frob"})[1] == 400
+
+    def test_run_control_no_active_run_409(self, monkeypatch):
+        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host: None)
+        r = self._handlers()["ot2-run-control"][0](None, {"host": "1.2.3.4", "action": "pause"})
+        assert r[1] == 409
+
+    def test_run_control_sends_action(self, monkeypatch):
+        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host: "RUNZ")
+        sent = {}
+        monkeypatch.setattr(ot2, "_ot2_run_action",
+                            lambda host, rid, action: sent.update(rid=rid, action=action) or {})
+        r = self._handlers()["ot2-run-control"][0](None, {"host": "1.2.3.4", "action": "pause"})
+        assert r["ok"] and r["run_id"] == "RUNZ" and sent["action"] == "pause"
+
+    def test_normalize_endpoint_uses_pipette_floor(self):
+        r = self._handlers()["ot2-normalize"][0](None, {
+            "items": [{"name": "a", "well": "A1", "concentration": 1000.0}],
+            "target_ng": 100.0, "pipette": "p300_single"})
+        assert r["normalized"][0]["sample_ul"] == 30.0 and r["warnings"]
+
+    def test_normalize_endpoint_emits_steps(self):
+        r = self._handlers()["ot2-normalize"][0](None, {
+            "items": [{"name": "a", "well": "A1", "concentration": 100.0}],
+            "target_ng": 200.0, "src": "src", "dst": "dst", "dst_labware": "plate_96"})
+        assert "steps" in r and r["steps"][0]["from"] == "src:A1"
+
+    def test_normalize_endpoint_guards(self):
+        H = self._handlers()
+        assert H["ot2-normalize"][0](None, {})[1] == 400   # no items
+        assert H["ot2-normalize"][0](None,
+                                     {"items": [{"name": "a", "concentration": 10}]})[1] == 400
+
+    def test_plate_map_endpoint(self):
+        import splicecraft as sc
+        colls = sc._load_collections()
+        colls.append({"name": "OT2MAP", "plasmids": [
+            {"id": "id1", "name": "pOne"}, {"id": "id2", "name": "pTwo"}]})
+        sc._save_collections(colls)
+        r = self._handlers()["ot2-plate-map"][0](None,
+                                                  {"collection": "OT2MAP", "labware": "eppi_24"})
+        assert r["ok"] and r["map"]["A1"] == {"id": "id1", "name": "pOne"}
+        assert r["map"]["A2"]["name"] == "pTwo" and r["n"] == 2 and r["overflow"] == 0
+
+    def test_plate_map_guards(self):
+        H = self._handlers()
+        assert H["ot2-plate-map"][0](None, {"collection": "NoSuchColl", "labware": "eppi_24"})[1] == 404
+        import splicecraft as sc
+        colls = sc._load_collections()
+        if not any(c.get("name") == "OT2MAP2" for c in colls):
+            colls.append({"name": "OT2MAP2", "plasmids": [{"id": "i", "name": "p"}]})
+            sc._save_collections(colls)
+        assert H["ot2-plate-map"][0](None, {"collection": "OT2MAP2", "labware": "bogus"})[1] == 400
+
+
+# ── AUTOLAB run-control buttons + live progress (2026-07-04) ─────────────────────
+class TestAutolabRunControlUI:
+    async def test_buttons_dispatch_and_progress(self, monkeypatch):
+        import splicecraft as sc
+        from textual.widgets import Button, Static, Input
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            for bid in ("autolab-pause", "autolab-resume", "autolab-abort"):
+                assert scr.query_one(f"#{bid}", Button) is not None
+            calls = []
+            monkeypatch.setattr(scr, "_worker_run_control",
+                                lambda host, action: calls.append((host, action)))
+            scr._on_run_control("pause")            # no host -> warn, no dispatch
+            assert calls == []
+            scr.query_one("#autolab-host", Input).value = "1.2.3.4"
+            scr._on_run_control("stop")
+            assert calls == [("1.2.3.4", "stop")]
+            # a live run snapshot captures the run id + renders the progress line
+            scr._render_state({"reachable": True, "health": {"name": "X"}, "ok": True,
+                               "run": {"id": "RUN5", "status": "running", "command_count": 3,
+                                       "current_command": {"commandType": "aspirate",
+                                                           "at": {"wellName": "A1"}}}})
+            assert scr._active_run_id == "RUN5"
+            assert scr.query_one("#autolab-run-progress", Static) is not None
+            body = scr._run_progress_text
+            assert "RUN" in body and "aspirate" in body and "A1" in body
+            scr._run_done({"ran": True, "run_status": "succeeded", "crashed": False})
+            assert scr._active_run_id is None
+
+
+# ── AUTOLAB Library tab: bind / cherry-pick / normalise / provenance ────────────
+class TestAutolabLibrary:
+    async def test_bind_and_cherry_pick(self):
+        import splicecraft as sc
+        from textual.widgets import Select
+        colls = sc._load_collections()
+        colls.append({"name": "AUTOLABCOLL", "plasmids": [
+            {"id": "p1", "name": "pOne", "size": 100, "n_feats": 0, "gb_text": "", "source": ""},
+            {"id": "p2", "name": "pTwo", "size": 100, "n_feats": 0, "gb_text": "", "source": ""}]})
+        sc._save_collections(colls)
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            scr._refresh_library_tab()
+            scr.query_one("#autolab-lib-coll", Select).value = "AUTOLABCOLL"
+            scr.query_one("#autolab-lib-slot", Select).value = "1"   # eppi_24 'src'
+            scr._bind_collection()
+            assert scr._bound_slot == 1
+            assert scr._deck[1]["map"]["A1"]["id"] == "p1"
+            assert scr._deck[1]["collection"] == "AUTOLABCOLL"
+            scr.query_one("#autolab-lib-dst", Select).value = "2"    # plate_24 'dst'
+            n0 = len(scr._steps)
+            scr._cherry_pick()
+            assert len(scr._steps) == n0 + 2
+            assert scr._steps[-2]["from"] == "src:A1" and scr._steps[-2]["to"] == "dst:A1"
+            assert scr._steps[-1]["from"] == "src:A2"
+            # the identity map round-trips through the compiled plan metadata
+            plan = ot2._ot2_normalize_plan(scr._build_plan())
+            assert plan["labware"]["src"]["collection"] == "AUTOLABCOLL"
+
+    async def test_normalise_and_provenance(self):
+        import splicecraft as sc
+        from textual.widgets import Select, Input, TextArea
+        colls = sc._load_collections()
+        colls.append({"name": "NORMCOLL", "plasmids": [
+            {"id": "n1", "name": "pHi", "size": 100, "n_feats": 0, "gb_text": "", "source": ""},
+            {"id": "n2", "name": "pLo", "size": 100, "n_feats": 0, "gb_text": "", "source": ""}]})
+        sc._save_collections(colls)
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            scr._refresh_library_tab()
+            scr.query_one("#autolab-lib-coll", Select).value = "NORMCOLL"
+            scr.query_one("#autolab-lib-slot", Select).value = "1"
+            scr._bind_collection()
+            scr.query_one("#autolab-lib-dst", Select).value = "2"
+            scr.query_one("#autolab-lib-conc", TextArea).text = "A1 = 100\nA2 = 50"
+            scr.query_one("#autolab-lib-mode", Select).value = "ng"
+            scr.query_one("#autolab-lib-target", Input).value = "200"
+            scr._normalize_build()
+            assert any(s.get("from") == "src:A1" for s in scr._steps)
+            n_before = len(sc._load_experiments())
+            scr.query_one("#autolab-lib-title", Input).value = "My OT-2 build"
+            scr._log_to_notebook()
+            entries = sc._load_experiments()
+            assert len(entries) == n_before + 1
+            logged = [e for e in entries if e.get("title") == "My OT-2 build"]
+            assert logged and "@n1" in logged[0]["body_md"]
+
+    async def test_bind_guards_no_selection(self):
+        import splicecraft as sc
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            scr._bind_collection()           # nothing selected -> no crash, no bind
+            assert scr._bound_slot is None
+            scr._cherry_pick()               # no bound plate -> no crash, no steps
+            assert scr._steps == []
+
+
+# ── Hardening sweep #3 (2026-07-04): audit of the run-control/identity/normalise batch ──
+class TestHardeningSweep3:
+    def test_normalize_overfill_final_volume_warns(self):
+        # target_ng + final_volume, stock too dilute -> sample > final -> diluent 0 + warn
+        r = ot2._ot2_normalize_volumes([{"name": "a", "well": "A1", "concentration": 50.0}],
+                                       target_ng=3000.0, final_volume=20.0, max_vol=300.0)
+        assert r[0]["sample_ul"] == 60.0 and r[0]["diluent_ul"] == 0.0
+        assert r[0]["warning"] and "final volume" in r[0]["warning"]
+
+    def test_parse_well_rejects_superscript_no_crash(self):
+        assert ot2._ot2_parse_well("A²") is None      # ² is isdigit-true, isdecimal-false
+        # a custom def with such a key no longer crashes the well ordering
+        wells = ot2._ot2_entry_wells({"definition": {"wells": {"A²": {}, "A1": {}}}})
+        assert "A1" in wells
+
+    def test_normalize_item_cap(self):
+        many = [{"name": str(i), "well": "A1", "concentration": 100.0}
+                for i in range(ot2._OT2_MAX_ITEMS + 1)]
+        with pytest.raises(ot2.OT2Error):
+            ot2._ot2_normalize_volumes(many, target_ng=200.0)
+
+    def test_normalize_validates_min_vol_resolution(self):
+        base = [{"name": "a", "well": "A1", "concentration": 100.0}]
+        with pytest.raises(ot2.OT2Error):
+            ot2._ot2_normalize_volumes(base, target_ng=100.0, resolution=float("inf"))
+        with pytest.raises(ot2.OT2Error):
+            ot2._ot2_normalize_volumes(base, target_ng=100.0, min_vol=float("inf"))
+        with pytest.raises(ot2.OT2Error):    # inverted min/max
+            ot2._ot2_normalize_volumes(base, target_ng=100.0, min_vol=50.0, max_vol=30.0)
+
+    def test_run_id_sanitised(self):
+        assert ot2._ot2_valid_run_id("3f2a-9b_1.2") == "3f2a-9b_1.2"
+        for bad in ("x/y", "../etc", "a b", "z" * 200, ""):
+            with pytest.raises(ot2.OT2Error):
+                ot2._ot2_valid_run_id(bad)
+        with pytest.raises(ot2.OT2Error):     # rejected before any request is built
+            ot2._ot2_run_action("h", "../../danger", "pause")
+
+    def test_agent_normalize_warns_missing_diluent(self):
+        import splicecraft as sc
+        H = sc._AGENT_HANDLERS
+        body = {"items": [{"name": "a", "well": "A1", "concentration": 100.0}],
+                "target_conc": 20.0, "final_volume": 50.0,
+                "src": "src", "dst": "dst", "dst_labware": "plate_96"}
+        r = H["ot2-normalize"][0](None, body)
+        assert any("diluent" in w.lower() for w in r["warnings"])
+        r2 = H["ot2-normalize"][0](None, {**body, "diluent_ref": "buf:A1"})
+        assert not any("no 'diluent_ref'" in w for w in r2["warnings"])
+
+
+class TestAutolabLibraryHardening:
+    async def test_normalize_refuses_missing_diluent(self):
+        import splicecraft as sc
+        from textual.widgets import Select, Input, TextArea
+        colls = sc._load_collections()
+        colls.append({"name": "DILCOLL", "plasmids": [
+            {"id": "d1", "name": "pD", "size": 100, "n_feats": 0, "gb_text": "", "source": ""}]})
+        sc._save_collections(colls)
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            scr._refresh_library_tab()
+            scr.query_one("#autolab-lib-coll", Select).value = "DILCOLL"
+            scr.query_one("#autolab-lib-slot", Select).value = "1"
+            scr._bind_collection()
+            scr.query_one("#autolab-lib-dst", Select).value = "2"
+            scr.query_one("#autolab-lib-conc", TextArea).text = "A1 = 100"
+            scr.query_one("#autolab-lib-mode", Select).value = "conc"
+            scr.query_one("#autolab-lib-target", Input).value = "20"
+            scr.query_one("#autolab-lib-final", Input).value = "50"
+            n0 = len(scr._steps)
+            scr._normalize_build()             # no diluent well set -> refuse
+            assert len(scr._steps) == n0
+            scr.query_one("#autolab-lib-diluent", Input).value = "buf:A1"
+            scr._normalize_build()             # now it builds
+            assert len(scr._steps) > n0
+
+    async def test_bound_slot_restored_on_load(self):
+        import splicecraft as sc
+        from textual.widgets import Select
+        colls = sc._load_collections()
+        colls.append({"name": "LOADCOLL", "plasmids": [
+            {"id": "l1", "name": "pL", "size": 100, "n_feats": 0, "gb_text": "", "source": ""}]})
+        sc._save_collections(colls)
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            scr._refresh_library_tab()
+            scr.query_one("#autolab-lib-coll", Select).value = "LOADCOLL"
+            scr.query_one("#autolab-lib-slot", Select).value = "1"
+            scr._bind_collection()
+            assert scr._bound_slot == 1
+            plan = scr._build_plan()
+            scr._bound_slot = None             # simulate a reload losing the pointer
+            scr._deck = {8: {"kind": "tips", "labware": "tiprack_300"}}
+            scr._apply_plan(plan)
+            assert scr._bound_slot is not None
+            assert scr._deck[scr._bound_slot].get("collection") == "LOADCOLL"

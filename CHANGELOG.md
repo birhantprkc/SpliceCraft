@@ -14,6 +14,53 @@
 
 ---
 
+## [1.0.122] — 2026-07-04
+
+### New features
+
+- **AUTOLAB live run controls.** Pause, Resume, and Abort a running OT-2 protocol
+  straight from the workbench — the manual counterpart to the automatic
+  stop-on-fault. A live one-line readout shows the run status, the current step and
+  well, how many commands have run, and elapsed time. Also available headlessly via
+  the new `ot2-run-control` agent endpoint.
+- **Plate ↔ library linking (new AUTOLAB "Library" tab).** Bind a deck plate or
+  tube rack to a plasmid collection — its wells fill A1, A2, … with your plasmids,
+  so transfers reference *plasmids*, not bare coordinates. Cherry-pick (or replate a
+  whole collection) into a destination plate with one click. The agent API gains
+  `ot2-plate-map` to compute the same well→plasmid map headlessly.
+- **Concentration normalization.** Enter per-well concentrations and a target — a
+  fixed DNA mass (ng) or a target concentration (ng/µL) — and AUTOLAB builds the
+  sample (and diluent) transfers to hit it, honouring the pipette's volume floor and
+  flagging any sample too dilute or too concentrated to reach target. Also available
+  as the `ot2-normalize` agent endpoint.
+- **Log a build to the lab notebook.** "Log to notebook" records an OT-2 plate build
+  — which plasmid went to which well, at what volume, on which robot — as an
+  Experiments entry, cross-linked to the library plasmids it touched.
+- **Pre-flight resource summary.** Compiling a protocol (and `ot2-compile`) now
+  reports how much liquid each source well must hold — so you know what to load and
+  whether a well will run dry — plus a rough time estimate for the run.
+
+### Hardening
+
+- **Normalization won't silently ship an undiluted plate.** If you set a target
+  concentration (or a fixed mass with a final volume) but leave the Diluent well
+  blank, the tool now refuses and tells you to set one — previously it built a
+  plate with only the concentrated sample while the preview claimed it hit target.
+  The `ot2-normalize` agent endpoint returns the same warning.
+- **Cherry-pick / normalize warn on overflow.** When there are more samples than
+  destination wells, you now get a "N not placed" warning and an accurate count,
+  instead of the extras being silently dropped.
+- **A reloaded bound plate works immediately.** Loading a saved protocol whose plate
+  was linked to a collection restores the link, so cherry-pick / normalize work
+  without re-binding.
+- **Fixed-mass over-fill warning.** Normalizing to a fixed mass with a final volume
+  now warns when the stock is too dilute to fit that mass in the well.
+- Input hardening across the new surface: a cap on normalization item counts,
+  validation of min/max/resolution volumes, path-safe run ids for the run controls,
+  and malformed well names (e.g. superscript digits) handled instead of crashing.
+
+---
+
 ## [1.0.121] — 2026-07-03
 
 ### Hardening
