@@ -83,6 +83,15 @@ _OT2_MAX_PROTOCOL_BYTES = 4 * 1024 * 1024
 # Plan sanity caps — defend the compiler + robot from garbage / runaway input.
 _OT2_MAX_TRANSFERS = 10000        # far beyond any real plate-prep run
 _OT2_MAX_VOLUME_UL = 100000.0     # 100 mL — reject absurd volumes (typos, Infinity)
+_OT2_MAX_STEPS = 5000             # a multi-step protocol far beyond any real run
+_OT2_MAX_DELAY_S = 86400.0        # 24 h — reject absurd delays
+
+# The multi-step "protocol designer" model (a plan may carry `steps` instead of
+# the legacy `transfers`). LIQUID steps need a pipette + tip rack + labware;
+# control steps (delay/pause/comment) don't.
+_OT2_STEP_TYPES = ("transfer", "distribute", "consolidate", "mix",
+                   "delay", "pause", "comment")
+_OT2_LIQUID_STEPS = ("transfer", "distribute", "consolidate", "mix")
 
 _OT2_DEFAULT_API_LEVEL = "2.13"
 _OT2_MULTIPART_BOUNDARY = "----SpliceCraftOT2FormBoundary7b3f"
@@ -214,6 +223,27 @@ def _ot2_well_ok(load_name: str, well: str) -> "bool | None":
     return row < info["rows"] and 1 <= col <= info["cols"]
 
 
+def _ot2_custom_wells(definition: Any) -> "set[str] | None":
+    """Valid well names of a custom Opentrons labware definition (from its
+    ``wells`` map), or ``None`` if it doesn't declare them."""
+    if not isinstance(definition, dict):
+        return None
+    wells = definition.get("wells")
+    if isinstance(wells, dict) and wells:
+        return {str(k).upper() for k in wells}
+    return None
+
+
+def _ot2_well_ok_entry(entry: "dict[str, Any]", well: str) -> "bool | None":
+    """Well validity for a loaded-labware ENTRY — a built-in load name OR a custom
+    definition (``{"definition": {...}}``). ``None`` when it can't be determined."""
+    definition = entry.get("definition")
+    if isinstance(definition, dict):
+        cw = _ot2_custom_wells(definition)
+        return None if cw is None else well.strip().upper() in cw
+    return _ot2_well_ok(str(entry.get("labware", "")), well)
+
+
 # ── Plan normalisation ──────────────────────────────────────────────────────────
 def _ot2_safe_var(label: str, prefix: str) -> str:
     """A valid, collision-resistant Python identifier for an emitted variable."""
@@ -234,6 +264,113 @@ def _ot2_split_ref(ref: str) -> "tuple[str, str] | None":
     if not lid or not well:
         return None
     return lid, well
+
+
+# ── Shared validation helpers (used by both the transfer + step paths) ──────────
+def _ot2_ref_errors(ref: "tuple[str, str] | None", labware: "dict[str, Any]",
+                    tag: str, end: str) -> "list[str]":
+    """Validate a parsed ``(labware_id, well)`` reference against loaded labware."""
+    if ref is None:
+        return [f"{tag}: '{end}' must look like 'labwareId:well'"]
+    lid, well = ref
+    if lid not in labware:
+        return [f"{tag}: '{end}' references unknown labware id {lid!r}"]
+    if _ot2_well_ok_entry(labware[lid], well) is False:
+        name = labware[lid].get("labware") or "custom labware"
+        return [f"{tag}: well {well!r} is out of range for {name!r}"]
+    return []
+
+
+def _ot2_volume_errors(vol: Any, spec: "tuple[float, float, int] | None",
+                       pipette: str, tag: str) -> "tuple[list[str], list[str]]":
+    """Validate one volume. Returns ``(errors, warnings)``."""
+    if not isinstance(vol, (int, float)) or isinstance(vol, bool):
+        return [f"{tag}: volume must be a number, got {vol!r}"], []
+    if not math.isfinite(vol):
+        return [f"{tag}: volume must be a finite number, got {vol!r}"], []
+    if vol <= 0:
+        return [f"{tag}: volume must be positive, got {vol}"], []
+    if vol > _OT2_MAX_VOLUME_UL:
+        return [f"{tag}: volume {vol:g} µL is implausibly large "
+                f"(max {_OT2_MAX_VOLUME_UL:g})"], []
+    if spec is not None and vol < spec[0]:
+        return [], [f"{tag}: {vol} µL is below the {pipette} minimum "
+                    f"({spec[0]:g} µL) — dispense will be inaccurate"]
+    return [], []
+
+
+def _ot2_mix_errors(mix: Any, spec: "tuple[float, float, int] | None",
+                    pipette: str, tag: str) -> "list[str]":
+    """Validate a ``[repetitions, volume]`` mix spec (for transfer mix_before/after)."""
+    if not (isinstance(mix, (list, tuple)) and len(mix) == 2):
+        return [f"{tag}: must be [repetitions, volume]"]
+    reps, vol = mix
+    errs: "list[str]" = []
+    if not isinstance(reps, int) or isinstance(reps, bool) or reps <= 0:
+        errs.append(f"{tag}: repetitions must be a positive integer, got {reps!r}")
+    errs += _ot2_volume_errors(vol, spec, pipette, tag)[0]
+    return errs
+
+
+def _ot2_normalize_step(step: Any, default_new_tip: str) -> "dict[str, Any]":
+    """Normalise one designer step into canonical form (parse refs, coerce types).
+    Unknown / malformed steps normalise to ``{"type": <as-given>}`` and are flagged
+    by ``_ot2_validate_steps``, never silently dropped."""
+    if not isinstance(step, dict):
+        return {"type": ""}
+    stype = str(step.get("type", "")).lower().strip()
+    # distribute / consolidate reuse ONE tip by default ("once"); a transfer
+    # follows the plan-level default. An explicit step `new_tip` always wins.
+    _nt_default = "once" if stype in ("distribute", "consolidate") else default_new_tip
+    nt = str(step.get("new_tip", _nt_default)).lower()
+    s: "dict[str, Any]" = {"type": stype,
+                           "new_tip": nt if nt in _OT2_NEW_TIP else _nt_default}
+
+    def _reflist(v: Any) -> "list[tuple[str, str] | None]":
+        if isinstance(v, str):
+            v = [v]
+        return [_ot2_split_ref(str(x)) for x in v] if isinstance(v, list) else []
+
+    def _mix(v: Any) -> "list[Any] | None":
+        if isinstance(v, (list, tuple)) and len(v) == 2:
+            return [v[0], v[1]]
+        if isinstance(v, dict):
+            return [v.get("reps", v.get("repetitions")), v.get("volume", v.get("vol"))]
+        return None
+
+    if stype == "transfer":
+        s["from"], s["to"] = step.get("from"), step.get("to")
+        s["_src"] = _ot2_split_ref(str(step.get("from", "")))
+        s["_dst"] = _ot2_split_ref(str(step.get("to", "")))
+        s["volume"] = step.get("volume")
+        s["mix_before"] = _mix(step.get("mix_before"))
+        s["mix_after"] = _mix(step.get("mix_after"))
+        s["blow_out"] = bool(step.get("blow_out"))
+        s["touch_tip"] = bool(step.get("touch_tip"))
+    elif stype == "distribute":
+        s["from"], s["to"] = step.get("from"), step.get("to")
+        s["_src"] = _ot2_split_ref(str(step.get("from", "")))
+        s["_dsts"] = _reflist(step.get("to"))
+        s["volume"] = step.get("volume")
+    elif stype == "consolidate":
+        s["from"], s["to"] = step.get("from"), step.get("to")
+        s["_srcs"] = _reflist(step.get("from"))
+        s["_dst"] = _ot2_split_ref(str(step.get("to", "")))
+        s["volume"] = step.get("volume")
+    elif stype == "mix":
+        at = step.get("at", step.get("from"))
+        s["at"] = at
+        s["_at"] = _ot2_split_ref(str(at or ""))
+        s["volume"] = step.get("volume")
+        s["repetitions"] = step.get("repetitions", step.get("reps"))
+    elif stype == "delay":
+        s["seconds"] = step.get("seconds")
+        s["message"] = step.get("message") or step.get("msg")
+    elif stype == "pause":
+        s["message"] = step.get("message") or step.get("msg")
+    elif stype == "comment":
+        s["text"] = str(step.get("text") or step.get("message") or "")
+    return s
 
 
 def _ot2_normalize_plan(plan: "dict[str, Any]") -> "dict[str, Any]":
@@ -280,8 +417,12 @@ def _ot2_normalize_plan(plan: "dict[str, Any]") -> "dict[str, Any]":
     labware: "dict[str, dict[str, Any]]" = {}
     for lid, lw in (plan.get("labware") or {}).items():
         if isinstance(lw, dict):
-            labware[str(lid)] = {"labware": _ot2_resolve_labware(str(lw.get("labware", ""))),
-                                 "slot": lw.get("slot")}
+            entry: "dict[str, Any]" = {
+                "labware": _ot2_resolve_labware(str(lw.get("labware", ""))),
+                "slot": lw.get("slot")}
+            if isinstance(lw.get("definition"), dict):
+                entry["definition"] = lw["definition"]   # custom Opentrons labware def
+            labware[str(lid)] = entry
     p["labware"] = labware
 
     transfers: "list[dict[str, Any]]" = []
@@ -296,6 +437,19 @@ def _ot2_normalize_plan(plan: "dict[str, Any]") -> "dict[str, Any]":
         })
     p["transfers"] = transfers
 
+    steps_in = plan.get("steps")
+    nt_default = str(plan.get("new_tip", "always")).lower()
+    nt_default = nt_default if nt_default in _OT2_NEW_TIP else "always"
+    p["steps"] = ([_ot2_normalize_step(s, nt_default) for s in steps_in]
+                  if isinstance(steps_in, list) else [])
+    # The multi-step `steps` designer model takes precedence over the legacy
+    # `transfers` list whenever the caller supplies it (even an empty list).
+    # IDEMPOTENT: a canonical plan already carries `uses_steps` (validate + compile
+    # both re-normalise), so trust it — otherwise a legacy transfers plan, whose
+    # normalised `steps` is [], would flip into steps mode on the second pass.
+    p["uses_steps"] = (bool(plan.get("uses_steps")) if "uses_steps" in plan
+                       else isinstance(steps_in, list))
+
     new_tip = str(plan.get("new_tip", "always")).lower()
     p["new_tip"] = new_tip if new_tip in _OT2_NEW_TIP else "always"
     p["api_level"] = str(plan.get("api_level", _OT2_DEFAULT_API_LEVEL))
@@ -309,11 +463,101 @@ def _ot2_normalize_plan(plan: "dict[str, Any]") -> "dict[str, Any]":
 
 
 # ── Validation ──────────────────────────────────────────────────────────────────
+def _ot2_validate_transfers(p: "dict[str, Any]", spec: Any,
+                            errors: "list[str]", warnings: "list[str]") -> None:
+    """Legacy transfer-list validation (a plan with `transfers`, not `steps`)."""
+    n = len(p["transfers"])
+    if n == 0:
+        errors.append("no transfers: add at least one entry to 'transfers'")
+    elif n > _OT2_MAX_TRANSFERS:
+        errors.append(f"too many transfers ({n}); the max is {_OT2_MAX_TRANSFERS}")
+    # Capped so a pathological count can't make validation itself O(huge).
+    for i, t in enumerate(p["transfers"][:_OT2_MAX_TRANSFERS], 1):
+        tag = f"transfer #{i}"
+        errors += _ot2_ref_errors(t["_src"], p["labware"], tag, "from")
+        errors += _ot2_ref_errors(t["_dst"], p["labware"], tag, "to")
+        verr, vwarn = _ot2_volume_errors(t.get("volume"), spec, p["pipette"], tag)
+        errors += verr
+        warnings += vwarn
+    if p["new_tip"] == "always":
+        tip_capacity = 96 * len([t for t in p["tips"] if t.get("labware")])
+        if tip_capacity and n > tip_capacity:
+            warnings.append(f"{n} transfers with new_tip='always' need {n} tips "
+                            f"but only {tip_capacity} are loaded — add tip racks or use "
+                            "new_tip='once'")
+
+
+def _ot2_validate_steps(p: "dict[str, Any]", spec: Any,
+                        errors: "list[str]", warnings: "list[str]") -> None:
+    """Multi-step designer validation (a plan with `steps`)."""
+    n = len(p["steps"])
+    if n == 0:
+        errors.append("no steps: add at least one entry to 'steps'")
+    elif n > _OT2_MAX_STEPS:
+        errors.append(f"too many steps ({n}); the max is {_OT2_MAX_STEPS}")
+    lw, pip = p["labware"], p["pipette"]
+    for i, s in enumerate(p["steps"][:_OT2_MAX_STEPS], 1):
+        st = s["type"]
+        tag = f"step #{i} ({st or '?'})"
+        if st not in _OT2_STEP_TYPES:
+            errors.append(f"step #{i}: unknown step type {st!r} "
+                          f"(known: {', '.join(_OT2_STEP_TYPES)})")
+            continue
+        if st == "transfer":
+            errors += _ot2_ref_errors(s["_src"], lw, tag, "from")
+            errors += _ot2_ref_errors(s["_dst"], lw, tag, "to")
+            verr, vwarn = _ot2_volume_errors(s.get("volume"), spec, pip, tag)
+            errors += verr
+            warnings += vwarn
+            for mk in ("mix_before", "mix_after"):
+                if s.get(mk) is not None:
+                    errors += _ot2_mix_errors(s[mk], spec, pip, f"{tag} {mk}")
+        elif st == "distribute":
+            errors += _ot2_ref_errors(s["_src"], lw, tag, "from")
+            if not s["_dsts"]:
+                errors.append(f"{tag}: 'to' must be a non-empty list of wells")
+            for j, r in enumerate(s["_dsts"], 1):
+                errors += _ot2_ref_errors(r, lw, f"{tag} to[{j}]", "to")
+            verr, vwarn = _ot2_volume_errors(s.get("volume"), spec, pip, tag)
+            errors += verr
+            warnings += vwarn
+        elif st == "consolidate":
+            if not s["_srcs"]:
+                errors.append(f"{tag}: 'from' must be a non-empty list of wells")
+            for j, r in enumerate(s["_srcs"], 1):
+                errors += _ot2_ref_errors(r, lw, f"{tag} from[{j}]", "from")
+            errors += _ot2_ref_errors(s["_dst"], lw, tag, "to")
+            verr, vwarn = _ot2_volume_errors(s.get("volume"), spec, pip, tag)
+            errors += verr
+            warnings += vwarn
+        elif st == "mix":
+            errors += _ot2_ref_errors(s["_at"], lw, tag, "at")
+            verr, vwarn = _ot2_volume_errors(s.get("volume"), spec, pip, tag)
+            errors += verr
+            warnings += vwarn
+            reps = s.get("repetitions")
+            if not isinstance(reps, int) or isinstance(reps, bool) or reps <= 0:
+                errors.append(f"{tag}: repetitions must be a positive integer, got {reps!r}")
+        elif st == "delay":
+            secs = s.get("seconds")
+            if (not isinstance(secs, (int, float)) or isinstance(secs, bool)
+                    or not math.isfinite(secs) or secs <= 0):
+                errors.append(f"{tag}: seconds must be a positive number, got {secs!r}")
+            elif secs > _OT2_MAX_DELAY_S:
+                errors.append(f"{tag}: delay {secs:g}s is implausibly long "
+                              f"(max {_OT2_MAX_DELAY_S:g}s)")
+        elif st == "comment":
+            if not str(s.get("text", "")).strip():
+                warnings.append(f"{tag}: empty comment")
+        # pause: an optional message — nothing to validate
+
+
 def _ot2_validate_plan(plan: "dict[str, Any]") -> "dict[str, list[str]]":
     """Validate a plan (raw or canonical). Returns ``{"errors": [...],
     "warnings": [...]}``. Errors block compilation; warnings don't (e.g. a
     sub-minimum volume the pipette can't dispense accurately, or an unrecognised
-    load name the robot will have the final say on)."""
+    load name the robot will have the final say on). Handles both the legacy
+    `transfers` list and the multi-step `steps` designer model."""
     p = _ot2_normalize_plan(plan)
     errors: "list[str]" = []
     warnings: "list[str]" = []
@@ -340,7 +584,11 @@ def _ot2_validate_plan(plan: "dict[str, Any]") -> "dict[str, list[str]]":
         else:
             used_slots[slot] = what
 
-    if not p["tips"]:
+    # A protocol of only control steps (delay / pause / comment) needs no tips or
+    # labware; require them only when a liquid-handling operation is present.
+    needs_liquid = (any(s["type"] in _OT2_LIQUID_STEPS for s in p["steps"])
+                    if p["uses_steps"] else bool(p["transfers"]))
+    if needs_liquid and not p["tips"]:
         errors.append("no tip rack: add at least one entry to 'tips'")
     for t in p["tips"]:
         _check_slot(t.get("slot"), f"tip rack {t.get('labware')!r}")
@@ -350,77 +598,86 @@ def _ot2_validate_plan(plan: "dict[str, Any]") -> "dict[str, list[str]]":
         elif t.get("labware") and _OT2_LABWARE[t["labware"]]["kind"] != "tiprack":
             errors.append(f"{t['labware']!r} is not a tip rack")
 
-    if not p["labware"]:
+    if needs_liquid and not p["labware"]:
         errors.append("no labware: add at least one entry to 'labware'")
     for lid, lw in p["labware"].items():
         _check_slot(lw.get("slot"), f"labware {lid!r}")
-        if lw.get("labware") and lw["labware"] not in _OT2_LABWARE:
+        if isinstance(lw.get("definition"), dict):
+            if _ot2_custom_wells(lw["definition"]) is None:
+                warnings.append(f"custom labware (id {lid!r}) declares no 'wells' — well "
+                                "checks skipped; the robot will validate it")
+        elif lw.get("labware") and lw["labware"] not in _OT2_LABWARE:
             warnings.append(f"labware {lw['labware']!r} (id {lid!r}) not in the built-in "
                             "catalog — well checks skipped; the robot will validate it")
 
-    n_transfers = len(p["transfers"])
-    if n_transfers == 0:
-        errors.append("no transfers: add at least one entry to 'transfers'")
-    elif n_transfers > _OT2_MAX_TRANSFERS:
-        errors.append(f"too many transfers ({n_transfers}); the max is {_OT2_MAX_TRANSFERS}")
-
-    # Detailed per-transfer checks, capped so a pathological count can't make
-    # validation itself O(huge) — the count error above already blocks compile.
-    for i, t in enumerate(p["transfers"][:_OT2_MAX_TRANSFERS], 1):
-        tag = f"transfer #{i}"
-        for end, ref in (("from", t["_src"]), ("to", t["_dst"])):
-            if ref is None:
-                errors.append(f"{tag}: '{end}' must look like 'labwareId:well', "
-                              f"got {t.get(end)!r}")
-                continue
-            lid, well = ref
-            if lid not in p["labware"]:
-                errors.append(f"{tag}: '{end}' references unknown labware id {lid!r}")
-                continue
-            load_name = p["labware"][lid]["labware"]
-            ok = _ot2_well_ok(load_name, well)
-            if ok is False:
-                errors.append(f"{tag}: well {well!r} is out of range for {load_name!r}")
-        vol = t.get("volume")
-        if not isinstance(vol, (int, float)) or isinstance(vol, bool):
-            errors.append(f"{tag}: volume must be a number, got {vol!r}")
-        elif not math.isfinite(vol):
-            errors.append(f"{tag}: volume must be a finite number, got {vol!r}")
-        elif vol <= 0:
-            errors.append(f"{tag}: volume must be positive, got {vol}")
-        elif vol > _OT2_MAX_VOLUME_UL:
-            errors.append(f"{tag}: volume {vol:g} µL is implausibly large "
-                          f"(max {_OT2_MAX_VOLUME_UL:g})")
-        elif spec is not None:
-            lo, hi, _ = spec
-            if vol < lo:
-                warnings.append(f"{tag}: {vol} µL is below the {p['pipette']} minimum "
-                                f"({lo:g} µL) — dispense will be inaccurate")
-            # vol > hi is fine: the Protocol API splits a large transfer into
-            # multiple aspirate/dispense cycles automatically.
-
-    # tip budget vs. a single 96-tip rack, when every transfer takes a fresh tip
-    if p["new_tip"] == "always":
-        tip_capacity = 96 * len([t for t in p["tips"] if t.get("labware")])
-        needed = len(p["transfers"])
-        if tip_capacity and needed > tip_capacity:
-            warnings.append(f"{needed} transfers with new_tip='always' need {needed} tips "
-                            f"but only {tip_capacity} are loaded — add tip racks or use "
-                            "new_tip='once'")
+    if p["uses_steps"]:
+        _ot2_validate_steps(p, spec, errors, warnings)
+    else:
+        _ot2_validate_transfers(p, spec, errors, warnings)
     return {"errors": errors, "warnings": warnings}
 
 
 # ── The compiler ────────────────────────────────────────────────────────────────
-def _ot2_compile_protocol(plan: "dict[str, Any]") -> str:
-    """Compile a transfer plan into Opentrons Protocol API v2 Python text.
+def _ot2_emit_step(s: "dict[str, Any]", id_var: "dict[str, str]") -> "list[str]":
+    """Emit the Protocol API v2 line(s) for one validated designer step."""
+    st = s["type"]
 
-    Raises ``OT2Error`` (listing every problem) if the plan does not validate —
-    a caller should surface those rather than ship a broken protocol.
+    def well(ref: "tuple[str, str]") -> str:
+        return f"{id_var[ref[0]]}[{json.dumps(ref[1])}]"
+
+    def wells(refs: "list[Any]") -> str:
+        return "[" + ", ".join(well(r) for r in refs) + "]"
+
+    kw: "list[str]" = []
+    if st in ("transfer", "distribute", "consolidate"):
+        kw.append(f"new_tip={json.dumps(s['new_tip'])}")
+    if st == "transfer":
+        if s.get("mix_before"):
+            kw.append(f"mix_before=({s['mix_before'][0]!r}, {s['mix_before'][1]!r})")
+        if s.get("mix_after"):
+            kw.append(f"mix_after=({s['mix_after'][0]!r}, {s['mix_after'][1]!r})")
+        if s.get("blow_out"):
+            kw.append("blow_out=True")
+            kw.append('blowout_location="destination well"')
+        if s.get("touch_tip"):
+            kw.append("touch_tip=True")
+        opts = "".join(f", {k}" for k in kw)
+        return [f"    pipette.transfer({s['volume']!r}, {well(s['_src'])}, "
+                f"{well(s['_dst'])}{opts})"]
+    if st == "distribute":
+        opts = "".join(f", {k}" for k in kw)
+        return [f"    pipette.distribute({s['volume']!r}, {well(s['_src'])}, "
+                f"{wells(s['_dsts'])}{opts})"]
+    if st == "consolidate":
+        opts = "".join(f", {k}" for k in kw)
+        return [f"    pipette.consolidate({s['volume']!r}, {wells(s['_srcs'])}, "
+                f"{well(s['_dst'])}{opts})"]
+    if st == "mix":
+        # A standalone mix needs a tip: pick up, mix, drop (self-contained).
+        return ["    pipette.pick_up_tip()",
+                f"    pipette.mix({s['repetitions']!r}, {s['volume']!r}, {well(s['_at'])})",
+                "    pipette.drop_tip()"]
+    if st == "delay":
+        msg = f", msg={json.dumps(s['message'])}" if s.get("message") else ""
+        return [f"    protocol.delay(seconds={s['seconds']!r}{msg})"]
+    if st == "pause":
+        return [f"    protocol.pause({json.dumps(s['message']) if s.get('message') else ''})"]
+    if st == "comment":
+        return [f"    protocol.comment({json.dumps(s['text'])})"]
+    return []
+
+
+def _ot2_compile_protocol(plan: "dict[str, Any]") -> str:
+    """Compile a plan into Opentrons Protocol API v2 Python text.
+
+    Handles both the legacy `transfers` list and the multi-step `steps` designer
+    model. Raises ``OT2Error`` (listing every problem) if the plan does not
+    validate — a caller should surface those rather than ship a broken protocol.
     """
     p = _ot2_normalize_plan(plan)
     report = _ot2_validate_plan(p)
     if report["errors"]:
-        raise OT2Error("invalid transfer plan:\n  - " + "\n  - ".join(report["errors"]))
+        raise OT2Error("invalid plan:\n  - " + "\n  - ".join(report["errors"]))
 
     md = p["metadata"]
     out: "list[str]" = [
@@ -458,8 +715,14 @@ def _ot2_compile_protocol(plan: "dict[str, Any]") -> str:
             var = f"{var}_{k}"
         used_vars.add(var)
         id_var[lid] = var
-        out.append(f"    {var} = protocol.load_labware("
-                   f"{json.dumps(lw['labware'])}, {lw['slot']})")
+        if isinstance(lw.get("definition"), dict):
+            # custom labware: embed the Opentrons definition (a plain dict → a
+            # valid Python literal) and load it from that.
+            out.append(f"    {var} = protocol.load_labware_from_definition("
+                       f"{lw['definition']!r}, {lw['slot']})")
+        else:
+            out.append(f"    {var} = protocol.load_labware("
+                       f"{json.dumps(lw['labware'])}, {lw['slot']})")
 
     out.append(
         f"    pipette = protocol.load_instrument("
@@ -468,16 +731,19 @@ def _ot2_compile_protocol(plan: "dict[str, Any]") -> str:
     )
     out.append("    protocol.home()")
 
-    volumes = [t["volume"] for t in p["transfers"]]
-    srcs = [f"{id_var[t['_src'][0]]}[{json.dumps(t['_src'][1])}]" for t in p["transfers"]]
-    dsts = [f"{id_var[t['_dst'][0]]}[{json.dumps(t['_dst'][1])}]" for t in p["transfers"]]
-
-    out.append("    pipette.transfer(")
-    out.append(f"        {volumes!r},")
-    out.append("        [" + ", ".join(srcs) + "],")
-    out.append("        [" + ", ".join(dsts) + "],")
-    out.append(f"        new_tip={json.dumps(p['new_tip'])},")
-    out.append("    )")
+    if p["uses_steps"]:
+        for s in p["steps"]:
+            out.extend(_ot2_emit_step(s, id_var))
+    else:
+        volumes = [t["volume"] for t in p["transfers"]]
+        srcs = [f"{id_var[t['_src'][0]]}[{json.dumps(t['_src'][1])}]" for t in p["transfers"]]
+        dsts = [f"{id_var[t['_dst'][0]]}[{json.dumps(t['_dst'][1])}]" for t in p["transfers"]]
+        out.append("    pipette.transfer(")
+        out.append(f"        {volumes!r},")
+        out.append("        [" + ", ".join(srcs) + "],")
+        out.append("        [" + ", ".join(dsts) + "],")
+        out.append(f"        new_tip={json.dumps(p['new_tip'])},")
+        out.append("    )")
     return "\n".join(out) + "\n"
 
 
@@ -485,22 +751,142 @@ def _ot2_plan_summary(plan: "dict[str, Any]") -> "dict[str, Any]":
     """A compact, human/agent-friendly digest of a plan (counts, volume, tips)."""
     p = _ot2_normalize_plan(plan)
     report = _ot2_validate_plan(p)
-    total_vol = sum(t["volume"] for t in p["transfers"]
-                    if isinstance(t["volume"], (int, float)) and not isinstance(t["volume"], bool))
-    tips_needed = (len(p["transfers"]) if p["new_tip"] == "always"
-                   else (1 if p["new_tip"] == "once" and p["transfers"] else 0))
+
+    def _num(v: Any) -> bool:
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    if p["uses_steps"]:
+        liquid = [s for s in p["steps"] if s["type"] in _OT2_LIQUID_STEPS]
+        total_vol = sum(s.get("volume") for s in liquid if _num(s.get("volume")))
+        n_steps = len(p["steps"])
+        n_transfers = len([s for s in p["steps"] if s["type"] == "transfer"])
+        tips_needed = len(liquid)   # each liquid step uses ~1 tip
+        step_types: "dict[str, int]" = {}
+        for s in p["steps"]:
+            step_types[s["type"]] = step_types.get(s["type"], 0) + 1
+    else:
+        total_vol = sum(t["volume"] for t in p["transfers"] if _num(t["volume"]))
+        n_steps = len(p["transfers"])
+        n_transfers = len(p["transfers"])
+        tips_needed = (n_transfers if p["new_tip"] == "always"
+                       else (1 if p["new_tip"] == "once" and p["transfers"] else 0))
+        step_types = {"transfer": n_transfers} if n_transfers else {}
     return {
         "name": p["metadata"]["name"],
         "pipette": p["pipette"],
         "mount": p["mount"],
-        "labware": {lid: lw["labware"] for lid, lw in p["labware"].items()},
-        "transfers": len(p["transfers"]),
+        "labware": {lid: (lw.get("labware") or "custom")
+                    for lid, lw in p["labware"].items()},
+        "steps": n_steps,
+        "transfers": n_transfers,
+        "step_types": step_types,
         "total_volume_ul": total_vol,
         "new_tip": p["new_tip"],
         "tips_needed": tips_needed,
         "valid": not report["errors"],
         "errors": report["errors"],
         "warnings": report["warnings"],
+    }
+
+
+# ── Deck visualizer ─────────────────────────────────────────────────────────────
+# The OT-2 deck, physical layout (front row 1-2-3 at the bottom, trash at 12):
+#     10  11  12(trash)
+#      7   8   9
+#      4   5   6
+#      1   2   3
+_OT2_DECK_LAYOUT = [[10, 11, 12], [7, 8, 9], [4, 5, 6], [1, 2, 3]]
+
+
+def _ot2_short_labware(name: str) -> str:
+    """A compact display label for a labware load name — its friendly alias if
+    one exists, else a truncated load name."""
+    if not name:
+        return ""
+    rev = {v: k for k, v in _OT2_LABWARE_ALIASES.items()}
+    return (rev.get(name) or name)[:13]
+
+
+def _ot2_render_deck(plan: "dict[str, Any]") -> str:
+    """Render the OT-2 deck as a Unicode grid (slots 1-11 + the fixed trash at 12),
+    showing which labware sits in each slot — a text 'deck map' à la the Opentrons
+    Protocol Designer."""
+    p = _ot2_normalize_plan(plan)
+    occ: "dict[int, tuple[str, str]]" = {}
+    for t in p["tips"]:
+        s = t.get("slot")
+        if isinstance(s, int) and not isinstance(s, bool):
+            occ[s] = ("tips", _ot2_short_labware(str(t.get("labware", ""))))
+    for lid, lw in p["labware"].items():
+        s = lw.get("slot")
+        if isinstance(s, int) and not isinstance(s, bool):
+            label = "custom" if lw.get("definition") else _ot2_short_labware(str(lw.get("labware", "")))
+            occ[s] = (lid, label)
+    w = 14
+
+    def clip(s: str) -> str:
+        return (" " + s)[:w].ljust(w)
+
+    def cell(slot: int) -> "list[str]":
+        if slot == 12:
+            return [clip("12  TRASH"), clip(""), clip("fixed trash")]
+        who, name = occ.get(slot, ("", ""))
+        return [clip(str(slot)), clip(who), clip(name)]
+
+    def hbar(left: str, mid: str, right: str) -> str:
+        return left + ("─" * w + mid) * 2 + "─" * w + right
+
+    lines = [hbar("┌", "┬", "┐")]
+    for ri, row in enumerate(_OT2_DECK_LAYOUT):
+        cells = [cell(s) for s in row]
+        for li in range(3):
+            lines.append("│" + "│".join(cells[c][li] for c in range(3)) + "│")
+        lines.append(hbar("├", "┼", "┤") if ri < len(_OT2_DECK_LAYOUT) - 1
+                     else hbar("└", "┴", "┘"))
+    return "\n".join(lines)
+
+
+def _ot2_build_labware_def(name: str, rows: int, cols: int, *,
+                           category: str = "wellPlate", spacing: float = 9.0,
+                           x_off: float = 14.38, y_off: float = 11.24,
+                           diameter: float = 6.5, depth: float = 14.0,
+                           volume: float = 200.0, x_dim: float = 127.76,
+                           y_dim: float = 85.48, z_dim: float = 15.0) -> "dict[str, Any]":
+    """Generate a structurally-valid Opentrons labware definition for a REGULAR
+    rows×cols grid (well plate / tube rack / reservoir), with SLAS-footprint
+    defaults. A1 is back-left; wells march right (columns) and toward the front
+    (rows). ALWAYS analyse on the robot before running — the geometry defaults
+    are generic, not a substitute for the official Labware Creator's calibration."""
+    rows = max(1, min(int(rows), len(_ROW_LETTERS)))
+    cols = max(1, min(int(cols), 99))
+    ordering: "list[list[str]]" = []
+    wells: "dict[str, Any]" = {}
+    for c in range(cols):
+        col: "list[str]" = []
+        for r in range(rows):
+            wn = f"{_ROW_LETTERS[r]}{c + 1}"
+            col.append(wn)
+            wells[wn] = {"depth": depth, "totalLiquidVolume": volume,
+                         "shape": "circular", "diameter": diameter,
+                         "x": round(x_off + c * spacing, 2),
+                         "y": round(y_dim - y_off - r * spacing, 2),
+                         "z": round(z_dim - depth, 2)}
+        ordering.append(col)
+    load_name = ("".join(ch if ch.isalnum() else "_" for ch in name.lower()).strip("_")
+                 or "custom_labware")
+    return {
+        "ordering": ordering,
+        "brand": {"brand": "SpliceCraft", "brandId": []},
+        "metadata": {"displayName": name, "displayCategory": category,
+                     "displayVolumeUnits": "µL", "tags": []},
+        "dimensions": {"xDimension": x_dim, "yDimension": y_dim, "zDimension": z_dim},
+        "wells": wells,
+        "groups": [{"metadata": {"wellBottomShape": "flat"}, "wells": list(wells)}],
+        "parameters": {"format": "irregular", "quirks": [],
+                       "isMagneticModuleCompatible": False,
+                       "loadName": load_name, "isTiprack": False},
+        "namespace": "custom_beta", "version": 1, "schemaVersion": 2,
+        "cornerOffsetFromSlot": {"x": 0.0, "y": 0.0, "z": 0.0},
     }
 
 

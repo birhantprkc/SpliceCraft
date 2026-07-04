@@ -14,6 +14,39 @@
 
 ---
 
+## [1.0.120] — 2026-07-03
+
+### New features
+
+- **OT-2 protocol designer with an interactive deck.** The AUTOLAB tab is now a
+  three-panel workbench — **Deck**, **Designer**, and **Labware**. The Deck is a
+  clickable slot grid: click a slot to choose its labware (or clear it) from a
+  picker that can also jump you straight to the Labware tab to define something
+  new. The **Designer** builds an ordered sequence of steps — transfer,
+  distribute (one source → many wells), consolidate (many wells → one), mix,
+  delay, pause, and comment — where a bare well like `A1` uses your src/dst and
+  `nick:A1` targets any slot's labware by its nickname. Transfers can carry
+  mix-before/after, blow-out, and touch-tip.
+- **Custom labware designer.** The Labware tab keeps a library of your own
+  labware and generates a valid Opentrons definition from a simple grid form
+  (name, rows, columns, spacing, depth, volume) — a tube rack, well plate, or
+  reservoir the OT-2 doesn't ship by default. Custom labware drops onto the deck
+  and compiles into the protocol like any built-in. (Always analyze on the robot
+  before running — the grid geometry is generic, not a calibration.)
+- **Protocol library.** Save a whole design as a named protocol, load it back,
+  and rename, move, or delete it — organised into named collections, just like
+  plasmids, primers, and enzymes. Saved protocols and custom labware are backed
+  up, restorable from Settings, and swept by Master Delete.
+- **Scriptable protocol + labware libraries.** New agent-API endpoints manage
+  both stores headlessly: `list-protocols` / `get-protocol` / `save-protocol`
+  (validates the plan) / `delete-protocol` and the `*-protocol-collection` set,
+  plus the matching `*-custom-labware` and `*-labware-collection` endpoints.
+  `ot2-compile` still accepts either a simple `transfers` list or a multi-step
+  `steps` sequence, and a plan's labware entry can now embed a custom
+  `definition`, so older calls keep working unchanged.
+
+---
+
 ## [1.0.119] — 2026-07-03
 
 ### New features

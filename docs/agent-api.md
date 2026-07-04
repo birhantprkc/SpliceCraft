@@ -328,7 +328,12 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   validating it against a built-in deck catalog first (friendly labware aliases
   like `tiprack_300` / `eppi_24` / `plate_24` / `plate_96` / `reservoir_12`
   expand to canonical load names; volumes are range-checked against the
-  pipette). `ot2-analyze` uploads a plan/protocol to the robot for its **built-in
+  pipette). For a **multi-step protocol designer**, pass an ordered `steps` list
+  instead of `transfers` (it takes precedence): each step is a typed operation —
+  `transfer` (with optional `mix_before` / `mix_after` / `blow_out` / `touch_tip`),
+  `distribute` (one source → many wells), `consolidate` (many wells → one),
+  `mix`, `delay`, `pause`, `comment` — compiled into one protocol; a control-only
+  protocol (delay/pause/comment) needs no tips or labware. `ot2-analyze` uploads a plan/protocol to the robot for its **built-in
   simulate** — server-side validation with NO motion, the pre-flight for a run.
   `ot2-status` returns a full state snapshot for **crash monitoring**:
   reachability + versions, pipette OK flags + volume specs, motor engagement,
@@ -343,6 +348,16 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   returned `run_id` to watch it live. Host comes from the body's `host` or the
   persisted `ot2_host` setting. (Compiler + client live in the app-free
   `splicecraft_opentrons` sibling.)
+- **OT-2 protocol + custom-labware libraries** — manage saved designs and custom
+  labware headlessly, mirroring the AUTOLAB Deck/Labware tabs. Protocols:
+  `list-protocols`, `get-protocol` (returns a compile-able `plan`), `save-protocol`
+  (**write**; validates the plan first), `delete-protocol`, and the collection set
+  `list-protocol-collections` / `create-protocol-collection` (**write**) /
+  `delete-protocol-collection` (**write**). Custom labware: the identical
+  `list/get/save/delete-custom-labware` + `list/create/delete-labware-collection`
+  set, where `save-custom-labware` takes an Opentrons `definition` (a `wells` map).
+  Both stores are single-file collections that embed their items — backed up,
+  restorable, and swept by Master Delete like every other user-data store.
 
 Call `/tools` for the live discovery endpoint. Each entry is
 `{name, method, write, doc, doc_full}` — `doc_full` is the endpoint's

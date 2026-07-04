@@ -53,6 +53,8 @@ _SANDBOXED_DATA_FILE_ATTRS = [
     ("_HMM_DB_CATALOG_FILE",  "_hmm_db_catalog_cache"),   # sweep #28
     ("_PROTEIN_COLLECTIONS_FILE", "_protein_collections_cache"),
     ("_MODEL_COLLECTIONS_FILE", "_model_collections_cache"),  # BABS model picker (INV-139)
+    ("_PROTOCOL_COLLECTIONS_FILE", "_protocol_collections_cache"),  # OT-2 saved protocols
+    ("_CUSTOM_LABWARE_FILE",  "_custom_labware_cache"),   # OT-2 custom labware defs
     ("_AGENT_TOKEN_FILE",     None),   # written when --agent-api is on
 ]
 

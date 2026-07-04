@@ -144,6 +144,8 @@ _PERSISTENT_CACHE_REGISTRY: "tuple[_CacheSpec, ...]" = (
     _CacheSpec("hmm_db_catalog",        "_HMM_DB_CATALOG_FILE",        "_hmm_db_catalog_cache",        True,  True),
     _CacheSpec("protein_collections",   "_PROTEIN_COLLECTIONS_FILE",   "_protein_collections_cache",   True,  True),
     _CacheSpec("model_collections",     "_MODEL_COLLECTIONS_FILE",     "_model_collections_cache",     True,  True),
+    _CacheSpec("protocol_collections",  "_PROTOCOL_COLLECTIONS_FILE",  "_protocol_collections_cache",  True,  True),
+    _CacheSpec("custom_labware",        "_CUSTOM_LABWARE_FILE",        "_custom_labware_cache",        True,  True),
 )
 
 
@@ -173,6 +175,8 @@ _USER_DATA_FILE_ATTRS: tuple = (
     "_HMM_DB_CATALOG_FILE",   # hmm_db_catalog.json — registry of HMM databases (sweep #28)
     "_PROTEIN_COLLECTIONS_FILE",  # protein_collections.json — named protein-sequence collections
     "_MODEL_COLLECTIONS_FILE",  # model_collections.json — BABS model-picker collections (INV-139)
+    "_PROTOCOL_COLLECTIONS_FILE",  # protocol_collections.json — saved OT-2 protocol designs
+    "_CUSTOM_LABWARE_FILE",  # custom_labware.json — custom Opentrons labware definitions
 )
 
 
@@ -1899,6 +1903,8 @@ _AGENT_BACKUP_LABELS: dict = {
     # binaries handled by the file-level Master Delete sweep, not by
     # the .bak rotation backup chain).
     "hmm_db_catalog":          "_HMM_DB_CATALOG_FILE",
+    "protocol_collections":    "_PROTOCOL_COLLECTIONS_FILE",
+    "custom_labware":          "_CUSTOM_LABWARE_FILE",
     "protein_collections":     "_PROTEIN_COLLECTIONS_FILE",
     # BABS model-picker collections (INV-139, 2026-06-29).
     "model_collections":       "_MODEL_COLLECTIONS_FILE",

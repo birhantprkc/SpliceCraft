@@ -37,6 +37,8 @@ from pathlib import Path
 
 import splicecraft_state as _state
 import splicecraft_opentrons as _ot2
+from splicecraft_dataaccess import (_load_custom_labware, _load_protocol_collections,
+                                    _save_custom_labware, _save_protocol_collections)
 from splicecraft_backup import (_list_pre_update_snapshots)
 from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _iupac_pattern, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len)
 from splicecraft_cloning import (_GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi)
@@ -5072,6 +5074,8 @@ _MASTER_DELETE_CACHE_ATTRS: tuple = (
     "_hmm_db_catalog_cache",      # sweep #28: HMM database registry
     "_protein_collections_cache",  # named protein-sequence collections (operon workbench)
     "_model_collections_cache",   # BABS model-picker collections (INV-139)
+    "_protocol_collections_cache",  # OT-2 saved protocol designs
+    "_custom_labware_cache",      # OT-2 custom labware definitions
 )
 
 
@@ -6748,6 +6752,8 @@ def _h_restore_backup(app, payload):
         "hmm_db_catalog":        "_hmm_db_catalog_cache",
         "protein_collections":   "_protein_collections_cache",
         "model_collections":     "_model_collections_cache",
+        "protocol_collections":  "_protocol_collections_cache",
+        "custom_labware":        "_custom_labware_cache",
     }.get(msg)
     if cache_attr is not None:
         _state._reset_master_delete_cache_hook(cache_attr)
@@ -7937,6 +7943,21 @@ def _h_ot2_compile(app, payload):
          "transfers": [{"from": "src:A1", "to": "dst:A1", "volume": 50}],
          "new_tip": "always"}
 
+    Or a multi-step protocol via ``steps`` (which takes precedence over
+    ``transfers``) — an ordered sequence of typed operations::
+
+        "steps": [
+          {"type": "transfer", "from": "src:A1", "to": "dst:A1", "volume": 50,
+           "mix_after": [3, 30], "blow_out": true, "touch_tip": true},
+          {"type": "distribute", "from": "src:A1", "to": ["dst:A1", "dst:A2"], "volume": 40},
+          {"type": "consolidate", "from": ["src:A1", "src:A2"], "to": "dst:B1", "volume": 60},
+          {"type": "mix", "at": "dst:A1", "volume": 100, "repetitions": 5},
+          {"type": "delay", "seconds": 30, "message": "incubate"},
+          {"type": "pause", "message": "swap plates"},
+          {"type": "comment", "text": "done"}]
+
+    A control-only protocol (delay / pause / comment) needs no tips or labware.
+
     Friendly labware aliases (``tiprack_300``, ``eppi_24``, ``plate_24``,
     ``plate_96``, ``reservoir_12`` …) expand to canonical Opentrons load names.
 
@@ -8045,3 +8066,227 @@ def _h_ot2_run(app, payload):
         )
     except _ot2.OT2Error as exc:
         return ({"error": str(exc)}, 502)
+
+
+# ── OT-2 protocol library + custom-labware library endpoints ────────────────────
+# Two single-file collection stores (collections embed items): protocols carry a
+# "plan" (a compile-able multi-step design), custom labware carry a "definition"
+# (Opentrons labware JSON). Same CRUD shape, so a small generic layer drives both.
+
+def _cstore_items(load_fn, item_key: str) -> "list[dict]":
+    out: "list[dict]" = []
+    for c in load_fn():
+        cn = c.get("name", "")
+        for it in c.get(item_key, []) or []:
+            out.append({"name": it.get("name"), "collection": cn})
+    return out
+
+
+def _cstore_find(load_fn, item_key: str, name):
+    key = str(name or "").strip().casefold()
+    for c in load_fn():
+        for it in c.get(item_key, []) or []:
+            if str(it.get("name", "")).strip().casefold() == key:
+                return c.get("name", ""), it
+    return None, None
+
+
+def _cstore_collections(load_fn, item_key: str) -> "list[dict]":
+    return [{"name": c.get("name", ""), "count": len(c.get(item_key, []) or [])}
+            for c in load_fn()]
+
+
+def _cstore_save_item(load_fn, save_fn, item_key, coll, item, label):
+    with _state._cache_lock:
+        colls = load_fn()
+        target = next((c for c in colls
+                       if (c.get("name") or "").strip().casefold() == coll.casefold()), None)
+        if target is None:
+            target = {"name": coll, item_key: []}
+            colls.append(target)
+        target.setdefault(item_key, [])
+        target[item_key] = [x for x in target[item_key] if x.get("name") != item.get("name")]
+        target[item_key].append(item)
+        return _agent_save_or_500(lambda: save_fn(colls), label)
+
+
+def _cstore_delete_item(load_fn, save_fn, item_key, name, label):
+    with _state._cache_lock:
+        colls = load_fn()
+        found = False
+        for c in colls:
+            kept = [x for x in c.get(item_key, []) or [] if x.get("name") != name]
+            if len(kept) != len(c.get(item_key, []) or []):
+                found = True
+            c[item_key] = kept
+        if not found:
+            return ({"error": f"{name!r} not found"}, 404)
+        return _agent_save_or_500(lambda: save_fn(colls), label)
+
+
+def _cstore_create_collection(load_fn, save_fn, item_key, name, label):
+    with _state._cache_lock:
+        colls = load_fn()
+        if any((c.get("name") or "").strip().casefold() == name.casefold() for c in colls):
+            return ({"error": f"collection {name!r} already exists"}, 409)
+        colls.append({"name": name, item_key: []})
+        return _agent_save_or_500(lambda: save_fn(colls), label)
+
+
+def _cstore_delete_collection(load_fn, save_fn, item_key, name, label):
+    with _state._cache_lock:
+        colls = load_fn()
+        kept = [c for c in colls if (c.get("name") or "").strip().casefold() != name.casefold()]
+        if len(kept) == len(colls):
+            return ({"error": f"collection {name!r} not found"}, 404)
+        return _agent_save_or_500(lambda: save_fn(kept), label)
+
+
+@_agent_endpoint("list-protocols")
+def _h_list_protocols(app, payload):
+    """Every saved OT-2 protocol as ``[{name, collection}]``. Load a plan with
+    ``get-protocol``; save one with ``save-protocol``."""
+    return {"ok": True, "protocols": _cstore_items(_load_protocol_collections, "protocols")}
+
+
+@_agent_endpoint("get-protocol")
+def _h_get_protocol(app, payload):
+    """The saved ``plan`` for a protocol. Body: ``{name}``. The plan is compile-able
+    by ``ot2-compile`` / ``ot2-run``."""
+    coll, it = _cstore_find(_load_protocol_collections, "protocols", payload.get("name"))
+    if it is None:
+        return ({"error": "protocol not found (pass 'name')"}, 404)
+    return {"ok": True, "name": it.get("name"), "collection": coll, "plan": it.get("plan")}
+
+
+@_agent_endpoint("save-protocol", write=True)
+def _h_save_protocol(app, payload):
+    """Save (or overwrite) a protocol. Body: ``{name, plan, collection?}``. ``plan`` is
+    a compile-able plan (see ``ot2-compile``) — it is validated before saving. A new
+    ``collection`` is created on demand (default ``Default``)."""
+    name = _normalize_collection_name(payload.get("name"))
+    if name is None:
+        return ({"error": "missing or invalid 'name'"}, 400)
+    plan = payload.get("plan")
+    if not isinstance(plan, dict):
+        return ({"error": "'plan' must be a compile-able plan object"}, 400)
+    report = _ot2._ot2_validate_plan(plan)
+    if report["errors"]:
+        return ({"error": "invalid plan", "errors": report["errors"]}, 400)
+    coll = _normalize_collection_name(payload.get("collection")) or "Default"
+    err = _cstore_save_item(_load_protocol_collections, _save_protocol_collections, "protocols",
+                            coll, {"name": name, "plan": plan}, "protocol_collections")
+    return err if err else {"ok": True, "name": name, "collection": coll}
+
+
+@_agent_endpoint("delete-protocol", write=True)
+def _h_delete_protocol(app, payload):
+    """Delete a saved protocol by name. Body: ``{name}``."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing 'name'"}, 400)
+    err = _cstore_delete_item(_load_protocol_collections, _save_protocol_collections, "protocols",
+                              name, "protocol_collections")
+    return err if err else {"ok": True, "deleted": name}
+
+
+@_agent_endpoint("list-protocol-collections")
+def _h_list_protocol_collections(app, payload):
+    """Named protocol collections as ``[{name, count}]``."""
+    return {"ok": True,
+            "protocol_collections": _cstore_collections(_load_protocol_collections, "protocols")}
+
+
+@_agent_endpoint("create-protocol-collection", write=True)
+def _h_create_protocol_collection(app, payload):
+    """Create an empty named protocol collection. Body: ``{name}``."""
+    name = _normalize_collection_name(payload.get("name"))
+    if name is None:
+        return ({"error": "missing or invalid 'name'"}, 400)
+    err = _cstore_create_collection(_load_protocol_collections, _save_protocol_collections,
+                                    "protocols", name, "protocol_collections")
+    return err if err else {"ok": True, "name": name}
+
+
+@_agent_endpoint("delete-protocol-collection", write=True)
+def _h_delete_protocol_collection(app, payload):
+    """Delete a protocol collection AND every protocol in it. Body: ``{name}``."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing 'name'"}, 400)
+    err = _cstore_delete_collection(_load_protocol_collections, _save_protocol_collections,
+                                    "protocols", name, "protocol_collections")
+    return err if err else {"ok": True, "deleted": name}
+
+
+@_agent_endpoint("list-custom-labware")
+def _h_list_custom_labware(app, payload):
+    """Every custom labware definition as ``[{name, collection}]``."""
+    return {"ok": True, "custom_labware": _cstore_items(_load_custom_labware, "labware")}
+
+
+@_agent_endpoint("get-custom-labware")
+def _h_get_custom_labware(app, payload):
+    """The Opentrons ``definition`` for a custom labware. Body: ``{name}``. Reference it
+    from a plan's labware entry as ``{"labware": name, "slot": N, "definition": <def>}``."""
+    coll, it = _cstore_find(_load_custom_labware, "labware", payload.get("name"))
+    if it is None:
+        return ({"error": "custom labware not found (pass 'name')"}, 404)
+    return {"ok": True, "name": it.get("name"), "collection": coll,
+            "definition": it.get("definition")}
+
+
+@_agent_endpoint("save-custom-labware", write=True)
+def _h_save_custom_labware(app, payload):
+    """Save (or overwrite) a custom labware. Body: ``{name, definition, collection?}`` —
+    ``definition`` is an Opentrons labware-definition object with a ``wells`` map."""
+    name = _normalize_collection_name(payload.get("name"))
+    if name is None:
+        return ({"error": "missing or invalid 'name'"}, 400)
+    definition = payload.get("definition")
+    if not isinstance(definition, dict) or not isinstance(definition.get("wells"), dict):
+        return ({"error": "'definition' must be an Opentrons labware object with a 'wells' map"}, 400)
+    coll = _normalize_collection_name(payload.get("collection")) or "Default"
+    err = _cstore_save_item(_load_custom_labware, _save_custom_labware, "labware", coll,
+                            {"name": name, "definition": definition}, "custom_labware")
+    return err if err else {"ok": True, "name": name, "collection": coll}
+
+
+@_agent_endpoint("delete-custom-labware", write=True)
+def _h_delete_custom_labware(app, payload):
+    """Delete a custom labware by name. Body: ``{name}``."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing 'name'"}, 400)
+    err = _cstore_delete_item(_load_custom_labware, _save_custom_labware, "labware", name,
+                              "custom_labware")
+    return err if err else {"ok": True, "deleted": name}
+
+
+@_agent_endpoint("list-labware-collections")
+def _h_list_labware_collections(app, payload):
+    """Named custom-labware collections as ``[{name, count}]``."""
+    return {"ok": True,
+            "labware_collections": _cstore_collections(_load_custom_labware, "labware")}
+
+
+@_agent_endpoint("create-labware-collection", write=True)
+def _h_create_labware_collection(app, payload):
+    """Create an empty named custom-labware collection. Body: ``{name}``."""
+    name = _normalize_collection_name(payload.get("name"))
+    if name is None:
+        return ({"error": "missing or invalid 'name'"}, 400)
+    err = _cstore_create_collection(_load_custom_labware, _save_custom_labware, "labware", name,
+                                    "custom_labware")
+    return err if err else {"ok": True, "name": name}
+
+
+@_agent_endpoint("delete-labware-collection", write=True)
+def _h_delete_labware_collection(app, payload):
+    """Delete a custom-labware collection AND every labware in it. Body: ``{name}``."""
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return ({"error": "missing 'name'"}, 400)
+    err = _cstore_delete_collection(_load_custom_labware, _save_custom_labware, "labware", name,
+                                    "custom_labware")
+    return err if err else {"ok": True, "deleted": name}

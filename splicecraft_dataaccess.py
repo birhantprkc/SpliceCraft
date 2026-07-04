@@ -2781,3 +2781,83 @@ def _find_project(name: str) -> "dict | None":
         if p.get("name") == name:
             return p
     return None
+
+
+# ── OT-2 protocol library + custom-labware library ──────────────────────────────
+# Two single-file stores, each a list of named collections that EMBED their items
+# (saved protocol designs / custom Opentrons labware definitions) — the plasmid-
+# collections shape. Saved through the sacred `_safe_save_json` engine; wired into
+# the backup / master-delete / migrate registries + the pytest sandbox (see
+# `splicecraft_backup._PERSISTENT_CACHE_REGISTRY`). The active-collection pointer
+# is a persisted setting.
+
+def _load_protocol_collections() -> "list[dict]":
+    """Every saved-protocol collection: ``{name, description?, protocols: [...]}``."""
+    if _state._protocol_collections_cache is not None:
+        return _typed_clone(_state._protocol_collections_cache)
+    with _state._cache_lock:
+        if _state._protocol_collections_cache is None:
+            entries, warning = _safe_load_json(
+                _state._PROTOCOL_COLLECTIONS_FILE, "Protocol collections")
+            if warning:
+                _log.warning(warning)
+            _state._protocol_collections_cache = [e for e in entries if isinstance(e, dict)]
+        return _typed_clone(_state._protocol_collections_cache)
+
+
+def _save_protocol_collections(entries: "list[dict]") -> None:
+    with _state._cache_lock:
+        _safe_save_json(_state._PROTOCOL_COLLECTIONS_FILE, entries, "Protocol collections")
+        _state._protocol_collections_cache = _typed_clone(entries)
+
+
+def _find_protocol_collection(name: str) -> "dict | None":
+    key = (name or "").strip().casefold()
+    for c in _load_protocol_collections():
+        if (c.get("name") or "").strip().casefold() == key:
+            return c
+    return None
+
+
+def _get_active_protocol_collection_name() -> str:
+    return str(_get_setting("active_protocol_collection", "") or "")
+
+
+def _set_active_protocol_collection_name(name: str) -> None:
+    _set_setting("active_protocol_collection", str(name or ""))
+
+
+def _load_custom_labware() -> "list[dict]":
+    """Every custom-labware collection: ``{name, description?, labware: [...]}``,
+    each labware ``{name, definition, ...}``."""
+    if _state._custom_labware_cache is not None:
+        return _typed_clone(_state._custom_labware_cache)
+    with _state._cache_lock:
+        if _state._custom_labware_cache is None:
+            entries, warning = _safe_load_json(_state._CUSTOM_LABWARE_FILE, "Custom labware")
+            if warning:
+                _log.warning(warning)
+            _state._custom_labware_cache = [e for e in entries if isinstance(e, dict)]
+        return _typed_clone(_state._custom_labware_cache)
+
+
+def _save_custom_labware(entries: "list[dict]") -> None:
+    with _state._cache_lock:
+        _safe_save_json(_state._CUSTOM_LABWARE_FILE, entries, "Custom labware")
+        _state._custom_labware_cache = _typed_clone(entries)
+
+
+def _find_labware_collection(name: str) -> "dict | None":
+    key = (name or "").strip().casefold()
+    for c in _load_custom_labware():
+        if (c.get("name") or "").strip().casefold() == key:
+            return c
+    return None
+
+
+def _get_active_labware_collection_name() -> str:
+    return str(_get_setting("active_labware_collection", "") or "")
+
+
+def _set_active_labware_collection_name(name: str) -> None:
+    _set_setting("active_labware_collection", str(name or ""))

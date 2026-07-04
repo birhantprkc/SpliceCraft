@@ -191,6 +191,68 @@ class TestHardening:
         assert hit["n"] == 0
 
 
+# ── Custom labware definitions ──────────────────────────────────────────────────
+class TestCustomLabware:
+    _DEF = {"metadata": {"displayName": "My Custom Rack"},
+            "wells": {"A1": {"depth": 40}, "A2": {"depth": 40}},
+            "ordering": [["A1"], ["A2"]]}
+
+    def _plan(self, **over):
+        p = {"pipette": "p300_single", "tips": {"labware": "tiprack_300", "slot": 8},
+             "labware": {"src": {"labware": "custom_rack", "slot": 1, "definition": self._DEF},
+                         "dst": {"labware": "plate_24", "slot": 2}},
+             "steps": [{"type": "transfer", "from": "src:A1", "to": "dst:A1", "volume": 50}]}
+        p.update(over)
+        return p
+
+    def test_compiles_via_load_from_definition(self):
+        proto = ot2._ot2_compile_protocol(self._plan())
+        compile(proto, "<gen>", "exec")
+        assert "load_labware_from_definition" in proto and "My Custom Rack" in proto
+        assert "load_labware(" in proto            # dst still uses the catalog path
+
+    def test_wells_checked_against_custom_def(self):
+        # A2 is declared in the def -> ok; B1 is not -> out of range
+        assert ot2._ot2_validate_plan(self._plan(
+            steps=[{"type": "transfer", "from": "src:A2", "to": "dst:A1", "volume": 50}]
+        ))["errors"] == []
+        bad = ot2._ot2_validate_plan(self._plan(
+            steps=[{"type": "transfer", "from": "src:B1", "to": "dst:A1", "volume": 50}]))
+        assert any("out of range" in e for e in bad["errors"])
+
+    def test_custom_without_wells_warns_not_errors(self):
+        rep = ot2._ot2_validate_plan({"pipette": "p300_single",
+            "tips": {"labware": "tiprack_300", "slot": 8},
+            "labware": {"src": {"labware": "blob", "slot": 1,
+                                "definition": {"metadata": {"displayName": "Blob"}}},
+                        "dst": {"labware": "plate_24", "slot": 2}},
+            "steps": [{"type": "transfer", "from": "src:A1", "to": "dst:A1", "volume": 50}]})
+        assert rep["errors"] == []
+        assert any("declares no 'wells'" in w for w in rep["warnings"])
+
+
+# ── Deck visualizer ─────────────────────────────────────────────────────────────
+class TestDeckVisualizer:
+    def test_renders_slots_labware_and_trash(self):
+        deck = ot2._ot2_render_deck({
+            "tips": {"labware": "tiprack_300", "slot": 8},
+            "labware": {"src": {"labware": "eppi_24", "slot": 1},
+                        "dst": {"labware": "plate_24", "slot": 2}}})
+        assert "TRASH" in deck                       # the fixed trash at slot 12
+        assert "tiprack_300" in deck                 # tips in slot 8
+        assert "src" in deck and "dst" in deck       # labware ids
+        assert "plate_24" in deck
+        for n in range(1, 13):                        # every deck slot labelled
+            assert str(n) in deck
+        assert "┌" in deck and "└" in deck            # box-drawn grid
+
+    def test_custom_labware_labelled_custom(self):
+        deck = ot2._ot2_render_deck({
+            "tips": {"labware": "tiprack_300", "slot": 8},
+            "labware": {"x": {"slot": 3, "definition": {"metadata": {}, "wells": {"A1": {}}}}}})
+        assert "custom" in deck
+
+
 # ── Well geometry ───────────────────────────────────────────────────────────────
 class TestGeometry:
     def test_wells_counts(self):
@@ -425,6 +487,29 @@ class TestAgentEndpoints:
         res = self._handlers()["ot2-run"][0](None, {"host": "1.2.3.4", **_good_plan()})
         assert res["ran"] is False and res["reason"] == "confirm-required"
 
+    def test_library_endpoints_crud(self):
+        H = self._handlers()
+        assert H["save-protocol"][1] is True and H["list-protocols"][1] is False
+        # protocols: save -> list -> get -> collections -> delete
+        r = H["save-protocol"][0](None, {"name": "P1", "plan": _good_plan(), "collection": "Mine"})
+        assert r["ok"] and r["collection"] == "Mine"
+        assert any(p["name"] == "P1" for p in H["list-protocols"][0](None, {})["protocols"])
+        assert H["get-protocol"][0](None, {"name": "P1"})["plan"]["pipette"] == "p300_single"
+        assert any(c["name"] == "Mine"
+                   for c in H["list-protocol-collections"][0](None, {})["protocol_collections"])
+        assert H["delete-protocol"][0](None, {"name": "P1"})["deleted"] == "P1"
+        # save-protocol rejects an invalid plan
+        bad = H["save-protocol"][0](None, {"name": "X", "plan": {"steps": [{"type": "frob"}]}})
+        assert isinstance(bad, tuple) and bad[1] == 400
+        # custom labware: save -> list -> get -> delete
+        d = {"metadata": {"displayName": "R"}, "wells": {"A1": {}}}
+        assert H["save-custom-labware"][0](None, {"name": "LW1", "definition": d})["ok"]
+        assert any(x["name"] == "LW1"
+                   for x in H["list-custom-labware"][0](None, {})["custom_labware"])
+        assert H["get-custom-labware"][0](None, {"name": "LW1"})["definition"]["wells"] == {"A1": {}}
+        assert H["save-custom-labware"][0](None, {"name": "Y", "definition": {"no": 1}})[1] == 400
+        assert H["delete-custom-labware"][0](None, {"name": "LW1"})["deleted"] == "LW1"
+
 
 # ── AUTOLAB toolbar screen ──────────────────────────────────────────────────────
 class TestAutolabScreen:
@@ -441,11 +526,16 @@ class TestAutolabScreen:
             await pilot.pause()
             assert isinstance(app.screen, sc.AutolabScreen)
             scr = app.screen
-            # default deck (P300/tiprack_300/eppi_24/plate_24) + one transfer
-            scr._transfers.append({"from": "src:A1", "to": "dst:A1", "volume": 50})
+            # build a multi-step protocol directly on the step list
+            scr._steps.append({"type": "transfer", "from": "src:A1", "to": "dst:A1", "volume": 50})
+            scr._steps.append({"type": "delay", "seconds": 30})
+            scr._steps.append({"type": "comment", "text": "done"})
             proto = scr._compile()
             assert proto is not None
             assert "load_instrument" in proto and "p300_single" in proto
+            assert "pipette.transfer(50" in proto
+            assert "protocol.delay(seconds=30" in proto
+            assert 'protocol.comment("done")' in proto
             # re-opening resurfaces the same instance (no duplicate on the stack)
             app.action_open_autolab()
             await pilot.pause()
@@ -454,7 +544,6 @@ class TestAutolabScreen:
     async def test_escape_unwinds_to_main(self):
         import splicecraft as sc
         from textual.screen import Screen
-        from textual.widgets import Static
         app = sc.PlasmidApp()
         async with app.run_test() as pilot:
             base = len(app.screen_stack)
@@ -488,8 +577,95 @@ class TestAutolabScreen:
         async with app.run_test() as pilot:
             app.action_open_autolab(); await pilot.pause()
             scr = app.screen
-            scr.query_one("#autolab-from", Input).value = "A1"
-            scr.query_one("#autolab-to", Input).value = "A1"
-            scr.query_one("#autolab-vol", Input).value = "inf"
-            scr._add_transfer()
-            assert scr._transfers == []   # inf must not be added
+            scr.query_one("#autolab-step-from", Input).value = "A1"
+            scr.query_one("#autolab-step-to", Input).value = "A1"
+            scr.query_one("#autolab-step-vol", Input).value = "inf"
+            scr._add_step()
+            assert scr._steps == []   # inf must not be added
+
+    async def test_ui_add_distribute_step(self):
+        import splicecraft as sc
+        from textual.widgets import Input, Select
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab(); await pilot.pause()
+            scr = app.screen
+            scr.query_one("#autolab-step-type", Select).value = "distribute"
+            await pilot.pause()
+            scr.query_one("#autolab-step-from", Input).value = "A1"
+            scr.query_one("#autolab-step-to", Input).value = "A1, A2, A3"
+            scr.query_one("#autolab-step-vol", Input).value = "40"
+            scr._add_step()
+            assert len(scr._steps) == 1 and scr._steps[0]["type"] == "distribute"
+            assert scr._steps[0]["to"] == ["dst:A1", "dst:A2", "dst:A3"]
+            assert "pipette.distribute(40" in scr._compile()
+
+    async def test_interactive_deck_place_remove_and_custom_labware(self):
+        import splicecraft as sc
+        from textual.widgets import Button, Input, TabbedContent
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab(); await pilot.pause()
+            scr = app.screen
+            assert scr.query_one("#deck-slot-1", Button) is not None   # slot grid exists
+            # place a reservoir in slot 5 via the picker result
+            scr._on_picker_result(5, {"action": "place", "labware": "reservoir_12",
+                                      "nickname": "res"})
+            assert scr._deck[5]["labware"] == "reservoir_12" and scr._deck[5]["id"] == "res"
+            # remove a slot
+            scr._on_picker_result(1, {"action": "remove"})
+            assert 1 not in scr._deck
+            # "new labware" jumps to the Labware tab
+            scr._on_picker_result(2, {"action": "new"}); await pilot.pause()
+            assert scr.query_one("#autolab-tabs", TabbedContent).active == "autolab-tab-labware"
+            # create a custom labware, place it, and confirm it reaches the protocol
+            scr.query_one("#autolab-lw-name", Input).value = "My Rack"
+            scr.query_one("#autolab-lw-rows", Input).value = "2"
+            scr.query_one("#autolab-lw-cols", Input).value = "3"
+            scr._create_labware()
+            assert scr._find_custom_labware_def("My Rack") is not None
+            scr._on_picker_result(6, {"action": "place", "labware": "custom:My Rack",
+                                      "nickname": "r"})
+            assert scr._deck[6].get("definition") is not None
+            scr._steps.append({"type": "transfer", "from": "r:A1", "to": "res:A1", "volume": 50})
+            proto = scr._compile()
+            assert proto and "load_labware_from_definition" in proto
+
+    async def test_labware_picker_modal_mounts_and_escapes(self):
+        import splicecraft as sc
+        from textual.widgets import Select
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.push_screen(sc.OT2LabwarePickerModal(3)); await pilot.pause()
+            assert isinstance(app.screen, sc.OT2LabwarePickerModal)
+            assert app.screen.query_one("#ot2lw-select", Select) is not None
+            await pilot.press("escape"); await pilot.pause()
+            assert not isinstance(app.screen, sc.OT2LabwarePickerModal)
+
+    async def test_protocol_save_load_rename_delete(self):
+        import splicecraft as sc
+        from textual.widgets import Input, Select
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab(); await pilot.pause()
+            scr = app.screen
+            scr._steps.append({"type": "transfer", "from": "src:A1", "to": "dst:A1", "volume": 50})
+            scr._on_picker_result(5, {"action": "place", "labware": "reservoir_12", "nickname": "res"})
+            scr.query_one("#autolab-proto-name", Input).value = "P1"
+            scr._save_protocol()
+            names = lambda: [n for _, n in scr._proto_index]   # noqa: E731
+            assert "P1" in names()
+            # mutate the live design, then load P1 back and confirm it's restored
+            scr._steps = []
+            scr._deck.pop(5, None)
+            scr.query_one("#autolab-proto-pick", Select).value = str(names().index("P1"))
+            scr._load_protocol()
+            assert len(scr._steps) == 1 and 5 in scr._deck
+            # rename
+            scr.query_one("#autolab-proto-name", Input).value = "P2"
+            scr._rename_protocol()
+            assert "P2" in names() and "P1" not in names()
+            # delete
+            scr.query_one("#autolab-proto-pick", Select).value = str(names().index("P2"))
+            scr._delete_protocol()
+            assert "P2" not in names()

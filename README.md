@@ -322,11 +322,17 @@ including a `call` passthrough to every endpoint) drive every workflow.
 [`docs/agent-api.md`](docs/agent-api.md) and [`docs/cli.md`](docs/cli.md).
 Full feature reference: [`docs/features.md`](docs/features.md).
 
-The agent API can also drive an **Opentrons OT-2** liquid handler for plate
-prep: `ot2-compile` turns a plate-transfer plan into an Opentrons protocol,
-`ot2-analyze` runs the robot's built-in simulate, `ot2-status` streams full
-robot state for crash monitoring, and `ot2-run` executes it — gated behind an
-explicit confirm, a clean analysis, and a pre-flight health check.
+SpliceCraft can also drive an **Opentrons OT-2** liquid handler. The **AUTOLAB**
+toolbar item is a three-panel protocol designer: an interactive **Deck** (click a
+slot to place or clear its labware), a **Designer** for an ordered sequence of
+steps (transfer, distribute, consolidate, mix, delay, pause, comment), and a
+**Labware** tab that keeps a library of custom labware you define from a simple
+grid form. Save whole designs as named protocols organised into collections,
+compile to an Opentrons protocol, analyze on the robot's built-in simulate, watch
+full robot state for crashes, and run it (gated behind Arm + a clean analysis + a
+pre-flight health check). All of it is scriptable via the agent API — `ot2-compile`
+(a `transfers` list or a multi-step `steps` sequence), `ot2-analyze`, `ot2-status`,
+the gated `ot2-run`, plus protocol- and custom-labware library CRUD endpoints.
 
 ## Documentation
 
