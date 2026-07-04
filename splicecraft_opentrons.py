@@ -86,6 +86,8 @@ _OT2_MAX_VOLUME_UL = 100000.0     # 100 mL — reject absurd volumes (typos, Inf
 _OT2_MAX_STEPS = 5000             # a multi-step protocol far beyond any real run
 _OT2_MAX_DELAY_S = 86400.0        # 24 h — reject absurd delays
 _OT2_MAX_ITEMS = 10000            # normalise: far beyond any real plate-prep run
+_OT2_MAX_OFFSET_MM = 5.0          # labware offset is a fine correction — reject fat-fingers
+_OT2_MAX_POSCHECK_WELLS = 384     # position-check: cap the per-labware move list (96-well ×4)
 
 # The multi-step "protocol designer" model (a plan may carry `steps` instead of
 # the legacy `transfers`). LIQUID steps need a pipette + tip rack + labware;
@@ -455,6 +457,10 @@ def _ot2_normalize_plan(plan: "dict[str, Any]") -> "dict[str, Any]":
                 entry["map"] = {str(k): v for k, v in lw["map"].items()}
             if lw.get("collection"):
                 entry["collection"] = str(lw["collection"])
+            # Labware-position offset (x/y/z mm) — applied to a run as a
+            # labwareOffset; the compiler ignores it (offsets are a run-time input).
+            if isinstance(lw.get("offset"), dict):
+                entry["offset"] = {k: lw["offset"].get(k) for k in ("x", "y", "z")}
             labware[str(lid)] = entry
     p["labware"] = labware
 
@@ -1189,7 +1195,10 @@ def _ot2_base_url(host: str) -> str:
     if not host:
         raise OT2Error("no OT-2 host given")
     if "://" in host:
-        parts = urllib.parse.urlsplit(host)
+        try:
+            parts = urllib.parse.urlsplit(host)
+        except ValueError as exc:   # e.g. an unbalanced IPv6 bracket "http://["
+            raise OT2Error(f"invalid host {host!r}: {exc}") from exc
         if parts.scheme not in ("http", ""):
             raise OT2Error(f"unsupported scheme {parts.scheme!r} — the OT-2 API is HTTP")
         netloc = parts.netloc or parts.path
@@ -1310,6 +1319,13 @@ def _ot2_set_lights(host: str, on: bool) -> "dict[str, Any]":
     return _ot2_request_json(host, "/robot/lights", method="POST", payload={"on": bool(on)})
 
 
+def _ot2_home(host: str) -> "dict[str, Any]":
+    """Home the gantry — all axes to their reference position. Safe motion: no
+    plunger actuation, no descent into labware."""
+    return _ot2_request_json(host, "/robot/home", method="POST",
+                             payload={"target": "robot"})
+
+
 # ── Telemetry / fault detection ─────────────────────────────────────────────────
 # The OT-2 REST API does not stream live gantry XYZ, so "position" is tracked at
 # the PROTOCOL level: which command the robot is currently executing and — on a
@@ -1420,6 +1436,19 @@ def _ot2_detect_faults(state: "dict[str, Any]") -> "list[str]":
     return faults
 
 
+def _ot2_pipette_offsets(host: str) -> "list[dict[str, Any]]":
+    """Per-pipette offset calibrations the robot has stored (empty when a pipette
+    was never calibrated in the Opentrons App). Best-effort — never raises."""
+    data, _ = _ot2_try_json(host, "/calibration/pipette_offset")
+    return (data or {}).get("data") or []
+
+
+def _ot2_tip_lengths(host: str) -> "list[dict[str, Any]]":
+    """Stored tip-length calibrations (per pipette + tip-rack pairing)."""
+    data, _ = _ot2_try_json(host, "/calibration/tip_length")
+    return (data or {}).get("data") or []
+
+
 def _ot2_state(host: str, *, run_id: "str | None" = None) -> "dict[str, Any]":
     """A full snapshot of everything the robot exposes — reachability + versions,
     pipette OK flags + volume specs, motor engagement, deck / instrument
@@ -1456,11 +1485,28 @@ def _ot2_state(host: str, *, run_id: "str | None" = None) -> "dict[str, Any]":
     lights, _ = _ot2_try_json(host, "/robot/lights")
     state["lights"] = (lights or {}).get("on")
 
+    calibration: "dict[str, Any]" = {}
     cal, _ = _ot2_try_json(host, "/calibration/status")
     if cal:
         dc = cal.get("deckCalibration") or {}
         marked = ((dc.get("data") or {}).get("status") or {}).get("markedBad")
-        state["calibration"] = {"deck_status": dc.get("status"), "marked_bad": bool(marked)}
+        calibration = {"deck_status": dc.get("status"), "marked_bad": bool(marked)}
+    # Pipette-offset + tip-length calibration presence. Kept OUT of the hard-fault
+    # list (below) so a position check can still move an uncalibrated gantry — the
+    # liquid-run gate is what insists on a calibrated pipette. Skipped while polling
+    # a live run (run_id set): calibration can't change mid-run, so the monitor stays
+    # lean (2 fewer HTTP calls per tick).
+    if run_id is None:
+        poff = _ot2_pipette_offsets(host)
+        cal_mounts = {str(p.get("mount")).lower() for p in poff if p.get("mount")}
+        calibration["pipette_offsets"] = [{"mount": p.get("mount"), "pipette": p.get("pipette")}
+                                          for p in poff]
+        calibration["tip_lengths"] = len(_ot2_tip_lengths(host))
+        calibration["pipettes_calibrated"] = {
+            str(i.get("mount")).lower(): (str(i.get("mount")).lower() in cal_mounts)
+            for i in instruments if i.get("mount")}
+    if calibration:
+        state["calibration"] = calibration
 
     modules: "list[dict[str, Any]]" = []
     mdata, _ = _ot2_try_json(host, "/modules")
@@ -1611,9 +1657,130 @@ def _ot2_analyze(host: str, protocol_text: str, *,
     }
 
 
+def _ot2_labware_offsets(analysis_labware: "list[dict[str, Any]]",
+                         plan: "dict[str, Any]") -> "list[dict[str, Any]]":
+    """Build a run's ``labwareOffsets`` from a plan's per-labware ``offset`` (x/y/z
+    mm) matched to each analysed labware's ``definitionUri`` + slot. An offset with
+    no matching analysed labware — or a zero vector (a no-op) — is skipped."""
+    p = _ot2_normalize_plan(plan)
+    slot_off: "dict[str, dict[str, Any]]" = {}
+    for lw in p["labware"].values():
+        off = lw.get("offset")
+        if isinstance(off, dict) and lw.get("slot") is not None:
+            slot_off[str(lw["slot"])] = off
+
+    def _f(off: "dict[str, Any]", k: str) -> float:
+        v = off.get(k)
+        return (float(v) if isinstance(v, (int, float)) and not isinstance(v, bool)
+                and math.isfinite(v) else 0.0)
+
+    out: "list[dict[str, Any]]" = []
+    for al in (analysis_labware or []):
+        if not isinstance(al, dict):
+            continue        # untrusted robot-analysis JSON: a non-dict item is skipped
+        loc = al.get("location")
+        if not isinstance(loc, dict):
+            loc = {}
+        slot = str(loc.get("slotName") or loc.get("slot") or "")
+        uri = al.get("definitionUri")
+        off = slot_off.get(slot)
+        if off is None or not uri:
+            continue
+        vec = {"x": _f(off, "x"), "y": _f(off, "y"), "z": _f(off, "z")}
+        # HARD safety cap: offsets are applied at run creation AFTER analysis, so the
+        # robot's own gate never sees them. A large / negative value would drive the
+        # pipette below the well top (a descent) — reject rather than move unsafely.
+        for axis, val in vec.items():
+            if abs(val) > _OT2_MAX_OFFSET_MM:
+                raise OT2Error(
+                    f"labware offset {axis}={val:g} mm on slot {slot} exceeds the "
+                    f"±{_OT2_MAX_OFFSET_MM:g} mm safety limit — an offset is a fine "
+                    "correction; re-seat the labware if it is off by more than that")
+        if vec == {"x": 0.0, "y": 0.0, "z": 0.0}:
+            continue
+        out.append({"definitionUri": uri, "location": {"slotName": slot}, "vector": vec})
+    return out
+
+
+def _ot2_compile_position_check(plan: "dict[str, Any]", *,
+                                wells: "list[str] | None" = None) -> str:
+    """Compile a MOTION-ONLY 'position check' protocol: load the deck, home, move
+    the pipette to the TOP of each loaded labware's reference wells (A1 + the far
+    corner by default), then home again. Emits NO aspirate / dispense / tip
+    pick-up — the plunger is never actuated and the pipette never descends into a
+    well — so it is safe on occupied slots (alignment / offset verification).
+    Raises ``OT2Error`` when the deck has no loadable labware."""
+    p = _ot2_normalize_plan(plan)
+    loaded: "list[tuple[str, dict[str, Any]]]" = []
+    for t in p["tips"]:
+        if t.get("labware") and t.get("slot") is not None:
+            loaded.append((f"tips_{t['slot']}", t))
+    for lid, lw in p["labware"].items():
+        if lw.get("slot") is not None:
+            loaded.append((lid, lw))
+    if not loaded:
+        raise OT2Error("position check: the deck has no labware to move to")
+    # Validate slots BEFORE interpolating them into the emitted Python (the main
+    # compiler does this via _ot2_validate_plan; this path must not skip it, or a
+    # non-int slot could emit malformed code / a non-.top() move).
+    for lid, lw in loaded:
+        slot = lw.get("slot")
+        if not (isinstance(slot, int) and not isinstance(slot, bool) and 1 <= slot <= 11):
+            raise OT2Error(f"position check: labware {lid!r} has an invalid slot "
+                           f"{slot!r} (slots are integers 1-11)")
+
+    md = p["metadata"]
+    out: "list[str]" = [
+        "from opentrons import protocol_api",
+        "",
+        "metadata = {",
+        f"    \"protocolName\": {json.dumps(md['name'] + ' — position check')},",
+        f"    \"author\": {json.dumps(md['author'])},",
+        "    \"description\": \"SpliceCraft position check — gantry moves to well "
+        "tops only (no liquid handling).\",",
+        f"    \"apiLevel\": {json.dumps(p['api_level'])},",
+        "}",
+        "",
+        "def run(protocol: protocol_api.ProtocolContext):",
+    ]
+    id_var: "dict[str, str]" = {}
+    used: "set[str]" = set()
+    for lid, lw in loaded:
+        var = _ot2_safe_var(lid, "lw_")
+        while var in used:
+            var += "_"
+        used.add(var)
+        id_var[lid] = var
+        if isinstance(lw.get("definition"), dict):
+            out.append(f"    {var} = protocol.load_labware_from_definition("
+                       f"{lw['definition']!r}, {lw['slot']})")
+        else:
+            out.append(f"    {var} = protocol.load_labware("
+                       f"{json.dumps(_ot2_resolve_labware(str(lw.get('labware', ''))))}, "
+                       f"{lw['slot']})")
+    out.append(f"    pipette = protocol.load_instrument({json.dumps(p['pipette'])}, "
+               f"{json.dumps(p['mount'])})")
+    out.append("    protocol.home()")
+    for lid, lw in loaded:
+        ew = _ot2_entry_wells(lw)
+        targets = wells or ([ew[0], ew[-1]] if ew else ["A1"])
+        seen_set: "set[str]" = set()
+        seen: "list[str]" = []
+        for w in targets[:_OT2_MAX_POSCHECK_WELLS]:   # cap + O(n) dedup (was O(n²))
+            if w not in seen_set:
+                seen_set.add(w)
+                seen.append(w)
+        for w in seen:
+            out.append(f"    pipette.move_to({id_var[lid]}[{json.dumps(w)}].top())")
+    out.append("    protocol.home()")
+    return "\n".join(out) + "\n"
+
+
 def _ot2_run_protocol(host: str, protocol_text: str, *, confirm: bool = False,
                       filename: str = "splicecraft_protocol.py", poll: bool = True,
-                      on_state: "Any" = None, stop_on_fault: bool = True) -> "dict[str, Any]":
+                      on_state: "Any" = None, stop_on_fault: bool = True,
+                      offset_plan: "dict[str, Any] | None" = None,
+                      require_pipette_cal: bool = True) -> "dict[str, Any]":
     """Analyse, then (only if it passed AND the caller confirmed) run a protocol
     on real hardware, monitoring state throughout for a crash.
 
@@ -1640,9 +1807,30 @@ def _ot2_run_protocol(host: str, protocol_text: str, *, confirm: bool = False,
     if pre.get("faults"):
         return {"ran": False, "reason": "robot-unhealthy",
                 "faults": pre["faults"], "state": pre, **analysis}
+    if require_pipette_cal:
+        calib = (pre.get("calibration") or {}).get("pipettes_calibrated") or {}
+        if not calib:
+            # Fail CLOSED: an empty map means we couldn't confirm a mounted pipette's
+            # calibration (a transient /instruments read failure would otherwise let
+            # an uncalibrated liquid run slip through).
+            return {"ran": False, "reason": "calibration-unknown",
+                    "detail": "could not confirm pipette calibration (robot busy, or the "
+                              "instruments read failed) — retry, or check the robot",
+                    "state": pre, **analysis}
+        uncal = sorted(m for m, ok in calib.items() if not ok)
+        if uncal:
+            return {"ran": False, "reason": "pipette-not-calibrated",
+                    "detail": f"pipette(s) {', '.join(uncal)} have no offset calibration "
+                              "— calibrate in the Opentrons App first",
+                    "state": pre, **analysis}
 
-    created = _ot2_request_json(host, "/runs", method="POST",
-                                payload={"data": {"protocolId": analysis["protocol_id"]}})
+    run_data: "dict[str, Any]" = {"protocolId": analysis["protocol_id"]}
+    if offset_plan is not None:
+        offsets = _ot2_labware_offsets(analysis.get("labware") or [], offset_plan)
+        if offsets:
+            run_data["labwareOffsets"] = offsets
+            _log.info("[ot2] applying %d labware offset(s)", len(offsets))
+    created = _ot2_request_json(host, "/runs", method="POST", payload={"data": run_data})
     rid = created.get("data", {}).get("id")
     if not rid:
         raise OT2Error("OT-2 did not return a run id")
@@ -1687,3 +1875,21 @@ def _ot2_run_protocol(host: str, protocol_text: str, *, confirm: bool = False,
         if _util._monotonic() > deadline:
             raise OT2Error(f"OT-2 run {rid} did not finish within {_OT2_RUN_POLL_TIMEOUT}s")
         time.sleep(_OT2_POLL_INTERVAL)
+
+
+def _ot2_run_position_check(host: str, plan: "dict[str, Any]", *,
+                            wells: "list[str] | None" = None, confirm: bool = False,
+                            poll: bool = True, on_state: "Any" = None,
+                            stop_on_fault: bool = True) -> "dict[str, Any]":
+    """Compile + run a MOTION-ONLY position check (a move-to-top tour). Gated like a
+    run (needs ``confirm=True``) but RELAXES the pipette-calibration requirement —
+    you position-check to VERIFY alignment, often before calibrating. Reachability +
+    deck calibration are still required (they gate any safe motion). Applies the
+    plan's labware offsets so you can see whether an offset lands the pipette dead
+    centre. No plunger, no descent — safe on occupied slots."""
+    proto = _ot2_compile_position_check(plan, wells=wells)
+    res = _ot2_run_protocol(host, proto, confirm=confirm, poll=poll, on_state=on_state,
+                            stop_on_fault=stop_on_fault, require_pipette_cal=False,
+                            offset_plan=plan)
+    res["position_check"] = True
+    return res

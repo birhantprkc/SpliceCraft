@@ -341,6 +341,10 @@ def _fake_transport(monkeypatch, *, instrument_ok=True, deck="OK", marked_bad=Fa
             return {"settings": [{"id": "shortFixedTrash", "value": None}]}
         if path == "/runs":
             return {"data": runs or []}
+        if path == "/calibration/pipette_offset":
+            return {"data": [{"mount": "left", "pipette": "p300_single_v1"}]}
+        if path == "/calibration/tip_length":
+            return {"data": []}
         raise AssertionError(f"unexpected path {path}")
     monkeypatch.setattr(ot2, "_ot2_request_json", fake_json)
 
@@ -437,7 +441,8 @@ class TestAnalyzeAndGate:
             if path == "/health":
                 return {"name": "Fake"}
             if path in ("/motors/engaged", "/robot/lights", "/calibration/status",
-                        "/modules", "/settings", "/runs"):
+                        "/modules", "/settings", "/runs",
+                        "/calibration/pipette_offset", "/calibration/tip_length"):
                 return {"data": []}
             raise AssertionError(path)
         monkeypatch.setattr(ot2, "_ot2_request_json", fake_json)
@@ -1218,3 +1223,270 @@ class TestAutolabLibraryHardening:
             scr._apply_plan(plan)
             assert scr._bound_slot is not None
             assert scr._deck[scr._bound_slot].get("collection") == "LOADCOLL"
+
+
+# ── Calibration + safe gantry motion (2026-07-04) ───────────────────────────────
+class TestCalibrationMotion:
+    def test_home_payload(self, monkeypatch):
+        sent = {}
+        monkeypatch.setattr(ot2, "_ot2_request_json",
+                            lambda host, path, *, method="GET", payload=None, **kw:
+                            sent.update(path=path, method=method, payload=payload) or {"data": {}})
+        ot2._ot2_home("h")
+        assert sent["path"] == "/robot/home" and sent["method"] == "POST"
+        assert sent["payload"] == {"target": "robot"}
+
+    def test_state_reports_pipette_calibration(self, monkeypatch):
+        _fake_transport(monkeypatch)     # left pipette HAS an offset calibration
+        st = ot2._ot2_state("h")
+        assert st["calibration"]["pipettes_calibrated"] == {"left": True}
+        assert st["faults"] == []        # a missing pipette cal is NOT a hard fault
+
+    def test_state_uncalibrated_pipette_not_a_fault(self, monkeypatch):
+        def fake(host, path, **kw):
+            if path == "/health":
+                return {"name": "F"}
+            if path == "/instruments":
+                return {"data": [{"mount": "left", "instrumentModel": "p300_single",
+                                  "ok": True, "data": {}}]}
+            if path == "/calibration/pipette_offset":
+                return {"data": []}      # none calibrated
+            return {"data": []}
+        monkeypatch.setattr(ot2, "_ot2_request_json", fake)
+        st = ot2._ot2_state("h")
+        assert st["calibration"]["pipettes_calibrated"] == {"left": False}
+        assert st["ok"] is True          # still safe to POSITION-check
+
+    def test_position_check_compile_move_only(self):
+        plan = {"pipette": "p300_single", "tips": {"labware": "tiprack_300", "slot": 8},
+                "labware": {"src": {"labware": "eppi_24", "slot": 1}}}
+        proto = ot2._ot2_compile_position_check(plan)
+        compile(proto, "<gen>", "exec")
+        assert "move_to" in proto and ".top()" in proto
+        for banned in ("aspirate", "dispense", "pick_up_tip", "transfer(", "mix("):
+            assert banned not in proto
+
+    def test_position_check_needs_labware(self):
+        with pytest.raises(ot2.OT2Error):
+            ot2._ot2_compile_position_check({"pipette": "p300_single"})
+
+    def test_labware_offsets_from_analysis(self):
+        plan = {"labware": {"src": {"labware": "eppi_24", "slot": 1,
+                                    "offset": {"x": 1.0, "y": 2.0, "z": 0.5}}}}
+        offs = ot2._ot2_labware_offsets(
+            [{"definitionUri": "opentrons/eppi/1", "location": {"slotName": "1"}}], plan)
+        assert offs == [{"definitionUri": "opentrons/eppi/1", "location": {"slotName": "1"},
+                         "vector": {"x": 1.0, "y": 2.0, "z": 0.5}}]
+
+    def _ok_analysis(self, monkeypatch, labware=None):
+        monkeypatch.setattr(ot2, "_ot2_analyze", lambda host, txt, **kw: {
+            "result": "ok", "protocol_id": "P", "analysis_id": "A", "status": "completed",
+            "errors": [], "commands": [], "pipettes": [], "labware": labware or []})
+
+    def _run_succeeds_state(self, monkeypatch, calibrated):
+        monkeypatch.setattr(ot2, "_ot2_state", lambda host, **kw: {
+            "reachable": True, "faults": [], "ok": True,
+            "calibration": {"pipettes_calibrated": {"left": calibrated}},
+            "run": {"status": "succeeded", "id": "R", "current_command": None,
+                    "command_count": 1, "failed_commands": [], "errors": []}})
+
+    def test_run_blocks_uncalibrated_pipette(self, monkeypatch):
+        self._ok_analysis(monkeypatch)
+        monkeypatch.setattr(ot2, "_ot2_state", lambda host, **kw: {
+            "reachable": True, "faults": [], "ok": True,
+            "calibration": {"pipettes_calibrated": {"left": False}}})
+        res = ot2._ot2_run_protocol("h", "print(1)", confirm=True)
+        assert res["ran"] is False and res["reason"] == "pipette-not-calibrated"
+
+    def test_run_applies_labware_offsets(self, monkeypatch):
+        self._ok_analysis(monkeypatch, labware=[
+            {"definitionUri": "opentrons/eppi/1", "location": {"slotName": "1"}}])
+        self._run_succeeds_state(monkeypatch, calibrated=True)
+        sent = {}
+        def fake_json(host, path, *, method="GET", payload=None, **kw):
+            if path == "/runs":
+                sent["payload"] = payload
+            return {"data": {"id": "R"}}
+        monkeypatch.setattr(ot2, "_ot2_request_json", fake_json)
+        plan = {"pipette": "p300_single", "tips": {"labware": "tiprack_300", "slot": 8},
+                "labware": {"src": {"labware": "eppi_24", "slot": 1,
+                                    "offset": {"x": 1.0, "y": 2.0, "z": 0.5}},
+                            "dst": {"labware": "plate_24", "slot": 2}},
+                "transfers": [{"from": "src:A1", "to": "dst:A1", "volume": 50}]}
+        proto = ot2._ot2_compile_protocol(plan)
+        res = ot2._ot2_run_protocol("h", proto, confirm=True, offset_plan=plan)
+        assert res["ran"] is True
+        assert sent["payload"]["data"]["labwareOffsets"][0]["vector"] == {"x": 1.0, "y": 2.0, "z": 0.5}
+
+    def test_position_check_run_allows_uncalibrated(self, monkeypatch):
+        self._ok_analysis(monkeypatch)
+        self._run_succeeds_state(monkeypatch, calibrated=False)   # uncalibrated pipette
+        monkeypatch.setattr(ot2, "_ot2_request_json",
+                            lambda host, path, *, method="GET", payload=None, **kw:
+                            {"data": {"id": "R"}})
+        plan = {"pipette": "p300_single", "tips": {"labware": "tiprack_300", "slot": 8},
+                "labware": {"src": {"labware": "eppi_24", "slot": 1}}}
+        res = ot2._ot2_run_position_check("h", plan, confirm=True)
+        assert res["ran"] is True and res["position_check"] is True
+
+
+class TestCalibrationAgentEndpoints:
+    def _h(self):
+        import splicecraft as sc
+        return sc._AGENT_HANDLERS
+
+    def test_registered_with_write_flags(self):
+        H = self._h()
+        assert H["ot2-calibration"][1] is False
+        assert H["ot2-home"][1] is True
+        assert H["ot2-position-check"][1] is True
+
+    def test_calibration_endpoint(self, monkeypatch):
+        monkeypatch.setattr(ot2, "_ot2_state", lambda host, **kw: {
+            "reachable": True, "faults": [], "ok": True, "instruments": [],
+            "calibration": {"deck_status": "OK", "marked_bad": False,
+                            "pipettes_calibrated": {"left": False}, "tip_lengths": 0}})
+        r = self._h()["ot2-calibration"][0](None, {"host": "1.2.3.4"})
+        assert r["ready"] is False and r["needs_calibration"] == ["left"] and r["deck_ok"] is True
+
+    def test_home_endpoint(self, monkeypatch):
+        monkeypatch.setattr(ot2, "_ot2_home", lambda host: {"data": {}})
+        assert self._h()["ot2-home"][0](None, {"host": "1.2.3.4"})["homed"]
+        assert self._h()["ot2-home"][0](None, {})[1] == 400
+
+    def test_position_check_confirm_gate(self, monkeypatch):
+        monkeypatch.setattr(ot2, "_ot2_analyze", lambda host, txt, **kw: {
+            "result": "ok", "protocol_id": "P", "analysis_id": "A", "status": "completed",
+            "errors": [], "commands": [], "pipettes": [], "labware": []})
+        body = {"host": "1.2.3.4", "pipette": "p300_single",
+                "tips": {"labware": "tiprack_300", "slot": 8},
+                "labware": {"src": {"labware": "eppi_24", "slot": 1}}}
+        r = self._h()["ot2-position-check"][0](None, body)
+        assert r["ran"] is False and r["reason"] == "confirm-required"
+
+    def test_position_check_needs_labware(self):
+        r = self._h()["ot2-position-check"][0](None, {"host": "1.2.3.4", "pipette": "p300_single"})
+        assert isinstance(r, tuple) and r[1] == 400
+
+
+class TestAutolabCalibrateUI:
+    async def test_offsets_set_clear_and_roundtrip(self):
+        import splicecraft as sc
+        from textual.widgets import Select, Input, Static
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            scr._refresh_calib_tab()
+            scr.query_one("#autolab-off-slot", Select).value = "1"   # eppi_24 'src'
+            scr.query_one("#autolab-off-x", Input).value = "1.5"
+            scr.query_one("#autolab-off-y", Input).value = "-0.5"
+            scr.query_one("#autolab-off-z", Input).value = "0.2"
+            scr._set_offset()
+            assert scr._deck[1]["offset"] == {"x": 1.5, "y": -0.5, "z": 0.2}
+            plan = scr._build_plan()
+            assert plan["labware"]["src"]["offset"] == {"x": 1.5, "y": -0.5, "z": 0.2}
+            assert sc.AutolabScreen._deck_from_plan(plan)[1]["offset"]["x"] == 1.5
+            scr._clear_offset()
+            assert "offset" not in scr._deck[1]
+            scr._render_calibration({"reachable": True, "calibration": {
+                "deck_status": "OK", "pipettes_calibrated": {"left": False}, "tip_lengths": 0}})
+            assert scr.query_one("#autolab-calib-status", Static) is not None
+
+    async def test_position_check_needs_arm(self):
+        import splicecraft as sc
+        from textual.widgets import Input
+        called = []
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            scr.query_one("#autolab-host", Input).value = "1.2.3.4"
+            scr._worker_position_check = lambda host, plan: called.append(host)  # type: ignore[method-assign]
+            scr._on_position_check()            # not armed -> no dispatch
+            assert called == []
+
+
+# ── Calibration/motion hardening sweep (audit of the batch, 2026-07-04) ──────────
+class TestCalibrationMotionHardening:
+    def test_offset_magnitude_cap_rejects(self):
+        # |z| beyond the safety cap RAISES rather than driving a descent below top
+        plan = {"labware": {"src": {"labware": "eppi_24", "slot": 1,
+                                    "offset": {"x": 0, "y": 0, "z": -40}}}}
+        with pytest.raises(ot2.OT2Error):
+            ot2._ot2_labware_offsets([{"definitionUri": "u", "location": {"slotName": "1"}}], plan)
+        plan["labware"]["src"]["offset"] = {"x": 1.0, "y": -0.5, "z": 0.5}    # in-range: fine
+        offs = ot2._ot2_labware_offsets([{"definitionUri": "u", "location": {"slotName": "1"}}], plan)
+        assert offs[0]["vector"] == {"x": 1.0, "y": -0.5, "z": 0.5}
+
+    def test_offset_skips_non_dict_analysis_items(self):
+        plan = {"labware": {"src": {"labware": "eppi_24", "slot": 1,
+                                    "offset": {"x": 1.0, "y": 0, "z": 0}}}}
+        offs = ot2._ot2_labware_offsets(
+            ["garbage", None, {"definitionUri": "u", "location": {"slotName": "1"}}], plan)
+        assert len(offs) == 1
+
+    def test_position_check_rejects_bad_slot(self):
+        for bad in ([1, 2], "1; drop", 99, True, None):
+            with pytest.raises(ot2.OT2Error):
+                ot2._ot2_compile_position_check(
+                    {"pipette": "p300_single", "labware": {"x": {"labware": "eppi_24", "slot": bad}}})
+
+    def test_position_check_wells_deduped_and_capped(self):
+        plan = {"pipette": "p300_single", "labware": {"x": {"labware": "eppi_24", "slot": 1}}}
+        assert ot2._ot2_compile_position_check(plan, wells=["A1", "A1", "A1"]).count("move_to") == 1
+        big = ["A1"] * (ot2._OT2_MAX_POSCHECK_WELLS + 500)
+        assert "move_to" in ot2._ot2_compile_position_check(plan, wells=big)   # no O(n^2) hang
+
+    def test_run_fails_closed_on_unknown_calibration(self, monkeypatch):
+        monkeypatch.setattr(ot2, "_ot2_analyze", lambda host, txt, **kw: {
+            "result": "ok", "protocol_id": "P", "analysis_id": "A", "status": "completed",
+            "errors": [], "commands": [], "pipettes": [], "labware": []})
+        monkeypatch.setattr(ot2, "_ot2_state", lambda host, **kw: {
+            "reachable": True, "faults": [], "ok": True,
+            "calibration": {"pipettes_calibrated": {}}})     # couldn't read instruments
+        res = ot2._ot2_run_protocol("h", "print(1)", confirm=True)
+        assert res["ran"] is False and res["reason"] == "calibration-unknown"
+
+    def test_base_url_malformed_host_raises_ot2error(self):
+        with pytest.raises(ot2.OT2Error):
+            ot2._ot2_base_url("http://[")     # ValueError from urlsplit -> OT2Error, not a 500
+
+    def test_agent_calibration_strict_deck(self, monkeypatch):
+        import splicecraft as sc
+        for deck, ready in (("OK", True), ("IDENTITY", False), (None, False)):
+            monkeypatch.setattr(ot2, "_ot2_state", lambda host, _d=deck, **kw: {
+                "reachable": True, "faults": [], "ok": True, "instruments": [],
+                "calibration": {"deck_status": _d, "marked_bad": False,
+                                "pipettes_calibrated": {"left": True}, "tip_lengths": 1}})
+            r = sc._AGENT_HANDLERS["ot2-calibration"][0](None, {"host": "1.2.3.4"})
+            assert r["deck_ok"] is ready and r["ready"] is ready
+
+    def test_agent_home_blocks_during_run(self, monkeypatch):
+        import splicecraft as sc
+        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host: "RUN1")
+        r = sc._AGENT_HANDLERS["ot2-home"][0](None, {"host": "1.2.3.4"})
+        assert isinstance(r, tuple) and r[1] == 409
+
+    def test_agent_position_check_no_slot_400(self):
+        import splicecraft as sc
+        r = sc._AGENT_HANDLERS["ot2-position-check"][0](None, {
+            "host": "1.2.3.4", "pipette": "p300_single",
+            "labware": {"src": {"labware": "eppi_24"}}})     # labware but NO slot
+        assert isinstance(r, tuple) and r[1] == 400
+
+    async def test_ui_set_offset_rejects_out_of_range(self):
+        import splicecraft as sc
+        from textual.widgets import Select, Input
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            scr._refresh_calib_tab()
+            scr.query_one("#autolab-off-slot", Select).value = "1"
+            scr.query_one("#autolab-off-z", Input).value = "-40"
+            scr._set_offset()
+            assert "offset" not in scr._deck[1]              # rejected, not stored

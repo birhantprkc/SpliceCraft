@@ -323,22 +323,26 @@ including a `call` passthrough to every endpoint) drive every workflow.
 Full feature reference: [`docs/features.md`](docs/features.md).
 
 SpliceCraft can also drive an **Opentrons OT-2** liquid handler. The **AUTOLAB**
-toolbar item is a four-panel protocol designer: an interactive **Deck** (click a
+toolbar item is a five-panel protocol designer: an interactive **Deck** (click a
 slot to place or clear its labware), a **Designer** for an ordered sequence of
 steps (transfer, distribute, consolidate, mix, delay, pause, comment), a
 **Labware** tab that keeps a library of custom labware you define from a simple
-grid form, and a **Library** tab that links the robot to your plasmid library —
+grid form, a **Library** tab that links the robot to your plasmid library —
 bind a deck plate to a collection so its wells map to your plasmids, then
 cherry-pick or replate them by identity, or normalise DNA concentration to a target
-ng or ng/µL. Save whole designs as named protocols organised into collections,
-compile to an Opentrons protocol, analyze on the robot's built-in simulate, watch
-full robot state for crashes, and run it (gated behind Arm + a clean analysis + a
-pre-flight health check) with live Pause / Resume / Abort controls and a running
-readout. A build can be logged straight to the Experiments notebook, cross-linked to
-the plasmids it touched. All of it is scriptable via the agent API — `ot2-compile`
-(a `transfers` list or a multi-step `steps` sequence), `ot2-analyze`, `ot2-status`,
-the gated `ot2-run`, `ot2-run-control`, `ot2-normalize`, `ot2-plate-map`, plus
-protocol- and custom-labware library CRUD endpoints.
+ng or ng/µL — and a **Calibrate** tab: read calibration status (deck + per-pipette
+offset + tip-length), home the gantry, set per-slot labware offsets, and run a
+**position check** that moves the gantry above each labware to verify alignment
+(no aspirate/dispense — the plunger never actuates). Save whole designs as named
+protocols organised into collections, compile to an Opentrons protocol, analyze on
+the robot's built-in simulate, watch full robot state for crashes, and run it (gated
+behind Arm + a clean analysis + a pre-flight health + calibration check) with live
+Pause / Resume / Abort controls and a running readout. A build can be logged straight
+to the Experiments notebook, cross-linked to the plasmids it touched. All of it is
+scriptable via the agent API — `ot2-compile` (a `transfers` list or a multi-step
+`steps` sequence), `ot2-analyze`, `ot2-status`, `ot2-calibration`, the gated
+`ot2-run` / `ot2-position-check` / `ot2-home`, `ot2-run-control`, `ot2-normalize`,
+`ot2-plate-map`, plus protocol- and custom-labware library CRUD endpoints.
 
 ## Documentation
 

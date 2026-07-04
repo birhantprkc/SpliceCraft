@@ -14,6 +14,40 @@
 
 ---
 
+## [1.0.123] — 2026-07-04
+
+### New features
+
+- **AUTOLAB can move the gantry safely (new "Calibrate" tab).** A **Position check**
+  tours the deck — the pipette moves *above* each loaded labware's wells so you can
+  verify alignment — with NO aspirate, dispense, or tip pick-up: the plunger is never
+  actuated and the pipette never descends into a well. Plus a **Home gantry** button
+  and a **calibration status** readout (deck + per-pipette offset + tip-length). Also
+  driveable headlessly via the `ot2-position-check`, `ot2-home`, and `ot2-calibration`
+  agent endpoints.
+- **Labware offsets.** Set a per-slot x/y/z correction (Calibrate tab) that is applied
+  to every run's motion, so dispensing lands where it should — then run a position
+  check to see whether the offset is right. Offsets travel with a saved protocol.
+- **Runs are gated on pipette calibration.** A liquid run now refuses to start if a
+  mounted pipette has no offset calibration, and points you to the Opentrons App to
+  calibrate. A position check still runs uncalibrated — that's how you verify
+  alignment before calibrating.
+
+### Hardening
+
+- **Labware offsets are capped at ±5 mm.** An out-of-range value (a fat-fingered or
+  sign-flipped offset) is now rejected up front — both in the Calibrate tab and at
+  run time — instead of silently driving the pipette below the well top. Offsets are
+  fine corrections; a larger discrepancy means the labware needs re-seating.
+- **A run fails safe when calibration can't be confirmed.** If the robot's pipette
+  read hiccups, a liquid run now blocks ("calibration unknown — retry") rather than
+  proceeding, and the calibration-status `ready` verdict is honest about a
+  never-calibrated (identity) or unknown deck.
+- Homing is refused while a run is in flight; the position-check validates its deck
+  slots and bounds its move list; and a malformed host returns a clean error.
+
+---
+
 ## [1.0.122] — 2026-07-04
 
 ### New features

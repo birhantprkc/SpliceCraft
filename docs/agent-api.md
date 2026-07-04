@@ -365,6 +365,20 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   → `{map: {well: {id, name}}, wells, n, overflow}`. Feed the result into
   `ot2-normalize` / `ot2-compile` to cherry-pick or replate a collection by
   identity.
+- **OT-2 calibration + safe motion** — `ot2-calibration` reports deck +
+  per-pipette-offset + tip-length calibration with a `ready` verdict and a
+  `needs_calibration` list (calibrate those in the Opentrons App). `ot2-home` (a
+  **write** endpoint) homes the gantry — safe motion, no plunger. `ot2-position-check`
+  (a **write** endpoint) runs a MOTION-ONLY tour: the gantry moves to the *top* of
+  each loaded labware's wells so you can verify alignment / labware offsets, emitting
+  no aspirate/dispense/tip pick-up (the plunger never actuates, the pipette never
+  descends into a well). It is gated like a run (`{"confirm": true}` + a clean
+  analysis) but does NOT require a calibrated pipette — that is what you're checking;
+  deck calibration + reachability are still required. Body:
+  `{host, plan|<plan fields>, wells?, confirm?, wait?}`. **Labware offsets:** add an
+  `offset: {x, y, z}` (mm) to any plan labware entry and it is applied to the run's
+  motion (`ot2-run` and `ot2-position-check` both honour it); a liquid `ot2-run` also
+  now refuses to move an *uncalibrated* pipette.
 - **OT-2 protocol + custom-labware libraries** — manage saved designs and custom
   labware headlessly, mirroring the AUTOLAB Deck/Labware tabs. Protocols:
   `list-protocols`, `get-protocol` (returns a compile-able `plan`), `save-protocol`

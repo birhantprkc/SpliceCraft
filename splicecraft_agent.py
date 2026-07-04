@@ -8052,17 +8052,21 @@ def _h_ot2_run(app, payload):
     if not host:
         return ({"error": "no OT-2 host (pass 'host' or set the 'ot2_host' setting)"}, 400)
     protocol = payload.get("protocol")
+    offset_plan = None
     if not (isinstance(protocol, str) and protocol.strip()):
+        plan = _agent_ot2_plan(payload)
         try:
-            protocol = _ot2._ot2_compile_protocol(_agent_ot2_plan(payload))
+            protocol = _ot2._ot2_compile_protocol(plan)
         except _ot2.OT2Error as exc:
             return ({"error": f"cannot compile plan: {exc}"}, 400)
+        offset_plan = plan   # so any per-labware offsets in the plan are applied
     try:
         return _ot2._ot2_run_protocol(
             host, protocol,
             confirm=bool(payload.get("confirm")),
             poll=bool(payload.get("wait", True)),
             stop_on_fault=bool(payload.get("stop_on_fault", True)),
+            offset_plan=offset_plan,
         )
     except _ot2.OT2Error as exc:
         return ({"error": str(exc)}, 502)
@@ -8201,6 +8205,88 @@ def _h_ot2_plate_map(app, payload):
             "labware": _ot2._ot2_resolve_labware(labware), "map": mapping,
             "wells": wells, "n": len(mapping),
             "overflow": max(0, len(plasmids) - len(wells))}
+
+
+@_agent_endpoint("ot2-calibration")
+def _h_ot2_calibration(app, payload):
+    """OT-2 calibration status — deck calibration + per-pipette offset calibration +
+    tip-length calibrations. Body: ``{host}``. Returns the ``calibration`` block plus
+    a ``ready`` verdict (deck OK AND every mounted pipette calibrated) and, when not
+    ready, ``needs_calibration`` (the mounts to calibrate in the Opentrons App).
+    A liquid run (``ot2-run``) is blocked until the pipette is calibrated; a
+    ``ot2-position-check`` can still run to verify alignment first.
+    """
+    host = _agent_ot2_host(payload)
+    if not host:
+        return ({"error": "no OT-2 host (pass 'host' or set the 'ot2_host' setting)"}, 400)
+    st = _ot2._ot2_state(host)
+    if not st.get("reachable"):
+        return ({"error": "robot unreachable", "faults": st.get("faults", [])}, 502)
+    cal = st.get("calibration") or {}
+    needs = sorted(m for m, ok in (cal.get("pipettes_calibrated") or {}).items() if not ok)
+    # Strict: only an explicit "OK" deck status counts as ready. "IDENTITY" is the
+    # identity transform = deck NEVER calibrated; None = unknown/unavailable — neither
+    # is "ready", so a caller can't trust `ready` and run on an uncalibrated deck.
+    deck_ok = cal.get("deck_status") == "OK" and not cal.get("marked_bad")
+    return {"ok": True, "calibration": cal, "ready": bool(deck_ok and not needs),
+            "deck_ok": bool(deck_ok), "needs_calibration": needs,
+            "instruments": st.get("instruments", [])}
+
+
+@_agent_endpoint("ot2-home", write=True)
+def _h_ot2_home(app, payload):
+    """Home the OT-2 gantry (all axes to their reference). Safe motion — no plunger,
+    no labware descent. Body: ``{host}``. A ``write`` endpoint (bearer token; a dirty
+    library blocks it unless ``{"force": true}``)."""
+    host = _agent_ot2_host(payload)
+    if not host:
+        return ({"error": "no OT-2 host (pass 'host' or set the 'ot2_host' setting)"}, 400)
+    if _ot2._ot2_active_run(host):
+        return ({"error": "a run is active — stop it before homing"}, 409)
+    try:
+        _ot2._ot2_home(host)
+    except _ot2.OT2Error as exc:
+        return ({"error": str(exc)}, 502)
+    return {"ok": True, "homed": True}
+
+
+@_agent_endpoint("ot2-position-check", write=True)
+def _h_ot2_position_check(app, payload):
+    """Run a MOTION-ONLY position check — the gantry tours the deck (moves to the top
+    of each loaded labware's wells) so you can verify alignment + labware offsets.
+    GATED like a run: needs ``{"confirm": true}`` and the robot's analysis to pass,
+    but NO aspirate/dispense/tip pick-up is ever emitted — the plunger is never
+    actuated and the pipette never descends into a well, so it is safe on occupied
+    slots. The pipette need NOT be calibrated (that is what you're checking); deck
+    calibration + reachability are still required. Any plan labware ``offset`` is
+    applied so you can see whether it lands the pipette dead centre.
+
+    Body: ``{host, plan|<plan fields>, wells?: ["A1", ...], confirm?, wait?}``.
+    Without ``confirm`` you get a dry, analysis-only result and NO motion.
+    """
+    host = _agent_ot2_host(payload)
+    if not host:
+        return ({"error": "no OT-2 host (pass 'host' or set the 'ot2_host' setting)"}, 400)
+    plan = _agent_ot2_plan(payload)
+    if not isinstance(plan, dict):
+        return ({"error": "missing plan (send plan fields or a 'plan' object)"}, 400)
+    p = _ot2._ot2_normalize_plan(plan)
+    if not any(lw.get("slot") is not None for lw in p["labware"].values()) and \
+       not any(t.get("slot") is not None for t in p["tips"]):
+        return ({"error": "position check needs at least one labware / tip rack with a "
+                          "slot on the deck"}, 400)
+    wells = payload.get("wells")
+    if isinstance(wells, list) and wells:
+        wells = [str(w) for w in wells[:_ot2._OT2_MAX_POSCHECK_WELLS]]
+    else:
+        wells = None
+    try:
+        return _ot2._ot2_run_position_check(
+            host, plan, wells=wells, confirm=bool(payload.get("confirm")),
+            poll=bool(payload.get("wait", True)),
+            stop_on_fault=bool(payload.get("stop_on_fault", True)))
+    except _ot2.OT2Error as exc:
+        return ({"error": str(exc)}, 502)
 
 
 # ── OT-2 protocol library + custom-labware library endpoints ────────────────────
