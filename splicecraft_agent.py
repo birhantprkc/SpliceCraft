@@ -36,6 +36,7 @@ from datetime import date as _date, datetime as _datetime
 from pathlib import Path
 
 import splicecraft_state as _state
+import splicecraft_opentrons as _ot2
 from splicecraft_backup import (_list_pre_update_snapshots)
 from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _iupac_pattern, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len)
 from splicecraft_cloning import (_GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi)
@@ -7899,3 +7900,148 @@ def _h_auto_detect_entry_vectors(app, payload):
         grammar_ids=grammar_ids,
     )
     return {"ok": True, "summary": summary}
+
+
+# ── OT-2 (Opentrons) liquid-handler endpoints ───────────────────────────────────
+# Compile a plate-transfer plan to an Opentrons protocol, analyse it on the robot
+# (server-side simulate — no motion), watch the robot's full state / sensors for a
+# crash, and — gated behind an explicit confirm + a clean analysis + a pre-flight
+# health check — run it on real hardware. The compiler + client live in the
+# app-free `splicecraft_opentrons` sibling; these endpoints are its data / network
+# surface. See docs/agent-api.md.
+
+def _agent_ot2_host(payload):
+    """Resolve the OT-2 host: explicit ``host`` in the body, else the persisted
+    ``ot2_host`` setting. Returns "" if neither is set."""
+    return str(payload.get("host") or _get_setting("ot2_host", "") or "").strip()
+
+
+def _agent_ot2_plan(payload):
+    """The transfer plan: the ``plan`` object if present, else the payload itself
+    (so a caller can send the plan fields at the top level)."""
+    plan = payload.get("plan")
+    return plan if isinstance(plan, dict) else payload
+
+
+@_agent_endpoint("ot2-compile")
+def _h_ot2_compile(app, payload):
+    """Compile a plate-transfer plan into an Opentrons OT-2 protocol (offline —
+    no robot needed). Validates the plan against the built-in deck catalog first.
+
+    Body: a transfer plan, either under ``plan`` or at the top level::
+
+        {"pipette": "p300_single", "mount": "left",
+         "tips": {"labware": "tiprack_300", "slot": 8},
+         "labware": {"src": {"labware": "eppi_24", "slot": 1},
+                     "dst": {"labware": "plate_24", "slot": 2}},
+         "transfers": [{"from": "src:A1", "to": "dst:A1", "volume": 50}],
+         "new_tip": "always"}
+
+    Friendly labware aliases (``tiprack_300``, ``eppi_24``, ``plate_24``,
+    ``plate_96``, ``reservoir_12`` …) expand to canonical Opentrons load names.
+
+    Returns ``{summary, valid, errors, warnings, protocol?}`` — ``protocol`` (the
+    ``.py`` text) is present only when the plan validates. Always re-check with
+    ``ot2-analyze`` before running on hardware.
+    """
+    plan = _agent_ot2_plan(payload)
+    if not isinstance(plan, dict):
+        return ({"error": "missing transfer plan (send plan fields or a 'plan' object)"}, 400)
+    try:
+        report = _ot2._ot2_validate_plan(plan)
+        summary = _ot2._ot2_plan_summary(plan)
+        out = {"summary": summary, "valid": not report["errors"],
+               "errors": report["errors"], "warnings": report["warnings"]}
+        if not report["errors"]:
+            out["protocol"] = _ot2._ot2_compile_protocol(plan)
+    except _ot2.OT2Error as exc:
+        return ({"error": str(exc)}, 400)
+    return out
+
+
+@_agent_endpoint("ot2-status")
+def _h_ot2_status(app, payload):
+    """Full OT-2 state snapshot — the monitoring surface. Reports reachability +
+    versions, pipette OK flags + volume specs, motor engagement, deck / instrument
+    calibration health, attached modules and their sensor readings, robot settings
+    (variables), the status light, and — for the active run or a given
+    ``run_id`` — live run / command state, plus any detected ``faults`` and an
+    ``ok`` verdict (so a crash is visible directly).
+
+    Body: ``{"host": "192.168.1.56", "run_id"?: "..."}`` (``host`` falls back to
+    the persisted ``ot2_host`` setting).
+    """
+    host = _agent_ot2_host(payload)
+    if not host:
+        return ({"error": "no OT-2 host (pass 'host' or set the 'ot2_host' setting)"}, 400)
+    run_id = payload.get("run_id")
+    return _ot2._ot2_state(host, run_id=str(run_id) if run_id else None)
+
+
+@_agent_endpoint("ot2-analyze")
+def _h_ot2_analyze(app, payload):
+    """Compile (if given a plan) and analyse a protocol on the robot itself — the
+    robot's built-in simulate. Catches deck / labware / tip errors a run would
+    hit, WITHOUT any motion. The pre-flight before ``ot2-run``.
+
+    Body: ``{"host": ..., "plan"|<plan fields>}`` or
+    ``{"host": ..., "protocol": "<py text>"}``. Returns ``{result, status, errors,
+    commands, pipettes, labware, protocol_id}``; ``result`` is ``"ok"`` /
+    ``"not-ok"``.
+    """
+    host = _agent_ot2_host(payload)
+    if not host:
+        return ({"error": "no OT-2 host (pass 'host' or set the 'ot2_host' setting)"}, 400)
+    protocol = payload.get("protocol")
+    if not (isinstance(protocol, str) and protocol.strip()):
+        try:
+            protocol = _ot2._ot2_compile_protocol(_agent_ot2_plan(payload))
+        except _ot2.OT2Error as exc:
+            return ({"error": f"cannot compile plan: {exc}"}, 400)
+    try:
+        return _ot2._ot2_analyze(host, protocol)
+    except _ot2.OT2Error as exc:
+        return ({"error": str(exc)}, 502)
+
+
+@_agent_endpoint("ot2-run", write=True)
+def _h_ot2_run(app, payload):
+    """Run a plate-transfer protocol on the OT-2 — GATED PHYSICAL ACTUATION.
+
+    Refuses to move the gantry unless BOTH the robot's own analysis passes AND the
+    body carries ``{"confirm": true}`` — and it also refuses on an already-faulted
+    robot (pre-flight state check). Throughout the run it monitors full robot
+    state and, the instant a fault is detected (a failed command, an instrument
+    fault, …), halts the run and reports it.
+
+    Body: ``{"host": ..., "plan"|<plan fields> | "protocol": "<py>",
+    "confirm": true, "wait"?: true, "stop_on_fault"?: true}``.
+
+    * ``confirm`` (default false) — without it you get a dry, analysis-only result
+      and NO motion.
+    * ``wait`` (default true) — block until the run finishes and return the final
+      result (``crashed``, ``faults``, ``run_status``, ``failed_commands``). Pass
+      ``wait: false`` to start it and return immediately with ``run_id``, then
+      poll ``ot2-status`` with that ``run_id`` to watch it live.
+
+    A ``write`` endpoint: needs the agent bearer token; a dirty library blocks it
+    unless you also pass ``{"force": true}``.
+    """
+    host = _agent_ot2_host(payload)
+    if not host:
+        return ({"error": "no OT-2 host (pass 'host' or set the 'ot2_host' setting)"}, 400)
+    protocol = payload.get("protocol")
+    if not (isinstance(protocol, str) and protocol.strip()):
+        try:
+            protocol = _ot2._ot2_compile_protocol(_agent_ot2_plan(payload))
+        except _ot2.OT2Error as exc:
+            return ({"error": f"cannot compile plan: {exc}"}, 400)
+    try:
+        return _ot2._ot2_run_protocol(
+            host, protocol,
+            confirm=bool(payload.get("confirm")),
+            poll=bool(payload.get("wait", True)),
+            stop_on_fault=bool(payload.get("stop_on_fault", True)),
+        )
+    except _ot2.OT2Error as exc:
+        return ({"error": str(exc)}, 502)

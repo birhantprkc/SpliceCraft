@@ -44,6 +44,7 @@ _LAYER_RULES = [
     ("splicecraft_experiments", 1), # [SUB-experiments] entry normalise/id/cross-ref/migrate: imports util L0
     ("splicecraft_backup", 1),      # user-data backup/restore/migrate engine: imports persistence/util/logging/state L0
     ("splicecraft_babs", 1),        # BABS chat engine: Ollama HTTP + HF search + chat protocol; imports net/util/logging/state L0
+    ("splicecraft_opentrons", 1),   # OT-2 protocol compiler + robot-server LAN client; imports logging/util/state L0
     ("splicecraft_cli_parser", 0),
     ("splicecraft_biology", 0),
     ("splicecraft_cli", 0),        # stdlib-only sidecar (standalone client)

@@ -14,6 +14,40 @@
 
 ---
 
+## [1.0.119] — 2026-07-03
+
+### New features
+
+- **Drive an Opentrons OT-2 from SpliceCraft.** A new **AUTOLAB** toolbar item
+  opens a plate-prep workbench: lay out a pipette and labware on deck slots,
+  build a list of well-to-well transfers with volumes, and compile them into a
+  ready-to-run Opentrons protocol. Analyze the plan on the robot itself (its
+  built-in simulate — no motion), watch the robot's live state, and — once you
+  tick **Arm** — run it on the bench. The same workflow is scriptable through
+  four new agent-API endpoints (compile, analyze, status, run).
+- **Live crash monitoring for OT-2 runs.** During a run SpliceCraft polls the
+  robot's full state — pipette health, motor engagement, deck calibration,
+  module sensors, and the current or failed command — and flags a fault the
+  instant it appears, halting the run and reporting what failed and where. A
+  physical run is gated behind a clean analysis, a healthy-robot pre-flight
+  check, and an explicit confirmation, so the gantry never moves by accident.
+
+### Bug fixes
+
+- **Escape reliably backs you out.** Pressing Escape now unwinds every open
+  dialog and sub-dialog back to the main screen, so you can no longer get stuck
+  in one that didn't handle the key.
+
+### Hardening
+
+- The OT-2 transfer planner refuses nonsensical input before it can reach the
+  robot: non-numeric, negative, non-finite (Infinity / NaN), or implausibly
+  large volumes; more transfers than any real run; and oversized protocols —
+  and deck labware with awkward names can no longer collide in the generated
+  protocol.
+
+---
+
 ## [1.0.118] — 2026-07-03
 
 ### New features

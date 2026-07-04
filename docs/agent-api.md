@@ -322,6 +322,27 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   hmm-database) has a matching `get-active-*` so a client can read the
   current selection before changing it.
 - **Utility** — check-primer-duplicates, capture-snapshot.
+- **OT-2 / Opentrons** (liquid-handler control) — `ot2-compile` turns a
+  plate-transfer plan (a pipette, labware on deck slots, and `from → to` well
+  transfers with µL volumes) into an Opentrons Protocol API v2 `.py` text,
+  validating it against a built-in deck catalog first (friendly labware aliases
+  like `tiprack_300` / `eppi_24` / `plate_24` / `plate_96` / `reservoir_12`
+  expand to canonical load names; volumes are range-checked against the
+  pipette). `ot2-analyze` uploads a plan/protocol to the robot for its **built-in
+  simulate** — server-side validation with NO motion, the pre-flight for a run.
+  `ot2-status` returns a full state snapshot for **crash monitoring**:
+  reachability + versions, pipette OK flags + volume specs, motor engagement,
+  deck / instrument calibration health, module sensor readings, robot settings
+  (variables), the status light, and — for the active run or a passed
+  `run_id` — live run / command state, with a detected `faults` list + an `ok`
+  verdict. `ot2-run` (a **write** endpoint) is GATED physical actuation: it moves
+  the gantry only when the robot's own analysis passes AND the body carries
+  `{"confirm": true}`, refuses on an already-faulted robot (pre-flight check), and
+  monitors state throughout — halting and reporting the instant a fault is
+  detected. Pass `{"wait": false}` to start a run and poll `ot2-status` with the
+  returned `run_id` to watch it live. Host comes from the body's `host` or the
+  persisted `ot2_host` setting. (Compiler + client live in the app-free
+  `splicecraft_opentrons` sibling.)
 
 Call `/tools` for the live discovery endpoint. Each entry is
 `{name, method, write, doc, doc_full}` — `doc_full` is the endpoint's

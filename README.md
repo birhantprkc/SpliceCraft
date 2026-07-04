@@ -322,6 +322,12 @@ including a `call` passthrough to every endpoint) drive every workflow.
 [`docs/agent-api.md`](docs/agent-api.md) and [`docs/cli.md`](docs/cli.md).
 Full feature reference: [`docs/features.md`](docs/features.md).
 
+The agent API can also drive an **Opentrons OT-2** liquid handler for plate
+prep: `ot2-compile` turns a plate-transfer plan into an Opentrons protocol,
+`ot2-analyze` runs the robot's built-in simulate, `ot2-status` streams full
+robot state for crash monitoring, and `ot2-run` executes it — gated behind an
+explicit confirm, a clean analysis, and a pre-flight health check.
+
 ## Documentation
 
 | Topic                         | Where                                                                |
