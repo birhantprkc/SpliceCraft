@@ -332,6 +332,8 @@ def _fake_transport(monkeypatch, *, instrument_ok=True, deck="OK", marked_bad=Fa
             return {"x": {"enabled": True}}
         if path == "/robot/lights":
             return {"on": True}
+        if path == "/robot/door/status":
+            return {"data": {"status": "closed", "doorRequiredClosedForProtocol": False}}
         if path == "/calibration/status":
             return {"deckCalibration": {"status": deck,
                                         "data": {"status": {"markedBad": marked_bad}}}}
@@ -440,8 +442,8 @@ class TestAnalyzeAndGate:
                                   "ok": False, "data": {}}]}
             if path == "/health":
                 return {"name": "Fake"}
-            if path in ("/motors/engaged", "/robot/lights", "/calibration/status",
-                        "/modules", "/settings", "/runs",
+            if path in ("/motors/engaged", "/robot/lights", "/robot/door/status",
+                        "/calibration/status", "/modules", "/settings", "/runs",
                         "/calibration/pipette_offset", "/calibration/tip_length"):
                 return {"data": []}
             raise AssertionError(path)
@@ -631,12 +633,12 @@ class TestAutolabScreen:
 
     async def test_interactive_deck_place_remove_and_custom_labware(self):
         import splicecraft as sc
-        from textual.widgets import Button, Input, TabbedContent
+        from textual.widgets import Input, TabbedContent
         app = sc.PlasmidApp()
         async with app.run_test() as pilot:
             app.action_open_autolab(); await pilot.pause()
             scr = app.screen
-            assert scr.query_one("#deck-slot-1", Button) is not None   # slot grid exists
+            assert scr.query_one("#autolab-deck-map", sc.OT2DeckMap) is not None  # deck drawn
             # place a reservoir in slot 5 via the picker result
             scr._on_picker_result(5, {"action": "place", "labware": "reservoir_12",
                                       "nickname": "res"})
@@ -1490,3 +1492,490 @@ class TestCalibrationMotionHardening:
             scr.query_one("#autolab-off-z", Input).value = "-40"
             scr._set_offset()
             assert "offset" not in scr._deck[1]              # rejected, not stored
+
+
+# ── New: motor disengage + door telemetry + extra run-gate interlocks ────────────
+class TestMotorDisengage:
+    def test_disengage_builds_request(self, monkeypatch):
+        sent = {}
+        def fake_json(host, path, *, method="GET", payload=None, **kw):
+            sent.update(path=path, method=method, payload=payload)
+            return {"ok": True}
+        monkeypatch.setattr(ot2, "_ot2_request_json", fake_json)
+        ot2._ot2_disengage("h")
+        assert sent["path"] == "/motors/disengage" and sent["method"] == "POST"
+        assert sent["payload"] == {"axes": list(ot2._OT2_ALL_AXES)}
+
+    def test_disengage_custom_axes_normalised(self, monkeypatch):
+        sent = {}
+        monkeypatch.setattr(ot2, "_ot2_request_json",
+                            lambda host, path, *, method="GET", payload=None, **kw:
+                            sent.update(payload=payload) or {})
+        ot2._ot2_disengage("h", axes=["X", " y "])
+        assert sent["payload"] == {"axes": ["x", "y"]}
+
+    def test_disengage_empty_axes_falls_back_to_all(self, monkeypatch):
+        sent = {}
+        monkeypatch.setattr(ot2, "_ot2_request_json",
+                            lambda host, path, *, method="GET", payload=None, **kw:
+                            sent.update(payload=payload) or {})
+        ot2._ot2_disengage("h", axes=[])
+        assert sent["payload"] == {"axes": list(ot2._OT2_ALL_AXES)}
+
+
+class TestDoorTelemetry:
+    def test_state_surfaces_door(self, monkeypatch):
+        _fake_transport(monkeypatch)
+        st = ot2._ot2_state("h")
+        assert st["door"] == {"status": "closed", "required_closed": False}
+
+    def test_door_open_required_closed(self, monkeypatch):
+        base = {
+            "/health": {"name": "F"}, "/instruments": {"data": []},
+            "/motors/engaged": {}, "/robot/lights": {"on": False},
+            "/robot/door/status": {"data": {"status": "open",
+                                            "doorRequiredClosedForProtocol": True}},
+            "/calibration/status": {"deckCalibration": {"status": "OK"}},
+            "/modules": {"data": []}, "/settings": {"settings": []}, "/runs": {"data": []},
+            "/calibration/pipette_offset": {"data": []}, "/calibration/tip_length": {"data": []},
+        }
+        def fake(host, path, **kw):
+            if path in base:
+                return base[path]
+            raise AssertionError(path)
+        monkeypatch.setattr(ot2, "_ot2_request_json", fake)
+        st = ot2._ot2_state("h")
+        assert st["door"] == {"status": "open", "required_closed": True}
+
+
+class TestPipetteMatch:
+    def test_base_strips_version_and_gen(self):
+        assert ot2._ot2_pipette_base("p300_single_v1.5") == "p300_single"
+        assert ot2._ot2_pipette_base("p20_single_gen2") == "p20_single"
+        assert ot2._ot2_pipette_base("p1000_single") == "p1000_single"
+        assert ot2._ot2_pipette_base(None) == ""
+
+    def test_no_mismatch_when_matched(self):
+        assert ot2._ot2_pipette_mismatch(
+            [{"mount": "left", "pipetteName": "p300_single"}],
+            [{"mount": "left", "model": "p300_single_v1.5"}]) == []
+
+    def test_wrong_model_flagged(self):
+        m = ot2._ot2_pipette_mismatch(
+            [{"mount": "left", "pipetteName": "p300_single"}],
+            [{"mount": "left", "model": "p20_single_gen2"}])
+        assert len(m) == 1 and "p20_single is attached" in m[0]
+
+    def test_absent_mount_flagged(self):
+        m = ot2._ot2_pipette_mismatch(
+            [{"mount": "right", "pipetteName": "p300_single"}],
+            [{"mount": "left", "model": "p300_single_v1.5"}])
+        assert len(m) == 1 and "nothing is attached" in m[0]
+
+    def test_junk_items_ignored(self):
+        assert ot2._ot2_pipette_mismatch([None, {"mount": "left"}], ["nope", 5]) == []
+
+
+class TestRunGateInterlocks:
+    def _ok_analysis(self, monkeypatch, pipettes=None):
+        monkeypatch.setattr(ot2, "_ot2_analyze", lambda host, txt, **kw: {
+            "result": "ok", "protocol_id": "P", "analysis_id": "A", "status": "completed",
+            "errors": [], "commands": [], "pipettes": pipettes or [], "labware": []})
+
+    def _succeeds_state(self, monkeypatch, **extra):
+        st = {"reachable": True, "faults": [], "ok": True, "door": {}, "instruments": [],
+              "lights": False, "calibration": {"pipettes_calibrated": {"left": True}},
+              "run": {"status": "succeeded", "failed_commands": [], "errors": []}}
+        st.update(extra)
+        monkeypatch.setattr(ot2, "_ot2_state", lambda host, **kw: st)
+        monkeypatch.setattr(ot2, "_ot2_request_json",
+                            lambda host, path, *, method="GET", payload=None, **kw:
+                            {"data": {"id": "R"}})
+
+    def test_gate_blocks_door_open(self, monkeypatch):
+        self._ok_analysis(monkeypatch)
+        monkeypatch.setattr(ot2, "_ot2_state", lambda host, **kw: {
+            "reachable": True, "faults": [], "ok": True,
+            "door": {"status": "open", "required_closed": True},
+            "calibration": {"pipettes_calibrated": {"left": True}}})
+        res = ot2._ot2_run_protocol("h", "print(1)", confirm=True)
+        assert res["ran"] is False and res["reason"] == "door-open"
+
+    def test_gate_allows_open_door_when_switch_disabled(self, monkeypatch):
+        self._ok_analysis(monkeypatch)
+        self._succeeds_state(monkeypatch, door={"status": "open", "required_closed": False})
+        monkeypatch.setattr(ot2, "_ot2_set_lights", lambda host, on: {"on": on})
+        res = ot2._ot2_run_protocol("h", "print(1)", confirm=True)
+        assert res["ran"] is True and res.get("crashed") is False
+
+    def test_gate_blocks_pipette_mismatch(self, monkeypatch):
+        self._ok_analysis(monkeypatch,
+                          pipettes=[{"mount": "left", "pipetteName": "p300_single"}])
+        monkeypatch.setattr(ot2, "_ot2_state", lambda host, **kw: {
+            "reachable": True, "faults": [], "ok": True, "door": {},
+            "instruments": [{"mount": "left", "model": "p20_single_gen2"}],
+            "calibration": {"pipettes_calibrated": {"left": True}}})
+        res = ot2._ot2_run_protocol("h", "print(1)", confirm=True)
+        assert res["ran"] is False and res["reason"] == "pipette-mismatch"
+        assert "p20_single" in res["detail"]
+
+    def test_run_turns_lights_on_and_restores(self, monkeypatch):
+        self._ok_analysis(monkeypatch)
+        self._succeeds_state(monkeypatch, lights=False)
+        lights = []
+        monkeypatch.setattr(ot2, "_ot2_set_lights",
+                            lambda host, on: lights.append(on) or {"on": on})
+        res = ot2._ot2_run_protocol("h", "print(1)", confirm=True)
+        assert res["run_status"] == "succeeded"
+        assert lights == [True, False]        # on at start, restored (off) at end
+
+    def test_run_lights_indicator_can_be_disabled(self, monkeypatch):
+        self._ok_analysis(monkeypatch)
+        self._succeeds_state(monkeypatch, lights=True)
+        lights = []
+        monkeypatch.setattr(ot2, "_ot2_set_lights",
+                            lambda host, on: lights.append(on) or {"on": on})
+        ot2._ot2_run_protocol("h", "print(1)", confirm=True, indicator_lights=False)
+        assert lights == []
+
+    def test_timeout_stops_the_run(self, monkeypatch):
+        self._ok_analysis(monkeypatch)
+        monkeypatch.setattr(ot2, "_ot2_state", lambda host, **kw: {
+            "reachable": True, "faults": [], "ok": True, "door": {}, "instruments": [],
+            "lights": False, "calibration": {"pipettes_calibrated": {"left": True}},
+            "run": {"status": "running", "failed_commands": [], "errors": []}})
+        monkeypatch.setattr(ot2, "_ot2_request_json",
+                            lambda host, path, *, method="GET", payload=None, **kw:
+                            {"data": {"id": "R"}})
+        monkeypatch.setattr(ot2, "_ot2_set_lights", lambda host, on: {"on": on})
+        stopped = []
+        monkeypatch.setattr(ot2, "_ot2_stop_run", lambda host, rid: stopped.append(rid))
+        monkeypatch.setattr(ot2, "_OT2_RUN_POLL_TIMEOUT", -1)   # already past deadline
+        with pytest.raises(ot2.OT2Error):
+            ot2._ot2_run_protocol("h", "print(1)", confirm=True)
+        assert stopped == ["R"]               # SAFETY: run halted, not left moving
+
+
+class TestOT2ControlEndpoints:
+    def _H(self):
+        import splicecraft as sc
+        return sc._AGENT_HANDLERS
+
+    def test_lights_and_disengage_registered_write(self):
+        H = self._H()
+        for n in ("ot2-lights", "ot2-disengage"):
+            assert n in H and H[n][1] is True
+
+    def test_lights_requires_host(self):
+        r = self._H()["ot2-lights"][0](None, {})
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_lights_toggles(self, monkeypatch):
+        sent = {}
+        monkeypatch.setattr(ot2, "_ot2_set_lights",
+                            lambda host, on: sent.update(host=host, on=on) or {"on": on})
+        r = self._H()["ot2-lights"][0](None, {"host": "1.2.3.4", "on": False})
+        assert r == {"ok": True, "on": False}
+        assert sent == {"host": "1.2.3.4", "on": False}
+
+    def test_lights_default_on(self, monkeypatch):
+        monkeypatch.setattr(ot2, "_ot2_set_lights", lambda host, on: {"on": on})
+        assert self._H()["ot2-lights"][0](None, {"host": "h"})["on"] is True
+
+    def test_disengage_blocked_during_run(self, monkeypatch):
+        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host: "R1")
+        r = self._H()["ot2-disengage"][0](None, {"host": "h"})
+        assert isinstance(r, tuple) and r[1] == 409
+
+    def test_disengage_calls_engine(self, monkeypatch):
+        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host: None)
+        sent = {}
+        monkeypatch.setattr(ot2, "_ot2_disengage",
+                            lambda host, *, axes=None: sent.update(host=host, axes=axes))
+        r = self._H()["ot2-disengage"][0](None, {"host": "h", "axes": ["x", "y"]})
+        assert r["ok"] and r["disengaged"] == ["x", "y"] and sent["axes"] == ["x", "y"]
+
+
+# ── AUTOLAB live telemetry visualization ────────────────────────────────────────
+class TestAutolabTelemetry:
+    async def test_new_widgets_present(self):
+        import splicecraft as sc
+        from textual.widgets import Static, ProgressBar, Button
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            for wid, cls in (("#autolab-conn", Static), ("#autolab-crash-banner", Static),
+                             ("#autolab-progress-bar", ProgressBar),
+                             ("#autolab-status-panel", Static),
+                             ("#autolab-lights-on", Button), ("#autolab-lights-off", Button),
+                             ("#autolab-disengage", Button)):
+                assert scr.query_one(wid, cls) is not None, wid
+
+    async def test_status_panel_renders_telemetry(self):
+        import splicecraft as sc
+        from textual.widgets import Static
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            snap = {"reachable": True, "ok": True,
+                    "health": {"name": "Jacques", "fw_version": "v1.1", "api_version": "26"},
+                    "lights": True, "door": {"status": "open", "required_closed": True},
+                    "motors": {"x": {"enabled": True}},
+                    "instruments": [{"mount": "left", "model": "p300_single", "ok": True,
+                                     "min_volume": 30, "max_volume": 300}],
+                    "calibration": {"deck_status": "OK"}}
+            scr._render_status_panel(snap)
+            body = str(scr.query_one("#autolab-status-panel", Static).render())
+            assert "Jacques" in body and "lights on" in body
+            assert "door OPEN" in body and "p300_single" in body
+            assert "motors engaged" in body and "deck cal: OK" in body
+            scr._set_conn_badge(True, "Jacques", "v1.1")
+            assert "Jacques" in str(scr.query_one("#autolab-conn", Static).render())
+
+    async def test_log_not_flooded_by_repeated_ticks(self):
+        import splicecraft as sc
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            scr._reset_run_telemetry()
+            scr._log_lines = []
+            snap = {"reachable": True, "ok": True, "health": {"name": "J"},
+                    "run": {"id": "R", "status": "running", "command_total": 5,
+                            "current_command": {"commandType": "aspirate",
+                                                "at": {"wellName": "A1"}}}}
+            for _ in range(10):
+                scr._render_state(snap)
+            # only the single running-transition line was logged, not 10 full dumps
+            assert len(scr._log_lines) <= 2
+
+    async def test_crash_banner_toggles(self):
+        import splicecraft as sc
+        from textual.widgets import Static
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            banner = scr.query_one("#autolab-crash-banner", Static)
+            scr._set_crash_banner(["pipette overpressure", "x", "y"])
+            assert banner.has_class("shown")
+            body = str(banner.render())
+            assert "overpressure" in body and "+2 more" in body
+            scr._set_crash_banner([])
+            assert not banner.has_class("shown")
+
+    async def test_progress_bar_determinate_when_total_known(self):
+        import splicecraft as sc
+        from textual.widgets import ProgressBar
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            scr._analysis_total = 20
+            scr._update_progress_bar({"status": "running", "command_total": 8})
+            bar = scr.query_one("#autolab-progress-bar", ProgressBar)
+            assert bar.display is True and bar.total == 20 and bar.progress == 8
+
+    async def test_disengage_button_guarded_during_run(self, monkeypatch):
+        import splicecraft as sc
+        from textual.widgets import Input
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            called = []
+            monkeypatch.setattr(scr, "_worker_disengage", lambda host: called.append(host))
+            scr.query_one("#autolab-host", Input).value = "1.2.3.4"
+            scr._active_run_id = "R1"          # a run is in flight
+            scr._on_disengage()
+            assert called == []                # refused because a run is active
+
+    async def test_lights_button_routes(self, monkeypatch):
+        import splicecraft as sc
+        from textual.widgets import Button
+        app = sc.PlasmidApp()
+        async with app.run_test() as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            got = []
+            monkeypatch.setattr(scr, "_on_lights", lambda on: got.append(on))
+            scr.on_button_pressed(Button.Pressed(scr.query_one("#autolab-lights-off", Button)))
+            assert got == [False]
+
+    async def test_deck_map_state_and_render(self):
+        import splicecraft as sc
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            scr._deck = {
+                8: {"kind": "tips", "labware": "tiprack_300"},
+                1: {"kind": "labware", "labware": "eppi_24", "id": "src"},
+                2: {"kind": "labware", "labware": "plate_96", "id": "dst"}}
+            scr._bound_slot = 2
+            scr._refresh_deck()
+            await pilot.pause()
+            m = scr.query_one("#autolab-deck-map", sc.OT2DeckMap)
+            pal = m._palette()
+            # bay = (bg, fg, accent, tag, name)
+            assert m._bay(8, pal)[3] == "tips" and "tiprack" in m._bay(8, pal)[4]
+            assert m._bay(2, pal)[3] == "bound"               # library-bound plate
+            assert m._bay(1, pal)[3] == "" and "src" in m._bay(1, pal)[4]
+            assert m._bay(3, pal)[4] == "empty"               # unoccupied bay
+            assert m._bay(12, pal)[3] == "trash"
+            text = m.render().plain
+            assert "tiprack" in text and "src" in text        # labware drawn in
+            assert "┌" in text and "┼" in text and "└" in text  # ONE connected grid
+            scr._bound_slot = None                            # unbind → plain occupied
+            scr._refresh_deck()                               # push state into the map
+            assert m._bay(2, m._palette())[3] == ""
+
+    async def test_deck_map_click_maps_to_bay(self):
+        import splicecraft as sc
+        from textual.geometry import Offset
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            m = scr.query_one("#autolab-deck-map", sc.OT2DeckMap)
+            m.render()                          # sets _cw from the widget width
+            cw, ch = m._cw, m._ch
+            assert m._slot_at(1, 1) == 10                       # top-left bay
+            assert m._slot_at(cw + 3, 1) == 11                  # 2nd column, top row
+            assert m._slot_at(1, 4 * (ch + 1)) == 1             # 1st column, bottom row
+            got = []
+            m._on_bay = got.append
+
+            class _Click:
+                def get_content_offset(self, _w):
+                    return Offset(1, 1)
+            m.on_click(_Click())
+            assert got == [10]                                 # click routed to the bay
+
+    async def test_scale_deck_sets_cell_height(self):
+        import splicecraft as sc
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 60)) as pilot:
+            app.action_open_autolab()
+            await pilot.pause()
+            scr = app.screen
+            scr._scale_deck()                    # must not raise; sizes the bays
+            m = scr.query_one("#autolab-deck-map", sc.OT2DeckMap)
+            assert 2 <= m._ch <= 6
+
+    async def test_deck_map_wide_char_name_keeps_alignment(self):
+        import splicecraft as sc
+        from rich.cells import cell_len
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            app.action_open_autolab(); await pilot.pause()
+            scr = app.screen
+            scr._deck = {1: {"kind": "labware", "labware": "plate_96",
+                             "id": "🧬wide-名前-nick"}}
+            scr._refresh_deck(); await pilot.pause()
+            m = scr.query_one("#autolab-deck-map", sc.OT2DeckMap)
+            widths = {cell_len(ln) for ln in m.render().plain.split("\n")}
+            assert len(widths) == 1        # every row equal DISPLAY width despite wide chars
+
+    async def test_deck_map_narrow_terminal_no_wrap(self):
+        import splicecraft as sc
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(22, 30)) as pilot:   # very narrow
+            app.action_open_autolab(); await pilot.pause()
+            scr = app.screen
+            m = scr.query_one("#autolab-deck-map", sc.OT2DeckMap)
+            t = m.render()
+            assert t.no_wrap is True and t.overflow == "crop"
+            assert len(t.plain.split("\n")) == 4 * m._ch + 5   # grid intact, no wrap
+
+
+# ── Hardening sweep (edge-case audit follow-up) ─────────────────────────────────
+class TestNewCodeHardening:
+    def test_run_commands_survives_non_dict_response(self, monkeypatch):
+        monkeypatch.setattr(ot2, "_ot2_request_json",
+                            lambda host, path, **kw: ["not", "a", "dict"])
+        out, total = ot2._ot2_run_commands("h", "R")
+        assert out == [] and total == 0                # no AttributeError
+
+    def test_run_commands_rejects_bool_and_absurd_total(self, monkeypatch):
+        monkeypatch.setattr(ot2, "_ot2_request_json", lambda host, path, **kw: {
+            "data": [{"id": "c1", "status": "succeeded"}], "meta": {"totalLength": True}})
+        _, total = ot2._ot2_run_commands("h", "R")
+        assert total == 1 and total is not True        # bool excluded
+        monkeypatch.setattr(ot2, "_ot2_request_json", lambda host, path, **kw: {
+            "data": [], "meta": {"totalLength": 10 ** 9}})
+        _, total = ot2._ot2_run_commands("h", "R")
+        assert total == 0                              # absurd value falls back
+
+    def test_state_door_non_dict_ignored(self, monkeypatch):
+        base = {
+            "/health": {"name": "F"}, "/instruments": {"data": []},
+            "/motors/engaged": {}, "/robot/lights": {"on": False},
+            "/robot/door/status": ["hostile", "list"],         # non-dict
+            "/calibration/status": {"deckCalibration": {"status": "OK"}},
+            "/modules": {"data": []}, "/settings": {"settings": []}, "/runs": {"data": []},
+            "/calibration/pipette_offset": {"data": []}, "/calibration/tip_length": {"data": []},
+        }
+        monkeypatch.setattr(ot2, "_ot2_request_json",
+                            lambda host, path, **kw: base.get(path, {"data": []}))
+        st = ot2._ot2_state("h")
+        assert st["reachable"] and "door" not in st    # skipped, no crash
+
+    def test_run_stops_on_monitor_exception(self, monkeypatch):
+        monkeypatch.setattr(ot2, "_ot2_analyze", lambda host, txt, **kw: {
+            "result": "ok", "protocol_id": "P", "analysis_id": "A", "status": "completed",
+            "errors": [], "commands": [], "pipettes": [], "labware": []})
+        healthy = {"reachable": True, "faults": [], "ok": True, "door": {}, "instruments": [],
+                   "lights": False, "calibration": {"pipettes_calibrated": {"left": True}}}
+        def state(host, **kw):
+            if kw.get("run_id"):
+                raise ValueError("malformed robot json mid-run")
+            return healthy
+        monkeypatch.setattr(ot2, "_ot2_state", state)
+        monkeypatch.setattr(ot2, "_ot2_request_json",
+                            lambda host, path, *, method="GET", payload=None, **kw:
+                            {"data": {"id": "R"}})
+        monkeypatch.setattr(ot2, "_ot2_set_lights", lambda host, on: {"on": on})
+        stopped = []
+        monkeypatch.setattr(ot2, "_ot2_stop_run", lambda host, rid: stopped.append(rid))
+        with pytest.raises(ValueError):
+            ot2._ot2_run_protocol("h", "print(1)", confirm=True)
+        assert stopped == ["R"]        # SAFETY: run halted before the exception propagated
+
+    def test_disengage_validates_and_caps_axes(self, monkeypatch):
+        import splicecraft as sc
+        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host: None)
+        sent = {}
+        monkeypatch.setattr(ot2, "_ot2_disengage",
+                            lambda host, *, axes=None: sent.update(axes=axes))
+        r = sc._AGENT_HANDLERS["ot2-disengage"][0](
+            None, {"host": "h", "axes": ["X", " z ", "garbage", "q", "b", "c", "a"]})
+        # unknowns dropped, normalised, capped at 6 (7th cut) → x, z, b, c
+        assert sent["axes"] == ["x", "z", "b", "c"]
+        assert r["disengaged"] == ["x", "z", "b", "c"]      # echo matches what was sent
+
+    def test_disengage_all_invalid_axes_defaults_all(self, monkeypatch):
+        import splicecraft as sc
+        monkeypatch.setattr(ot2, "_ot2_active_run", lambda host: None)
+        sent = {}
+        monkeypatch.setattr(ot2, "_ot2_disengage",
+                            lambda host, *, axes=None: sent.update(axes=axes))
+        r = sc._AGENT_HANDLERS["ot2-disengage"][0](None, {"host": "h", "axes": ["junk", 5]})
+        assert sent["axes"] is None and r["disengaged"] == list(ot2._OT2_ALL_AXES)
+
+    def test_lights_endpoint_survives_non_dict_response(self, monkeypatch):
+        import splicecraft as sc
+        monkeypatch.setattr(ot2, "_ot2_set_lights", lambda host, on: ["not", "dict"])
+        r = sc._AGENT_HANDLERS["ot2-lights"][0](None, {"host": "h", "on": True})
+        assert r == {"ok": True, "on": True}           # falls back to requested state

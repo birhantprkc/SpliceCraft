@@ -8250,6 +8250,57 @@ def _h_ot2_home(app, payload):
     return {"ok": True, "homed": True}
 
 
+@_agent_endpoint("ot2-lights", write=True)
+def _h_ot2_lights(app, payload):
+    """Toggle the OT-2 rail (status) lights — a zero-motion control, handy to
+    blink / identify the robot, confirm you're talking to the right one, or turn the
+    lights off when the bench is done for the night.
+
+    Body: ``{host, "on": true|false}`` (``on`` defaults to true). A ``write``
+    endpoint (bearer token; a dirty library blocks it unless ``{"force": true}``)."""
+    host = _agent_ot2_host(payload)
+    if not host:
+        return ({"error": "no OT-2 host (pass 'host' or set the 'ot2_host' setting)"}, 400)
+    on = payload.get("on", True)
+    if isinstance(on, str):
+        on = on.strip().lower() in ("1", "true", "yes", "on")
+    try:
+        res = _ot2._ot2_set_lights(host, bool(on))
+    except _ot2.OT2Error as exc:
+        return ({"error": str(exc)}, 502)
+    state = res.get("on") if isinstance(res, dict) else None
+    return {"ok": True, "on": bool(state) if state is not None else bool(on)}
+
+
+@_agent_endpoint("ot2-disengage", write=True)
+def _h_ot2_disengage(app, payload):
+    """De-energise the OT-2 gantry motors so the carriage can be moved by hand and no
+    motor holds torque — a zero-descent power-down (homes nothing; no plunger, no
+    labware descent). Refused while a run is active (disengaging mid-run would drop
+    the moving gantry).
+
+    Body: ``{host, "axes"?: ["x","y","z","a","b","c"]}`` (defaults to all six axes).
+    A ``write`` endpoint (bearer token; a dirty library blocks it unless
+    ``{"force": true}``)."""
+    host = _agent_ot2_host(payload)
+    if not host:
+        return ({"error": "no OT-2 host (pass 'host' or set the 'ot2_host' setting)"}, 400)
+    if _ot2._ot2_active_run(host):
+        return ({"error": "a run is active — stop it before disengaging the motors"}, 409)
+    # Validate axes against the six-axis set (drop unknowns, cap the list); an empty
+    # or absent list means the engine default (all six).
+    raw = payload.get("axes")
+    axes = None
+    if isinstance(raw, list) and raw:
+        valid = set(_ot2._OT2_ALL_AXES)
+        axes = [a for a in (str(x).strip().lower() for x in raw[:6]) if a in valid] or None
+    try:
+        _ot2._ot2_disengage(host, axes=axes)
+    except _ot2.OT2Error as exc:
+        return ({"error": str(exc)}, 502)
+    return {"ok": True, "disengaged": axes or list(_ot2._OT2_ALL_AXES)}
+
+
 @_agent_endpoint("ot2-position-check", write=True)
 def _h_ot2_position_check(app, payload):
     """Run a MOTION-ONLY position check — the gantry tours the deck (moves to the top

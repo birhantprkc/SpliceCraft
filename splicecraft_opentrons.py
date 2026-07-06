@@ -1326,6 +1326,24 @@ def _ot2_home(host: str) -> "dict[str, Any]":
                              payload={"target": "robot"})
 
 
+# The six OT-2 gantry axes: x/y (deck), z/a (left/right mount carriage), b/c
+# (left/right plunger). Disengaging all six releases every motor's holding torque.
+_OT2_ALL_AXES = ("x", "y", "z", "a", "b", "c")
+
+
+def _ot2_disengage(host: str, *, axes: "list[str] | None" = None) -> "dict[str, Any]":
+    """De-energise the gantry motors (``POST /motors/disengage``) so the carriage can
+    be pushed by hand and no motor holds torque — a zero-descent power-down. Homes
+    nothing and never actuates a plunger; safe when the robot is idle. Defaults to
+    all six axes. NB: disengaging DURING a run would drop the moving gantry, so the
+    caller must refuse while a run is active (the endpoint + UI both enforce that)."""
+    ax = [str(a).strip().lower() for a in (axes or _OT2_ALL_AXES) if str(a).strip()]
+    if not ax:
+        ax = list(_OT2_ALL_AXES)
+    return _ot2_request_json(host, "/motors/disengage", method="POST",
+                             payload={"axes": ax})
+
+
 # ── Telemetry / fault detection ─────────────────────────────────────────────────
 # The OT-2 REST API does not stream live gantry XYZ, so "position" is tracked at
 # the PROTOCOL level: which command the robot is currently executing and — on a
@@ -1346,13 +1364,21 @@ def _ot2_try_json(host: str, path: str, *,
         return None, str(exc)
 
 
-def _ot2_run_commands(host: str, rid: str, *, page_length: int = 200) -> "list[dict[str, Any]]":
-    """Per-command status for a run (capped). Each item carries the command id,
-    type, status, error detail (or ``None``) and a brief position hint
-    (labware / well / mount) — the closest thing to 'where the pipette is'."""
+def _ot2_run_commands(host: str, rid: str, *, page_length: int = 200
+                      ) -> "tuple[list[dict[str, Any]], int]":
+    """Per-command status for a run (page-capped) PLUS the run's true command total.
+
+    Returns ``(commands, total)``. Each command carries id / type / status / error
+    detail (or ``None``) and a brief position hint (labware / well / mount) — the
+    closest thing to 'where the pipette is'. ``total`` is the run's full command
+    count so far (``meta.totalLength``): the OT-2 creates run commands as the
+    protocol executes, so it climbs from 0 toward the analysed length and makes a
+    real progress numerator (the page itself holds at most ``page_length`` items)."""
     data, _ = _ot2_try_json(host, f"/runs/{rid}/commands?pageLength={int(page_length)}")
+    if not isinstance(data, dict):   # a non-dict (e.g. a top-level list) must not raise
+        data = {}
     out: "list[dict[str, Any]]" = []
-    for c in ((data or {}).get("data") or []):
+    for c in (data.get("data") or []):
         params = c.get("params") or {}
         at = {k: params[k] for k in ("labwareId", "wellName", "pipetteId", "mount")
               if k in params}
@@ -1364,7 +1390,14 @@ def _ot2_run_commands(host: str, rid: str, *, page_length: int = 200) -> "list[d
             "error": (err.get("detail") if isinstance(err, dict) else err),
             "at": at or None,
         })
-    return out
+    meta = data.get("meta")
+    total = meta.get("totalLength") if isinstance(meta, dict) else None
+    # Reject bool (True is an int), non-int, too-small, or absurdly-large values —
+    # any of which would poison the progress numerator — falling back to the page.
+    if (not isinstance(total, int) or isinstance(total, bool)
+            or total < len(out) or total > 1_000_000):
+        total = len(out)
+    return out, total
 
 
 def _ot2_active_run(host: str) -> "str | None":
@@ -1384,13 +1417,15 @@ def _ot2_active_run(host: str) -> "str | None":
 
 def _ot2_run_state(host: str, rid: str) -> "dict[str, Any]":
     """Live run state: overall status, the current command (position), any failed
-    commands, and run-level errors."""
+    commands, run-level errors, and a progress numerator (``command_total`` = run
+    commands created so far vs ``command_count`` = the page actually seen)."""
     data, err = _ot2_try_json(host, f"/runs/{rid}")
     if data is None:
         return {"id": rid, "status": "unknown", "error": err, "errors": [],
-                "current_command": None, "failed_commands": [], "command_count": 0}
+                "current_command": None, "failed_commands": [], "command_count": 0,
+                "command_total": 0}
     d = data.get("data") or {}
-    cmds = _ot2_run_commands(host, rid)
+    cmds, total = _ot2_run_commands(host, rid)
     running = [c for c in cmds if c["status"] == "running"]
     progressed = [c for c in cmds if c["status"] in ("running", "succeeded")]
     current = running[0] if running else (progressed[-1] if progressed else None)
@@ -1401,6 +1436,7 @@ def _ot2_run_state(host: str, rid: str) -> "dict[str, Any]":
         "current_command": current,
         "failed_commands": [c for c in cmds if c["status"] == "failed"],
         "command_count": len(cmds),
+        "command_total": total,
     }
 
 
@@ -1484,6 +1520,19 @@ def _ot2_state(host: str, *, run_id: "str | None" = None) -> "dict[str, Any]":
 
     lights, _ = _ot2_try_json(host, "/robot/lights")
     state["lights"] = (lights or {}).get("on")
+
+    # Door switch: status + whether the robot enforces closed-for-protocol. Present
+    # even mid-run (an open door pauses the run) — cheap and safety-relevant, so it
+    # is NOT skipped by the lean-poll path. Best-effort: a robot/firmware without the
+    # endpoint just leaves ``door`` absent.
+    door, _ = _ot2_try_json(host, "/robot/door/status")
+    if isinstance(door, dict):
+        inner = door.get("data")
+        dd = inner if isinstance(inner, dict) else door
+        state["door"] = {
+            "status": dd.get("status"),
+            "required_closed": bool(dd.get("doorRequiredClosedForProtocol")),
+        }
 
     calibration: "dict[str, Any]" = {}
     cal, _ = _ot2_try_json(host, "/calibration/status")
@@ -1776,28 +1825,92 @@ def _ot2_compile_position_check(plan: "dict[str, Any]", *,
     return "\n".join(out) + "\n"
 
 
+def _ot2_pipette_base(name: "Any") -> str:
+    """A pipette identifier without its version/generation suffix so an analysed
+    ``pipetteName`` (``p300_single``) matches an attached ``instrumentModel``
+    (``p300_single_v1.5`` / ``p300_single_gen2``). Lower-cased; empty on junk."""
+    s = str(name or "").strip().lower()
+    for sep in ("_v", "_gen"):
+        i = s.find(sep)
+        if i != -1 and i + len(sep) < len(s) and s[i + len(sep)].isdigit():
+            s = s[:i]
+    return s
+
+
+def _ot2_pipette_mismatch(analysis_pipettes: "list[dict[str, Any]]",
+                          instruments: "list[dict[str, Any]]") -> "list[str]":
+    """Which pipettes the analysed protocol loads are NOT satisfied by an attached
+    instrument on the same mount + (version-insensitive) model. Returns
+    human-readable mismatch strings; empty when every required pipette is present.
+    The robot's *analysis* simulates with the requested pipette regardless of what
+    is physically attached, so a wrong / absent pipette passes analysis and only
+    fails at ``load_instrument`` once the run starts — this catches it BEFORE any
+    motion so the gate can refuse."""
+    attached: "dict[str, str]" = {}
+    for it in (instruments or []):
+        if not isinstance(it, dict):
+            continue
+        mount = str(it.get("mount") or "").strip().lower()
+        if mount:
+            attached[mount] = _ot2_pipette_base(it.get("model"))
+    problems: "list[str]" = []
+    for p in (analysis_pipettes or []):
+        if not isinstance(p, dict):
+            continue
+        want_mount = str(p.get("mount") or "").strip().lower()
+        want = _ot2_pipette_base(p.get("pipetteName") or p.get("pipetteModel")
+                                 or p.get("model"))
+        if not want:
+            continue
+        have = attached.get(want_mount)
+        if have is None:
+            problems.append(f"protocol needs {want} on the {want_mount or '?'} mount "
+                            "but nothing is attached there")
+        elif have != want:
+            problems.append(f"protocol needs {want} on the {want_mount} mount "
+                            f"but a {have} is attached")
+    return problems
+
+
 def _ot2_run_protocol(host: str, protocol_text: str, *, confirm: bool = False,
                       filename: str = "splicecraft_protocol.py", poll: bool = True,
                       on_state: "Any" = None, stop_on_fault: bool = True,
                       offset_plan: "dict[str, Any] | None" = None,
-                      require_pipette_cal: bool = True) -> "dict[str, Any]":
+                      require_pipette_cal: bool = True,
+                      indicator_lights: bool = True,
+                      on_analysis: "Any" = None) -> "dict[str, Any]":
     """Analyse, then (only if it passed AND the caller confirmed) run a protocol
     on real hardware, monitoring state throughout for a crash.
 
     The gate is deliberate and non-negotiable: this refuses to move the gantry
     unless ``_ot2_analyze`` returns ``result == "ok"`` *and* ``confirm=True`` was
     passed. It also refuses to start on an already-faulted robot (pre-flight
-    ``_ot2_state`` check — bad calibration, a pipette subsystem error, etc.).
+    ``_ot2_state`` check — bad calibration, a pipette subsystem error, etc.), when
+    the door-safety switch is enabled but the door is open (``reason:
+    "door-open"``), and when the attached pipette does not match what the protocol
+    loads (``reason: "pipette-mismatch"`` — analysis can't see the hardware, so a
+    wrong pipette would otherwise only fail mid-run).
 
     While the run executes it polls a full ``_ot2_state`` snapshot each tick,
-    calls ``on_state(snapshot)`` (for a live UI / log), and — the instant a fault
+    calls ``on_state(snapshot)`` (for a live UI / log), turns the rail lights on as
+    a "robot is moving" indicator (restored afterwards), and — the instant a fault
     is detected (a failed command, an instrument fault, …) — records it and, if
-    ``stop_on_fault``, halts the run. The result carries ``crashed`` plus the
-    ``faults`` / ``failed_commands`` that explain what went wrong and where.
+    ``stop_on_fault``, halts the run. If the run overruns ``_OT2_RUN_POLL_TIMEOUT``
+    it is STOPPED on the robot before the timeout is raised (never left moving
+    unattended). The result carries ``crashed`` plus the ``faults`` /
+    ``failed_commands`` that explain what went wrong and where. ``indicator_lights``
+    (default on) governs the rail-light signalling.
     """
     analysis = _ot2_analyze(host, protocol_text, filename=filename)
     if analysis["result"] != "ok":
         return {"ran": False, "reason": "analysis-failed", **analysis}
+    # Hand the analysed command list to the caller (for a determinate progress bar)
+    # the moment it's known — before the confirm gate, so a dry run reports it too.
+    if on_analysis:
+        try:
+            on_analysis(analysis)
+        except Exception:
+            _log.debug("[ot2] on_analysis callback raised (ignored)", exc_info=True)
     if not confirm:
         return {"ran": False, "reason": "confirm-required",
                 "detail": "physical run needs confirm=True (analysis passed)",
@@ -1807,6 +1920,15 @@ def _ot2_run_protocol(host: str, protocol_text: str, *, confirm: bool = False,
     if pre.get("faults"):
         return {"ran": False, "reason": "robot-unhealthy",
                 "faults": pre["faults"], "state": pre, **analysis}
+    # Door interlock: only when the robot itself enforces closed-for-protocol (its
+    # door-safety switch is on). If enforced AND open, the robot would refuse/pause
+    # anyway — surface it as a clear reason rather than a mid-run stall.
+    door = pre.get("door") or {}
+    if door.get("required_closed") and str(door.get("status") or "").lower() == "open":
+        return {"ran": False, "reason": "door-open",
+                "detail": "the robot's door-safety switch is enabled and the door is "
+                          "open — close the door before running",
+                "state": pre, **analysis}
     if require_pipette_cal:
         calib = (pre.get("calibration") or {}).get("pipettes_calibrated") or {}
         if not calib:
@@ -1823,6 +1945,16 @@ def _ot2_run_protocol(host: str, protocol_text: str, *, confirm: bool = False,
                     "detail": f"pipette(s) {', '.join(uncal)} have no offset calibration "
                               "— calibrate in the Opentrons App first",
                     "state": pre, **analysis}
+
+    # Attached-pipette-vs-protocol match: calibration confirms a pipette is
+    # calibrated, NOT that it is the RIGHT one. Analysis simulates with whatever the
+    # protocol requests, so a wrong / absent pipette only fails at load_instrument
+    # once the run starts — refuse here, before any motion.
+    mismatch = _ot2_pipette_mismatch(analysis.get("pipettes") or [],
+                                     pre.get("instruments") or [])
+    if mismatch:
+        return {"ran": False, "reason": "pipette-mismatch",
+                "detail": "; ".join(mismatch), "state": pre, **analysis}
 
     run_data: "dict[str, Any]" = {"protocolId": analysis["protocol_id"]}
     if offset_plan is not None:
@@ -1841,40 +1973,78 @@ def _ot2_run_protocol(host: str, protocol_text: str, *, confirm: bool = False,
     if not poll:
         return {"ran": True, "run_id": rid, "run_status": "running", **analysis}
 
-    deadline = _util._monotonic() + _OT2_RUN_POLL_TIMEOUT
-    while True:
-        snap = _ot2_state(host, run_id=rid)
-        if on_state:
+    # Rail lights ON for the duration as a physical "robot is moving" signal, then
+    # restored to their prior state when we stop watching. The finally makes the
+    # restore fire on a clean finish, a fault, OR the timeout. Best-effort — a
+    # lights hiccup never affects the run itself.
+    prev_lights = pre.get("lights")
+    if indicator_lights:
+        try:
+            _ot2_set_lights(host, True)
+        except OT2Error:
+            pass
+    try:
+        deadline = _util._monotonic() + _OT2_RUN_POLL_TIMEOUT
+        while True:
             try:
-                on_state(snap)
+                snap = _ot2_state(host, run_id=rid)
             except Exception:
-                pass
-        run = snap.get("run") or {}
-        status = run.get("status", "unknown")
-        faults = snap.get("faults") or []
-
-        if faults and status != "succeeded":
-            # A crash mid-flight. The robot already halts on a hard move error
-            # (status 'failed'); for any other detected fault, stop it ourselves.
-            if stop_on_fault and status not in ("failed", "stopped"):
+                # SAFETY: an unexpected monitor error (e.g. a malformed robot
+                # response) must never leave the gantry moving unwatched — stop the
+                # run, then re-raise (the finally still restores the lights).
+                _log.exception("[ot2] monitor error during run %s — stopping it", rid)
                 try:
                     _ot2_stop_run(host, rid)
                 except OT2Error:
                     pass
-            _log.warning("[ot2] fault during run %s: %s", rid, faults)
-            return {"ran": True, "run_id": rid, "run_status": status, "crashed": True,
-                    "faults": faults, "failed_commands": run.get("failed_commands") or [],
-                    "run_errors": run.get("errors") or [], "state": snap, **analysis}
+                raise
+            if on_state:
+                try:
+                    on_state(snap)
+                except Exception:
+                    _log.debug("[ot2] on_state callback raised (ignored)", exc_info=True)
+            run = snap.get("run") or {}
+            status = run.get("status", "unknown")
+            faults = snap.get("faults") or []
 
-        if status in ("succeeded", "failed", "stopped"):
-            _log.info("[ot2] run %s finished: %s", rid, status)
-            return {"ran": True, "run_id": rid, "run_status": status, "crashed": False,
-                    "faults": [], "failed_commands": run.get("failed_commands") or [],
-                    "run_errors": run.get("errors") or [], "state": snap, **analysis}
+            if faults and status != "succeeded":
+                # A crash mid-flight. The robot already halts on a hard move error
+                # (status 'failed'); for any other detected fault, stop it ourselves.
+                if stop_on_fault and status not in ("failed", "stopped"):
+                    try:
+                        _ot2_stop_run(host, rid)
+                    except OT2Error:
+                        pass
+                _log.warning("[ot2] fault during run %s: %s", rid, faults)
+                return {"ran": True, "run_id": rid, "run_status": status, "crashed": True,
+                        "faults": faults, "failed_commands": run.get("failed_commands") or [],
+                        "run_errors": run.get("errors") or [], "state": snap, **analysis}
 
-        if _util._monotonic() > deadline:
-            raise OT2Error(f"OT-2 run {rid} did not finish within {_OT2_RUN_POLL_TIMEOUT}s")
-        time.sleep(_OT2_POLL_INTERVAL)
+            if status in ("succeeded", "failed", "stopped"):
+                _log.info("[ot2] run %s finished: %s", rid, status)
+                return {"ran": True, "run_id": rid, "run_status": status, "crashed": False,
+                        "faults": [], "failed_commands": run.get("failed_commands") or [],
+                        "run_errors": run.get("errors") or [], "state": snap, **analysis}
+
+            if _util._monotonic() > deadline:
+                # SAFETY: never leave the gantry moving unattended. Stop the run on
+                # the robot BEFORE surfacing the timeout (this used to just stop
+                # watching while the robot kept running).
+                _log.warning("[ot2] run %s exceeded %ss — stopping it",
+                             rid, _OT2_RUN_POLL_TIMEOUT)
+                try:
+                    _ot2_stop_run(host, rid)
+                except OT2Error:
+                    pass
+                raise OT2Error(f"OT-2 run {rid} did not finish within "
+                               f"{_OT2_RUN_POLL_TIMEOUT}s — the run was stopped")
+            time.sleep(_OT2_POLL_INTERVAL)
+    finally:
+        if indicator_lights:
+            try:
+                _ot2_set_lights(host, bool(prev_lights))
+            except OT2Error:
+                pass
 
 
 def _ot2_run_position_check(host: str, plan: "dict[str, Any]", *,

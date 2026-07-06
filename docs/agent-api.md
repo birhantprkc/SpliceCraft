@@ -378,7 +378,20 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   `{host, plan|<plan fields>, wells?, confirm?, wait?}`. **Labware offsets:** add an
   `offset: {x, y, z}` (mm) to any plan labware entry and it is applied to the run's
   motion (`ot2-run` and `ot2-position-check` both honour it); a liquid `ot2-run` also
-  now refuses to move an *uncalibrated* pipette.
+  now refuses to move an *uncalibrated* pipette, refuses when the **attached pipette
+  does not match** what the protocol loads (`reason: "pipette-mismatch"`), and refuses
+  when the robot's **door-safety switch is enabled and the door is open** (`reason:
+  "door-open"`). During a monitored run the robot's rail lights come on as a
+  "gantry moving" indicator and are restored afterwards, and a run that overruns the
+  poll timeout is **stopped on the robot** rather than left moving.
+- **OT-2 lights + motor disengage** (zero-/low-motion controls) — `ot2-lights` (a
+  **write** endpoint) toggles the robot's rail (status) lights: `{host, "on":
+  true|false}` (defaults on) — handy to blink/identify the robot or turn the lights
+  off for the night. `ot2-disengage` (a **write** endpoint) de-energises the gantry
+  motors so the carriage can be moved by hand (`{host, "axes"?: [...]}`, all six axes
+  by default); it homes nothing and is refused while a run is active. `ot2-status`
+  additionally surfaces the **door** state (`{"status", "required_closed"}`) alongside
+  lights, motors, and modules.
 - **OT-2 protocol + custom-labware libraries** — manage saved designs and custom
   labware headlessly, mirroring the AUTOLAB Deck/Labware tabs. Protocols:
   `list-protocols`, `get-protocol` (returns a compile-able `plan`), `save-protocol`

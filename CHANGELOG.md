@@ -14,6 +14,60 @@
 
 ---
 
+## [1.0.124] — 2026-07-06
+
+### New features
+
+- **Live OT-2 telemetry in AUTOLAB.** The Deck tab now shows the robot at a glance
+  while it works: a **connection badge** (self-updates every few seconds), a live
+  **status panel** (name / firmware, rail-light + door + motor state, the attached
+  pipette and its volumes, deck calibration), a determinate run **progress bar with
+  ETA**, and a prominent **fault banner** the instant something goes wrong. The run
+  log no longer floods — it records state changes and faults, not a full snapshot
+  every second.
+- **The AUTOLAB deck looks like the robot.** The Deck tab now draws the OT-2 deck as
+  a single top-down diagram — the 11 slots plus the fixed trash as one connected grid
+  of boxes in the physical layout (10/11/12 across the top … 1/2/3 along the bottom),
+  each bay colour-filled by what sits on it (tips, labware, the library-bound plate,
+  empty, or trash) and labelled with its slot number and contents. The whole deck
+  scales with your terminal, and you still click a bay to place or clear its labware.
+- **Rail-light + motor controls.** New **Lights On / Lights Off** and **Disengage
+  Motors** buttons on the AUTOLAB Deck tab (disengage frees the gantry to be moved by
+  hand; it's refused while a run is active). The same controls are now reachable from
+  the agent API and Babs as the `ot2-lights` and `ot2-disengage` endpoints — so an
+  assistant can turn the robot's lights off for the night or release the motors.
+- **The rail lights signal a live run.** When a run starts the robot's lights come on
+  as a "the gantry is moving" indicator, then return to their previous state when it
+  finishes.
+- **Babs knows what's on screen.** The assistant is now told about the plasmid you
+  currently have open (name, length, topology, features) with every message, so
+  "domesticate this plasmid" or "what's in the construct" just work without it having
+  to look it up first.
+
+### Hardening
+
+- **A run that overruns its time limit is now stopped.** Previously, if a run took
+  longer than the 30-minute ceiling, SpliceCraft stopped watching but the robot kept
+  moving. It now halts the run on the robot before reporting the timeout — and,
+  likewise, if monitoring hits an unexpected error mid-run, the run is halted rather
+  than left moving unwatched.
+- **Sturdier against odd robot responses and untrusted files.** A malformed reply
+  from the robot can no longer crash a status read or a run monitor, and a crafted
+  feature label in an opened plasmid can't smuggle text into Babs's context — robot
+  inputs are dict-guarded and bounded, and injected labels are sanitised.
+- **A run won't start with the wrong pipette.** Before moving, SpliceCraft checks that
+  the pipette the protocol needs is actually attached on the right mount — a mismatch
+  is caught up front instead of failing mid-run at the first tip pick-up.
+- **Door-open interlock.** If the robot's door-safety switch is enabled and the door
+  is open, a run is refused with a clear message rather than stalling once it starts.
+- **Babs always asks before the robot moves.** Physical-motion commands — run, home,
+  position-check, disengage, and resuming a paused run — now prompt for confirmation
+  even in hands-off "auto" autonomy, so the model can't actuate real hardware
+  unattended. Zero-motion controls (lights) and run-halting controls (pause/stop)
+  still follow the autonomy setting.
+
+---
+
 ## [1.0.123] — 2026-07-04
 
 ### New features

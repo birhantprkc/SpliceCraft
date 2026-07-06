@@ -249,10 +249,14 @@ exports the whole conversation to markdown. Three tabs:
 - **Agent mode** — flip **Agent** on (or `/agent`) and Babs can *drive
   SpliceCraft herself*: she calls the same scripting endpoints the external
   `--agent` API exposes — read the loaded plasmid, find a motif, design primers,
-  run a digest, clone, manage the library — and **everything she does shows up
-  live in the app**. By default she **asks before every write** (a one-tap
-  approve/deny); `/autonomy auto` lets her run unattended, `/autonomy readonly`
-  keeps her to read-only. Destructive whole-library wipes are never reachable.
+  run a digest, clone, manage the library, **even drive the OT-2** — and
+  **everything she does shows up live in the app**. She's always told which
+  plasmid you have open, so "domesticate this" or "what's in the construct" just
+  work. By default she **asks before every write** (a one-tap approve/deny);
+  `/autonomy auto` lets her run unattended, `/autonomy readonly` keeps her to
+  read-only. Destructive whole-library wipes are never reachable, and **physical
+  robot motion always asks first** — even in `auto` — so nothing moves the
+  hardware unattended.
 - **Online lookups** — in Agent mode Babs can also look things up on the web:
   **FPbase** (fluorescent-protein spectra), **UniProt** (proteins), **Europe
   PMC** (papers), **NCBI/GenBank** (sequence records), **Wikipedia**, general
@@ -323,8 +327,10 @@ including a `call` passthrough to every endpoint) drive every workflow.
 Full feature reference: [`docs/features.md`](docs/features.md).
 
 SpliceCraft can also drive an **Opentrons OT-2** liquid handler. The **AUTOLAB**
-toolbar item is a five-panel protocol designer: an interactive **Deck** (click a
-slot to place or clear its labware), a **Designer** for an ordered sequence of
+toolbar item is a five-panel protocol designer: an interactive **Deck** drawn as a
+top-down diagram of the robot — the slots as one connected grid of boxes in the
+physical layout, colour-filled by what's on each bay, scaling with your terminal
+(click a bay to place or clear its labware), a **Designer** for an ordered sequence of
 steps (transfer, distribute, consolidate, mix, delay, pause, comment), a
 **Labware** tab that keeps a library of custom labware you define from a simple
 grid form, a **Library** tab that links the robot to your plasmid library —
@@ -335,14 +341,18 @@ offset + tip-length), home the gantry, set per-slot labware offsets, and run a
 **position check** that moves the gantry above each labware to verify alignment
 (no aspirate/dispense — the plunger never actuates). Save whole designs as named
 protocols organised into collections, compile to an Opentrons protocol, analyze on
-the robot's built-in simulate, watch full robot state for crashes, and run it (gated
-behind Arm + a clean analysis + a pre-flight health + calibration check) with live
-Pause / Resume / Abort controls and a running readout. A build can be logged straight
-to the Experiments notebook, cross-linked to the plasmids it touched. All of it is
-scriptable via the agent API — `ot2-compile` (a `transfers` list or a multi-step
+the robot's built-in simulate, and run it (gated behind Arm + a clean analysis + a
+pre-flight health + calibration + attached-pipette + door check) with live Pause /
+Resume / Abort controls. A **live telemetry** panel tracks the robot as it works — a
+connection badge, the robot's light / door / motor / pipette state, a run **progress
+bar with ETA**, and a **fault banner** that pops the instant something goes wrong —
+plus quick **Lights On / Off** and **Disengage Motors** buttons. A build can be logged
+straight to the Experiments notebook, cross-linked to the plasmids it touched. All of
+it is scriptable via the agent API — `ot2-compile` (a `transfers` list or a multi-step
 `steps` sequence), `ot2-analyze`, `ot2-status`, `ot2-calibration`, the gated
-`ot2-run` / `ot2-position-check` / `ot2-home`, `ot2-run-control`, `ot2-normalize`,
-`ot2-plate-map`, plus protocol- and custom-labware library CRUD endpoints.
+`ot2-run` / `ot2-position-check` / `ot2-home`, `ot2-run-control`, `ot2-lights`,
+`ot2-disengage`, `ot2-normalize`, `ot2-plate-map`, plus protocol- and custom-labware
+library CRUD endpoints.
 
 ## Documentation
 
