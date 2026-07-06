@@ -768,6 +768,7 @@ HELP_COMMANDS = [
     ("/clear", "clear the transcript on screen (keeps memory)"),
     ("/agent", "toggle agent mode — let Babs drive SpliceCraft (call its endpoints)"),
     ("/autonomy [ask|auto|readonly|off]", "set the write policy in agent mode"),
+    ("/agentmodel [auto|chat|name]", "which model runs agent/tool turns (default: a fast tool-capable one)"),
     ("/exit  /quit  /q", "close the BABS tab"),
 ]
 

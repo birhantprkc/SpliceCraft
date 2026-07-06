@@ -886,7 +886,13 @@ class TestBabsAgentic:
         names = {t["function"]["name"] for t in sc._babs_tool_manifest()}
         assert names == {"splicecraft_list_endpoints",
                          "splicecraft_describe_endpoint", "splicecraft_call",
-                         "splicecraft_search_online", "splicecraft_fetch_page"}
+                         "splicecraft_search_online", "splicecraft_fetch_page",
+                         "splicecraft_batch"}
+
+    def test_batch_tool_requires_calls(self):
+        tool = next(t for t in sc._babs_tool_manifest()
+                    if t["function"]["name"] == "splicecraft_batch")
+        assert set(tool["function"]["parameters"]["required"]) == {"calls"}
 
     def test_fetch_page_tool_requires_url(self):
         # The page-reader tool must take a `url` (required) so the model always
@@ -1237,3 +1243,263 @@ class TestBabsAgentic:
             await pilot.pause(); await pilot.pause()
             assert app.screen is babs
             assert sum(isinstance(s, sc.BabsScreen) for s in app.screen_stack) == 1
+
+    # — agent-turn model routing + online-intent nudge (2026-07-06) —
+    def test_looks_like_online_request(self):
+        for q in ["search the web for GFP", "look up mNeonGreen online",
+                  "can you google this", "https://example.com/x",
+                  "find papers on Himar1", "check pubmed for cas9",
+                  "what's the latest paper on base editing"]:
+            assert sc.BabsScreen._looks_like_online_request(q) is True, q
+        for q in ["design a primer for my CDS", "what is a plasmid",
+                  "translate this sequence", "add a feature called GFP",
+                  "explain golden gate assembly", ""]:
+            assert sc.BabsScreen._looks_like_online_request(q) is False, q
+
+    def test_resolve_agent_model_auto_prefers_fast_for_heavy_chat(self, monkeypatch):
+        # Auto: a heavier chat model → agent turns fall back to the fast default.
+        scr = sc.BabsScreen()
+        scr._model = "hf.co/big/Heavy-9B-GGUF"
+        scr._agent_model = ""
+        monkeypatch.setattr(B, "model_is_installed", lambda name, *a, **k: True)
+        assert scr._resolve_agent_model() == (B.DEFAULT_CHAT_MODEL, "auto")
+
+    def test_resolve_agent_model_auto_noop_when_chat_is_fast(self, monkeypatch):
+        # Chat model already IS the fast default → no install probe, no swap.
+        scr = sc.BabsScreen()
+        scr._model = B.DEFAULT_CHAT_MODEL
+        scr._agent_model = ""
+        monkeypatch.setattr(B, "model_is_installed", lambda *a, **k:
+                            (_ for _ in ()).throw(AssertionError("should not probe")))
+        assert scr._resolve_agent_model() == (B.DEFAULT_CHAT_MODEL, "chat")
+
+    def test_resolve_agent_model_auto_falls_back_when_fast_absent(self, monkeypatch):
+        # Fast default not pulled → keep the chat model (never break the turn).
+        scr = sc.BabsScreen()
+        scr._model = "hf.co/big/Heavy-9B-GGUF"
+        scr._agent_model = ""
+        monkeypatch.setattr(B, "model_is_installed", lambda name, *a, **k: False)
+        assert scr._resolve_agent_model() == ("hf.co/big/Heavy-9B-GGUF", "chat")
+
+    def test_resolve_agent_model_explicit_chat_sentinel(self):
+        scr = sc.BabsScreen()
+        scr._model = "hf.co/big/Heavy-9B-GGUF"
+        for sentinel in ("chat", "same", "off", "CHAT"):
+            scr._agent_model = sentinel
+            assert scr._resolve_agent_model() == ("hf.co/big/Heavy-9B-GGUF", "chat")
+
+    def test_resolve_agent_model_explicit_name_installed_or_missing(self, monkeypatch):
+        scr = sc.BabsScreen()
+        scr._model = "chat-model:latest"
+        scr._agent_model = "qwen2.5:7b"
+        monkeypatch.setattr(B, "model_is_installed", lambda name, *a, **k: True)
+        assert scr._resolve_agent_model() == ("qwen2.5:7b", "set")
+        monkeypatch.setattr(B, "model_is_installed", lambda name, *a, **k: False)
+        assert scr._resolve_agent_model() == ("chat-model:latest", "set-missing")
+
+    def test_resolve_agent_model_ollama_down_trusts_pick(self, monkeypatch):
+        scr = sc.BabsScreen()
+        scr._model = "chat-model:latest"
+        scr._agent_model = "some-model:latest"
+        monkeypatch.setattr(B, "model_is_installed", lambda *a, **k:
+                            (_ for _ in ()).throw(B.OllamaUnavailable("down")))
+        assert scr._resolve_agent_model() == ("some-model:latest", "set")
+
+    async def test_agentmodel_command_persists(self, monkeypatch):
+        monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            scr._handle_command("/agentmodel qwen2.5:7b")
+            assert scr._agent_model == "qwen2.5:7b"
+            assert sc._get_setting("babs_agent_model") == "qwen2.5:7b"
+            scr._handle_command("/agentmodel chat")
+            assert scr._agent_model == "chat"
+            scr._handle_command("/agentmodel auto")
+            assert scr._agent_model == ""
+            assert sc._get_setting("babs_agent_model") == ""
+
+    async def test_agentic_turn_streams_on_resolved_fast_model(self, monkeypatch):
+        # Integration: a heavy chat model + auto routing → the agentic worker must
+        # stream on the FAST resolved model (qwen2.5:7b), not the heavy chat model.
+        monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
+        monkeypatch.setattr(B, "model_is_installed", lambda name, *a, **k: True)
+        captured = {}
+
+        def fake_chat(model, messages, **kwargs):
+            captured["model"] = model
+            yield {"content": "ok", "thinking": "", "tool_calls": [],
+                   "done": True, "done_reason": "stop", "error": None}
+
+        monkeypatch.setattr(B, "chat_stream", fake_chat)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            scr._agent_enabled = True
+            scr._model = "hf.co/big/Heavy-9B-GGUF"
+            scr._agent_model = ""
+            scr.query_one("#babs-input", Input).value = "hi"
+            scr._submit_current()
+            for _ in range(80):
+                await pilot.pause()
+                await asyncio.sleep(0.03)
+                if not scr._generating:
+                    break
+            assert not scr._generating
+            assert captured["model"] == B.DEFAULT_CHAT_MODEL
+
+    # — splicecraft_batch: multi-call power tool (2026-07-06) —
+    def test_batch_validates_input(self):
+        scr = sc.BabsScreen()
+        for bad in (None, [], "nope", 5, {}):
+            assert "error" in scr._dispatch_agent_batch(bad)
+        big = [{"endpoint": "status"}] * (sc._BABS_BATCH_MAX_CALLS + 1)
+        assert "too many" in scr._dispatch_agent_batch(big)["error"]
+
+    def test_batch_ask_mode_one_approval_and_pre_approves(self, monkeypatch):
+        # ONE modal covers every non-physical write in the batch; each approved
+        # write is dispatched pre_approved (so it won't prompt again); reads run
+        # un-pre-approved.
+        scr = sc.BabsScreen()
+        scr._autonomy = "ask"
+        calls = []
+        scr._dispatch_agent_endpoint = (
+            lambda ep, body, *, pre_approved=False:
+            calls.append((ep, pre_approved)) or {"status": 200, "result": {}})
+        approvals = []
+        monkeypatch.setattr(scr, "_ask_batch_approval",
+                            lambda writes: approvals.append([w[0] for w in writes]) or True)
+        out = scr._dispatch_agent_batch([
+            {"endpoint": "status"},
+            {"endpoint": "set-feature-color",
+             "arguments": {"feature_type": "CDS", "color": "#111111"}},
+            {"endpoint": "set-feature-color",
+             "arguments": {"feature_type": "mRNA", "color": "#222222"}},
+        ])
+        assert len(approvals) == 1 and len(approvals[0]) == 2
+        assert calls == [("status", False),
+                         ("set-feature-color", True),
+                         ("set-feature-color", True)]
+        assert out["count"] == 3
+
+    def test_batch_ask_mode_deny_skips_writes_keeps_reads(self, monkeypatch):
+        scr = sc.BabsScreen()
+        scr._autonomy = "ask"
+        calls = []
+        scr._dispatch_agent_endpoint = (
+            lambda ep, body, *, pre_approved=False:
+            calls.append(ep) or {"status": 200, "result": {}})
+        monkeypatch.setattr(scr, "_ask_batch_approval", lambda writes: False)
+        out = scr._dispatch_agent_batch([
+            {"endpoint": "status"},
+            {"endpoint": "set-feature-color",
+             "arguments": {"feature_type": "CDS", "color": "#111111"}},
+        ])
+        assert calls == ["status"]                       # write never dispatched
+        assert "declined" in out["results"][1]["error"]
+
+    def test_batch_unknown_endpoint_isolated(self):
+        scr = sc.BabsScreen()
+        scr._autonomy = "auto"
+        calls = []
+        scr._dispatch_agent_endpoint = (
+            lambda ep, body, *, pre_approved=False:
+            calls.append(ep) or {"status": 200, "result": {}})
+        out = scr._dispatch_agent_batch([
+            {"endpoint": "status"},
+            {"endpoint": "no-such-xyz"},
+            {"endpoint": "list-library"},
+        ])
+        assert calls == ["status", "list-library"]       # unknown never dispatched
+        assert "unknown endpoint" in out["results"][1]["error"]
+        assert out["count"] == 3
+
+    def test_batch_physical_motion_not_bundled(self, monkeypatch):
+        # A physical robot-motion write is NOT folded into the batch approval —
+        # it dispatches pre_approved=False so its own per-call confirm fires.
+        scr = sc.BabsScreen()
+        scr._autonomy = "ask"
+        seen = []
+        scr._dispatch_agent_endpoint = (
+            lambda ep, body, *, pre_approved=False:
+            seen.append((ep, pre_approved)) or {"status": 200, "result": {}})
+        approvals = []
+        monkeypatch.setattr(scr, "_ask_batch_approval",
+                            lambda writes: approvals.append([w[0] for w in writes]) or True)
+        scr._dispatch_agent_batch([
+            {"endpoint": "set-feature-color",
+             "arguments": {"feature_type": "CDS", "color": "#111111"}},
+            {"endpoint": "ot2-home", "arguments": {"host": "h"}},
+        ])
+        assert approvals == [["set-feature-color"]]      # only the data write bundled
+        assert ("ot2-home", False) in seen              # physical dispatched un-pre-approved
+        assert ("set-feature-color", True) in seen
+
+    async def test_dispatch_endpoint_pre_approved_semantics(self, monkeypatch):
+        # The gate itself: pre_approved skips an ask-mode confirm for a data
+        # write, but a PHYSICAL write still confirms even when pre_approved.
+        monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
+        monkeypatch.setattr(B, "show", lambda *a, **k: {})
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            scr._autonomy = "ask"
+            prompted = []
+            monkeypatch.setattr(scr, "_ask_tool_approval",
+                                lambda ep, body, *, physical=False:
+                                prompted.append(ep) or True)
+            monkeypatch.setattr(sc, "_agent_invoke",
+                                lambda a, ep, body, source=None: ({"ok": True}, 200))
+            out = scr._dispatch_agent_endpoint(
+                "set-feature-color", {"feature_type": "CDS", "color": "#123456"},
+                pre_approved=True)
+            assert prompted == [] and out["status"] == 200      # no prompt
+            out2 = scr._dispatch_agent_endpoint(
+                "ot2-home", {"host": "h", "confirm": True}, pre_approved=True)
+            assert prompted == ["ot2-home"] and out2["status"] == 200  # still confirms
+
+    def test_batch_coerces_stringified_arguments(self):
+        # Small models sometimes emit a sub-call's `arguments` as a JSON string;
+        # it must be parsed, not silently dropped to {}.
+        scr = sc.BabsScreen()
+        scr._autonomy = "auto"
+        bodies = []
+        scr._dispatch_agent_endpoint = (
+            lambda ep, body, *, pre_approved=False:
+            bodies.append(body) or {"status": 200, "result": {}})
+        scr._dispatch_agent_batch([
+            {"endpoint": "set-feature-color",
+             "arguments": '{"feature_type": "CDS", "color": "#abcabc"}'},
+        ])
+        assert bodies == [{"feature_type": "CDS", "color": "#abcabc"}]
+
+    async def test_batch_end_to_end_real_read_endpoints(self, monkeypatch):
+        # End-to-end: a batch of REAL read-only endpoints flows through the real
+        # _agent_invoke (nothing stubbed) and returns real results; an unknown
+        # endpoint in the middle is isolated.
+        monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
+        monkeypatch.setattr(B, "show", lambda *a, **k: {})
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            scr._autonomy = "readonly"        # reads run; any write would refuse
+            out = scr._dispatch_agent_batch([
+                {"endpoint": "status"},
+                {"endpoint": "list-collections"},
+                {"endpoint": "no-such"},
+            ])
+        assert out["count"] == 3
+        assert out["results"][0]["endpoint"] == "status"
+        assert out["results"][0]["status"] == 200
+        assert out["results"][1]["status"] == 200
+        assert "unknown endpoint" in out["results"][2]["error"]

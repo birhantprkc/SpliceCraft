@@ -256,7 +256,15 @@ exports the whole conversation to markdown. Three tabs:
   `/autonomy auto` lets her run unattended, `/autonomy readonly` keeps her to
   read-only. Destructive whole-library wipes are never reachable, and **physical
   robot motion always asks first** — even in `auto` — so nothing moves the
-  hardware unattended.
+  hardware unattended. She can carry out a **whole multi-step workflow in one
+  turn** — a batch of endpoints run in order (in `ask` mode a single prompt lists
+  every change, so you approve the batch once instead of click-by-click). A big
+  local chat model can be slow in a multi-step tool
+  loop, so **agent turns automatically run on a fast, tool-capable model**
+  (qwen2.5:7b by default) while your chosen model still handles ordinary chat —
+  override with `/agentmodel <name>|chat|auto`. And if you ask a lookup-type
+  question with Agent **off**, Babs reminds you to turn it on so she can actually
+  search instead of guessing from memory.
 - **Online lookups** — in Agent mode Babs can also look things up on the web:
   **FPbase** (fluorescent-protein spectra), **UniProt** (proteins), **Europe
   PMC** (papers), **NCBI/GenBank** (sequence records), **Wikipedia**, general

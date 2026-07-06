@@ -14,6 +14,35 @@
 
 ---
 
+## [1.0.126] — 2026-07-06
+
+### New features
+
+- **Babs can do more, in one go.** In Agent mode she can now run a **batch of
+  steps in a single turn** instead of one action per turn — so a multi-step job
+  (look something up, make several edits, then check the result) finishes in one
+  pass, and long autonomous tasks get more room to complete. In the default
+  ask-mode a single approval lists every change so you okay the whole batch at
+  once; physical robot moves still confirm one at a time, and the whole-workspace
+  wipe stays off-limits to her.
+
+- **Babs searches the web on her own — and faster.** When you ask Babs to look
+  something up online in Agent mode, she now reliably calls her own search tools
+  instead of telling you to run a command and feed it a URL yourself. Two changes
+  make that dependable. First, **agent turns automatically run on a fast,
+  tool-capable model** (qwen2.5:7b by default) even when you chat with a big,
+  slower model — so a lookup that used to take minutes on a large local model
+  finishes in a fraction of the time, while your chosen model keeps handling
+  ordinary chat. Pin or disable it with the new **`/agentmodel <name>|chat|auto`**
+  command.
+
+- **Babs points you to Agent mode when you need it.** Ask a lookup-type question
+  ("search for…", "look up … online", a URL) while Agent mode is **off** and Babs
+  now reminds you (once) to switch it on so she can actually search — rather than
+  answering from memory or improvising a manual workaround. If Agent mode is
+  **on** but the model answered a lookup without searching, she flags that the
+  model may not tool-call reliably and suggests one that does.
+
 ## [1.0.125] — 2026-07-06
 
 ### New features
