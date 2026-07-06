@@ -14,6 +14,36 @@
 
 ---
 
+## [1.0.125] — 2026-07-06
+
+### New features
+
+- **Find your OT-2 on the network.** AUTOLAB's Deck tab has a new **Find Robots**
+  button that scans your network (and USB) for Opentrons OT-2 robots and lists what
+  it finds — name, address, how it was reached, model, and firmware — in a
+  pick-and-connect window. Choose one and SpliceCraft fills in the host and connects.
+  Tick **Auto-connect to first** to search and connect to the first robot found in a
+  single click, skipping the list. No more hunting for the robot's IP address by hand.
+
+- **The deck is drawn to scale.** The AUTOLAB deck diagram now draws each slot at the
+  real robot slot's rectangular proportions instead of stretching bays into thin
+  strips — the whole deck sizes to your terminal and stays centred, so it reads like a
+  true top-down picture of the robot at any window size.
+
+### Hardening
+
+- **Robot discovery is bounded and safe.** A scan now only ever probes robots on your
+  own local network, reads just a small amount from each host, and can't run forever
+  if a host stalls — so a misbehaving or hostile device answering on the robot port
+  can't slow the scan down or make SpliceCraft reach off-network. Your saved robot
+  address is still contacted directly as before.
+- **Clicking the empty margin beside the deck does nothing.** With the deck now
+  centred, clicks in the blank space to either side are ignored instead of opening a
+  labware picker for an edge slot.
+- **Your robot connection sticks.** The **Auto-connect to first** toggle and the
+  address of the robot you last connected to now survive closing and reopening AUTOLAB
+  instead of resetting.
+
 ## [1.0.124] — 2026-07-06
 
 ### New features

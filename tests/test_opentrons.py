@@ -253,6 +253,54 @@ class TestDeckVisualizer:
         assert "custom" in deck
 
 
+class TestDeckAspect:
+    """The OT2DeckMap draws bays at the real slot's aspect ratio (footprint corrected
+    for the terminal cell being ~2× taller than wide), not as squished slivers."""
+
+    def _map(self):
+        import splicecraft as sc
+        return sc.OT2DeckMap()
+
+    def test_bays_hold_real_aspect_across_widths(self):
+        m = self._map()
+        wmm, dmm = ot2._OT2_SLOT_FOOTPRINT_MM
+        target = wmm / dmm                       # ~1.495 (landscape)
+        for width in (40, 60, 100, 160, 240, 320):
+            m._budget = 25
+            cw, ch, grid_w, pad = m._geometry(width)
+            # on-screen physical ratio of a bay = (cols·cell_w) : (rows·cell_h)
+            on_screen = (cw * m._CELL_ASPECT) / ch
+            # unless a bay is clamped to its floor, it should track the real slot
+            if cw > m._CW_MIN and ch > m._CH_MIN:
+                assert abs(on_screen - target) < 0.35, (width, on_screen)
+            assert m._CH_MIN <= ch <= m._CH_MAX and cw >= m._CW_MIN
+
+    def test_wide_terminal_does_not_stretch_bays(self):
+        # The old bug: a wide terminal made each bay a wide, 3-row sliver. Now the
+        # grid is capped + centred, so the bay width stays bounded and pad grows.
+        m = self._map()
+        m._budget = 25
+        cw_100, _, grid_100, pad_100 = m._geometry(100)
+        cw_300, _, grid_300, pad_300 = m._geometry(300)
+        assert cw_300 == cw_100                   # bay width doesn't grow with the terminal
+        assert grid_300 == grid_100               # deck size is aspect-locked, not width-locked
+        assert pad_300 > pad_100                   # the extra width becomes centring pad
+
+    def test_content_height_matches_geometry(self):
+        m = self._map()
+        for width, budget in ((116, 25), (40, 17), (18, 13)):
+            m._budget = budget
+            h = m.get_content_height(None, None, width)
+            assert h == m._ROWS * m._ch + (m._ROWS + 1)
+
+    def test_height_budget_updates_cell_height(self):
+        m = self._map()
+        m.set_height_budget(25)
+        tall = m._ch
+        m.set_height_budget(13)
+        assert m._CH_MIN <= m._ch <= m._CH_MAX and m._ch <= tall
+
+
 # ── Well geometry ───────────────────────────────────────────────────────────────
 class TestGeometry:
     def test_wells_counts(self):
@@ -286,6 +334,146 @@ class TestClientPure:
 
     def test_user_agent(self):
         assert ot2._ot2_user_agent().startswith("SpliceCraft/")
+
+
+# ── Robot discovery ─────────────────────────────────────────────────────────────
+_ROBOT_HEALTH = {"name": "Jacques", "api_version": "4", "fw_version": "7.1.0",
+                 "system_version": "v7.1.0", "robot_model": "OT-2 Standard",
+                 "serial_number": "OT2CEP20240101A00"}
+
+
+class TestDiscovery:
+    def test_mdns_query_packet_shape(self):
+        q = ot2._ot2_build_mdns_query("_http._tcp.local")
+        # header: id 0, flags 0, 1 question, 0 ans/auth/add
+        assert q[:12] == bytes.fromhex("000000000001000000000000")
+        # length-prefixed labels for the service name
+        assert b"\x05_http\x04_tcp\x05local\x00" in q
+        # trailing QTYPE PTR (12) + QCLASS 0x8001 (IN + QU unicast-response bit)
+        assert q[-4:] == bytes.fromhex("000c8001")
+
+    def test_probe_robot_accepts_real_health(self, monkeypatch):
+        monkeypatch.setattr(ot2, "_ot2_request_json", lambda h, p, **k: dict(_ROBOT_HEALTH))
+        r = ot2._ot2_probe_robot("192.168.1.56", source="network")
+        assert r and r["host"] == "192.168.1.56" and r["name"] == "Jacques"
+        assert r["model"] == "OT-2 Standard" and r["source"] == "network"
+        assert r["serial"] == "OT2CEP20240101A00"
+
+    def test_probe_robot_rejects_non_robot(self, monkeypatch):
+        # a service on :31950 with NO Opentrons version signature is not a robot
+        monkeypatch.setattr(ot2, "_ot2_request_json", lambda h, p, **k: {"name": "printer"})
+        assert ot2._ot2_probe_robot("192.168.1.9") is None
+
+    def test_probe_robot_swallows_transport_error(self, monkeypatch):
+        def boom(h, p, **k):
+            raise ot2.OT2Error("host down")
+        monkeypatch.setattr(ot2, "_ot2_request_json", boom)
+        assert ot2._ot2_probe_robot("10.0.0.5") is None       # a dead host is a miss
+
+    def test_sweep_candidates_capped_and_tagged(self):
+        cands = ot2._ot2_sweep_candidates(max_hosts=12)
+        assert len(cands) <= 12
+        assert all(isinstance(h, str) and s in ("network", "usb") for h, s in cands)
+        assert len({h for h, _ in cands}) == len(cands)       # deduped
+
+    def test_discover_ranks_and_dedups(self, monkeypatch):
+        monkeypatch.setattr(ot2, "_ot2_mdns_responders", lambda **k: ["169.254.5.5"])
+        monkeypatch.setattr(ot2, "_ot2_sweep_candidates",
+                            lambda **k: [("192.168.1.56", "network"), ("192.168.1.99", "network")])
+
+        def fake_probe(host, timeout=0.8, source="network"):
+            if host.endswith(".56") or host.startswith("169.254"):
+                return {"host": host, "name": ("Jacques" if host.endswith(".56") else "USB-bot"),
+                        "model": "OT-2", "source": source, "fw_version": "7.1"}
+            return None
+        monkeypatch.setattr(ot2, "_ot2_probe_robot", fake_probe)
+        prog = []
+        robots = ot2._ot2_discover(extra_hosts=["opentrons.local"],
+                                   on_progress=lambda d, t: prog.append((d, t)))
+        hosts = [(r["host"], r["source"]) for r in robots]
+        # network robot ranks before the usb one; the dead 'known' + '.99' drop out
+        assert hosts == [("192.168.1.56", "network"), ("169.254.5.5", "usb")]
+        assert prog and prog[-1][0] == prog[-1][1]            # progress reaches 100%
+
+    def test_discover_cancel_stops_early(self, monkeypatch):
+        monkeypatch.setattr(ot2, "_ot2_mdns_responders", lambda **k: [])
+        monkeypatch.setattr(ot2, "_ot2_sweep_candidates",
+                            lambda **k: [(f"10.0.0.{i}", "network") for i in range(1, 40)])
+        monkeypatch.setattr(ot2, "_ot2_probe_robot", lambda *a, **k: None)
+        # cancel fires on the first completed probe → the sweep must not run all 39
+        seen = {"n": 0}
+
+        def cancel():
+            seen["n"] += 1
+            return True
+        ot2._ot2_discover(cancel=cancel)
+        assert seen["n"] >= 1                                 # cancel path exercised
+
+    def test_discover_egress_gated_fail_closed(self, monkeypatch):
+        def refuse(label=""):
+            raise RuntimeError("blocked in demo")
+        monkeypatch.setattr(ot2._state, "_demo_block_network_hook", refuse)
+        with pytest.raises(RuntimeError):
+            ot2._ot2_discover()                              # never scans a LAN in the demo
+
+    def test_usb_serial_hint_is_string_or_none(self):
+        # Environment-dependent (reads /dev/serial/by-id) — just contract-check it.
+        h = ot2._ot2_usb_serial_hint()
+        assert h is None or isinstance(h, str)
+
+    # ── hardening (2026-07-06 sweep) ──
+    def test_probe_caps_response_size(self, monkeypatch):
+        seen = {}
+        def fake(host, path, **kw):
+            seen.update(kw)
+            return dict(_ROBOT_HEALTH)
+        monkeypatch.setattr(ot2, "_ot2_request_json", fake)
+        ot2._ot2_probe_robot("192.168.1.56")
+        # a tight cap, NOT the 24 MB default — a rogue :31950 can't force a huge read
+        assert seen.get("max_bytes") == ot2._OT2_DISCOVER_HEALTH_MAX_BYTES
+        assert seen["max_bytes"] < ot2._OT2_JSON_MAX_BYTES
+
+    def test_is_lan_ip(self):
+        for ok in ("192.168.1.56", "10.0.0.4", "172.16.5.9", "169.254.5.5"):
+            assert ot2._ot2_is_lan_ip(ok), ok
+        for bad in ("8.8.8.8", "1.2.3.4", "not-an-ip", ""):
+            assert not ot2._ot2_is_lan_ip(bad), bad
+
+    def test_discover_rejects_offlan_mdns_responder(self, monkeypatch):
+        # a spoofed mDNS reply with a PUBLIC source IP must never be probed (SSRF)
+        monkeypatch.setattr(ot2, "_ot2_mdns_responders", lambda **k: ["8.8.8.8"])
+        monkeypatch.setattr(ot2, "_ot2_sweep_candidates", lambda **k: [])
+        probed = []
+        def fake_probe(host, timeout=0.8, source="network"):
+            probed.append(host)
+            return {"host": host, "name": "evil", "source": source}
+        monkeypatch.setattr(ot2, "_ot2_probe_robot", fake_probe)
+        robots = ot2._ot2_discover()
+        assert probed == [] and robots == []          # off-LAN candidate filtered out
+
+    def test_discover_known_host_exempt_from_lan_filter(self, monkeypatch):
+        # a user-configured host (extra_hosts) may be a .local name / any host
+        monkeypatch.setattr(ot2, "_ot2_mdns_responders", lambda **k: [])
+        monkeypatch.setattr(ot2, "_ot2_sweep_candidates", lambda **k: [])
+        probed = []
+        def fake_probe(host, timeout=0.8, source="network"):
+            probed.append((host, source))
+            return {"host": host, "name": "Jacques", "source": source}
+        monkeypatch.setattr(ot2, "_ot2_probe_robot", fake_probe)
+        robots = ot2._ot2_discover(extra_hosts=["opentrons.local"])
+        assert probed == [("opentrons.local", "known")] and len(robots) == 1
+
+    def test_discover_overall_deadline_bails(self, monkeypatch):
+        monkeypatch.setattr(ot2, "_ot2_mdns_responders", lambda **k: [])
+        monkeypatch.setattr(ot2, "_ot2_sweep_candidates",
+                            lambda **k: [("192.168.1.5", "network")])
+        monkeypatch.setattr(ot2, "_ot2_probe_robot",
+                            lambda *a, **k: {"host": a[0], "name": "x", "source": "network"})
+        # clock jumps past the deadline right after it's computed → the drain loop
+        # never enters, so a wedged sweep can't run forever
+        ticks = iter([0.0] + [ot2._OT2_DISCOVER_OVERALL_TIMEOUT + 1] * 50)
+        monkeypatch.setattr(ot2._util, "_monotonic", lambda: next(ticks))
+        assert ot2._ot2_discover() == []
 
 
 # ── Fault detection ─────────────────────────────────────────────────────────────
@@ -1849,17 +2037,18 @@ class TestAutolabTelemetry:
             await pilot.pause()
             scr = app.screen
             m = scr.query_one("#autolab-deck-map", sc.OT2DeckMap)
-            m.render()                          # sets _cw from the widget width
-            cw, ch = m._cw, m._ch
-            assert m._slot_at(1, 1) == 10                       # top-left bay
-            assert m._slot_at(cw + 3, 1) == 11                  # 2nd column, top row
-            assert m._slot_at(1, 4 * (ch + 1)) == 1             # 1st column, bottom row
+            m.render()                          # sets _cw / _pad_left from the width
+            cw, ch, pad = m._cw, m._ch, m._pad_left
+            # The grid is aspect-locked + centred, so clicks map relative to pad_left.
+            assert m._slot_at(pad + 1, 1) == 10                 # top-left bay
+            assert m._slot_at(pad + cw + 3, 1) == 11            # 2nd column, top row
+            assert m._slot_at(pad + 1, 4 * (ch + 1)) == 1       # 1st column, bottom row
             got = []
             m._on_bay = got.append
 
             class _Click:
                 def get_content_offset(self, _w):
-                    return Offset(1, 1)
+                    return Offset(pad + 1, 1)
             m.on_click(_Click())
             assert got == [10]                                 # click routed to the bay
 
@@ -1898,6 +2087,208 @@ class TestAutolabTelemetry:
             t = m.render()
             assert t.no_wrap is True and t.overflow == "crop"
             assert len(t.plain.split("\n")) == 4 * m._ch + 5   # grid intact, no wrap
+
+
+class TestAutolabDiscovery:
+    """The Find-Robots flow: scan → enumerated modal → connect, with an optional
+    auto-connect-to-first that skips the modal."""
+
+    async def test_find_controls_present(self):
+        import splicecraft as sc
+        from textual.widgets import Button, Checkbox
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            app.action_open_autolab(); await pilot.pause()
+            scr = app.screen
+            assert scr.query_one("#autolab-discover", Button) is not None
+            assert scr.query_one("#autolab-autoconnect", Checkbox) is not None
+
+    async def test_discover_done_opens_modal(self):
+        import splicecraft as sc
+        from textual.widgets import DataTable
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            app.action_open_autolab(); await pilot.pause()
+            scr = app.screen
+            scr.query_one("#autolab-autoconnect").value = False
+            robots = [{"host": "192.168.1.56", "name": "Jacques", "model": "OT-2",
+                       "source": "network", "fw_version": "7.1"},
+                      {"host": "169.254.5.5", "name": "USB-bot", "model": "OT-2",
+                       "source": "usb", "fw_version": "7.1"}]
+            scr._discover_done(robots); await pilot.pause()
+            assert isinstance(app.screen, sc.OT2DiscoverModal)
+            assert app.screen.query_one("#ot2disc-table", DataTable).row_count == 2
+            assert app.screen._selected()["host"] == "192.168.1.56"   # first is default
+
+    async def test_discover_autoconnect_sets_host_and_connects(self):
+        import splicecraft as sc
+        from textual.widgets import Input
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            app.action_open_autolab(); await pilot.pause()
+            scr = app.screen
+            scr.query_one("#autolab-autoconnect").value = True
+            called = []
+            scr._worker_status = lambda host: called.append(host)   # stub the network
+            scr._discover_done([{"host": "10.0.0.7", "name": "Bo", "source": "network"}])
+            await pilot.pause()
+            assert not isinstance(app.screen, sc.OT2DiscoverModal)   # skipped the modal
+            assert scr.query_one("#autolab-host", Input).value == "10.0.0.7"
+            assert called == ["10.0.0.7"]
+
+    async def test_discover_none_no_modal(self):
+        import splicecraft as sc
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            app.action_open_autolab(); await pilot.pause()
+            scr = app.screen
+            scr._discover_done([]); await pilot.pause()
+            assert isinstance(app.screen, sc.AutolabScreen)          # stayed put
+
+    async def test_apply_discovered_robot_persists_host(self):
+        import splicecraft as sc
+        from textual.widgets import Input
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            app.action_open_autolab(); await pilot.pause()
+            scr = app.screen
+            scr._worker_status = lambda host: None
+            scr._apply_discovered_robot({"host": "192.168.1.42", "name": "Zed"})
+            assert scr.query_one("#autolab-host", Input).value == "192.168.1.42"
+            assert sc._get_setting("ot2_host") == "192.168.1.42"
+
+    async def test_autoconnect_checkbox_persists(self):
+        import splicecraft as sc
+        from textual.widgets import Checkbox
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            app.action_open_autolab(); await pilot.pause()
+            cb = app.screen.query_one("#autolab-autoconnect", Checkbox)
+            cb.value = True; await pilot.pause()
+            assert sc._get_setting("ot2_autoconnect") is True
+            cb.value = False; await pilot.pause()
+            assert sc._get_setting("ot2_autoconnect") is False
+
+    async def test_discover_modal_connect_dismisses_first(self):
+        import splicecraft as sc
+        from textual.widgets import Button
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            r1 = {"host": "192.168.1.56", "name": "Jacques", "source": "network"}
+            r2 = {"host": "169.254.5.5", "name": "USB-bot", "source": "usb"}
+            got = {}
+            app.push_screen(sc.OT2DiscoverModal([r1, r2], "usb hint"),
+                            lambda res: got.__setitem__("r", res))
+            await pilot.pause()
+            m = app.screen
+            assert isinstance(m, sc.OT2DiscoverModal)
+            m.on_button_pressed(Button.Pressed(m.query_one("#ot2disc-connect", Button)))
+            await pilot.pause()
+            assert got["r"] == r1                              # highlighted (first) robot
+
+    async def test_discover_modal_rescan(self):
+        import splicecraft as sc
+        from textual.widgets import Button
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            got = {}
+            app.push_screen(sc.OT2DiscoverModal(
+                [{"host": "1.2.3.4", "name": "X", "source": "network"}]),
+                lambda res: got.__setitem__("r", res))
+            await pilot.pause()
+            m = app.screen
+            m.on_button_pressed(Button.Pressed(m.query_one("#ot2disc-rescan", Button)))
+            await pilot.pause()
+            assert got["r"] == {"action": "rescan"}
+
+    async def test_discover_result_rescan_triggers_new_scan(self):
+        import splicecraft as sc
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            app.action_open_autolab(); await pilot.pause()
+            scr = app.screen
+            fired = []
+            scr._on_discover = lambda: fired.append(1)
+            scr._on_discover_result({"action": "rescan"})
+            assert fired == [1]
+
+    async def test_discover_empty_modal_has_no_connect(self):
+        import splicecraft as sc
+        import pytest as _pytest
+        from textual.widgets import Button
+        from textual.css.query import NoMatches
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            app.push_screen(sc.OT2DiscoverModal([], "USB serial present"))
+            await pilot.pause()
+            m = app.screen
+            assert isinstance(m, sc.OT2DiscoverModal)
+            with _pytest.raises(NoMatches):
+                m.query_one("#ot2disc-connect", Button)      # nothing to connect to
+            await pilot.press("escape"); await pilot.pause()
+            assert not isinstance(app.screen, sc.OT2DiscoverModal)
+
+    # ── hardening (2026-07-06 sweep) ──
+    async def test_deck_click_rejects_gutter(self):
+        import splicecraft as sc
+        from textual.geometry import Offset
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(160, 44)) as pilot:   # wide → big side gutters
+            app.action_open_autolab(); await pilot.pause()
+            m = app.screen.query_one("#autolab-deck-map", sc.OT2DeckMap)
+            m.render()
+            cw, pad = m._cw, m._pad_left
+            grid_w = m._COLS * cw + (m._COLS + 1)
+            assert pad > 0                                    # centred, real gutters
+            assert m._slot_at(pad + 1, 1) is not None         # inside → a real bay
+            assert m._slot_at(0, 1) is None                   # left gutter → nothing
+            assert m._slot_at(pad + grid_w + 1, 1) is None    # right gutter → nothing
+            got = []
+            m._on_bay = got.append
+
+            class _Click:
+                def __init__(self, x): self._x = x
+                def get_content_offset(self, _w): return Offset(self._x, 1)
+            m.on_click(_Click(0))                             # click the whitespace gutter
+            assert got == []                                  # no picker from whitespace
+            m.on_click(_Click(pad + 1))                       # click a real bay
+            assert got == [10]
+
+    async def test_reopen_reseeds_host_and_autoconnect(self):
+        import splicecraft as sc
+        from textual.widgets import Checkbox, Input
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            app.action_open_autolab(); await pilot.pause()
+            scr = app.screen
+            sc._set_setting("ot2_autoconnect", True)
+            sc._set_setting("ot2_host", "192.168.9.9")
+            app.pop_screen(); await pilot.pause()             # close AUTOLAB
+            app.action_open_autolab(); await pilot.pause()    # reopen (reused instance)
+            scr2 = app.screen
+            assert scr2 is scr                                # same cached screen
+            assert scr2.query_one("#autolab-autoconnect", Checkbox).value is True
+            assert scr2.query_one("#autolab-host", Input).value == "192.168.9.9"
+
+    async def test_worker_discover_passes_typed_host(self, monkeypatch):
+        import splicecraft as sc
+        from textual.widgets import Input
+        app = sc.PlasmidApp()
+        async with app.run_test(size=(120, 50)) as pilot:
+            app.action_open_autolab(); await pilot.pause()
+            scr = app.screen
+            captured = {}
+            def fake_discover(**kw):
+                captured.update(kw)
+                return []
+            monkeypatch.setattr(sc._ot2, "_ot2_discover", fake_discover)
+            scr.query_one("#autolab-host", Input).value = "1.2.3.4"
+            scr._on_discover()                                # host read on UI thread
+            for _ in range(60):
+                await pilot.pause()
+                if "extra_hosts" in captured:
+                    break
+            assert captured.get("extra_hosts") == ["1.2.3.4"]  # passed into the worker
 
 
 # ── Hardening sweep (edge-case audit follow-up) ─────────────────────────────────

@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import math
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -71,6 +72,24 @@ _OT2_UPLOAD_TIMEOUT = 90         # POST /protocols (also kicks off analysis)
 _OT2_ANALYSIS_POLL_TIMEOUT = 180 # wait for server-side analysis to complete
 _OT2_RUN_POLL_TIMEOUT = 1800     # a physical run: 30 min ceiling
 _OT2_POLL_INTERVAL = 1.0
+
+# ── Discovery tunables ──────────────────────────────────────────────────────────
+# Find robots by sweeping the local subnet(s) for a live robot-server. A dead host
+# hits the full probe timeout (a closed port refuses instantly), so keep it short
+# and the pool wide: one /24 (254 hosts) then sweeps in a few seconds.
+_OT2_DISCOVER_PROBE_TIMEOUT = 0.8   # per-host /health probe during a sweep
+_OT2_DISCOVER_WORKERS = 64          # concurrent probes (bounded pool)
+_OT2_DISCOVER_MAX_HOSTS = 1024      # hard cap on addresses probed in one sweep
+# A /health reply is well under 4 KB; cap the probe tight so a rogue/large service
+# answering on :31950 can't make every worker buffer the 24 MB default across a sweep.
+_OT2_DISCOVER_HEALTH_MAX_BYTES = 64 * 1024
+# Wall-clock backstop for a whole sweep — a well-behaved /24 finishes in a few
+# seconds; this only trips on a host that trickles bytes to stall a worker.
+_OT2_DISCOVER_OVERALL_TIMEOUT = 30.0
+# One-shot mDNS multicast to catch robots the flat subnet sweep would miss.
+_OT2_MDNS_GROUP = "224.0.0.251"
+_OT2_MDNS_PORT = 5353
+_OT2_MDNS_TIMEOUT = 1.5             # seconds to collect responders
 
 # Response-size cap (bytes). A protocol analysis with hundreds of commands can be
 # a few MB; 24 MB is generous vs. real payloads yet defends against a misbehaving
@@ -1071,6 +1090,12 @@ def _ot2_cherrypick_steps(picks: "list[dict[str, Any]]", *, src_id: str, dst_id:
 #      1   2   3
 _OT2_DECK_LAYOUT = [[10, 11, 12], [7, 8, 9], [4, 5, 6], [1, 2, 3]]
 
+# A single deck slot's physical footprint (mm): the ANSI/SLAS microplate standard,
+# long axis left-right. Width:depth ≈ 1.49 — a slot is a landscape rectangle, not a
+# square. The Textual deck map (OT2DeckMap) uses this to draw bays at the real
+# aspect ratio rather than as squished slivers.
+_OT2_SLOT_FOOTPRINT_MM = (127.76, 85.48)
+
 
 def _ot2_short_labware(name: str) -> str:
     """A compact display label for a labware load name — its friendly alias if
@@ -1252,6 +1277,7 @@ def _ot2_request_json(host: str, path: str, *, method: str = "GET",
         detail = ""
         try:
             detail = exc.read(64 * 1024).decode("utf-8", "replace")
+            exc.close()          # release the socket promptly (up to 1024×/sweep)
         except Exception:
             pass
         raise OT2Error(f"OT-2 {method} {path} → HTTP {exc.code}"
@@ -1292,6 +1318,7 @@ def _ot2_request_multipart(host: str, path: str, *, filename: str, file_bytes: b
         detail = ""
         try:
             detail = exc.read(64 * 1024).decode("utf-8", "replace")
+            exc.close()          # release the socket promptly (up to 1024×/sweep)
         except Exception:
             pass
         raise OT2Error(f"OT-2 protocol upload → HTTP {exc.code}"
@@ -1342,6 +1369,289 @@ def _ot2_disengage(host: str, *, axes: "list[str] | None" = None) -> "dict[str, 
         ax = list(_OT2_ALL_AXES)
     return _ot2_request_json(host, "/motors/disengage", method="POST",
                              payload={"axes": ax})
+
+
+# ── Robot discovery (network sweep + mDNS + USB link-local) ──────────────────────
+# Find OT-2 robots reachable from this machine WITHOUT any new dependency. Three
+# best-effort, pure-stdlib sources are merged: a concurrent ``/health`` sweep of the
+# local subnet(s), a one-shot mDNS multicast (catches robots the flat sweep misses),
+# and the USB link-local interface (169.254/16) an OT-2 USB-ethernet gadget brings
+# up. Every candidate is CONFIRMED by a real ``GET /health`` carrying an Opentrons
+# signature, so only genuine robots are ever returned.
+
+def _ot2_probe_robot(host: str, *, timeout: float = _OT2_DISCOVER_PROBE_TIMEOUT,
+                     source: str = "network") -> "dict[str, Any] | None":
+    """Probe one host's ``/health``. Returns a robot-summary dict for a genuine OT-2
+    (health JSON carrying an Opentrons version signature), else ``None``. NEVER
+    raises — a dead or non-robot host is just a miss, so the sweep can fan out over
+    a whole subnet safely."""
+    try:
+        h = _ot2_request_json(host, "/health", timeout=timeout,
+                              max_bytes=_OT2_DISCOVER_HEALTH_MAX_BYTES)
+    except Exception:
+        return None
+    if not isinstance(h, dict):
+        return None
+    # A random service answering on :31950 that ISN'T a robot-server won't carry
+    # these Opentrons-only version fields; require at least one so discovery can
+    # never list a false robot.
+    sig = h.get("api_version") or h.get("fw_version") or h.get("system_version")
+    if not sig:
+        return None
+    name = h.get("name")
+    return {
+        "host": host,
+        "name": str(name) if name else host,
+        "model": h.get("robot_model") or "OT-2",
+        "fw_version": h.get("fw_version"),
+        "api_version": h.get("api_version"),
+        "system_version": h.get("system_version"),
+        "serial": h.get("serial_number") or h.get("serialNumber"),
+        "source": source,
+    }
+
+
+def _ot2_host_ipv4s() -> "list[tuple[str, bool]]":
+    """This machine's own IPv4 address(es) as ``(addr, is_link_local)`` pairs,
+    stdlib-only (no ``netifaces``/``ifaddr``). The UDP-connect trick reads the
+    source address the OS would use to reach a target WITHOUT sending a packet, one
+    per probed route — a normal LAN address plus, if a USB-ethernet gadget is up, a
+    ``169.254`` link-local one. ``getaddrinfo(hostname)`` supplements. Deduped;
+    loopback dropped."""
+    found: "dict[str, bool]" = {}
+    for tgt in ("10.255.255.255", "172.31.255.255", "192.168.255.255",
+                "169.254.255.255"):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect((tgt, 9))          # no traffic — only fixes the local addr
+                ip = s.getsockname()[0]
+            finally:
+                s.close()
+        except OSError:
+            continue
+        if ip and not ip.startswith("127."):
+            found[ip] = ip.startswith("169.254.")
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = str(info[4][0])          # AF_INET sockaddr is (addr, port)
+            if ip and not ip.startswith("127."):
+                found.setdefault(ip, ip.startswith("169.254."))
+    except OSError:
+        pass
+    return list(found.items())
+
+
+def _ot2_sweep_candidates(*, max_hosts: int = _OT2_DISCOVER_MAX_HOSTS
+                          ) -> "list[tuple[str, str]]":
+    """Every host address in the local ``/24``(s) to probe, as ``(host, source)``
+    pairs. Each of this machine's interfaces contributes its ``/24`` (254 hosts) —
+    enough for a home/lab LAN, small enough to sweep in a few seconds; a wider
+    prefix is clamped to ``/24`` so a ``/16`` can't explode into 65k probes. A
+    link-local (``169.254``) interface is tagged ``"usb"`` (that's the address
+    family an OT-2 USB gadget uses); everything else ``"network"``. Deduped, own
+    address skipped, hard-capped."""
+    import ipaddress
+    out: "list[tuple[str, str]]" = []
+    seen: "set[str]" = set()
+    for ip, is_ll in _ot2_host_ipv4s():
+        try:
+            net = ipaddress.ip_network(f"{ip}/24", strict=False)
+        except ValueError:
+            continue
+        src = "usb" if is_ll else "network"
+        for host in net.hosts():
+            h = str(host)
+            if h == ip or h in seen:
+                continue
+            seen.add(h)
+            out.append((h, src))
+            if len(out) >= max_hosts:
+                return out
+    return out
+
+
+def _ot2_build_mdns_query(service: str = "_http._tcp.local") -> bytes:
+    """A minimal one-question mDNS packet: a PTR query for ``service``. Header (id 0,
+    flags 0, 1 question, 0 answers) + length-prefixed QNAME + QTYPE 12 (PTR) +
+    QCLASS ``0x8001`` — IN (1) with the top **QU (unicast-response) bit** set, so
+    responders reply directly to our ephemeral socket instead of only to the
+    multicast group (which, un-joined + off port 5353, we'd never receive)."""
+    import struct
+    header = struct.pack(">HHHHHH", 0, 0, 1, 0, 0, 0)
+    qname = b"".join(bytes([len(lbl)]) + lbl.encode("ascii")
+                     for lbl in service.split(".") if lbl) + b"\x00"
+    return header + qname + struct.pack(">HH", 12, 0x8001)
+
+
+def _ot2_mdns_responders(*, timeout: float = _OT2_MDNS_TIMEOUT) -> "list[str]":
+    """Best-effort mDNS: multicast an ``_http._tcp`` PTR query and collect the
+    SOURCE address of every responder. We deliberately do NOT parse the DNS answer
+    (name compression is a footgun) — we harvest who replied and let ``/health``
+    decide which are OT-2s. Pure stdlib, swallow-all (mDNS is a bonus on top of the
+    subnet sweep). Returns responder IPs (loopback dropped)."""
+    ips: "set[str]" = set()
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except OSError:
+            pass
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        sock.settimeout(0.5)
+        sock.sendto(_ot2_build_mdns_query(), (_OT2_MDNS_GROUP, _OT2_MDNS_PORT))
+        deadline = _util._monotonic() + max(0.1, float(timeout))
+        while _util._monotonic() < deadline:
+            try:
+                _data, addr = sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if addr and addr[0] and not addr[0].startswith("127."):
+                ips.add(addr[0])
+    except OSError:
+        pass
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+    return sorted(ips)
+
+
+def _ot2_usb_serial_hint() -> "str | None":
+    """Best-effort, non-fatal: is an OT-2 cabled over USB as a serial device? Linux
+    only (reads ``/dev/serial/by-id``). Returns a short human note or ``None``. It
+    does NOT imply serial control — the OT-2 API is HTTP; this only flags a cabled
+    robot that may need USB networking (or Wi-Fi/Ethernet) to expose an address we
+    can actually reach."""
+    import glob
+    import os
+    try:
+        for path in sorted(glob.glob("/dev/serial/by-id/*")):
+            low = os.path.basename(path).lower()
+            if "opentrons" in low or "ot-2" in low or "ot2" in low:
+                return (f"USB serial device present ({os.path.basename(path)}) — "
+                        "enable USB networking (or Wi-Fi/Ethernet) so it gets an "
+                        "address SpliceCraft can reach.")
+    except OSError:
+        pass
+    return None
+
+
+def _ot2_is_lan_ip(ip: str) -> bool:
+    """True iff ``ip`` is a private (RFC-1918) or link-local IPv4 address — the only
+    ranges an OT-2 legitimately lives on. Discovery filters every AUTO-discovered
+    candidate (subnet sweep + mDNS responder) through this so a spoofed mDNS reply
+    can't point the probe at an arbitrary off-LAN address. The user's own persisted
+    host is exempt (it's config, not discovery, and may be a ``.local`` name)."""
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return bool(addr.is_private or addr.is_link_local)
+
+
+def _ot2_discover(*, probe_timeout: float = _OT2_DISCOVER_PROBE_TIMEOUT,
+                  max_hosts: int = _OT2_DISCOVER_MAX_HOSTS,
+                  workers: int = _OT2_DISCOVER_WORKERS, use_mdns: bool = True,
+                  extra_hosts: "list[str] | None" = None,
+                  on_progress: "Any" = None, cancel: "Any" = None
+                  ) -> "list[dict[str, Any]]":
+    """Discover OT-2 robots reachable from this machine. Merges three best-effort,
+    dependency-free candidate sources — mDNS responders, the local ``/24`` subnet
+    sweep (incl. any USB link-local interface), and caller ``extra_hosts`` (e.g. the
+    persisted host) — then CONFIRMS each with a real ``GET /health`` carrying an
+    Opentrons signature, concurrently over a bounded pool. Returns a list of robot
+    dicts, sorted known/network-first then by name. ``on_progress(done, total)``
+    fires as probes finish; a truthy ``cancel()`` aborts the sweep early. Egress is
+    gated by the fail-closed demo hook, so a web-demo session never scans a LAN."""
+    import concurrent.futures
+    _state._demo_block_network_hook("OT-2 discovery")
+
+    cands: "list[tuple[str, str]]" = []      # (host, source), deduped
+    seen: "set[str]" = set()
+
+    def _add(host: str, source: str) -> None:
+        host = (host or "").strip()
+        if not host or host in seen:
+            return
+        # An auto-discovered candidate (sweep / mDNS responder) MUST be a LAN IP so a
+        # forged mDNS source address can't redirect the probe off-box; the user's own
+        # persisted host ("known") is exempt.
+        if source != "known" and not _ot2_is_lan_ip(host):
+            return
+        seen.add(host)
+        cands.append((host, source))
+
+    # Known/persisted hosts first (so a reachable one sorts to the top), then mDNS,
+    # then the flat sweep.
+    for h in (extra_hosts or []):
+        _add(str(h), "known")
+    if use_mdns:
+        try:
+            for ip in _ot2_mdns_responders():
+                _add(ip, "usb" if ip.startswith("169.254.") else "network")
+        except Exception:
+            _log.debug("[ot2] mDNS discovery failed (ignored)", exc_info=True)
+    try:
+        for host, source in _ot2_sweep_candidates(max_hosts=max_hosts):
+            _add(host, source)
+    except Exception:
+        _log.debug("[ot2] subnet enumeration failed (ignored)", exc_info=True)
+
+    total = len(cands)
+    found: "list[dict[str, Any]]" = []
+    if not total:
+        return found
+
+    def _cancelled() -> bool:
+        try:
+            return bool(cancel and cancel())
+        except Exception:
+            return False
+
+    done = 0
+    deadline = _util._monotonic() + _OT2_DISCOVER_OVERALL_TIMEOUT
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(workers)))
+    try:
+        futs = {ex.submit(_ot2_probe_robot, host, timeout=probe_timeout, source=src): host
+                for host, src in cands}
+        # Drain in short waits (not a bare `as_completed`) so `cancel()` and the
+        # overall deadline stay responsive even while every in-flight probe is
+        # blocked on a slow host — a bare as_completed would only re-check between
+        # completions and a wedged batch would freeze the whole loop.
+        pending = set(futs)
+        while pending and not _cancelled() and _util._monotonic() < deadline:
+            batch, pending = concurrent.futures.wait(
+                pending, timeout=0.25,
+                return_when=concurrent.futures.FIRST_COMPLETED)
+            for fut in batch:
+                done += 1
+                if on_progress:
+                    try:
+                        on_progress(done, total)
+                    except Exception:
+                        pass
+                try:
+                    robot = fut.result()
+                except Exception:
+                    robot = None
+                if robot:
+                    found.append(robot)
+    finally:
+        # Don't block on the remaining probes when cancelled or erroring — a sweep
+        # of dead hosts would otherwise hang on their timeouts.
+        ex.shutdown(wait=False, cancel_futures=True)
+
+    rank = {"known": 0, "network": 1, "usb": 2}
+    found.sort(key=lambda r: (rank.get(str(r.get("source")), 3),
+                              str(r.get("name") or "").lower()))
+    return found
 
 
 # ── Telemetry / fault detection ─────────────────────────────────────────────────

@@ -327,10 +327,13 @@ including a `call` passthrough to every endpoint) drive every workflow.
 Full feature reference: [`docs/features.md`](docs/features.md).
 
 SpliceCraft can also drive an **Opentrons OT-2** liquid handler. The **AUTOLAB**
-toolbar item is a five-panel protocol designer: an interactive **Deck** drawn as a
-top-down diagram of the robot — the slots as one connected grid of boxes in the
-physical layout, colour-filled by what's on each bay, scaling with your terminal
-(click a bay to place or clear its labware), a **Designer** for an ordered sequence of
+toolbar item is a five-panel protocol designer. **Find Robots** scans your network
+(and USB) for OT-2s and lists what it finds in a pick-and-connect modal — or tick
+**Auto-connect to first** to search and connect in one click. Then an interactive
+**Deck** drawn as a top-down diagram of the robot — the slots as one connected grid
+of boxes in the physical layout, each bay drawn at the real slot's rectangular
+aspect ratio and the whole deck scaled + centred to your terminal, colour-filled by
+what's on each bay (click a bay to place or clear its labware), a **Designer** for an ordered sequence of
 steps (transfer, distribute, consolidate, mix, delay, pause, comment), a
 **Labware** tab that keeps a library of custom labware you define from a simple
 grid form, a **Library** tab that links the robot to your plasmid library —
