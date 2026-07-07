@@ -204,8 +204,9 @@ def _vector_half_top_seq(ev_gb: str, enzyme: str) -> "str | None":
     enzyme inputs we feed.
     """
     key = (hash(ev_gb), enzyme)
-    if key in _state._VECTOR_MATCH_CACHE:
-        return _state._VECTOR_MATCH_CACHE[key]
+    with _state._COMPUTE_CACHE_LOCK:
+        if key in _state._VECTOR_MATCH_CACHE:
+            return _state._VECTOR_MATCH_CACHE[key]
     result: "str | None" = None
     try:
         ev_rec = _gb_text_to_record(ev_gb)
@@ -240,12 +241,13 @@ def _vector_half_top_seq(ev_gb: str, enzyme: str) -> "str | None":
     # Bounded LRU-ish: drop one arbitrary entry when over cap. Insertion
     # order eviction (Python 3.7+ dict preserves insertion order) gives
     # us FIFO behaviour without an OrderedDict import.
-    if len(_state._VECTOR_MATCH_CACHE) >= _VECTOR_MATCH_CACHE_MAX:
-        try:
-            _state._VECTOR_MATCH_CACHE.pop(next(iter(_state._VECTOR_MATCH_CACHE)))
-        except StopIteration:
-            pass
-    _state._VECTOR_MATCH_CACHE[key] = result
+    with _state._COMPUTE_CACHE_LOCK:
+        if len(_state._VECTOR_MATCH_CACHE) >= _VECTOR_MATCH_CACHE_MAX:
+            try:
+                _state._VECTOR_MATCH_CACHE.pop(next(iter(_state._VECTOR_MATCH_CACHE)))
+            except (StopIteration, KeyError):
+                pass
+        _state._VECTOR_MATCH_CACHE[key] = result
     return result
 
 
@@ -524,9 +526,10 @@ def _grammar_acceptor_tu_pairs(
     fall through to None classification with no hint why.
     """
     cache_key = (grammar_id, enzyme)
-    cached = _state._ACCEPTOR_TU_PAIRS_CACHE.get(cache_key)
-    if cached is not None:
-        return list(cached)
+    with _state._COMPUTE_CACHE_LOCK:
+        cached = _state._ACCEPTOR_TU_PAIRS_CACHE.get(cache_key)
+        if cached is not None:
+            return list(cached)
     out: "list[tuple[str, str, str, str]]" = []
     for ev in _load_entry_vectors():
         if ev.get("grammar_id") != grammar_id:
@@ -583,12 +586,13 @@ def _grammar_acceptor_tu_pairs(
         if oh5 and oh3:
             out.append((role, ev_name, oh5, oh3))
     # Sweep #26: FIFO-evict oldest entry if at cap.
-    if len(_state._ACCEPTOR_TU_PAIRS_CACHE) >= _ACCEPTOR_TU_PAIRS_CACHE_MAX:
-        try:
-            _state._ACCEPTOR_TU_PAIRS_CACHE.pop(next(iter(_state._ACCEPTOR_TU_PAIRS_CACHE)))
-        except (StopIteration, KeyError):
-            pass
-    _state._ACCEPTOR_TU_PAIRS_CACHE[cache_key] = list(out)
+    with _state._COMPUTE_CACHE_LOCK:
+        if len(_state._ACCEPTOR_TU_PAIRS_CACHE) >= _ACCEPTOR_TU_PAIRS_CACHE_MAX:
+            try:
+                _state._ACCEPTOR_TU_PAIRS_CACHE.pop(next(iter(_state._ACCEPTOR_TU_PAIRS_CACHE)))
+            except (StopIteration, KeyError):
+                pass
+        _state._ACCEPTOR_TU_PAIRS_CACHE[cache_key] = list(out)
     return out
 
 

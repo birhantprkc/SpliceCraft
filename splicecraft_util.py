@@ -1153,16 +1153,38 @@ def _safe_xml_parse(xml_data: str, *, allow_dtd: bool = False):
                     "XML contains DTD/ENTITY — refusing to parse"
                 )
             # Permit an external-DTD reference but refuse any internal
-            # subset (`[ … ]`), which is where entity-expansion attacks
-            # live. The DOCTYPE without a subset ends at the first `>`.
-            close = xml_data.find(">", i)
-            bracket = xml_data.find("[", i)
-            if close == -1:
-                break  # malformed — let expat surface the parse error
-            if bracket != -1 and bracket < close:
+            # subset (`[ … ]`), which is where entity-expansion attacks live.
+            # Find the DOCTYPE's terminating `>` QUOTE-AWARELY: a SYSTEM/PUBLIC
+            # literal can legally contain a `>` (e.g. `SYSTEM "a>b"`), so a naive
+            # first-`>` scan would stop INSIDE the literal and miss a trailing
+            # `[ … ]` subset — a billion-laughs bypass. Walk char-by-char,
+            # skipping quoted spans, and stop at the first UNquoted `[` (subset →
+            # refuse) or `>` (clean external ref → skip past it).
+            j = i + len("<!doctype")
+            quote = ""
+            close = -1
+            saw_bracket = False
+            n_xml = len(xml_data)
+            while j < n_xml:
+                ch = xml_data[j]
+                if quote:
+                    if ch == quote:
+                        quote = ""
+                elif ch in ("'", '"'):
+                    quote = ch
+                elif ch == "[":
+                    saw_bracket = True
+                    break
+                elif ch == ">":
+                    close = j
+                    break
+                j += 1
+            if saw_bracket:
                 raise ET.ParseError(
                     "XML DOCTYPE has an internal subset — refusing to parse"
                 )
+            if close == -1:
+                break  # malformed / unterminated — let expat surface it
             i = close + 1
             continue
         # Reached a normal start tag — safe to hand off to expat.

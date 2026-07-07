@@ -973,13 +973,17 @@ def _h_set_active_codon_table(app, payload):
 @_agent_endpoint("optimize-protein")
 def _h_optimize_protein(app, payload):
     """Codon-optimize a 1-letter AA sequence to DNA using a codon
-    table from the registry. Body: ``{protein, table?, stops?}`` where
+    table from the registry. Body: ``{protein, table?, stops?,
+    transl_table?}`` where
     `table` is a taxid (defaults to E. coli K12 = 83333) and `stops`
     (0–3, default 1) is how many stop codons to append when `protein`
     has no trailing '*'. A trailing '*' run in `protein` (1–3) is honored
     verbatim and overrides `stops`; a single stop is TAA, 2–3 are
-    frequency-matched to the table's stop usage. Read-only — doesn't
-    touch the loaded record."""
+    frequency-matched to the table's stop usage. `transl_table` is an
+    optional NCBI genetic-code id (default 1 = standard); set it (e.g. 4
+    Mycoplasma, 6 ciliate, a mito code) so a host with a reassigned codon
+    optimises and terminates against the code it actually reads. Read-only —
+    doesn't touch the loaded record."""
     protein = _sanitize_label(payload.get("protein"),
                                 max_len=10_000).upper()
     if not protein:
@@ -996,13 +1000,26 @@ def _h_optimize_protein(app, payload):
         return ({"error": "'stops' must be an integer between 0 and 3"}, 400)
     if not 0 <= stops <= 3:
         return ({"error": "'stops' must be between 0 and 3"}, 400)
+    # Optional NCBI genetic-code id (transl_table): default None ⇒ standard
+    # table 1. Lets a host with a reassigned codon (Mycoplasma 4, ciliate 6,
+    # a mito code) optimise + terminate correctly; an unknown id degrades to
+    # the standard code (with a log warning) rather than erroring.
+    transl_raw = payload.get("transl_table")
+    transl_table = None
+    if transl_raw is not None:
+        try:
+            transl_table = int(transl_raw)
+        except (TypeError, ValueError):
+            return ({"error": "'transl_table' must be an NCBI genetic-code "
+                      "integer (e.g. 1, 4, 6, 11)"}, 400)
     taxid = _sanitize_accession(payload.get("table")) or "83333"
     entry = _codon_tables_get(taxid)
     if entry is None:
         return ({"error": f"no codon table with taxid {taxid!r}; "
                           f"see list-codon-tables"}, 404)
     try:
-        dna = _codon_optimize(protein, entry["raw"], stops=stops)
+        dna = _codon_optimize(protein, entry["raw"], stops=stops,
+                              transl_table=transl_table)
     except ValueError as exc:
         return ({"error": str(exc)}, 400)
     return {
@@ -1010,6 +1027,7 @@ def _h_optimize_protein(app, payload):
         "protein":      protein,
         "table":        taxid,
         "table_name":   entry.get("name", "?"),
+        "transl_table": transl_table or 1,
         "dna":          dna,
         "length":       len(dna),
         "n_codons":     len(dna) // 3,
@@ -6757,6 +6775,12 @@ def _h_restore_backup(app, payload):
     }.get(msg)
     if cache_attr is not None:
         _state._reset_master_delete_cache_hook(cache_attr)
+    # Mirror files (plasmid_library / primers / parts_bin) revert on the next
+    # launch unless the restore is written through into the owning active
+    # collection — reconcile via the hub hook (guarded for the import window).
+    reconcile = getattr(_state, "_reconcile_mirror_after_restore_hook", None)
+    if reconcile is not None:
+        reconcile(path)
     return {"ok": True, "label": msg, "entries_restored": n,
             "source_path": str(src)}
 

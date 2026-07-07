@@ -175,9 +175,14 @@ def _mut_tm(seq: str) -> float:
         _log.exception(
             "_mut_tm: primer3.calc_tm fell back to GC approximation "
             "for %d-mer", len(seq))
-        gc = sum(1 for c in seq.upper() if c in "GC")
-        at = sum(1 for c in seq.upper() if c in "AT")
-        return 2 * at + 4 * gc
+        su = seq.upper()
+        gc = sum(1 for c in su if c in "GC")
+        at = sum(1 for c in su if c in "AT")
+        # Degenerate/IUPAC bases (N, R, Y, …) contribute to neither term; count
+        # them as the AT/GC midpoint (3) so a user-pasted degenerate oligo isn't
+        # Tm-UNDERestimated (which would over-extend a binding-region search).
+        other = len(su) - gc - at
+        return 2 * at + 4 * gc + 3 * other
     _mut_thermo_cache_put(_MUT_TM_CACHE, seq, val)
     return val
 
@@ -502,7 +507,10 @@ def _primer_tm(seq: str) -> "float | None":
     except Exception:
         gc = sum(1 for c in s if c in "GC")
         at = sum(1 for c in s if c in "AT")
-        return float(2 * at + 4 * gc)
+        # Degenerate/IUPAC bases → AT/GC midpoint (3) so a degenerate oligo
+        # isn't Tm-underestimated (mirrors `_mut_tm`).
+        other = len(s) - gc - at
+        return float(2 * at + 4 * gc + 3 * other)
 
 
 # Hard cap on the TOTAL synthesised oligo length: the 5' tail (pad + enzyme

@@ -173,7 +173,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   before saving), optimize-protein
   (codon-optimise an AA sequence to a chosen table; optional `stops`
   0–3 appends that many stop codons, and a trailing `*` run in the
-  protein is honored as-is and overrides it).
+  protein is honored as-is and overrides it; optional `transl_table`
+  is an NCBI genetic-code id — default 1 = standard — so a host with a
+  reassigned codon, e.g. 4 *Mycoplasma* or 6 ciliate, optimises and
+  terminates against the code it actually reads).
 - **Simulate** — simulate-pcr (exact-match in-silico amplification,
   wrap-aware on circular templates) and simulate-gel (per-lane band
   positions + optional rendered ASCII gel image; ladder / plasmid /

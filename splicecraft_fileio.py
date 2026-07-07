@@ -917,6 +917,7 @@ def _ab1_path_to_record(path: str):
     Raises ValueError on malformed traces / missing base-call channels
     or files exceeding the size cap.
     """
+    import struct
     from Bio import SeqIO
     ok, reason = _safe_file_size_check(
         Path(path), _BULK_IMPORT_MAX_BYTES, "AB1",
@@ -925,7 +926,10 @@ def _ab1_path_to_record(path: str):
         raise ValueError(reason or "AB1 trace rejected")
     try:
         records = list(SeqIO.parse(path, "abi"))
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, struct.error, KeyError) as exc:
+        # Biopython's ABI reader struct.unpack's attacker-controlled directory
+        # entries; a truncated/garbage trace can raise struct.error or KeyError.
+        # Normalise all of them to the friendly ValueError (mirrors load_genbank).
         raise ValueError(f"could not parse AB1 trace: {exc}") from exc
     if not records:
         raise ValueError(f"no base-called sequence in {Path(path).name}")
@@ -2674,11 +2678,14 @@ def _summarize_perbase_tsv(fh, *, max_bytes: "int | None" = None) -> dict:
             # silently discard its first data row.
             try:
                 float(cols[2])
-            except ValueError:
+            except (ValueError, OverflowError):
                 return
         try:
             v = int(float(cols[2]))
-        except ValueError:
+        except (ValueError, OverflowError):
+            # `int(float("1e400"))` / `int(float("inf"))` raise OverflowError,
+            # not ValueError — without this a single poisoned coverage row would
+            # escape to the outer `except Exception` and discard ALL QC stats.
             return
         n += 1
         total += v
@@ -3397,6 +3404,10 @@ def fetch_genbank(accession: str, email: str = "splicecraft@local"):
     # not the ~60s our retry intends. We do our own retry, so cap Biopython
     # at one try per efetch call.
     Entrez.max_tries = 1
+    # Serialise the process-global socket-timeout window (see _NCBI_FETCH_LOCK):
+    # a concurrent fetch must not interleave set/restore and leave this socket
+    # timeout-less → a pinned worker thread. Released in the `finally` below.
+    _state._NCBI_FETCH_LOCK.acquire()
     prev_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(_NCBI_TIMEOUT_S)
     # One-retry pattern with 250 ms backoff to absorb transient
@@ -3432,6 +3443,7 @@ def fetch_genbank(accession: str, email: str = "splicecraft@local"):
                 raise
     finally:
         socket.setdefaulttimeout(prev_timeout)
+        _state._NCBI_FETCH_LOCK.release()
     if raw is None:
         # Defensive — if we got here without raw, something went
         # wrong that the loop didn't catch. Fall back to last_exc.
@@ -3522,6 +3534,8 @@ def fetch_protein(accession: str, email: str = "splicecraft@local"):
     # not the ~60s our retry intends. We do our own retry, so cap Biopython
     # at one try per efetch call.
     Entrez.max_tries = 1
+    # Serialise the process-global socket-timeout window (see _NCBI_FETCH_LOCK).
+    _state._NCBI_FETCH_LOCK.acquire()
     prev_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(_NCBI_TIMEOUT_S)
     raw: "bytes | str | None" = None
@@ -3545,6 +3559,7 @@ def fetch_protein(accession: str, email: str = "splicecraft@local"):
                 raise
     finally:
         socket.setdefaulttimeout(prev_timeout)
+        _state._NCBI_FETCH_LOCK.release()
     if raw is None:
         raise last_exc if last_exc is not None else OSError(
             f"NCBI protein fetch failed for {accession!r}")

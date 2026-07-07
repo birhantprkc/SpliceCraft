@@ -85,10 +85,18 @@ def _iupac_pattern(site: str) -> "re.Pattern[str]":
     # metacharacter (``*``, ``(``, ``?``) became part of the pattern.
     # User-defined enzyme sites are an attack surface; validate here.
     key = site.upper()
-    pat = _PATTERN_CACHE.get(key)
-    if pat is not None:
-        _PATTERN_CACHE.move_to_end(key)
-        return pat
+    # An empty / whitespace-only site would compile to `re.compile("")`, which
+    # matches at EVERY position → a phantom cut at every base of any plasmid.
+    # Both `_rebuild_scan_catalog` and `_enzyme_cuts_impl` wrap this call in an
+    # `except ValueError … skip`, so raising here neutralises a corrupt
+    # custom_enzymes.json entry (e.g. `["", 1, 1]`) at a single chokepoint.
+    if not key.strip():
+        raise ValueError(f"recognition site {site!r} is empty / whitespace-only")
+    with _state._COMPUTE_CACHE_LOCK:
+        pat = _PATTERN_CACHE.get(key)
+        if pat is not None:
+            _PATTERN_CACHE.move_to_end(key)
+            return pat
     bad = [c for c in key if c not in _IUPAC_RE]
     if bad:
         raise ValueError(
@@ -97,9 +105,10 @@ def _iupac_pattern(site: str) -> "re.Pattern[str]":
             f"{' (truncated)' if len(bad) > 6 else ''}"
         )
     pat = re.compile("".join(_IUPAC_RE[c] for c in key))
-    _PATTERN_CACHE[key] = pat
-    if len(_PATTERN_CACHE) > _PATTERN_CACHE_MAX:
-        _PATTERN_CACHE.popitem(last=False)
+    with _state._COMPUTE_CACHE_LOCK:
+        _PATTERN_CACHE[key] = pat
+        if len(_PATTERN_CACHE) > _PATTERN_CACHE_MAX:
+            _PATTERN_CACHE.popitem(last=False)
     return pat
 
 
@@ -1556,22 +1565,32 @@ def _scan_restriction_sites(
     allowed_key = (
         tuple(sorted(allowed_enzymes)) if allowed_enzymes else None
     )
-    key = (hash(seq), int(min_recognition_len),
+    # `len(seq)` is folded into the key so two different sequences can only
+    # ever share a slot if they collide on BOTH `hash()` AND length — a strictly
+    # narrower (still statistically-negligible) collision cross-section at zero
+    # memory cost (unlike full value-keying, which would pin a multi-Mb string
+    # per slot; see `_ENZYME_CUTS_CACHE`).
+    key = (hash(seq), len(seq), int(min_recognition_len),
            bool(unique_only), bool(circular), allowed_key)
-    hit = _state._RESTR_SCAN_CACHE.get(key)
-    if hit is not None:
-        # Move to end (LRU touch) so a steady-state "I'm scanning the
-        # same record" stays hot.
-        _state._RESTR_SCAN_CACHE.move_to_end(key)
-        return hit
+    with _state._COMPUTE_CACHE_LOCK:
+        hit = _state._RESTR_SCAN_CACHE.get(key)
+        if hit is not None:
+            # Move to end (LRU touch) so a steady-state "I'm scanning the
+            # same record" stays hot.
+            _state._RESTR_SCAN_CACHE.move_to_end(key)
+            # Defensive copy (match `_enzyme_cuts`): a consumer that mutates
+            # the returned resite/recut dicts must not poison the shared cache
+            # entry for the next scan of this sequence.
+            return [dict(d) for d in hit]
     result = _scan_restriction_sites_impl(
         seq, min_recognition_len, unique_only, circular,
         allowed_enzymes=allowed_enzymes,
     )
-    if len(_state._RESTR_SCAN_CACHE) >= _state._RESTR_SCAN_CACHE_MAX:
-        _state._RESTR_SCAN_CACHE.popitem(last=False)
-    _state._RESTR_SCAN_CACHE[key] = result
-    return result
+    with _state._COMPUTE_CACHE_LOCK:
+        if len(_state._RESTR_SCAN_CACHE) >= _state._RESTR_SCAN_CACHE_MAX:
+            _state._RESTR_SCAN_CACHE.popitem(last=False)
+        _state._RESTR_SCAN_CACHE[key] = result
+    return [dict(d) for d in result]
 
 
 def _scan_restriction_sites_impl(
@@ -1886,18 +1905,20 @@ def _enzyme_cuts(seq: str, enzyme_names: list[str], *,
     Why not `id(seq)`: the old key only worked when the caller held
     onto the exact same string object across calls. The traditional-
     cloning flow doesn't, so the cache used to be permanently cold."""
-    key = (hash(seq), tuple(sorted(set(enzyme_names))), bool(circular))
-    hit = _state._ENZYME_CUTS_CACHE.get(key)
-    if hit is not None:
-        _state._ENZYME_CUTS_CACHE.move_to_end(key)
-        # Defensive copy — callers occasionally mutate fragment dicts
-        # (e.g., when filtering features), and a shared mutable list
-        # would poison subsequent hits.
-        return [dict(c) for c in hit]
+    key = (hash(seq), len(seq), tuple(sorted(set(enzyme_names))), bool(circular))
+    with _state._COMPUTE_CACHE_LOCK:
+        hit = _state._ENZYME_CUTS_CACHE.get(key)
+        if hit is not None:
+            _state._ENZYME_CUTS_CACHE.move_to_end(key)
+            # Defensive copy — callers occasionally mutate fragment dicts
+            # (e.g., when filtering features), and a shared mutable list
+            # would poison subsequent hits.
+            return [dict(c) for c in hit]
     result = _enzyme_cuts_impl(seq, enzyme_names, circular=circular)
-    if len(_state._ENZYME_CUTS_CACHE) >= _state._ENZYME_CUTS_CACHE_MAX:
-        _state._ENZYME_CUTS_CACHE.popitem(last=False)
-    _state._ENZYME_CUTS_CACHE[key] = [dict(c) for c in result]
+    with _state._COMPUTE_CACHE_LOCK:
+        if len(_state._ENZYME_CUTS_CACHE) >= _state._ENZYME_CUTS_CACHE_MAX:
+            _state._ENZYME_CUTS_CACHE.popitem(last=False)
+        _state._ENZYME_CUTS_CACHE[key] = [dict(c) for c in result]
     return result
 
 
@@ -2178,6 +2199,22 @@ def _fragments_from_cuts(seq: str, cuts: list[dict], *,
             "features": [dict(f) for f in (features or [])],
             "source_label": source_label,
         }]
+    # De-dup COINCIDENT top-strand cuts. Two enzymes severing the same top bond
+    # with different overhangs stay as separate cuts (`_enzyme_cuts` merges only
+    # on the full (top,bot) bond). Sliced by top position, a coincident pair
+    # drives the circular `a==b` branch below to emit a phantom FULL-LENGTH
+    # fragment for BOTH cuts, and `_slot_for` then mis-slots every feature into
+    # one — a wrong digest/clone. Collapse to one boundary per top position.
+    # Guarded so the normal all-distinct case is byte-for-byte unchanged (no
+    # re-sort): only the already-degenerate coincident case is normalised.
+    if len({c["top"] for c in cuts}) != len(cuts):
+        seen_tops = set()
+        deduped = []
+        for c in sorted(cuts, key=lambda c: c["top"]):
+            if c["top"] not in seen_tops:
+                seen_tops.add(c["top"])
+                deduped.append(c)
+        cuts = deduped
     cut_tops = [c["top"] for c in cuts]
     feat_slots = _split_features_at_cuts(features or [], n, cut_tops,
                                            circular=circular)
@@ -2533,7 +2570,18 @@ def _search_subsequence(
     for h in hits:
         key = (h["start"], h["end"])
         prev = seen.get(key)
-        if prev is None or (prev["strand"] == "-" and h["strand"] == "+"):
+        if prev is None:
+            seen[key] = h
+        elif h["mismatches"] < prev["mismatches"]:
+            # Fewer mismatches = the strictly better match — keep it regardless
+            # of strand (pre-fix a '+' always won even when the '-' hit annealed
+            # more tightly, mis-ranking mismatch-tolerant Ctrl-F results).
+            seen[key] = h
+        elif (h["mismatches"] == prev["mismatches"]
+              and prev["strand"] == "-" and h["strand"] == "+"):
+            # Tie on mismatches → prefer the '+' (forward) representation, so a
+            # semi-palindromic span still collapses to one '+' entry. Exact
+            # (k=0) search is unaffected: all mismatches are 0 ⇒ this tie branch.
             seen[key] = h
     deduped = list(seen.values())
     deduped.sort(

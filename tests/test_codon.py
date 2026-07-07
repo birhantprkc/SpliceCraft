@@ -1670,6 +1670,55 @@ class TestOptimizeProperties:
     def test_single_residue(self):
         assert sc._codon_optimize("M", sc._CODON_BUILTIN_K12) == "ATGTAA"
 
+    def test_alt_genetic_code_table6_ciliate(self):
+        # NCBI table 6 (ciliate): TAA/TAG encode Gln (Q); only TGA is a stop.
+        # A uniform all-64-codon usage table makes every synonym available.
+        gc6 = sc._codon_table_for(6)
+        raw = {c: (gc6[c], 1) for c in gc6}
+        dna = sc._codon_optimize("MQK*", raw, transl_table=6)
+        assert all(b in "ACGT" for b in dna)
+        assert len(dna) % 3 == 0
+        # Appended stop must be a REAL table-6 stop (TGA), NOT TAA/TAG (= Gln).
+        assert dna[-3:] == "TGA"
+        # Round-trip UNDER table 6 recovers the protein + stop; a Q may legally
+        # be encoded as TAA/TAG here (which standard code would misread as stop).
+        prot = "".join(gc6[dna[i:i + 3]] for i in range(0, len(dna), 3))
+        assert prot == "MQK*"
+
+    def test_alt_genetic_code_table4_mycoplasma_tga_trp(self):
+        # NCBI table 4 (Mycoplasma): TGA encodes Trp (W); stops are TAA/TAG.
+        gc4 = sc._codon_table_for(4)
+        raw = {c: (gc4[c], 1) for c in gc4}
+        dna = sc._codon_optimize("MWW*", raw, transl_table=4)
+        assert all(b in "ACGT" for b in dna)
+        prot = "".join(gc4[dna[i:i + 3]] for i in range(0, len(dna), 3))
+        assert prot == "MWW*"
+        assert dna[-3:] in ("TAA", "TAG")   # TGA is Trp here, never a stop
+
+    def test_transl_table_default_matches_standard(self):
+        # transl_table=None / 1 must be byte-identical to the pre-feature path.
+        for p in ("MAKLEND**", "MWQCK*", "M", ""):
+            base = sc._codon_optimize(p, sc._CODON_BUILTIN_K12)
+            assert sc._codon_optimize(p, sc._CODON_BUILTIN_K12,
+                                      transl_table=None) == base
+            assert sc._codon_optimize(p, sc._CODON_BUILTIN_K12,
+                                      transl_table=1) == base
+
+    def test_fix_sites_transl_table_preserves_protein_alt_code(self):
+        # The forbidden-site scrub under an alt code must swap only to synonyms
+        # of THAT code (Q↔TAA/TAG/CAA/CAG under table 6), preserving the protein.
+        gc6 = sc._codon_table_for(6)
+        raw = {c: (gc6[c], 1) for c in gc6}
+        prot = "MQKQKQK"
+        dna = sc._codon_optimize(prot, raw, transl_table=6)
+        fixed, _fixes = sc._codon_fix_sites(
+            dna, prot, raw, {"BsaI": "GGTCTC"}, transl_table=6,
+        )
+        assert all(b in "ACGT" for b in fixed)
+        body = "".join(gc6[fixed[i:i + 3]]
+                       for i in range(0, len(fixed) - 3, 3))
+        assert body == prot
+
     def test_unknown_aa_raises(self):
         for bad in ("MAXA", "MZA", "MBK", "MUK", "MOK"):
             with pytest.raises(ValueError, match="No codons"):

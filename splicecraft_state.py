@@ -300,6 +300,14 @@ _dehydrate_collections_hook: "_Callable[[list], list] | None" = None
 # 129 `with _cache_lock:` sites + the inspect.getsource assertions stay valid.
 _cache_lock = threading.RLock()
 
+# Serialises the process-global `socket.setdefaulttimeout` window used by the
+# NCBI Entrez fetchers (`fetch_genbank` / `fetch_protein` in splicecraft_fileio).
+# `setdefaulttimeout` is process-wide, so two concurrent fetches on the threaded
+# agent server could interleave the set/restore and leave one socket created
+# with NO timeout → a pinned worker thread. NCBI fetches are slow + rate-limited,
+# so serialising them costs nothing real.
+_NCBI_FETCH_LOCK = threading.Lock()
+
 
 # ── Post-save side-effect hooks (Phase D) ──────────────────────────────────
 # Some `_save_X` accessors trigger DOMAIN side-effects beyond the disk write +
@@ -317,6 +325,11 @@ _after_entry_vectors_save_hook: "_Callable[[], None] | None" = None
 # Saving cloning grammars busts the assembly-fragment + EV-role-detect caches (a
 # grammar enzyme change shifts fragment overhangs / role detection) — hub-side.
 _after_custom_grammars_save_hook: "_Callable[[], None] | None" = None
+# Restore-from-backup of a MIRROR file (plasmid_library/primers/parts_bin) must
+# be written THROUGH into the owning active collection or it silently reverts on
+# the next launch. The hub registers the reconcile here; agents reach it via this
+# hook (guarded getattr, so the import window is a safe no-op).
+_reconcile_mirror_after_restore_hook: "_Callable[[object], None] | None" = None
 
 # ── Restriction-scanner runtime state (Phase D — the scanner + digest engine
 # move to splicecraft_biology; their caches + catalog access live here so the L0
@@ -347,6 +360,17 @@ _ENZYME_CUTS_CACHE_MAX: int = 16
 # never desyncs. (FIFO-bounded by the sibling's `_*_CACHE_MAX`.)
 _VECTOR_MATCH_CACHE: "dict[tuple, str | None]" = {}
 _ACCEPTOR_TU_PAIRS_CACHE: "dict[tuple[str, str], list[tuple[str, str, str, str]]]" = {}
+# A single dedicated RLock guarding the mutate-in-place RMW on the four ephemeral
+# compute caches above (+ biology's module-local `_PATTERN_CACHE`). Distinct from
+# `_cache_lock` (which serialises the PERSISTENT JSON caches vs. disk): these are
+# pure in-process memoisation, but the agent server (`ThreadingMixIn`) now calls
+# the biology/seqanalysis scanners directly on its request threads — concurrent
+# with the UI scan worker — so the lock-free `.get` / `.move_to_end` / `.popitem`
+# / `[k]=` sequence could raise `KeyError` when one thread evicts a key another is
+# mid-touch on. Held ONLY around the dict ops, never across the compute (the
+# classifier compute re-enters the enzyme scanners), so there is no
+# lock-across-call deadlock. RLock to match `_cache_lock` / `_GB_PARSE_CACHE_LOCK`.
+_COMPUTE_CACHE_LOCK = threading.RLock()
 # Getters the hub registers at import so the sibling scanner reaches hub-side
 # data: the fresh `_SCAN_CATALOG`, and the combined `_all_enzymes()` view
 # (built-in + custom — reads dataaccess, so the function itself stays hub-side).

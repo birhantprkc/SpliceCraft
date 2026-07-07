@@ -14,6 +14,65 @@
 
 ---
 
+## [1.2.1] — 2026-07-07
+
+Fresh whole-codebase audit sweep — data-safety, correctness, and UI polish.
+
+### Bug fixes
+
+- **Restore-from-backup now sticks.** Restoring your plasmid library, primers,
+  or parts bin from a backup used to *appear* to succeed and then silently
+  revert to the pre-restore state on the next launch (those files mirror your
+  active collection, which the restore never updated). The restore is now
+  written through into the owning collection, so your recovery is permanent.
+- **No more spurious "restriction scan failed" errors.** When the app and the
+  automation (agent) API ran restriction scans or part-classification at the
+  same time, an internal cache could momentarily trip and surface a failed
+  scan, a failed cloning step, or a 500 from the API. The shared scan caches
+  are now properly serialized.
+- **A double digest with two enzymes cutting the exact same position** no
+  longer produces a wrong fragment set (and a wrong clone).
+- **A corrupt custom-enzyme entry** with a blank recognition site no longer
+  floods every plasmid with a phantom cut at every base — it's skipped.
+- **Your last preference toggle before quitting** can no longer be dropped in a
+  rare timing window on exit.
+- **Codon tables and lab-notebook entries** edited from the API and the app at
+  the same moment can no longer stomp on each other's save.
+- **Sequencing-QC coverage summaries** no longer vanish entirely when a single
+  row carries a non-finite value.
+
+### New features
+
+- **Codon optimizer targets alternate genetic codes.** Optimizing a protein for
+  a host that reassigns codons (e.g. *Mycoplasma*, ciliates, mitochondrial
+  codes) now handles those reassignments and picks a real stop codon for that
+  host, instead of silently emitting a standard-code gene that would
+  mistranslate. Available via the new `transl_table` option on the
+  `optimize-protein` API.
+
+### UI polish
+
+- Modal panels now draw their background from the shared theme, so they stay
+  consistent (and correct if you switch your terminal's theme).
+- Fixed two picker dialogs whose titles were hard to read (light text on a
+  light banner).
+- Rounded dialog borders in the BABS and AUTOLAB screens now match the app's
+  square-border style.
+- "Save to Library" is spelled consistently everywhere; two dialogs had their
+  Save/Cancel buttons put back in the standard order; the spell-check and a few
+  other wide dialogs now fit an 80-column terminal.
+
+### Hardening
+
+- The NCBI fetch path can no longer hang a worker when several fetches run at
+  once (a process-global timeout race), and is now concurrency-capped.
+- Malformed `.ab1` traces and adversarial per-base TSV values fail gracefully.
+- Closed a defense-in-depth gap where a crafted XML declaration could smuggle an
+  entity-expansion payload past the parser; internal error responses no longer
+  echo filesystem paths.
+
+---
+
 ## [1.2.0] — 2026-07-07
 
 ### New features

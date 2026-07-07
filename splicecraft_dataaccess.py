@@ -471,46 +471,52 @@ def _codon_tables_load() -> list[dict]:
     mutation of the `raw` dict (e.g. an in-progress Kazusa import edit)
     can't poison the cache — matches invariant #17. Seeds built-in
     E. coli K12 on first run so the library is never empty."""
-    if _state._codon_tables_cache is not None:
+    # Double-checked locking (match `_load_features`): lock-free cache hit; the
+    # populate (incl. the K12 seed + its save) holds `_cache_lock` so it can't
+    # race a concurrent `_codon_tables_save` (agent thread) and lose the write.
+    cached = _state._codon_tables_cache
+    if cached is not None:
+        return _typed_clone(cached)
+    with _state._cache_lock:
+        if _state._codon_tables_cache is None:
+            entries, warning = _safe_load_json(_state._CODON_TABLES_FILE, "Codon table library")
+            if warning:
+                _log.warning("Codon table library: %s", warning)
+            fixed: list = []
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                raw = _codon_raw_from_json(e.get("raw", {}))
+                if not raw:
+                    continue
+                fixed.append({
+                    "name":   e.get("name", "?"),
+                    "taxid":  str(e.get("taxid", "")),
+                    "source": e.get("source", "user"),
+                    "added":  e.get("added", ""),
+                    "raw":    raw,
+                })
+            # Seed built-in K12 if not present
+            if not any(e.get("taxid") == "83333" for e in fixed):
+                fixed.insert(0, {
+                    "name":   "E. coli K12",
+                    "taxid":  "83333",
+                    "source": "builtin",
+                    "added":  _date.today().isoformat(),
+                    "raw":    dict(_CODON_BUILTIN_K12),
+                })
+                _state._codon_tables_cache = fixed
+                # Module-level seed path — no `app` context to notify. Log-only
+                # so a disk-full first launch surfaces in the log bundle and
+                # the cache (in memory) still has the K12 seed.
+                try:
+                    _codon_tables_save(fixed)
+                except (OSError, RuntimeError):
+                    _log.exception("Codon tables: K12 seed save failed (in-memory "
+                                   "cache populated; disk write deferred)")
+            else:
+                _state._codon_tables_cache = fixed
         return _typed_clone(_state._codon_tables_cache)
-    entries, warning = _safe_load_json(_state._CODON_TABLES_FILE, "Codon table library")
-    if warning:
-        _log.warning("Codon table library: %s", warning)
-    fixed: list = []
-    for e in entries:
-        if not isinstance(e, dict):
-            continue
-        raw = _codon_raw_from_json(e.get("raw", {}))
-        if not raw:
-            continue
-        fixed.append({
-            "name":   e.get("name", "?"),
-            "taxid":  str(e.get("taxid", "")),
-            "source": e.get("source", "user"),
-            "added":  e.get("added", ""),
-            "raw":    raw,
-        })
-    # Seed built-in K12 if not present
-    if not any(e.get("taxid") == "83333" for e in fixed):
-        fixed.insert(0, {
-            "name":   "E. coli K12",
-            "taxid":  "83333",
-            "source": "builtin",
-            "added":  _date.today().isoformat(),
-            "raw":    dict(_CODON_BUILTIN_K12),
-        })
-        _state._codon_tables_cache = fixed
-        # Module-level seed path — no `app` context to notify. Log-only
-        # so a disk-full first launch surfaces in the log bundle and
-        # the cache (in memory) still has the K12 seed.
-        try:
-            _codon_tables_save(fixed)
-        except (OSError, RuntimeError):
-            _log.exception("Codon tables: K12 seed save failed (in-memory "
-                           "cache populated; disk write deferred)")
-    else:
-        _state._codon_tables_cache = fixed
-    return _typed_clone(_state._codon_tables_cache)
 
 
 def _codon_tables_save(entries: list[dict]) -> None:
@@ -1430,31 +1436,38 @@ def _load_experiments() -> "list[dict]":
     defensively (hand-edited JSON / schema drift). Applies the
     legacy-tag-format migration (hub-side via the body hook) to every
     entry's body so the editor only ever sees the new single-sigil tokens."""
-    if _state._experiments_cache is not None:
+    # Double-checked locking (match `_load_features`): the cache-hit fast path
+    # is lock-free; the populate holds `_cache_lock` so it can't race a
+    # concurrent `_save_experiments` (agent thread) and clobber its cache reseat
+    # (lost-update → the UI shows stale entries / the agent's write is dropped).
+    cached = _state._experiments_cache
+    if cached is not None:
+        return _typed_clone(cached)
+    with _state._cache_lock:
+        if _state._experiments_cache is None:
+            entries, warning = _safe_load_json(_state._EXPERIMENTS_FILE, "Experiments")
+            if warning:
+                _log.warning(warning)
+            _migrate = getattr(_state, "_migrate_experiment_body_hook", None)
+            cleaned: "list[dict]" = []
+            n_migrated = 0
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                body = e.get("body_md")
+                if isinstance(body, str) and _migrate is not None:
+                    migrated = _migrate(body)
+                    if migrated != body:
+                        e["body_md"] = migrated
+                        n_migrated += 1
+                cleaned.append(e)
+            if n_migrated:
+                _log_event(
+                    "experiments.tag.migrated",
+                    n_entries=n_migrated, n_loaded=len(cleaned),
+                )
+            _state._experiments_cache = cleaned
         return _typed_clone(_state._experiments_cache)
-    entries, warning = _safe_load_json(_state._EXPERIMENTS_FILE, "Experiments")
-    if warning:
-        _log.warning(warning)
-    _migrate = getattr(_state, "_migrate_experiment_body_hook", None)
-    cleaned: "list[dict]" = []
-    n_migrated = 0
-    for e in entries:
-        if not isinstance(e, dict):
-            continue
-        body = e.get("body_md")
-        if isinstance(body, str) and _migrate is not None:
-            migrated = _migrate(body)
-            if migrated != body:
-                e["body_md"] = migrated
-                n_migrated += 1
-        cleaned.append(e)
-    if n_migrated:
-        _log_event(
-            "experiments.tag.migrated",
-            n_entries=n_migrated, n_loaded=len(cleaned),
-        )
-    _state._experiments_cache = cleaned
-    return _typed_clone(_state._experiments_cache)
 
 
 def _save_experiments(entries: "list[dict]") -> None:

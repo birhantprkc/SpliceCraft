@@ -1778,7 +1778,7 @@ class ExperimentUnsavedChangesModal(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="expunsaved-dlg"):
-            yield Static(" Unsaved changes ", id="expunsaved-title")
+            yield Static(" Unsaved Changes ", id="expunsaved-title")
             yield Static(
                 "The current entry has [b]unsaved changes[/b]. "
                 "What would you like to do?",
@@ -1841,7 +1841,7 @@ class SpellcheckModal(_OneShotDismissScreen, ModalScreen):
 
     DEFAULT_CSS = """
     #spell-dlg {
-        width: 100; height: 36;
+        width: 100; height: 36; max-width: 95%; max-height: 90%;
         background: $surface; border: solid $primary-darken-2;
         padding: 1 2; layout: vertical;
     }
@@ -3273,7 +3273,7 @@ class LargeFileConfirmModal(ModalScreen):
     DEFAULT_CSS = """
     #lfc-dlg {
         width: 72; height: auto; max-height: 60%;
-        background: #1c1c1c; border: solid $warning; padding: 1 2;
+        background: $surface; border: solid $warning; padding: 1 2;
     }
     #lfc-title { background: $warning-darken-2; color: $text;
                   padding: 0 1; margin-bottom: 1; text-align: center; }
@@ -3497,7 +3497,7 @@ class MasterDeleteModal(_OneShotDismissScreen, ModalScreen):
     DEFAULT_CSS = """
     #md-dlg {
         width: 78; height: auto; max-height: 90%;
-        background: #1c1c1c; border: solid $error; padding: 1 2;
+        background: $surface; border: solid $error; padding: 1 2;
     }
     #md-title {
         background: $error-darken-1; color: $text;
@@ -3704,7 +3704,7 @@ class MasterDeleteResultModal(_OneShotDismissScreen, ModalScreen):
     DEFAULT_CSS = """
     #mdr-dlg {
         width: 70; height: auto; max-height: 70%;
-        background: #1c1c1c; border: solid $accent; padding: 1 2;
+        background: $surface; border: solid $accent; padding: 1 2;
     }
     #mdr-title {
         background: $accent-darken-2; color: $text;
@@ -5351,7 +5351,7 @@ class CloneMethodChooserModal(_OneShotDismissScreen, ModalScreen):
     DEFAULT_CSS = """
     #cmc-dlg {
         width: 76; height: auto; max-height: 90%;
-        background: #1c1c1c; border: solid $primary; padding: 1 2;
+        background: $surface; border: solid $primary; padding: 1 2;
     }
     #cmc-title {
         background: $primary-darken-2; color: $text;
@@ -6948,7 +6948,7 @@ class SplitFeatureModal(ModalScreen):
 
     DEFAULT_CSS = """
     #split-dlg {
-        width: 100; height: auto; max-height: 90%;
+        width: 100; max-width: 95%; height: auto; max-height: 90%;
         background: $surface; border: solid $primary;
         padding: 1 2;
     }
@@ -8021,7 +8021,7 @@ class HistoryViewerModal(_OneShotDismissScreen, ModalScreen):
            cap so the dialog shrinks to content on a sparse history
            and still leaves Tree room to scroll on a deep one
            (2026-05-20 UX audit). */
-        width: 110; height: 90%; max-height: 36; min-height: 18;
+        width: 110; max-width: 95%; height: 90%; max-height: 36; min-height: 18;
         background: $surface; border: solid $accent;
         padding: 1 2;
     }

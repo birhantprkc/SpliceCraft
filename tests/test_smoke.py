@@ -6306,16 +6306,33 @@ class TestShiftClickFeatureExtend:
         app.on_key(event)
 
     def test_restriction_scan_cache_hits_on_repeat(self):
-        """Second call with the same (seq, args) tuple returns the
-        cached list without re-scanning. Verifies via list identity:
-        if the cache is a hit, the SAME list object comes back."""
+        """Second call with the same (seq, args) hits the cache without
+        re-scanning. The entry point now DEFENSIVELY COPIES the cached list on
+        return (so a caller mutating the result can't poison the cache — matches
+        `_enzyme_cuts`), so object identity no longer proves a hit. Verify it
+        directly: `_scan_restriction_sites_impl` runs exactly once for two
+        identical scans, and the two results are equal but distinct copies."""
+        import splicecraft_biology as _bio
         seq = "ATGCATGCATGC" * 200
-        a = sc._scan_restriction_sites(seq, 6, True, True)
-        b = sc._scan_restriction_sites(seq, 6, True, True)
-        assert a is b, (
-            "second call should return the cached list object — "
-            "indicates we re-scanned"
+        sc._RESTR_SCAN_CACHE.clear()
+        calls = {"n": 0}
+        real_impl = _bio._scan_restriction_sites_impl
+
+        def _counting(*a, **k):
+            calls["n"] += 1
+            return real_impl(*a, **k)
+
+        _bio._scan_restriction_sites_impl = _counting
+        try:
+            a = sc._scan_restriction_sites(seq, 6, True, True)
+            b = sc._scan_restriction_sites(seq, 6, True, True)
+        finally:
+            _bio._scan_restriction_sites_impl = real_impl
+        assert calls["n"] == 1, (
+            "second identical scan should hit the cache, not re-run the impl"
         )
+        assert a == b            # same content
+        assert a is not b        # fresh defensive copy each call
 
     def test_restriction_scan_cache_separate_keys(self):
         """Different (min_len, unique_only, circular) combinations

@@ -8263,7 +8263,7 @@ class TestConstructorSaveToLibrary:
             await pilot.pause(0.1)
             modal = app.screen
             btn = modal.query_one("#btn-ctor-simulate-gb_l0", sc.Button)
-            assert "Save To Library" in str(btn.label)
+            assert "Save to Library" in str(btn.label)
 
 
 class TestConstructorGreenStatus:

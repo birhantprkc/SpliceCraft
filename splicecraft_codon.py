@@ -330,7 +330,7 @@ def _codon_search(query: str, entries: "list | None" = None) -> list[dict]:
     return [t[2] for t in ranked]
 
 
-def _codon_build_aa_map(raw: dict) -> tuple[dict, dict]:
+def _codon_build_aa_map(raw: dict, *, genetic_code: "dict | None" = None) -> tuple[dict, dict]:
     """Given {codon: (aa, count)}, return (aa_codons, codon_frac) where
     aa_codons[aa] = [(codon, frac), ...] sorted by fraction descending, and
     codon_frac[codon] = fractional usage for its amino acid.
@@ -346,10 +346,15 @@ def _codon_build_aa_map(raw: dict) -> tuple[dict, dict]:
     standard code closes that hole; codons outside the 64 ACGT keys (N / gaps)
     are skipped."""
     from collections import defaultdict
+    # `genetic_code` defaults to the standard NCBI table 1; pass an alternate
+    # (via `_codon_table_for`) so a reassigned codon (TGA=Trp, TAA=Gln, …) is
+    # LABELLED with the residue the target host actually reads. Default keeps
+    # every existing call byte-identical.
+    gc = genetic_code if genetic_code is not None else _CODON_GENETIC_CODE
     aa_total: dict = defaultdict(int)
     codon_aa: dict = {}
     for codon, (_aa, count) in raw.items():
-        canon = _CODON_GENETIC_CODE.get(codon)
+        canon = gc.get(codon)
         if canon is None:               # non-ACGT codon (N / gap) — not optimizable
             continue
         codon_aa[codon] = canon
@@ -424,7 +429,8 @@ def _codon_allocate(codons: list, n: int) -> list:
     return interleaved[:n]
 
 
-def _codon_optimize(protein: str, raw: dict, *, stops: int = 1) -> str:
+def _codon_optimize(protein: str, raw: dict, *, stops: int = 1,
+                    transl_table: "int | None" = None) -> str:
     """Frequency-matching codon optimization: distribute synonymous codons
     across the protein so each amino acid's codon distribution matches
     the target organism's overall usage frequencies. Raises ValueError on
@@ -453,8 +459,20 @@ def _codon_optimize(protein: str, raw: dict, *, stops: int = 1) -> str:
     rare-codon positions in the target (those positions encode
     translation pauses important for cotranslational folding). We only
     consume the target table, so this is pure optimization, not
-    harmonization. Renamed 2026-05-01 to stop misleading users."""
-    aa_codons, codon_frac = _codon_build_aa_map(raw)
+    harmonization. Renamed 2026-05-01 to stop misleading users.
+
+    ``transl_table`` (default: standard NCBI table 1) selects the target host's
+    genetic code, so an organism with a reassigned codon (Mycoplasma table 4
+    TGA=Trp, ciliate table 6 TAA/TAG=Gln, a mito code, …) optimises — and
+    terminates — against the residues/stops it ACTUALLY reads instead of
+    silently emitting a standard-code gene that mistranslates in the host. The
+    default (``None`` / 1) path is byte-identical to before. An empty protein
+    still yields the requested stop run (``stops`` default 1 ⇒ ``TAA``) so the
+    ``len == 3·len(body) + 3·n_stops`` invariant holds — see
+    ``test_empty_protein_is_lone_stop``."""
+    gc = (_CODON_GENETIC_CODE if transl_table in (None, 1)
+          else _codon_table_for(transl_table))
+    aa_codons, codon_frac = _codon_build_aa_map(raw, genetic_code=gc)
     # Peel a trailing run of stop requests; a '*' anywhere else is an error.
     body = protein
     n_trailing = 0
@@ -478,13 +496,21 @@ def _codon_optimize(protein: str, raw: dict, *, stops: int = 1) -> str:
                               _codon_allocate(codons_for_aa, len(positions))):
             codon_at[pos] = codon
 
+    # Stop codons come from the TARGET genetic code, not a hardcoded standard
+    # stop: under an alt code (e.g. table 6, TAA/TAG = Gln) a literal "TAA"
+    # would read THROUGH. "TAA" stays the single-stop default whenever it IS a
+    # stop of `gc` (every standard-ish code), so the default path is unchanged.
+    code_stops = [c for c, a in gc.items() if a == "*"]
+    single_stop = ("TAA" if "TAA" in code_stops
+                   else (code_stops[0] if code_stops else "TAA"))
     if n_stops <= 1:
-        tail = "TAA" * n_stops
+        tail = single_stop * n_stops
     else:
         stop_codons = sorted(
-            ((c, codon_frac.get(c, 0.0)) for c, (a, _ct) in raw.items() if a == "*"),
+            ((c, codon_frac.get(c, 0.0))
+             for c, (a, _ct) in raw.items() if gc.get(c) == "*"),
             key=lambda x: -x[1])
-        tail = "".join(_codon_allocate(stop_codons or [("TAA", 1.0)], n_stops))
+        tail = "".join(_codon_allocate(stop_codons or [(single_stop, 1.0)], n_stops))
     return "".join(codon_at) + tail
 
 
@@ -536,7 +562,8 @@ def _codon_swap_ok(seq: str, codon_start: int, alt: str, site: str, idx: int,
 
 def _codon_fix_sites(dna: str, protein: str, raw: dict,
                      sites: "dict | None" = None,
-                     *, has_appended_stop: bool = True) -> tuple:
+                     *, has_appended_stop: bool = True,
+                     transl_table: "int | None" = None) -> tuple:
     """Substitute synonymous codons to remove internal restriction sites.
 
     ``sites`` is a forward-strand ``{name: site}`` dict; reverse complements
@@ -597,7 +624,9 @@ def _codon_fix_sites(dna: str, protein: str, raw: dict,
     # Precompiled (cached) IUPAC matchers for the per-enzyme outer scan, so
     # a degenerate site is actually located (not literal-substring searched).
     site_pats = {nm: _iupac_pattern(st) for nm, st in expanded.items()}
-    aa_codons, _ = _codon_build_aa_map(raw)
+    _gc = (_CODON_GENETIC_CODE if transl_table in (None, 1)
+           else _codon_table_for(transl_table))
+    aa_codons, _ = _codon_build_aa_map(raw, genetic_code=_gc)
     dna_list = list(dna)
     fixes: list[str] = []
     for enzyme, site in expanded.items():
@@ -684,18 +713,26 @@ def _codon_forbidden_sites() -> "dict[str, str]":
     return out
 
 
-def _codon_cai(dna: str, raw: dict) -> float:
+def _codon_cai(dna: str, raw: dict, *, transl_table: "int | None" = None) -> float:
     """Codon Adaptation Index (geometric mean of per-codon freq ÷ peak freq
-    of its amino-acid synonymy group). Skips stops and unknown codons."""
+    of its amino-acid synonymy group). Skips stops and unknown codons.
+
+    ``transl_table`` labels codons by the target host's genetic code (default
+    standard), so a reassigned codon is scored against the RIGHT synonymy group
+    — pre-fix CAI keyed on the table's stored label, mis-scoring alt-code
+    tables. Display-only; never affects an emitted sequence."""
     import math
-    aa_codons, codon_frac = _codon_build_aa_map(raw)
+    gc = (_CODON_GENETIC_CODE if transl_table in (None, 1)
+          else _codon_table_for(transl_table))
+    aa_codons, codon_frac = _codon_build_aa_map(raw, genetic_code=gc)
     w: list[float] = []
     for i in range(0, len(dna) - 2, 3):
         codon = dna[i:i + 3].upper()
         entry = raw.get(codon)
-        if not entry or entry[0] == "*":
+        aa = gc.get(codon)
+        if not entry or aa is None or aa == "*":
             continue
-        peak = aa_codons[entry[0]][0][1] if entry[0] in aa_codons else 0.0
+        peak = aa_codons[aa][0][1] if aa in aa_codons else 0.0
         if peak > 0:
             w.append(codon_frac.get(codon, 0.0) / peak)
     if not w:
