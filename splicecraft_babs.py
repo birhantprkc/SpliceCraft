@@ -760,6 +760,8 @@ HELP_COMMANDS = [
     ("/models", "browse + pick a model — installed · HuggingFace GGUF (pull on demand)"),
     ("/model [name]", "show the active model, or switch to <name> (pulls if needed)"),
     ("/system [text]", "show the system prompt (persona), or set it to <text>"),
+    ("/remember <fact>", "save a durable fact Babs recalls in every future session"),
+    ("/memory", "show what Babs remembers (persistent notes)"),
     ("/temp [0-2]", "show or set the answer temperature (0 = deterministic)"),
     ("/think [on|off]", "show or hide the model's reasoning (<think>) — default off"),
     ("/context  /ctx", "show the context lifebar (chat memory left before /reset)"),

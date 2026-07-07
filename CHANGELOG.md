@@ -14,6 +14,48 @@
 
 ---
 
+## [1.2.0] — 2026-07-07
+
+### New features
+
+- **Background Learning — teach Babs about a topic.** A new **Learn** tab in the
+  BABS screen (and matching agent commands) grows Babs' knowledge about a
+  *specific* subject on demand. Give it a topic and a paper budget; it runs a
+  focused, **drift-resistant** crawl of open scientific databases — seeding from
+  open-access search, scoring every candidate for how on-topic it is, and only
+  following a paper's citations when that paper is *strongly* on-topic, so it
+  digs deeper into your subject instead of wandering off into adjacent fields.
+  Each topic gets its own isolated corpus, with a live status readout
+  (kept / fetched / dropped / frontier) and a scored "kept papers" table; it also
+  pulls in open-licensed web pages, not just journal articles. Only short topic
+  search-strings ever leave your machine — never your sequences — and it stays
+  behind the same human-armed "Allow Babs online database lookups" switch.
+  Drivable over the agent API too (`learn-start` / `-status` / `-results` /
+  `-list`).
+
+- **Babs remembers across sessions.** Tell Babs a durable fact with
+  **`/remember <fact>`** and it's loaded into every future conversation;
+  **`/memory`** shows what she's holding. Memories are plain, hand-editable
+  notes, kept separate from crawled documents — so you can read, edit, or prune
+  them yourself.
+
+### Hardening
+
+- A learning session is budget-bounded and cancelable, and never holds a global
+  lock for the length of the crawl — so it can't stall Babs' other background
+  work or wedge on the first paper it keeps.
+- A session that's killed or crashes reports as **stopped** rather than looking
+  like it runs forever; launching the same topic twice is refused instead of
+  racing itself; and a malformed page or resume file can't abort a whole crawl.
+- Generated topic definitions are fully sanitised and every session file read is
+  size-capped, so neither a crafted topic nor an oversized file can misbehave.
+- The live status readout, the kept-papers list and the session list all shrug
+  off a corrupt or half-written session file — a bad line is skipped, not fatal —
+  and Babs' persistent memory still loads if a hand-edit leaves an odd byte in the
+  notes file, so neither can interrupt a chat.
+
+---
+
 ## [1.0.126] — 2026-07-06
 
 ### New features

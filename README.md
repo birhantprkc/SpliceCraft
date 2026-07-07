@@ -296,6 +296,20 @@ exports the whole conversation to markdown. Three tabs:
   changed *embedding* model needs the corpus re-ingested to match, and can run
   that re-embed for you. Shown only when the Babs repo is present (`~/babs`, or
   `$SPLICECRAFT_BABS_HOME`).
+- **Learn** — grow Babs' knowledge about a **specific topic** with a focused,
+  drift-resistant crawl of open scientific databases (plus open-licensed web
+  pages). Give it a topic and a paper budget; it seeds from open-access search,
+  scores every candidate for relevance, and only follows citations out of the
+  *strongly* on-topic ones — so it deepens on your subject instead of wandering
+  off into adjacent fields. Each topic gets its own isolated corpus. Live status
+  (kept / fetched / dropped / frontier) and a scored "kept papers" table. Requires
+  arming Settings → "Allow Babs online database lookups" (only topic query strings
+  are sent — never your sequences). Also drivable over the agent API (`learn-start`
+  / `learn-status` / `learn-results` / `learn-list`).
+- **Persistent memory** — tell Babs something to keep with **`/remember <fact>`**
+  and it survives across sessions (loaded into every future conversation);
+  **`/memory`** shows what it holds. Stored as plain, hand-editable markdown in the
+  Babs corpus, kept separate from crawled documents.
 
 The BABS tab is **persistent** — switch to another part of SpliceCraft or close
 it and your conversation, model choice and agent mode are still there when you

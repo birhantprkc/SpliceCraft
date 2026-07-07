@@ -239,6 +239,19 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   rate-limited returns `502` with a hint to add a key. Upstream/network failures
   → `502`. Every fetch routes through the SSRF-hardened opener with the
   fail-closed DEMO_MODE egress gate.
+
+- **Background Learning** (`learn-start`, `learn-status`, `learn-results`,
+  `learn-list`) — grow Babs' corpus about a TOPIC with a focused, drift-resistant
+  crawl of open databases + open-licensed web pages. `learn-start {topic, max_docs?,
+  max_minutes?}` is the only **write** (it launches a crawl): refused `403` unless
+  the user has armed the same "Allow Babs online database lookups" setting, and
+  write-flagged so the in-app Babs prompts before an autonomous agent starts one.
+  It returns immediately with a `slug`; poll `learn-status {slug}` for live counters
+  (kept / fetched / dropped / frontier / status / drift), read `learn-results {slug,
+  limit?}` for the scored kept papers, and `learn-list` for all sessions on the box.
+  Only topic query strings leave the machine — never your sequences. The crawl
+  engine lives in the separate Babs repo (`bb_learn.py`); each topic is isolated in
+  its own corpus + vector collection.
 - **RNA structure + RBS** — fold-rna (minimum-free-energy secondary
   structure: dot-bracket fold + ΔG in kcal/mol, pure-Python Turner-2004,
   no external dependency); cofold-rna (bound-state heterodimer ΔG of two
