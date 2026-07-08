@@ -14,6 +14,22 @@
 
 ---
 
+## [1.2.10] — 2026-07-08
+
+### New features
+
+- **The workbench menu bar is now a true tab bar.** Switching from one full-screen
+  workbench to another (Synthesis, Babs, Autolab, Simulator, Sequencing,
+  Experiments, History, Features, Parts, Primers) via the menu bar now **closes
+  the one you're leaving** instead of stacking screens on top of each other — so
+  you can hop between tools freely without a growing pile of open screens. Each
+  tab keeps its own work across the switch (your Synthesis fragment, your Babs
+  chat, your Autolab plate). Dialogs (BLAST, Settings, Enzymes, Constructor,
+  Mutato) still open as overlays on top of the current tab, as before. Babs and
+  Autolab now behave exactly like the Synthesis workbench in this respect.
+
+---
+
 ## [1.2.9] — 2026-07-08
 
 ### New features

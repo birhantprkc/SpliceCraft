@@ -4933,6 +4933,90 @@ class TestSynthesisPersistence:
                 == "ATGCGTACGT"
 
 
+class TestWorkbenchTrueSwitch:
+    """Opening a workbench tab while on another CLOSES the prior (true
+    switch, not a stack); each tab persists its work; modals still overlay."""
+
+    async def test_switch_closes_prior_and_persists(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCGTACGTAAA", [{"start": 0, "end": 3, "label": "keep",
+                                       "type": "CDS", "color": "#88cc88",
+                                       "strand": 1, "qualifiers": {}}])
+            await pilot.pause()
+            # Switch to another workbench tab.
+            app.push_screen(sc.FeatureLibraryScreen())
+            await pilot.pause(); await pilot.pause()
+            assert isinstance(app.screen, sc.FeatureLibraryScreen)
+            assert not any(isinstance(s, sc.SynthesisScreen)
+                           for s in app.screen_stack)   # closed, not stacked
+            # Switch back → prior tab closes, Synthesis data restored + laid out.
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            assert isinstance(app.screen, sc.SynthesisScreen)
+            assert not any(isinstance(s, sc.FeatureLibraryScreen)
+                           for s in app.screen_stack)
+            ed2 = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            assert ed2._seq == "ATGCGTACGTAAA"
+            assert app.screen.query_one("#syn-box").size.width > 0
+
+    async def test_modal_overlays_not_switch(self):
+        from textual.screen import ModalScreen
+        from textual.widgets import Static as _TS
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+
+            class _Dlg(ModalScreen):
+                def compose(self):
+                    yield _TS("dialog")
+            app.push_screen(_Dlg())
+            await pilot.pause(); await pilot.pause()
+            # Synthesis stays (overlaid, not closed).
+            assert any(isinstance(s, sc.SynthesisScreen)
+                       for s in app.screen_stack)
+            assert isinstance(app.screen, _Dlg)
+
+    def test_workbench_tab_registry(self):
+        for cls in (sc.SynthesisScreen, sc.BabsScreen, sc.AutolabScreen,
+                    sc.SimulatorScreen, sc.SequencingScreen,
+                    sc.ExperimentsScreen, sc.HistoryScreen,
+                    sc.FeatureLibraryScreen, sc.PartsBinModal,
+                    sc.PrimerDesignScreen):
+            assert cls in sc.PlasmidApp._WORKBENCH_TAB_TYPES
+        # Modals are NOT tabs (they overlay).
+        for cls in (sc.SettingsModal, sc.BlastModal, sc.ConstructorModal):
+            assert cls not in sc.PlasmidApp._WORKBENCH_TAB_TYPES
+
+    async def test_switch_synthesis_babs_roundtrip(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            app.screen.query_one("#syn-editor",
+                                 sc.SynthesisEditor).load("ATGATGATG", [])
+            await pilot.pause()
+            app.action_open_babs()            # Synthesis → Babs
+            await pilot.pause(); await pilot.pause()
+            assert isinstance(app.screen, sc.BabsScreen)
+            assert not any(isinstance(s, sc.SynthesisScreen)
+                           for s in app.screen_stack)
+            app.action_open_synthesis()       # Babs → Synthesis (restore)
+            await pilot.pause(); await pilot.pause()
+            assert isinstance(app.screen, sc.SynthesisScreen)
+            assert not any(isinstance(s, sc.BabsScreen)
+                           for s in app.screen_stack)
+            assert app.screen.query_one(
+                "#syn-editor", sc.SynthesisEditor)._seq == "ATGATGATG"
+
+
 class TestSynthesisToolbarNav:
     """The main menu bar is present on the Synthesis screen; closing is
     lossless (no save modal); re-opening while stacked resurfaces."""
