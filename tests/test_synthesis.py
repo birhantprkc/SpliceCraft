@@ -508,24 +508,29 @@ class TestSaveRoundTrip:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestRestrictionInsert:
-    async def test_picker_dismisses_with_enzyme_name(self):
+    async def test_picker_dismisses_with_enzyme_and_strand(self):
+        # action_pick returns {"enzyme", "strand"} — default direction is
+        # forward (strand 1); the Select drives the strand.
         app = sc.PlasmidApp()
         async with app.run_test(size=_TERM) as pilot:
             await pilot.pause()
             await pilot.pause()
             holder = {"result": "sentinel"}
-
-            def _cb(result):
-                holder["result"] = result
-
-            app.push_screen(sc.RestrictionInsertModal(), callback=_cb)
+            app.push_screen(sc.RestrictionInsertModal(),
+                            callback=lambda r: holder.update(result=r))
             await pilot.pause()
             await pilot.pause()
             modal = app.screen
-            modal.dismiss("EcoRI")
+            modal._repopulate("EcoRI")            # filter to a single row
+            await pilot.pause()
+            t = modal.query_one("#ri-table", sc.DataTable)
+            t.move_cursor(row=0)
+            modal.query_one("#ri-direction", sc.Select).value = "-1"
+            await pilot.pause()
+            modal.action_pick()
             await pilot.pause()
             await pilot.pause()
-            assert holder["result"] == "EcoRI"
+            assert holder["result"] == {"enzyme": "EcoRI", "strand": -1}
 
     async def test_inserted_site_appears_in_buffer(self):
         app = sc.PlasmidApp()
@@ -4267,3 +4272,400 @@ class TestSynthesisProteinOpenIntegration:
             await pilot.pause()
             pe = scr.query_one("#syn-protein-editor", sc.ProteinEditor)
             assert pe.get_state()[0] == "MKMK"   # X dropped
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2026-07-08 — editable features on paste (lane-click highlight + edit),
+# R cut-site overlay, Synthesis undo/redo, and the 3' insert-site fix.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import types as _types
+
+
+def _mouse(**kw):
+    """Minimal stand-in for a Textual mouse event — the editors' handlers
+    only read button / screen_x / screen_y / shift / chain (+ stop())."""
+    kw.setdefault("button", 1)
+    kw.setdefault("shift", False)
+    kw.setdefault("chain", 1)
+    kw.setdefault("stop", lambda: None)
+    return _types.SimpleNamespace(**kw)
+
+
+class TestSynthesis3pInsertSite:
+    """The Insert-site path must not let a feature that ends at the 3'
+    end swallow the inserted recognition bases (the '5' works, 3' doesn't'
+    bug reported 2026-07-08). `extend_adjacent_feats=False` keeps the
+    site standalone, symmetric with the 5' end."""
+
+    def test_boundary_feature_absorbs_by_default(self):
+        # Baseline: the default (extend) DOES absorb — documents WHY the
+        # insert-site path must pass extend_adjacent_feats=False.
+        ed = sc.SynthesisEditor()
+        n = 12
+        ed._seq = "A" * n
+        ed._feats = [{"start": 0, "end": n, "label": "f", "type": "CDS",
+                      "color": "#88cc88", "strand": 1, "qualifiers": {}}]
+        ed._cursor_pos = n
+        # Offline mirror of insert_at_cursor's feature-shift (extend=True).
+        cur, n_ins = n, 6
+        for f in ed._feats:
+            s, e = f["start"], f["end"]
+            if e >= cur and not (e == cur and s == cur):
+                f["end"] = e + n_ins
+        assert ed._feats[0]["end"] == n + n_ins   # swallowed
+
+    async def test_insert_site_3p_stays_standalone(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            seq = "ATG" + "AAACCCGGG" * 3 + "TAA"
+            n = len(seq)
+            ed.load(seq, [{"start": 0, "end": n, "label": "cds",
+                           "type": "CDS", "color": "#88cc88", "strand": 1,
+                           "qualifiers": {}}])
+            await pilot.pause()
+            ed.set_cursor(n)
+            ok = ed.insert_at_cursor("GGTACC", extend_adjacent_feats=False)
+            await pilot.pause()
+            assert ok
+            assert ed._seq.endswith("GGTACC")
+            # Feature must NOT have grown over the appended site.
+            assert ed._feats[0]["end"] == n
+            # Symmetric with the 5' behaviour: reload + insert at 0.
+            ed.load(seq, [{"start": 0, "end": n, "label": "cds",
+                           "type": "CDS", "color": "#88cc88", "strand": 1,
+                           "qualifiers": {}}])
+            await pilot.pause()
+            ed.set_cursor(0)
+            ed.insert_at_cursor("GTCGAC", extend_adjacent_feats=False)
+            await pilot.pause()
+            assert ed._feats[0]["start"] == 6   # site left uncovered at 5'
+
+    def test_action_insert_site_uses_no_extend(self):
+        import inspect
+        src = inspect.getsource(sc.SynthesisScreen.action_insert_site)
+        assert "extend_adjacent_feats=False" in src
+
+
+class TestInsertSiteFeature:
+    """Insert-site drops a real, editable feature (hot-pink protein_bind,
+    arrowed by the chosen direction), not just bare bases."""
+
+    async def _insert(self, pilot, app, result):
+        """Load a fragment, open the picker via action_insert_site, and
+        dismiss it with `result`; return the DNA editor."""
+        app.push_screen(sc.SynthesisScreen())
+        await pilot.pause(); await pilot.pause()
+        scr = app.screen
+        ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+        ed.load("AAAACCCCGGGG", [])
+        await pilot.pause()
+        ed.set_cursor(4)
+        scr.action_insert_site()
+        await pilot.pause(); await pilot.pause()
+        assert isinstance(app.screen, sc.RestrictionInsertModal)
+        app.screen.dismiss(result)
+        await pilot.pause(); await pilot.pause()
+        return ed
+
+    async def test_forward_creates_hotpink_feature(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            ed = await self._insert(pilot, app,
+                                    {"enzyme": "EcoRI", "strand": 1})
+            assert "GAATTC" in ed._seq
+            hits = [f for f in ed._feats if f.get("label") == "EcoRI"]
+            assert len(hits) == 1
+            f = hits[0]
+            assert f["type"] == "protein_bind"
+            assert f["color"] == sc._RESTR_SITE_FEATURE_COLOR
+            assert f["strand"] == 1
+            assert f["end"] - f["start"] == 6
+            # spans exactly the inserted site
+            assert ed._seq[f["start"]:f["end"]] == "GAATTC"
+
+    async def test_reverse_inserts_rc_and_reverse_arrow(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            # BsaI GGTCTC → RC GAGACC on reverse.
+            ed = await self._insert(pilot, app,
+                                    {"enzyme": "BsaI", "strand": -1})
+            assert "GAGACC" in ed._seq
+            assert "GGTCTC" not in ed._seq
+            f = [f for f in ed._feats if f.get("label") == "BsaI"][0]
+            assert f["strand"] == -1
+            assert ed._seq[f["start"]:f["end"]] == "GAGACC"
+
+    async def test_palindrome_reverse_same_bases_flipped_arrow(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            ed = await self._insert(pilot, app,
+                                    {"enzyme": "EcoRI", "strand": -1})
+            # EcoRI is palindromic → RC == site; only the arrow flips.
+            assert "GAATTC" in ed._seq
+            f = [f for f in ed._feats if f.get("label") == "EcoRI"][0]
+            assert f["strand"] == -1
+
+    async def test_insert_site_feature_is_editable(self):
+        # The stamped site behaves like any feature: click highlights it,
+        # Enter opens the editor.
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            ed = await self._insert(pilot, app,
+                                    {"enzyme": "EcoRI", "strand": 1})
+            f = [f for f in ed._feats if f.get("label") == "EcoRI"][0]
+            ed._cursor_pos = (f["start"] + f["end"]) // 2
+            assert ed._feature_at_cursor() == ed._feats.index(f)
+
+    async def test_cancel_adds_nothing(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            ed = await self._insert(pilot, app, None)
+            assert ed._seq == "AAAACCCCGGGG"
+            assert ed._feats == []
+
+    def test_hotpink_color_is_valid_6hex(self):
+        import re
+        assert re.fullmatch(r"#[0-9A-Fa-f]{6}", sc._RESTR_SITE_FEATURE_COLOR)
+
+
+class TestSynthesisLaneClick:
+    """Clicking a feature's lane art highlights the whole feature; a
+    double-click opens FeatureEditModal. DNA + protein editors."""
+
+    @staticmethod
+    def _dna_bar_xy(ed, bp):
+        """(x, y) of the row directly above the DNA strand (non-CDS bar)
+        at base `bp`."""
+        reg = ed.query_one("#syn-view", sc.Static).region
+        above = ed._dna_top_row_offset()
+        y = reg.y + ed._pad_above_rows + (above - 1)   # packed_row 0 bar
+        x = reg.x + ed._pad_left_cols + ed._FLANK_MARKER_WIDTH + bp
+        return x, y
+
+    async def test_dna_lane_click_highlights_and_dna_click_does_not(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATG" + "AAACCCGGGTTT" * 3 + "TAA",
+                    [{"start": 5, "end": 20, "label": "f",
+                      "type": "misc_feature", "color": "#88cc88",
+                      "strand": 1, "qualifiers": {}}])
+            await pilot.pause(); await pilot.pause()
+            x, y = self._dna_bar_xy(ed, 12)
+            assert ed._lane_feature_at(x, y)[0] == 0
+            ed.on_mouse_down(_mouse(screen_x=x, screen_y=y))
+            ed.on_mouse_up(_mouse())
+            ed.on_click(_mouse(screen_x=x, screen_y=y))
+            await pilot.pause()
+            assert ed._user_sel == (5, 20)
+            # A DNA-strand click clears the whole-feature highlight.
+            reg = ed.query_one("#syn-view", sc.Static).region
+            dy = reg.y + ed._pad_above_rows + ed._dna_top_row_offset()
+            dx = reg.x + ed._pad_left_cols + ed._FLANK_MARKER_WIDTH + 30
+            ed.on_mouse_down(_mouse(screen_x=dx, screen_y=dy))
+            ed.on_mouse_up(_mouse())
+            ed.on_click(_mouse(screen_x=dx, screen_y=dy))
+            await pilot.pause()
+            assert ed._user_sel is None
+
+    async def test_dna_double_click_opens_feature_editor(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGAAACCCGGGTTTAAACCC",
+                    [{"start": 3, "end": 12, "label": "f",
+                      "type": "misc_feature", "color": "#88cc88",
+                      "strand": 1, "qualifiers": {}}])
+            await pilot.pause(); await pilot.pause()
+            x, y = self._dna_bar_xy(ed, 7)
+            ed.on_mouse_down(_mouse(screen_x=x, screen_y=y))
+            ed.on_mouse_up(_mouse())
+            ed.on_click(_mouse(screen_x=x, screen_y=y, chain=2))
+            await pilot.pause(); await pilot.pause()
+            assert isinstance(app.screen, sc.FeatureEditModal)
+
+    async def test_protein_lane_click_and_enter_edit(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            scr.query_one("#syn-tabs", sc.TabbedContent).active = \
+                "syn-tab-protein"
+            await pilot.pause(); await pilot.pause()
+            pe = scr.query_one("#syn-protein-editor", sc.ProteinEditor)
+            pe.set_codon_mode(False)
+            pe.load("MASGGGSGGGSKKKK", feats=[
+                {"start": 4, "end": 10, "label": "linker", "type": "Linker",
+                 "color": "#6B7280", "qualifiers": {}}])
+            await pilot.pause(); await pilot.pause()
+            _placements, total_rows = pe._pack_aa_feats()
+            reg = pe.query_one("#pe-view", sc.Static).region
+            aax = reg.x + pe._pad_left_cols + pe._FLANK_MARKER_WIDTH + 6
+            hit_y = None
+            for rr in range(total_rows):
+                yy = reg.y + pe._pad_above_rows + rr
+                if pe._lane_feature_at(aax, yy)[0] == 0:
+                    hit_y = yy
+                    break
+            assert hit_y is not None
+            pe.on_mouse_down(_mouse(screen_x=aax, screen_y=hit_y))
+            pe.on_mouse_up(_mouse())
+            pe.on_click(_mouse(screen_x=aax, screen_y=hit_y))
+            await pilot.pause()
+            assert pe._user_sel == (4, 10)
+            # Enter inside the motif opens the editor.
+            pe._cursor_pos = 6
+            pe.query_one("#pe-scroll", sc.ScrollableContainer).focus()
+            await pilot.pause()
+            pe.on_key(_types.SimpleNamespace(key="enter", character=None,
+                                             stop=lambda: None))
+            await pilot.pause(); await pilot.pause()
+            assert isinstance(app.screen, sc.FeatureEditModal)
+
+
+class TestSynthesisRestrictionOverlay:
+    """The R key reveals / hides restriction cut sites on the DNA tab."""
+
+    async def test_toggle_scans_and_clears(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("TTTTGAATTCTTTTGGATCCTTTTAAGCTTTTTT")  # EcoRI/BamHI/HindIII
+            await pilot.pause(); await pilot.pause()
+            assert ed._show_restr_overlay is False
+            scr.action_toggle_restr_sites()
+            await pilot.pause(); await pilot.pause()
+            assert ed._show_restr_overlay is True
+            assert any(f.get("type") == "resite" for f in ed._restr_feats)
+            assert len(ed._display_feats()) >= len(ed._restr_feats)
+            scr.action_toggle_restr_sites()
+            await pilot.pause()
+            assert ed._show_restr_overlay is False
+            assert ed._restr_feats == []
+
+    async def test_overlay_rescans_on_edit(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("TTTTTTTTTTTT")
+            await pilot.pause()
+            ed.toggle_restr_overlay()
+            await pilot.pause()
+            n0 = sum(1 for f in ed._restr_feats if f.get("type") == "resite")
+            # Type an EcoRI site at the cursor; the overlay must pick it up.
+            ed.set_cursor(6)
+            ed.insert_at_cursor("GAATTC")
+            await pilot.pause(); await pilot.pause()
+            n1 = sum(1 for f in ed._restr_feats if f.get("type") == "resite")
+            assert n1 > n0
+
+
+class TestSynthesisUndoRedo:
+    """Ctrl+Z / Ctrl+Y in the Synthesis tab undo/redo typed bases + edits."""
+
+    async def test_dna_undo_redo_cycle(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.insert_at_cursor("ATG")
+            await pilot.pause()
+            ed.insert_at_cursor("CCC")
+            await pilot.pause()
+            assert ed._seq == "ATGCCC"
+            scr.action_undo()
+            await pilot.pause()
+            assert ed._seq == "ATG"
+            scr.action_undo()
+            await pilot.pause()
+            assert ed._seq == ""
+            scr.action_redo()
+            await pilot.pause()
+            assert ed._seq == "ATG"
+            scr.action_redo()
+            await pilot.pause()
+            assert ed._seq == "ATGCCC"
+
+    async def test_new_edit_clears_redo(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.insert_at_cursor("ATGCCC")
+            await pilot.pause()
+            scr.action_undo()          # -> ""
+            await pilot.pause()
+            assert scr._dna_redo       # redo now has content
+            ed.insert_at_cursor("GGG")
+            await pilot.pause()
+            assert ed._seq == "GGG"
+            assert scr._dna_redo == []
+
+    async def test_load_resets_undo_history(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.insert_at_cursor("ATGATG")
+            await pilot.pause()
+            ed.load("CCCCCC")          # posts Loaded → resets history
+            await pilot.pause(); await pilot.pause()
+            # Ctrl+Z can't reach the pre-load buffer.
+            scr.action_undo()
+            await pilot.pause()
+            assert ed._seq == "CCCCCC"
+
+    async def test_protein_undo_redo(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            scr.query_one("#syn-tabs", sc.TabbedContent).active = \
+                "syn-tab-protein"
+            await pilot.pause(); await pilot.pause()
+            pe = scr.query_one("#syn-protein-editor", sc.ProteinEditor)
+            pe.insert_at_cursor("MKK")
+            await pilot.pause()
+            assert pe.get_state()[0] == "MKK"
+            scr.action_undo()
+            await pilot.pause()
+            assert pe.get_state()[0] == ""
+            scr.action_redo()
+            await pilot.pause()
+            assert pe.get_state()[0] == "MKK"

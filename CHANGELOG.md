@@ -14,6 +14,49 @@
 
 ---
 
+## [1.2.5] — 2026-07-08
+
+### New features
+
+- **Synthesis composer: features you paste in are now editable, just like on
+  the main sequence viewer.** On both the **DNA** and **Protein** tabs, click a
+  feature's stripe to highlight the whole feature, and **double-click it** (or
+  press **Enter** with the cursor inside it) to open the editor and change its
+  label, type, color, strand, or notes. Previously a click only moved the
+  cursor and pasted features could only be viewed, not touched.
+
+- **Press `R` to reveal restriction cut sites in the Synthesis DNA editor.**
+  The same overlay the main sequence viewer toggles now works while you compose
+  a fragment — it respects your active enzyme collection and refreshes as you
+  edit. Press `R` again to hide it. (On the Protein tab `R` still types
+  arginine.)
+
+- **Undo / redo in the Synthesis tab.** `Ctrl+Z` reverts typed bases, deletes,
+  pastes, inserted sites, and feature edits; `Ctrl+Y` redoes them. Each tab
+  (DNA / Protein) keeps its own history, and loading or starting a new fragment
+  begins a fresh one so undo can't reach into a different document.
+
+- **Insert Site now drops a real, labelled feature you can point either way.**
+  Inserting a restriction site (Ctrl+R / the Insert Site button) stamps a
+  hot-pink `protein_bind` feature named for the enzyme, with a direction arrow —
+  so the site is visible and editable, not just bare bases. The Insert Site
+  dialog has a new **Direction** picker: **Forward ▶** inserts the recognition
+  sequence as shown; **Reverse ◀** inserts its reverse-complement (so a
+  directional Type IIS enzyme like BsaI cuts the other way) and draws the arrow
+  ◀. For a palindromic site the bases are identical either way and only the
+  arrow flips.
+
+### Bug fixes
+
+- **Inserting a restriction site at the 3′ end of a DNA fragment no longer
+  vanishes into the neighbouring feature.** When a feature ended exactly at the
+  last base (e.g. a loaded CDS filling the whole fragment), an inserted site's
+  bases were being absorbed into that feature's coloured stripe — so the site
+  showed up when added at the 5′ end but seemed to do nothing at the 3′ end.
+  Inserted sites now stay standalone at either end.
+
+---
+
 ## [1.2.4] — 2026-07-08
 
 ### Bug fixes

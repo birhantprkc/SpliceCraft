@@ -5864,8 +5864,11 @@ class RestrictionInsertModal(_OneShotDismissScreen, ModalScreen):
     site at the synthesis cursor.
 
     Dismiss payload:
-      * ``str`` — the enzyme name (caller looks up the recognition
-        site via ``_site_for_enzyme`` and inserts at cursor).
+      * ``dict`` — ``{"enzyme": <name>, "strand": 1 | -1}``. The caller
+        looks up the recognition site via ``_site_for_enzyme``; for
+        ``strand == -1`` it inserts the reverse-complement (so a
+        directional Type IIS enzyme cuts the other way) and draws the
+        feature arrow ◀. ``strand == 1`` inserts the site as shown, arrow ▶.
       * ``None`` — user cancelled."""
 
     _blocks_undo: bool = True
@@ -5877,7 +5880,7 @@ class RestrictionInsertModal(_OneShotDismissScreen, ModalScreen):
 
     DEFAULT_CSS = """
     #ri-dlg {
-        width: 60%; max-width: 80; height: 80%; max-height: 36;
+        width: 60%; max-width: 80; height: 80%; max-height: 40;
         background: $surface; padding: 1 2; border: solid $primary-darken-2;
     }
     #ri-title {
@@ -5887,9 +5890,18 @@ class RestrictionInsertModal(_OneShotDismissScreen, ModalScreen):
     #ri-search { height: 3; margin-top: 1; }
     #ri-table  { height: 1fr; border: solid $primary-darken-2;
                  margin-top: 1; }
+    #ri-dir-row { height: 3; margin-top: 1; }
+    #ri-dir-label { width: auto; padding: 1 1 0 0; color: $text-muted; }
+    #ri-direction { width: 1fr; }
     #ri-btns   { height: 3; align: right middle; margin-top: 1; }
     #ri-btns Button { margin-left: 1; min-width: 10; }
     """
+
+    # Direction options for the Select — value is the feature strand.
+    _DIR_OPTIONS = [
+        ("Forward  ▶  (site as shown, cuts →)", "1"),
+        ("Reverse  ◀  (reverse-complement, cuts ←)", "-1"),
+    ]
 
     def __init__(self) -> None:
         super().__init__()
@@ -5914,6 +5926,10 @@ class RestrictionInsertModal(_OneShotDismissScreen, ModalScreen):
             yield DataTable(id="ri-table",
                               cursor_type="row",
                               zebra_stripes=True)
+            with Horizontal(id="ri-dir-row"):
+                yield Static("Direction:", id="ri-dir-label")
+                yield Select(self._DIR_OPTIONS, value="1",
+                              id="ri-direction", allow_blank=False)
             with Horizontal(id="ri-btns"):
                 yield Button("Insert", id="btn-ri-insert", variant="primary")
                 yield Button("Cancel", id="btn-ri-cancel")
@@ -5978,7 +5994,16 @@ class RestrictionInsertModal(_OneShotDismissScreen, ModalScreen):
             self.dismiss(None)
             return
         enzyme = row_key.value if hasattr(row_key, "value") else str(row_key)
-        self.dismiss(enzyme)
+        # Read the direction Select — value is the feature strand as a
+        # string ("1" / "-1"). Defensive: fall back to forward if the
+        # Select is missing or holds an unexpected value.
+        strand = 1
+        try:
+            raw = self.query_one("#ri-direction", Select).value
+            strand = -1 if str(raw) == "-1" else 1
+        except NoMatches:
+            pass
+        self.dismiss({"enzyme": enzyme, "strand": strand})
 
 
 class CollectionNameModal(_OneShotDismissScreen, ModalScreen):
