@@ -4750,6 +4750,196 @@ class TestSynthesisCopyPaste:
             assert (got[0]["start"], got[0]["end"]) == (3, 7)
 
 
+class TestSynthesisDeleteFeatureFirst:
+    """Delete on a highlighted feature removes the annotation first
+    (keeping the bases + the exact highlight); a second Delete then
+    removes the highlighted bases."""
+
+    async def test_dna_two_step_delete(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            seq = "ATGAAACCCGGGTTTAAA"
+            ed.load(seq, [{"start": 3, "end": 9, "label": "f", "type": "CDS",
+                           "color": "#88cc88", "strand": 1, "qualifiers": {}}])
+            await pilot.pause()
+            ed._select_feature_span(0)          # lane-click highlight
+            await pilot.pause()
+            assert ed._user_sel == (3, 9)
+            ed.delete_at_cursor(forward=True)   # 1st Delete: feature only
+            await pilot.pause()
+            assert ed._seq == seq               # DNA untouched
+            assert ed._feats == []              # feature gone
+            assert ed._user_sel == (3, 9)       # highlight maintained
+            ed.delete_at_cursor(forward=True)   # 2nd Delete: the bases
+            await pilot.pause()
+            assert ed._seq == seq[:3] + seq[9:]
+            assert ed._user_sel is None
+
+    async def test_dna_plain_selection_deletes_bases_immediately(self):
+        # A drag-selection that does NOT match a feature span deletes
+        # the bases on the first Delete (no feature to strip).
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGAAACCCGGG", [{"start": 3, "end": 9, "label": "f",
+                                      "type": "CDS", "color": "#88cc88",
+                                      "strand": 1, "qualifiers": {}}])
+            await pilot.pause()
+            ed._user_sel = (1, 4)               # not a feature span
+            ed.delete_at_cursor(forward=True)
+            await pilot.pause()
+            assert ed._seq == "A" + "AACCCGGG"  # bases [1,4) gone
+            assert len(ed._feats) == 1          # feature kept
+
+    async def test_protein_two_step_delete(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            scr.query_one("#syn-tabs", sc.TabbedContent).active = \
+                "syn-tab-protein"
+            await pilot.pause(); await pilot.pause()
+            pe = scr.query_one("#syn-protein-editor", sc.ProteinEditor)
+            pe.load("MASGGGSKKKK", feats=[
+                {"start": 3, "end": 7, "label": "L", "type": "Linker",
+                 "color": "#6B7280", "qualifiers": {}}])
+            await pilot.pause()
+            pe._select_feature_span(0)
+            await pilot.pause()
+            assert pe._user_sel == (3, 7)
+            pe.delete_at_cursor(forward=True)   # motif only
+            await pilot.pause()
+            assert pe._aa_seq == "MASGGGSKKKK"
+            assert pe._aa_feats == []
+            assert pe._user_sel == (3, 7)
+            pe.delete_at_cursor(forward=True)   # residues
+            await pilot.pause()
+            assert pe._aa_seq == "MAS" + "KKKK"
+
+
+class TestSynthesisClear:
+    """The Clear button wipes the whole active sub-tab."""
+
+    async def test_dna_clear_wipes_bases_and_feats(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCGT", [{"start": 0, "end": 3, "label": "x",
+                                "type": "CDS", "color": "#88cc88",
+                                "strand": 1, "qualifiers": {}}])
+            scr._dirty = False
+            await pilot.pause()
+            scr._btn_dna_clear(None)
+            await pilot.pause(); await pilot.pause()
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            assert ed._seq == ""
+            assert ed._feats == []
+
+
+class TestSynthesisPersistence:
+    """The app reuses ONE SynthesisScreen so DNA / Protein data survives
+    navigating away and back."""
+
+    async def test_close_reopen_restores_content(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            scr1 = app.screen
+            assert isinstance(scr1, sc.SynthesisScreen)
+            ed = scr1.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCGTACGTAAA", [{"start": 0, "end": 3, "label": "keep",
+                                       "type": "CDS", "color": "#88cc88",
+                                       "strand": 1, "qualifiers": {}}])
+            await pilot.pause()
+            scr1.action_cancel()                # close
+            await pilot.pause(); await pilot.pause()
+            assert app.screen is not scr1
+            app.action_open_synthesis()         # reopen
+            await pilot.pause(); await pilot.pause()
+            scr2 = app.screen
+            assert scr2 is scr1                 # same instance reused
+            ed2 = scr2.query_one("#syn-editor", sc.SynthesisEditor)
+            assert ed2._seq == "ATGCGTACGTAAA"  # content restored
+            assert len(ed2._feats) == 1
+            assert ed2._feats[0]["label"] == "keep"
+            # And it can be closed again (one-shot dismiss flag reset).
+            scr2.action_cancel()
+            await pilot.pause(); await pilot.pause()
+            assert app.screen is not scr2
+
+    async def test_subtab_switch_keeps_data(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCGTACGT", [])
+            await pilot.pause()
+            tabs = scr.query_one("#syn-tabs", sc.TabbedContent)
+            tabs.active = "syn-tab-protein"
+            await pilot.pause(); await pilot.pause()
+            tabs.active = "syn-tab-dna"
+            await pilot.pause(); await pilot.pause()
+            assert scr.query_one("#syn-editor", sc.SynthesisEditor)._seq \
+                == "ATGCGTACGT"
+
+
+class TestFeatureColorSafety:
+    """A malformed feature colour (short/garbage hex from a hand-edited
+    .gb) must not crash the render, and _parse must normalise it."""
+
+    def test_safe_feature_color(self):
+        assert sc._safe_feature_color("#8c8") == "#88cc88"     # expand
+        assert sc._safe_feature_color("#88cc88") == "#88cc88"  # valid
+        assert sc._safe_feature_color("red") == "red"          # named
+        assert sc._safe_feature_color("color(252)") == "color(252)"
+        assert sc._safe_feature_color("#ZZZZZZ") == "color(252)"  # garbage
+        assert sc._safe_feature_color(None) == "color(252)"
+
+    def test_build_seq_text_renders_bad_color_without_crash(self):
+        from rich.console import Console
+        import io
+        for bad in ("#8c8", "#ZZZZZZ", "notacolor", "#12345"):
+            feats = [{"start": 2, "end": 8, "label": "b",
+                      "type": "misc_feature", "color": bad, "strand": 1}]
+            txt = sc._build_seq_text("ATGCATGCATGCATGC", feats, line_width=25)
+            # Force the DEFERRED style parse (the paint that crashed).
+            Console(file=io.StringIO(), force_terminal=True,
+                    width=100).print(txt)
+
+    def test_parse_normalises_short_hex_qualifier(self):
+        gb = ("LOCUS       t              20 bp    DNA     linear\n"
+              "FEATURES             Location/Qualifiers\n"
+              "     misc_feature    5..15\n"
+              '                     /label="badc"\n'
+              '                     /ApEinfo_fwdcolor="#8c8"\n'
+              "ORIGIN\n"
+              "        1 atgcatgcat gcatgcatgc\n"
+              "//\n")
+        rec = sc._gb_text_to_record(gb)
+        pm = sc.PlasmidMap()
+        parsed = pm._parse(rec)
+        cols = [f.get("color") for f in parsed if f.get("label") == "badc"]
+        assert cols == ["#88cc88"]   # expanded, not the crashing #8c8
+
+
 class TestSynthesisRestrictionOverlay:
     """The R key reveals / hides restriction cut sites on the DNA tab."""
 

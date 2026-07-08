@@ -14,6 +14,32 @@
 
 ---
 
+## [1.2.7] — 2026-07-08
+
+### New features
+
+- **Deleting a highlighted feature in the Synthesis editor no longer nukes the
+  DNA it labels.** Click a feature to highlight it and press Delete: the first
+  press removes just the annotation and keeps the exact bases highlighted; a
+  second Delete then removes those bases. Works on the DNA and Protein tabs.
+
+- **Synthesis data survives leaving and returning.** The Synthesis workbench now
+  keeps one session, so navigating to another menu and back preserves your DNA /
+  Protein / Operon work (and the toolbar). The **Clear** button remains the
+  explicit way to wipe the active sub-tab. (Switching between the DNA / Protein /
+  Operon sub-tabs already preserved data.)
+
+### Bug fixes
+
+- **Opening a plasmid with a malformed feature colour no longer crashes the
+  view.** A hand-edited or exported `.gb`/`.dna` whose feature colour was a
+  3-digit short hex (`#8c8`) or otherwise invalid could crash the sequence panel
+  when it painted. Short-hex colours are now expanded (`#8c8` → `#88cc88`) and
+  anything unparseable falls back to a neutral colour, so the record always
+  renders.
+
+---
+
 ## [1.2.6] — 2026-07-08
 
 ### Bug fixes
