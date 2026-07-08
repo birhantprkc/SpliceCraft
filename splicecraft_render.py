@@ -31,6 +31,16 @@ class _Canvas:
         for j, ch in enumerate(text):
             self.put(col + j, row, ch, style)
 
+    def copy(self) -> "_Canvas":
+        """Deep copy of the grid (rows copied, cells are immutable str). Backs
+        the circular map's base-canvas cache: a selection re-paint copies the
+        cached base and re-tints only the selected feature, instead of a full
+        redraw of every feature."""
+        c = _Canvas(self.w, self.h)
+        c._chars  = [row[:] for row in self._chars]
+        c._styles = [row[:] for row in self._styles]
+        return c
+
 
 # Pre-built lookup table for braille glyphs U+2800..U+28FF. The combine
 # loop in `_BrailleCanvas.render` writes one cell per (col, row) — on a
@@ -113,6 +123,16 @@ class _BrailleCanvas:
         if color and priority >= self._prio[row][col]:
             self._colors[row][col] = color
             self._prio[row][col]   = priority
+
+    def copy(self) -> "_BrailleCanvas":
+        """Deep copy of the dot/colour/priority grids (rows copied, cells are
+        immutable). Backs the circular map's base-canvas cache — see
+        ``_Canvas.copy``."""
+        bc = _BrailleCanvas(self.cols, self.rows)
+        bc._bits   = [row[:] for row in self._bits]
+        bc._colors = [row[:] for row in self._colors]
+        bc._prio   = [row[:] for row in self._prio]
+        return bc
 
     def combine(self, text_canvas: "_Canvas") -> Text:
         """

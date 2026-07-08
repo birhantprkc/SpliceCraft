@@ -103,6 +103,14 @@ def _find_orfs(seq: str, *,
                             else:
                                 o_s = n - e_rc
                                 o_e = n - p_rc
+                        # Full-lap ORF (fwd or rev): [o_s, o_s) mod n is ambiguous
+                        # (0-length vs whole-circle) and `_feat_len` would render
+                        # it as length 0. Any ORF reaching here has aa_len >=
+                        # min_aa (never truly zero-length), so o_e == o_s can only
+                        # mean full-lap — nudge the end 1 bp short so it draws as a
+                        # near-full-circle wrap arc; length_aa / aa_seq stay exact.
+                        if circular and o_e == o_s:
+                            o_e = (o_s - 1) % n
                         orfs.append({
                             "start":     o_s,
                             "end":       o_e,

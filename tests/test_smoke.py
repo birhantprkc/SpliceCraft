@@ -869,6 +869,93 @@ class TestLibraryRename:
                     f"expected 'renamed-test' in cache key; got {key_after}"
                 )
 
+    async def test_map_base_canvas_cache_reuse_and_no_corruption(
+        self, tiny_record, isolated_library
+    ):
+        """M1 base-canvas cache: the circular map caches a base (all features
+        UNSELECTED) keyed WITHOUT selected_idx, then copies it + re-tints only
+        the selected feature on a navigation. This guards the two real risks:
+        (1) the re-paint must copy — never mutate — the cached base, so two
+        renders of the same selection (with a DIFFERENT selection rendered in
+        between) are byte-identical; (2) selecting a feature actually changes the
+        map, and different selections differ from each other."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm._map_mode = "circular"          # exercise the base-canvas path
+            assert len(pm._feats) >= 2, "fixture needs >=2 features"
+
+            def _render(idx):
+                pm.selected_idx = idx
+                pm._draw_cache = None           # bypass render()'s own (with-idx) cache
+                t = pm.render()
+                # Style-aware: the selection highlight is a STYLE change (reverse),
+                # not a character change, so capture the style spans too — a plain
+                # `str(t)` would strip them and miss the highlight.
+                return (t.plain, tuple((s.start, s.end, str(s.style)) for s in t.spans))
+
+            text_none = _render(-1)             # builds + caches the base
+            assert pm._draw_base_cache is not None
+            base_key = pm._draw_base_cache[0]
+
+            text0       = _render(0)            # base hit → copy + re-tint feat 0
+            text1       = _render(1)            # base hit → copy + re-tint feat 1
+            text0_again = _render(0)            # base hit → copy + re-tint feat 0
+
+            # Base cache reused (record/geometry unchanged) across all selections.
+            assert pm._draw_base_cache[0] == base_key
+            # Anti-corruption: the intervening feat-1 render did NOT mutate the
+            # cached base, so both feat-0 renders are byte-identical.
+            assert text0 == text0_again
+            # A selection actually re-tints the map, and the two selections differ.
+            assert text0 != text_none
+            assert text1 != text_none
+            assert text0 != text1
+
+    async def test_map_base_canvas_stale_selection_is_safe(
+        self, tiny_record, isolated_library
+    ):
+        """A stale / out-of-range selected_idx (left over after a feature delete)
+        must render the base map (no highlight) without an IndexError — `_draw`
+        guards `0 <= sel < len(_feats)` before re-tinting."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm._map_mode = "circular"
+
+            def _render(idx):
+                pm.selected_idx = idx
+                pm._draw_cache = None
+                t = pm.render()
+                return (t.plain, tuple((s.start, s.end, str(s.style)) for s in t.spans))
+
+            base = _render(-1)
+            # Past-the-end and large-negative both fall back to the base render.
+            assert _render(len(pm._feats) + 50) == base
+            assert _render(-999) == base
+
+    async def test_map_base_canvas_no_features(
+        self, tiny_record, isolated_library
+    ):
+        """A featureless circular map renders (backbone only) via the base-canvas
+        path without crashing, even with a stale selection."""
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pm = app.query_one("#plasmid-map", sc.PlasmidMap)
+            pm._map_mode = "circular"
+            pm._feats = []                     # featureless
+            pm._draw_base_cache = None
+            pm.selected_idx = 0                # stale — nothing to select
+            pm._draw_cache = None
+            text = str(pm.render())            # must not raise
+            assert isinstance(text, str) and len(text) > 0
+
     async def test_rename_rejects_duplicate_name(
         self, tiny_record, isolated_library, monkeypatch
     ):

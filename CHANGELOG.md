@@ -14,6 +14,24 @@
 
 ---
 
+## [1.2.2] — 2026-07-07
+
+### Performance
+
+- **Snappier feature navigation on the circular map.** Tabbing through features
+  (or clicking between them) on a plasmid with many annotations no longer
+  redraws the whole map each time — it re-tints a cached base image and repaints
+  only the selected feature. On a 300-feature construct that's roughly **6×
+  faster** (now sub-millisecond), so navigation stays fluid on dense assemblies
+  and large contigs. The map is pixel-identical to before.
+
+### Bug fixes
+
+- A (very rare) open reading frame spanning the *entire* plasmid now draws as a
+  near-full-circle arc instead of collapsing to a zero-length mark on the map.
+
+---
+
 ## [1.2.1] — 2026-07-07
 
 Fresh whole-codebase audit sweep — data-safety, correctness, and UI polish.
