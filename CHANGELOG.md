@@ -14,6 +14,26 @@
 
 ---
 
+## [1.2.8] — 2026-07-08
+
+### Bug fixes
+
+- **Fixed the Synthesis workbench appearing to hang when reopened.** In 1.2.7
+  the workbench kept its session by reusing one screen; on some terminals the
+  reopened screen came back blank/unlaid-out and looked frozen. It now opens a
+  fresh screen each time (which always renders) while still restoring your DNA /
+  Protein / Operon work, so persistence is kept without the freeze.
+
+### Hardening
+
+- **The app now auto-captures a diagnostic trace if it ever stalls.** If the UI
+  stops responding for a few seconds, SpliceCraft writes every thread's stack to
+  `logs/splicecraft.stacks.log` and notes it in the main log — so a "the app
+  hung" report carries the evidence to pinpoint it, without you needing to run
+  anything by hand.
+
+---
+
 ## [1.2.7] — 2026-07-08
 
 ### New features

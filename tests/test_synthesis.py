@@ -4850,8 +4850,8 @@ class TestSynthesisClear:
 
 
 class TestSynthesisPersistence:
-    """The app reuses ONE SynthesisScreen so DNA / Protein data survives
-    navigating away and back."""
+    """A FRESH SynthesisScreen each open (robust layout), but the composed
+    DNA / Protein data survives via app-level `_synthesis_state`."""
 
     async def test_close_reopen_restores_content(self):
         app = sc.PlasmidApp()
@@ -4865,22 +4865,99 @@ class TestSynthesisPersistence:
             ed.load("ATGCGTACGTAAA", [{"start": 0, "end": 3, "label": "keep",
                                        "type": "CDS", "color": "#88cc88",
                                        "strand": 1, "qualifiers": {}}])
+            # A protein motif too, to prove both tabs persist.
+            pe = scr1.query_one("#syn-protein-editor", sc.ProteinEditor)
+            pe.load("MASKKK", feats=[{"start": 0, "end": 3, "label": "m",
+                                      "type": "Motif", "color": "#6B7280",
+                                      "qualifiers": {}}])
             await pilot.pause()
-            scr1.action_cancel()                # close
+            scr1.action_cancel()                # close → saves state
             await pilot.pause(); await pilot.pause()
             assert app.screen is not scr1
-            app.action_open_synthesis()         # reopen
+            app.action_open_synthesis()         # reopen → FRESH screen
             await pilot.pause(); await pilot.pause()
             scr2 = app.screen
-            assert scr2 is scr1                 # same instance reused
+            assert scr2 is not scr1             # fresh instance
+            # But the widgets ARE laid out (the regression was a 0×0
+            # re-mounted reused instance).
+            assert scr2.query_one("#syn-box").size.width > 0
             ed2 = scr2.query_one("#syn-editor", sc.SynthesisEditor)
-            assert ed2._seq == "ATGCGTACGTAAA"  # content restored
+            assert ed2._seq == "ATGCGTACGTAAA"  # DNA restored
             assert len(ed2._feats) == 1
             assert ed2._feats[0]["label"] == "keep"
-            # And it can be closed again (one-shot dismiss flag reset).
+            pe2 = scr2.query_one("#syn-protein-editor", sc.ProteinEditor)
+            assert pe2._aa_seq == "MASKKK"       # protein restored
+            assert len(pe2._aa_feats) == 1
+            # And it closes cleanly a second time.
             scr2.action_cancel()
             await pilot.pause(); await pilot.pause()
             assert app.screen is not scr2
+
+    async def test_clear_then_reopen_stays_empty(self):
+        # Clear wipes the tab AND the persisted state, so a reopen is empty.
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCGT", [])
+            scr._dirty = False
+            await pilot.pause()
+            scr._btn_dna_clear(None)            # Clear → empty
+            await pilot.pause(); await pilot.pause()
+            scr.action_cancel()
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            assert app.screen.query_one("#syn-editor",
+                                        sc.SynthesisEditor)._seq == ""
+
+    async def test_subtab_switch_keeps_data(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCGTACGT", [])
+            await pilot.pause()
+            tabs = scr.query_one("#syn-tabs", sc.TabbedContent)
+            tabs.active = "syn-tab-protein"
+            await pilot.pause(); await pilot.pause()
+            tabs.active = "syn-tab-dna"
+            await pilot.pause(); await pilot.pause()
+            assert scr.query_one("#syn-editor", sc.SynthesisEditor)._seq \
+                == "ATGCGTACGT"
+
+
+class TestHangWatchdog:
+    """The auto stack-dump watchdog for UI-thread stalls."""
+
+    def test_tick_and_stall_detection(self):
+        wd = sc._HangWatchdog()
+        wd.tick()
+        # Fresh tick → not stalled.
+        import time as _t
+        with wd._lock:
+            stalled = _t.monotonic() - wd._last_tick
+        assert stalled < sc._HANG_WATCHDOG_STALL_S
+        # Simulate a stall by back-dating the last tick.
+        with wd._lock:
+            wd._last_tick = _t.monotonic() - (sc._HANG_WATCHDOG_STALL_S + 5)
+            aged = _t.monotonic() - wd._last_tick
+        assert aged >= sc._HANG_WATCHDOG_STALL_S
+        # tick() re-arms.
+        wd.tick()
+        with wd._lock:
+            assert wd._dumped_for_stall is False
+
+    def test_dump_is_safe_without_fd(self):
+        # _dump must never raise even if the stacks FD is unavailable.
+        wd = sc._HangWatchdog()
+        wd._dump(9.0)   # should log + not raise
 
     async def test_subtab_switch_keeps_data(self):
         app = sc.PlasmidApp()
