@@ -14,6 +14,25 @@
 
 ---
 
+## [1.2.9] — 2026-07-08
+
+### New features
+
+- **The main menu bar now stays on the Synthesis workbench.** You can jump
+  straight to another tool (Parts, Constructor, BLAST, …) from inside Synthesis
+  without closing it first — click the menu and come right back; your work is
+  still there. Clicking Synthesis again just returns to the open workbench
+  rather than stacking a second one.
+
+- **Leaving Synthesis no longer nags you to save.** Because your DNA / Protein /
+  Operon work now persists across leaving and returning, closing the workbench
+  (Esc or Close) just closes it — the old "save / abandon / cancel" prompt is
+  gone. Use **Save** to write the fragment to your library (as a linear
+  synthetic fragment); use **Clone Fragment** for the cloning workflow that also
+  files a parts-bin entry.
+
+---
+
 ## [1.2.8] — 2026-07-08
 
 ### Bug fixes

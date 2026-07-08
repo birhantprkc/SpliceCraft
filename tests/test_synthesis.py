@@ -4933,6 +4933,90 @@ class TestSynthesisPersistence:
                 == "ATGCGTACGT"
 
 
+class TestSynthesisToolbarNav:
+    """The main menu bar is present on the Synthesis screen; closing is
+    lossless (no save modal); re-opening while stacked resurfaces."""
+
+    async def test_menubar_present(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            mb = app.screen.query_one("#menubar", sc.MenuBar)
+            assert mb.size.width > 0
+
+    async def test_close_never_prompts_and_persists(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.insert_at_cursor("ATGCGT")       # dirty
+            await pilot.pause()
+            assert scr._dirty is True
+            scr.action_cancel()                 # close — NO modal
+            await pilot.pause(); await pilot.pause()
+            assert not isinstance(app.screen,
+                                  sc.SynthesisUnsavedChangesModal)
+            assert not isinstance(app.screen, sc.SynthesisScreen)
+            app.action_open_synthesis()         # reopen restores
+            await pilot.pause(); await pilot.pause()
+            assert app.screen.query_one(
+                "#syn-editor", sc.SynthesisEditor)._seq == "ATGCGT"
+
+    async def test_reopen_while_stacked_resurfaces(self):
+        from textual.screen import ModalScreen
+        from textual.widgets import Static as _TS
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            syn = app.screen
+
+            class _Top(ModalScreen):
+                def compose(self):
+                    yield _TS("top")
+            app.push_screen(_Top())
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()         # from atop → resurface
+            await pilot.pause(); await pilot.pause()
+            assert app.screen is syn
+            assert sum(1 for s in app.screen_stack
+                       if isinstance(s, sc.SynthesisScreen)) == 1
+
+
+class TestSynthesisSaveIsLibraryOnly:
+    """Save writes the fragment to the library as LINEAR and does NOT
+    populate the parts bin (that's the Clone Fragment button's job)."""
+
+    async def test_save_linear_no_parts_bin(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCGTACGTAAA", [{"start": 0, "end": 6, "label": "f",
+                                       "type": "CDS", "color": "#88cc88",
+                                       "strand": 1, "qualifiers": {}}])
+            scr._loaded_name = "myfrag"
+            scr._loaded_id = "myfrag"
+            bin_before = len(sc._load_parts_bin())
+            await pilot.pause()
+            scr.action_save()
+            await pilot.pause(); await pilot.pause()
+            entry = sc._find_library_entry_by_id("myfrag")
+            assert entry is not None
+            rec = sc._gb_text_to_record(entry.get("gb_text", ""))
+            assert rec.annotations.get("topology") == "linear"
+            assert len(sc._load_parts_bin()) == bin_before   # untouched
+
+
 class TestHangWatchdog:
     """The auto stack-dump watchdog for UI-thread stalls."""
 
