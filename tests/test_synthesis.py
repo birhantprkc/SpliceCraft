@@ -4933,6 +4933,152 @@ class TestSynthesisPersistence:
                 == "ATGCGTACGT"
 
 
+class TestSynthesisEnzymeClick:
+    """Clicking a restriction-enzyme name highlights recognition + spacer +
+    cut (Type IIS footprint computed from the sequence), like SequencePanel."""
+
+    def test_build_resite_highlight_typeIIS(self):
+        seq = "AAAAA" + "GGTCTC" + "A" * 14   # BsaI at [5,11)
+        resites = [f for f in sc._scan_restriction_sites(
+            seq, min_recognition_len=4, unique_only=False, circular=False,
+            allowed_enzymes={"BsaI"}) if f.get("type") == "resite"
+            and f.get("label")]
+        assert resites
+        hi = sc._build_resite_highlight(len(seq), resites[0])
+        # recognition [5,11) + spacer [11,12) + overhang [12,16) → [5,16)
+        assert (hi["start"], hi["end"]) == (5, 16)
+        assert (hi["rec_start"], hi["rec_end"]) == (5, 11)
+
+    def test_build_resite_highlight_palindrome(self):
+        seq = "TTTTT" + "GAATTC" + "TTTTT"    # EcoRI at [5,11)
+        resites = [f for f in sc._scan_restriction_sites(
+            seq, min_recognition_len=4, unique_only=False, circular=False,
+            allowed_enzymes={"EcoRI"}) if f.get("type") == "resite"
+            and f.get("label")]
+        assert resites
+        hi = sc._build_resite_highlight(len(seq), resites[0])
+        assert (hi["start"], hi["end"]) == (5, 11)   # recognition only
+
+    async def test_click_enzyme_name_highlights_and_arrow_clears(self):
+        import types
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("AAAAA" + "GGTCTC" + "A" * 14, [])
+            ed.toggle_restr_overlay()
+            await pilot.pause(); await pilot.pause()
+            r = next(f for f in ed._restr_feats
+                     if f.get("type") == "resite" and f.get("label") == "BsaI")
+            view = ed.query_one("#syn-view", sc.Static)
+            reg = view.region
+            sx = reg.x + ed._pad_left_cols + ed._FLANK_MARKER_WIDTH + r["start"]
+            hit = None
+            for rr in range(0, 8):
+                sy = reg.y + ed._pad_above_rows + rr
+                ed._last_resite_click = None
+                ed._lane_feature_at(sx, sy)
+                if ed._last_resite_click is not None:
+                    hit = sy
+                    break
+            assert hit is not None
+            ev = types.SimpleNamespace(button=1, screen_x=sx, screen_y=hit,
+                                       shift=False, ctrl=False, chain=1,
+                                       stop=lambda: None)
+            ed.on_mouse_down(ev)
+            ed.on_click(ev)
+            await pilot.pause()
+            assert ed._re_highlight is not None
+            assert (ed._re_highlight["start"], ed._re_highlight["end"]) == (5, 16)
+            ed.set_cursor(3)                    # arrow clears the highlight
+            assert ed._re_highlight is None
+
+
+class TestSynthesisCtrlSelection:
+    """Ctrl+click extends (shift alias); Ctrl+arrow slides the selection."""
+
+    @staticmethod
+    def _ev(**kw):
+        import types
+        kw.setdefault("button", 1); kw.setdefault("shift", False)
+        kw.setdefault("ctrl", False); kw.setdefault("chain", 1)
+        kw.setdefault("stop", lambda: None)
+        return types.SimpleNamespace(**kw)
+
+    async def test_ctrl_arrow_slides_selection(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCGTACGTAAACCCGGG", [])
+            ed._user_sel = (3, 7); ed._sel_anchor = 3; ed._cursor_pos = 7
+            await pilot.pause()
+            ed.on_key(self._ev(key="ctrl+right"))
+            assert ed._user_sel == (4, 8)
+            ed.on_key(self._ev(key="ctrl+left"))
+            ed.on_key(self._ev(key="ctrl+left"))
+            assert ed._user_sel == (2, 6)
+            for _ in range(10):
+                ed.on_key(self._ev(key="ctrl+left"))
+            assert ed._user_sel == (0, 4)      # clamps, keeps length
+
+    async def test_ctrl_click_extends(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCGTACGTAAACCCGGG", [])
+            await pilot.pause()
+            reg = ed.query_one("#syn-view", sc.Static).region
+            row = reg.y + ed._pad_above_rows + ed._dna_top_row_offset()
+
+            def sx(bp):
+                return reg.x + ed._pad_left_cols + ed._FLANK_MARKER_WIDTH + bp
+            ed.on_mouse_down(self._ev(screen_x=sx(3), screen_y=row))
+            ed.on_mouse_up(self._ev(screen_x=sx(3), screen_y=row))
+            ed.on_click(self._ev(screen_x=sx(3), screen_y=row))
+            assert ed._cursor_pos == 3
+            ed.on_mouse_down(self._ev(screen_x=sx(9), screen_y=row, ctrl=True))
+            ed.on_mouse_up(self._ev(screen_x=sx(9), screen_y=row, ctrl=True))
+            assert ed._user_sel == (3, 9)
+
+
+class TestSynthesisFeatlibSave:
+    """Save-to-library from the DNA tab persists AND refreshes the list."""
+
+    async def test_save_refreshes_featlib_list(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCGTACGTAAACCCGGG", [])
+            ed._user_sel = (0, 9); ed._sel_anchor = 0; ed._cursor_pos = 9
+            await pilot.pause()
+            before = scr.query_one("#syn-featlib-table", sc.DataTable).row_count
+            n_before = len(sc._load_features())
+            scr.action_add_feature()
+            await pilot.pause(); await pilot.pause()
+            entry = {"name": "RegFeatSave", "feature_type": "misc_feature",
+                     "sequence": "ATGCGTACG", "strand": 1, "color": None,
+                     "qualifiers": {}, "description": ""}
+            app.screen.dismiss({"action": "save", "entry": entry})
+            await pilot.pause(); await pilot.pause()
+            assert len(sc._load_features()) == n_before + 1
+            assert app.screen.query_one(
+                "#syn-featlib-table", sc.DataTable).row_count == before + 1
+            assert any(e.get("name") == "RegFeatSave"
+                       for e in sc._load_features())
+
+
 class TestSynthesisPasteFeatureIsolation:
     """Pasting one annotated sequence after another must keep the features
     separate — the upstream feature must NOT extend beneath the new bases."""

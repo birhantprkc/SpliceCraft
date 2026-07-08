@@ -14,6 +14,31 @@
 
 ---
 
+## [1.2.12] — 2026-07-08
+
+### New features
+
+- **Click a restriction-enzyme name in the Synthesis DNA tab to highlight its
+  cut.** With cut sites revealed (press **R**), clicking an enzyme's name now
+  highlights its recognition site plus — for Type IIS enzymes (BsaI, BsmBI,
+  BbsI, …) — the spacer and the staggered overhang out to the actual cut,
+  computed from the surrounding sequence, exactly like the main sequence viewer.
+  Inserting a Type IIS site still inserts just the recognition sequence; the cut
+  and spacer are shown relative to wherever it lands.
+- **Synthesis DNA selection now matches the sequence viewer.** Ctrl+click extends
+  a selection (a reliable stand-in for Shift+click, which some terminals eat),
+  and Ctrl+←/→ slides the whole selection one base at a time — on top of the
+  existing Shift+click, drag, and Shift+arrow selecting.
+
+### Bug fixes
+
+- **Saving a feature to the library from the Synthesis DNA tab now updates the
+  list.** "Save to Library" in Add Feature persisted the feature but didn't
+  refresh the right-hand feature list (or, previously, didn't save it at all);
+  it now saves and the list updates immediately.
+
+---
+
 ## [1.2.11] — 2026-07-08
 
 ### Bug fixes
