@@ -352,6 +352,34 @@ class TestToolsHandler:
         # the @_agent_endpoint decoration was missing `write=True`.
         assert eps["set-setting"]["write"] is True
 
+    def test_tools_is_envelope_free_bare_endpoints(self):
+        # `/tools` is served unauthenticated, ahead of the dispatcher
+        # envelope, and is the DOCUMENTED exception to the universal
+        # `data` contract: it returns a bare `{endpoints: [...]}`. Guard
+        # against re-adding a `data` mirror — doing so would double the
+        # API's largest response (~150 KB of doc_full text) for no gain.
+        result = sc._h_tools(None, {})
+        assert set(result) == {"endpoints"}, (
+            "/tools must stay a bare {endpoints} shape (no `data` envelope)")
+        assert isinstance(result["endpoints"], list)
+
+    def test_list_features_alias_resolves(self):
+        # `list-features` is a natural-guess alias for `features` (the
+        # list-* convention every other collection list follows). Both
+        # names must resolve to the SAME handler so a client guessing
+        # `list-features` doesn't 404.
+        names = {ep["name"] for ep in sc._h_tools(None, {})["endpoints"]}
+        assert "list-features" in names
+        assert "features" in names
+        # Registry values are (fn, write) tuples; the two names are
+        # registered by separate decorator applications, so compare the
+        # underlying handler FUNCTION (same object) + write flag, not the
+        # tuple identity.
+        assert (sc._AGENT_HANDLERS["list-features"][0]
+                is sc._AGENT_HANDLERS["features"][0])
+        assert (sc._AGENT_HANDLERS["list-features"][1]
+                == sc._AGENT_HANDLERS["features"][1] is False)
+
 
 class TestAddFeatureHandler:
     def test_validates_missing_record(self):

@@ -5145,6 +5145,14 @@ def _h_tools(app, payload):
       * Crash       → ``500`` with ``{"error": "...", "type": "..."}``
                        (the dispatcher's catch-all).
     """
+    # `/tools` is served unauthenticated and AHEAD of the dispatcher's
+    # envelope wrapper (which adds the universal `data`/`_stale` fields),
+    # so it deliberately returns a bare ``{endpoints: [...]}`` — no `data`
+    # mirror. It is the documented exception to the "every response carries
+    # `data`" contract (docs/agent-api.md): duplicating this response's
+    # `doc_full` corpus under `data` would double the single largest
+    # payload in the API (~150 KB → ~300 KB) for zero ergonomic gain — a
+    # client calling the discovery endpoint reads `endpoints` by name.
     return {"endpoints": [
         {
             "name":   name,

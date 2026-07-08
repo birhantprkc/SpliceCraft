@@ -67,7 +67,8 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   arrow type — forward ▶ / reverse ◀ / arrowless / double-stranded ◀▶ —
   plus colour and arbitrary GenBank qualifiers, matching the Insert/Edit
   Feature dialog; `add-features` inserts MANY at once under one lock + one
-  dirty-check), list features, find ORFs (length cutoff in AMINO ACIDS —
+  dirty-check), list features (`features`, alias `list-features`), find ORFs
+  (length cutoff in AMINO ACIDS —
   `min_aa`; `min_length`/`min_bp` are rejected so a bp-vs-aa mix-up can't
   silently return a default-length result), `undo` / `redo` the last edit,
   `discard-changes` (revert the canvas to its library-stored copy / clear a
@@ -433,7 +434,11 @@ don't have to know each endpoint's ad-hoc key (`seq` / `library` / `sites`
 / `matches` / …): `data` is the result with the envelope/metadata stripped,
 unwrapped to the bare value when there's a single content key (a scalar or
 list lands directly under `data`). The original keys stay too, so it's a
-superset — read whichever you prefer.
+superset — read whichever you prefer. The sole exception is the
+unauthenticated `/tools` discovery endpoint, which is served ahead of the
+envelope wrapper and returns a bare `{endpoints: [...]}` (read it by name) —
+mirroring its `doc_full` corpus under `data` would needlessly double the
+API's largest response.
 
 ## Security posture
 

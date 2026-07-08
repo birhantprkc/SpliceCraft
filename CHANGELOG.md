@@ -14,6 +14,26 @@
 
 ---
 
+## [1.2.3] — 2026-07-08
+
+### New features
+
+- **Agent API: `list-features` endpoint alias.** The loaded-record feature
+  listing is now reachable as `list-features` as well as `features`, matching
+  the `list-*` naming every other listing already uses (`list-parts`,
+  `list-collections`, `list-primers`, …). Scripts and AI agents that follow the
+  convention no longer hit a 404 guessing the name. Both names resolve to the
+  same handler and appear in `/tools`.
+
+### Housekeeping
+
+- Clarified in the agent-API reference that the unauthenticated `/tools`
+  discovery endpoint intentionally returns a bare `{endpoints: [...]}` (it is
+  served ahead of the response envelope), the one documented exception to the
+  universal `data` field — so no client special-cases it as a gap.
+
+---
+
 ## [1.2.2] — 2026-07-07
 
 ### Performance
