@@ -14,7 +14,31 @@
 
 ---
 
-## [1.2.5] — 2026-07-08
+## [1.2.6] — 2026-07-08
+
+### Bug fixes
+
+- **Synthesis editor: clicking a feature after scrolling right now works.**
+  Once you panned a long fragment to the right, clicking a feature's lane art
+  stopped highlighting it (and cursor clicks landed at the wrong base) — the
+  click math was double-counting the horizontal scroll. Fixed on both the DNA
+  and Protein tabs; clicks are now position-perfect at any scroll offset.
+
+- **No more phantom selections from clicking/dragging off the sequence.**
+  Clicking or drag-selecting on a feature lane, the 5'/3' end markers' padding,
+  or the blank space above/below the strand used to move the cursor or start a
+  stray highlight. Now only the actual sequence row is a cursor/selection
+  surface (feature lanes still highlight the whole feature on click); a drag
+  started off the sequence does nothing.
+
+### New features
+
+- **Ctrl+C in the Synthesis tab copies the editor's own selection — byte-for-byte,
+  with its features.** Previously Ctrl+C there fell through to the main-canvas
+  copy and grabbed the wrong (or an empty) selection. Now it copies exactly the
+  selected bases (DNA) or residues (Protein) and carries the selection's
+  features/motifs, so pasting back into a SpliceCraft editor re-lays the
+  annotations over the pasted sequence.
 
 ### New features
 

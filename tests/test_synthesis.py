@@ -4541,6 +4541,215 @@ class TestSynthesisLaneClick:
             assert isinstance(app.screen, sc.FeatureEditModal)
 
 
+class TestSynthesisScrolledClick:
+    """Clicks resolve correctly after panning the editor horizontally —
+    `view.region.x` already includes the scroll, so the resolver must not
+    add scroll_x again (the double-count that made scrolled-right feature
+    clicks miss, reported 2026-07-08)."""
+
+    async def test_dna_lane_click_and_cursor_after_scroll(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            scroll = ed.query_one("#syn-scroll", sc.ScrollableContainer)
+            seq = "ACGT" * 160   # 640 bp, far wider than the viewport
+            ed.load(seq, [{"start": 520, "end": 560, "label": "far",
+                           "type": "misc_feature", "color": "#88cc88",
+                           "strand": 1, "qualifiers": {}}])
+            await pilot.pause(); await pilot.pause()
+            scroll.scroll_to(x=scroll.max_scroll_x, animate=False)
+            await pilot.pause(); await pilot.pause()
+            assert int(scroll.scroll_x) > 0        # actually scrolled
+            reg = ed.query_one("#syn-view", sc.Static).region
+            bp = 540
+            x = reg.x + ed._pad_left_cols + ed._FLANK_MARKER_WIDTH + bp
+            above = ed._dna_top_row_offset()
+            lane_y = reg.y + ed._pad_above_rows + (above - 1)
+            dna_y = reg.y + ed._pad_above_rows + above
+            # Lane click resolves to the feature (not a miss / wrong bp).
+            assert ed._lane_feature_at(x, lane_y) == (0, 540)
+            # Cursor click on the DNA row resolves to the right bp.
+            assert ed._click_to_bp(x, dna_y) == 540
+
+
+class TestSynthesisRowAwareClicks:
+    """Clicks / drags off the actual sequence row don't move the cursor
+    or start a phantom selection (reported 2026-07-08)."""
+
+    async def test_dna_off_strand_no_phantom_selection(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATG" + "AAACCCGGGTTT" * 3 + "TAA",
+                    [{"start": 5, "end": 20, "label": "f",
+                      "type": "misc_feature", "color": "#88cc88",
+                      "strand": 1, "qualifiers": {}}])
+            await pilot.pause(); await pilot.pause()
+            reg = ed.query_one("#syn-view", sc.Static).region
+            above = ed._dna_top_row_offset()
+            bx = reg.x + ed._pad_left_cols + ed._FLANK_MARKER_WIDTH
+            dna_y = reg.y + ed._pad_above_rows + above
+            off_y = reg.y + ed._pad_above_rows + above + 2  # below the strands
+            assert ed._dna_row_bp(bx + 30, dna_y) == 30
+            assert ed._dna_row_bp(bx + 30, off_y) == -1
+            # Drag off the strand → nothing selected.
+            ed.on_mouse_down(_mouse(screen_x=bx + 30, screen_y=off_y))
+            ed.on_mouse_move(_mouse(screen_x=bx + 34, screen_y=off_y))
+            ed.on_mouse_up(_mouse())
+            await pilot.pause()
+            assert ed._user_sel is None
+            assert ed._drag_start_bp == -1
+            # Drag on the strand → real selection.
+            ed.on_mouse_down(_mouse(screen_x=bx + 8, screen_y=dna_y))
+            ed.on_mouse_move(_mouse(screen_x=bx + 16, screen_y=dna_y))
+            ed.on_mouse_up(_mouse())
+            await pilot.pause()
+            assert ed._user_sel == (8, 16)
+
+    async def test_protein_off_strand_no_phantom_selection(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            scr.query_one("#syn-tabs", sc.TabbedContent).active = \
+                "syn-tab-protein"
+            await pilot.pause(); await pilot.pause()
+            pe = scr.query_one("#syn-protein-editor", sc.ProteinEditor)
+            pe.set_codon_mode(False)
+            pe.load("MASGGGSGGGSKKKK", feats=[
+                {"start": 4, "end": 10, "label": "L", "type": "Linker",
+                 "color": "#6B7280", "qualifiers": {}}])
+            await pilot.pause(); await pilot.pause()
+            _pl, total_rows = pe._pack_aa_feats()
+            reg = pe.query_one("#pe-view", sc.Static).region
+            bx = reg.x + pe._pad_left_cols + pe._FLANK_MARKER_WIDTH
+            aa_y = reg.y + pe._pad_above_rows + total_rows      # AA strand
+            lane_y = reg.y + pe._pad_above_rows                 # lane row 0
+            assert pe._aa_row_idx(bx + 12, aa_y) == 12
+            assert pe._aa_row_idx(bx + 12, lane_y) == -1
+            pe.on_mouse_down(_mouse(screen_x=bx + 12, screen_y=lane_y))
+            pe.on_mouse_move(_mouse(screen_x=bx + 13, screen_y=lane_y))
+            pe.on_mouse_up(_mouse())
+            await pilot.pause()
+            # lane row 0 IS the linker's label/bar span at aa 12? No —
+            # aa 12 is outside [4,10), so it's a blank lane cell: no select.
+            assert pe._user_sel is None
+
+
+class TestSynthesisCopyPaste:
+    """Ctrl+C copies the active editor's selection byte-perfect and
+    carries the selection's features; paste re-lays them."""
+
+    async def test_dna_copy_is_byteperfect_and_carries_feats(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            seq = "ATGAAACCCGGGTTTAAACCCGGG"
+            ed.load(seq, [{"start": 6, "end": 15, "label": "mid",
+                           "type": "CDS", "color": "#88cc88", "strand": 1,
+                           "qualifiers": {}}])
+            await pilot.pause()
+            ed._user_sel = (3, 18)
+            scr._copy_dna_selection()
+            await pilot.pause()
+            cr = app._copied_region
+            assert cr["seq"] == seq[3:18]                 # byte-perfect
+            assert len(cr["feats"]) == 1
+            f = cr["feats"][0]
+            assert (f["start"], f["end"]) == (3, 12)      # rebased to [0,span)
+            assert f["label"] == "mid"
+            # paste back → feature rides along at the cursor offset
+            ed.load("NNNN", [])
+            await pilot.pause()
+            ed._cursor_pos = 2
+            ed.on_paste(_types.SimpleNamespace(text=cr["seq"],
+                                               stop=lambda: None))
+            await pilot.pause()
+            assert ed._seq == "NN" + seq[3:18] + "NN"
+            got = [g for g in ed._feats if g.get("label") == "mid"]
+            assert len(got) == 1
+            assert (got[0]["start"], got[0]["end"]) == (5, 14)
+
+    async def test_dna_copy_no_selection_notifies(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            ed = scr.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCGT", [])
+            app._copied_region = "sentinel"
+            scr._copy_dna_selection()          # no selection
+            await pilot.pause()
+            assert app._copied_region == "sentinel"   # untouched
+
+    async def test_ctrl_c_binding_targets_synthesis_editor(self):
+        # The screen's priority ctrl+c must win over the app's own
+        # ctrl+c (which targets the absent main #seq-panel).
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            seq = "ATGCGTACGTACGTAC"
+            ed.load(seq, [])
+            await pilot.pause()
+            ed._user_sel = (2, 9)
+            ed.query_one("#syn-scroll", sc.ScrollableContainer).focus()
+            await pilot.pause()
+            app._copied_region = None
+            await pilot.press("ctrl+c")
+            await pilot.pause(); await pilot.pause()
+            assert app._copied_region is not None
+            assert app._copied_region["seq"] == seq[2:9]
+
+    async def test_protein_copy_paste_carries_motif(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.push_screen(sc.SynthesisScreen())
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            scr.query_one("#syn-tabs", sc.TabbedContent).active = \
+                "syn-tab-protein"
+            await pilot.pause(); await pilot.pause()
+            pe = scr.query_one("#syn-protein-editor", sc.ProteinEditor)
+            pe.load("MASGGGSKKKKLLLL", feats=[
+                {"start": 3, "end": 7, "label": "linker", "type": "Linker",
+                 "color": "#6B7280", "qualifiers": {}}])
+            await pilot.pause()
+            pe._user_sel = (1, 9)
+            scr._copy_protein_selection()
+            await pilot.pause()
+            cr = app._copied_protein_region
+            assert cr["aa"] == "ASGGGSKK"
+            assert (cr["feats"][0]["start"], cr["feats"][0]["end"]) == (2, 6)
+            pe.load("MM", feats=[])
+            await pilot.pause()
+            pe._cursor_pos = 1
+            pe.on_paste(_types.SimpleNamespace(text=cr["aa"],
+                                               stop=lambda: None))
+            await pilot.pause()
+            assert pe._aa_seq == "MASGGGSKKM"
+            got = [g for g in pe._aa_feats if g.get("label") == "linker"]
+            assert len(got) == 1
+            assert (got[0]["start"], got[0]["end"]) == (3, 7)
+
+
 class TestSynthesisRestrictionOverlay:
     """The R key reveals / hides restriction cut sites on the DNA tab."""
 
