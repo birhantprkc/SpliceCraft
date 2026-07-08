@@ -4933,6 +4933,108 @@ class TestSynthesisPersistence:
                 == "ATGCGTACGT"
 
 
+class TestSynthesisPasteFeatureIsolation:
+    """Pasting one annotated sequence after another must keep the features
+    separate — the upstream feature must NOT extend beneath the new bases."""
+
+    @staticmethod
+    def _paste(ed, app, seq, feats):
+        import types
+        app._copied_region = {"seq": seq, "feats": [dict(f) for f in feats]}
+        ed.on_paste(types.SimpleNamespace(text=seq, stop=lambda: None))
+
+    async def test_paste_after_paste_keeps_features_separate(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            self._paste(ed, app, "ATGCGTACGT",
+                        [{"start": 0, "end": 10, "label": "featA",
+                          "type": "promoter", "color": "#84B0DC",
+                          "strand": 1, "qualifiers": {}}])
+            await pilot.pause()
+            self._paste(ed, app, "TTTTGGGGCC",
+                        [{"start": 0, "end": 10, "label": "featB",
+                          "type": "CDS", "color": "#88cc88",
+                          "strand": 1, "qualifiers": {}}])
+            await pilot.pause()
+            spans = {f["label"]: (f["start"], f["end"]) for f in ed._feats}
+            assert ed._seq == "ATGCGTACGTTTTTGGGGCC"
+            assert spans["featA"] == (0, 10)     # did NOT grow under B
+            assert spans["featB"] == (10, 20)
+
+    async def test_plain_paste_after_feature_does_not_extend(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCGT", [{"start": 0, "end": 6, "label": "A",
+                                "type": "CDS", "color": "#88cc88",
+                                "strand": 1, "qualifiers": {}}])
+            ed.set_cursor(6)
+            await pilot.pause()
+            app._copied_region = None
+            import types
+            ed.on_paste(types.SimpleNamespace(text="GGGG", stop=lambda: None))
+            await pilot.pause()
+            spans = {f["label"]: (f["start"], f["end"]) for f in ed._feats}
+            assert ed._seq == "ATGCGTGGGG"
+            assert spans["A"] == (0, 6)
+
+    async def test_paste_inside_feature_still_extends(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGCGT", [{"start": 0, "end": 6, "label": "A",
+                                "type": "CDS", "color": "#88cc88",
+                                "strand": 1, "qualifiers": {}}])
+            ed.set_cursor(3)
+            await pilot.pause()
+            app._copied_region = None
+            import types
+            ed.on_paste(types.SimpleNamespace(text="AAA", stop=lambda: None))
+            await pilot.pause()
+            spans = {f["label"]: (f["start"], f["end"]) for f in ed._feats}
+            assert ed._seq == "ATGAAACGT"
+            assert spans["A"] == (0, 9)          # grew (insert is inside it)
+
+    async def test_protein_paste_after_paste_keeps_motifs_separate(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            scr.query_one("#syn-tabs", sc.TabbedContent).active = "syn-tab-protein"
+            await pilot.pause(); await pilot.pause()
+            pe = scr.query_one("#syn-protein-editor", sc.ProteinEditor)
+            import types
+
+            def _pp(aa, feats):
+                app._copied_protein_region = {"aa": aa,
+                                              "feats": [dict(f) for f in feats]}
+                pe.on_paste(types.SimpleNamespace(text=aa, stop=lambda: None))
+            _pp("MASK", [{"start": 0, "end": 4, "label": "mA",
+                          "type": "Motif", "color": "#6B7280",
+                          "qualifiers": {}}])
+            await pilot.pause()
+            _pp("WYFG", [{"start": 0, "end": 4, "label": "mB",
+                          "type": "Motif", "color": "#6B7280",
+                          "qualifiers": {}}])
+            await pilot.pause()
+            spans = {f["label"]: (f["start"], f["end"]) for f in pe._aa_feats}
+            assert pe._aa_seq == "MASKWYFG"
+            assert spans["mA"] == (0, 4)         # did NOT grow under mB
+            assert spans["mB"] == (4, 8)
+
+
 class TestWorkbenchTrueSwitch:
     """Opening a workbench tab while on another CLOSES the prior (true
     switch, not a stack); each tab persists its work; modals still overlay."""

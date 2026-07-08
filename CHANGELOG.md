@@ -14,6 +14,19 @@
 
 ---
 
+## [1.2.11] — 2026-07-08
+
+### Bug fixes
+
+- **Pasting one annotated sequence after another no longer merges their
+  features.** In the Synthesis DNA and Protein tabs, pasting a second annotated
+  region right after the first used to stretch the first feature so it ran
+  underneath the newly pasted bases. Each pasted region now keeps its own
+  feature cleanly. (Pasting *into* an existing feature still grows that feature,
+  as before.)
+
+---
+
 ## [1.2.10] — 2026-07-08
 
 ### New features
