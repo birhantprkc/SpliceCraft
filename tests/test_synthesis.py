@@ -4933,6 +4933,117 @@ class TestSynthesisPersistence:
                 == "ATGCGTACGT"
 
 
+class TestSynthesisZoom:
+    """In-editor bp/column zoom-out overview (−/+/0), mirroring the main
+    app's linear view, for the always-linear DNA fragment."""
+
+    @staticmethod
+    def _key(k):
+        import types
+        return types.SimpleNamespace(key=k, stop=lambda: None)
+
+    async def test_zoom_out_in_reset_and_render(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGC" * 200, [{"start": 10, "end": 120, "label": "prom",
+                                    "type": "promoter", "color": "#84B0DC",
+                                    "strand": 1, "qualifiers": {}}])
+            await pilot.pause()
+            assert ed._zoom_bp_per_col == 1
+            ed.on_key(self._key("minus"))
+            await pilot.pause()
+            assert ed._zoom_bp_per_col == 2
+            ed.on_key(self._key("minus"))
+            await pilot.pause()
+            assert ed._zoom_bp_per_col == 4
+            rendered = ed.query_one("#syn-view", sc.Static).render()
+            txt = getattr(rendered, "plain", str(rendered))
+            assert "zoom" in txt           # hint header
+            assert "prom" in txt           # feature name block
+            ed.on_key(self._key("plus"))
+            await pilot.pause()
+            assert ed._zoom_bp_per_col == 2
+            ed.on_key(self._key("0"))
+            await pilot.pause()
+            assert ed._zoom_bp_per_col == 1
+
+    async def test_click_in_zoom_jumps_to_1to1(self):
+        import types
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGC" * 200, [])
+            await pilot.pause()
+            ed.on_key(self._key("minus")); ed.on_key(self._key("minus"))
+            await pilot.pause()
+            z = ed._zoom_bp_per_col
+            assert z > 1
+            reg = ed.query_one("#syn-view", sc.Static).region
+            col = 20
+            ev = types.SimpleNamespace(
+                button=1, screen_x=reg.x + ed._pad_left_cols + col,
+                screen_y=reg.y + ed._pad_above_rows + 2,
+                shift=False, ctrl=False, chain=1, stop=lambda: None)
+            ed.on_click(ev)
+            await pilot.pause()
+            assert ed._zoom_bp_per_col == 1
+            assert ed._cursor_pos == col * z
+
+    async def test_no_typing_while_zoomed(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGC" * 200, [])
+            await pilot.pause()
+            ed.on_key(self._key("minus"))
+            await pilot.pause()
+            before = ed._seq
+            ed.on_key(self._key("a"))
+            await pilot.pause()
+            assert ed._seq == before
+
+    async def test_zoom_capped_at_fit(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGC" * 50, [])
+            await pilot.pause()
+            for _ in range(20):
+                ed.on_key(self._key("minus"))
+            await pilot.pause()
+            z = ed._zoom_bp_per_col
+            ncols = (len(ed._seq) + z - 1) // z
+            assert ncols <= ed._viewport_width()
+            assert z == ed._zoom_max()
+
+    async def test_load_resets_zoom(self):
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_synthesis()
+            await pilot.pause(); await pilot.pause()
+            ed = app.screen.query_one("#syn-editor", sc.SynthesisEditor)
+            ed.load("ATGC" * 200, [])
+            ed.on_key(self._key("minus"))
+            await pilot.pause()
+            assert ed._zoom_bp_per_col > 1
+            ed.load("GGGG", [])        # fresh buffer
+            assert ed._zoom_bp_per_col == 1
+
+
 class TestSynthesisEnzymeClick:
     """Clicking a restriction-enzyme name highlights recognition + spacer +
     cut (Type IIS footprint computed from the sequence), like SequencePanel."""

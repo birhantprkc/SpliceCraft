@@ -14,6 +14,19 @@
 
 ---
 
+## [1.2.13] — 2026-07-08
+
+### New features
+
+- **Zoom out in the Synthesis DNA tab to see the whole fragment.** Press **−**
+  to zoom out (and **+** to zoom back in, **0** to reset) — just like the main
+  app's linear view. Zoomed out, the editor shows a compact overview: every
+  feature and restriction site as a labeled colored block along a position
+  ruler, so you can take in a long fragment at a glance. Click any column to
+  jump straight back to 1:1 editing at that base.
+
+---
+
 ## [1.2.12] — 2026-07-08
 
 ### New features
