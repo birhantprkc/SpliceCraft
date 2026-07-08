@@ -14,6 +14,31 @@
 
 ---
 
+## [1.2.4] — 2026-07-08
+
+### Bug fixes
+
+- **Agent-API reference: corrected which endpoints skip the `data` envelope.**
+  The reference (and the v1.2.3 note) called `/tools` the *sole* endpoint
+  served ahead of the response envelope — but the unauthenticated `/healthz`
+  readiness probe is envelope-free too. Both return bare bodies with **no
+  `data` field** (and no `_stale` daemon-staleness warning); those fields
+  appear only on **authenticated** responses. A client that trusted the docs
+  and unconditionally read `data` on `/healthz` would have hit a missing
+  field — the reference now names both endpoints and spells out the rule.
+
+### Hardening
+
+- **Wire-level regression guard for the response envelope.** Added an
+  end-to-end test that drives the real socket and confirms `/tools` and
+  `/healthz` stay bare while an authenticated endpoint carries `data`, so a
+  future refactor can't silently push the ~150 KB `/tools` self-describe
+  corpus (or the `/healthz` probe) through the envelope. The previous guard
+  exercised only the handler in isolation — below the dispatcher layer that
+  adds `data` — so it could not observe the served response.
+
+---
+
 ## [1.2.3] — 2026-07-08
 
 ### New features

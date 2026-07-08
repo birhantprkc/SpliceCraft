@@ -352,15 +352,18 @@ class TestToolsHandler:
         # the @_agent_endpoint decoration was missing `write=True`.
         assert eps["set-setting"]["write"] is True
 
-    def test_tools_is_envelope_free_bare_endpoints(self):
-        # `/tools` is served unauthenticated, ahead of the dispatcher
-        # envelope, and is the DOCUMENTED exception to the universal
-        # `data` contract: it returns a bare `{endpoints: [...]}`. Guard
-        # against re-adding a `data` mirror — doing so would double the
-        # API's largest response (~150 KB of doc_full text) for no gain.
+    def test_tools_handler_returns_bare_shape(self):
+        # HANDLER-LAYER check only: `_h_tools` itself must return a bare
+        # `{endpoints: [...]}` with no `data` key. This is necessary but
+        # NOT sufficient to prove the SERVED response is envelope-free —
+        # the `data`/`_stale` fields are added by the dispatcher
+        # (`_agent_data_envelope`), a layer this unit call never reaches.
+        # The authoritative wire-level guard (that removing the
+        # `/tools` + `/healthz` early-returns would let the dispatcher
+        # envelope them) lives in `TestEnvelopeContract` below.
         result = sc._h_tools(None, {})
         assert set(result) == {"endpoints"}, (
-            "/tools must stay a bare {endpoints} shape (no `data` envelope)")
+            "/tools handler must return a bare {endpoints} shape")
         assert isinstance(result["endpoints"], list)
 
     def test_list_features_alias_resolves(self):
@@ -374,11 +377,13 @@ class TestToolsHandler:
         # Registry values are (fn, write) tuples; the two names are
         # registered by separate decorator applications, so compare the
         # underlying handler FUNCTION (same object) + write flag, not the
-        # tuple identity.
+        # tuple identity. (Split into separate asserts — a chained
+        # `a == b is False` would parse as `(a == b) and (b is False)`,
+        # which is not the intended "both are read-only" check.)
         assert (sc._AGENT_HANDLERS["list-features"][0]
                 is sc._AGENT_HANDLERS["features"][0])
-        assert (sc._AGENT_HANDLERS["list-features"][1]
-                == sc._AGENT_HANDLERS["features"][1] is False)
+        assert sc._AGENT_HANDLERS["list-features"][1] is False
+        assert sc._AGENT_HANDLERS["features"][1] is False
 
 
 class TestAddFeatureHandler:
@@ -2776,6 +2781,59 @@ class TestHTTPRouting:
         status, payload = _http(f"{base}/", token=token)
         assert status == 200
         assert "endpoints" in payload
+
+
+class TestEnvelopeContract:
+    """The `data` / `_stale` response envelope is added by the DISPATCHER
+    (`_agent_data_envelope` + the stale stamp in `_AgentRequestHandler.
+    _handle`) to AUTHENTICATED endpoints only. The two unauthenticated
+    endpoints served *ahead* of the wrapper — `/healthz` (readiness) and
+    `/tools` (self-describe) — stay bare.
+
+    These drive the REAL socket so they observe the SERVED bytes, not a
+    handler return value: the handler runs BELOW the enveloping layer, so
+    a handler-only assertion (see `test_tools_handler_returns_bare_shape`)
+    cannot catch a dispatcher regression. Concretely, dropping the
+    `path_part == "healthz"` or `path_part in ("", "tools")` early-return
+    would push the ~150 KB `/tools` corpus (or the `/healthz` probe)
+    through the envelope — and the negative tests here would fail, while
+    the positive control proves the envelope is genuinely active (so the
+    bare-ness is a real signal, not the envelope being globally off)."""
+
+    def test_tools_served_bare_no_data_no_stale(self, http_server):
+        base, _token, _app = http_server
+        # Unauthenticated on purpose — served ahead of the token check.
+        status, payload = _http(f"{base}/tools", token=None)
+        assert status == 200
+        assert "endpoints" in payload
+        assert "data" not in payload, (
+            "/tools must stay bare — the dispatcher must NOT envelope it "
+            "(mirroring `doc_full` under `data` doubles the largest response)")
+        assert "_stale" not in payload
+
+    def test_healthz_served_bare_no_data_no_stale(self, http_server):
+        base, _token, _app = http_server
+        # `/healthz` is the SECOND envelope-free endpoint (not a lone
+        # `/tools` exception): a readiness probe, also served pre-auth.
+        status, payload = _http(f"{base}/healthz", token=None)
+        assert status == 200
+        assert payload.get("ok") is True
+        assert {"ok", "status", "version", "headless"} <= set(payload)
+        assert "data" not in payload, (
+            "/healthz is envelope-free too — the dispatcher must NOT wrap it")
+        assert "_stale" not in payload
+
+    def test_authenticated_endpoint_carries_data(self, http_server):
+        # POSITIVE control: an authenticated endpoint DOES carry `data`,
+        # proving the envelope is active — so the bare-ness of /tools and
+        # /healthz above is a meaningful signal, not the wrapper being off.
+        base, token, _app = http_server
+        status, payload = _http(f"{base}/status", token=token)
+        assert status == 200
+        assert "data" in payload, (
+            "authenticated success responses must carry the `data` envelope")
+        # Superset property: the original ad-hoc keys survive alongside `data`.
+        assert payload.get("loaded") is True
 
 
 class TestHTTPAuth:

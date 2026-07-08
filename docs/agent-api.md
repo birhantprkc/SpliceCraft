@@ -36,9 +36,11 @@ A long-running daemon keeps serving the code it launched with, so after a
 `splicecraft update` in another terminal it silently runs stale. `status`
 surfaces this: it reports `installed_version` (what's on disk now) next to
 the running `version`, plus a `stale` boolean (`installed_version` is `null`
-when it can't be read, e.g. running from a source checkout). Every response
-also carries a `_stale` warning when the running version is behind, so you
-notice without polling `status`. A **headless** daemon can `POST /restart`
+when it can't be read, e.g. running from a source checkout). Every
+authenticated response also carries a `_stale` warning when the running
+version is behind, so you notice without polling `status` (the pre-auth
+`/healthz` and `/tools` probes are served ahead of that stamp, so they stay
+bare). A **headless** daemon can `POST /restart`
 itself — it re-execs and the API returns on the same port (poll `/healthz`);
 a GUI `--agent` session refuses (it would lose its live view — restart it
 manually).
@@ -429,16 +431,21 @@ it lists every registered endpoint, including the ~42 app-coupled
 handlers that live in `splicecraft.py` rather than `splicecraft_agent.py`
 — don't rely on grepping a single file for `@_agent_endpoint`.
 
-Every success response also carries a predictable **`data`** field, so you
-don't have to know each endpoint's ad-hoc key (`seq` / `library` / `sites`
-/ `matches` / …): `data` is the result with the envelope/metadata stripped,
-unwrapped to the bare value when there's a single content key (a scalar or
-list lands directly under `data`). The original keys stay too, so it's a
-superset — read whichever you prefer. The sole exception is the
-unauthenticated `/tools` discovery endpoint, which is served ahead of the
-envelope wrapper and returns a bare `{endpoints: [...]}` (read it by name) —
-mirroring its `doc_full` corpus under `data` would needlessly double the
-API's largest response.
+Every **authenticated** success response also carries a predictable **`data`**
+field, so you don't have to know each endpoint's ad-hoc key (`seq` / `library`
+/ `sites` / `matches` / …): `data` is the result with the envelope/metadata
+stripped, unwrapped to the bare value when there's a single content key (a
+scalar or list lands directly under `data`). The original keys stay too, so
+it's a superset — read whichever you prefer.
+
+Two **unauthenticated** endpoints are served *ahead* of the envelope wrapper
+and stay bare — neither carries `data` (nor the `_stale` warning): the
+`/healthz` readiness probe (`{ok, status, version, headless}`) and the
+`/tools` self-describe (`{endpoints: [...]}`, read it by name). Both answer
+before a client has a token, so they short-circuit the authenticated response
+pipeline; for `/tools`, mirroring its `doc_full` corpus under `data` would
+also needlessly double the API's largest response. Don't blindly read
+`resp["data"]` on these two — check by endpoint.
 
 ## Security posture
 
