@@ -5059,6 +5059,8 @@ _BULK_EXPORT_FORMATS: dict = {
     "embl":    ("embl", "EMBL"),
     "fasta":   ("fa",   "FASTA"),
     "dna":     ("dna",  "CommercialSaaS .dna"),
+    "png":     ("png",  "Map image (PNG)"),
+    "svg":     ("svg",  "Map image (SVG)"),
 }
 
 

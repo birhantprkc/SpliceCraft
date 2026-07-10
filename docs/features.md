@@ -7,6 +7,13 @@ What you can do without leaving the terminal.
 - **Braille dot-matrix circular maps** — plasmids rendered as crisp
   Unicode braille rings with per-strand feature arcs, directional
   arrowheads, and proximity-placed labels. `v` toggles linear view.
+- **Export the map as a publication-quality image** — File → *Export map
+  image* renders the current plasmid as a circular
+  **PNG or SVG**: feature arrowheads with leader-line labels, a
+  de-collided restriction-site tick ring, and a centre name + bp block.
+  Options for size (300–6000 px), a transparent background (for figure
+  overlays), and toggling labels / sites. SVG is true vector; PNG is
+  super-sampled + LANCZOS-downscaled for clean anti-aliasing.
 - **Per-base sequence panel** with two-strand display, wrap-aware
   feature lanes, restriction-site overlays, and inline AA translation
   (one letter per codon midpoint, in the CDS's colour, with wrap-CDS
@@ -216,7 +223,7 @@ What you can do without leaving the terminal.
 - **Plasmid collections** — named buckets (e.g. "yeast project",
   "E. coli toolkit"); the panel toggles between a collection list and
   the active collection's plasmids. Atomic writes, `.bak` per change.
-  Save the loaded record with `Ctrl+Shift+A`.
+  Add the loaded record to your library with `Alt+K` ("keep").
 - **Bulk import a folder** — from the collections-list view, click `+`,
   type a name, and pick a folder via the embedded directory tree.
   Every `.dna` / `.gb` / `.gbk` / `.genbank` file inside is loaded
@@ -247,12 +254,17 @@ What you can do without leaving the terminal.
   scattered alphabetically; entry indices remain stable across the
   re-sort so dirty-edit markers don't desync.
 - **Bulk export collection** (`File → Export collection (bulk)…`) —
-  pick a collection + format (GenBank / EMBL / FASTA / `.dna`) + a
-  target folder. Each plasmid is written as `<name>.<ext>` with
-  filesystem-safe sanitisation (path-traversal characters scrubbed,
-  Windows reserved device names prefixed, case-insensitive collision
-  defence on APFS/NTFS). Per-entry failures don't abort the run; the
-  summary toast reports written / failed counts.
+  pick a collection + format (GenBank / EMBL / FASTA / `.dna` /
+  circular-map **PNG** / **SVG**) + a target folder. Each plasmid is
+  written as `<name>.<ext>` with filesystem-safe sanitisation
+  (path-traversal characters scrubbed, Windows reserved device names
+  prefixed, case-insensitive collision defence on APFS/NTFS). Per-entry
+  failures don't abort the run; the summary toast reports written /
+  failed counts.
+- **Export marked plasmids as images** — mark rows in the library, press
+  `p`, and every marked plasmid is rendered to a circular-map PNG / SVG
+  in a folder you pick. Runs on a worker thread with per-entry failure
+  isolation; ids resolve across every collection.
 
 ## File formats
 
@@ -266,6 +278,7 @@ What you can do without leaving the terminal.
 | FASTQ multi-read | `.fastq` / `.fq` | yes (≤ 1000 reads per file) | — | one library entry per read |
 | GFF3 | `.gff` / `.gff3` | yes (standalone via `##FASTA`; or apply features to loaded canvas via `apply-gff3`) | yes | wrap features as same-`ID=` split rows; `Is_circular=true` on region row |
 | Plasmidsaurus zip | `.zip` | yes (Sequencing → Plasmidsaurus tab) | — | consensus + run-level QC + AB1 traces |
+| Circular map image | `.png` / `.svg` | — | yes (File menu, bulk, or agent) | rendered circular map (picture, not re-importable) |
 
 All file reads route through size-cap + symlink-refusal checks; all
 file writes route through `_atomic_write_text` / `_atomic_write_bytes`

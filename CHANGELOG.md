@@ -14,6 +14,48 @@
 
 ---
 
+## [1.2.14] — 2026-07-10
+
+### New features
+
+- **Export any plasmid's circular map as a publication-quality image.** File →
+  *Export map image* renders the map you're
+  looking at as a **PNG or SVG**: feature arrowheads with leader-line labels, a
+  restriction-site tick ring, and the plasmid name + length in the centre — the
+  same layout as the on-screen map, at any size from 300 up to 6000 px. Turn on
+  a **transparent background** to drop the map straight onto a figure or slide,
+  or toggle the labels and cut-site ring off for a cleaner picture. SVG comes
+  out as true vector art (scales to any size, edits in Illustrator/Inkscape);
+  PNG is rendered oversized and smoothly downscaled so the curves stay crisp.
+- **Export a whole batch of maps at once.** Mark plasmids in the library and
+  press **p** to save every one as its own map image in a folder you pick, or
+  choose **PNG** / **SVG** in File → *Export collection (bulk)* to render an
+  entire collection. Big plasmids are scanned for cut sites on a background
+  thread, so the app stays responsive, and one plasmid failing never aborts the
+  rest of the batch.
+
+### Bug fixes
+
+- **Several keyboard shortcuts now work on every terminal.** Many terminals
+  (GNOME/Ptyxis, macOS Terminal, most non-kitty emulators) can't tell
+  **Ctrl+Shift+<letter>** apart from plain **Ctrl+<letter>**, and they deliver
+  **Ctrl+I** as Tab — so a handful of shortcuts silently did the wrong thing or
+  nothing at all. Each now has a shortcut that works everywhere:
+  - **Add to Library** was Ctrl+Shift+A, which those terminals turned into
+    Ctrl+A = *Select all*. It's now **Alt+K** ("keep"). It's also right there in
+    the **File** menu.
+  - **Clear marks** in the library (and the Babs model list) was Ctrl+Shift+C,
+    which collapsed onto Ctrl+C. Just press **c** now — the mark list clears.
+  - **Attach image** in the Experiments notebook was Ctrl+I, which is the Tab
+    key — so it just moved focus. It's now **Alt+I** (the toolbar button still
+    works too).
+  - Where a shortcut was already backed by a working key, nothing changes:
+    bottom-strand copy stays on **Alt+C**, redo on **Ctrl+Y**, construction
+    history on **F6**. The old combos still work as bonus aliases on terminals
+    that support them.
+
+---
+
 ## [1.2.13] — 2026-07-08
 
 ### New features

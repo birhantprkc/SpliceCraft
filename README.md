@@ -17,7 +17,10 @@ map, edit the sequence, design primers, plan a Golden Braid or MoClo
 assembly, BLAST a hit, check your Sanger reads, and keep a lab notebook —
 all from the keyboard, in one place, no browser tab and no cloud account.
 Circular and linear maps render as crisp Unicode braille graphics in any
-modern terminal, and nothing leaves your machine unless you ask it to.
+modern terminal, and nothing leaves your machine unless you ask it to — and any
+plasmid's map exports to a publication-quality **PNG or SVG** (with a
+transparent-background option for figures), one at a time or a whole batch
+straight from the library.
 
 It's built by a practicing bioengineer for daily bench work: the bug reports
 come from real cloning, and so do the fixes.
@@ -325,8 +328,10 @@ checklist whenever Ollama or a model is missing.
 
 ### File & Settings
 
-**File** opens / fetches (NCBI) / saves / exports (GenBank · FASTA · GFF3),
-bulk-imports a folder, and restores from backup; every GenBank it writes stamps
+**File** opens / fetches (NCBI) / saves / exports (GenBank · FASTA · GFF3 ·
+circular-**map image** as PNG/SVG, one plasmid or a whole collection in
+bulk), bulk-imports a folder, and restores from backup; every
+GenBank it writes stamps
 a traceable `Created by SpliceCraft v…` COMMENT. It also hosts the **selection →
 cloning hub** (**Alt+Shift+P**): highlight any DNA and pick **Traditional**,
 **Golden Braid / MoClo**, or **Gibson** — each opens pre-loaded with the

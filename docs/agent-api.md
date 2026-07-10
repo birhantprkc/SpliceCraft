@@ -82,7 +82,8 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   FASTA / `.ab1` / single-record `.fastq` / `.gff3`),
   export GenBank / GFF3 / FASTA / EMBL / CommercialSaaS `.dna`
   (symlink-guarded), bulk import a folder, bulk export a
-  collection (`bulk-export-collection`).
+  collection — to any of those formats or a circular-map image
+  (`png` / `svg`) — via `bulk-export-collection`.
 - **Library + collections** — list, search across collections,
   load an entry by name or id (`load-entry` resolves cross-collection:
   active collection first, then the others; pass `collection` to
