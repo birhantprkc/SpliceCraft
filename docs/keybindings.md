@@ -19,7 +19,7 @@ can drag-select a combo to copy).
 | `Ctrl+O`       | Open a `.gb` / `.gbk` / `.dna` file from disk |
 | `Ctrl+N`       | New Plasmid (paste sequence + optional annotate) |
 | `Ctrl+B`       | BLAST modal (BLASTN / BLASTP / HMMscan)      |
-| `Ctrl+Shift+A` | Add current plasmid to the library           |
+| `Alt+K`        | Add ("keep") the current plasmid in the library |
 | `Ctrl+A`       | Select-all sequence                          |
 | `Ctrl+E`       | Enter sequence editor mode                   |
 | `Ctrl+S`       | Save edits to file                           |
@@ -30,16 +30,26 @@ can drag-select a combo to copy).
 | `Enter`        | Highlight the feature enclosing the seq cursor |
 | `Delete`       | Context-aware delete (feature or library entry) |
 | `Ctrl+Z`       | Undo                                         |
-| `Ctrl+Shift+Z` / `Ctrl+Y` | Redo                              |
+| `Ctrl+Y`       | Redo (`Ctrl+Shift+Z` also works on terminals that report it) |
 | `Ctrl+C`       | Copy selection (top strand 5'→3', or AA when CDS highlighted) |
 | `Alt+C`        | Copy selection (bottom strand, reverse-complement) |
 | `F1` – `F4`    | Focus mode: library / map / features / sequence |
 | `F5`           | Restore all panels (split-window layout)     |
-| `F6` / `Ctrl+H` | Construction-history viewer (full-screen)   |
+| `F6`           | Construction-history viewer (full-screen)    |
 | `Alt+D`        | Capture UI snapshot to `<DATA_DIR>/ui_snapshots/` (bug-report attach) |
 | `Alt+Shift+D`  | Toggle hover-status diagnostic row           |
 | `?`            | Help modal                                   |
 | `Ctrl+Q`       | Quit                                         |
+
+## Library panel (when the plasmid list has focus)
+
+| Key       | Description                                            |
+|-----------|-------------------------------------------------------|
+| `Space`   | Mark / unmark the highlighted plasmid                 |
+| `c`       | Clear every mark                                      |
+| `m` / `y` | Move / copy the marked plasmids to another collection |
+| `p`       | Export the marked plasmids as circular-map images (PNG / SVG) |
+| `s` / `h` | Set status / view history for the highlighted plasmid |
 
 ## Mouse
 
@@ -61,6 +71,14 @@ emulators. The current keymap was chosen to avoid common collisions
 (see the 0.5.5.x churn in `CHANGELOG.md` for the history). If a
 binding doesn't reach the app:
 
+- **`Ctrl+Shift`+letter (and `Ctrl+I` / `Ctrl+H`) don't work on most
+  terminals.** Without the Kitty keyboard protocol (VTE / Ptyxis, macOS
+  Terminal, basic xterm), `Ctrl+Shift`+letter collapses to plain
+  `Ctrl`+letter, and `Ctrl+I` / `Ctrl+H` arrive as Tab / Backspace. So
+  every action uses a terminal-safe primary — `Alt+K` add-to-library,
+  plain `c` clear-marks, `Alt+I` attach-image (Experiments), `Ctrl+Y`
+  redo, `F6` history, `Alt+C` bottom-strand copy — with the old combos
+  kept as aliases where the terminal reports them.
 - `Alt+M` toggles **click-debug mode**: every keystroke + click is
   reported as a toast with the modifier set that actually arrived at
   the app. Use this to identify what the terminal swallowed.
@@ -76,7 +94,7 @@ maintainer runs before each release.
 
 | Menu        | Items                                                                            |
 |-------------|----------------------------------------------------------------------------------|
-| File        | Open · Fetch from NCBI · New Plasmid · Add to Library · Save · Export GenBank / GFF3 / FASTA · Align sequencing run (Plasmidsaurus) · Bulk import folder · Restore from backup · Quit |
+| File        | Open · Fetch from NCBI · New Plasmid · Add to Library (`Alt+K`) · Save · Export GenBank / GFF3 / FASTA / `.dna` / map image (PNG · SVG) · Export collection (bulk) · Align sequencing run (Plasmidsaurus) · Bulk import folder · Restore from backup · Quit |
 | Settings    | Persisted toggles (RE overlay, primer binding length, custom enzyme list, …)     |
 | Edit        | Edit Sequence · Undo · Redo · Add Feature · Capture → feat-lib · Delete Feature · Find plasmid… |
 | Enzymes     | Show RE sites · Unique cutters · 6+/4+ bp sites · Connectors · Edit custom enzyme list… |

@@ -14,6 +14,22 @@
 
 ---
 
+## [1.2.15] — 2026-07-10
+
+### Bug fixes
+
+- **The in-app help (`?`) now shows only shortcuts that actually work on your
+  terminal — and it's reorganised.** The reference had been advertising keys
+  that silently don't fire on most terminals: redo as *Ctrl+Shift+Z* (now
+  **Ctrl+Y**), the history viewer with a *Ctrl+H* alias (now **F6**), and Add to
+  Library as *Ctrl+Shift+A* (now **Alt+K**). It's also regrouped by task from
+  basic to advanced — Getting around → Files & library → Select & copy → Edit →
+  Cloning & analysis → menus → diagnostics — and now documents the library
+  mark / move / copy keys and the circular-map image export. The bundled
+  keybinding and getting-started docs were brought in line to match.
+
+---
+
 ## [1.2.14] — 2026-07-10
 
 ### New features

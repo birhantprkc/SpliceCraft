@@ -27,7 +27,7 @@ What you should see:
 - **Feature sidebar** on the right listing CDS, primer_bind, and
   rep_origin features.
 - **Library panel** on the left (empty until you add this plasmid
-  via `Ctrl+Shift+A`).
+  via `Alt+K`).
 - **Sequence panel** at the bottom, two-strand, with the cursor at
   bp 1.
 
@@ -42,7 +42,7 @@ Try these in order:
    the cursor.
 5. `Ctrl+A`, `Ctrl+C` — select all + copy the top strand.
 6. `Alt+C` — copy the reverse complement instead.
-7. `Ctrl+Shift+A` — add pUC19 to the library.
+7. `Alt+K` — add ("keep") pUC19 in the library.
 8. `Ctrl+Q` — quit. Re-launch with `splicecraft`; pUC19 is in the
    panel.
 

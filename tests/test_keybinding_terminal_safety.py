@@ -99,6 +99,22 @@ def test_ctrl_a_is_still_select_all_not_shadowed():
     assert "ctrl+a" in _action_keys(sc.PlasmidApp).get("select_all", set())
 
 
+def test_help_modal_advertises_terminal_safe_keys():
+    """The `?` help must show the keys that WORK, not the collapsed ones — the
+    help drifting out of sync with the bindings is what this whole file guards.
+    """
+    h = sc._HELP_BODY_MD
+    # Working primaries the fixes introduced must be present…
+    for key in ("Alt+K", "Ctrl+Y", "F6", "`c`"):
+        assert key in h, f"help modal no longer shows {key!r}"
+    # …and the dead-on-most-terminals keys must not be advertised as primaries.
+    for dead in ("Ctrl+Shift+A", "Ctrl+Shift+Z", "Ctrl+Shift+E"):
+        assert dead not in h, (
+            f"help modal advertises {dead!r}, which silently fails on most "
+            f"terminals (see [PIT-14])"
+        )
+
+
 @pytest.mark.asyncio
 async def test_alt_k_dispatches_add_to_library():
     """Live Pilot check: pressing Alt+K actually routes to add_to_library.
