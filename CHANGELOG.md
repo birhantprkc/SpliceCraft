@@ -14,6 +14,21 @@
 
 ---
 
+## [1.2.22] — 2026-07-11
+
+### New features
+
+- **Agent API: export one plasmid's map.** A new `export-map-image` endpoint
+  renders the currently-loaded plasmid's circular map to a `.png` or `.svg`
+  file, so an external agent (or the `--agent` API) can grab a single map
+  without bulk-exporting a whole collection. Same atomic, symlink-guarded write
+  as the other exporters.
+- **Agent API: `list-plasmidsaurus-items`.** The Plasmidsaurus order-list
+  endpoint now also answers to the conventional `list-` name (the old
+  `plasmidsaurus-items` still works).
+
+---
+
 ## [1.2.21] — 2026-07-11
 
 ### New features

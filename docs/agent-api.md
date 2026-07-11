@@ -83,7 +83,9 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   export GenBank / GFF3 / FASTA / EMBL / CommercialSaaS `.dna`
   (symlink-guarded), bulk import a folder, bulk export a
   collection — to any of those formats or a circular-map image
-  (`png` / `svg`) — via `bulk-export-collection`.
+  (`png` / `svg`) — via `bulk-export-collection`, or export the
+  LOADED plasmid's circular map alone (`png` / `svg`) via
+  `export-map-image`.
 - **Library + collections** — list, search across collections,
   load an entry by name or id (`load-entry` resolves cross-collection:
   active collection first, then the others; pass `collection` to
@@ -283,8 +285,9 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   blocks the request for minutes; a 409 means a download for that id is
   already in flight. `delete` un-downloads the files but keeps the
   catalog entry so `download` can re-fetch it.
-- **Plasmidsaurus** — plasmidsaurus-items (list your sequencing
-  orders, most-recent first) / download-plasmidsaurus (fetch a run's
+- **Plasmidsaurus** — list-plasmidsaurus-items (list your sequencing
+  orders, most-recent first; `plasmidsaurus-items` is a back-compat
+  alias) / download-plasmidsaurus (fetch a run's
   results zip by its 6-character item code over Plasmidsaurus's
   official OAuth2 REST API and import the run's `.gbk` assemblies into
   the library as new entries, tagged

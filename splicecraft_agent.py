@@ -616,6 +616,50 @@ def _h_export_embl(app, payload):
     return {"ok": True, **result}
 
 
+@_agent_endpoint("export-map-image", write=True)
+def _h_export_map_image(app, payload):
+    """Render the LOADED plasmid's circular map to `path` as PNG or SVG. Body:
+    ``{path, format?, size?, transparent?, labels?, sites?}``. ``format`` ∈
+    {"png","svg"} (inferred from the path extension when omitted). Fills the
+    single-plasmid gap that `bulk-export-collection` (whole collection) left.
+    Path is sanitised + symlink-refused like the other exporters; the write is
+    atomic. Returns ``{ok, path, fmt, bp, features, bytes}``."""
+    import splicecraft_mapimage as _mi
+    rec = getattr(app, "_current_record", None)
+    if rec is None:
+        return ({"error": "no plasmid loaded"}, 422)
+    path = _sanitize_path(payload.get("path"))
+    if path is None:
+        return ({"error": "missing 'path'"}, 400)
+    fmt = str(payload.get("format") or path.suffix[1:] or "png").lower()
+    if fmt not in _mi._MAP_EXPORT_FORMATS:
+        return ({"error": f"unknown format {fmt!r}; "
+                          f"choose one of {sorted(_mi._MAP_EXPORT_FORMATS)}"}, 400)
+    if path.suffix.lower() != f".{fmt}":
+        return ({"error": f"path extension must be .{fmt} for format {fmt!r}"},
+                400)
+    err = _check_agent_write_path(path)
+    if err is not None:
+        return ({"error": err}, 403)
+    size = _coerce_int(payload.get("size", 1400), name="size")
+    if isinstance(size, str):
+        return ({"error": size}, 400)
+    show_labels = bool(payload.get("labels", True))
+    show_sites = bool(payload.get("sites", True))
+    transparent = bool(payload.get("transparent", False))
+    title = str(getattr(rec, "_tui_display_name", None)
+                or getattr(rec, "name", "") or "")
+    try:
+        sites = _mi._map_sites_from_record(rec) if show_sites else []
+        result = _mi.export_plasmid_map(
+            path, record=rec, fmt=fmt, title=title, sites=sites,
+            size=int(size), transparent=transparent,
+            show_labels=show_labels, show_sites=show_sites)
+    except (OSError, ValueError) as exc:
+        return ({"error": f"map export failed: {_scrub_path(str(exc))}"}, 500)
+    return {"ok": True, **result}
+
+
 @_agent_endpoint("list-library")
 def _h_list_library(app, payload):
     """Plasmid library entries. Returns name, id, length (bp),
@@ -2181,6 +2225,10 @@ def _h_download_hmm_database(app, payload):
         _hmm_db_release_download_slot(eid)
 
 
+# `list-plasmidsaurus-items` is the canonical name (every other list endpoint
+# uses the `list-` prefix); `plasmidsaurus-items` stays as an alias for
+# V1_GATE back-compat. Same handler, registered under both names.
+@_agent_endpoint("list-plasmidsaurus-items")
 @_agent_endpoint("plasmidsaurus-items")
 def _h_plasmidsaurus_items(app, payload):
     """List your Plasmidsaurus items (sequencing orders), most-recent first,

@@ -582,3 +582,37 @@ def test_download_hmm_database_failure_500_releases_slot(monkeypatch):
     # Slot must be released even on failure.
     assert sc._hmm_db_acquire_download_slot("pfam-a")
     sc._hmm_db_release_download_slot("pfam-a")
+
+
+# ── export-map-image (F6) + list-plasmidsaurus-items alias (F5) ──────────────
+
+def test_export_map_image_endpoint(tmp_path):
+    """`export-map-image` renders the loaded record to png / svg, rejects a
+    bad format (400) and a missing record (422)."""
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    rec = SeqRecord(Seq("ACGT" * 200), id="pMap", name="pMap")
+    rec.annotations["molecule_type"] = "DNA"
+    rec.annotations["topology"] = "circular"
+    app = type("A", (), {"_current_record": rec})()
+    fn = sc._state._AGENT_HANDLERS["export-map-image"][0]   # via the registry
+    for fmt in ("png", "svg"):
+        out = tmp_path / f"map.{fmt}"
+        res = fn(app, {"path": str(out)})
+        assert res.get("ok") is True, res
+        assert res["fmt"] == fmt
+        assert out.exists() and out.stat().st_size > 0
+    # extension must match the format
+    bad = fn(app, {"path": str(tmp_path / "x.png"), "format": "gif"})
+    assert isinstance(bad, tuple) and bad[1] == 400
+    # no plasmid loaded → 422
+    empty = type("A", (), {"_current_record": None})()
+    nores = fn(empty, {"path": str(tmp_path / "y.png")})
+    assert isinstance(nores, tuple) and nores[1] == 422
+
+
+def test_list_plasmidsaurus_items_alias_registered():
+    """F5: the `list-`-prefixed name is an alias for the same handler."""
+    h = sc._state._AGENT_HANDLERS
+    assert "list-plasmidsaurus-items" in h
+    assert h["list-plasmidsaurus-items"] == h["plasmidsaurus-items"]
