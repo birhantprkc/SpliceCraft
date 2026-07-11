@@ -14,6 +14,24 @@
 
 ---
 
+## [1.2.16] — 2026-07-10
+
+### New features
+
+- **Cleaner, more readable labels on exported plasmid maps.** The circular
+  map-image export now draws a feature's name **right on its arc** — rotated to
+  follow the curve — whenever the name fits, so the big obvious features read at
+  a glance without a leader line. Names too long for their arc sit just outside
+  the circle on short, non-crossing leaders, and every outer label's text now
+  **auto-shrinks to stay inside the image** instead of ever running off the
+  edge. A long plasmid name that won't fit inside the ring drops neatly **below
+  the map** rather than crowding the centre, and very dense plasmids thin their
+  outer labels down to what actually fits (the overflow is dropped, not piled
+  into an unreadable smear). Applies everywhere maps are exported — single map,
+  marked-plasmid batch, and whole-collection bulk — in both PNG and SVG.
+
+---
+
 ## [1.2.15] — 2026-07-10
 
 ### Bug fixes

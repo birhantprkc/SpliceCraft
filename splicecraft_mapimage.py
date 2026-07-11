@@ -6,9 +6,17 @@ A pure, app-free renderer that turns a plasmid (a normalised feature list
 * the backbone circle,
 * colour-coded feature arcs (arrowheads for stranded features), stacked
   onto concentric lanes when they overlap,
-* feature labels in outer left/right columns with leader lines,
-* restriction-site ticks + enzyme names just outside the backbone,
-* a centre block carrying the plasmid name + bp count.
+* feature names drawn ON the arc (rotated to the tangent) when they fit,
+  else on an outer ellipse hugging the circle with a short radial leader,
+* restriction-site ticks just outside the backbone, their enzyme names
+  joining the same outer-ellipse label system,
+* the plasmid name + bp count centred inside the circle when it fits the
+  clear inner diameter, otherwise dropped just below the map.
+
+Every external label auto-shrinks its font to clear the canvas edge, and
+a dense plasmid's labels are de-collided per side and adaptively capped to
+what physically fits the canvas height (the overflow is dropped + logged,
+never silently truncated).
 
 Two rendering back-ends consume ONE shared geometry pass
 (:func:`_build_primitives`):
@@ -44,29 +52,32 @@ _MAP_IMAGE_MIN_SIZE     = 300
 _MAP_IMAGE_MAX_SIZE     = 6000   # guard against a runaway allocation
 _PNG_SUPERSAMPLE        = 2      # draw at N× then LANCZOS-downscale for AA
 
-# Feature-label / site-label caps keep dense plasmids legible instead of a
-# hairball of overlapping text. Anything beyond the cap is dropped and logged
-# (never silently truncated — the caller surfaces the count).
-_MAP_MAX_FEATURE_LABELS = 60
+# Site-tick cap keeps dense plasmids legible instead of a hairball of ticks.
+# Feature/site NAME labels are capped adaptively per side by how many physically
+# fit the canvas height (see `_place_radial_labels`), not by a fixed number.
 _MAP_MAX_SITE_TICKS     = 60
 _MAP_MAX_LANES          = 14   # bounds lane assignment on pathological plasmids
-_LABEL_MAX_CHARS        = 18
+_LABEL_MAX_CHARS        = 28   # adaptive font shrinks to fit, so allow long names
 
-# Radii + thicknesses as a fraction of the canvas side. Features stack
-# INWARD from the backbone; labels fan OUTWARD into fixed left/right
-# columns; sites sit just outside. The circle is kept modest (0.26) so the
-# label columns have room to hold text WITHOUT clipping the canvas edge.
-_R_BACKBONE   = 0.260
-_BAND         = 0.050   # feature band thickness
-_LANE_STEP    = 0.062   # inward radius drop per stacked lane
-_R_MIN_LANE   = 0.100   # innermost a feature band may reach (protect centre)
+# Radii + thicknesses as a fraction of the canvas side. Features stack INWARD
+# from the backbone; every external label sits on an OUTER ELLIPSE hugging the
+# circle, each joined to its feature/site by a leader. The circle is kept
+# COMPACT so the outer zone holds radial labels + long text WITHOUT clipping
+# the canvas edge, and leaders stay short + radial so they don't cross.
+_R_BACKBONE   = 0.230
+_BAND         = 0.046   # feature band thickness
+_LANE_STEP    = 0.056   # inward radius drop per stacked lane
+_R_MIN_LANE   = 0.088   # innermost a feature band may reach (protect centre)
 _ARROW_HEAD   = 0.020   # arrowhead angular reach, radians (clamped to arc)
-_SITE_TICK    = 0.024   # pink tick length outside the backbone
-_R_SITE_LABEL = 0.300   # radius the enzyme name sits at (inner zone)
-_R_LEADER_OUT = 0.380   # feature label's vertical target = cy + this·sin(θ)
-_LABEL_COL_X  = 0.335   # |x-cx|/S of the outer label columns (outside site ring)
-_SITE_LABEL_MIN_GAP = 0.16   # radians; suppress an enzyme label this close to
-                             # the previous one so clustered cutters don't pile up
+_SITE_TICK    = 0.018   # tick length just outside the backbone
+# Outer label ellipse: taller than wide so the full canvas height is usable for
+# stacked labels while long text still clears the left/right edges. Text sits at
+# the ellipse and extends OUTWARD; the font auto-shrinks so it never clips.
+_LABEL_ELLIPSE_A = 0.250   # horizontal semi-axis (label inner edge at mid-height)
+_LABEL_ELLIPSE_B = 0.455   # vertical semi-axis
+_LABEL_BASE_FS   = 0.0165  # label font size (fraction of s); shrinks to fit
+_CHAR_W          = 0.56    # mean glyph width / font-size (label-fit estimate)
+_MAP_MARGIN      = 0.022   # min clearance to the canvas edge (fraction of s)
 
 _BACKBONE_COLOR = "#5A6472"
 _SITE_COLOR     = "#FF69B4"   # mirrors hub _RESTR_SITE_FEATURE_COLOR
@@ -343,11 +354,12 @@ def _build_primitives(feats: list, total: int, *,
     circles.append((cx, cy, _R_BACKBONE * s, _BACKBONE_COLOR,
                     max(1.5, s * 0.0022), None))
 
+    external: list = []   # labels that don't fit on their band → outer ellipse
+    inner_clear_r = _R_BACKBONE * s   # clear centre radius for the title
     if total > 0 and feats:
         lanes = _assign_lanes(feats, total)
-        # Feature label candidates by side, gathered then de-collided.
-        left: list = []
-        right: list = []
+        deepest = max(lanes.values()) if lanes else 0
+        inner_clear_r = _lane_radius(deepest, s) - (_BAND / 2.0) * s
         for i, f in enumerate(feats):
             start = int(f["start"])
             arclen = _bio._feat_len(start, f["end"], total)
@@ -369,102 +381,154 @@ def _build_primitives(feats: list, total: int, *,
             if not label:
                 continue
             a_mid = a0 + (a1 - a0) / 2.0
-            anchor_r = r_mid + (_BAND / 2.0) * s
-            ax = cx + anchor_r * math.cos(a_mid)
-            ay = cy + anchor_r * math.sin(a_mid)
-            side = right if math.cos(a_mid) >= 0 else left
-            side.append({
-                "y": cy + (_R_LEADER_OUT * s) * math.sin(a_mid),
-                "ax": ax, "ay": ay,
-                "label": label, "color": _hex(_ensure_readable(rgb)),
-            })
+            span = a1 - a0
+            # Name drawn ON the arc when it fits the band's length — rotated to
+            # the tangent, coloured for contrast against the band.
+            band_px = _BAND * s
+            onband_fs = min(_LABEL_BASE_FS * s, band_px * 0.66)
+            if span > 0 and (r_mid * span) >= len(label) * onband_fs * _CHAR_W * 1.12:
+                rot = math.degrees(a_mid) + 90.0
+                while rot > 90.0:
+                    rot -= 180.0
+                while rot < -90.0:
+                    rot += 180.0
+                txt_c = "#101010" if _luminance(rgb) > 0.55 else "#FFFFFF"
+                texts.append((cx + r_mid * math.cos(a_mid),
+                              cy + r_mid * math.sin(a_mid),
+                              label, onband_fs, txt_c, "middle", "bold", rot))
+            else:
+                # Anchor the leader at the ring perimeter (not the band's own
+                # radius) so stacked inner-lane features in a cluster fan out
+                # cleanly from the circle instead of converging on the centre.
+                anchor_r = max(r_mid + (_BAND / 2.0) * s,
+                               _R_BACKBONE * s + _SITE_TICK * s * 0.4)
+                external.append({
+                    "a": a_mid,
+                    "ax": cx + anchor_r * math.cos(a_mid),
+                    "ay": cy + anchor_r * math.sin(a_mid),
+                    "label": label, "color": _hex(_ensure_readable(rgb)),
+                })
 
-        if show_labels:
-            _place_side_labels(right, +1, cx, cy, s, lines, texts)
-            _place_side_labels(left, -1, cx, cy, s, lines, texts)
-
-    # Restriction ticks + enzyme names. Ticks are drawn for every (deduped)
-    # cut; the NAME labels are angularly de-collided so a cluster of cutters
-    # doesn't stack into an unreadable pile.
+    # Restriction ticks. Each unique cut's NAME joins the outer radial label
+    # system so ticks + feature labels de-collide together (no separate pile).
     if show_sites and sites and total > 0:
         seen: set = set()
-        uniq: list = []
+        nsites = 0
         for rf in sites:
-            # Ticks mark CUT positions. A live map hands us its full
-            # `_restr_feats` (recognition-span "resite" dicts + single-bp
-            # "recut" dicts); keep only recuts. A pre-filtered list (no
-            # `type` key) is taken as-is.
+            # Keep CUT positions only: a live map hands us its full
+            # `_restr_feats` (recognition-span "resite" + single-bp "recut"
+            # dicts); a pre-filtered list (no `type` key) is taken as-is.
             if rf.get("type") not in (None, "recut"):
                 continue
-            enzyme = _sanitize_label(str(rf.get("label") or ""), max_len=18)
+            enzyme = _sanitize_label(str(rf.get("label") or ""),
+                                     max_len=_LABEL_MAX_CHARS)
             pos = int(rf.get("start", 0))
             key = (enzyme, pos)
             if not enzyme or key in seen:
                 continue
             seen.add(key)
-            uniq.append((_angle(pos, total, origin_bp), enzyme))
-            if len(uniq) >= _MAP_MAX_SITE_TICKS:
+            a = _angle(pos, total, origin_bp)
+            r_out = _R_BACKBONE * s + _SITE_TICK * s
+            lines.append((cx + _R_BACKBONE * s * math.cos(a),
+                          cy + _R_BACKBONE * s * math.sin(a),
+                          cx + r_out * math.cos(a), cy + r_out * math.sin(a),
+                          _SITE_COLOR, max(1.0, s * 0.0015)))
+            if show_labels:
+                external.append({
+                    "a": a, "ax": cx + r_out * math.cos(a),
+                    "ay": cy + r_out * math.sin(a),
+                    "label": enzyme, "color": _SITE_COLOR,
+                })
+            nsites += 1
+            if nsites >= _MAP_MAX_SITE_TICKS:
                 break
-        uniq.sort(key=lambda t: t[0])
-        last_label_a = -10.0
-        suppressed = 0
-        for a, enzyme in uniq:
-            x0 = cx + _R_BACKBONE * s * math.cos(a)
-            y0 = cy + _R_BACKBONE * s * math.sin(a)
-            x1 = cx + (_R_BACKBONE * s + _SITE_TICK * s) * math.cos(a)
-            y1 = cy + (_R_BACKBONE * s + _SITE_TICK * s) * math.sin(a)
-            lines.append((x0, y0, x1, y1, _SITE_COLOR, max(1.0, s * 0.0015)))
-            if a - last_label_a < _SITE_LABEL_MIN_GAP:
-                suppressed += 1
-                continue
-            last_label_a = a
-            lx = cx + _R_SITE_LABEL * s * math.cos(a)
-            ly = cy + _R_SITE_LABEL * s * math.sin(a)
-            texts.append((lx, ly, enzyme, s * 0.016, _SITE_COLOR,
-                          "middle", "normal"))
-        if suppressed:
-            _log.info("map image: %d clustered enzyme labels suppressed "
-                      "(ticks still drawn)", suppressed)
 
-    # Centre block: name + bp.
-    if title:
-        texts.append((cx, cy - s * 0.018,
-                      _sanitize_label(title, max_len=40),
-                      s * 0.032, _TITLE_COLOR, "middle", "bold"))
-    if total > 0:
-        texts.append((cx, cy + s * 0.028, _fmt_bp(total),
-                      s * 0.022, _SUBTITLE_COLOR, "middle", "normal"))
+    if show_labels and external:
+        dropped = _place_radial_labels(external, cx, cy, s, lines, texts)
+        if dropped:
+            _log.info("map image: %d labels dropped (canvas full)", dropped)
+
+    _place_title(title, total, cx, cy, s, inner_clear_r, texts)
 
     return {"size": size, "circles": circles, "polys": polys,
             "lines": lines, "texts": texts}
 
 
-def _place_side_labels(side: list, direction: int, cx: float, cy: float,
-                       s: float, lines: list, texts: list) -> None:
-    """De-collide one side's labels vertically, then emit each as a leader
-    line (feature edge → column) plus text. ``direction`` +1 = right."""
-    if not side:
+def _place_radial_labels(items: list, cx: float, cy: float, s: float,
+                         lines: list, texts: list) -> int:
+    """Lay external labels out around the OUTSIDE of the map on an ellipse
+    hugging the circle. Per side (right / left) they are stacked in angular
+    order and de-collided vertically, so their leaders stay short + radial and
+    never cross; the font auto-shrinks so the longest never clips the edge.
+    Returns the count dropped when even the floor font can't fit them all."""
+    A = _LABEL_ELLIPSE_A * s
+    B = _LABEL_ELLIPSE_B * s
+    margin = _MAP_MARGIN * s
+    dropped = 0
+    for direction in (+1, -1):
+        side = [d for d in items if (math.cos(d["a"]) >= 0) == (direction > 0)]
+        if not side:
+            continue
+        maxchars = max(len(d["label"]) for d in side)
+        # Font that lets the longest label fit from its inner edge (worst case
+        # x = cx ± A, at mid-height) to the canvas margin…
+        room = (s - margin) - (cx + A) if direction > 0 else (cx - A) - margin
+        fs = _LABEL_BASE_FS * s
+        if maxchars > 0 and room > 0:
+            fs = min(fs, room / (maxchars * _CHAR_W))
+        # …and that lets ALL of this side's lines fit the height.
+        fs = min(fs, (s - 2.0 * margin) / (len(side) * 1.55))
+        fs = max(fs, s * 0.0075)
+        lh = fs * 1.55
+        cap = max(1, int((s - 2.0 * margin) // lh))
+        side.sort(key=lambda d: d["a"])
+        if len(side) > cap:
+            side = [side[(k * len(side)) // cap] for k in range(cap)]
+            dropped += (len([d for d in items
+                             if (math.cos(d["a"]) >= 0) == (direction > 0)])
+                        - cap)
+        for d in side:
+            d["y"] = cy + B * math.sin(d["a"])
+        _spread_labels(side, lh, margin + lh / 2.0, s - margin - lh / 2.0)
+        anchor = "start" if direction > 0 else "end"
+        for d in side:
+            y = d["y"]
+            t = max(-1.0, min(1.0, (y - cy) / B))
+            x = cx + direction * A * math.sqrt(max(0.0, 1.0 - t * t))
+            lines.append((d["ax"], d["ay"], x, y, d["color"],
+                          max(0.5, s * 0.0010)))
+            texts.append((x + direction * fs * 0.3, y, d["label"], fs,
+                          d["color"], anchor, "normal", 0.0))
+    return dropped
+
+
+def _place_title(title: str, total: int, cx: float, cy: float, s: float,
+                 inner_clear_r: float, texts: list) -> None:
+    """Plasmid name + bp. Centred INSIDE the circle when the name fits the
+    clear inner diameter; otherwise moved BELOW the circle (name, then bp),
+    shrunk to fit the canvas width. bp always sits directly under the name."""
+    name = _sanitize_label(title or "", max_len=60)
+    bp = _fmt_bp(total) if total > 0 else ""
+    margin = _MAP_MARGIN * s
+    inner_d = max(0.0, 2.0 * inner_clear_r) * 0.9
+    name_fs = s * 0.030
+    if name and len(name) * name_fs * _CHAR_W <= inner_d:
+        texts.append((cx, cy - s * 0.016, name, name_fs, _TITLE_COLOR,
+                      "middle", "bold", 0.0))
+        if bp:
+            texts.append((cx, cy + s * 0.026, bp, s * 0.021, _SUBTITLE_COLOR,
+                          "middle", "normal", 0.0))
         return
-    over = 0
-    if len(side) > _MAP_MAX_FEATURE_LABELS:
-        over = len(side) - _MAP_MAX_FEATURE_LABELS
-        # Keep the outermost (longest-arc) features' labels; drop the rest.
-        side = side[:_MAP_MAX_FEATURE_LABELS]
-    lh = s * 0.026
-    _spread_labels(side, lh, s * 0.06, s * 0.94)
-    col_x = cx + direction * _LABEL_COL_X * s
-    anchor = "start" if direction > 0 else "end"
-    tick = direction * s * 0.012
-    for d in side:
-        ly = d["y"]
-        # Leader: feature anchor → just before the text column.
-        lines.append((d["ax"], d["ay"], col_x - tick, ly,
-                      d["color"], max(0.6, s * 0.0011)))
-        texts.append((col_x, ly, d["label"], s * 0.018, d["color"],
-                      anchor, "normal"))
-    if over > 0:
-        _log.info("map image: %d feature labels dropped (cap %d)",
-                  over, _MAP_MAX_FEATURE_LABELS)
+    # Below the circle: name shrunk to span at most the canvas width, bp under.
+    y = cy + _R_BACKBONE * s + s * 0.06
+    if name:
+        nfs = min(s * 0.030, (s - 2.0 * margin) / max(1, len(name) * _CHAR_W))
+        nfs = max(nfs, s * 0.012)
+        texts.append((cx, y, name, nfs, _TITLE_COLOR, "middle", "bold", 0.0))
+        y += nfs * 1.6
+    if bp:
+        texts.append((cx, y, bp, s * 0.020, _SUBTITLE_COLOR,
+                      "middle", "normal", 0.0))
 
 
 # ── SVG back-end ─────────────────────────────────────────────────────────────
@@ -509,12 +573,13 @@ def render_plasmid_map_svg(feats: list, total: int, *, title: str = "",
             f'<line x1="{x0:.2f}" y1="{y0:.2f}" x2="{x1:.2f}" y2="{y1:.2f}" '
             f'stroke="{color}" stroke-width="{w:.2f}"/>'
         )
-    for x, y, text, fs, color, anchor, weight in prims["texts"]:
+    for x, y, text, fs, color, anchor, weight, rot in prims["texts"]:
+        tr = f' transform="rotate({rot:.2f} {x:.2f} {y:.2f})"' if rot else ""
         parts.append(
             f'<text x="{x:.2f}" y="{y:.2f}" font-size="{fs:.2f}" '
             f'fill="{color}" text-anchor="{anchor}" '
             f'dominant-baseline="central" '
-            f'font-weight="{weight}">{_xml_escape(text)}</text>'
+            f'font-weight="{weight}"{tr}>{_xml_escape(text)}</text>'
         )
     parts.append("</svg>")
     return "\n".join(parts)
@@ -539,6 +604,26 @@ def _load_font(px: int):
 
 
 _PIL_ANCHOR = {"start": "lm", "middle": "mm", "end": "rm"}
+
+
+def _draw_rotated_text(base_img, x: float, y: float, text: str, font,
+                       fill, rot_deg: float) -> None:
+    """Draw ``text`` centred at ``(x, y)`` rotated ``rot_deg``° onto the RGBA
+    ``base_img`` via a temp text tile → rotate → alpha-composite. ``rot_deg``
+    is SVG-positive (clockwise), so the PIL rotate (CCW-positive) is negated,
+    keeping the two back-ends visually identical for on-arc feature names."""
+    from PIL import Image, ImageDraw
+    probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    left, top, right, bottom = probe.textbbox((0, 0), text, font=font)
+    tw = max(1, int(math.ceil(right - left)))
+    th = max(1, int(math.ceil(bottom - top)))
+    pad = 2
+    tile = Image.new("RGBA", (tw + 2 * pad, th + 2 * pad), (0, 0, 0, 0))
+    ImageDraw.Draw(tile).text((pad - left, pad - top), text, font=font, fill=fill)
+    tile = tile.rotate(-rot_deg, expand=True, resample=Image.Resampling.BICUBIC)
+    base_img.alpha_composite(
+        tile, (int(round(x - tile.width / 2.0)),
+               int(round(y - tile.height / 2.0))))
 
 
 def render_plasmid_map_png(feats: list, total: int, *, title: str = "",
@@ -573,7 +658,7 @@ def render_plasmid_map_png(feats: list, total: int, *, title: str = "",
         draw.line([x0, y0, x1, y1], fill=_to_rgb(color),
                   width=max(1, int(round(w))))
     _font_cache: dict = {}
-    for x, y, text, fs, color, anchor, weight in prims["texts"]:
+    for x, y, text, fs, color, anchor, weight, rot in prims["texts"]:
         key = int(fs)
         font = _font_cache.get(key)
         if font is None:
@@ -581,6 +666,9 @@ def render_plasmid_map_png(feats: list, total: int, *, title: str = "",
             _font_cache[key] = font
         rgb = _to_rgb(color)
         pa = _PIL_ANCHOR.get(anchor, "lm")
+        if rot:
+            _draw_rotated_text(img, x, y, text, font, rgb, rot)
+            continue
         try:
             draw.text((x, y), text, font=font, fill=rgb, anchor=pa)
             if weight == "bold":   # fake-bold: 1px over-stamp at supersample

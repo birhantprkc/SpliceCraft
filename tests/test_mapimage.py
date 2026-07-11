@@ -504,3 +504,105 @@ class TestMarkedExportModal:
                 and (tmp_path / "pM2.png").exists(),
                 what="bulk pngs written")
             assert Image.open(tmp_path / "pM1.png").size == (800, 800)
+
+
+# ── Label layout: on-band names, radial placement, title, padding ────────────
+
+class TestLayout:
+    """The 2026-07 relayout: names on the arc when they fit, external labels on
+    an outer ellipse with non-crossing leaders, a title that drops below the
+    circle when too long, and no text clipping the canvas."""
+
+    def _texts(self, rec, *, title="", size=1000, sites=False):
+        feats, total = mi._map_feats_from_record(rec)
+        return mi._build_primitives(feats, total, title=title, size=size,
+                                    show_sites=sites)["texts"]
+
+    def test_every_text_carries_rotation(self):
+        texts = self._texts(sc._make_demo_record(), title="pDemo")
+        assert texts and all(len(t) == 8 for t in texts)
+
+    def test_long_arc_short_name_is_on_band_rotated(self):
+        # A feature spanning most of the plasmid with a short name → drawn ON
+        # the band (rotated), never as an external horizontal label.
+        rec = _rec("ACGT" * 250, [(50, 900, 1, "CDS", "bigGene", "#3366CC")])
+        texts = self._texts(rec, size=1000)
+        matches = [t for t in texts if t[2] == "bigGene"]
+        assert matches, "feature label missing entirely"
+        assert all(t[7] != 0 for t in matches)     # rotated to the arc tangent
+
+    def test_short_tight_feature_is_external_horizontal(self):
+        # A tiny feature can't hold its name → external label, horizontal.
+        rec = _rec("ACGT" * 250, [(500, 510, 1, "CDS",
+                                   "TinyFeatureLabelHere", "#3366CC")])
+        texts = self._texts(rec, size=1000)
+        m = [t for t in texts if t[2] == "TinyFeatureLabelHere"]
+        assert m and all(t[7] == 0 for t in m)      # horizontal external label
+
+    def test_title_centres_when_it_fits(self):
+        texts = self._texts(sc._make_demo_record(), title="pX", size=1000)
+        t = [x for x in texts if x[2] == "pX"][0]
+        assert abs(t[1] - 500) < 0.15 * 1000        # near the centre (cy=500)
+
+    def test_long_title_moves_below_the_circle(self):
+        long_t = "LONG SPEC pDemoVector-Pdemo-GeneX-TermDemo-99"
+        texts = self._texts(sc._make_demo_record(), title=long_t, size=1000)
+        t = [x for x in texts if x[2] == long_t]
+        assert t, "title text missing"
+        assert t[0][1] > 500 + mi._R_BACKBONE * 1000   # below the ring bottom
+
+    def test_no_label_clips_the_canvas(self):
+        # Ample padding: every label (with its estimated width) stays inside the
+        # canvas on a dense plasmid full of long names.
+        specs = [(i * 30, i * 30 + 18, (1 if i % 2 else -1), "misc_feature",
+                  f"very-long-feature-name-{i:02d}", "#8833AA")
+                 for i in range(28)]
+        size = 1400
+        texts = self._texts(_rec("ACGT" * 500, specs), title="dense", size=size)
+        for x, y, text, fs, _c, anchor, _w, _r in texts:
+            assert 0 <= y <= size, f"{text!r} y={y} off-canvas"
+            w = len(text) * fs * mi._CHAR_W
+            if anchor == "start":
+                assert x + w <= size + 3, f"{text!r} clips right edge"
+            elif anchor == "end":
+                assert x - w >= -3, f"{text!r} clips left edge"
+
+    def test_rotated_on_band_label_renders_both_backends(self):
+        # The on-band (rotated) label path has its own PNG code — a temp text
+        # tile that is rotated + alpha-composited (`_draw_rotated_text`). Render
+        # both back-ends for a big-arc/short-name plasmid so that whole path is
+        # exercised, not just the primitive tuple.
+        rec = _rec("ACGT" * 250, [(50, 900, 1, "CDS", "bigGene", "#3366CC")])
+        feats, total = mi._map_feats_from_record(rec)
+        svg = mi.render_plasmid_map_svg(feats, total, title="pRot", size=600)
+        ET.fromstring(svg)
+        assert "rotate(" in svg                       # tangent-rotated name
+        png = mi.render_plasmid_map_png(feats, total, title="pRot", size=600)
+        assert Image.open(BytesIO(png)).size == (600, 600)
+
+    def test_dense_long_names_render_without_clip_or_crash(self):
+        # Drive the real emit path (not just `_build_primitives`) on a dense
+        # plasmid of long names + many cut sites: adaptive font, per-side
+        # de-collision, and the downsample cap must all survive rendering.
+        specs = [(i * 30, i * 30 + 18, (1 if i % 2 else -1), "misc_feature",
+                  f"very-long-feature-name-{i:02d}", "#8833AA")
+                 for i in range(40)]
+        feats, total = mi._map_feats_from_record(_rec("ACGT" * 500, specs))
+        sites = [{"type": "recut", "start": i * 61, "label": f"BsaI-{i}"}
+                 for i in range(20)]
+        ET.fromstring(mi.render_plasmid_map_svg(feats, total, sites=sites,
+                                                title="dense", size=1200))
+        png = mi.render_plasmid_map_png(feats, total, sites=sites,
+                                        title="dense", size=1200)
+        assert Image.open(BytesIO(png)).size == (1200, 1200)
+
+    def test_long_title_below_renders(self):
+        # The title-below-the-circle branch must render in both back-ends.
+        long_t = "LONG SPEC pDemoVector-Pdemo-GeneX-TermDemo-99-extralong"
+        feats, total = mi._map_feats_from_record(sc._make_demo_record())
+        svg = mi.render_plasmid_map_svg(feats, total, title=long_t, size=700)
+        ET.fromstring(svg)
+        assert "pDemoVector" in svg
+        assert Image.open(BytesIO(
+            mi.render_plasmid_map_png(feats, total, title=long_t,
+                                      size=700))).size == (700, 700)
