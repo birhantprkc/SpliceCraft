@@ -2535,6 +2535,18 @@ class _PrimerCollectionNameModal(ModalScreen):
         Binding("escape", "cancel", "Cancel"),
     ]
 
+    DEFAULT_CSS = """
+    _PrimerCollectionNameModal { align: center middle; }
+    #primer-coll-name-dlg { width: 60; height: auto; background: $surface;
+                            border: solid $primary; padding: 1 2; }
+    #primer-coll-name-title { background: $primary-darken-2; color: $text;
+                              padding: 0 1; margin-bottom: 1; text-align: center; }
+    #primer-coll-name-input { margin-bottom: 1; }
+    #primer-coll-name-status { min-height: 1; margin-bottom: 1; }
+    #primer-coll-name-buttons { height: 3; align: right middle; }
+    #primer-coll-name-buttons Button { margin-left: 2; }
+    """
+
     def __init__(self, *, taken: "set[str]") -> None:
         super().__init__()
         self._taken = taken
@@ -6511,6 +6523,18 @@ class HmmDbAddEditModal(ModalScreen):
     _blocks_undo: bool = True
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    DEFAULT_CSS = """
+    HmmDbAddEditModal { align: center middle; }
+    #hmmdb-form-dlg { width: 84; height: auto; max-height: 90%;
+                      background: $surface; border: solid $primary; padding: 1 2; }
+    #hmmdb-form-title { background: $primary-darken-2; color: $text;
+                        padding: 0 1; margin-bottom: 1; text-align: center; }
+    #hmmdb-form-dlg Input { margin-bottom: 1; }
+    #hmmdb-form-status { min-height: 1; margin-bottom: 1; }
+    #hmmdb-form-btns { height: 3; align: right middle; }
+    #hmmdb-form-btns Button { margin-left: 2; }
+    """
 
     def __init__(self, *, mode: str = "add",
                  entry_id: "str | None" = None,

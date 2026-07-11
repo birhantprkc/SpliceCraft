@@ -62,7 +62,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ## Endpoint inventory
 
-~180 endpoints across:
+~220 endpoints across:
 
 - **Records** — `new-plasmid` (create from a raw sequence, the Ctrl+N
   flow), get / set sequence, add / update / delete features (with the full
@@ -428,7 +428,7 @@ Call `/tools` for the live discovery endpoint. Each entry is
 COMPLETE docstring, which documents the request body (required / optional
 keys, aliases, enums, size caps), so a client forms a correct call in one
 round-trip instead of N trial-and-error 400s. `/tools` is authoritative:
-it lists every registered endpoint, including the ~42 app-coupled
+it lists every registered endpoint, including the ~49 app-coupled
 handlers that live in `splicecraft.py` rather than `splicecraft_agent.py`
 — don't rely on grepping a single file for `@_agent_endpoint`.
 

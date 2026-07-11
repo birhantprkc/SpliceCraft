@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name            = "splicecraft"
-version         = "1.2.16"
+version         = "1.2.17"
 description     = "Terminal-based circular plasmid map viewer, sequence editor, and Primer3/Golden Braid primer design workbench"
 readme          = "README.md"
 requires-python = ">=3.10"
@@ -33,10 +33,10 @@ classifiers = [
 ]
 dependencies = [
     # Pin floors track the versions the test suite is verified
-    # against (refreshed 2026-05-22 to current PyPI latest). End-user
+    # against (refreshed 2026-07-11 to current PyPI latest). End-user
     # `pipx install splicecraft` pulls the matching minimum so
     # behaviour matches what shipped.
-    "textual>=8.2.7",
+    "textual>=8.2.8",
     # Capped <1.87 (2026-06-05): biopython 1.87 DROPPED its Intel-macOS
     # (x86_64) wheels — only arm64 / manylinux / win remain — so `pipx
     # install splicecraft` on an Intel Mac would compile biopython (a
@@ -111,7 +111,7 @@ dependencies = [
     #   * rich-pixels — renders attached images as Unicode half-blocks
     #     in any terminal (no kitty/sixel/iTerm graphics protocol
     #     required), used in the Attachments grid preview.
-    "Pillow>=12.2.0",
+    "Pillow>=12.3.0",
     # pyspellchecker floor stays at 0.8.0 because conda-forge's
     # newest build is still 0.8.0 (0.9.0 hasn't landed there yet).
     # Bumping the floor above 0.8.0 makes the bioconda Linux Tests

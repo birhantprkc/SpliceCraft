@@ -60,7 +60,8 @@ boxes (a font without those glyphs), toggle **'ASCII plasmid map'** in
 Settings → Display. See [`docs/PLATFORMS.md`](docs/PLATFORMS.md) for the full
 terminal matrix.
 
-Press `?` once running for the full keyboard-shortcut reference. See
+Press `?` once running for the full keyboard-shortcut reference, or `Ctrl+K` for a
+fuzzy command palette that jumps straight to any tool by name. See
 [`docs/install.md`](docs/install.md) for pip / uv / conda / source installs.
 
 ## A workhorse that just works
@@ -217,8 +218,8 @@ amplicon · `ρ` protein) badges.
 A genuine lab notebook in markdown: a split-pane editor, entries grouped into
 **projects** (the way plasmids group into collections), and live colored
 cross-references — type `@plasmid`, `!action`, or `&gel` and `Ctrl+G` jumps to
-the source. Attach images, and spellcheck with `F7` against a dictionary you can
-grow.
+the source. Attach images — previewed inline in the notebook — and spellcheck
+with `F7` against a dictionary you can grow.
 
 ### History
 

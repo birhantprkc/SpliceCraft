@@ -16897,11 +16897,11 @@ class TestTextualVersionGate:
         assert ei.value.code == 1
         out = capsys.readouterr().out
         assert "Textual" in out and "2.1.2" in out
-        assert "8.2.7" in out                  # the required floor
+        assert "8.2.8" in out                  # the required floor
         assert ("pipx" in out or "venv" in out)  # actionable remedy
 
     def test_check_deps_accepts_current_textual(self, monkeypatch):
-        # The actually-installed Textual (>= 8.2.7) must pass cleanly.
+        # The actually-installed Textual (>= 8.2.8) must pass cleanly.
         sc._check_deps()  # no SystemExit
 
     def test_min_textual_matches_pyproject_pin(self):

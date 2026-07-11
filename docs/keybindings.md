@@ -16,9 +16,10 @@ can drag-select a combo to copy).
 | `l`            | Toggle feature label connector lines         |
 | `r`            | Toggle restriction-site overlay              |
 | `f`            | Fetch a record from NCBI by accession        |
-| `Ctrl+O`       | Open a `.gb` / `.gbk` / `.dna` file from disk |
+| `Ctrl+O` / `o` | Open a `.gb` / `.gbk` / `.dna` file from disk |
 | `Ctrl+N`       | New Plasmid (paste sequence + optional annotate) |
 | `Ctrl+B`       | BLAST modal (BLASTN / BLASTP / HMMscan)      |
+| `Ctrl+K`       | Command palette — fuzzy-jump to any tool     |
 | `Alt+K`        | Add ("keep") the current plasmid in the library |
 | `Ctrl+A`       | Select-all sequence                          |
 | `Ctrl+E`       | Enter sequence editor mode                   |
@@ -92,17 +93,25 @@ maintainer runs before each release.
 
 ## Menus
 
-| Menu        | Items                                                                            |
+The top bar has 16 menus, left to right. All but **File** open their tool
+directly (no dropdown). Press `Ctrl+K` for a fuzzy command palette that reaches
+every one by name. Most menus also have an `Alt`+letter (shown in `?` Help).
+
+| Menu        | Opens                                                                            |
 |-------------|----------------------------------------------------------------------------------|
-| File        | Open · Fetch from NCBI · New Plasmid · Add to Library (`Alt+K`) · Save · Export GenBank / GFF3 / FASTA / `.dna` / map image (PNG · SVG) · Export collection (bulk) · Align sequencing run (Plasmidsaurus) · Bulk import folder · Restore from backup · Quit |
-| Settings    | Persisted toggles (RE overlay, primer binding length, custom enzyme list, …)     |
-| Edit        | Edit Sequence · Undo · Redo · Add Feature · Capture → feat-lib · Delete Feature · Find plasmid… |
-| Enzymes     | Show RE sites · Unique cutters · 6+/4+ bp sites · Connectors · Edit custom enzyme list… |
+| File        | Open · Fetch from NCBI · New Plasmid · Add to Library (`Alt+K`) · Find plasmid · Diff · Find ORFs · Transfer annotations · Send selection to cloning · Save · Export (GenBank / FASTA / GFF3 / `.dna` / map image PNG · SVG) · Export collection · Collections · Migrate Data · What's New · Master Delete · Quit |
+| Settings    | Persisted toggles (RE overlay, primer binding length, online lookups, ASCII map, …) |
+| BLAST       | BLAST / HMMscan modal (`Ctrl+B`)                                                 |
+| Enzymes     | Enzyme collections + settings (catalog, custom enzymes, unique / 6+ / 4+ cutters) |
 | Features    | Feature Library workbench                                                        |
-| Primers     | Full-screen Primer Design workbench                                              |
-| Mutato      | SOE-PCR site-directed mutagenesis designer (4-source CDS picker)                 |
+| Primers     | Full-screen Primer Design workbench (`Ctrl+P`)                                   |
+| Mutato      | SOE-PCR site-directed mutagenesis + restriction-site Scrub                       |
+| Synthesis   | Gene-synthesis composer (DNA · Protein · Operon design)                          |
 | Parts       | Parts Bin (per-grammar; multi-bin via Parts Bin collections)                     |
-| Constructor | Traditional cloning · Gibson assembly · Golden Braid / MoClo / custom grammar assembly |
-| Simulator   | In-silico PCR (exact-match binding) + agarose gel rendering (0.5–4.0%, ladder / uncut / digest / amplicon lanes) |
-| History     | Construction-history viewer (`<HistoryTree>` for the loaded plasmid)             |
-| BLAST       | BLAST / HMMscan modal (Ctrl+B)                                                   |
+| Constructor | Traditional · Gibson · Golden Braid · MoClo assembly                             |
+| Simulator   | In-silico PCR + agarose gel rendering (0.5–4.0 %, ladder / uncut / digest / amplicon lanes) |
+| Sequencing  | Plasmidsaurus run alignment / verification overlay                              |
+| Experiments | Lab notebook (projects, entries, inline image attachments)                      |
+| History     | Construction-history viewer (`F6` / `Alt+H`)                                     |
+| AUTOLAB     | Opentrons OT-2 robot control (`Alt+U`)                                           |
+| BABS        | Local-AI assistant (chat · model browser · learn · memory)                      |

@@ -14,6 +14,71 @@
 
 ---
 
+## [1.2.17] — 2026-07-11
+
+### New features
+
+- **The lab notebook now previews your attached photos inline.** Open an
+  experiment's **Attachments** tab and the highlighted image — a gel, a plate,
+  a scanned page — now renders right there in a preview box (Unicode half-blocks,
+  so it works in any terminal, no special graphics support needed). Non-image
+  files show a short "no preview" note instead. Previously you could only ever
+  see the filename.
+- **The command palette actually opens now — press `Ctrl+K`.** Fuzzy-jump to any
+  tool by name ("blast", "constructor", "codon", "babs", "align"…) without
+  hunting the menu bar. It had been silently shadowed by the Primer-Design
+  shortcut and never opened; it now lists every workbench (including AUTOLAB,
+  BABS, History, and the sequencing-alignment actions).
+- **Press `o` to open a file.** The empty-canvas hint told you to "press o" but
+  only `Ctrl+O` worked — plain `o` now opens the file picker too, matching the
+  hint.
+
+### Bug fixes
+
+- **The circular map no longer vanishes on a normal-height terminal.** On
+  windows around 28–30 rows tall the flagship map was being replaced by a bare
+  "Window too small" message; it now renders (a little smaller) down to much
+  shorter windows, and when the window genuinely is too small it tells you to
+  **press `F2` for a full-screen map** instead of just going blank. A split you
+  saved on a big monitor can no longer squeeze the map off a smaller laptop
+  screen.
+- **Four dialogs that rendered as borderless, see-through text now have proper
+  boxes.** The HMM-database manager, the custom-enzyme-list editor, the
+  new-primer-collection prompt, and the HMM add/edit form all floated
+  unreadably over the dimmed canvas — they're now centered, bordered dialogs
+  with a title bar like every other modal.
+- **The construction-history header shows your plasmid's real name** ("FFE 2
+  ENTRY A1") instead of the underscored GenBank LOCUS ("FFE_2_ENTRY_A1").
+- **Dates in the Parts Bin, primer-collection, and Experiments lists now read
+  "JUL 11 2026"** instead of the ambiguous ISO "2026-07-11", matching the rest
+  of the app.
+- **The bottom shortcut bar no longer clips on an 80-column terminal.** It was
+  showing twelve hints and cutting off the rightmost ones (including Help and
+  Quit); it's trimmed to the core set, with the full list still in `?` Help.
+- **History detail no longer prints "createDocument (createDocument)"** — the
+  operation name is shown once.
+- **Alt+H now opens the construction history from the keyboard** (it was a dead
+  keystroke), and **AUTOLAB got a keyboard shortcut** (`Alt+U`).
+- **Long plasmid names in the map centre get a "…" instead of a hard cut**, and
+  the two online-lookup toggles in Settings no longer truncate mid-word.
+
+### Hardening
+
+- **Content that used to clip now scrolls.** Primer-design results, the operon
+  design summary, the Babs write-approval lists, the sequencing verification
+  report, and the Parts / Feature-library / Synthesis button rows now scroll
+  when they overflow instead of hiding rows or buttons off-screen.
+- **Narrower terminals are handled better** in the Primer-design workbench
+  (its two-page layout now fits ~90-column windows and scrolls below that) and
+  the Constructor's Golden-Braid validation box shows more at once.
+- **`Ctrl+Shift+C` no longer collides** between "copy bottom strand" and "clear
+  marks" on terminals that report the distinct key.
+- **Dependencies refreshed** to the latest verified releases (textual 8.2.8,
+  Pillow 12.3.0); biopython, edlib, and pyspellchecker stay deliberately pinned
+  for wheel-availability and conda-forge reasons.
+
+---
+
 ## [1.2.16] — 2026-07-10
 
 ### New features

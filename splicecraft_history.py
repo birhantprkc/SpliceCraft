@@ -676,8 +676,13 @@ def _history_detail_lines(hist: "_CommercialSaaSHistoryNode") -> "list[str]":
     op_raw = hist.operation
     op_friendly = _history_op_label(op_raw)
     if op_friendly:
-        op_disp = (f"[cyan]{_esc(op_friendly)}[/]  "
-                   f"[dim]({_esc(op_raw)})[/]")
+        # Don't echo the raw op when the friendly label IS the raw op
+        # (e.g. "createDocument") — that just prints "X (X)".
+        if op_friendly == op_raw:
+            op_disp = f"[cyan]{_esc(op_friendly)}[/]"
+        else:
+            op_disp = (f"[cyan]{_esc(op_friendly)}[/]  "
+                       f"[dim]({_esc(op_raw)})[/]")
     else:
         # Empty, or a CommercialSaaS sentinel ("invalid" / "unknown")
         # for a base / starting sequence with no recorded operation —
