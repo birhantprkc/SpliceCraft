@@ -14,6 +14,43 @@
 
 ---
 
+## [1.2.19] — 2026-07-11
+
+### Bug fixes
+
+- **Renaming an experiment no longer wipes its notes.** Opening the lab
+  notebook from the menu and renaming an entry from the list (without opening
+  it first) used to silently blank that entry's body text and tags on save.
+  Rename now preserves the full entry — only the title changes. (Deleting or
+  moving an entry also no longer leaves the removed entry's text lingering in
+  the editor.)
+- **Opening "Enzyme Settings" no longer flips the restriction overlay on.** On
+  a fresh profile the "Show RE sites" / "Show connectors" checkboxes showed
+  checked while the overlay was actually off, and simply opening the tab turned
+  it on with a toast. The checkboxes now match the real state.
+- **Mutato's "Avoid sites (N)" count now updates on both tabs.** Changing the
+  forbidden-enzyme set from the Amino-acid-swap tab now also updates the count
+  shown on the Scrub tab (they share one set), so the label can't mislead.
+- **The Attachments list clears when you switch entries** instead of briefly
+  showing the previous entry's files, and its "Inserted?" column refreshes when
+  you open the Attachments tab.
+
+### Improvements
+
+- **Babs chat fits narrow terminals.** The Corpus / Agent session toggles moved
+  off the message line to their own row, so the input and the Send / Stop
+  buttons no longer get squeezed or clipped on a small window; and a long model
+  name can no longer shove the "answering… · Esc to stop" indicator off-screen.
+- **Babs Background-Learning is stickier.** The Learn tab remembers your last
+  topic across an app restart, gained its own **Stop** button (no more hunting
+  for the job in the Paper-scraper tab), and reflects a Settings online-lookups
+  toggle without reopening. The job bars re-sync on every tab switch.
+- **Staleguard sweep.** Closing the Collections manager now refreshes the
+  library's collections view even without loading (a deleted collection's row
+  no longer lingers), plus the refresh-on-change hardening above.
+
+---
+
 ## [1.2.18] — 2026-07-11
 
 ### New features

@@ -535,6 +535,40 @@ class TestScreenMount:
             await pilot.pause()
             assert isinstance(app.screen, sc.ExperimentsScreen)
 
+    async def test_rename_from_menu_preserves_body_and_tags(self):
+        """[staleguard / data-loss regression] Opening Experiments from the
+        menu loads no entry (`_current_entry is None`, compose widgets empty);
+        renaming a cursor row must NOT wipe the entry's body + tags. The fix
+        loads the full entry into the compose widgets before the rename
+        persists, instead of rebuilding the record from the empty widgets."""
+        from textual.widgets import DataTable, Input
+        body = "IMPORTANT lab notes that must survive a rename."
+        sc._save_experiments([sc._normalise_experiment_entry(
+            {"id": "exp-dl1", "title": "Old", "body_md": body,
+             "tags": ["cloning", "gel"]})])
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause()
+            app.push_screen(sc.ExperimentsScreen())
+            await pilot.pause()
+            await pilot.pause()
+            scr = app.screen
+            t = scr.query_one("#exp-entries-table", DataTable)
+            t.focus()
+            t.move_cursor(row=0)
+            assert scr._current_entry is None      # menu-open precondition
+            scr._rename_current()
+            await pilot.pause()
+            await pilot.pause()
+            app.screen.query_one("#exprn-input", Input).value = "New"
+            app.screen.action_submit()
+            await pilot.pause()
+            await pilot.pause()
+        e2 = {e["id"]: e for e in sc._load_experiments()}["exp-dl1"]
+        assert e2["title"] == "New"
+        assert e2["body_md"] == body            # was silently wiped pre-fix
+        assert e2["tags"] == ["cloning", "gel"]
+
     async def test_initial_state(self):
         # Split-pane layout (2026-05-18): entries list is always
         # visible on the left, Compose + Attachments are the two
