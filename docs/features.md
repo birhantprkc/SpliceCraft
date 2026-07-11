@@ -96,7 +96,12 @@ What you can do without leaving the terminal.
   junction for circular topology), validates against a configurable
   minimum, and produces a single assembled product with each overlap
   appearing once. Reverse-orientation fragments surface a "did you
-  mean to flip" hint instead of silently failing.
+  mean to flip" hint instead of silently failing. A circular plasmid
+  source can be **linearised at any base** ("Linearize at"), and
+  **Design overlaps** auto-appends the homology arms (each downstream
+  fragment gets a 5' tail from its upstream neighbour's 3' end) so
+  every junction reaches the minimum — idempotent, re-run after a
+  reorder.
 - **Traditional cloning** — restriction-digest + ligation simulator
   with three insert sources (current plasmid, library entry, free-form
   PCR product). 2-enzyme directional cuts produce both forward and

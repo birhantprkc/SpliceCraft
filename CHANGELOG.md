@@ -14,6 +14,24 @@
 
 ---
 
+## [1.2.24] — 2026-07-11
+
+### New features
+
+- **Gibson: linearize a plasmid where you want, and auto-design the overlaps.**
+  The Constructor's Gibson tab now lets you open a circular plasmid at any base
+  ("Linearize at") when you add it as a fragment — so a vector backbone starts
+  exactly where you're joining it, not always at base 0 — and features that
+  straddle the cut split cleanly at the ends. A new **Design overlaps** button
+  then appends the homology arms so every junction reaches the minimum overlap:
+  each downstream fragment gets a 5' tail copied from its upstream neighbour's
+  3' end (the standard Gibson primer tail), which collapses back in the product
+  so the result is your fragments joined seamlessly in lane order. It's
+  idempotent — safe to re-run after reordering fragments or changing the
+  minimum overlap.
+
+---
+
 ## [1.2.23] — 2026-07-11
 
 ### Bug fixes
