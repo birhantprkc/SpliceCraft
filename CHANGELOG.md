@@ -14,6 +14,19 @@
 
 ---
 
+## [1.2.21] — 2026-07-11
+
+### New features
+
+- **Type-to-filter every Constructor picker.** Following the Traditional
+  source list, the **Gibson** source-plasmid picker and the **Golden Braid /
+  MoClo parts palettes** now have a filter box too — start typing to narrow a
+  large library or parts bin to what you want. Each filter is applied
+  identically to what's displayed and to what a click selects, so the picked
+  plasmid / part is always exactly the one on the highlighted row.
+
+---
+
 ## [1.2.20] — 2026-07-11
 
 ### New features

@@ -335,6 +335,43 @@ class TestGibsonAssemblyPaneSmoke:
             assert pane._min_overlap() == sc._GIBSON_MIN_OVERLAP_BP
 
     @pytest.mark.asyncio
+    async def test_source_filter_maps_row_to_correct_plasmid(
+            self, tiny_record, isolated_library):
+        """[E2 safety] The Gibson source-filter box keeps the row→entry mapping
+        exact: a filtered row resolves to the plasmid shown on that row, never
+        the entry at the same index in the unfiltered list."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+
+        def _entry(name, ln):
+            r = SeqRecord(Seq("ACGT" * (ln // 4)), id=name, name=name)
+            r.annotations["molecule_type"] = "DNA"
+            r.annotations["topology"] = "circular"
+            return {"id": name, "name": name, "size": ln,
+                    "gb_text": sc._record_to_gb_text(r)}
+        sc._save_library([_entry("Alpha", 100), _entry("Beta", 200),
+                          _entry("Delta", 300), _entry("Gamma", 400)])
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            modal = sc.ConstructorModal()
+            app.push_screen(modal)
+            await pilot.pause()
+            pane = modal.query_one("#ctor-gib-pane", sc.GibsonAssemblyPane)
+            mine = {"Alpha", "Beta", "Delta", "Gamma"}
+            for flt in ("", "e", "a", "lph"):
+                pane._gib_source_filter = flt
+                pane._populate_library_table()
+                await pilot.pause()
+                for i, ent in enumerate(pane._filtered_source_entries()):
+                    if ent["name"] not in mine:
+                        continue
+                    r = pane._record_for_table_row(i)
+                    assert r is not None and len(r.seq) == ent["size"], (
+                        flt, i, ent["name"])
+
+    @pytest.mark.asyncio
     async def test_pane_add_paste_fragment_and_simulate(
             self, tiny_record, isolated_library):
         """Drive the pane via direct method calls (faster + more
