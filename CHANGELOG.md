@@ -14,6 +14,19 @@
 
 ---
 
+## [1.2.20] — 2026-07-11
+
+### New features
+
+- **Type-to-filter the Constructor's plasmid picker.** The Traditional-cloning
+  source list now has a filter box — start typing a name to narrow a big
+  library down to the plasmid you want, instead of scrolling a small window.
+  The filter is applied identically to what's shown and to what a click
+  selects, so the picked fragment is always exactly the one on the highlighted
+  row.
+
+---
+
 ## [1.2.19] — 2026-07-11
 
 ### Bug fixes

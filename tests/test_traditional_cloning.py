@@ -794,6 +794,50 @@ class TestSimulateTraditionalCloning:
             # Traditional opens by default.
             assert tabs.active == "ctor-tab-traditional"
 
+    async def test_source_filter_maps_row_to_correct_plasmid(
+            self, tiny_record, isolated_library):
+        """[E2 safety] The source-filter box must keep the row→entry mapping
+        exact: a filtered row resolves to the plasmid SHOWN on that row, never
+        the entry at the same index in the UNfiltered list (which would
+        silently clone the wrong fragment)."""
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from tests.test_smoke import _build_app, TERMINAL_SIZE
+
+        def _entry(name, ln):
+            r = SeqRecord(Seq("ACGT" * (ln // 4)), id=name, name=name)
+            r.annotations["molecule_type"] = "DNA"
+            r.annotations["topology"] = "circular"
+            return {"id": name, "name": name, "size": ln,
+                    "gb_text": sc._record_to_gb_text(r)}
+        # sorted: Alpha(100), Beta(200), Delta(300), Gamma(400)
+        sc._save_library([_entry("Alpha", 100), _entry("Beta", 200),
+                          _entry("Delta", 300), _entry("Gamma", 400)])
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause()
+            modal = sc.ConstructorModal()
+            await app.push_screen(modal)
+            await pilot.pause()
+            pane = modal.query_one("#ctor-trad-pane", sc.TraditionalCloningPane)
+            mine = {"Alpha", "Beta", "Delta", "Gamma"}
+            # The mapping INVARIANT: under any filter, the record resolved for
+            # display row i is EXACTLY the entry shown on row i (its bp size is
+            # unique per entry, so a mismatch means the resolver indexed the
+            # unfiltered list — the wrong-plasmid bug). 'e' matches Beta+Delta
+            # (a strict subset whose row indices differ from the full list).
+            for flt in ("", "e", "a", "lph"):
+                pane._trad_source_filter = flt
+                pane._populate_library_tables()
+                await pilot.pause()
+                filtered = pane._filtered_source_entries()
+                for i, ent in enumerate(filtered):
+                    if ent["name"] not in mine:
+                        continue
+                    r = pane._record_for_table_row(i, "#trad-source-table")
+                    assert r is not None and len(r.seq) == ent["size"], (
+                        flt, i, ent["name"], len(r.seq) if r else None)
+
     async def test_traditional_pane_pcr_mode_simulate(
             self, tiny_record, isolated_library):
         """End-to-end: backbone-as-first-lane-row + PCR-mode donor →
