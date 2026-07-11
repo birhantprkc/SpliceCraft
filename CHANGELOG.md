@@ -14,6 +14,34 @@
 
 ---
 
+## [1.2.18] — 2026-07-11
+
+### New features
+
+- **Much cleaner exported plasmid maps.** The circular map-image export
+  (File ▸ Export map image, and the bulk exports) lays feature and
+  restriction-site labels out far better: each label sits beside its own
+  feature and its leader line stays short and near-radial, labels are stacked
+  in order down each side so their leaders no longer cross, the font
+  auto-shrinks so no label ever runs off the canvas edge, and dense clusters
+  fan out with room to breathe instead of piling into one column with long
+  crossing lines. A very dense map thins its labels evenly (keeping the spread)
+  rather than overlapping them.
+
+### Improvements
+
+- **The virtual gel now renders the moment you open the Gel tab** in the
+  Simulator, instead of showing a blank panel until you click "Run gel" — the
+  pre-loaded ladder / lanes are visible right away.
+- **The DNA composer status line now shows live GC%.** After a codon-optimize
+  (or any edit) the GC content is recomputed and shown in the Synthesis DNA
+  tab, so the key metric no longer disappears with the optimize toast.
+- **The operon designer now shows the RBS it designed** for each gene (and the
+  spacer length) in the results, so you can read/copy the actual Shine-Dalgarno
+  sequence without exporting to the DNA tab first.
+
+---
+
 ## [1.2.17] — 2026-07-11
 
 ### New features

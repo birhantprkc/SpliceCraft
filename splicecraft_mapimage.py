@@ -73,7 +73,7 @@ _SITE_TICK    = 0.018   # tick length just outside the backbone
 # Outer label ellipse: taller than wide so the full canvas height is usable for
 # stacked labels while long text still clears the left/right edges. Text sits at
 # the ellipse and extends OUTWARD; the font auto-shrinks so it never clips.
-_LABEL_ELLIPSE_A = 0.250   # horizontal semi-axis (label inner edge at mid-height)
+_LABEL_ELLIPSE_A = 0.290   # horizontal semi-axis (label inner edge at mid-height)
 _LABEL_ELLIPSE_B = 0.455   # vertical semi-axis
 _LABEL_BASE_FS   = 0.0165  # label font size (fraction of s); shrinks to fit
 _CHAR_W          = 0.56    # mean glyph width / font-size (label-fit estimate)
@@ -456,37 +456,50 @@ def _build_primitives(feats: list, total: int, *,
 
 def _place_radial_labels(items: list, cx: float, cy: float, s: float,
                          lines: list, texts: list) -> int:
-    """Lay external labels out around the OUTSIDE of the map on an ellipse
-    hugging the circle. Per side (right / left) they are stacked in angular
-    order and de-collided vertically, so their leaders stay short + radial and
-    never cross; the font auto-shrinks so the longest never clips the edge.
-    Returns the count dropped when even the floor font can't fit them all."""
+    """Lay external labels around the OUTSIDE on a tall ellipse, each on the
+    LEFT or RIGHT half (by its anchor), stacked in angular order and
+    de-collided VERTICALLY — text extends outward into the free side-space so
+    labels never overlap. Each label sits at its anchor's own angular height,
+    so its leader is short + near-radial; and because a side's leaders keep the
+    shared angular→vertical order they stay nested and don't cross. The font
+    auto-shrinks so the longest clears the canvas edge and the side fits the
+    height with slack (no jam-packed overflow that would drag a cluster away
+    from its feature); excess is dropped EVENLY by angle so the rest keep their
+    spread. Returns the count dropped."""
     A = _LABEL_ELLIPSE_A * s
     B = _LABEL_ELLIPSE_B * s
     margin = _MAP_MARGIN * s
+    usable = s - 2.0 * margin
     dropped = 0
     for direction in (+1, -1):
-        side = [d for d in items if (math.cos(d["a"]) >= 0) == (direction > 0)]
+        side = [d for d in items
+                if (math.cos(d["a"]) >= 0) == (direction > 0)]
         if not side:
             continue
+        n_side = len(side)
         maxchars = max(len(d["label"]) for d in side)
-        # Font that lets the longest label fit from its inner edge (worst case
-        # x = cx ± A, at mid-height) to the canvas margin…
+        # Font that (1) lets the longest label reach from its inner edge
+        # (cx ± A, mid-height) to the margin and (2) fits the whole side's
+        # stack into the height with a little slack.
         room = (s - margin) - (cx + A) if direction > 0 else (cx - A) - margin
         fs = _LABEL_BASE_FS * s
         if maxchars > 0 and room > 0:
             fs = min(fs, room / (maxchars * _CHAR_W))
-        # …and that lets ALL of this side's lines fit the height.
-        fs = min(fs, (s - 2.0 * margin) / (len(side) * 1.55))
-        fs = max(fs, s * 0.0075)
-        lh = fs * 1.55
-        cap = max(1, int((s - 2.0 * margin) // lh))
-        side.sort(key=lambda d: d["a"])
-        if len(side) > cap:
-            side = [side[(k * len(side)) // cap] for k in range(cap)]
-            dropped += (len([d for d in items
-                             if (math.cos(d["a"]) >= 0) == (direction > 0)])
-                        - cap)
+        fs = min(fs, usable / (n_side * 1.62))
+        fs = max(fs, s * 0.0072)
+        lh = fs * 1.62
+        # Order the side top→bottom by the anchor's vertical height. Both the
+        # anchors and the labels then share this order, so their leaders stay
+        # nested (never cross within a side).
+        side.sort(key=lambda d: math.sin(d["a"]))
+        # Cap with slack: leave ~6% of the height free so de-collision only
+        # nudges neighbours apart instead of packing edge-to-edge and shifting
+        # the whole stack (which is what drags a dense cluster's labels far
+        # from their features → long crossing leaders).
+        cap = max(1, int(usable / lh * 0.94))
+        if n_side > cap:
+            side = [side[(k * n_side) // cap] for k in range(cap)]
+            dropped += n_side - cap
         for d in side:
             d["y"] = cy + B * math.sin(d["a"])
         _spread_labels(side, lh, margin + lh / 2.0, s - margin - lh / 2.0)
@@ -496,7 +509,7 @@ def _place_radial_labels(items: list, cx: float, cy: float, s: float,
             t = max(-1.0, min(1.0, (y - cy) / B))
             x = cx + direction * A * math.sqrt(max(0.0, 1.0 - t * t))
             lines.append((d["ax"], d["ay"], x, y, d["color"],
-                          max(0.5, s * 0.0010)))
+                          max(0.5, s * 0.0009)))
             texts.append((x + direction * fs * 0.3, y, d["label"], fs,
                           d["color"], anchor, "normal", 0.0))
     return dropped
