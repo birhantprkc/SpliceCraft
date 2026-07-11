@@ -14,6 +14,29 @@
 
 ---
 
+## [1.2.23] — 2026-07-11
+
+### Bug fixes
+
+- **Agent display-setting changes now show up live.** When an external agent
+  (or Babs) flips a display toggle through the API — the restriction-site
+  overlay, connector lines, or the restriction min-length / unique-only filter
+  — the open map now updates immediately, instead of waiting for you to toggle
+  the same checkbox by hand.
+
+### Hardening
+
+- **Constructor checks the assembly before asking you to name it.** In the
+  Golden Braid / MoClo Constructor, "Save To Library" now runs the real
+  digest-and-ligate simulation *first* — if the parts can't actually clone (an
+  extra enzyme site in the entry vector, terminal overhangs that don't match the
+  vector's dropout), you see the error immediately instead of after typing a
+  name. A green "READY TO CLONE" badge only ever meant the overhangs line up;
+  now the whole simulation has to pass before the name prompt opens, and it runs
+  off the UI thread so a heavy library doesn't freeze the screen.
+
+---
+
 ## [1.2.22] — 2026-07-11
 
 ### New features
