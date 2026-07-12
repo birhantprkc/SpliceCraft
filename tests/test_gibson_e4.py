@@ -230,6 +230,37 @@ class TestGibsonArmDesigner:
             assert armed == 0 and skipped == ["B"]
 
 
+class TestGibsonLayout:
+
+    @pytest.mark.asyncio
+    async def test_linearize_row_has_bounded_height(
+            self, tiny_record, isolated_library):
+        # Regression: the E4 "Linearize at" row shipped (v1.2.24) without a CSS
+        # height rule, so it ballooned to fill the source box (~23 rows) and
+        # collapsed the assembly lane + action buttons below the fold. It must
+        # stay a compact fixed row so the pane keeps a usable layout.
+        from textual.widgets import TabbedContent
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause()
+            modal = sc.ConstructorModal()
+            app.push_screen(modal)
+            await pilot.pause()
+            await pilot.pause(0.05)
+            modal.query_one(TabbedContent).active = "ctor-tab-gibson"
+            await pilot.pause()
+            await pilot.pause(0.05)
+            pane = modal.query_one("#ctor-gib-pane", sc.GibsonAssemblyPane)
+            row = pane.query_one("#gib-linearize-row")
+            h = row.region.height
+            assert 0 < h <= 4, f"linearize row height = {h} (expected ~3)"
+            # The assembly lane must be laid out with real height (not
+            # squeezed to nothing by a runaway sibling).
+            lane = pane.query_one("#gib-lane-host")
+            assert lane.region.height >= 6, \
+                f"lane host height = {lane.region.height} (too small)"
+
+
 class TestGibsonE4RealPlasmid:
 
     @pytest.mark.asyncio

@@ -14,6 +14,20 @@
 
 ---
 
+## [1.2.25] — 2026-07-12
+
+### Bug fixes
+
+- **Gibson tab no longer collapses the assembly lane.** The "Linearize at" row
+  added last release had no fixed height and stretched to fill the source box,
+  pushing the assembly lane and action buttons off-screen. The source-plasmid
+  picker is now a compact height as well, so the linearize control, Add
+  Fragment, the assembly lane with your staged fragments, and the topology /
+  min-overlap settings are all visible together instead of buried under an
+  over-tall picker.
+
+---
+
 ## [1.2.24] — 2026-07-11
 
 ### New features
