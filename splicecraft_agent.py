@@ -59,7 +59,7 @@ from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
 from splicecraft_biology import (_digest_with_enzymes, _enzyme_cuts, _scan_restriction_sites)
-from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _design_gb_primers)
+from splicecraft_cloning import (_PCR_AMPLICON_HARD_CAP, _PCR_DEFAULT_MAX_AMPLICON, _PCR_MAX_AMPLICONS, _PCR_MAX_PRIMER_LEN, _PCR_MAX_TEMPLATE_BP, _PCR_MIN_PRIMER_LEN, _build_synthesis_l0_fragment, _design_gb_primers, _entry_vector_acceptor_overhangs, _grammar_position_by_type)
 from splicecraft_dataaccess import (_active_enzyme_allowed_set, _find_enzyme_collection, _find_library_entry_by_name, _find_parts_bin, _find_project, _get_active_enzyme_collection_name, _get_active_parts_bin_name, _get_active_project_name, _load_parts_bin_collections, _set_active_enzyme_collection_name, _set_active_parts_bin_name, _set_active_project_name)
 from splicecraft_fileio import (_export_fasta_to_path, _export_genbank_to_path, _export_gff_to_path, _extract_gbk_member)
 from splicecraft_gels import (_AGAROSE_CHOICES, _GEL_HEIGHT_MAX, _GEL_HEIGHT_MIN, _GEL_LANE_WIDTH_MAX, _GEL_LANE_WIDTH_MIN, _GEL_MAX_LANES, _agarose_mobility, _gel_bands_for_lane, _render_gel_image)
@@ -7240,6 +7240,16 @@ def _h_design_gb_part(app, payload):
     internal forbidden sites are silently repaired via synonymous
     substitution.
 
+    If a singleton L0 entry vector is CONFIGURED for the grammar and its
+    external acceptor overhangs differ from the grammar's category overhangs
+    (a two-tier Golden-Braid UPD vector — external CTCG/TGAG vs category
+    AATG/GCTT), the primers are automatically NESTED: the Type IIS cut presents
+    the external pair so the fragment enters the vector, with the category pair
+    one layer in (released later by the vector's own nested sites). The
+    fragment's actual cut overhangs come back as ``result.entry_oh5`` /
+    ``entry_oh3``. With no entry vector configured (or one whose overhangs
+    already equal the category pair) the classic one-tier design is unchanged.
+
     Pass ``check_entry_vector: true`` to validate the designed part's 4-nt
     overhangs against the CONFIGURED entry vector for the grammar (agent-API
     feedback) — the design digests that vector, reads its acceptor overhangs,
@@ -7323,10 +7333,19 @@ def _h_design_gb_part(app, payload):
             return ({"error": f"unknown codon_taxid {codon_taxid!r}"},
                     404)
         codon_raw = entry.get("raw")
+    # Two-tier Golden-Braid nesting: derive the destination L0 acceptor's
+    # EXTERNAL overhangs from the configured entry vector (role="" = the
+    # singleton domestication vector) and nest the grammar's category overhangs
+    # inside them, so the designed fragment actually drops into that vector.
+    # None (no vector configured / not cleanly digestible) → classic one-tier.
+    enzyme = grammar.get("enzyme") if isinstance(grammar, dict) else None
+    entry_overhangs = (_entry_vector_acceptor_overhangs(gid, "", enzyme)
+                       if enzyme else None)
     try:
         result = _design_gb_primers(
             template_clean, start, end, part_type,
             target_tm=target_tm, codon_raw=codon_raw, grammar=grammar,
+            entry_overhangs=entry_overhangs,
         )
     except Exception as exc:
         _log.exception("agent design-gb-part: design failed")
@@ -7343,12 +7362,90 @@ def _h_design_gb_part(app, payload):
         try:
             result["entry_vector_check"] = _agent_entry_vector_check(
                 grammar, gid, role,
-                {"oh5": result.get("oh5") or "", "oh3": result.get("oh3") or ""})
+                {"oh5": result.get("entry_oh5") or result.get("oh5") or "",
+                 "oh3": result.get("entry_oh3") or result.get("oh3") or ""})
         except Exception as exc:
             _log.exception("agent design-gb-part: entry-vector check failed")
             result["entry_vector_check"] = {
                 "checkable": False,
                 "note": f"entry-vector check failed: {_scrub_path(str(exc))}"}
+    return {"ok": True, "result": result}
+
+
+@_agent_endpoint("design-synthesis-fragment")
+def _h_design_synthesis_fragment(app, payload):
+    """Wrap a sequence in the correct nested overhangs so the directly-
+    SYNTHESISED fragment (order it as a gBlock — no PCR) becomes a Level-0 part
+    once cloned into the configured UPD/pUPD entry vector with the grammar's
+    Type IIS enzyme. The direct-synthesis counterpart to ``design-gb-part``
+    (which designs PCR domestication primers for an existing template).
+
+    Body: ``{sequence, part_type?, oh5?, oh3?, grammar?="gb_l0"}``.
+      * ``sequence`` — the insert to wrap (IUPAC DNA).
+      * ``part_type`` — a grammar POSITION type (``CDS`` / ``Promoter`` /
+        ``Terminator`` …) whose category overhangs flank the insert; OR
+      * ``oh5`` / ``oh3`` — CUSTOM 4-nt category overhangs (override part_type).
+      * ``grammar`` — cloning grammar id (default ``gb_l0``).
+
+    Auto-nests exactly like ``design-gb-part``: if the grammar's configured L0
+    entry vector exposes EXTERNAL overhangs that differ from the category pair
+    (a two-tier UPD vector — e.g. external CTCG/TGAG vs category AATG/GCTT), the
+    category pair nests inside so the fragment cuts to the vector's external
+    overhangs. With no entry vector configured, the category overhangs are used
+    directly (one-tier).
+
+    Returns ``{ok, result}`` — result = ``{fragment, length, oh5, oh3,
+    entry_oh5, entry_oh3, part_type, enzyme, nested, entry_vector,
+    internal_sites}``. ``entry_oh5``/``entry_oh3`` are the fragment's ACTUAL
+    Type IIS-cut overhangs (what enters the vector); ``internal_sites`` (when
+    non-empty) flags grammar-forbidden recognition sites in the insert that make
+    the fragment self-cut — scrub them (codon-optimise) before ordering."""
+    seq, serr = _sanitize_bases(payload.get("sequence") or payload.get("template"))
+    if serr is not None:
+        return ({"error": f"'sequence': {serr}"}, 400)
+    if not seq:
+        return ({"error": "missing/empty 'sequence'"}, 400)
+    if len(seq) > _PAIRWISE_MAX_LEN:
+        return ({"error": f"'sequence' exceeds {_PAIRWISE_MAX_LEN:,} bp cap"}, 413)
+    gid = payload.get("grammar", "gb_l0")
+    if not isinstance(gid, str):
+        return ({"error": "'grammar' must be a string"}, 400)
+    grammar = _all_grammars().get(gid)
+    if grammar is None:
+        return ({"error": f"unknown grammar id {gid!r}"}, 404)
+    # Category overhangs: explicit oh5/oh3 override a part_type lookup.
+    part_type = payload.get("part_type") or ""
+    if payload.get("oh5") is not None or payload.get("oh3") is not None:
+        c5, e5 = _sanitize_bases(payload.get("oh5"), max_len=8)
+        c3, e3 = _sanitize_bases(payload.get("oh3"), max_len=8)
+        if e5 is not None or e3 is not None or len(c5) != 4 or len(c3) != 4:
+            return ({"error": "custom 'oh5'/'oh3' must each be exactly "
+                     "4 ACGT bases"}, 400)
+        cat5, cat3 = c5, c3
+    elif part_type:
+        if not isinstance(part_type, str):
+            return ({"error": "'part_type' must be a string"}, 400)
+        pos = _grammar_position_by_type(grammar, part_type)
+        if pos is None:
+            avail = ", ".join(p.get("type", "?")
+                              for p in grammar.get("positions", []))
+            return ({"error": f"part_type {part_type!r} not in grammar "
+                     f"{gid!r}. Available: {avail}"}, 400)
+        cat5, cat3 = pos.get("oh5", ""), pos.get("oh3", "")
+    else:
+        return ({"error": "supply either 'part_type' or custom "
+                 "'oh5'+'oh3'"}, 400)
+    enzyme = grammar.get("enzyme") or ""
+    ext = _entry_vector_acceptor_overhangs(gid, "", enzyme) if enzyme else None
+    try:
+        result = _build_synthesis_l0_fragment(
+            seq, cat5, cat3, grammar=grammar,
+            part_type=part_type, entry_overhangs=ext)
+    except Exception as exc:
+        _log.exception("agent design-synthesis-fragment: build failed")
+        return ({"error": f"build failed: {_scrub_path(str(exc))}"}, 500)
+    ev = _get_entry_vector(gid, "")
+    result["entry_vector"] = (ev.get("name") if isinstance(ev, dict) else "") or ""
     return {"ok": True, "result": result}
 
 

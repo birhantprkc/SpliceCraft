@@ -51,13 +51,13 @@ from splicecraft_primer import (   # L2 (downward; primer never imports cloning)
 )
 from splicecraft_dataaccess import (
     _BUILTIN_GRAMMARS, _GB_CODING_PART_TYPES, _GB_DOMESTICATION_FORBIDDEN,
-    _GB_L0_ENZYME_SITE, _GB_PAD, _GB_SPACER,
+    _GB_L0_ENZYME_SITE, _GB_PAD, _GB_SPACER, _get_entry_vector,
 )
 from splicecraft_history import (
     _CommercialSaaSHistoryNode, _coerce_int_or_zero, _history_now_str,
 )
 from splicecraft_logging import _log, _timed
-from splicecraft_record import _normalize_primer_seq
+from splicecraft_record import _gb_text_to_record, _normalize_primer_seq
 
 
 def _serialize_commercialsaas_history(root: "_CommercialSaaSHistoryNode | None"
@@ -236,10 +236,11 @@ def _simulate_primed_amplicon(
     insert: str, oh5: str, oh3: str,
     grammar: "dict | None" = None,
     part_type: str = "",
+    entry_overhangs: "tuple[str, str] | None" = None,
 ) -> str:
     """PCR amplicon top strand (5'→3'), as it would run on a pre-digest gel.
 
-    Structure:  [pad] [enzyme site] [spacer] [oh5] [insert] [oh3]
+    Structure:  [pad] [enzyme site] [spacer] [ent5] [oh5] [insert] [oh3] [ent3]
                 [rc(spacer)] [rc(enzyme site)] [rc(pad)]
 
     Matches the primer geometry in :func:`_design_gb_primers`. Defaults to
@@ -247,6 +248,13 @@ def _simulate_primed_amplicon(
     grammar's enzyme/pad/spacer (e.g., MoClo Plant uses BsaI). Used by
     both DomesticatorModal (active grammar at design time) and
     PartsBinModal "Copy Primed Sequence" (the part's stored grammar).
+
+    ``entry_overhangs`` = ``(external_oh5, external_oh3)`` nests a two-tier
+    Golden-Braid UPD layout: the external entry pair (e.g. CTCG/TGAG) wraps the
+    category overhangs, exactly as `_design_gb_primers` builds the primers, so
+    the simulated amplicon equals what those primers produce on the bench.
+    ``None`` — or a pair equal to ``(oh5, oh3)`` — keeps the classic one-tier
+    amplicon (byte-identical to the pre-nesting output).
     """
     g = grammar if isinstance(grammar, dict) else _BUILTIN_GRAMMARS["gb_l0"]
     pad    = g.get("pad",    _GB_PAD)
@@ -254,11 +262,19 @@ def _simulate_primed_amplicon(
     spacer = g.get("spacer", _GB_SPACER)
     left_tail  = pad + site + spacer
     right_tail = _rc(spacer) + _rc(site) + _rc(pad)
+    ent5 = ent3 = ""
+    if isinstance(entry_overhangs, (tuple, list)) and len(entry_overhangs) == 2:
+        e5 = str(entry_overhangs[0] or "").upper()
+        e3 = str(entry_overhangs[1] or "").upper()
+        if len(e5) == 4 and len(e3) == 4 \
+                and (e5, e3) != ((oh5 or "").upper(), (oh3 or "").upper()):
+            ent5, ent3 = e5, e3
     # `_fuse_overhang_body` collapses the AATG-CDS start-codon overlap so the
     # amplicon matches the designed primers (which bind at codon 2) — no
-    # duplicated ATG. Grammar-agnostic (GB + MoClo); no-op otherwise.
-    return (left_tail + _fuse_overhang_body(oh5, insert, part_type)
-            + oh3 + right_tail)
+    # duplicated ATG. Grammar-agnostic (GB + MoClo); no-op otherwise. The
+    # external entry overhangs (`ent5`/`ent3`) wrap that fused body.
+    return (left_tail + ent5 + _fuse_overhang_body(oh5, insert, part_type)
+            + oh3 + ent3 + right_tail)
 
 
 def _simulate_cloned_plasmid(insert: str, oh5: str, oh3: str,
@@ -2293,6 +2309,57 @@ def _scrub_gb_design(seq: str, feats: "list | None" = None, enzymes=None, *,
 # Reuse primer L2 (designers + _scrub_design) + codon L2 (_codon_fix_*) + the
 # GB grammar data (dataaccess) + _atg_offset_for_part (local).
 
+def _entry_vector_acceptor_overhangs(
+    grammar_id: str, role: str = "", enzyme: str = "",
+) -> "tuple[str, str] | None":
+    """The 4-nt overhang pair a domestication fragment must PRESENT to drop
+    into the CONFIGURED entry vector for ``(grammar_id, role)``.
+
+    Digests that vector with ``enzyme`` (the grammar's Type IIS enzyme) and
+    returns the dropout/stuffer fragment's ``(oh5, oh3)`` — the acceptor
+    overhangs the incoming part inherits. For a two-tier Golden-Braid UPD
+    vector these are the EXTERNAL entry overhangs (e.g. ``CTCG`` / ``TGAG``),
+    which differ from the grammar's INTERNAL category overhangs (``AATG`` /
+    ``GCTT`` for a CDS): the fragment enters the vector on the external pair
+    (Esp3I/BsmBI) and later releases the L0 part on the internal pair (BsaI),
+    which the vector's own nested sites regenerate. `_design_gb_primers` nests
+    the category overhangs inside this pair when they differ.
+
+    Returns ``None`` — and the caller keeps the classic one-tier layout
+    (category overhang IS the entry overhang, standard MoClo pUPD2) — when no
+    vector is configured, it carries no sequence, or it doesn't cut to a clean
+    2-fragment acceptor. Never raises: a misconfigured vector degrades to the
+    safe one-tier default rather than aborting the design."""
+    if not enzyme:
+        return None
+    try:
+        ev = _get_entry_vector(grammar_id, role or "")
+    except Exception:
+        _log.exception("_entry_vector_acceptor_overhangs: EV lookup failed")
+        return None
+    if not isinstance(ev, dict):
+        return None
+    gb = ev.get("gb_text") or ""
+    if not gb:
+        return None
+    try:
+        seq = str(getattr(_gb_text_to_record(gb), "seq", "") or "").upper()
+        if not seq:
+            return None
+        frags, err = _excise_fragment_pair(seq, [enzyme], circular=True)
+    except Exception:
+        _log.exception("_entry_vector_acceptor_overhangs: EV digest failed")
+        return None
+    if err is not None or len(frags) != 2:
+        return None
+    stuffer = min(frags, key=lambda f: len(f.get("top_seq", "")))
+    oh5 = ((stuffer.get("left") or {}).get("overhang_seq") or "").upper()
+    oh3 = ((stuffer.get("right") or {}).get("overhang_seq") or "").upper()
+    if len(oh5) == 4 and len(oh3) == 4:
+        return (oh5, oh3)
+    return None
+
+
 def _dom_primer_pair_names(part_name: str, idx: int = 1) -> "tuple[str, str]":
     """The canonical ``(fwd, rev)`` primer NAMES for a domestication pair:
     ``{part_name}-DOM-{idx}-F`` / ``-R``. Single source of the naming
@@ -2409,6 +2476,7 @@ def _design_gb_primers(
     target_tm: float = 60.0,
     codon_raw: "dict | None" = None,
     grammar: "dict | None" = None,
+    entry_overhangs: "tuple[str, str] | None" = None,
 ) -> dict:
     """Design modular cloning domestication primers for a template region.
 
@@ -2422,6 +2490,17 @@ def _design_gb_primers(
 
         Forward: [pad] [enzyme site] [spacer] [5' overhang]    [binding →]
         Reverse: [pad] [enzyme site] [spacer] [RC 3' overhang] [← binding RC]
+
+    Pass ``entry_overhangs`` = ``(external_oh5, external_oh3)`` to nest a
+    two-tier Golden-Braid layout: the grammar's category overhangs (``oh5`` /
+    ``oh3``) move INSIDE the given external pair, so the Type IIS cut presents
+    the external overhangs (which enter a UPD/pUPD entry vector) while the
+    category overhangs survive to be released one level up. When ``None`` — or
+    equal to the category pair — the classic one-tier layout is emitted
+    unchanged (external overhang IS the category overhang, standard MoClo).
+    Resolve the pair from the configured entry vector with
+    :func:`_entry_vector_acceptor_overhangs`. The result reports the fragment's
+    actual cut overhangs under ``entry_oh5`` / ``entry_oh3``.
 
     When *codon_raw* (a ``{codon: (aa, count)}`` dict from the codon-table
     registry) is supplied and *part_type* is a coding type (CDS / CDS-NS /
@@ -2456,6 +2535,26 @@ def _design_gb_primers(
     enzyme_pad = g.get("pad", _GB_PAD)
     enzyme_site = g.get("site", _GB_L0_ENZYME_SITE)
     enzyme_spacer = g.get("spacer", _GB_SPACER)
+
+    # Two-tier Golden-Braid nesting. `oh5`/`oh3` are the grammar's INTERNAL
+    # category overhangs (AATG/GCTT for a CDS — what BsaI releases at L1). When
+    # the destination entry vector exposes DIFFERENT external acceptor overhangs
+    # (`entry_overhangs`, e.g. CTCG/TGAG for a UPD vector — resolved by the
+    # caller via `_entry_vector_acceptor_overhangs`), the Type IIS cut must
+    # present THOSE, with the category pair nested one layer in. `ent5`/`ent3`
+    # are that external layer (empty ⇒ classic one-tier: category == entry, the
+    # standard MoClo pUPD2 layout, byte-identical to the pre-nesting design).
+    # `entry_oh5`/`entry_oh3` report the fragment's ACTUAL enzyme-cut overhangs
+    # (what physically ligates into the acceptor) — the entry-vector check reads
+    # these, not the category pair.
+    ent5 = ent3 = ""
+    entry_oh5, entry_oh3 = oh5, oh3
+    if isinstance(entry_overhangs, (tuple, list)) and len(entry_overhangs) == 2:
+        e5 = str(entry_overhangs[0] or "").upper()
+        e3 = str(entry_overhangs[1] or "").upper()
+        if len(e5) == 4 and len(e3) == 4 and (e5, e3) != (oh5.upper(), oh3.upper()):
+            ent5, ent3 = e5, e3
+            entry_oh5, entry_oh3 = e5, e3
 
     total  = len(template_seq)
     insert = _slice_circular(template_seq.upper(), start, end)
@@ -2598,8 +2697,8 @@ def _design_gb_primers(
     # the TOTAL oligo within `_PRIMER_MAX_OLIGO_LEN` (binding grows to reach
     # `target_tm` but never past 50 − len(tail)) — a low-GC arm reaches
     # ~60 °C without blowing the oligo-synthesis budget.
-    fwd_tail = enzyme_pad + enzyme_site + enzyme_spacer + oh5
-    rev_tail = enzyme_pad + enzyme_site + enzyme_spacer + _rc(oh3)
+    fwd_tail = enzyme_pad + enzyme_site + enzyme_spacer + ent5 + oh5
+    rev_tail = enzyme_pad + enzyme_site + enzyme_spacer + _rc(ent3) + _rc(oh3)
     fwd_bind, fwd_tm = _pick_binding_region(
         fwd_insert, target_tm, max_len=_binding_max_len(len(fwd_tail)))
     rev_bind, rev_tm = _pick_binding_region(
@@ -2666,6 +2765,13 @@ def _design_gb_primers(
         "position":     pos_label,
         "oh5":          oh5,
         "oh3":          oh3,
+        # The fragment's ACTUAL Type IIS-released overhangs (the domestication
+        # junction that ligates into the entry vector). Equal to oh5/oh3 for a
+        # classic one-tier design; the EXTERNAL entry pair (e.g. CTCG/TGAG) when
+        # nested into a two-tier Golden-Braid UPD vector. Callers validate
+        # entry-vector compatibility against THESE, not the category overhangs.
+        "entry_oh5":    entry_oh5,
+        "entry_oh3":    entry_oh3,
         "insert_seq":   insert,
         "mutations":    mutations,
         "binding_region_mutations": binding_region_mutations,
@@ -2687,6 +2793,59 @@ def _design_gb_primers(
         # Legacy top-level mirror of pairs[0] for callers (cloning simulator,
         # PrimerDesignScreen) that don't iterate the list yet.
         **pair,
+    }
+
+
+def _build_synthesis_l0_fragment(
+    sequence: str, oh5: str, oh3: str, *,
+    grammar: "dict | None" = None,
+    part_type: str = "",
+    entry_overhangs: "tuple[str, str] | None" = None,
+) -> dict:
+    """Wrap ``sequence`` in the grammar's Type IIS ends + fusion overhangs so the
+    directly-SYNTHESISED fragment (order it as a gBlock — no PCR) becomes a
+    proper Level-0 part once cloned into a UPD/pUPD entry vector.
+
+    Shared by the Synthesis-tab "L0 Fragment" button and the ``design-
+    synthesis-fragment`` agent endpoint, so a human and an agent/Babs produce
+    the SAME fragment. Two-tier aware: pass the vector's EXTERNAL acceptor
+    overhangs (resolve with :func:`_entry_vector_acceptor_overhangs`) as
+    ``entry_overhangs`` and the category pair (``oh5``/``oh3``) nests inside
+    them; ``None`` — or a pair equal to the category — yields the classic
+    one-tier fragment.
+
+    Returns ``{fragment, length, oh5, oh3, entry_oh5, entry_oh3, part_type,
+    enzyme, nested, internal_sites}`` where ``entry_oh5``/``entry_oh3`` are the
+    fragment's ACTUAL Type IIS-cut overhangs (what enters the vector) and
+    ``internal_sites`` lists any grammar-forbidden recognition site FOUND in the
+    insert (each ``{enzyme, site, pos}``, 0-based) — those must be scrubbed (e.g.
+    via codon Optimize) before ordering or the fragment self-cuts."""
+    g = grammar if isinstance(grammar, dict) else _BUILTIN_GRAMMARS["gb_l0"]
+    seq = "".join(c for c in (sequence or "").upper() if c in "ACGTRYSWKMBDHVN")
+    cat5 = (oh5 or "").upper()
+    cat3 = (oh3 or "").upper()
+    ext: "tuple[str, str] | None" = None
+    if isinstance(entry_overhangs, (tuple, list)) and len(entry_overhangs) == 2:
+        e5 = str(entry_overhangs[0] or "").upper()
+        e3 = str(entry_overhangs[1] or "").upper()
+        if len(e5) == 4 and len(e3) == 4 and (e5, e3) != (cat5, cat3):
+            ext = (e5, e3)
+    fragment = _simulate_primed_amplicon(
+        seq, cat5, cat3, grammar=g, part_type=part_type, entry_overhangs=ext)
+    forbidden = g.get("forbidden_sites") or {}
+    hits = _gb_find_forbidden_hits(seq, sites=forbidden) if forbidden else []
+    return {
+        "fragment":       fragment,
+        "length":         len(fragment),
+        "oh5":            cat5,
+        "oh3":            cat3,
+        "entry_oh5":      ext[0] if ext else cat5,
+        "entry_oh3":      ext[1] if ext else cat3,
+        "part_type":      part_type,
+        "enzyme":         g.get("enzyme") or "",
+        "nested":         ext is not None,
+        "internal_sites": [{"enzyme": n, "site": s, "pos": p}
+                           for (n, s, p) in hits],
     }
 
 

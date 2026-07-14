@@ -14,6 +14,48 @@
 
 ---
 
+## [1.2.26] — 2026-07-13
+
+### Bug fixes
+
+- **Golden-Braid domestication now makes fragments that actually clone into a
+  UPD entry vector.** When you domesticate into a two-tier UPD / pUPD vector —
+  one whose Esp3I (BsmBI) cut exposes *external* fusion overhangs (e.g.
+  `CTCG`/`TGAG`) that differ from a part's category overhangs (e.g. `AATG`/`GCTT`
+  for a CDS) — the fragment now carries the external overhangs on the outside
+  with the category overhangs **nested inside**, so it enters the vector on
+  Esp3I and later releases the part on BsaI. Previously the category overhangs
+  were used directly as the cut overhangs, so the fragment didn't match the
+  backbone and wouldn't ligate. The fix is automatic — the Domesticator, the
+  `design-gb-part` agent endpoint, and `domesticate-part` all read the
+  configured entry vector's own overhangs and nest to match. Standard one-tier
+  MoClo pUPD2 designs are unchanged.
+
+### New features
+
+- **"L0 Fragment" button on the Synthesis tab.** Ordering the DNA synthetic
+  instead of amplifying it? Wrap the composed sequence in the correct nested
+  overhangs for direct synthesis: pick a grammar position (Promoter / CDS /
+  Terminator …) or type a custom 4-nt overhang, and the fragment comes back
+  annotated and ready to order as a gBlock, so a single Esp3I cut drops it into
+  your UPD entry vector as a proper L0 part. It's two-tier aware, and any
+  internal Type IIS site in your insert is flagged so you can scrub it (via
+  **Optimize**) before ordering.
+- **New `design-synthesis-fragment` agent endpoint** (also reachable from
+  Babs) — the direct-synthesis counterpart to `design-gb-part`: give it a
+  sequence plus a grammar position or custom overhangs and it returns the
+  nested, synthesis-ready fragment along with its overhangs, the target entry
+  vector, and any internal-site warnings.
+
+### Hardening
+
+- The nesting layer ignores malformed (non-4-nt) external overhangs and falls
+  back to the classic one-tier fragment, and the entry-vector overhang resolver
+  degrades safely to one-tier — never raising — on an unparseable, extra-cut, or
+  unknown-enzyme vector.
+
+---
+
 ## [1.2.25] — 2026-07-12
 
 ### Bug fixes

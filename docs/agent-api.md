@@ -150,7 +150,21 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   for a Golden-Braid role — to validate at DESIGN time that the part's
   overhangs actually match the configured entry vector's acceptor, so a
   mismatch surfaces here instead of at the clone step; verdict rides under
-  `result.entry_vector_check`), domesticate-part
+  `result.entry_vector_check`. **Two-tier aware:** if the configured L0 entry
+  vector exposes EXTERNAL acceptor overhangs that differ from the position's
+  category overhangs — a UPD/pUPD vector, e.g. external `CTCG`/`TGAG` vs category
+  `AATG`/`GCTT` — the category pair is auto-NESTED inside the external pair so
+  the fragment enters on Esp3I (external) and later releases on BsaI (category);
+  actual cut overhangs return as `result.entry_oh5`/`entry_oh3`),
+  design-synthesis-fragment (the direct-synthesis counterpart: wrap a `sequence`
+  in the SAME nested overhangs so the SYNTHESISED fragment — ordered as a gBlock,
+  no PCR — clones into the UPD vector as an L0 part. Pass `{sequence, part_type?,
+  oh5?, oh3?, grammar?}` — a grammar POSITION type OR a custom 4-nt overhang
+  pair; auto-nests from the configured entry vector like design-gb-part. Returns
+  `result.fragment` (+ `length`, category `oh5`/`oh3`, external
+  `entry_oh5`/`entry_oh3`, `nested`, `entry_vector`, and `internal_sites`
+  flagging any grammar-forbidden site in the insert that would self-cut)),
+  domesticate-part
   (the real Synthesis-tab L0 clone: digest the grammar's CONFIGURED entry
   vector + the part's primed amplicon at the Type IIS enzyme, ligate the
   insert into the backbone, and save the circular L0 plasmid with its

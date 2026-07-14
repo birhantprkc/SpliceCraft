@@ -4203,14 +4203,33 @@ class TestDesignGbPartEntryVector:
         assert chk["vector_name"] == "CompatUPD"
         assert chk["acceptor_oh5"] == d["oh5"] and chk["acceptor_oh3"] == d["oh3"]
 
-    def test_incompatible_vector_reported(self):
-        # A vector whose dropout releases overhangs the part doesn't carry.
+    def test_design_auto_conforms_to_configured_vector(self):
+        # 2026-07-13 two-tier fix: `design-gb-part` NESTS the grammar's category
+        # overhangs inside whatever EXTERNAL overhangs the configured L0 acceptor
+        # exposes, so the fragment drops in BY CONSTRUCTION — even for an unusual
+        # external pair the part's category overhangs don't themselves match.
         d = self._design()
         assert (d["oh5"], d["oh3"]) != ("AAAA", "TTTT")
-        self._bind_vector("AAAA", "TTTT", name="WrongUPD")
-        chk = self._call(check_entry_vector=True)["result"]["entry_vector_check"]
-        assert chk["checkable"] is True
-        assert chk["compatible"] is False, chk
+        self._bind_vector("AAAA", "TTTT", name="UnusualUPD")
+        res = self._call(check_entry_vector=True)["result"]
+        # actual Type IIS-cut overhangs now equal the vector's external pair …
+        assert res["entry_oh5"] == "AAAA" and res["entry_oh3"] == "TTTT"
+        # … while the category identity (what BsaI releases at L1) is unchanged
+        assert res["oh5"] == d["oh5"] and res["oh3"] == d["oh3"]
+        chk = res["entry_vector_check"]
+        assert chk["checkable"] is True and chk["compatible"] is True, chk
+
+    def test_check_still_flags_genuine_mismatch(self):
+        # The entry-vector check itself still reports incompatible for a part
+        # that genuinely doesn't match the acceptor (unit-level — bypassing the
+        # design's auto-conform): a part carrying AATG/GCTT vs a CTCG/TGAG UPD
+        # acceptor won't ligate.
+        from splicecraft_agent import _agent_entry_vector_check
+        self._bind_vector("CTCG", "TGAG", name="UPD")
+        g = sc._BUILTIN_GRAMMARS["gb_l0"]
+        chk = _agent_entry_vector_check(g, "gb_l0", "",
+                                        {"oh5": "AATG", "oh3": "GCTT"})
+        assert chk["checkable"] is True and chk["compatible"] is False, chk
 
     def test_no_vector_configured_reported(self):
         sc._set_entry_vector("gb_l0", None)

@@ -174,6 +174,18 @@ fragment** (`FRAG-…`, the primed amplicon with its domestication primers +
 features drawn on it), and the **parts bin** the L0 part lands in — each into any
 collection. Nothing on your canvas is touched until you save.
 
+Ordering the DNA synthetic instead of amplifying it? **L0 Fragment** wraps the
+composed sequence in the correct nested overhangs for direct synthesis — pick a
+grammar position (Promoter / CDS / Terminator …) or type a custom 4-nt overhang,
+and the fragment comes back annotated and ready to order as a gBlock, so a
+single **Esp3I** (BsmBI) cut drops it into your **UPD / pUPD entry vector** as a
+proper L0 part. It's *two-tier aware*: when the configured entry vector's
+external acceptor overhangs (e.g. `CTCG`/`TGAG`) differ from the part's category
+overhangs (e.g. `AATG`/`GCTT`), the category pair is **nested inside** the
+external pair automatically — the layout GoldenBraid needs so the part enters on
+Esp3I and later releases on BsaI. Internal Type IIS sites in your insert are
+flagged so you can scrub them (via **Optimize**) before ordering.
+
 ### Parts
 
 Your **Parts Bin** — the Level-0 building blocks for grammar-based assembly, in

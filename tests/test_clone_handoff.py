@@ -1437,6 +1437,28 @@ class TestDomesticatePartEndpoint:
         assert h["history"] is not None
         assert h["history"]["operation"] == "insertFragment"
 
+    def test_two_tier_vector_nests_from_category_overhangs(self):
+        # Two-tier hardening (2026-07-13): call domesticate-part with the part's
+        # CATEGORY overhangs (Promoter GGAG/AATG) and NO primers into a UPD
+        # acceptor whose EXTERNAL overhangs are CTCG/TGAG. The endpoint resolves
+        # the external pair from the vector and nests, so the clone succeeds
+        # with the category overhang PRESERVED inside the external one
+        # (…CTCG·GGAG·insert…) — not a one-tier amplicon that finds no dropout.
+        sc._set_entry_vector("gb_l0", {
+            "name": "TESTUPD", "size": 0, "source": "test",
+            "id": "TESTUPD", "gb_text": _make_acceptor_gb(2)})   # CTCG/TGAG
+        r = sc._h_domesticate_part(None, {
+            "sequence": _INSERT, "oh5": "GGAG", "oh3": "AATG",
+            "name": "TwoTierProm", "grammar": "gb_l0", "type": "Promoter"})
+        assert isinstance(r, dict) and r["ok"], r
+        ent = next(e for e in sc._load_library() if e["name"] == "TwoTierProm")
+        cls = str(sc._gb_text_to_record(ent["gb_text"]).seq).upper()
+        doubled = cls + cls   # rotation-invariant substring search (circular)
+        # external CTCG wraps the category GGAG, which precedes the insert body
+        assert "CTCGGGAG" in doubled, "external entry overhang not nested"
+        assert ("GGAG" + _INSERT[:20]) in doubled, \
+            "category overhang not preserved before the insert"
+
     def test_no_entry_vector_fails_loud(self):
         sc._set_entry_vector("gb_l0", None)            # fresh-install: no vector
         r = sc._h_domesticate_part(None, {
@@ -1542,3 +1564,62 @@ class TestDomesticatePartEndpoint:
             "sequence": d["insert_seq"], "oh5": d["oh5"], "oh3": d["oh3"],
             "name": "x", "grammar": "gb_l0", "collection": "NoSuchColl"})
         assert isinstance(r, tuple) and r[1] == 404, r
+
+
+class TestSynthL0FragmentButton:
+    """Synthesis-tab "L0 Fragment" button → SynthL0FragmentModal → nested
+    fragment loaded into the DNA buffer, ready to order for synthesis
+    (2026-07-13). Uses the CTCG/TGAG two-tier acceptor from _bind_test_vector."""
+
+    _CDS = "ATG" + "GAACTGAAAGCAGGT" * 8 + "TAA"
+
+    @pytest.mark.asyncio
+    async def test_button_opens_modal(self):
+        _bind_test_vector()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            syn = await _open_synthesis_with_seq(app, pilot, self._CDS)
+            syn.action_make_l0_fragment()
+            for _ in range(5):
+                await pilot.pause()
+            assert type(app.screen).__name__ == "SynthL0FragmentModal"
+
+    @pytest.mark.asyncio
+    async def test_wraps_buffer_with_nested_overhangs(self):
+        _bind_test_vector()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            syn = await _open_synthesis_with_seq(app, pilot, self._CDS)
+            syn.action_make_l0_fragment()
+            for _ in range(5):
+                await pilot.pause()
+            # pick the CDS position — category AATG/GCTT nests inside CTCG/TGAG
+            app.screen.dismiss({"oh5": "AATG", "oh3": "GCTT",
+                                "part_type": "CDS", "label": "CDS"})
+            for _ in range(6):
+                await pilot.pause()
+            ed = syn.query_one("#syn-editor", sc.SynthesisEditor)
+            frag = (ed.get_state()[0] or "").upper()
+            # buffer now holds the synthesis-ready nested L0 fragment …
+            assert frag.startswith("GCGCCGTCTCACTCGAATG"), frag[:24]
+            # … whose Esp3I cut exposes the vector's external overhangs
+            digs = sc._digest_with_enzymes(frag, ["Esp3I"], circular=False)
+            ins = [f for f in digs if f["left"]["kind"] != "linear"
+                   and f["right"]["kind"] != "linear"]
+            assert ins and ins[0]["left"]["overhang_seq"] == "CTCG"
+            assert ins[0]["right"]["overhang_seq"] == "TGAG"
+
+    @pytest.mark.asyncio
+    async def test_cancel_leaves_buffer_untouched(self):
+        _bind_test_vector()
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            syn = await _open_synthesis_with_seq(app, pilot, self._CDS)
+            syn.action_make_l0_fragment()
+            for _ in range(5):
+                await pilot.pause()
+            app.screen.dismiss(None)                       # cancel = no-op
+            for _ in range(6):
+                await pilot.pause()
+            ed = syn.query_one("#syn-editor", sc.SynthesisEditor)
+            assert (ed.get_state()[0] or "").upper() == self._CDS

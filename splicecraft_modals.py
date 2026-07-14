@@ -5431,6 +5431,123 @@ class CloneMethodChooserModal(_OneShotDismissScreen, ModalScreen):
         self.dismiss(None)
 
 
+class SynthL0FragmentModal(_OneShotDismissScreen, ModalScreen):
+    """Synthesis-tab "L0 Fragment": pick a grammar POSITION (Promoter / CDS /
+    Terminator …) or enter CUSTOM overhangs, and the composed sequence is
+    wrapped in the correct nested overhangs so the SYNTHESISED fragment becomes
+    a proper Level-0 part once cloned into the configured UPD/pUPD entry vector
+    with the grammar's Type IIS enzyme.
+
+    Two-tier aware: when the entry vector's EXTERNAL acceptor overhangs (shown
+    in the header) differ from the position's category overhangs, the category
+    pair nests INSIDE the external pair — the same layout `_design_gb_primers`
+    builds, so the fragment both enters the vector (external, e.g. CTCG/TGAG)
+    and later releases the part on its category overhangs (e.g. AATG/GCTT).
+
+    Inputs (passed by the caller so the modal stays data-access-free):
+      * ``positions`` — ``[{name, type, oh5, oh3}, …]`` from the active grammar.
+      * ``ext_overhangs`` — the vector's external ``(oh5, oh3)`` or ``None``.
+      * ``ev_name`` / ``enzyme`` — for the header line.
+
+    Dismisses ``{oh5, oh3, part_type, label}`` (category overhangs + the part
+    type used for the ATG-fusion rule) or ``None`` on cancel."""
+
+    _blocks_undo: bool = True
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    DEFAULT_CSS = """
+    #l0-dlg {
+        width: 84; height: auto; max-height: 90%;
+        background: $surface; border: solid $primary; padding: 1 2;
+    }
+    #l0-title {
+        background: $primary-darken-2; color: $text;
+        padding: 0 1; margin-bottom: 1; text-align: center;
+    }
+    #l0-info { color: $text-muted; margin-bottom: 1; }
+    #l0-pos { height: auto; max-height: 16; margin-bottom: 1; }
+    #l0-custom-row { height: 3; margin-bottom: 1; }
+    #l0-custom-row Label { padding: 1 1 0 0; }
+    #l0-custom-row Input { width: 14; margin-right: 2; }
+    #l0-status { height: auto; margin-bottom: 1; }
+    #l0-btns { height: 3; align: right middle; }
+    #l0-btns Button { margin-left: 2; }
+    """
+
+    def __init__(self, positions, ext_overhangs, ev_name="", enzyme="") -> None:
+        super().__init__()
+        self._positions = list(positions or [])
+        self._ext = tuple(ext_overhangs) if ext_overhangs else None
+        self._ev_name = ev_name or ""
+        self._enzyme = enzyme or "Esp3I"
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="l0-dlg"):
+            yield Static(" L0 Fragment — pick the part position ", id="l0-title")
+            if self._ext:
+                info = (f"Entry vector [b]{self._ev_name or '—'}[/b]: a "
+                        f"{self._enzyme} cut exposes [b]{self._ext[0]}[/b] / "
+                        f"[b]{self._ext[1]}[/b] (external). The position's "
+                        f"overhangs nest INSIDE these so it clones as a real L0 "
+                        f"part.")
+            else:
+                info = ("No two-tier entry vector configured — the fragment "
+                        "will carry the position's own overhangs directly "
+                        "(one-tier). Bind a UPD vector in Settings to nest.")
+            yield Static(info, id="l0-info")
+            with RadioSet(id="l0-pos"):
+                for i, p in enumerate(self._positions):
+                    yield RadioButton(
+                        f"{p.get('name','?')}  "
+                        f"({p.get('oh5','')}→{p.get('oh3','')})  "
+                        f"{p.get('type','')}",
+                        value=(i == 0),
+                    )
+                yield RadioButton("Custom overhangs (enter below)")
+            with Horizontal(id="l0-custom-row"):
+                yield Label("Custom 5'")
+                yield Input(placeholder="AATG", id="l0-oh5", max_length=8)
+                yield Label("3'")
+                yield Input(placeholder="GCTT", id="l0-oh3", max_length=8)
+            yield Static("", id="l0-status", markup=True)
+            with Horizontal(id="l0-btns"):
+                yield Button("Make Fragment", id="l0-ok", variant="success")
+                yield Button("Cancel", id="l0-cancel")
+
+    @staticmethod
+    def _clean_oh(val: str) -> str:
+        return "".join(c for c in (val or "").upper() if c in "ACGT")
+
+    @on(Button.Pressed, "#l0-cancel")
+    def _cancel(self, _) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#l0-ok")
+    def _ok(self, _) -> None:
+        status = self.query_one("#l0-status", Static)
+        try:
+            idx = self.query_one("#l0-pos", RadioSet).pressed_index
+        except NoMatches:
+            idx = -1
+        n = len(self._positions)
+        if 0 <= idx < n:
+            p = self._positions[idx]
+            self.dismiss({"oh5": p.get("oh5", ""), "oh3": p.get("oh3", ""),
+                          "part_type": p.get("type", ""),
+                          "label": p.get("name", "")})
+            return
+        # Custom-overhang row (the entry AFTER every grammar position).
+        oh5 = self._clean_oh(self.query_one("#l0-oh5", Input).value)
+        oh3 = self._clean_oh(self.query_one("#l0-oh3", Input).value)
+        if len(oh5) != 4 or len(oh3) != 4:
+            status.update("[red]Custom overhangs must each be exactly 4 ACGT "
+                          "bases (the Type IIS overhang width).[/red]")
+            return
+        self.dismiss({"oh5": oh5, "oh3": oh3, "part_type": "", "label": "Custom"})
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class NamePlasmidModal(_OneShotDismissScreen, ModalScreen):
     """Prompt the user to name a freshly-assembled plasmid before
     it lands in the library.
@@ -7848,9 +7965,16 @@ class PartEditModal(_OneShotDismissScreen, ModalScreen):
         )
         if seq_or_oh_changed:
             if clean_seq:
+                # Preserve any two-tier Golden-Braid nesting stored on the part
+                # (external UPD entry overhangs wrapping the category pair) so an
+                # edit to the body/overhangs doesn't silently collapse the primed
+                # amplicon back to a one-tier layout that won't clone.
+                _e5 = str(self._part.get("entry_oh5") or "")
+                _e3 = str(self._part.get("entry_oh3") or "")
+                _entry_overhangs = (_e5, _e3) if _e5 and _e3 else None
                 out["primed_seq"] = _simulate_primed_amplicon(
                     clean_seq, clean_oh5, clean_oh3, grammar=self._grammar,
-                    part_type=clean_ptype,
+                    part_type=clean_ptype, entry_overhangs=_entry_overhangs,
                 )
                 out["cloned_seq"] = _simulate_cloned_plasmid(
                     clean_seq, clean_oh5, clean_oh3, clean_ptype,

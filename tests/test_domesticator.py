@@ -10972,3 +10972,307 @@ class TestAssembleIntoEntryVectorEndpoint:
             "source_level": 0, "role": "Alpha1", "name": "x",
             "collection": "NoSuchColl"})
         assert isinstance(r, tuple) and r[1] == 404, r
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Two-tier Golden-Braid nesting (external UPD entry overhangs wrap the category
+# overhangs) — the FFE 1 ENTRY UPD / pUPD2 architecture. Regression for the
+# 2026-07-13 fix: a domestication fragment for a two-tier UPD vector must be cut
+# by Esp3I to the vector's EXTERNAL overhangs (e.g. CTCG/TGAG), NOT the grammar's
+# category overhangs (AATG/GCTT) — else it can't clone into the acceptor.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _make_l0_upd_vector(name: str,
+                        ext_oh5: str = "CTCG", ext_oh3: str = "TGAG",
+                        cat_oh5: str = "AATG", cat_oh3: str = "GCTT") -> dict:
+    """A two-tier Golden-Braid UPD (L0 domestication) vector: OUTER Esp3I sites
+    expose the EXTERNAL entry overhangs (`ext_oh5`/`ext_oh3` — what a fragment
+    must present to drop in), with INNER BsaI sites that later release the
+    domesticated part on its category overhangs (`cat_oh5`/`cat_oh3`). Mirrors
+    the FFE UPD / pUPD2 nested-enzyme architecture (cf. `_make_l1_alpha_vector`,
+    which nests the same way one level up)."""
+    from Bio.Seq import Seq
+    from Bio.SeqRecord import SeqRecord
+    esp_left, esp_right = "CGTCTCA", sc._rc("CGTCTCA")   # Esp3I, inward (outer)
+    bsa_left, bsa_right = "GGTCTCA", sc._rc("GGTCTCA")   # BsaI,  inward (inner)
+    dropout  = "ACGTAGCT" * 10
+    backbone = "GGGGTTTTAAAA" * 30
+    seq = (backbone +
+           esp_left + ext_oh5 +
+           bsa_left + cat_oh5 + dropout + cat_oh3 + bsa_right +
+           ext_oh3 + esp_right +
+           "TTTGGG" * 30)
+    rec = SeqRecord(Seq(seq), id=name, name=name)
+    rec.annotations["molecule_type"] = "DNA"
+    rec.annotations["topology"] = "circular"
+    return {"name": name, "gb_text": sc._record_to_gb_text(rec)}
+
+
+@pytest.fixture
+def upd_l0_ev():
+    """Configure a two-tier UPD L0 acceptor (CTCG/TGAG external) for gb_l0;
+    clear afterwards. The suite's data dir is sandboxed by conftest."""
+    sc._set_entry_vector("gb_l0", _make_l0_upd_vector("UPD_test"))
+    try:
+        yield
+    finally:
+        sc._set_entry_vector("gb_l0", None)
+
+
+class TestTwoTierNesting:
+    _PREFIX = len(sc._GB_PAD + sc._GB_L0_ENZYME_SITE + sc._GB_SPACER)
+
+    # ── resolver ────────────────────────────────────────────────────────────
+    def test_resolver_reads_external_overhangs(self, upd_l0_ev):
+        got = sc._entry_vector_acceptor_overhangs("gb_l0", "", "Esp3I")
+        assert got == ("CTCG", "TGAG"), got
+
+    def test_resolver_none_when_unconfigured(self):
+        sc._set_entry_vector("gb_l0", None)
+        assert sc._entry_vector_acceptor_overhangs("gb_l0", "", "Esp3I") is None
+
+    def test_resolver_none_without_enzyme(self, upd_l0_ev):
+        assert sc._entry_vector_acceptor_overhangs("gb_l0", "", "") is None
+
+    # ── designer nesting ──────────────────────────────────────────────────────
+    def test_design_nests_external_overhang_fwd(self, random_template):
+        r = sc._design_gb_primers(random_template, 100, 600, "CDS",
+                                  entry_overhangs=("CTCG", "TGAG"))
+        # forward tail:  pad+site+spacer | CTCG (external) | AATG (category)
+        assert r["fwd_full"][self._PREFIX:self._PREFIX + 8] == "CTCG" + "AATG"
+        assert r["oh5"] == "AATG" and r["oh3"] == "GCTT"        # identity
+        assert r["entry_oh5"] == "CTCG" and r["entry_oh3"] == "TGAG"  # cut
+
+    def test_design_nests_external_overhang_rev(self, random_template):
+        r = sc._design_gb_primers(random_template, 100, 600, "CDS",
+                                  entry_overhangs=("CTCG", "TGAG"))
+        # reverse tail:  pad+site+spacer | rc(TGAG)=CTCA | rc(GCTT)=AAGC
+        assert r["rev_full"][self._PREFIX:self._PREFIX + 8] == \
+            sc._rc("TGAG") + sc._rc("GCTT")
+
+    def test_nested_amplicon_cuts_to_external_overhangs(self, random_template):
+        """The saved fragment's Esp3I cut must expose the EXTERNAL entry pair —
+        this is what actually ligates into the UPD acceptor."""
+        r = sc._design_gb_primers(random_template, 100, 600, "CDS",
+                                  entry_overhangs=("CTCG", "TGAG"))
+        amp = sc._simulate_primed_amplicon(
+            r["insert_seq"], r["oh5"], r["oh3"],
+            part_type="CDS", entry_overhangs=("CTCG", "TGAG"))
+        frags = sc._digest_with_enzymes(amp, ["Esp3I"], circular=False)
+        insert = [f for f in frags
+                  if f["left"]["kind"] != "linear"
+                  and f["right"]["kind"] != "linear"]
+        assert len(insert) == 1
+        assert insert[0]["left"]["overhang_seq"] == "CTCG"
+        assert insert[0]["right"]["overhang_seq"] == "TGAG"
+
+    # ── one-tier regression (must be byte-identical to the pre-fix output) ─────
+    def test_one_tier_none_unchanged(self, random_template):
+        r = sc._design_gb_primers(random_template, 100, 600, "CDS",
+                                  entry_overhangs=None)
+        # no nesting: overhang right after the tail prefix is the category AATG
+        assert r["fwd_full"][self._PREFIX:self._PREFIX + 4] == "AATG"
+        assert r["entry_oh5"] == "AATG" and r["entry_oh3"] == "GCTT"
+
+    def test_one_tier_equal_pair_is_noop(self, random_template):
+        """entry_overhangs equal to the category pair ⇒ NO nesting (identical
+        to entry_overhangs=None), so a one-tier pUPD2 is never double-wrapped."""
+        base = sc._design_gb_primers(random_template, 100, 600, "CDS",
+                                     entry_overhangs=None)
+        same = sc._design_gb_primers(random_template, 100, 600, "CDS",
+                                     entry_overhangs=("AATG", "GCTT"))
+        assert base["fwd_full"] == same["fwd_full"]
+        assert base["rev_full"] == same["rev_full"]
+        a1 = sc._simulate_primed_amplicon(base["insert_seq"], "AATG", "GCTT",
+                                          part_type="CDS")
+        a2 = sc._simulate_primed_amplicon(base["insert_seq"], "AATG", "GCTT",
+                                          part_type="CDS",
+                                          entry_overhangs=("AATG", "GCTT"))
+        assert a1 == a2
+
+    # ── agent endpoint auto-resolves + nests from the configured vector ───────
+    def test_agent_endpoint_auto_nests(self, random_template, upd_l0_ev):
+        r = sc._h_design_gb_part(None, {
+            "template": random_template, "start": 100, "end": 600,
+            "part_type": "CDS", "grammar": "gb_l0",
+            "check_entry_vector": True})
+        assert isinstance(r, dict) and r.get("ok"), r
+        res = r["result"]
+        assert res["entry_oh5"] == "CTCG" and res["entry_oh3"] == "TGAG"
+        # the advisory check now reports the nested part AS compatible
+        chk = res.get("entry_vector_check") or {}
+        assert chk.get("compatible") is True, chk
+
+    def test_agent_endpoint_no_vector_stays_one_tier(self, random_template):
+        sc._set_entry_vector("gb_l0", None)
+        r = sc._h_design_gb_part(None, {
+            "template": random_template, "start": 100, "end": 600,
+            "part_type": "CDS", "grammar": "gb_l0"})
+        assert isinstance(r, dict) and r.get("ok"), r
+        res = r["result"]
+        assert res["entry_oh5"] == "AATG" and res["entry_oh3"] == "GCTT"
+
+
+class TestSynthesisL0Fragment:
+    """`_build_synthesis_l0_fragment` + the `design-synthesis-fragment` agent
+    endpoint (2026-07-13): wrap a sequence in nested overhangs so the directly-
+    SYNTHESISED fragment clones into a UPD entry vector as a proper L0 part."""
+
+    CDS = "ATG" + "GAACTGAAAGCAGGT" * 8 + "TAA"   # clean CDS, no Esp3I/BsaI
+
+    # ── shared builder ────────────────────────────────────────────────────────
+    def test_build_nests_external_overhangs(self):
+        r = sc._build_synthesis_l0_fragment(
+            self.CDS, "AATG", "GCTT", part_type="CDS",
+            entry_overhangs=("CTCG", "TGAG"))
+        assert r["nested"] is True
+        assert (r["entry_oh5"], r["entry_oh3"]) == ("CTCG", "TGAG")
+        assert (r["oh5"], r["oh3"]) == ("AATG", "GCTT")
+        frags = sc._digest_with_enzymes(r["fragment"], ["Esp3I"], circular=False)
+        ins = [f for f in frags if f["left"]["kind"] != "linear"
+               and f["right"]["kind"] != "linear"]
+        assert len(ins) == 1
+        assert ins[0]["left"]["overhang_seq"] == "CTCG"
+        assert ins[0]["right"]["overhang_seq"] == "TGAG"
+
+    def test_build_one_tier_without_entry_overhangs(self):
+        r = sc._build_synthesis_l0_fragment(self.CDS, "AATG", "GCTT",
+                                            part_type="CDS")
+        assert r["nested"] is False
+        assert (r["entry_oh5"], r["entry_oh3"]) == ("AATG", "GCTT")
+        frags = sc._digest_with_enzymes(r["fragment"], ["Esp3I"], circular=False)
+        ins = [f for f in frags if f["left"]["kind"] != "linear"
+               and f["right"]["kind"] != "linear"]
+        assert ins[0]["left"]["overhang_seq"] == "AATG"
+
+    def test_build_flags_internal_forbidden_site(self):
+        dirty = "ATG" + "GGTCTC" + "GAACTGAAAGCA" * 4 + "TAA"   # embedded BsaI
+        r = sc._build_synthesis_l0_fragment(dirty, "AATG", "GCTT",
+                                            part_type="CDS")
+        assert any(h["enzyme"] == "BsaI" for h in r["internal_sites"]), \
+            r["internal_sites"]
+
+    # ── agent endpoint ───────────────────────────────────────────────────────
+    def test_agent_part_type_one_tier(self):
+        sc._set_entry_vector("gb_l0", None)
+        r = sc._h_design_synthesis_fragment(None, {
+            "sequence": self.CDS, "part_type": "CDS", "grammar": "gb_l0"})
+        assert isinstance(r, dict) and r["ok"], r
+        res = r["result"]
+        assert (res["oh5"], res["oh3"]) == ("AATG", "GCTT")
+        assert res["nested"] is False
+        assert res["fragment"].startswith("GCGCCGTCTCAAATG")
+
+    def test_agent_auto_nests_from_vector(self, upd_l0_ev):
+        r = sc._h_design_synthesis_fragment(None, {
+            "sequence": self.CDS, "part_type": "CDS", "grammar": "gb_l0"})
+        assert isinstance(r, dict) and r["ok"], r
+        res = r["result"]
+        assert res["nested"] is True
+        assert (res["entry_oh5"], res["entry_oh3"]) == ("CTCG", "TGAG")
+        assert res["fragment"].startswith("GCGCCGTCTCACTCGAATG")
+        assert res["entry_vector"] == "UPD_test"
+
+    def test_agent_custom_overhangs(self):
+        sc._set_entry_vector("gb_l0", None)
+        r = sc._h_design_synthesis_fragment(None, {
+            "sequence": self.CDS, "oh5": "TTAA", "oh3": "GGCC",
+            "grammar": "gb_l0"})
+        assert isinstance(r, dict) and r["ok"], r
+        assert (r["result"]["oh5"], r["result"]["oh3"]) == ("TTAA", "GGCC")
+
+    def test_agent_bad_custom_overhang_rejected(self):
+        r = sc._h_design_synthesis_fragment(None, {
+            "sequence": self.CDS, "oh5": "AT", "oh3": "GCTT"})
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_agent_requires_position_or_overhangs(self):
+        r = sc._h_design_synthesis_fragment(None, {"sequence": self.CDS})
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_agent_unknown_part_type(self):
+        r = sc._h_design_synthesis_fragment(None, {
+            "sequence": self.CDS, "part_type": "Nonsense"})
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_agent_empty_sequence(self):
+        r = sc._h_design_synthesis_fragment(None, {"part_type": "CDS"})
+        assert isinstance(r, tuple) and r[1] == 400
+
+
+class TestNestingHardening:
+    """Edge cases + defensive hardening for two-tier nesting and the
+    design-synthesis-fragment endpoint (harden pass 2026-07-13)."""
+
+    CDS = "ATG" + "GAACTGAAAGCAGGT" * 8 + "TAA"
+
+    # ── resolver robustness (never raises; bails to one-tier) ────────────────
+    def test_resolver_none_for_unparseable_vector(self):
+        sc._set_entry_vector("gb_l0", {"name": "Junk",
+                                       "gb_text": "not a genbank file at all"})
+        try:
+            assert sc._entry_vector_acceptor_overhangs("gb_l0", "", "Esp3I") is None
+        finally:
+            sc._set_entry_vector("gb_l0", None)
+
+    def test_resolver_none_for_unknown_enzyme(self, upd_l0_ev):
+        assert sc._entry_vector_acceptor_overhangs("gb_l0", "", "NotAnEnzyme") is None
+
+    def test_resolver_none_for_extra_site_vector(self):
+        # A THIRD Esp3I site => no clean 2-fragment acceptor => one-tier fallback
+        # (same guard as _agent_entry_vector_check).
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        seq = ("A" * 120 + "CGTCTCA" + "CTCG" + "T" * 120
+               + "CGTCTCA" + "GGGG" + "C" * 120 + "CGTCTCA" + "AAAA" + "G" * 120)
+        rec = SeqRecord(Seq(seq), id="X3", name="X3",
+                        annotations={"molecule_type": "DNA", "topology": "circular"})
+        sc._set_entry_vector("gb_l0", {"name": "X3",
+                                       "gb_text": sc._record_to_gb_text(rec)})
+        try:
+            assert sc._entry_vector_acceptor_overhangs("gb_l0", "", "Esp3I") is None
+        finally:
+            sc._set_entry_vector("gb_l0", None)
+
+    # ── 4-nt guard: a wrong-width external overhang must NOT nest ─────────────
+    def test_design_malformed_entry_overhang_ignored(self, random_template):
+        r = sc._design_gb_primers(random_template, 100, 600, "CDS",
+                                  entry_overhangs=("CT", "TGAG"))   # 2 nt + 4 nt
+        assert r["entry_oh5"] == "AATG"                    # fell back to one-tier
+        assert r["fwd_full"].startswith("GCGCCGTCTCAAATG")
+
+    def test_build_malformed_entry_overhang_no_nest(self):
+        r = sc._build_synthesis_l0_fragment(self.CDS, "AATG", "GCTT",
+                                            part_type="CDS",
+                                            entry_overhangs=("CTCGG", "TGAG"))  # 5 nt
+        assert r["nested"] is False and r["entry_oh5"] == "AATG"
+
+    # ── endpoint edge cases ──────────────────────────────────────────────────
+    def test_agent_custom_overrides_part_type(self):
+        sc._set_entry_vector("gb_l0", None)
+        r = sc._h_design_synthesis_fragment(None, {
+            "sequence": self.CDS, "part_type": "CDS", "oh5": "TTAA", "oh3": "GGCC"})
+        assert isinstance(r, dict) and r["ok"], r
+        assert (r["result"]["oh5"], r["result"]["oh3"]) == ("TTAA", "GGCC")
+
+    def test_agent_only_oh5_rejected(self):
+        r = sc._h_design_synthesis_fragment(None, {"sequence": self.CDS,
+                                                   "oh5": "AATG"})
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_agent_lowercase_sequence_ok(self):
+        sc._set_entry_vector("gb_l0", None)
+        r = sc._h_design_synthesis_fragment(None, {"sequence": self.CDS.lower(),
+                                                   "part_type": "CDS"})
+        assert isinstance(r, dict) and r["ok"], r
+        assert r["result"]["fragment"].startswith("GCGCCGTCTCAAATG")
+
+    def test_agent_promoter_nests_without_atg_fusion(self, upd_l0_ev):
+        prom = "TTGACAGCTAGCTCAGTCCTAGGTACTGTGCTAGC" * 2   # no Esp3I/BsaI, no ATG rule
+        r = sc._h_design_synthesis_fragment(None, {"sequence": prom,
+                                                   "part_type": "Promoter",
+                                                   "grammar": "gb_l0"})
+        assert isinstance(r, dict) and r["ok"], r
+        res = r["result"]
+        assert res["nested"] is True
+        assert res["fragment"].startswith("GCGCCGTCTCACTCGGGAG")   # CTCG then GGAG
