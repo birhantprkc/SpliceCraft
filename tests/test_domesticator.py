@@ -11276,3 +11276,83 @@ class TestNestingHardening:
         res = r["result"]
         assert res["nested"] is True
         assert res["fragment"].startswith("GCGCCGTCTCACTCGGGAG")   # CTCG then GGAG
+
+
+class TestAuditHardening:
+    """Fixes from the 2026-07-16 adversarial audit of v1.2.21-1.2.26:
+    A1 (dropout picked by marker not size), B2 (junction forbidden-site scan),
+    B1 (IUPAC custom overhangs), B4 (empty-overhang grammar position)."""
+
+    CDS = "ATG" + "GAACTGAAAGCAGGT" * 8 + "TAA"
+
+    def _big_dropout_vector(self, ext5="CTCG", ext3="TGAG"):
+        # DROPOUT (1600 bp, no markers) LARGER than the BACKBONE (400 bp, has a
+        # rep_origin). Esp3I flanks the dropout exposing ext5/ext3.
+        from Bio.Seq import Seq
+        from Bio.SeqRecord import SeqRecord
+        from Bio.SeqFeature import SeqFeature, FeatureLocation
+        esp_l, esp_r = "CGTCTCA", sc._rc("CGTCTCA")
+        backbone = "GGTATTCCAA" * 40                 # 400 bp
+        dropout = "ACGTAGCTAG" * 160                 # 1600 bp
+        seq = backbone + esp_l + ext5 + dropout + ext3 + esp_r + "TTTGGGAAAC" * 5
+        rec = SeqRecord(Seq(seq), id="BIGDROP", name="BIGDROP",
+                        annotations={"molecule_type": "DNA",
+                                     "topology": "circular"})
+        rec.features = [SeqFeature(FeatureLocation(0, len(backbone)),
+                                   type="rep_origin",
+                                   qualifiers={"label": ["Ori"]})]
+        return {"name": "BIGDROP", "gb_text": sc._record_to_gb_text(rec)}
+
+    # ── A1: dropout identified by backbone-marker absence, not by size ────────
+    def test_resolver_picks_dropout_not_swapped_backbone(self):
+        sc._set_entry_vector("gb_l0", self._big_dropout_vector())
+        try:
+            got = sc._entry_vector_acceptor_overhangs("gb_l0", "", "Esp3I")
+        finally:
+            sc._set_entry_vector("gb_l0", None)
+        # min-size (the pre-fix bug) would return the backbone's SWAPPED
+        # ('TGAG','CTCG'); marker-aware must return the dropout's ('CTCG','TGAG').
+        assert got == ("CTCG", "TGAG"), got
+
+    def test_resolver_size_fallback_when_no_markers(self, upd_l0_ev):
+        # the marker-less test UPD (dropout < backbone) still resolves correctly
+        assert sc._entry_vector_acceptor_overhangs("gb_l0", "", "Esp3I") \
+            == ("CTCG", "TGAG")
+
+    # ── B2: forbidden site straddling a fusion junction is flagged ────────────
+    def test_junction_forbidden_site_flagged_fragment_relative(self):
+        # insert has no BsaI standalone, but AATG overhang + GTCTC start = GGTCTC
+        r = sc._build_synthesis_l0_fragment("GTCTCAAACCCTTTAAA", "AATG", "GCTT",
+                                            part_type="")
+        sites = r["internal_sites"]
+        assert any(h["enzyme"] == "BsaI" for h in sites), sites
+        frag = r["fragment"]
+        for h in sites:                       # positions are fragment-relative
+            assert frag[h["pos"]:h["pos"] + len(h["site"])] == h["site"]
+
+    def test_clean_insert_no_false_internal_site(self):
+        # the two INTENDED Esp3I tail sites must not be reported as internal
+        r = sc._build_synthesis_l0_fragment(self.CDS, "AATG", "GCTT",
+                                            part_type="CDS")
+        assert r["internal_sites"] == []
+
+    # ── B1: agent endpoint rejects IUPAC/N custom overhangs ───────────────────
+    @pytest.mark.parametrize("oh5", ["RYSW", "NNNN", "AT-G", "acgt"[:2]])
+    def test_agent_rejects_non_acgt_custom_overhang(self, oh5):
+        r = sc._h_design_synthesis_fragment(None, {"sequence": self.CDS,
+                                                   "oh5": oh5, "oh3": "AATG"})
+        assert isinstance(r, tuple) and r[1] == 400
+
+    def test_agent_accepts_valid_acgt_custom_overhang(self):
+        r = sc._h_design_synthesis_fragment(None, {"sequence": self.CDS,
+                                                   "oh5": "TTAA", "oh3": "GGCC"})
+        assert isinstance(r, dict) and r["ok"], r
+
+    # ── B4: agent endpoint rejects a grammar position with blank overhangs ────
+    def test_agent_rejects_empty_overhang_position(self, monkeypatch):
+        import splicecraft_agent as sca
+        monkeypatch.setattr(sca, "_grammar_position_by_type",
+                            lambda g, t: {"type": t, "oh5": "", "oh3": ""})
+        r = sc._h_design_synthesis_fragment(None, {"sequence": self.CDS,
+                                                   "part_type": "Blank"})
+        assert isinstance(r, tuple) and r[1] == 400

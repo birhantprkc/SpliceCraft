@@ -296,3 +296,53 @@ class TestGibsonE4RealPlasmid:
             # Seamless circular product: backbone + insert, each shared arm
             # appearing exactly once → plen + len(insert).
             assert len(r["product_seq"]) == plen + len(insert)
+
+
+class TestGibsonArmHardening:
+    """Audit fixes 2026-07-16: F4 (arm design survives non-int feature coords)
+    and F1 (a fragment consumed by its arms is reported invalid, not success)."""
+
+    async def _mk(self, app, pilot, min_oh="15", circular=False):
+        pane = await _pane(app, pilot)
+        target = "gib-topo-circular" if circular else "gib-topo-linear"
+        pane.query_one(f"#{target}", RadioButton).value = True
+        pane.query_one("#gib-min-overlap", Input).value = min_oh
+        await pilot.pause()
+        await pilot.pause()
+        return pane
+
+    @pytest.mark.asyncio
+    async def test_arm_design_survives_non_int_feature_coord(
+            self, tiny_record, isolated_library):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            pane = await self._mk(app, pilot, min_oh="15", circular=False)
+            bad = _frag("A", "ACGTACGT" * 10,
+                        [{"start": "x", "end": "y", "label": "bad"}])
+            pane._lane = [bad, _frag("B", "TTTTGGGG" * 10)]
+            armed, already, skipped = pane._design_homology_arms()   # must not raise
+            assert isinstance(armed, int)
+
+    @pytest.mark.asyncio
+    async def test_consumed_fragment_reported_invalid(
+            self, tiny_record, isolated_library, monkeypatch):
+        app = _build_app(tiny_record, isolated_library)
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            pane = await self._mk(app, pilot, min_oh="20", circular=True)
+            # 2-fragment circular: a 20-bp insert (= min_overlap) is armed on
+            # BOTH ends (leading + wrap) and fully consumed → assembly invalid.
+            pane._lane = [_frag("BB", "ACGTACGT" * 10),          # 80 bp
+                          _frag("INS", "GGGGTTTTAAAACCCCGGGG")]  # 20 bp
+            msgs: list = []
+            monkeypatch.setattr(pane.app, "notify",
+                                lambda *a, **k: msgs.append((a, k)))
+            pane._on_design_arms(None)
+            for _ in range(3):
+                await pilot.pause()
+            # the assembly is genuinely invalid …
+            r = sc._simulate_gibson_assembly(pane._lane, min_overlap=20,
+                                             circular=True)
+            assert not (r.get("success") and not r.get("errors"))
+            # … and the notify says so instead of a bare success
+            joined = " ".join(str(x) for m in msgs for x in m[0])
+            assert "still invalid" in joined, msgs

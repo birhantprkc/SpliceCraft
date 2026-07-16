@@ -7416,9 +7416,14 @@ def _h_design_synthesis_fragment(app, payload):
     # Category overhangs: explicit oh5/oh3 override a part_type lookup.
     part_type = payload.get("part_type") or ""
     if payload.get("oh5") is not None or payload.get("oh3") is not None:
+        # `_sanitize_bases` permits full IUPAC; a Type IIS sticky end must be
+        # ACGT-only (ambiguous bases won't ligate) — match the GUI modal's
+        # ACGT filter so an agent/Babs caller can't design a non-cloneable frag.
         c5, e5 = _sanitize_bases(payload.get("oh5"), max_len=8)
         c3, e3 = _sanitize_bases(payload.get("oh3"), max_len=8)
-        if e5 is not None or e3 is not None or len(c5) != 4 or len(c3) != 4:
+        _acgt = set("ACGT")
+        if (e5 is not None or e3 is not None or len(c5) != 4 or len(c3) != 4
+                or not set(c5) <= _acgt or not set(c3) <= _acgt):
             return ({"error": "custom 'oh5'/'oh3' must each be exactly "
                      "4 ACGT bases"}, 400)
         cat5, cat3 = c5, c3
@@ -7432,6 +7437,12 @@ def _h_design_synthesis_fragment(app, payload):
             return ({"error": f"part_type {part_type!r} not in grammar "
                      f"{gid!r}. Available: {avail}"}, 400)
         cat5, cat3 = pos.get("oh5", ""), pos.get("oh3", "")
+        # A position with blank overhangs (malformed custom grammar) would yield
+        # an un-cloneable "L0 part" with no fusion sites — reject like the modal
+        # (which filters positions lacking oh5/oh3).
+        if len(cat5) != 4 or len(cat3) != 4:
+            return ({"error": f"grammar position {part_type!r} has no valid "
+                     "4-nt fusion overhangs"}, 400)
     else:
         return ({"error": "supply either 'part_type' or custom "
                  "'oh5'+'oh3'"}, 400)

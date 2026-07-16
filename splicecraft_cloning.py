@@ -2309,6 +2309,60 @@ def _scrub_gb_design(seq: str, feats: "list | None" = None, enzymes=None, *,
 # Reuse primer L2 (designers + _scrub_design) + codon L2 (_codon_fix_*) + the
 # GB grammar data (dataaccess) + _atg_offset_for_part (local).
 
+# Backbone-marker detection for the dropout picker in the resolver below.
+# cloning (L3) can't import splicecraft_seqanalysis._fragment_has_backbone_marker
+# (L3→L3 cycle: seqanalysis imports cloning's _excise_fragment_pair), so a
+# compact copy of its constants lives here — keep in sync with
+# splicecraft_seqanalysis._BACKBONE_{FEATURE_TYPES,LABEL_KEYWORDS}.
+_ACCEPTOR_BACKBONE_FEATURE_TYPES = frozenset({"rep_origin", "oriT"})
+_ACCEPTOR_BACKBONE_LABEL_KEYWORDS = (
+    "ori", "rep_origin", "ampr", "kanr", "specr", "specinomycin",
+    "spectinomycin", "cmr", "chloramphenicol", "tetr", "tetracyclin",
+    "carbr", "carbenicillin", "selection", "antibiotic",
+)
+
+
+def _frag_carries_backbone_marker(frag: dict) -> bool:
+    """True iff ``frag``'s features include an origin / resistance marker — the
+    signal that identifies the vector BACKBONE (never the dropout an insert
+    replaces). Mirrors splicecraft_seqanalysis._fragment_has_backbone_marker."""
+    for f in (frag.get("features") or []):
+        if not isinstance(f, dict):
+            continue
+        if str(f.get("type") or "").lower() in _ACCEPTOR_BACKBONE_FEATURE_TYPES:
+            return True
+        label = str(f.get("label") or "").lower()
+        if label and any(kw in label
+                         for kw in _ACCEPTOR_BACKBONE_LABEL_KEYWORDS):
+            return True
+    return False
+
+
+def _acceptor_vector_features(rec) -> "list[dict]":
+    """Minimal feature dicts (type/label/start/end) from a parsed entry-vector
+    record, so the digest can tag which fragment carries a backbone marker.
+    Skips features whose coords don't resolve; wrap/compound features flatten to
+    their span (fine — only used to identify the backbone fragment)."""
+    out: list[dict] = []
+    for f in getattr(rec, "features", None) or []:
+        try:
+            loc = getattr(f, "location", None)
+            s, e = int(loc.start), int(loc.end)   # type: ignore[union-attr]
+        except Exception:
+            continue
+        if e <= s:
+            continue
+        try:
+            q = getattr(f, "qualifiers", {}) or {}
+            lbl = (q.get("label") or q.get("gene") or q.get("product")
+                   or [""])[0]
+        except Exception:
+            lbl = ""
+        out.append({"type": str(getattr(f, "type", "") or ""),
+                    "label": str(lbl or ""), "start": s, "end": e})
+    return out
+
+
 def _entry_vector_acceptor_overhangs(
     grammar_id: str, role: str = "", enzyme: str = "",
 ) -> "tuple[str, str] | None":
@@ -2343,16 +2397,26 @@ def _entry_vector_acceptor_overhangs(
     if not gb:
         return None
     try:
-        seq = str(getattr(_gb_text_to_record(gb), "seq", "") or "").upper()
+        rec = _gb_text_to_record(gb)
+        seq = str(getattr(rec, "seq", "") or "").upper()
         if not seq:
             return None
-        frags, err = _excise_fragment_pair(seq, [enzyme], circular=True)
+        frags, err = _excise_fragment_pair(
+            seq, [enzyme], circular=True,
+            features=_acceptor_vector_features(rec))
     except Exception:
         _log.exception("_entry_vector_acceptor_overhangs: EV digest failed")
         return None
     if err is not None or len(frags) != 2:
         return None
-    stuffer = min(frags, key=lambda f: len(f.get("top_seq", "")))
+    # Identify the DROPOUT (the fragment an insert replaces) by the ABSENCE of a
+    # backbone marker — NOT by size, which inverts the overhang order the moment
+    # a visible-marker / counterselection dropout outgrows the backbone (never
+    # assume the smaller frag is the payload). Fall back to smallest only when
+    # the marker signal is ambiguous (both or neither fragment annotated).
+    non_backbone = [f for f in frags if not _frag_carries_backbone_marker(f)]
+    stuffer = (non_backbone[0] if len(non_backbone) == 1
+               else min(frags, key=lambda f: len(f.get("top_seq", ""))))
     oh5 = ((stuffer.get("left") or {}).get("overhang_seq") or "").upper()
     oh3 = ((stuffer.get("right") or {}).get("overhang_seq") or "").upper()
     if len(oh5) == 4 and len(oh3) == 4:
@@ -2833,7 +2897,19 @@ def _build_synthesis_l0_fragment(
     fragment = _simulate_primed_amplicon(
         seq, cat5, cat3, grammar=g, part_type=part_type, entry_overhangs=ext)
     forbidden = g.get("forbidden_sites") or {}
-    hits = _gb_find_forbidden_hits(seq, sites=forbidden) if forbidden else []
+    # Scan the CLONED region (everything between the two intended Type IIS
+    # tails), NOT the raw insert — a forbidden site can straddle a fusion
+    # junction (e.g. the AATG overhang + a GTCTC insert start = a BsaI GGTCTC)
+    # and would silently self-cut during domestication / L1. `_tail` is the
+    # pad+site+spacer machinery on each end; positions are reported
+    # FRAGMENT-relative so the warning locates the site in the built fragment.
+    _tail = (len(g.get("pad", _GB_PAD)) + len(g.get("site", _GB_L0_ENZYME_SITE))
+             + len(g.get("spacer", _GB_SPACER)))
+    _region = (fragment[_tail:len(fragment) - _tail]
+               if len(fragment) > 2 * _tail else fragment)
+    hits = ([(n, s, p + _tail)
+             for (n, s, p) in _gb_find_forbidden_hits(_region, sites=forbidden)]
+            if forbidden else [])
     return {
         "fragment":       fragment,
         "length":         len(fragment),

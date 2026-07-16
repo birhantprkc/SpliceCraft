@@ -14,6 +14,36 @@
 
 ---
 
+## [1.2.27] — 2026-07-16
+
+### Bug fixes
+
+- **Domestication into a UPD vector whose dropout is larger than its backbone
+  no longer mis-orients the part.** The entry-vector overhang resolver used to
+  pick the dropout cassette by size, which handed back the *backbone's*
+  overhangs (swapped) whenever a vector's visible-marker / counter-selection
+  dropout outgrew its backbone — producing a reversed, non-functional L0 part
+  that still reported success. It now identifies the dropout the same way the
+  clone step does: by the absence of an origin / resistance marker.
+- **The "L0 Fragment" self-cut warning now catches forbidden sites that form
+  across a fusion junction.** A Type IIS site straddling an overhang↔insert
+  boundary (e.g. an `AATG` fusion overhang + a `GTCTC` insert start spelling a
+  BsaI `GGTCTC`) was missed because only the bare insert was scanned; the whole
+  cloned region is now checked, and the flagged position points at the built
+  fragment so you can find it. Applies to both the Synthesis button and the
+  `design-synthesis-fragment` agent endpoint.
+
+### Hardening
+
+- `design-synthesis-fragment` now rejects ambiguous (non-ACGT / `N`) custom
+  overhangs and grammar positions with blank overhangs, instead of returning an
+  un-cloneable fragment.
+- Gibson **Design overlaps** no longer claims success when a fragment is too
+  short to carry its homology arms — it flags the still-invalid assembly — and
+  it tolerates a malformed feature coordinate without crashing.
+
+---
+
 ## [1.2.26] — 2026-07-13
 
 ### Bug fixes
