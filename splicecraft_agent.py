@@ -42,7 +42,7 @@ from splicecraft_dataaccess import (_load_custom_labware, _load_protocol_collect
 from splicecraft_backup import (_list_pre_update_snapshots)
 from splicecraft_biology import (_ENZYME_CUT_RANGE, _assemble_operon, _iupac_pattern, _rbs_design, _rbs_strength, _rc, _rna_cofold, _rna_fold, _seq_len)
 from splicecraft_cloning import (_GIBSON_MAX_OVERLAP_BP, _GIBSON_MIN_OVERLAP_BP, _excise_fragment_pair, _excise_pcr_insert, _scrub_gb_design, _simulate_gibson_assembly, _simulate_golden_gate, _simulate_traditional_cloning_multi)
-from splicecraft_codon import (_CODON_GENETIC_CODE, _codon_fetch_kazusa, _codon_optimize, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
+from splicecraft_codon import (_CODON_GENETIC_CODE, _codon_cai, _codon_fetch_kazusa, _codon_gc, _codon_optimize, _codon_tables_add, _file_build_codon_table, _genome_build_codon_table)
 from splicecraft_dataaccess import (_BUILTIN_GRAMMARS, _all_grammars, _clear_entry_vectors_for_grammar, _codon_tables_get, _codon_tables_load, _codon_tables_save, _find_gel, _find_hmm_db_entry, _find_library_entry_by_id, _get_active_collection_name, _get_active_primer_collection_name, _get_entry_vector, _get_setting, _hmm_db_name_taken, _iter_collections_readonly, _iter_library_readonly, _iter_parts_bin_readonly, _load_custom_enzymes, _load_custom_grammars, _load_entry_vectors, _load_enzyme_collections, _load_experiment_projects, _load_experiments, _load_feature_colors, _load_features, _load_gels, _load_hmm_db_catalog, _load_library, _load_parts_bin, _load_primer_collections, _load_primers, _load_protein_motifs, _normalise_hmm_db_entry, _sanitize_hmm_db_id, _sanitize_hmm_db_url, _save_custom_enzymes, _save_custom_grammars, _save_enzyme_collections, _save_experiment_projects, _save_experiments, _save_feature_colors, _save_features, _save_gels, _save_hmm_db_catalog, _save_library, _save_parts_bin, _save_parts_bin_collections, _save_primer_collections, _save_primers, _save_protein_motifs, _search_collections_library, _set_active_primer_collection_name, _set_entry_vector, _set_setting, _typed_clone)
 from splicecraft_experiments import (_new_experiment_id, _normalise_experiment_entry, _sanitize_experiment_id)
 from splicecraft_fileio import (_PLASMIDSAURUS_ZIP_MAX_BYTES, _export_commercialsaas_dna, _export_embl_to_path, _list_gbk_members_in_zip, _parse_commercialsaas_history, _plasmidsaurus_zip_to_entries)
@@ -1075,6 +1075,12 @@ def _h_optimize_protein(app, payload):
         "dna":          dna,
         "length":       len(dna),
         "n_codons":     len(dna) // 3,
+        # Display/report-only metrics, matching the Synthesis + Mutato toasts.
+        # Scored against the SAME genetic code the sequence was optimised under
+        # so a reassigned-codon host isn't mis-scored. Additive (V1_GATE-safe).
+        "cai":          round(_codon_cai(dna, entry["raw"],
+                                         transl_table=transl_table), 4),
+        "gc":           round(_codon_gc(dna), 2),
     }
 
 

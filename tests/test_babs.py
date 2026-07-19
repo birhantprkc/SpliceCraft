@@ -412,6 +412,34 @@ class TestBabsUI:
             assert "secret" not in answer and "world" in answer
             assert scr._transcript[-1][0] == "babs"
 
+    async def test_export_includes_agentic_tool_steps(self, monkeypatch, tmp_path):
+        import pathlib
+        monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
+        monkeypatch.setattr(pathlib.Path, "home",
+                            staticmethod(lambda: tmp_path))
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            scr._transcript.append(("you", "list the features"))
+            scr._mount_tool_bubble(
+                {"function": {"name": "splicecraft_call",
+                              "arguments": {"endpoint": "list-features"}}},
+                {"ok": True, "features": []})
+            scr._transcript.append(("babs", "Here are the features."))
+            # The ⚙ tool step is captured in the transcript (for export +
+            # rehydrate), NOT pushed into the model's _history.
+            assert any(role == "tool" and "list-features" in text
+                       for role, text in scr._transcript)
+            scr.action_export_chat()
+            await pilot.pause()
+            exported = list(tmp_path.glob("babs-chat-*.md"))
+            assert exported, "no export file written"
+            body = exported[0].read_text(encoding="utf-8")
+            assert "list-features" in body and "> ⚙" in body
+
     async def test_corpus_toggle_gates_on_corpus(self, monkeypatch):
         """The Corpus toggle is disabled (and forced off) without a corpus, and flips on when one
         exists — it can't promise grounding it can't deliver."""

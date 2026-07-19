@@ -1972,6 +1972,14 @@ class TestOptimizeProteinEndpoint:
         _body, code = sc._h_optimize_protein(None, {})
         assert code == 400
 
+    def test_response_carries_cai_and_gc(self):
+        # CAI + GC report metrics, added to match the Synthesis / Mutato UI
+        # toasts. Additive (V1_GATE-safe) and report-only — computed after the
+        # sequence is final, so they can't perturb it.
+        r = sc._h_optimize_protein(None, {"protein": "MGKAAA"})
+        assert 0.0 < r["cai"] <= 1.0
+        assert 0.0 <= r["gc"] <= 100.0
+
 
 class TestNcbiTaxonPickerModalStyle:
     """The NCBI taxon picker is a centered modal dialog (like the species

@@ -14,6 +14,42 @@
 
 ---
 
+## [1.2.29] — 2026-07-19
+
+### New features
+
+- **"Add to library" now asks which collection.** The canvas add-to-library
+  shortcut prompts for the destination collection, defaulting to the active one
+  so the fast path stays a quick Enter — but now you can file a plasmid straight
+  into any collection without switching to it first, and rename it in the same
+  step.
+- **The Sequencing screen stays open per sample.** After aligning one
+  Plasmidsaurus sample it no longer closes; it confirms the alignment and waits
+  for you to pick the next sample (matching the bulk-align and Sanger flows), so
+  you can work through a whole run without reopening and re-selecting the zip
+  each time. Esc / Close still exits when you're done.
+- **Babs chat export includes the tool steps.** Exporting an Agent-mode
+  conversation now writes the `⚙` tool calls Babs actually ran into the
+  transcript (and restores them when you reopen the Babs tab), instead of
+  dropping them so an agentic session read as plain chat.
+
+### Hardening
+
+- The `optimize-protein` scripting endpoint now returns the **CAI and GC%** of
+  the optimized sequence — the same report-only metrics the Synthesis and Mutato
+  panels already display. Additive; it never affects the emitted sequence.
+- Scripting-API responses now all carry a uniform **`ok: true`** success flag —
+  the read endpoints that previously omitted it are consistent with the rest.
+  Purely additive: every existing result key and field is unchanged.
+- **Babs's ❤ context meter is now accurate.** It reserved only the base persona,
+  so it over-reported how much context was left whenever a plasmid was open, you
+  had saved memory notes, or Agent mode was on; it now reckons with the same full
+  prompt the model actually receives.
+- A long unbroken token (a URL, a spaceless sequence) in a Babs chat bubble now
+  wraps instead of running off the edge.
+
+---
+
 ## [1.2.28] — 2026-07-18
 
 ### Bug fixes

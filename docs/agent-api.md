@@ -449,9 +449,11 @@ it lists every registered endpoint, including the ~49 app-coupled
 handlers that live in `splicecraft.py` rather than `splicecraft_agent.py`
 — don't rely on grepping a single file for `@_agent_endpoint`.
 
-Every **authenticated** success response also carries a predictable **`data`**
-field, so you don't have to know each endpoint's ad-hoc key (`seq` / `library`
-/ `sites` / `matches` / …): `data` is the result with the envelope/metadata
+Every **authenticated** success response also carries a uniform **`ok: true`**
+flag and a predictable **`data`** field. `ok: true` is one consistent success
+signal across every endpoint (an explicit `ok` a handler already sets is never
+overwritten). `data` saves you from knowing each endpoint's ad-hoc key (`seq` /
+`library` / `sites` / `matches` / …): it's the result with the envelope/metadata
 stripped, unwrapped to the bare value when there's a single content key (a
 scalar or list lands directly under `data`). The original keys stay too, so
 it's a superset — read whichever you prefer.

@@ -1685,6 +1685,22 @@ class TestDataEnvelope:
     def test_empty_content_no_data(self):
         assert "data" not in sc._agent_data_envelope({"ok": True}, 200)
 
+    def test_ok_flag_added_when_missing(self):
+        # F1/F2: a 2xx success payload without `ok` gets a uniform ok:true, and
+        # the data-unwrap shape is unchanged (`ok` is an envelope meta key).
+        r = sc._agent_data_envelope({"gels": [1, 2]}, 200)
+        assert r["ok"] is True
+        assert r["gels"] == [1, 2]        # container key untouched
+        assert r["data"] == [1, 2]        # still unwrapped to the bare list
+
+    def test_ok_flag_not_clobbered(self):
+        # An explicit `ok` is never overwritten.
+        assert sc._agent_data_envelope({"ok": False, "x": 1}, 200)["ok"] is False
+
+    def test_ok_flag_not_added_to_errors_or_non2xx(self):
+        assert "ok" not in sc._agent_data_envelope({"error": "x"}, 400)
+        assert "ok" not in sc._agent_data_envelope({"matches": []}, 500)
+
 
 class TestRestartEndpoint:
     """SC-A: `restart` re-execs a HEADLESS daemon to pick up an update;

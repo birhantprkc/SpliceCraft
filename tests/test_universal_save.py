@@ -275,3 +275,33 @@ class TestAddEntryCollectionRouting:
                         if c.get("name") == "Side Bin")
             assert sum(1 for e in side["plasmids"]
                        if e.get("id") == "frag_rt") == 1
+
+
+class TestAddToLibraryDestinationPrompt:
+    """E10: canvas Alt+K (`action_add_to_library`) prompts for a destination
+    collection (defaulting to active) and routes the save there."""
+
+    async def test_prompts_then_routes_to_picked_collection(
+            self, tiny_record, isolated_library):
+        sc._save_collections([{"name": "Default", "plasmids": []},
+                              {"name": "Targets", "plasmids": []}])
+        sc._set_active_collection_name("Default")
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            rec = app._current_record
+            assert rec is not None
+            rec._tui_display_name = "MyPlasmid"
+            app.action_add_to_library()
+            await pilot.pause()
+            modal = app.screen
+            assert isinstance(modal, sc.NamePlasmidModal)
+            assert modal._collection_mode is True   # destination picker on
+            # Pick the NON-active collection; the callback routes the save.
+            modal.dismiss({"name": "MyPlasmid", "collection": "Targets"})
+            await pilot.pause(); await pilot.pause()
+            targets = next(c for c in sc._load_collections()
+                           if c.get("name") == "Targets")
+            assert any(e.get("name") == "MyPlasmid"
+                       for e in targets["plasmids"])
