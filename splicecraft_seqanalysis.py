@@ -154,7 +154,12 @@ _BACKBONE_LABEL_KEYWORDS: tuple[str, ...] = (
     "ampr", "kanr", "specr", "specinomycin", "spectinomycin",
     "cmr", "chloramphenicol", "tetr", "tetracyclin",
     "carbr", "carbenicillin",
-    "selection", "antibiotic",
+    # NB: bare "selection"/"antibiotic" deliberately excluded — a ccdB/sacB
+    # counter-selection DROPOUT is often labeled "...selection cassette", and
+    # matching it would tag the dropout as backbone, collapsing the marker-
+    # absence dropout test back to the size heuristic it was meant to replace.
+    # Specific resistance genes + origins only. Keep in sync with cloning's
+    # `_ACCEPTOR_BACKBONE_LABEL_KEYWORDS`.
 )
 
 
@@ -183,6 +188,34 @@ def _fragment_has_backbone_marker(frag: dict) -> bool:
             if kw in label:
                 return True
     return False
+
+
+def _ev_frag_input_features(record) -> "list[dict]":
+    """Marshal a parsed entry-vector record's features into the
+    ``[{start, end, type, label}]`` shape `_excise_fragment_pair` splits onto
+    its fragments, so `_fragment_has_backbone_marker` can tell the backbone half
+    from the dropout by ORIGIN/RESISTANCE markers instead of by size (which
+    inverts when a vector's dropout cassette outgrows its backbone)."""
+    feats: "list[dict]" = []
+    for f in (getattr(record, "features", None) or []):
+        try:
+            start = int(f.location.start)
+            end = int(f.location.end)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        q = getattr(f, "qualifiers", None) or {}
+        label = ""
+        for k in ("label", "gene", "product", "note"):
+            v = q.get(k)
+            if v:
+                label = str(v[0] if isinstance(v, (list, tuple)) else v)
+                break
+        feats.append({
+            "start": start, "end": end,
+            "type": str(getattr(f, "type", "") or ""),
+            "label": label,
+        })
+    return feats
 
 
 _VECTOR_MATCH_CACHE_MAX = 64
@@ -233,11 +266,19 @@ def _vector_half_top_seq(ev_gb: str, enzyme: str) -> "str | None":
             ev_seq = str(ev_rec.seq).upper()
             ev_frags, ev_err = _excise_fragment_pair(
                 ev_seq, [enzyme], circular=True,
+                features=_ev_frag_input_features(ev_rec),
             )
             if ev_err is None and len(ev_frags) == 2:
-                ev_vector_half = max(
-                    ev_frags,
-                    key=lambda f: len(f.get("top_seq") or ""),
+                # The VECTOR half carries the backbone marker (ori/resistance);
+                # prefer it by marker, not size — size inverts when a vector's
+                # dropout outgrows its backbone. Fall back to the larger fragment
+                # when the marker signal is absent/ambiguous.
+                marked = [f for f in ev_frags
+                          if _fragment_has_backbone_marker(f)]
+                ev_vector_half = (
+                    marked[0] if len(marked) == 1
+                    else max(ev_frags,
+                             key=lambda f: len(f.get("top_seq") or ""))
                 )
                 result = (
                     ev_vector_half.get("top_seq") or ""
@@ -566,6 +607,7 @@ def _grammar_acceptor_tu_pairs(
                 continue
             frags, err = _excise_fragment_pair(
                 ev_seq, [enzyme], circular=True,
+                features=_ev_frag_input_features(record),
             )
         except Exception:
             _log.exception(
@@ -580,11 +622,15 @@ def _grammar_acceptor_tu_pairs(
                 ev_name, role, enzyme, len(frags), err,
             )
             continue
-        # Stuffer = the smaller fragment (the placeholder lacZα or
-        # ccdB cassette that gets replaced by the assembled TU). Its
-        # 5' / 3' overhangs ARE the TU-boundary overhangs for this
-        # acceptor.
-        insert = min(frags, key=lambda f: len(f.get("top_seq", "")))
+        # Stuffer/dropout = the placeholder (lacZα / ccdB) that the assembled
+        # TU replaces; its 5'/3' overhangs ARE this acceptor's TU-boundary
+        # overhangs. Identify it by marker-ABSENCE (not "smaller") so an
+        # acceptor whose dropout outgrew its backbone still yields the right
+        # overhangs; fall back to the smaller fragment when marker-ambiguous.
+        non_marker = [f for f in frags
+                      if not _fragment_has_backbone_marker(f)]
+        insert = (non_marker[0] if len(non_marker) == 1
+                  else min(frags, key=lambda f: len(f.get("top_seq", ""))))
         oh5 = (insert.get("left")  or {}).get(
             "overhang_seq", "",
         ).upper()

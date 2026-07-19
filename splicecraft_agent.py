@@ -54,7 +54,7 @@ from splicecraft_persistence import (_safe_file_size_check, _safe_load_json)
 from splicecraft_primer import (_mut_design_inner, _mut_design_outer, _scrub_design, _scrub_qc_primers, _scrub_qc_verify)
 from splicecraft_record import (_gb_text_to_record, _normalize_primer_seq)
 from splicecraft_search import (_ONLINE_LOOKUP_MAX_HITS, _ONLINE_LOOKUP_QUERY_MAX, _PLASMIDSAURUS_RESULT_KINDS, _delete_hmm_db_files, _europepmc_search, _fpbase_search, _hmm_db_acquire_download_slot, _hmm_db_perform_download, _hmm_db_pressed, _hmm_db_release_download_slot, _hmmer_web_hmmscan, _ncbi_blast_db_for, _ncbi_blast_online, _ncbi_db_search, _online_clean_query, _online_max_query_len, _patent_search, _plasmidsaurus_credentials, _plasmidsaurus_fetch_item_zip, _plasmidsaurus_list_items, _plasmidsaurus_oauth_token, _read_url, _sanitize_plasmidsaurus_item_code, _uniprot_search, _web_search, _wikipedia_search)
-from splicecraft_seqanalysis import (_classify_part_from_plasmid, _find_orfs, _synthesis_lint)
+from splicecraft_seqanalysis import (_classify_part_from_plasmid, _ev_frag_input_features, _find_orfs, _fragment_has_backbone_marker, _synthesis_lint)
 from splicecraft_util import (_PLASMID_STATUS_VALUES, _check_export_extension, _feat_bounds, _feat_label, _normalize_collection_name, _notify_save_failure, _primer_tm_safe, _safe_color_for_picker, _sanitize_feat_type, _sanitize_gel_id, _sanitize_label, _sanitize_note, _sanitize_path, _scrub_path)
 from splicecraft_widgets import (_PLASMID_STATUS_COLORS)
 from splicecraft_backup import (_AGENT_BACKUP_LABELS, _PRE_UPDATE_NAME_RE, _export_migrate_archive, _list_recoverable_backups, _resolve_backup_label, _restore_from_backup, _restore_pre_update_snapshot)
@@ -7183,9 +7183,11 @@ def _agent_entry_vector_check(grammar, gid, role, part):
                 "note": f"grammar {gid!r} declares no Type IIS enzyme to "
                         "digest the entry vector with"}
     try:
-        ev_seq = str(getattr(_gb_text_to_record(ev.get("gb_text") or ""),
-                             "seq", "") or "").upper()
-        frags, err = (_excise_fragment_pair(ev_seq, [enzyme], circular=True)
+        ev_rec = _gb_text_to_record(ev.get("gb_text") or "")
+        ev_seq = str(getattr(ev_rec, "seq", "") or "").upper()
+        frags, err = (_excise_fragment_pair(
+                          ev_seq, [enzyme], circular=True,
+                          features=_ev_frag_input_features(ev_rec))
                       if ev_seq else ([], {"error": "no sequence"}))
     except Exception as exc:
         _log.exception("agent design-gb-part: entry-vector digest failed")
@@ -7201,7 +7203,14 @@ def _agent_entry_vector_check(grammar, gid, role, part):
     # The stuffer (smaller fragment) carries the acceptor's boundary overhangs;
     # report them either way. Compatibility checks BOTH fragments (fwd + RC),
     # matching how the real clone locates the dropout regardless of size.
-    stuffer = min(frags, key=lambda f: len(f.get("top_seq", "")))
+    # Report the DROPOUT's overhangs (its boundary == the acceptor's): identify
+    # it by marker-ABSENCE, not size — size mislabels an acceptor whose dropout
+    # outgrew its backbone. Fall back to the smaller fragment when the marker
+    # signal is ambiguous. If a fragment actually MATCHES the part below, report
+    # ITS overhangs so `compatible` and the shown overhangs never disagree.
+    non_marker = [f for f in frags if not _fragment_has_backbone_marker(f)]
+    stuffer = (non_marker[0] if len(non_marker) == 1
+               else min(frags, key=lambda f: len(f.get("top_seq", ""))))
     acc5 = ((stuffer.get("left") or {}).get("overhang_seq") or "").upper()
     acc3 = ((stuffer.get("right") or {}).get("overhang_seq") or "").upper()
     orientation = None
@@ -7211,9 +7220,9 @@ def _agent_entry_vector_check(grammar, gid, role, part):
         if not (oh5 and oh3 and fl and fr):
             continue
         if oh5 == fl and oh3 == fr:
-            orientation = "forward"; break
+            orientation = "forward"; acc5, acc3 = fl, fr; break
         if oh5 == _rc(fr) and oh3 == _rc(fl):
-            orientation = "reverse"; break
+            orientation = "reverse"; acc5, acc3 = _rc(fr), _rc(fl); break
     compatible = orientation is not None
     return {"configured": True, "checkable": True, "compatible": compatible,
             "orientation": orientation, "vector_name": ev_name, "role": role,

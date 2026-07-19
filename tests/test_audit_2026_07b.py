@@ -59,6 +59,31 @@ def test_reconcile_is_noop_for_non_mirror_target():
     assert [p["name"] for p in sc._find_collection("C1")["plasmids"]] == ["P"]
 
 
+def test_restore_experiments_reconciles_into_active_project():
+    """2026-07-18 extension of DATA-1: `experiments.json` is a MIRROR of the
+    active project's `experiments` list in `experiment_projects.json`. A raw
+    restore that overwrites only the mirror must be written THROUGH into the
+    active project, else the next project-open reverts it (the recovery
+    silently undoes). The reconcile previously covered library / primers /
+    parts_bin but not experiments."""
+    sc._save_experiment_projects([{
+        "name": "Proj1",
+        "experiments": [{"id": "e_old", "title": "old"}],
+    }])
+    sc._set_active_project_name("Proj1")
+    # Raw restore of the experiments MIRROR file (cache busted); the owning
+    # project is NOT touched — exactly what `_restore_from_backup` does.
+    sc._safe_save_json(sc._state._EXPERIMENTS_FILE,
+                       [{"id": "e_restored", "title": "restored"}],
+                       "Experiments")
+    sc._state._experiments_cache = None
+    # Pre-reconcile the project still holds the OLD entry → would revert.
+    assert [e["id"] for e in sc._find_project("Proj1")["experiments"]] == ["e_old"]
+    # Reconcile writes the restored experiments THROUGH into the project.
+    sc._reconcile_mirror_after_restore(sc._state._EXPERIMENTS_FILE)
+    assert [e["id"] for e in sc._find_project("Proj1")["experiments"]] == ["e_restored"]
+
+
 # ── BIO-1: empty / whitespace enzyme recognition site ───────────────────────
 def test_empty_recognition_site_is_refused():
     for bad in ("", "   ", "\t"):

@@ -2318,7 +2318,10 @@ _ACCEPTOR_BACKBONE_FEATURE_TYPES = frozenset({"rep_origin", "oriT"})
 _ACCEPTOR_BACKBONE_LABEL_KEYWORDS = (
     "ori", "rep_origin", "ampr", "kanr", "specr", "specinomycin",
     "spectinomycin", "cmr", "chloramphenicol", "tetr", "tetracyclin",
-    "carbr", "carbenicillin", "selection", "antibiotic",
+    "carbr", "carbenicillin",
+    # bare "selection"/"antibiotic" excluded on purpose — see the rationale on
+    # splicecraft_seqanalysis._BACKBONE_LABEL_KEYWORDS (a counter-selection
+    # dropout labeled "...selection..." must NOT read as backbone).
 )
 
 
@@ -2735,6 +2738,41 @@ def _design_gb_primers(
                          f"Pick a different region or redesign.",
                 "mutations": [],
             }
+
+    # Junction-inclusive self-cut check: the bare-insert scan above cannot see a
+    # Type IIS site that FORMS across a fusion boundary — an insert ending
+    # ...GGTCT plus a CGCT 3' overhang spells GGTCTC (BsaI); an AATG overhang
+    # plus a GTCTC insert start spells GGTCTC — which would silently self-cut
+    # during the domestication / L1 digest. The insert body is internally clean
+    # here (started clean, or was repaired above), so rebuild the exact cloned
+    # region the real amplicon produces (same `_simulate_primed_amplicon` +
+    # `_tail` trim as the synthesis path) and scan the whole thing; any hit is a
+    # boundary-straddling site. Refuse rather than hand back a self-cutting part.
+    _ent = (ent5, ent3) if (ent5 and ent3) else None
+    try:
+        _fused = _simulate_primed_amplicon(
+            insert, oh5, oh3, grammar=g, part_type=part_type,
+            entry_overhangs=_ent,
+        )
+        _tail_len = len(enzyme_pad) + len(enzyme_site) + len(enzyme_spacer)
+        _region = (_fused[_tail_len:len(_fused) - _tail_len]
+                   if len(_fused) > 2 * _tail_len else _fused)
+        _junction_hits = _gb_find_forbidden_hits(_region, sites=forbidden_sites)
+    except Exception:
+        _log.exception("design_gb_primers: junction self-cut scan failed")
+        _junction_hits = []
+    if _junction_hits:
+        _jstr = ", ".join(f"{n} {s} at +{p + 1}"
+                          for n, s, p in _junction_hits)
+        return {
+            "error": f"A Type IIS site forms across a fusion junction in the "
+                     f"cloned part ({_jstr}) — it would self-cut during "
+                     f"domestication / L1 even though the insert body is clean. "
+                     f"Shift the selected region a few bp (so the overhang↔insert "
+                     f"junction no longer spells the site) or pick a different "
+                     f"boundary.",
+            "mutations": mutations,
+        }
 
     # CDS ATG-fusion rule (regression guard 2026-05-21):
     # When the 5' overhang carries the CDS start codon (e.g.

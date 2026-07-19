@@ -41,6 +41,7 @@ the hub so sc.<name> + every call site resolves unchanged.
 from __future__ import annotations
 
 import re
+import threading
 from typing import Callable as _Callable
 
 import splicecraft_state as _state
@@ -142,21 +143,29 @@ _MUT_TM_CACHE: "dict[str, float]" = {}
 _MUT_HAIRPIN_CACHE: "dict[str, float]" = {}
 _MUT_HOMODIMER_CACHE: "dict[str, float]" = {}
 _MUT_THERMO_CACHE_MAX = 8192
+# The three caches above are read/filled from BOTH the agent-API design
+# endpoints (design-primers / design-mutagenesis / simulate-pcr / check-primer,
+# on ThreadingMixIn worker threads) AND the Textual design workers. Guard the
+# evict+insert so two concurrent designs can't `pop(next(iter()))` the same key
+# (KeyError) or iterate a dict mid-insert (RuntimeError) — 2026-07 finding.
+_MUT_THERMO_CACHE_LOCK = threading.Lock()
 
 
 def _mut_thermo_cache_put(cache: "dict[str, float]", seq: str, val: float) -> None:
-    if len(cache) >= _MUT_THERMO_CACHE_MAX:
-        cache.pop(next(iter(cache)))          # evict oldest insertion (FIFO)
-    cache[seq] = val
+    with _MUT_THERMO_CACHE_LOCK:
+        if len(cache) >= _MUT_THERMO_CACHE_MAX:
+            cache.pop(next(iter(cache)))       # evict oldest insertion (FIFO)
+        cache[seq] = val
 
 
 def _mut_thermo_cache_clear() -> None:
     """Drop all memoized primer3 thermodynamic results. The fallback property
     tests call this so a real value cached by an earlier primer-design test
     can't mask the primer3-unavailable path they deliberately force."""
-    _MUT_TM_CACHE.clear()
-    _MUT_HAIRPIN_CACHE.clear()
-    _MUT_HOMODIMER_CACHE.clear()
+    with _MUT_THERMO_CACHE_LOCK:
+        _MUT_TM_CACHE.clear()
+        _MUT_HAIRPIN_CACHE.clear()
+        _MUT_HOMODIMER_CACHE.clear()
 
 
 def _mut_tm(seq: str) -> float:

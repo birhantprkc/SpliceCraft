@@ -14,6 +14,56 @@
 
 ---
 
+## [1.2.28] — 2026-07-18
+
+### Bug fixes
+
+- **Golden-Braid / MoClo domestication now catches a Type IIS site that forms
+  across a fusion junction.** When you domesticate a region whose body is clean
+  but whose boundary meets the cloning overhang to spell a forbidden site — e.g.
+  an insert ending `…GGTCT` next to a `CGCT` overhang, which together read as a
+  BsaI `GGTCTC` — the designer used to report success and hand back primers that
+  would silently self-cut during the domestication or Level-1 assembly digest.
+  The whole cloned region is now scanned (both overhangs, plus the nested
+  external overhangs for a two-tier UPD vector), and the design is refused with
+  the offending site and guidance to shift the region a few bases. The
+  direct-synthesis "L0 Fragment" path already did this; its PCR-domestication
+  twin now matches.
+- **Restoring your lab notebook (Experiments) from a backup no longer silently
+  reverts.** Settings → Restore-from-backup reported success, but the entries
+  reappeared as the pre-restore set the next time you opened the Experiments tab
+  — the restore wasn't written through into the active project. It now is, so
+  the recovery sticks. (Library, primer, and parts-bin restores already behaved
+  correctly; the experiments mirror was the one left out.)
+- **Dates in the experiment-projects picker, the gel library, and the primer
+  library now read as `JUL 11 2026`** instead of `2026-07-11`, matching the rest
+  of the app.
+
+### Hardening
+
+- **Driving primer design or Golden-Braid assembly from the scripting API and
+  the on-screen workbench at the same time no longer risks an intermittent
+  crash.** Several internal caches (entry-vector detection, assembled-fragment
+  digests, and primer melting-temperature / secondary-structure results) were
+  read and updated without a lock, so overlapping API and UI work could collide
+  and raise an error. They're now guarded, and the fragment cache no longer grows
+  without bound when many digests fail. A newly-added custom enzyme can likewise
+  no longer be briefly missed by a catalog lookup racing the save.
+- **A vector's backbone is identified by its origin / resistance markers rather
+  than by fragment size** in a few more part-classification and
+  compatibility-check paths, so an entry vector whose dropout cassette is larger
+  than its backbone is handled correctly — and a counter-selection cassette
+  labelled "…selection…" is no longer mistaken for the backbone.
+- The `align-plasmidsaurus-zip` scripting endpoint now counts against the
+  heavy-operation limit like the other alignment endpoints, so a burst of
+  alignment requests can't saturate the server.
+- The codon-table "Build from CDS file" tab no longer stretches its input rows
+  to fill the pane, keeping the browse / build controls in view.
+- Primer binding on an un-annotated circular plasmid is now found consistently
+  (the primer-attach step uses the same linear-vs-circular rule as the map).
+
+---
+
 ## [1.2.27] — 2026-07-16
 
 ### Bug fixes

@@ -168,6 +168,36 @@ class TestDesignGBPrimers:
             assert result["oh5"] == oh5
             assert result["oh3"] == oh3
 
+    def test_junction_site_across_overhang_is_refused(self):
+        """A Type IIS site that forms ACROSS the insert↔overhang fusion
+        junction (insert body itself clean) must be refused, not silently
+        handed back as a self-cutting design. Terminator oh3 is CGCT; an
+        insert ending ...GGTCT makes ...GGTCTCGCT — a BsaI GGTCTC straddling
+        the junction that would self-cut at the L1 assembly step."""
+        insert = "ATGGCA" * 9 + "GGTCT"          # 59 bp; body has no BsaI/Esp3I
+        assert "GGTCTC" not in insert and "CGTCTC" not in insert
+        flank = "GAATTCGCTAGC" * 9
+        template = flank + insert + flank
+        start = len(flank)
+        result = sc._design_gb_primers(template, start, start + len(insert),
+                                       "Terminator")
+        assert "error" in result, "junction self-cut site should be refused"
+        assert "junction" in result["error"].lower()
+
+    def test_clean_insert_junction_still_designs(self):
+        """Control for the junction scan: an insert whose body AND both
+        overhang junctions are clean still designs successfully — the scan
+        must not false-positive."""
+        insert = "ATGGCA" * 10                    # 60 bp; ...ATGGCA + CGCT clean
+        assert "GGTCTC" not in insert and "CGTCTC" not in insert
+        flank = "GAATTCGCTAGC" * 9
+        template = flank + insert + flank
+        start = len(flank)
+        result = sc._design_gb_primers(template, start, start + len(insert),
+                                       "Terminator")
+        assert "error" not in result, result.get("error")
+        assert result["fwd_full"] and result["rev_full"]
+
     def test_pad_and_spacer_present(self, random_template):
         result = sc._design_gb_primers(random_template, 0, 200, "CDS")
         assert result["fwd_full"].startswith(sc._GB_PAD)

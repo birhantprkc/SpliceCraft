@@ -1511,7 +1511,6 @@ def _assemble_operon(genes, *, promoter='', terminator='',
 # dataaccess) stay hub-side and feed in through the _state getters.
 # ──────────────────────────────────────────────────────────────────────────
 
-@_timed("op.scan_restriction", threshold_ms=25)
 def _iter_match_starts(pat, s: str):
     """Yield the start index of EVERY match of `pat` in `s`, INCLUDING
     self-overlapping tandem matches.
@@ -1593,6 +1592,7 @@ def _scan_restriction_sites(
     return [dict(d) for d in result]
 
 
+@_timed("op.scan_restriction", threshold_ms=25)
 def _scan_restriction_sites_impl(
     seq: str,
     min_recognition_len: int = 6,
