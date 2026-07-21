@@ -14,6 +14,32 @@
 
 ---
 
+## [1.2.30] — 2026-07-20
+
+### Bug fixes
+
+- **"Add to library" no longer blocks re-saving a plasmid you opened from that
+  collection.** The destination picker added in v1.2.29 treated the plasmid's
+  own existing name as a duplicate and disabled Save, so you couldn't update a
+  library plasmid in place with the add-to-library shortcut. It now recognises
+  the plasmid you're re-saving and lets the update through, while still catching
+  a genuine clash with a *different* plasmid's name.
+
+### Hardening
+
+- **Babs keeps its persona on a small context window.** With saved memory notes
+  (from `/remember`) and a nearly-full context, a long message could push Babs's
+  own instructions out of the window and flatten its personality mid-chat. The
+  budget that trims your message now counts those memory notes too, so the
+  persona stays put — completing the context-accuracy work started in v1.2.29.
+- **Babs's chat transcript can't grow without bound.** A long Agent-mode session
+  records every ⚙ tool step for the export/reopen transcript; that list is now
+  capped the same way the on-screen history already was, so a marathon
+  autonomous run can't slowly pin memory, and reopening the Babs tab after a
+  huge session is snappy again.
+
+---
+
 ## [1.2.29] — 2026-07-19
 
 ### New features

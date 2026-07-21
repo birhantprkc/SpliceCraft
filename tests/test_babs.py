@@ -440,6 +440,75 @@ class TestBabsUI:
             body = exported[0].read_text(encoding="utf-8")
             assert "list-features" in body and "> ⚙" in body
 
+    async def test_transcript_capped_and_keeps_tail(self, monkeypatch):
+        """v1.2.30 hardening: `_push_transcript` bounds the export/rehydrate
+        transcript at `_MAX_TRANSCRIPT`. An agent-mode turn appends a ⚙ tool
+        step per call, so without a cap a marathon autonomous run grows the list
+        without limit and slowly pins RAM. The cap keeps the TAIL (most recent
+        turns) and stays ≥ `_MAX_BUBBLES` so a close→reopen still rehydrates a
+        full screen of scrollback."""
+        monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            # Reopen must be able to restore a full screen of bubbles.
+            assert scr._MAX_TRANSCRIPT >= scr._MAX_BUBBLES
+            n = scr._MAX_TRANSCRIPT + 500
+            for i in range(n):
+                scr._push_transcript("tool", f"step {i}")
+            assert len(scr._transcript) == scr._MAX_TRANSCRIPT
+            # Tail preserved, no off-by-one: newest is the last pushed; the
+            # oldest survivor is exactly _MAX_TRANSCRIPT back.
+            assert scr._transcript[-1] == ("tool", f"step {n - 1}")
+            assert scr._transcript[0] == ("tool", f"step {n - scr._MAX_TRANSCRIPT}")
+
+    async def test_ask_reserve_counts_persistent_memory(self, monkeypatch):
+        """v1.2.30 hardening: `_ask` clamps the user's query against a reserve
+        for the FULL system prompt built by `_effective_system` — persona +
+        persistent memory + plasmid context + agent preamble. The pre-fix reserve
+        was hand-rolled and omitted the memory block, so a near-limit query
+        passed the clamp yet overran once memory was prepended, evicting Babs's
+        persona on a small context window. Spy on the reserve `_ask` actually
+        hands `clamp_prompt`: it must cover the whole effective prompt (memory
+        included), which is strictly more than the bare persona."""
+        monkeypatch.setattr(B, "list_installed", lambda **k: _ONE_MODEL)
+        monkeypatch.setattr(B, "chat_stream", _fake_chat)
+        # A memory block big enough that omitting it from the reserve is
+        # unambiguous (a marathon /remember store looks like this).
+        marker = "MEMORY-NOTE-XYZZY: the user prefers terse answers. " * 40
+        monkeypatch.setattr(sc, "_babs_memory_index", lambda: marker)
+        captured = {}
+        real_clamp = B.clamp_prompt
+
+        def _spy_clamp(text, *, num_ctx=None, reserve_tokens=0):
+            captured["reserve"] = reserve_tokens
+            return real_clamp(text, num_ctx=num_ctx,
+                              reserve_tokens=reserve_tokens)
+
+        monkeypatch.setattr(B, "clamp_prompt", _spy_clamp)
+        app = sc.PlasmidApp()
+        async with app.run_test(size=_TERM) as pilot:
+            await pilot.pause(); await pilot.pause()
+            app.action_open_babs()
+            await pilot.pause(); await pilot.pause()
+            scr = app.screen
+            assert marker in scr._effective_system()   # memory is in the prompt
+            scr.query_one("#babs-input", Input).value = "hello there"
+            scr._submit_current()                      # → _ask → clamp_prompt
+            for _ in range(60):
+                await pilot.pause()
+                await asyncio.sleep(0.02)
+                if not scr._generating:
+                    break
+            assert "reserve" in captured, "_ask never clamped the query"
+            # The reserve must cover the whole effective prompt (memory + ctx +
+            # preamble), not just the persona — that IS the fix.
+            assert captured["reserve"] >= B.est_tokens(scr._effective_system())
+            assert captured["reserve"] > B.est_tokens(scr._system)
+
     async def test_corpus_toggle_gates_on_corpus(self, monkeypatch):
         """The Corpus toggle is disabled (and forced off) without a corpus, and flips on when one
         exists — it can't promise grounding it can't deliver."""

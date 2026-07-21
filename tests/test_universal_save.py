@@ -305,3 +305,79 @@ class TestAddToLibraryDestinationPrompt:
                            if c.get("name") == "Targets")
             assert any(e.get("name") == "MyPlasmid"
                        for e in targets["plasmids"])
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# NamePlasmidModal — exempt_id (Alt+K re-save-in-place, v1.2.30 bug fix)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestNamePlasmidExemptId:
+    """v1.2.30: the destination picker added in v1.2.29 treated a re-saved
+    plasmid's OWN existing name as a duplicate, blocking Save — so you couldn't
+    update a library plasmid in place with Alt+K. `NamePlasmidModal(exempt_id=
+    <the loaded entry's id>)` drops that one entry from the dup-scope so a same-
+    name re-save reads as the intended edit-in-place (`add_entry` keys the
+    replace on a matching id). A clash with a DIFFERENT plasmid's name is still
+    caught, and the fresh-artifact callers (Constructor / Gibson / PCR / protein
+    — no exempt_id) keep the full collision contract."""
+
+    def _seed(self):
+        sc._save_collections([{"name": "Default", "plasmids": [
+            _entry("My Plasmid", eid="MYPLAS"),
+            _entry("Other Plasmid", eid="OTHER"),
+        ]}])
+        sc._set_active_collection_name("Default")
+
+    async def test_resave_own_name_allowed(self, tiny_record):
+        self._seed()
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            app.push_screen(sc.NamePlasmidModal(
+                "My Plasmid", default_collection="Default", exempt_id="MYPLAS"))
+            await pilot.pause()
+            modal = app.screen
+            # The loaded plasmid's own entry is dropped from BOTH dup maps, so
+            # re-typing its exact name doesn't self-collide by name or by id.
+            assert "my plasmid" not in modal._existing_names
+            assert "myplas" not in modal._existing_ids
+            cleaned = modal._refresh_dup_state("My Plasmid")
+            save_btn = modal.query_one("#btn-nameplasmid-save", sc.Button)
+            assert cleaned == "My Plasmid"          # re-save allowed
+            assert save_btn.disabled is False
+
+    async def test_rename_into_other_plasmid_still_blocked(self, tiny_record):
+        self._seed()
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            app.push_screen(sc.NamePlasmidModal(
+                "My Plasmid", default_collection="Default", exempt_id="MYPLAS"))
+            await pilot.pause()
+            modal = app.screen
+            # Only the loaded plasmid's OWN entry is exempt — a DIFFERENT
+            # plasmid's name is still a hard duplicate (Save stays disabled).
+            cleaned = modal._refresh_dup_state("Other Plasmid")
+            save_btn = modal.query_one("#btn-nameplasmid-save", sc.Button)
+            assert cleaned is None
+            assert save_btn.disabled is True
+
+    async def test_fresh_artifact_no_exempt_catches_own_name(self, tiny_record):
+        self._seed()
+        app = sc.PlasmidApp()
+        app._preload_record = tiny_record
+        async with app.run_test(size=TERMINAL_SIZE) as pilot:
+            await pilot.pause(); await pilot.pause(0.05)
+            # No exempt_id → the fresh-artifact path: every existing name is a
+            # live collision, so an accidental exact match is still blocked.
+            app.push_screen(sc.NamePlasmidModal(
+                "My Plasmid", default_collection="Default"))
+            await pilot.pause()
+            modal = app.screen
+            assert "my plasmid" in modal._existing_names   # nothing exempted
+            cleaned = modal._refresh_dup_state("My Plasmid")
+            save_btn = modal.query_one("#btn-nameplasmid-save", sc.Button)
+            assert cleaned is None
+            assert save_btn.disabled is True

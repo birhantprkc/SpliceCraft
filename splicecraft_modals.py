@@ -5590,8 +5590,15 @@ class NamePlasmidModal(_OneShotDismissScreen, ModalScreen):
     def __init__(self, default_name: str,
                  *, target_label: str = "plasmid",
                  default_collection: "str | None" = None,
-                 primer_family: "str | None" = None) -> None:
+                 primer_family: "str | None" = None,
+                 exempt_id: "str | None" = None) -> None:
         super().__init__()
+        # Opt-in: the id of an EXISTING library entry that this save will edit
+        # in place (Alt+K re-saving the loaded plasmid). Its own name/id must
+        # NOT count as a duplicate, else the modal blocks the user from
+        # re-saving their own plasmid. Callers naming a FRESH artifact
+        # (Constructor / Gibson / PCR / protein) pass nothing → no exemption.
+        self._exempt_id = (exempt_id or "").strip()
         self._default_name = _sanitize_plasmid_name(
             default_name or "", fallback="assembly",
         )
@@ -5655,6 +5662,12 @@ class NamePlasmidModal(_OneShotDismissScreen, ModalScreen):
                 continue
             nm = (e.get("name") or "").strip()
             eid = (e.get("id") or "").strip()
+            # The record being re-saved isn't a collision with ITSELF: drop its
+            # own entry from the dup-scope so re-saving under the same name
+            # reads as the intended edit-in-place (add_entry keys that on a
+            # matching id), not a blocked "DUPLICATE". No exempt_id → no skip.
+            if self._exempt_id and eid == self._exempt_id:
+                continue
             if nm:
                 key = nm.casefold()
                 if key in seen_name_keys:
